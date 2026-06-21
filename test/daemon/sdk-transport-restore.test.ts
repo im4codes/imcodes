@@ -154,6 +154,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
@@ -202,6 +203,18 @@ async function settleCodexRun(sessionName: string, mode: 'start' | 'resume') {
   while (!codexRunForSession(sessionName, mode) && Date.now() < deadline) {
     await flush();
   }
+}
+
+function forceRuntimeProviderError(
+  runtime: NonNullable<ReturnType<typeof getTransportRuntime>>,
+  error: ProviderError,
+): void {
+  const internal = runtime as unknown as {
+    recordProviderError(error: ProviderError): void;
+    setStatus(status: 'error'): void;
+  };
+  internal.recordProviderError(error);
+  internal.setStatus('error');
 }
 
 describe('sdk transport session restore', () => {
@@ -274,6 +287,48 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('persists transport runtime running status so session snapshots do not stay idle while tools run', async () => {
+    const persistedRecords: Array<Record<string, any> | null> = [];
+    setSessionPersistCallback(async (record) => {
+      persistedRecords.push(record);
+    });
+    mocks.store.set('deck_sdk_status_brain', {
+      name: 'deck_sdk_status_brain',
+      projectName: 'sdkstatus',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-status',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-status',
+      codexSessionId: 'codex-thread-status',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    const runtime = getTransportRuntime('deck_sdk_status_brain');
+    expect(runtime).toBeDefined();
+    (runtime as unknown as { setStatus(status: 'thinking'): void }).setStatus('thinking');
+
+    expect(mocks.store.get('deck_sdk_status_brain')?.state).toBe('running');
+    expect(persistedRecords.at(-1)).toMatchObject({
+      name: 'deck_sdk_status_brain',
+      state: 'running',
+    });
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_sdk_status_brain',
+      'session.state',
+      expect.objectContaining({ state: 'running' }),
+      { source: 'daemon', confidence: 'high' },
+    );
   });
 
   it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {
@@ -641,7 +696,7 @@ describe('sdk transport session restore', () => {
     expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
   });
 
-  it('auto-restarts an errored transport runtime and replays the failed turn', async () => {
+  it('does not auto-restart ordinary provider errors', async () => {
     await connectProvider('claude-code-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_retry_brain',
@@ -658,27 +713,25 @@ describe('sdk transport session restore', () => {
 
     firstRuntime!.send('Please retry me [transport-retry-once]', 'cmd-retry-1');
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      if (mocks.claudeRuns.length >= 2 && getResendCount('deck_sdk_retry_brain') === 0) break;
+      if (firstRuntime!.getStatus() === 'error') break;
       await flush();
     }
 
-    expect(mocks.claudeRuns).toHaveLength(2);
+    expect(firstRuntime!.getStatus()).toBe('error');
+    await flush();
+    expect(mocks.claudeRuns).toHaveLength(1);
     expect(mocks.claudeRuns[0]).toMatchObject({
       prompt: 'Please retry me [transport-retry-once]',
       options: expect.objectContaining({ resume: 'cc-session-retry' }),
     });
-    expect(mocks.claudeRuns[1]).toMatchObject({
-      prompt: 'Please retry me [transport-retry-once]',
-      options: expect.objectContaining({ resume: 'cc-session-retry' }),
-    });
     expect(getResendCount('deck_sdk_retry_brain')).toBe(0);
-    expect(getTransportRuntime('deck_sdk_retry_brain')).toBeDefined();
-    expect(getTransportRuntime('deck_sdk_retry_brain')).not.toBe(firstRuntime);
+    expect(getTransportRuntime('deck_sdk_retry_brain')).toBe(firstRuntime);
+    expect(firstRuntime!.activeDispatchEntries).toEqual([]);
   });
 
-  it('auto-restart preserves messages queued behind the failed active turn', async () => {
+  it('auto-restart preserves messages queued behind a lost provider connection', async () => {
     await connectProvider('claude-code-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_retry_pending_brain',
@@ -693,27 +746,37 @@ describe('sdk transport session restore', () => {
     const firstRuntime = getTransportRuntime('deck_sdk_retry_pending_brain');
     expect(firstRuntime).toBeDefined();
 
-    expect(firstRuntime!.send('Please retry me [transport-retry-once]', 'cmd-retry-active')).toBe('sent');
+    expect(firstRuntime!.send('Please replay after connection loss', 'cmd-retry-active')).toBe('sent');
     expect(firstRuntime!.send('follow up one', 'cmd-retry-pending-1')).toBe('queued');
     expect(firstRuntime!.send('follow up two', 'cmd-retry-pending-2')).toBe('queued');
 
+    forceRuntimeProviderError(firstRuntime!, {
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'simulated provider connection loss',
+      recoverable: false,
+    });
+
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      if (mocks.claudeRuns.length >= 3 && getResendCount('deck_sdk_retry_pending_brain') === 0) break;
+      const relaunched = getTransportRuntime('deck_sdk_retry_pending_brain') !== firstRuntime;
+      const prompts = mocks.claudeRuns.map((run) => run.prompt);
+      if (relaunched
+        && getResendCount('deck_sdk_retry_pending_brain') === 0
+        && prompts.includes('Please replay after connection loss')
+        && prompts.includes('follow up one\n\nfollow up two')) break;
       await flush();
     }
 
-    expect(mocks.claudeRuns.map((run) => run.prompt)).toEqual([
-      'Please retry me [transport-retry-once]',
-      'Please retry me [transport-retry-once]',
+    expect(mocks.claudeRuns.map((run) => run.prompt)).toEqual(expect.arrayContaining([
+      'Please replay after connection loss',
       'follow up one\n\nfollow up two',
-    ]);
+    ]));
     expect(getResendCount('deck_sdk_retry_pending_brain')).toBe(0);
     expect(getTransportRuntime('deck_sdk_retry_pending_brain')).toBeDefined();
     expect(getTransportRuntime('deck_sdk_retry_pending_brain')).not.toBe(firstRuntime);
   });
 
-  it('rate-limited auto-recovery still preserves active and pending messages for later resend', async () => {
+  it('does not feed ordinary provider failures into the auto-recovery loop', async () => {
     await connectProvider('claude-code-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_retry_limited_brain',
@@ -732,32 +795,23 @@ describe('sdk transport session restore', () => {
     expect(firstRuntime!.send('limited follow up one', 'cmd-retry-limit-pending-1')).toBe('queued');
     expect(firstRuntime!.send('limited follow up two', 'cmd-retry-limit-pending-2')).toBe('queued');
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const recoveryStopped = timelineEmitterEmitMock.mock.calls.some((call) => (
-        call[0] === 'deck_sdk_retry_limited_brain'
-          && call[1] === 'assistant.text'
-          && typeof call[2]?.text === 'string'
-          && call[2].text.includes('Transport recovery stopped')
-      ));
-      if (recoveryStopped && getResendCount('deck_sdk_retry_limited_brain') >= 3) break;
+      if (firstRuntime!.getStatus() === 'error') break;
       await flush();
     }
 
-    expect(timelineEmitterEmitMock.mock.calls).toEqual(expect.arrayContaining([
-      expect.arrayContaining([
-        'deck_sdk_retry_limited_brain',
-        'assistant.text',
-        expect.objectContaining({
-          text: expect.stringContaining('Transport recovery stopped'),
-        }),
-      ]),
-    ]));
-    expect(getResendEntries('deck_sdk_retry_limited_brain').map((entry) => entry.commandId)).toEqual([
-      'cmd-retry-limit-active',
-      'cmd-retry-limit-pending-1',
-      'cmd-retry-limit-pending-2',
-    ]);
+    expect(firstRuntime!.getStatus()).toBe('error');
+    await flush();
+    expect(mocks.claudeRuns).toHaveLength(1);
+    expect(getTransportRuntime('deck_sdk_retry_limited_brain')).toBe(firstRuntime);
+    expect(getResendEntries('deck_sdk_retry_limited_brain')).toEqual([]);
+    expect(timelineEmitterEmitMock.mock.calls.some((call) => (
+      call[0] === 'deck_sdk_retry_limited_brain'
+        && call[1] === 'assistant.text'
+        && typeof call[2]?.text === 'string'
+        && call[2].text.includes('Transport recovery stopped')
+    ))).toBe(false);
   });
 
   it('emits startup memory.context when the first transport turn carries the seeded memory', { timeout: 30_000 }, async () => {

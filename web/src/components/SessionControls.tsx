@@ -182,6 +182,8 @@ interface Props {
   onPendingPrefillApplied?: () => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
+  /** Whether this full control surface is the active keyboard target for window-level shortcuts. */
+  keyboardActive?: boolean;
   /** Notifies parent when the quick input panel opens/closes. */
   onQuickOpenChange?: (open: boolean) => void;
   /** Notifies parent when any floating overlay/dropdown is open. */
@@ -308,10 +310,22 @@ function isModalKeyboardOwnerOpen(): boolean {
   return !!document.querySelector('[role="dialog"][aria-modal="true"], .fb-lightbox, .html-fullscreen-preview');
 }
 
+function isTextEntryKeyboardOwner(node: EventTarget | Node | null | undefined): boolean {
+  if (!(node instanceof HTMLElement)) return false;
+  const tag = node.tagName;
+  return tag === 'INPUT'
+    || tag === 'TEXTAREA'
+    || tag === 'SELECT'
+    || node.isContentEditable
+    || node.getAttribute('contenteditable') === 'true'
+    || node.classList.contains('xterm-helper-textarea');
+}
+
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'fable' | 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
+const IME_ESCAPE_CANCEL_GRACE_MS = 800;
 
 /*
  * R3 v2 PR-ρ — Composer attachments now carry a per-composer sequence
@@ -762,7 +776,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -961,6 +975,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
   const imeComposingRef = useRef(false);
+  const lastImeCompositionAtRef = useRef(0);
   const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
   const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
@@ -988,12 +1003,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     const el = divRef.current;
     if (!el) return;
-    const handleCompositionStart = () => { imeComposingRef.current = true; };
-    const handleCompositionEnd = () => { imeComposingRef.current = false; };
+    const markImeActivity = () => { lastImeCompositionAtRef.current = Date.now(); };
+    const handleCompositionStart = () => {
+      imeComposingRef.current = true;
+      markImeActivity();
+    };
+    const handleCompositionEnd = () => {
+      imeComposingRef.current = false;
+      markImeActivity();
+    };
     el.addEventListener('compositionstart', handleCompositionStart);
+    el.addEventListener('compositionupdate', markImeActivity);
     el.addEventListener('compositionend', handleCompositionEnd);
     return () => {
       el.removeEventListener('compositionstart', handleCompositionStart);
+      el.removeEventListener('compositionupdate', markImeActivity);
       el.removeEventListener('compositionend', handleCompositionEnd);
     };
   }, []);
@@ -2689,6 +2713,66 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     cancelActiveTransportTurn();
   }, [cancelActiveTransportTurn, showStopFeedback]);
 
+  const escapeKeyboardOwnerOpen = atPickerOpen
+    || quickOpen
+    || modelOpen
+    || autoOpen
+    || thinkingOpen
+    || cloneDialogOpen
+    || voiceOpen
+    || p2pOpen
+    || p2pConfigOpen
+    || openSpecOpen
+    || !!mobileFileBrowserOpen;
+
+  const shouldProtectTransportEscape = useCallback((e: KeyboardEvent): boolean => {
+    if (e.key !== 'Escape') return true;
+    if (e.defaultPrevented) return true;
+    if (imeComposingRef.current || isImeComposingKeyEvent(e)) return true;
+    if (Date.now() - lastImeCompositionAtRef.current < IME_ESCAPE_CANCEL_GRACE_MS) return true;
+    if (escapeKeyboardOwnerOpen || isModalKeyboardOwnerOpen()) return true;
+
+    const composer = divRef.current;
+    const target = e.target instanceof Node ? e.target : null;
+    const active = typeof document !== 'undefined' && document.activeElement instanceof Node
+      ? document.activeElement
+      : null;
+    const targetIsComposer = !!composer && !!target && composer.contains(target);
+    const activeIsComposer = !!composer && !!active && composer.contains(active);
+
+    // If a different text entry owns focus (rename input, picker field, hidden
+    // terminal helper textarea, etc.), Esc belongs to that owner, not to the
+    // transport turn. Window/body/chat-surface focus is allowed to cancel.
+    if (target && isTextEntryKeyboardOwner(target) && !targetIsComposer) return true;
+    if (active && isTextEntryKeyboardOwner(active) && !activeIsComposer) return true;
+
+    return false;
+  }, [escapeKeyboardOwnerOpen]);
+
+  const handleTransportEscapeCancel = useCallback((e: KeyboardEvent): boolean => {
+    if (
+      effectiveRuntimeType !== 'transport'
+      || !isRunningSessionState(activeSession?.state)
+      || shouldProtectTransportEscape(e)
+    ) {
+      return false;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    handleStopPress();
+    return true;
+  }, [activeSession?.state, effectiveRuntimeType, handleStopPress, shouldProtectTransportEscape]);
+
+  useEffect(() => {
+    const enabled = !compact && (keyboardActive ?? true);
+    if (!enabled) return;
+    const handler = (e: KeyboardEvent) => {
+      handleTransportEscapeCancel(e);
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [compact, handleTransportEscapeCancel, keyboardActive]);
+
   // Clear the optimistic state once the turn actually settles (session leaves
   // the running state) or after a safety timeout so a stuck turn re-enables it.
   useEffect(() => {
@@ -3058,22 +3142,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
 
-    // When @ picker is open, it owns Enter/Arrow/Escape. Keep this ahead of
-    // transport Escape cancel so closing picker layers never stops the chat.
+    // When @ picker is open, it owns Enter/Arrow/Escape.
     if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
       e.preventDefault();
       e.stopPropagation();
       return;
     }
 
-    if (
-      e.key === 'Escape'
-      && effectiveRuntimeType === 'transport'
-      && isRunningSessionState(activeSession?.state)
-      && !isModalKeyboardOwnerOpen()
-    ) {
-      e.preventDefault();
-      handleStopPress();
+    if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
       return;
     }
 

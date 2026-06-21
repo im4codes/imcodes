@@ -5014,6 +5014,7 @@ export function App() {
                 ws={wsRef.current}
                 connected={connected}
                 isActive={s.name === activeSession}
+                keyboardActive={s.name === activeSession && openSubIds.size === 0}
                 viewMode={(viewModes[s.name] ?? defaultViewMode) as ViewMode}
                 quickData={quickData}
                 detectedModel={detectedModels.get(s.name)}

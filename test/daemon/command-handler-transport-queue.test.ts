@@ -2553,7 +2553,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'deck_transport_brain',
       'assistant.text',
       expect.objectContaining({
-        text: expect.stringContaining('will resend 1 queued message'),
+        text: expect.stringContaining('Agent claude-code-sdk is restoring'),
         streaming: false,
         memoryExcluded: true,
       }),
@@ -3216,12 +3216,18 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('skips terminal subscribe and snapshot requests for transport sessions', async () => {
+    getTransportRuntimeMock.mockReturnValue(undefined);
     handleWebCommand({ type: 'terminal.subscribe', session: 'deck_transport_brain' }, serverLink as any);
     handleWebCommand({ type: 'terminal.snapshot_request', sessionName: 'deck_transport_brain' }, serverLink as any);
-    await flushAsync();
+    await waitForAsync(() => launchTransportSessionMock.mock.calls.length > 0);
 
     expect(terminalSubscribeMock).not.toHaveBeenCalled();
     expect(terminalRequestSnapshotMock).not.toHaveBeenCalled();
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'claude-code-sdk',
+    }));
   });
 
   it('skips passive shell/script terminal subscriptions and releases any live shell stream', async () => {

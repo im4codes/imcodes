@@ -70,6 +70,8 @@ export interface SessionPaneProps {
   viewMode: ViewMode;
   /** For future split-view focus highlighting. */
   focused?: boolean;
+  /** Whether this pane is the active target for window-level shortcuts. */
+  keyboardActive?: boolean;
   quickData: UseQuickDataResult;
   detectedModel?: string;
 
@@ -123,6 +125,7 @@ export function SessionPane({
   ws,
   connected,
   isActive,
+  keyboardActive,
   viewMode,
   quickData,
   detectedModel,
@@ -530,6 +533,7 @@ export function SessionPane({
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
           activeTransportTurn={activeTimelineTurn}
+          keyboardActive={keyboardActive ?? isActive}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
           sessions={sessions}

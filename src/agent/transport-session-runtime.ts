@@ -82,6 +82,12 @@ export interface TransportRuntimeDiagnosticSnapshot {
   stalePendingRecoveryActive: boolean;
   providerSessionBound: boolean;
   providerDiagnostics?: Record<string, unknown>;
+  lastProviderError?: {
+    code: string;
+    message: string;
+    recoverable: boolean;
+    at: number;
+  };
   lastActivityAt: number;
   lastActivityAgeMs: number;
 }
@@ -89,12 +95,25 @@ export interface TransportRuntimeDiagnosticSnapshot {
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
+const DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 5_000;
 const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
 const MAX_TRANSPORT_CONTEXT_BUDGET_MS = 30_000;
 const MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 50;
 const MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 10 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS = 10_000;
+// Auto-retry for RECOVERABLE dispatch failures (e.g. "provider is already
+// busy", shared-context retry-scheduled). The failed turn is re-queued and
+// re-dispatched with capped exponential backoff instead of being dropped, so
+// transient/retryable conditions complete on their own. The budget is reset on
+// any provider activity (delta/complete/successful send) so a legitimately long
+// active turn stays patient; only a wedged provider (repeated failure with NO
+// activity) exhausts the budget and surfaces a terminal error.
+const RECOVERABLE_DISPATCH_RETRY_BASE_MS = 1_000;
+const RECOVERABLE_DISPATCH_RETRY_MAX_MS = 8_000;
+const MAX_RECOVERABLE_DISPATCH_RETRIES = 15;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
+const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
+const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
 
 type TimeoutOutcome<T> =
   | { timedOut: false; value: T }
@@ -143,6 +162,16 @@ export function getTransportStalePendingRecoveryMs(): number {
     DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS,
     MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS,
     MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS,
+    { allowZero: false },
+  );
+}
+
+export function getTransportStalePendingCancelFallbackMs(): number {
+  return readBoundedTimeoutMs(
+    'IMCODES_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS',
+    DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS,
+    MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS,
+    MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS,
     { allowZero: false },
   );
 }
@@ -207,6 +236,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _history: AgentMessage[] = [];
   private _providerSessionId: string | null = null;
   private _sending = false;
+  private _lastProviderError: ProviderError | null = null;
+  private _lastProviderErrorAt = 0;
   /** Epoch ms of the last sign of life for the active turn — any provider
    *  event (delta / completion / error / tool call / session info) or a turn
    *  dispatch we initiated. Frozen if the provider wedges mid-turn (e.g. a
@@ -215,6 +246,11 @@ export class TransportSessionRuntime implements SessionRuntime {
    *  in-progress turn and stop blocking upgrades indefinitely — one stuck SDK
    *  session must never pin the daemon on an old version. */
   private _lastActivityAt = Date.now();
+  // Epoch ms of the last genuine provider OUTPUT (delta/completion/tool-call) —
+  // NOT errors. The recoverable-retry tick uses this (not _lastActivityAt, which
+  // errors also bump) to tell "provider is mid-turn, wait for it to drain" from
+  // "provider is quiet/wedged, force a re-attempt". 0 until the first output.
+  private _lastProviderOutputAt = 0;
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
   /**
@@ -277,6 +313,19 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchProviderStarted = false;
   private _activeDispatchId: number | null = null;
   private _activeDispatchStaleRecoveryStarted = false;
+  private _stalePendingCancelFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  // Consecutive recoverable dispatch-failure count for the current run of
+  // retries; reset to 0 on any provider activity / successful send.
+  private _recoverableDispatchRetries = 0;
+  // Pending backoff timer for the next auto-retry drain. While set, the session
+  // counts as having active turn work (so new sends queue in order behind the
+  // message being retried) and presents an in-progress status, not idle.
+  private _recoverableRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  // How many FRONT pending entries make up the turn currently being retried.
+  // STOP uses this to interrupt exactly that turn while keeping messages the
+  // user queued AFTER it. Overwritten on each re-queue; harmless when stale
+  // (only read while the retry timer is set, and re-queue always sets it first).
+  private _recoverableRetryEntryCount = 0;
   private _nextDispatchId = 0;
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private _externalCompletionSettlementsToIgnore = 0;
@@ -303,6 +352,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        this._lastProviderOutputAt = this._lastActivityAt;
         if (this._activeDispatchCancelled) return;
         // A delta with no active turn is a late/stray callback from an
         // already-settled turn (provider callbacks are not dispatch-id scoped).
@@ -317,6 +367,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        this._lastProviderOutputAt = this._lastActivityAt;
+        // A completed turn means the provider is responsive and queued work is
+        // about to drain — clear any recoverable-retry streak.
+        this._recoverableDispatchRetries = 0;
         if (this._externalCompletionSettlementsToIgnore > 0) {
           this._externalCompletionSettlementsToIgnore--;
           logger.warn(
@@ -340,6 +394,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
         }
         if (this._activeDispatchCancelled) {
+          this.clearStalePendingCancelFallbackTimer();
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
           this._activeTurn = null;
@@ -359,6 +414,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
         }
+        this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
         this._history.push(message);
         this._activeTurn?.resolve();
@@ -379,7 +435,13 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this._externalCompletionSettlementsToIgnore > 0) {
           this._externalCompletionSettlementsToIgnore--;
           logger.warn(
-            { sessionKey: this.sessionKey, status: this._status, errorCode: error.code },
+            {
+              sessionKey: this.sessionKey,
+              status: this._status,
+              errorCode: error.code,
+              errorMessage: error.message,
+              recoverable: error.recoverable,
+            },
             'transport runtime ignored late provider error for externally completed dispatch',
           );
           return;
@@ -392,10 +454,18 @@ export class TransportSessionRuntime implements SessionRuntime {
           // drain it through the normal path; unrecoverable errors still surface
           // as terminal error without consuming the queue.
           logger.warn(
-            { sessionKey: this.sessionKey, status: this._status, errorCode: error.code, pendingCount: this._pendingMessages.length },
+            {
+              sessionKey: this.sessionKey,
+              status: this._status,
+              errorCode: error.code,
+              errorMessage: error.message,
+              recoverable: error.recoverable,
+              pendingCount: this._pendingMessages.length,
+            },
             'transport runtime got provider error without active turn',
           );
           if (this._pendingMessages.length === 0) {
+            this.clearStalePendingCancelFallbackTimer();
             this._activeDispatchCancelled = false;
             this._activeDispatchProviderStarted = false;
             this._activeDispatchId = null;
@@ -404,9 +474,24 @@ export class TransportSessionRuntime implements SessionRuntime {
             return;
           }
         }
+        this.recordProviderError(error);
+        logger.warn(
+          {
+            sessionKey: this.sessionKey,
+            provider: this.provider.id,
+            status: this._status,
+            errorCode: error.code,
+            errorMessage: error.message,
+            recoverable: error.recoverable,
+            pendingCount: this._pendingMessages.length,
+            activeDispatchCount: this._activeDispatchEntries.length,
+          },
+          'transport runtime provider error',
+        );
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
+        this.clearStalePendingCancelFallbackTimer();
         this._activeDispatchProviderStarted = false;
         if (this._activeDispatchId !== null) {
           this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
@@ -421,7 +506,20 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._activeDispatchEntries = [];
           if (this._drainPending()) return;
         }
-        this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
+        // A provider onError means the turn was ACCEPTED and then failed/produced
+        // nothing (e.g. "exited without producing a response") — distinct from a
+        // DELIVERY failure (handled in the dispatch catch with auto-retry). We do
+        // NOT re-deliver here: queued work drains and moves on. Recoverable errors
+        // and cancellations leave the session usable (idle); only genuinely
+        // unrecoverable errors surface as a terminal error.
+        this.setStatus(canDrain ? 'idle' : 'error');
+        if (!canDrain) {
+          // Let synchronous status listeners preserve the active payload first
+          // (CONNECTION_LOST recovery needs it), then clear local active state
+          // so non-relaunch errors cannot wedge future sends behind a phantom
+          // dispatch.
+          this._activeDispatchEntries = [];
+        }
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
         if (sid !== this._providerSessionId) return;
@@ -440,6 +538,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
       if (sid !== this._providerSessionId) return;
       this._lastActivityAt = Date.now();
+      this._lastProviderOutputAt = this._lastActivityAt;
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -523,6 +622,15 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   get providerSessionId(): string | null { return this._providerSessionId; }
   get sending(): boolean { return this._sending; }
+  get lastProviderError(): { code: string; message: string; recoverable: boolean; at: number } | null {
+    if (!this._lastProviderError) return null;
+    return {
+      code: this._lastProviderError.code,
+      message: this._lastProviderError.message,
+      recoverable: this._lastProviderError.recoverable,
+      at: this._lastProviderErrorAt,
+    };
+  }
   /** Number of messages waiting in the queue. */
   get pendingCount(): number { return this._pendingMessages.length; }
   /** Monotonic version of the pending-queue. See `_pendingVersion`. */
@@ -556,6 +664,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       stalePendingRecoveryActive: this._activeDispatchStaleRecoveryStarted,
       providerSessionBound: !!this._providerSessionId,
       ...(providerDiagnostics ? { providerDiagnostics } : {}),
+      ...(this.lastProviderError ? { lastProviderError: this.lastProviderError } : {}),
       lastActivityAt: this._lastActivityAt,
       lastActivityAgeMs: Math.max(0, nowMs - this._lastActivityAt),
     };
@@ -577,9 +686,10 @@ export class TransportSessionRuntime implements SessionRuntime {
    * Queue-visible watchdog for the harder split-brain case: the provider/UI
    * has gone quiet, but the runtime never received onComplete/onError, so an
    * active dispatch pins `_sending=true` and queued user messages never drain.
-   * We do not abandon the active turn locally because late provider callbacks
-   * are not dispatch-id scoped. Instead, nudge the provider's normal cancel
-   * path once; its recoverable CANCELLED callback owns the existing drain path.
+   * First nudge the provider's normal cancel path once; its recoverable
+   * CANCELLED callback owns the preferred drain path. If that callback never
+   * arrives, a short local fallback abandons the stale active turn so queued
+   * work is not pinned behind it indefinitely.
    */
   cancelStaleActiveTurnWithPending(options?: {
     reason?: string;
@@ -610,8 +720,11 @@ export class TransportSessionRuntime implements SessionRuntime {
       },
       'transport runtime active turn is stale with queued messages; cancelling once so pending work can drain',
     );
+    const dispatchId = this._activeDispatchId;
+    this.scheduleStalePendingCancelFallback(dispatchId);
     void this.cancel().catch((err) => {
       this._activeDispatchStaleRecoveryStarted = false;
+      this.clearStalePendingCancelFallbackTimer();
       logger.warn(
         { err, sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
         'transport stale pending recovery cancel failed',
@@ -653,6 +766,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._sending = false;
     this._activeTurn?.resolve();
     this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchEntries = [];
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
@@ -698,7 +812,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private hasActiveTurnWork(): boolean {
-    return this._sending || !!this._activeTurn || this._activeDispatchEntries.length > 0;
+    return this._sending
+      || !!this._activeTurn
+      || this._activeDispatchEntries.length > 0
+      // A pending recoverable-retry means a turn is mid-delivery (re-queued,
+      // waiting on backoff). The session is busy: new sends must queue behind
+      // it, and status must read in-progress rather than idle.
+      || this._recoverableRetryTimer !== null;
   }
 
   private isInProgressStatus(status: AgentStatus): boolean {
@@ -837,6 +957,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
+      this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
       this._activeDispatchId = null;
@@ -887,6 +1008,28 @@ export class TransportSessionRuntime implements SessionRuntime {
   async cancel(): Promise<void> {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    // A recoverable auto-retry is mid-flight (re-queued message waiting on
+    // backoff, no active provider turn). STOP must halt it deterministically:
+    // clear the backoff, drop the queued work, and settle idle so the UI does
+    // not keep "working" with nothing scheduled.
+    if (this._recoverableRetryTimer && !this._activeTurn && !this._sending) {
+      // STOP during an auto-retry interrupts ONLY the turn being retried (the
+      // front entries). Messages the user queued AFTER it stay intact and drain,
+      // matching normal STOP semantics ("keep queued messages; interrupt the
+      // active turn"). Do NOT clear the whole queue.
+      const retriedEntryCount = this._recoverableRetryEntryCount;
+      this.clearRecoverableRetryTimer();
+      this._recoverableDispatchRetries = 0;
+      this._recoverableRetryEntryCount = 0;
+      if (retriedEntryCount > 0) {
+        this._pendingMessages.splice(0, retriedEntryCount);
+        this._pendingVersion++;
+      }
+      // Remaining queued messages drain (deliver) after the cancelled turn;
+      // settle idle when nothing is left.
+      if (!this._drainPending()) this.setStatus('idle');
+      return;
     }
     // STOP/CANCEL is a cut-in-line operation, not a queued transport turn.
     // It must be effective while the active turn is still in the async
@@ -944,12 +1087,15 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._sending = false;
     this._activeTurn = null;
     this._activeDispatchEntries = [];
+    this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
     this._externalCompletionSettlementsToIgnore = 0;
+    this.clearRecoverableRetryTimer();
+    this._recoverableDispatchRetries = 0;
     if (this._pendingMessages.length > 0) {
       logger.warn(
         { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
@@ -990,6 +1136,120 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
+  private recordProviderError(error: ProviderError): void {
+    this._lastProviderError = {
+      code: error.code,
+      message: error.message,
+      recoverable: error.recoverable,
+    };
+    this._lastProviderErrorAt = Date.now();
+  }
+
+  private clearStalePendingCancelFallbackTimer(): void {
+    if (!this._stalePendingCancelFallbackTimer) return;
+    clearTimeout(this._stalePendingCancelFallbackTimer);
+    this._stalePendingCancelFallbackTimer = null;
+  }
+
+  private clearRecoverableRetryTimer(): void {
+    if (!this._recoverableRetryTimer) return;
+    clearTimeout(this._recoverableRetryTimer);
+    this._recoverableRetryTimer = null;
+  }
+
+  /**
+   * Recoverable dispatch failure → DO NOT drop the turn. Re-queue the failed
+   * message(s) at the FRONT of the pending queue (order preserved) and schedule
+   * a capped-exponential-backoff retry drain, keeping the session in-progress.
+   * Returns true if a retry was scheduled (caller must return — the turn is
+   * still being delivered), false if the retry budget is exhausted (caller
+   * falls through to give up: drop + surface error).
+   *
+   * The natural recovery is the existing onComplete/onError drain (when the
+   * provider's current turn finishes, queued work drains and re-dispatches);
+   * this backoff timer is the fallback when no such settlement ever arrives.
+   */
+  private requeueAndScheduleRecoverableRetry(error: ProviderError): boolean {
+    if (this._activeDispatchEntries.length === 0) return false;
+    if (this._recoverableDispatchRetries >= MAX_RECOVERABLE_DISPATCH_RETRIES) return false;
+    this._recoverableDispatchRetries++;
+    // Record the size of THIS retried turn so STOP can drop exactly it.
+    this._recoverableRetryEntryCount = this._activeDispatchEntries.length;
+    this._pendingMessages.unshift(...this._activeDispatchEntries);
+    this._pendingVersion++;
+    this._activeDispatchEntries = [];
+    const attempt = this._recoverableDispatchRetries;
+    const backoffMs = Math.min(
+      RECOVERABLE_DISPATCH_RETRY_BASE_MS * 2 ** (attempt - 1),
+      RECOVERABLE_DISPATCH_RETRY_MAX_MS,
+    );
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        errorCode: error.code,
+        errorMessage: error.message,
+        attempt,
+        maxAttempts: MAX_RECOVERABLE_DISPATCH_RETRIES,
+        backoffMs,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport recoverable dispatch failure — re-queued message and scheduled auto-retry',
+    );
+    this.armRecoverableRetryTimer(backoffMs);
+    // In-progress, NOT idle/error: the message is still being delivered.
+    this.setStatus('thinking');
+    return true;
+  }
+
+  private armRecoverableRetryTimer(delayMs: number): void {
+    this.clearRecoverableRetryTimer();
+    this._recoverableRetryTimer = setTimeout(() => this.runRecoverableRetryTick(), delayMs);
+    this._recoverableRetryTimer.unref?.();
+  }
+
+  private runRecoverableRetryTick(): void {
+    this._recoverableRetryTimer = null;
+    if (!this._providerSessionId || this._pendingMessages.length === 0) return;
+    // A turn became active in the meantime (e.g. onComplete already drained the
+    // queue) — its settlement owns the next drain.
+    if (this._sending || this._activeTurn) return;
+    // If the provider has shown activity recently, its current
+    // (runtime-untracked) turn is still in progress — re-dispatching now would
+    // just hit the same "busy" rejection. Keep waiting (rearm without counting a
+    // failure) so the turn's completion drains the queue naturally; only force a
+    // re-attempt once the provider has gone quiet (genuinely wedged).
+    if (Date.now() - this._lastProviderOutputAt < RECOVERABLE_DISPATCH_RETRY_MAX_MS) {
+      this.armRecoverableRetryTimer(RECOVERABLE_DISPATCH_RETRY_MAX_MS);
+      return;
+    }
+    this._drainPending();
+  }
+
+  private scheduleStalePendingCancelFallback(dispatchId: number | null): void {
+    this.clearStalePendingCancelFallbackTimer();
+    const timeoutMs = getTransportStalePendingCancelFallbackMs();
+    this._stalePendingCancelFallbackTimer = setTimeout(() => {
+      this._stalePendingCancelFallbackTimer = null;
+      if (!this._activeDispatchStaleRecoveryStarted) return;
+      if (dispatchId !== null && this._activeDispatchId !== dispatchId) return;
+      if (this._pendingMessages.length === 0) return;
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          status: this._status,
+          sending: this._sending,
+          activeDispatchCount: this._activeDispatchEntries.length,
+          pendingCount: this._pendingMessages.length,
+          fallbackMs: timeoutMs,
+        },
+        'transport stale pending recovery cancel did not settle; abandoning active turn locally',
+      );
+      this.cancelActiveDispatchLocally(dispatchId);
+    }, timeoutMs);
+    this._stalePendingCancelFallbackTimer.unref?.();
+  }
+
   /** Dispatch a single turn to the provider. Assumes _sending is false. */
   private _dispatchTurn(
     message: string,
@@ -1000,6 +1260,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     const dispatchId = ++this._nextDispatchId;
     this._lastActivityAt = Date.now();
     this._sending = true;
+    this._lastProviderError = null;
+    this._lastProviderErrorAt = 0;
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = dispatchId;
@@ -1133,6 +1395,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         });
         return;
       }
+      // Provider accepted the send — the turn was delivered. Resolve any
+      // recoverable-retry streak so a later failure starts with a full budget.
+      this._recoverableDispatchRetries = 0;
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
         if (hitIds.length > 0) {
@@ -1178,16 +1443,42 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._locallyCancelledDispatchIds.delete(dispatchId);
           return;
         }
-        this.setStatus('error');
-        this._sending = false;
-        this._activeTurn.reject(
-          err instanceof SharedContextDispatchError
-            ? err.toProviderError()
-            : (typeof err === 'object' && err && 'code' in err
-                ? err
-                : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false }),
+        const providerError: ProviderError = err instanceof SharedContextDispatchError
+          ? err.toProviderError()
+          : (typeof err === 'object' && err && 'code' in err
+              ? {
+                  code: String((err as Partial<ProviderError>).code ?? PROVIDER_ERROR_CODES.PROVIDER_ERROR),
+                  message: typeof (err as Partial<ProviderError>).message === 'string'
+                    ? (err as Partial<ProviderError>).message!
+                    : String(err),
+                  recoverable: !!(err as Partial<ProviderError>).recoverable,
+                  ...((err as Partial<ProviderError>).details !== undefined
+                    ? { details: (err as Partial<ProviderError>).details }
+                    : {}),
+                }
+              : {
+                  code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+                  message: err instanceof Error ? err.message : String(err),
+                  recoverable: false,
+                });
+        this.recordProviderError(providerError);
+        logger.warn(
+          {
+            sessionKey: this.sessionKey,
+            provider: this.provider.id,
+            errorCode: providerError.code,
+            errorMessage: providerError.message,
+            recoverable: providerError.recoverable,
+            activeDispatchCount: this._activeDispatchEntries.length,
+            pendingCount: this._pendingMessages.length,
+          },
+          'transport runtime dispatch failed',
         );
+        const canDrain = providerError.code === PROVIDER_ERROR_CODES.CANCELLED || providerError.recoverable;
+        this._sending = false;
+        this._activeTurn.reject(providerError);
         this._activeTurn = null;
+        this.clearStalePendingCancelFallbackTimer();
         this._activeDispatchProviderStarted = false;
         this._activeDispatchCancelled = false;
         if (this._activeDispatchId === dispatchId) {
@@ -1195,8 +1486,31 @@ export class TransportSessionRuntime implements SessionRuntime {
         }
         this._activeDispatchStaleRecoveryStarted = false;
         this._locallyCancelledDispatchIds.delete(dispatchId);
-        // Preserve the in-flight payload so session-manager can replay it
-        // after automatically rebuilding the transport runtime.
+        if (canDrain) {
+          // Recoverable (non-cancel) failures — "provider busy",
+          // shared-context retry-scheduled, etc. — must NOT stop the turn or
+          // drop the message. Re-queue and auto-retry with backoff so the work
+          // completes when the provider frees up; only give up (error) once the
+          // bounded retry budget is exhausted (a genuinely wedged provider).
+          if (providerError.code !== PROVIDER_ERROR_CODES.CANCELLED
+            && this.requeueAndScheduleRecoverableRetry(providerError)) {
+            return;
+          }
+          this._recoverableDispatchRetries = 0;
+          this.clearRecoverableRetryTimer();
+          this._activeDispatchEntries = [];
+          if (this._drainPending()) return;
+          // Cancellation → idle (the user stopped). Recoverable budget exhausted
+          // → error (we tried and could not deliver).
+          this.setStatus(providerError.code === PROVIDER_ERROR_CODES.CANCELLED ? 'idle' : 'error');
+          return;
+        }
+        this.setStatus('error');
+        // Preserve the in-flight payload through the synchronous status
+        // listener above so a genuine CONNECTION_LOST can be copied to the
+        // resend queue, then clear runtime-local active state. Ordinary
+        // dispatch failures must not leave `hasActiveTurnWork()` true forever.
+        this._activeDispatchEntries = [];
         // Don't drain on async send failure — the provider is likely broken.
       });
   }
@@ -1213,6 +1527,8 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
+    // Draining now supersedes any pending recoverable-retry backoff.
+    this.clearRecoverableRetryTimer();
 
     const messages = this._pendingMessages.splice(0);
     // Bump the queue version the moment the queue empties. The onDrain
@@ -1264,6 +1580,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
+      this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
       this._activeDispatchId = null;
@@ -1289,6 +1606,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     if (!this._activeTurn && !this._sending) {
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
       this._activeDispatchProviderStarted = false;
       this._activeDispatchId = null;
@@ -1299,6 +1617,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.reject(makeCancelledProviderError());
     this._activeTurn = null;
     this._activeDispatchEntries = [];
+    this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;

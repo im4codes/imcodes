@@ -3916,7 +3916,7 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
-  it('pressing Escape in a running transport input sends direct cancel', () => {
+  it('pressing Escape in a focused running transport input sends direct cancel', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -3932,6 +3932,7 @@ afterEach(() => {
     );
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
     fireEvent.keyDown(input, { key: 'Escape' });
 
     // Transport sessions cancel the SDK turn directly instead of sending
@@ -3942,6 +3943,52 @@ afterEach(() => {
       sessionName: 'qwen-session',
       text: '/stop',
     }));
+    expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('pressing Escape with window focus sends direct cancel for the active transport surface', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(screen.getByRole('button', { name: /^stop$/i }).classList.contains('shortcut-btn-stop-pending')).toBe(true);
+    expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('does not send window-level Escape cancel when the surface is not keyboard-active', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_inactive',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        subSessionId="inactive"
+        keyboardActive={false}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(gatherCancelCalls(ws)).toEqual([]);
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
@@ -3970,6 +4017,7 @@ afterEach(() => {
       fireEvent.input(input);
       expect(screen.getByText('files')).toBeDefined();
 
+      input.focus();
       fireEvent.keyDown(input, { key: 'Escape' });
 
       expect(gatherCancelCalls(ws)).toEqual([]);
@@ -4000,16 +4048,71 @@ afterEach(() => {
       );
 
       const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.focus();
       fireEvent.keyDown(input, { key: 'Escape' });
 
-      expect(gatherSendCalls(ws)).toEqual([]);
+      expect(gatherCancelCalls(ws)).toEqual([]);
       expect(ws.sendInput).not.toHaveBeenCalled();
     } finally {
       dialog.remove();
     }
   });
 
-  it('pressing Escape in a running transport sub-session uses the same Stop feedback', () => {
+  it('does not send direct cancel on Escape while an image lightbox owns the keyboard', () => {
+    const ws = makeWs();
+    const lightbox = document.createElement('div');
+    lightbox.className = 'fb-lightbox';
+    document.body.appendChild(lightbox);
+    try {
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({
+            name: 'qwen-session',
+            agentType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.focus();
+      fireEvent.keyDown(input, { key: 'Escape' });
+
+      expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(ws.sendInput).not.toHaveBeenCalled();
+    } finally {
+      lightbox.remove();
+    }
+  });
+
+  it('does not send direct cancel on Escape during IME composition', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: 'Escape', isComposing: true });
+
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('pressing Escape in a focused running transport sub-session uses the same Stop feedback', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4026,6 +4129,7 @@ afterEach(() => {
     );
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
     fireEvent.keyDown(input, { key: 'Escape' });
 
     expectUrgentCancelPayload(ws, { sessionName: 'deck_sub_worker' });

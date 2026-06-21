@@ -94,6 +94,24 @@ const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
   'runtime_subagent_notification',
   'runtime_subagent_status',
 ]);
+const CLAUDE_CHECKLIST_TOOL_NAMES = new Set([
+  'todowrite',
+  'todo_write',
+  'write_todos',
+  'writetodos',
+  'update_plan',
+  'updateplan',
+  'update_todo_list',
+  'updatetodolist',
+  'set_plan',
+  'setplan',
+]);
+const CLAUDE_CHECKLIST_LIST_KEYS = ['todos', 'plan', 'tasks', 'steps'] as const;
+const CLAUDE_CHECKLIST_TEXT_KEYS = ['content', 'step', 'text', 'title', 'task', 'description', 'name'] as const;
+
+type ClaudeChecklistInput = {
+  plan: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+};
 
 interface ClaudeSdkSessionState {
   routeId: string;
@@ -1537,15 +1555,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private emitToolCall(sessionId: string, state: ClaudeSdkSessionState, tool: ToolCallEvent): void {
+    const normalizedTool = this.normalizeChecklistToolCall(tool);
     const signature = JSON.stringify({
-      status: tool.status,
-      name: tool.name,
-      input: tool.input ?? null,
-      output: tool.output ?? null,
+      status: normalizedTool.status,
+      name: normalizedTool.name,
+      input: normalizedTool.input ?? null,
+      output: normalizedTool.output ?? null,
     });
-    if (state.emittedToolStates.get(tool.id) === signature) return;
-    state.emittedToolStates.set(tool.id, signature);
-    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    if (state.emittedToolStates.get(normalizedTool.id) === signature) return;
+    state.emittedToolStates.set(normalizedTool.id, signature);
+    for (const cb of this.toolCallCallbacks) cb(sessionId, normalizedTool);
   }
 
   private isClaudeTaskLifecycleMessage(msg: SDKMessage): msg is ClaudeTaskLifecycleMessage {
@@ -1585,6 +1604,72 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         raw: block,
       },
     };
+  }
+
+  private normalizeChecklistToolCall(tool: ToolCallEvent): ToolCallEvent {
+    const normalizedName = normalizeStatusName(tool.name);
+    if (!CLAUDE_CHECKLIST_TOOL_NAMES.has(normalizedName)) return tool;
+    const input = this.normalizeClaudeChecklistInput(tool.input)
+      ?? this.normalizeClaudeChecklistInput(tool.detail?.input);
+    if (!input) return tool;
+    return {
+      ...tool,
+      input,
+      detail: {
+        ...(tool.detail ?? {}),
+        kind: 'plan',
+        summary: 'Plan',
+        input,
+        raw: tool.detail?.raw ?? tool.input,
+      },
+    };
+  }
+
+  private normalizeClaudeChecklistInput(value: unknown): ClaudeChecklistInput | null {
+    const rawItems = Array.isArray(value) ? value : this.rawChecklistItemsFromRecord(value);
+    if (!rawItems) return null;
+    const plan: ClaudeChecklistInput['plan'] = [];
+    for (const rawItem of rawItems) {
+      const content = this.claudeChecklistText(rawItem);
+      if (!content) continue;
+      const record = this.asRecord(rawItem);
+      const status = record
+        ? this.normalizeClaudeChecklistStatus(record.status)
+        : 'pending';
+      plan.push({ content, status });
+    }
+    return { plan };
+  }
+
+  private rawChecklistItemsFromRecord(value: unknown): unknown[] | null {
+    const record = this.asRecord(value);
+    if (!record) return null;
+    for (const key of CLAUDE_CHECKLIST_LIST_KEYS) {
+      if (Array.isArray(record[key])) return record[key] as unknown[];
+    }
+    return null;
+  }
+
+  private claudeChecklistText(value: unknown): string {
+    if (typeof value === 'string') return value.trim();
+    const record = this.asRecord(value);
+    if (!record) return '';
+    for (const key of CLAUDE_CHECKLIST_TEXT_KEYS) {
+      const text = record[key];
+      if (typeof text === 'string' && text.trim()) return text.trim();
+    }
+    return '';
+  }
+
+  private normalizeClaudeChecklistStatus(value: unknown): 'pending' | 'in_progress' | 'completed' {
+    const normalized = normalizeStatusName(typeof value === 'string' ? value : undefined);
+    if (normalized === 'completed' || normalized === 'complete' || normalized === 'done' || normalized === 'finished' || normalized === 'checked') {
+      return 'completed';
+    }
+    if (normalized === 'inprogress' || normalized === 'active' || normalized === 'doing' || normalized === 'running' || normalized === 'started') {
+      return 'in_progress';
+    }
+    return 'pending';
   }
 
   private tryParsePartialJson(value: string): unknown {

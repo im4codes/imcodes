@@ -12,7 +12,7 @@ import { buildTransportResumeLaunchOpts } from './transport-resume-opts.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
-import type { SessionInfoUpdate } from './transport-provider.js';
+import { PROVIDER_ERROR_CODES, type SessionInfoUpdate } from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
@@ -22,6 +22,7 @@ import {
   listSessions as storeSessions,
   updateSessionState,
   type SessionRecord,
+  type SessionState,
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
@@ -64,6 +65,12 @@ const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
     || isTransportAgent(record.agentType as AgentType);
+}
+
+function shouldAutoRelaunchTransportRuntimeAfterError(
+  providerError: TransportSessionRuntime['lastProviderError'],
+): boolean {
+  return providerError?.code === PROVIDER_ERROR_CODES.CONNECTION_LOST;
 }
 
 function sanitizeCodexSdkStartupModel(value: string | null | undefined): string | undefined {
@@ -1091,9 +1098,9 @@ const TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS = (() => {
 })();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
-function pauseBetweenTransportRestores(index: number): Promise<void> {
+function pauseBetweenTransportRestores(index: number, delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS): Promise<void> {
   if (index <= 0) return new Promise((resolve) => setImmediate(resolve));
-  return new Promise((resolve) => setTimeout(resolve, TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS));
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function buildTransportSessionEnv(
@@ -1139,8 +1146,31 @@ async function recoverTransportRuntimeAfterError(
       return false;
     }
 
+    const providerError = runtime.lastProviderError;
+    if (!shouldAutoRelaunchTransportRuntimeAfterError(providerError)) {
+      logger.warn(
+        {
+          sessionName,
+          providerError,
+          status: runtime.getStatus(),
+          pendingCount: runtime.pendingCount,
+          activeDispatchCount: runtime.activeDispatchEntries.length,
+        },
+        'Transport runtime error did not indicate provider connection loss; skipping provider relaunch',
+      );
+      return false;
+    }
+
     const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
     const pendingCount = preservation.afterCount;
+    logger.warn(
+      {
+        sessionName,
+        providerError,
+        ...preservation,
+      },
+      'Transport provider connection lost — preserving queues and relaunching provider runtime',
+    );
 
     const now = Date.now();
     const windowStart = now - RESTART_WINDOW_MS;
@@ -1169,7 +1199,7 @@ async function recoverTransportRuntimeAfterError(
     if (pendingCount > 0) {
       const queued = getResendEntries(sessionName);
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⏳ Provider error detected — restarting and auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'}.`,
+        text: `⏳ Provider connection lost — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -1368,12 +1398,21 @@ async function drainTransportResendQueueIntoRuntime(
 
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
+  const persistTransportState = (state: unknown): void => {
+    if (state !== 'running' && state !== 'idle' && state !== 'error') return;
+    const existing = getSession(sessionName);
+    if (!existing || existing.state === state) return;
+    const next: SessionRecord = { ...existing, state: state as SessionState, updatedAt: Date.now() };
+    upsertSession(next);
+    emitSessionPersist(next, sessionName);
+  };
   runtime.onStatusChange = (status) => {
     // Emit assistant.thinking for chat typing indicator (matches tmux watcher behavior)
     if (status === 'thinking') {
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
     const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
+    persistTransportState(mapped);
     // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
     // During running/streaming, command-handler's 'queued' event is the sole queue-update
     // authority. This keeps queued messages visible in the UI until the drained turn completes.
@@ -1416,6 +1455,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // been moved into the timeline via user.message emissions above, so they must
     // leave the queue UI simultaneously. The runtime's pending queue is now [] (or
     // contains any NEW messages queued since drain started).
+    persistTransportState('running');
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'running',
       pendingCount: runtime.pendingCount,
@@ -1654,10 +1694,16 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
  */
 export async function restoreTransportSessions(
   providerId: string,
-  options: { onlyWithPendingResend?: boolean } = {},
+  options: { onlyWithPendingResend?: boolean; concurrency?: number; interSessionDelayMs?: number } = {},
 ): Promise<void> {
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
+  const restoreConcurrency = Number.isFinite(options.concurrency) && (options.concurrency ?? 0) >= 1
+    ? Math.trunc(options.concurrency!)
+    : TRANSPORT_RESTORE_CONCURRENCY;
+  const restoreInterSessionDelayMs = Number.isFinite(options.interSessionDelayMs) && (options.interSessionDelayMs ?? -1) >= 0
+    ? Math.trunc(options.interSessionDelayMs!)
+    : TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS;
   // Restore with BOUNDED CONCURRENCY rather than one-at-a-time. Each session's
   // restore is ~1s of mostly-I/O wait (context bootstrap has a 2.5s timeout +
   // the provider's resume RPC), so a sequential loop over ~30 transport
@@ -1669,15 +1715,25 @@ export async function restoreTransportSessions(
   // process; node:sqlite is synchronous so memory/context reads serialise on
   // the main thread anyway; every store write is keyed by session name.
   type Restorable = SessionRecord & { providerId: string; providerSessionId: string };
-  const pending = all.filter((s): s is Restorable =>
+  const pending = all.filter((s) =>
     isStoredTransportSession(s)
-    && s.providerId === providerId
+    && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
     && (!options.onlyWithPendingResend || getResendCount(s.name) > 0),
-  );
+  ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
   const restoreOne = async (s: Restorable, index: number): Promise<void> => {
-    await pauseBetweenTransportRestores(index);
-    if (transportRuntimes.has(s.name)) return; // already rebuilt by oc-sync
+    await pauseBetweenTransportRestores(index, restoreInterSessionDelayMs);
+    const existingRuntime = transportRuntimes.get(s.name);
+    if (existingRuntime?.providerSessionId) return; // already rebuilt by oc-sync / warm restore
+    if (existingRuntime) {
+      const preservation = preserveTransportRuntimeQueuesToResend(s.name, existingRuntime);
+      if (preservation.preservedCount > 0) {
+        logger.info({ sessionName: s.name, ...preservation }, 'preserved unbound transport runtime queues before restore');
+      }
+      await stopTransportRuntimeSession(s.name).catch((err) => {
+        logger.warn({ err, session: s.name }, 'Failed to stop unbound transport runtime before restore');
+      });
+    }
     try {
       const provider = getProvider(s.providerId);
       if (!provider) return;
@@ -1883,10 +1939,10 @@ export async function restoreTransportSessions(
   logger.info({
     providerId,
     count: pending.length,
-    concurrency: TRANSPORT_RESTORE_CONCURRENCY,
-    interSessionDelayMs: TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS,
+    concurrency: restoreConcurrency,
+    interSessionDelayMs: restoreInterSessionDelayMs,
   }, 'Restoring transport session runtimes');
-  await mapWithConcurrency(pending, TRANSPORT_RESTORE_CONCURRENCY, restoreOne);
+  await mapWithConcurrency(pending, restoreConcurrency, restoreOne);
   logger.info({ providerId, count: pending.length }, 'Transport session runtime restore completed');
 }
 

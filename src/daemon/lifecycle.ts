@@ -50,6 +50,7 @@ import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-s
 import { getResendCount } from './transport-resend-queue.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
+import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { createWorkerSessionSyncRetrier, type WorkerSessionSyncRetrier, type WorkerSessionSyncRetryOutcome } from './worker-session-sync-retrier.js';
 import {
@@ -145,8 +146,12 @@ const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
 // the hot path. Runs after everything else has settled.
 const STARTUP_EMBEDDING_BACKFILL_DELAY_MS = 240_000;
 const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
+const STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS = 90_000;
+const TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS = 2_000;
+const TRANSPORT_SLOW_RESTORE_PROVIDER_PAUSE_MS = 5_000;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_MS = 25;
 const STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY = 5;
+const LOCAL_STARTUP_TRANSPORT_PROVIDER_IDS = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
 
 function yieldToDaemonEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -1130,6 +1135,11 @@ export async function startup(): Promise<DaemonContext> {
     autoReconnectProviders,
     startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_RESTORE_DELAY_MS,
   );
+  scheduleDaemonStartupBackgroundTask(
+    'transport runtime slow warm restore',
+    slowWarmRestoreTransportProviders,
+    startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS,
+  );
   if (creds && startupWorkerSessionSyncOutcome && startupWorkerSessionSyncOutcome.retryable) {
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = createWorkerSessionSyncRetrier({
@@ -1199,21 +1209,66 @@ async function reconcileRuntimesAfterWorkerSessionSync(
   }
 }
 
+function hasRestorableLocalTransportSessions(
+  providerId: string,
+  options: { onlyWithPendingResend?: boolean; onlyMissingRuntime?: boolean } = {},
+): boolean {
+  return listSessions().some((s) => {
+    const effectiveProviderId = s.providerId ?? s.agentType;
+    if (!(s.runtimeType === 'transport' || isTransportAgent(s.agentType))) return false;
+    if (effectiveProviderId !== providerId) return false;
+    if (!s.providerSessionId) return false;
+    if (options.onlyWithPendingResend && getResendCount(s.name) === 0) return false;
+    if (options.onlyMissingRuntime && getTransportRuntime(s.name)?.providerSessionId) return false;
+    return true;
+  });
+}
+
+let slowTransportWarmRestoreInFlight: Promise<void> | null = null;
+
+async function slowWarmRestoreTransportProviders(): Promise<void> {
+  if (slowTransportWarmRestoreInFlight) return slowTransportWarmRestoreInFlight;
+  const task = (async () => {
+    const { ensureProviderConnected } = await import('../agent/provider-registry.js');
+    const { restoreTransportSessions } = await import('../agent/session-manager.js');
+    let restoredProviderCount = 0;
+
+    for (const providerId of LOCAL_STARTUP_TRANSPORT_PROVIDER_IDS) {
+      if (!hasRestorableLocalTransportSessions(providerId, { onlyMissingRuntime: true })) continue;
+      if (restoredProviderCount > 0) {
+        await pauseDaemonBackgroundWork(TRANSPORT_SLOW_RESTORE_PROVIDER_PAUSE_MS);
+      }
+      try {
+        restoredProviderCount += 1;
+        logger.info({ providerId }, 'Starting delayed transport runtime warm restore');
+        await ensureProviderConnected(providerId, {});
+        await restoreTransportSessions(providerId, {
+          concurrency: 1,
+          interSessionDelayMs: TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS,
+        });
+      } catch (err) {
+        logger.warn({ err, providerId }, 'Delayed transport runtime warm restore failed');
+      }
+    }
+  })();
+  slowTransportWarmRestoreInFlight = task;
+  try {
+    await task;
+  } finally {
+    if (slowTransportWarmRestoreInFlight === task) slowTransportWarmRestoreInFlight = null;
+  }
+}
+
 async function autoReconnectProviders(): Promise<void> {
   try {
     // Dynamic import to avoid loading WS deps when not needed
-    const { listSessions } = await import('../store/session-store.js');
     const { loadConfig: loadOcConfig } = await import('../agent/openclaw-config.js');
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
     let restoredProviderCount = 0;
-    for (const providerId of ['qwen', 'gemini-sdk', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
-      if (!listSessions().some((s) =>
-        (s.runtimeType === 'transport' || isTransportAgent(s.agentType))
-        && s.providerId === providerId
-        && getResendCount(s.name) > 0,
-      )) continue;
+    for (const providerId of LOCAL_STARTUP_TRANSPORT_PROVIDER_IDS) {
+      if (!hasRestorableLocalTransportSessions(providerId, { onlyWithPendingResend: true })) continue;
       if (restoredProviderCount > 0) await yieldToDaemonEventLoop();
       try {
         restoredProviderCount += 1;

@@ -114,6 +114,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
+    transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
 }
 

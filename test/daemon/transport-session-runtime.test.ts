@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import type { TransportProvider, ProviderError, SessionConfig, ProviderStatusUpdate, ProviderUsageUpdate } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -446,6 +446,25 @@ describe('TransportSessionRuntime', () => {
     expect(snapshot.pendingVersion).toBeGreaterThanOrEqual(1);
   });
 
+  it('diagnostic snapshot keeps the latest provider error for recovery debugging', async () => {
+    runtime.send('fail this turn', 'cmd-fail');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const beforeError = Date.now();
+    mock.fireError('sess-1', {
+      code: 'PROVIDER_ERROR',
+      message: 'raw provider failure',
+      recoverable: false,
+    });
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: 'PROVIDER_ERROR',
+      message: 'raw provider failure',
+      recoverable: false,
+    });
+    expect(runtime.getDiagnosticSnapshot().lastProviderError?.at).toBeGreaterThanOrEqual(beforeError);
+  });
+
   it('treats provider status, usage, and approval callbacks as turn liveness evidence', async () => {
     const internal = runtime as unknown as {
       _lastActivityAt: number;
@@ -668,7 +687,14 @@ describe('TransportSessionRuntime', () => {
     }));
   });
 
-  it('tracks the active dispatch payload for restart-based replay', async () => {
+  it('exposes the active dispatch payload during error status, then clears local active state', async () => {
+    let activeEntriesDuringError: PendingTransportMessage[] | undefined;
+    runtime.onStatusChange = (status) => {
+      if (status === 'error') {
+        activeEntriesDuringError = runtime.activeDispatchEntries;
+      }
+    };
+
     runtime.send('retry me', 'msg-retry');
     await flushDispatch();
 
@@ -676,10 +702,118 @@ describe('TransportSessionRuntime', () => {
       { clientMessageId: 'msg-retry', text: 'retry me' },
     ]);
 
-    mock.fireError('sess-1');
-    expect(runtime.activeDispatchEntries).toEqual([
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'connection lost',
+      recoverable: false,
+    });
+    expect(activeEntriesDuringError).toEqual([
       { clientMessageId: 'msg-retry', text: 'retry me' },
     ]);
+    expect(runtime.activeDispatchEntries).toEqual([]);
+  });
+
+  it('clears active dispatch state after an async provider send failure', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: 'TRANSPORT_TURN_TIMEOUT',
+      message: 'provider did not accept the turn',
+      recoverable: false,
+    });
+
+    runtime.send('timeout once', 'msg-timeout');
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.sending).toBe(false);
+    expect(runtime.activeDispatchEntries).toEqual([]);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: 'TRANSPORT_TURN_TIMEOUT',
+      message: 'provider did not accept the turn',
+      recoverable: false,
+    });
+  });
+
+  it('auto-retries a recoverable async send failure instead of dropping the turn', async () => {
+    // A recoverable DELIVERY failure (provider.send rejects, e.g. "provider
+    // busy") must NOT stop the turn or strand the UI: the failed message is
+    // re-queued and the session shows in-progress (thinking) while an auto-retry
+    // is scheduled. Only the active-dispatch scratch state is cleared.
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'temporary provider refusal',
+      recoverable: true,
+    });
+
+    runtime.send('recoverable refusal', 'msg-recoverable');
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.sending).toBe(false);
+    expect(runtime.activeDispatchEntries).toEqual([]);
+    // Re-queued (not dropped) for auto-retry; the session counts as busy so
+    // later sends queue in order behind it.
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.pendingMessages).toEqual(['recoverable refusal']);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'temporary provider refusal',
+      recoverable: true,
+    });
+  });
+
+  it('auto-retry redelivers a recoverable-failed message once the provider frees up', async () => {
+    // The first provider.send rejects with a recoverable "busy" error; the
+    // runtime must re-queue and auto-retry, and the next attempt (provider now
+    // free) must actually DELIVER the message — the turn completes rather than
+    // silently stopping or stranding the frontend.
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'provider is already busy',
+      recoverable: true,
+    });
+
+    runtime.send('deliver me', 'msg-retry');
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.pendingCount).toBe(1);
+
+    // The backoff retry fires and redelivers to the now-free provider.
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'deliver me',
+    }));
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+  });
+
+  it('STOP during an auto-retry interrupts only the retried turn and keeps later-queued messages', async () => {
+    // Regression (audit Medium): STOP must NOT clear the whole queue during an
+    // auto-retry. Only the turn being retried is dropped; messages the user
+    // queued AFTER it survive and are delivered.
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'provider is already busy',
+      recoverable: true,
+    });
+    runtime.send('being retried', 'msg-a');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.pendingCount).toBe(1);
+
+    // User queues another message behind the one being retried.
+    runtime.send('queued after stop', 'msg-b');
+    expect(runtime.pendingCount).toBe(2);
+
+    // STOP during the retry backoff: 'being retried' is dropped, but 'queued
+    // after stop' is preserved and delivered (the provider is free now).
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stop',
+    }));
+    expect(runtime.pendingMessages).not.toContain('being retried');
+    expect(runtime.pendingCount).toBe(0);
   });
 
   it('send() merges description and runtime prompt into normalized systemText', async () => {
@@ -765,8 +899,18 @@ describe('TransportSessionRuntime', () => {
     r.send('help');
     await flushDispatch();
 
+    // Authority not ready → recoverable "retry scheduled". The send is blocked
+    // before provider dispatch, but the turn is NOT dropped: it is re-queued and
+    // the session shows in-progress while an auto-retry waits for authority to
+    // refresh. (Genuinely unrecoverable shared-context failures —
+    // unsupported / authority-unavailable — still surface as a terminal error.)
     expect(mock.provider.send).not.toHaveBeenCalled();
-    expect(r.getStatus()).toBe('error');
+    expect(r.getStatus()).toBe('thinking');
+    expect(r.pendingCount).toBe(1);
+    expect(r.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: 'SHARED_CONTEXT_RETRY_SCHEDULED',
+      recoverable: true,
+    });
   });
 
 
@@ -1478,9 +1622,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(localMock.provider.send).toHaveBeenCalledTimes(1);
     expect(r.getStatus()).toBe('error');
     expect(r.sending).toBe(false);
-    expect(r.activeDispatchEntries).toEqual([
-      { clientMessageId: 'client-provider-hang', text: '/status' },
-    ]);
+    expect(r.activeDispatchEntries).toEqual([]);
   });
 
   it('emits a template-prompt skip status before transport recall lookup', async () => {
@@ -1954,6 +2096,36 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(resentPayload.userMessage).toBe('queued-after-stale-active');
   });
 
+  it('locally abandons stale active work when provider cancel never settles', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS', '50');
+    runtime.send('first', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued-after-lost-cancel', 'cmd-queued-lost-cancel');
+    expect(runtime.pendingCount).toBe(1);
+
+    const internal = runtime as unknown as {
+      _lastActivityAt: number;
+    };
+    internal._lastActivityAt = 1_000;
+
+    const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(runtime.cancelStaleActiveTurnWithPending({
+      reason: 'test-stale-active-lost-cancel',
+      nowMs: 11_001,
+      staleMs: 10_000,
+    })).toBe(true);
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+
+    await sleep(80);
+    await waitForProviderSendCount(mock.provider, beforeDrainSendCount + 1);
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getDiagnosticSnapshot(11_200).stalePendingRecoveryActive).toBe(false);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('queued-after-lost-cancel');
+  });
+
   it('ignores late provider deltas after a turn has already settled', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
@@ -2021,6 +2193,7 @@ ${PREFERENCE_CONTEXT_END}`;
 
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore);
   });
 

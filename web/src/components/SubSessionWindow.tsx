@@ -411,6 +411,7 @@ export function SubSessionWindow({
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
+    transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
 
   useEffect(() => {
@@ -966,6 +967,7 @@ export function SubSessionWindow({
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}
+        keyboardActive={active}
         onSend={(_name, text, meta) => {
           // Inject the optimistic "sending" bubble so the user sees the
           // message with a spinner immediately, instead of waiting for the

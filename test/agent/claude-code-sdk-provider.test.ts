@@ -829,6 +829,59 @@ describe('ClaudeCodeSdkProvider', () => {
     ]);
   });
 
+  it('normalizes Claude update_plan bare array input into a plan checklist tool call', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-tool-plan', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-tool-plan', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-plan', name: 'update_plan' } } },
+      {
+        type: 'stream_event',
+        session_id: 'session-tool-plan',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: '[{"content":"梳理重启恢复入口和活跃信号","status":"in_progress"},{"content":"实现优先/延迟恢复与提示语","status":"pending"}]',
+          },
+        },
+      },
+      { type: 'stream_event', session_id: 'session-tool-plan', event: { type: 'content_block_stop', index: 0 } },
+      { type: 'result', session_id: 'session-tool-plan', subtype: 'success', is_error: false, result: 'done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-tool-plan', cwd: '/tmp/project', resumeId: 'session-tool-plan' });
+
+    const tools: ToolEventSnapshot[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-tool-plan', 'hello');
+    await flush();
+
+    expect(tools[0]).toMatchObject({ name: 'update_plan', status: 'running', input: undefined });
+    expect(tools[1]).toMatchObject({
+      name: 'update_plan',
+      status: 'complete',
+      input: {
+        plan: [
+          { content: '梳理重启恢复入口和活跃信号', status: 'in_progress' },
+          { content: '实现优先/延迟恢复与提示语', status: 'pending' },
+        ],
+      },
+      detail: {
+        kind: 'plan',
+        summary: 'Plan',
+        input: {
+          plan: [
+            { content: '梳理重启恢复入口和活跃信号', status: 'in_progress' },
+            { content: '实现优先/延迟恢复与提示语', status: 'pending' },
+          ],
+        },
+      },
+    });
+  });
+
   it('emits tool events from assistant/user message content when stream events are absent', async () => {
     sdkMock.setNextMessages([
       {

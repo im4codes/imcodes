@@ -3341,7 +3341,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
-    const infoMsg = `⏳ Provider ${providerLabel} not connected yet — will resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once reconnected.`;
+    const infoMsg = `⏳ Agent ${providerLabel} is restoring — ${queued.length} queued message${queued.length === 1 ? '' : 's'} will send automatically once ready.`;
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
@@ -3426,7 +3426,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
-    const infoMsg = `⏳ Provider ${providerLabel} is restarting — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once the runtime is back.`;
+    const infoMsg = `⏳ Provider ${providerLabel} runtime is recovering — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once it is back.`;
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
@@ -4258,7 +4258,22 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
       existing.unsubscribe();
       activeSubscriptions.delete(session);
     }
-    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for transport session');
+    const runtime = getTransportRuntime(session);
+    if (!runtime?.providerSessionId && record) {
+      // A browser subscription is the daemon's strongest signal that this
+      // transport session is active/visible after a daemon restart. Warm-restore
+      // it here so the user's next message does not have to be the thing that
+      // creates the SDK runtime. The per-session relaunch lock prevents repeated
+      // subscribe replays from causing a launch storm.
+      void runExclusiveSessionRelaunch(session, async () => {
+        try {
+          await resumeTransportRuntimeAfterLoss(record);
+        } catch (err) {
+          logger.warn({ err, session, agentType: record.agentType }, 'Transport warm restore from browser subscription failed');
+        }
+      });
+    }
+    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for transport session; warm restore requested if needed');
     return;
   }
   const raw = cmd.raw === true;
