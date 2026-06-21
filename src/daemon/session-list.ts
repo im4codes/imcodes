@@ -27,6 +27,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   runtimeType?: string;
   providerId?: string;
   providerSessionId?: string;
+  ccPreset?: string;
   qwenModel?: string;
   requestedModel?: string;
   activeModel?: string;
@@ -131,6 +132,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     runtimeType: s.runtimeType,
     providerId: s.providerId,
     providerSessionId: s.providerSessionId,
+    ccPreset: s.ccPreset,
     qwenModel: s.qwenModel,
     requestedModel: s.requestedModel,
     activeModel: s.activeModel,

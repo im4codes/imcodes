@@ -1896,6 +1896,27 @@ describe('P2pConfigPanel', () => {
       expect(options.some((o) => o.value === 'deck_proj_brain')).toBe(false);
     });
 
+    it('shows qwen preset and model metadata in execution template options', async () => {
+      renderExecTab({
+        subSessions: [
+          {
+            sessionName: 'deck_sub_qwen',
+            type: 'qwen',
+            label: 'Qw1',
+            state: 'idle',
+            parentSession: 'deck_proj_brain',
+            executionTemplateEligible: true,
+            ccPresetId: 'MiniMax',
+            qwenModel: 'MiniMax-M2.7',
+          },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const opt = Array.from(select.querySelectorAll('option')).find((o) => o.value === 'deck_sub_qwen');
+      expect(opt?.textContent).toBe('Qw1 · qwen · MiniMax · MiniMax-M2.7');
+    });
+
     it('renders a daemon-ineligible sub-session as a DISABLED option (not hidden)', async () => {
       renderExecTab({
         subSessions: [

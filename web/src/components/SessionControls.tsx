@@ -17,6 +17,7 @@ import { AtPicker } from './AtPicker.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { buildExecutionTemplateLabel } from '../execution-template-label.js';
 import {
   OpenSpecAutoDeliverCurrentRunEntry,
   OpenSpecAutoDeliverDetailsPanel,
@@ -160,6 +161,10 @@ interface Props {
     parentSession?: string | null;
     executionCloneKind?: string | null;
     parentRunId?: string | null;
+    qwenModel?: string | null;
+    requestedModel?: string | null;
+    activeModel?: string | null;
+    modelDisplay?: string | null;
     executionTemplateEligible?: boolean;
     executionTemplateIneligibleReason?: string;
   }>;
@@ -198,8 +203,13 @@ const OPENSPEC_EXEC_EXCLUDED_TYPES = new Set(['shell', 'script']);
 
 /** OpenSpec Execute candidate label: session short name + SDK (agent type) +
  *  preset name, so identical-looking workers (w2…wN) are distinguishable. */
-function formatExecLabel(shortName: string, sdk?: string | null, preset?: string | null): string {
-  return [shortName, sdk || null, preset || null].filter(Boolean).join(' · ');
+function formatExecLabel(shortName: string, sdk?: string | null, preset?: string | null, model?: string | null): string {
+  return buildExecutionTemplateLabel({
+    shortName,
+    agentType: sdk,
+    ccPreset: preset,
+    modelDisplay: model,
+  });
 }
 
 type OpenSpecTaskStatsSummary = {
@@ -2045,7 +2055,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const executionSessionDisplayName = useMemo(() => {
     if (!configuredExecutionSession) return null;
     const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
-    if (sub && !isExecutionCloneTemplateLike(sub)) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
+    if (sub && !isExecutionCloneTemplateLike(sub)) return buildExecutionTemplateLabel({
+      shortName: sub.label || sub.sessionName.split('_').pop() || sub.sessionName,
+      agentType: sub.type,
+      ccPreset: sub.ccPresetId,
+      qwenModel: sub.qwenModel,
+      requestedModel: sub.requestedModel,
+      activeModel: sub.activeModel,
+      modelDisplay: sub.modelDisplay,
+    });
     return null;
   }, [configuredExecutionSession, subSessions]);
   const hasValidExecutionDefault = Boolean(
@@ -2068,12 +2086,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // the UI renders the flag and never recomputes eligibility client-side. This
   // mirrors the P2pConfigPanel template scan.
   const openSpecExecutionTemplateScan = useMemo(() => {
-    const eligible: Array<{ sessionName: string; shortName: string; sdk: string; preset: string | null }> = [];
+    const eligible: Array<{ sessionName: string; shortName: string; sdk: string; preset: string | null; model: string | null }> = [];
     const seen = new Set<string>();
-    const push = (sessionName: string, shortName: string, sdk: string, preset: string | null) => {
+    const push = (sessionName: string, shortName: string, sdk: string, preset: string | null, model: string | null) => {
       if (seen.has(sessionName)) return;
       seen.add(sessionName);
-      eligible.push({ sessionName, shortName, sdk, preset });
+      eligible.push({ sessionName, shortName, sdk, preset, model });
     };
     // GROUP-SCOPED: execution targets are attached non-main sub-sessions only.
     // Main sessions (brain/orchestrator/worker `wN`) are not execution templates.
@@ -2085,7 +2103,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (!rootSession || s.parentSession !== rootSession) continue;
       if (isExecutionCloneTemplateLike(s)) continue;
       if (s.executionTemplateEligible === false) continue;
-      push(s.sessionName, s.label || s.sessionName.split('_').pop() || s.sessionName, s.type, s.ccPresetId ?? null);
+      push(
+        s.sessionName,
+        s.label || s.sessionName.split('_').pop() || s.sessionName,
+        s.type,
+        s.ccPresetId ?? null,
+        resolveEffectiveSessionModel(s) ?? null,
+      );
     }
     return eligible;
   }, [subSessions, activeSession?.name, rootSession]);
@@ -2098,9 +2122,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!sub || isExecutionCloneTemplateLike(sub)) return null;
     return {
       sessionName: configuredExecutionSession,
-      shortName: executionSessionDisplayName,
+      shortName: sub.label || sub.sessionName.split('_').pop() || sub.sessionName,
       sdk: sub.type,
       preset: sub.ccPresetId ?? null,
+      model: resolveEffectiveSessionModel(sub) ?? null,
     };
   }, [hasValidExecutionDefault, configuredExecutionSession, executionSessionDisplayName, subSessions]);
 
@@ -2139,7 +2164,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           }}
         >
           <span aria-hidden="true">★ </span>
-          {t('openspec.execute.dispatch_to', { name: formatExecLabel(openSpecPinnedExecutionSession.shortName, openSpecPinnedExecutionSession.sdk, openSpecPinnedExecutionSession.preset) })}
+          {t('openspec.execute.dispatch_to', { name: formatExecLabel(openSpecPinnedExecutionSession.shortName, openSpecPinnedExecutionSession.sdk, openSpecPinnedExecutionSession.preset, openSpecPinnedExecutionSession.model) })}
         </button>
       )}
       {openSpecExecutionCandidates.map((candidate) => (
@@ -2155,7 +2180,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             setOpenSpecOpen(false);
           }}
         >
-          {t('openspec.execute.dispatch_to', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset) })}
+          {t('openspec.execute.dispatch_to', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset, candidate.model) })}
         </button>
       ))}
       {!openSpecPinnedExecutionSession && openSpecExecutionCandidates.length === 0 && (
@@ -2177,7 +2202,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             setOpenSpecExecuteMenu(null);
           }}
         >
-          {t('openspec.execute.set_default', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset) })}
+          {t('openspec.execute.set_default', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset, candidate.model) })}
         </button>
       ))}
       {openSpecPinnedExecutionSession && (

@@ -107,6 +107,32 @@ describe('mergeSessionListEntry — supervision preservation', () => {
     });
   });
 
+  it('preserves and updates qwen preset metadata from session_list broadcasts', () => {
+    const existing = makeExisting({
+      agentType: 'qwen',
+      ccPreset: 'OldPreset',
+      qwenModel: 'old-model',
+    });
+
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'qwen',
+      ccPreset: 'MiniMax',
+      qwenModel: 'MiniMax-M2.7',
+    }, existing);
+
+    expect(merged.ccPreset).toBe('MiniMax');
+    expect(merged.qwenModel).toBe('MiniMax-M2.7');
+
+    const preserved = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'qwen',
+    }, merged);
+
+    expect(preserved.ccPreset).toBe('MiniMax');
+    expect(preserved.qwenModel).toBe('MiniMax-M2.7');
+  });
+
   it('replaces supervision with the broadcast value when daemon sends an authoritative snapshot', () => {
     const existing = makeExisting();
     const incomingOffSnapshot: SessionSupervisionSnapshot = {

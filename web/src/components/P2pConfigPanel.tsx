@@ -6,6 +6,7 @@ import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { usePref } from '../hooks/usePref.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { buildExecutionTemplateLabel } from '../execution-template-label.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
@@ -58,6 +59,12 @@ interface SessionRow {
   state: string;
   project?: string | null;
   role?: string | null;
+  label?: string | null;
+  ccPreset?: string | null;
+  qwenModel?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  modelDisplay?: string | null;
   /** DAEMON-AUTHORITATIVE execution-template eligibility (optional; absent on
    *  legacy daemons). When present it overrides client-side recomputation. */
   executionTemplateEligible?: boolean;
@@ -150,9 +157,15 @@ function isExecutionCloneCandidate(sub: Pick<SubSessionRow, 'executionCloneKind'
 }
 
 function formatExecutionTemplateLabel(sub: SubSessionRow): string {
-  const shortName = sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
-  const model = sub.modelDisplay || sub.activeModel || sub.requestedModel || sub.qwenModel || null;
-  return [shortName, sub.type || null, sub.ccPresetId || null, model].filter(Boolean).join(' · ');
+  return buildExecutionTemplateLabel({
+    shortName: sub.label || sub.sessionName.split('_').pop() || sub.sessionName,
+    agentType: sub.type,
+    ccPreset: sub.ccPresetId,
+    qwenModel: sub.qwenModel,
+    requestedModel: sub.requestedModel,
+    activeModel: sub.activeModel,
+    modelDisplay: sub.modelDisplay,
+  });
 }
 
 export interface P2pWorkflowLaunchContextInput {

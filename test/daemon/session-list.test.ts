@@ -346,6 +346,7 @@ describe('buildSessionList', () => {
     const sessions = await buildSessionList();
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
+      ccPreset: 'minimax',
       qwenAuthType: 'api-key',
       qwenAvailableModels: ['MiniMax-M2.7'],
       qwenModel: 'MiniMax-M2.7',
