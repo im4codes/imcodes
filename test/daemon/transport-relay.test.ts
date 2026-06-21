@@ -45,7 +45,7 @@ import {
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
-import type { TransportProvider } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -770,6 +770,24 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.type).toBe('session.error');
       expect(event.error).toBe('Provider down');
       expect(event.code).toBe('PROVIDER_ERROR');
+    });
+
+    it('does not render or cache CANCELLED as assistant error text', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-cancelled', makeDelta({ messageId: 'msg-cancelled', delta: 'partial before stop' }));
+      emitMock.mockClear();
+
+      fireError('sess-cancelled', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
+      await Promise.resolve();
+
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
+      const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
+      expect(stateCall).toBeDefined();
+      expect(stateCall![0]).toBe('sess-cancelled');
+      expect(stateCall![2]).toEqual({ state: 'idle' });
+      expect(appendMock).not.toHaveBeenCalled();
     });
 
     it('does NOT call sendToServer', () => {

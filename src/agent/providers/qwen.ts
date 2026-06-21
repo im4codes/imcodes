@@ -893,11 +893,11 @@ export class QwenProvider implements TransportProvider {
     };
 
     const armResultCompletionFallback = (): void => {
-      if (!state.pendingFinalText) return;
+      if (state.cancelled || !state.pendingFinalText) return;
       clearResultCompletionFallback();
       resultCompletionTimer = setTimeout(() => {
         resultCompletionTimer = null;
-        if (completed || sawError || !state.pendingFinalText) return;
+        if (completed || sawError || state.cancelled || !state.pendingFinalText) return;
         const finalText = state.pendingFinalText;
         const messageId = state.currentMessageId ?? undefined;
         const metadata = state.pendingFinalMetadata;
@@ -974,7 +974,7 @@ export class QwenProvider implements TransportProvider {
     };
 
     const emitComplete = (text: string, messageId?: string, metadata?: Record<string, unknown>): void => {
-      if (completed || sawError) return;
+      if (completed || sawError || state.cancelled) return;
       completed = true;
       clearResultCompletionFallback();
       state.started = true;
@@ -1003,6 +1003,7 @@ export class QwenProvider implements TransportProvider {
     };
 
     const emitTool = (tool: ToolCallEvent): void => {
+      if (state.cancelled) return;
       const signature = JSON.stringify({
         status: tool.status,
         name: tool.name,
@@ -1029,6 +1030,8 @@ export class QwenProvider implements TransportProvider {
       } catch {
         return;
       }
+
+      if (state.cancelled) return;
 
       if (isRuntimeSubagentPayload(payload as unknown as Record<string, unknown>)) {
         emitRuntimeSubagent(payload as unknown as Record<string, unknown>);

@@ -1292,6 +1292,33 @@ describe('QwenProvider', () => {
     expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
   });
 
+  it('suppresses buffered qwen output after cancel so stop cannot leak assistant text', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-cancel-buffered', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    const completions: string[] = [];
+    const errors: Array<{ code: string; message: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, message) => completions.push(message.content));
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+
+    await provider.send('sess-cancel-buffered', 'cancel me');
+    const run = lastSpawn();
+    await provider.cancel?.('sess-cancel-buffered');
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-after-cancel' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'should not leak' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'should not complete' })}\n`);
+    await flushIO();
+    await flushIO();
+
+    expect(run.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(deltas).toEqual([]);
+    expect(completions).toEqual([]);
+    expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
+  });
+
   it('emits tool.call and tool.result events for qwen tool blocks', async () => {
     const provider = new QwenProvider();
     await provider.connect({});

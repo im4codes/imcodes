@@ -5,7 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import type { TransportProvider, ProviderError, ProviderStatusUpdate, ProviderUsageUpdate } from '../agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type ProviderStatusUpdate, type ProviderUsageUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
@@ -354,6 +354,14 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const tracked = inFlightMessages.get(sessionName);
     inFlightMessages.delete(sessionName);
     if (tracked) clearPendingStreamUpdate(tracked.eventId);
+
+    if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: 'idle',
+      }, { source: 'daemon', confidence: 'high' });
+      return;
+    }
+
     const errorText = tracked?.text
       ? `${tracked.text}\n\n⚠️ Error: ${error.message}`
       : `⚠️ Error: ${error.message}`;
