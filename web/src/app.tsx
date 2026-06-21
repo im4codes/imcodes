@@ -2999,7 +2999,7 @@ export function App() {
                 { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
               );
               const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
-              const applyPending = shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
                 hasExplicitSnapshot: hasPendingSnapshot,
                 isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
               });
@@ -3037,7 +3037,7 @@ export function App() {
                 { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
               );
               const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
-              const applyPending = shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
                 hasExplicitSnapshot: hasPendingSnapshot,
                 isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
               });

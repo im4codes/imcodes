@@ -164,7 +164,10 @@ export function removeTransportPendingEntryForUserMessage(
 ): TransportPendingQueueSnapshot {
   const messages = extractTransportPendingMessages(existingMessages);
   const entries = normalizeTransportPendingEntries(existingEntries, messages, scopeKey, {
-    hasEntriesField: Array.isArray(existingEntries),
+    // This is stored state, not an incoming authoritative snapshot. Older
+    // clients may have messages without structured entries; keep legacy
+    // fallback alive when the stored entry list is empty but messages exist.
+    hasEntriesField: Array.isArray(existingEntries) && existingEntries.length > 0,
     hasMessagesField: Array.isArray(existingMessages),
   });
   const candidateIds = [
@@ -214,7 +217,7 @@ export function mergeTransportPendingEntriesForRunningState(
   pendingMessagesFromEvent: unknown,
   hasPendingMessagesField: boolean,
   scopeKey: string,
-  hasPendingEntriesField = Array.isArray(pendingFromEvent),
+  hasPendingEntriesField = hasPendingMessagesField && Array.isArray(pendingFromEvent),
 ): TransportPendingMessageEntry[] {
   const existingEntries = Array.isArray(existing)
     ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
@@ -247,7 +250,7 @@ export function mergeTransportPendingEntriesForIdleState(
   pendingMessagesFromEvent: unknown,
   hasPendingMessagesField: boolean,
   scopeKey: string,
-  hasPendingEntriesField = Array.isArray(pendingFromEvent),
+  hasPendingEntriesField = hasPendingMessagesField && Array.isArray(pendingFromEvent),
 ): TransportPendingMessageEntry[] {
   const existingEntries = Array.isArray(existing)
     ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)

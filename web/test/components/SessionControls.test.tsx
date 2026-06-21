@@ -2824,7 +2824,7 @@ afterEach(() => {
     expect(screen.getByText('queued second')).toBeDefined();
   });
 
-  it('renders all queued transport messages when pending entries are partial', () => {
+  it('treats partial queued transport entries as authoritative', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2843,7 +2843,7 @@ afterEach(() => {
     );
 
     expect(screen.getByText('queued first')).toBeDefined();
-    expect(screen.getByText('queued second')).toBeDefined();
+    expect(screen.queryByText('queued second')).toBeNull();
   });
 
   it('renders shared actor labels on queued transport messages', () => {

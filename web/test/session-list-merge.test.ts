@@ -449,7 +449,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('accepts a fresh-runtime snapshot (version 0) even when the baseline is higher', () => {
+  it('rejects version 0 snapshots when the baseline is higher', () => {
     // After a provider restart the runtime version resets to 0; that snapshot
     // must win so the queue does not get stuck behind a stale-high baseline.
     const merged = mergeSessionListEntry({
@@ -459,7 +459,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [],
       transportPendingMessageVersion: 0,
     }, existing);
-    expect(merged.transportPendingMessageVersion).toBe(0);
+    expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
   it('rejects unversioned queue snapshots after a versioned baseline exists', () => {

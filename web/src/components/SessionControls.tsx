@@ -869,6 +869,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         activeSession?.transportPendingMessageEntries,
         activeSession?.transportPendingMessages,
         activeSession?.name ?? '',
+        {
+          // This is already-normalized session state, not a raw daemon payload.
+          // Keep legacy messages visible when older state lacks structured
+          // entries, but do not synthesize tails for partial structured entries.
+          hasEntriesField: Array.isArray(activeSession?.transportPendingMessageEntries)
+            && activeSession.transportPendingMessageEntries.length > 0,
+          hasMessagesField: Array.isArray(activeSession?.transportPendingMessages),
+        },
       )
     : [];
   const incomingQueuedTransportVersion = typeof activeSession?.transportPendingMessageVersion === 'number'

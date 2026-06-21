@@ -558,6 +558,7 @@ export function useSubSessions(
         });
         const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
         const applyIdlePending = state === 'idle'
+          && hasPendingSnapshot
           && shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
             hasExplicitSnapshot: hasPendingSnapshot,
             isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
