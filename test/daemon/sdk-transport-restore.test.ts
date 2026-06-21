@@ -161,6 +161,25 @@ const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
+function claudeRunForSession(sessionName: string, prompt?: string) {
+  return mocks.claudeRuns.find((run) => {
+    const env = run.options.env;
+    return !!env
+      && typeof env === 'object'
+      && (env as Record<string, unknown>).IMCODES_SESSION === sessionName
+      && (!prompt || run.prompt === prompt);
+  });
+}
+
+async function settleClaudeRun(sessionName: string, prompt?: string) {
+  await flush();
+  const deadline = Date.now() + 5_000;
+  while (!claudeRunForSession(sessionName, prompt) && Date.now() < deadline) {
+    await flush();
+  }
+  return claudeRunForSession(sessionName, prompt);
+}
+
 function codexRunForSession(sessionName: string, mode?: 'start' | 'resume') {
   return mocks.codexRuns.find((run) => {
     const env = run.options.env;
@@ -238,17 +257,17 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe('route-cc-restore');
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    const run = await settleClaudeRun('deck_sdk_cc_brain', 'What token did I ask you to remember?');
 
     expect(mocks.claudeRuns).toHaveLength(1);
-    expect(mocks.claudeRuns[0].options.resume).toBe('cc-session-restore');
-    expect(mocks.claudeRuns[0].options.model).toBe('sonnet');
-    expect(mocks.claudeRuns[0].options.effort).toBe('high');
-    expect(mocks.claudeRuns[0].options.env).toMatchObject({
+    expect(run?.options.resume).toBe('cc-session-restore');
+    expect(run?.options.model).toBe('sonnet');
+    expect(run?.options.effort).toBe('high');
+    expect(run?.options.env).toMatchObject({
       IMCODES_SESSION: 'deck_sdk_cc_brain',
       IMCODES_SESSION_LABEL: 'deck_sdk_cc_brain',
     });
-    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
+    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
     expect(mocks.store.get('deck_sdk_cc_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
@@ -291,11 +310,11 @@ describe('sdk transport session restore', () => {
     expect(runtime).toBeDefined();
 
     runtime!.send('hello after restart');
-    await flush();
+    const run = await settleClaudeRun('deck_sdk_cc_fable', 'hello after restart');
 
     expect(mocks.claudeRuns).toHaveLength(1);
     // The picker alias must be resolved to the documented API id before the SDK sees it.
-    expect(mocks.claudeRuns[0].options.model).toBe('claude-fable-5');
+    expect(run?.options.model).toBe('claude-fable-5');
   });
 
   it('restoreTransportSessions awaits drainResend — pre-populated resend queue is fully transferred to runtime before resolve (audit cae1de69-826)', async () => {
@@ -614,12 +633,12 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_new_brain');
     expect(runtime).toBeDefined();
     runtime!.send('verify sdk env identity');
-    await flush();
-    expect(mocks.claudeRuns.at(-1)?.options.env).toMatchObject({
+    const run = await settleClaudeRun('deck_sdk_new_brain', 'verify sdk env identity');
+    expect(run?.options.env).toMatchObject({
       IMCODES_SESSION: 'deck_sdk_new_brain',
       IMCODES_SESSION_LABEL: 'CC1',
     });
-    expect(String(mocks.claudeRuns.at(-1)?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
+    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
   });
 
   it('auto-restarts an errored transport runtime and replays the failed turn', async () => {
@@ -894,10 +913,10 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.ccSessionId).toBe('cc-session-switch');
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    const run = await settleClaudeRun(name, 'What token did I ask you to remember?');
 
-    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-switch');
-    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+    expect(run?.options.resume).toBe('cc-session-switch');
+    expect(run?.options.sessionId).toBeUndefined();
   });
 
   it('relaunches claude-code-sdk with a fresh provider route key while preserving the Claude resume id', async () => {
@@ -933,10 +952,10 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe(next?.providerSessionId);
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    const run = await settleClaudeRun(name, 'What token did I ask you to remember?');
 
-    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-restart');
-    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+    expect(run?.options.resume).toBe('cc-session-restart');
+    expect(run?.options.sessionId).toBeUndefined();
   });
 
   it('starts a fresh claude-code cli conversation when relaunching with fresh', async () => {

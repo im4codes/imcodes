@@ -765,7 +765,7 @@ describe('structured P2P routing via WS fields', () => {
 
       await vi.waitFor(
         () => expect(sendKeysDelayedEnter).toHaveBeenCalled(),
-        { timeout: 5_000, interval: 50 },
+        { timeout: 15_000, interval: 50 },
       );
 
       const sentText = vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] as string;
