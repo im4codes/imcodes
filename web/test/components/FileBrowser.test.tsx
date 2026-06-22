@@ -87,9 +87,11 @@ function makeWsFactory() {
   let lastRequestId = 'mock-req-id';
   let lastSentPath = '';
   let lastSentIncludeFiles = false;
-  const fsListDir = vi.fn((path: string, includeFiles = false) => {
+  let lastSentIncludeMetadata = false;
+  const fsListDir = vi.fn((path: string, includeFiles = false, includeMetadata = false) => {
     lastSentPath = path;
     lastSentIncludeFiles = includeFiles;
+    lastSentIncludeMetadata = includeMetadata;
     return lastRequestId;
   });
   const fsMkdir = vi.fn((path: string) => {
@@ -153,7 +155,7 @@ function makeWsFactory() {
     for (const messageHandler of messageHandlers) messageHandler(msg);
   };
 
-  return { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles, getIncludeMetadata: () => lastSentIncludeMetadata };
 }
 
 describe('FileBrowser', () => {
@@ -195,6 +197,14 @@ describe('FileBrowser', () => {
   });
 
   // ── Layout ─────────────────────────────────────────────────────────────
+
+
+  it('requests lightweight directory listings even when hidden files are visible by default', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+  });
 
   it('renders modal overlay in modal layout', () => {
     const { ws } = makeWsFactory();
@@ -298,7 +308,7 @@ describe('FileBrowser', () => {
     render(
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, true);
+    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
   });
 
   it('does NOT include files for dir-only mode', () => {
@@ -319,7 +329,7 @@ describe('FileBrowser', () => {
       <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
     );
 
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
     expect(getByTitle('Hidden').querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
     expect(getByTitle('New file').querySelector('.fb-create-icon-file')).not.toBeNull();
     expect(getByTitle('New folder').querySelector('.fb-create-icon-folder')).not.toBeNull();
@@ -365,7 +375,7 @@ describe('FileBrowser', () => {
 
     expect(getByText('projects')).toBeDefined();
     expect(getByText('documents')).toBeDefined();
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, true);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, false);
   });
 
   it('keeps the initial list request lightweight even when downloads are enabled', () => {
@@ -381,7 +391,7 @@ describe('FileBrowser', () => {
       />,
     );
 
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
   });
 
   it('uses entry.path from a Windows drive root listing', async () => {
@@ -544,7 +554,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.mkdir_response', requestId: 'mock-mkdir-id', path: '/home/user/newdir', resolvedPath: '/home/user/newdir', status: 'ok' } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, true);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
     expect(onDirectoryCreated).toHaveBeenCalledWith('/home/user/newdir');
   });
 
@@ -575,7 +585,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/new-file.ts', resolvedPath: '/home/user/new-file.ts', status: 'ok', mtime: 2000 } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, true);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, false);
     expect(fsReadFile).toHaveBeenCalledWith('/home/user/new-file.ts');
   });
 
@@ -693,7 +703,7 @@ describe('FileBrowser', () => {
     });
 
     expect(factory.fsListDir.mock.calls.length).toBe(callsBefore + 1);
-    expect(factory.fsListDir).toHaveBeenLastCalledWith(longSegmentPath, true, true);
+    expect(factory.fsListDir).toHaveBeenLastCalledWith(longSegmentPath, true, false);
   });
 
   it('copies the current directory path from the footer next to Select', async () => {
@@ -2217,7 +2227,7 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       );
     });
     // The left tree navigated to the previewed file's folder (its siblings).
-    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/sub', true, true));
+    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/sub', true, false));
   });
 
   it('previewing a folder opens its listing instead of "preview failed" (bug B)', async () => {
@@ -2239,7 +2249,7 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       } as unknown as ServerMessage);
     });
     // The folder's listing is opened in the left tree (navigated into it)...
-    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/somedir', true, true));
+    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/somedir', true, false));
     // ...and no "preview failed" error is rendered.
     expect(screen.queryByText('file_browser.preview_error')).toBeNull();
   });
