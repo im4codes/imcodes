@@ -2218,6 +2218,40 @@ describe('getParentDir', () => {
 });
 
 describe('FileBrowser — file-manager preview/folder sync', () => {
+  it('previewing a file already present in the current tree does not collapse sibling branches', async () => {
+    localStorage.setItem(
+      'rcc_fb_snapshot_v1:local:files:hidden:/home/user',
+      JSON.stringify({
+        savedAt: Date.now(),
+        currentLabel: '/home/user',
+        rootChildren: [
+          {
+            id: '/home/user/sub',
+            name: 'sub',
+            isDir: true,
+            children: [
+              { id: '/home/user/sub/deep.ts', name: 'deep.ts', isDir: false },
+            ],
+          },
+          { id: '/home/user/docs', name: 'docs', isDir: true, children: [] },
+        ],
+      }),
+    );
+    const { ws } = makeWsFactory();
+
+    await act(async () => {
+      render(
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+          autoPreviewPath="/home/user/sub/deep.ts" onConfirm={vi.fn()} />,
+      );
+    });
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledWith('/home/user/sub/deep.ts'));
+    expect(screen.getByText('sub')).toBeTruthy();
+    expect(screen.getAllByText('deep.ts').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('docs')).toBeTruthy();
+  });
+
   it('previewing a file re-roots the left list to the file\'s parent directory (bug A)', async () => {
     const { ws, fsListDir } = makeWsFactory();
     await act(async () => {

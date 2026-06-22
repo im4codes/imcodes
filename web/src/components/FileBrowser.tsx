@@ -359,6 +359,17 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
+function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
+  for (const node of nodes) {
+    if (node.id === targetId) return [node.id];
+    if (node.children?.length) {
+      const childPath = findNodePath(node.children, targetId);
+      if (childPath) return [node.id, ...childPath];
+    }
+  }
+  return null;
+}
+
 type PendingPreviewReason = 'interactive' | 'refresh';
 type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
@@ -467,6 +478,8 @@ export function FileBrowser({
   const navigateToRef = useRef<(path: string) => void>(() => {});
   const currentLabelRef = useRef(currentLabel);
   useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
+  const dataRef = useRef(data);
+  useEffect(() => { dataRef.current = data; }, [data]);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
@@ -1060,13 +1073,24 @@ export function FileBrowser({
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
-    // Keep the LEFT file list in sync with the previewed file's folder: re-root
-    // the tree to the file's parent directory (its siblings) when we aren't
-    // already showing it. Runs for both inline and external (onPreviewFile)
-    // preview modes since FileBrowser is the left list in both.
+    // Keep the left tree in sync with the previewed file without discarding the
+    // user's expanded tree. If the file's parent already exists in the current
+    // tree, reveal/select it in-place. Only re-root when the preview came from
+    // outside the current tree (for example an external chat path).
     const parentDir = getParentDir(filePath);
     if (parentDir && parentDir !== currentLabelRef.current) {
-      navigateToRef.current(parentDir);
+      const parentNodePath = findNodePath(dataRef.current, parentDir);
+      if (parentNodePath) {
+        setExpandedPaths((prev) => {
+          const next = new Set(prev);
+          for (const nodeId of parentNodePath) next.add(nodeId);
+          return next;
+        });
+        setCurrentLabel(parentDir);
+        fetchDir(parentDir);
+      } else {
+        navigateToRef.current(parentDir);
+      }
       setSelectedPaths(new Set([filePath]));
     }
     if (onPreviewFile) {
@@ -1111,7 +1135,7 @@ export function FileBrowser({
       const diffId = ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
+  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
