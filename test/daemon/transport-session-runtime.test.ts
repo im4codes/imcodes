@@ -787,6 +787,102 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.sending).toBe(true);
   });
 
+  it('auto-retry of a direct send does not duplicate timeline drain or runtime history', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK session is already busy',
+      recoverable: true,
+    });
+    const drains: PendingTransportMessage[][] = [];
+    runtime.onDrain = (entries) => {
+      drains.push(entries.map((entry) => ({ ...entry })));
+    };
+
+    expect(runtime.send('direct busy retry', 'msg-direct-busy')).toBe('sent');
+    await flushDispatch();
+
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-direct-busy', text: 'direct busy retry' },
+    ]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'direct busy retry',
+    ]);
+
+    await waitForProviderSendCount(mock.provider, 2);
+
+    // The command handler already rendered direct sends when send() returned
+    // "sent"; retry-drain must not emit a second visible user event.
+    expect(drains).toEqual([[]]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'direct busy retry',
+    ]);
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('auto-retry of a drained queued turn emits its user event only once', async () => {
+    const drains: PendingTransportMessage[][] = [];
+    runtime.onDrain = (entries) => {
+      drains.push(entries.map((entry) => ({ ...entry })));
+    };
+
+    expect(runtime.send('active turn', 'msg-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.send('queued busy retry', 'msg-queued-busy')).toBe('queued');
+
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK session is already busy',
+      recoverable: true,
+    });
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(drains).toEqual([
+      [{ clientMessageId: 'msg-queued-busy', text: 'queued busy retry' }],
+    ]);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-queued-busy', text: 'queued busy retry' },
+    ]);
+
+    (runtime as unknown as { _lastProviderOutputAt: number })._lastProviderOutputAt = Date.now() - 10_000;
+    await waitForProviderSendCount(mock.provider, 3);
+
+    expect(drains).toEqual([
+      [{ clientMessageId: 'msg-queued-busy', text: 'queued busy retry' }],
+      [],
+    ]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'active turn',
+      'queued busy retry',
+    ]);
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('preserves active messages in the pending queue when stale busy exhausts retry budget', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK session is already busy',
+      recoverable: true,
+    });
+
+    expect(runtime.send('wedged busy turn', 'msg-wedged-busy')).toBe('sent');
+    // Force the next recoverable busy failure to be treated as budget
+    // exhausted without spending 15 real backoff cycles.
+    (runtime as unknown as { _recoverableDispatchRetries: number })._recoverableDispatchRetries = 15;
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.activeDispatchEntries).toEqual([]);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-wedged-busy', text: 'wedged busy turn' },
+    ]);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK session is already busy',
+      recoverable: true,
+    });
+  });
+
   it('STOP during an auto-retry interrupts only the retried turn and keeps later-queued messages', async () => {
     // Regression (audit Medium): STOP must NOT clear the whole queue during an
     // auto-retry. Only the turn being retried is dropped; messages the user

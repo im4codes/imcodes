@@ -43,6 +43,10 @@ export interface ResendEntry {
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** @internal: this logical user event has already been written to the timeline. */
+  timelineCommitted?: boolean;
+  /** @internal: this logical user event has already been written to runtime history. */
+  historyCommitted?: boolean;
   /** Enqueue timestamp for expiry calculation. */
   queuedAt: number;
 }

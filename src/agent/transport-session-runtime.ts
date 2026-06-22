@@ -59,6 +59,15 @@ export interface PendingTransportMessage {
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** @internal: this logical user event has already been written to the timeline. */
+  timelineCommitted?: boolean;
+  /** @internal: this logical user event has already been written to runtime history. */
+  historyCommitted?: boolean;
+}
+
+function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMessage {
+  const { timelineCommitted: _timelineCommitted, historyCommitted: _historyCommitted, ...publicEntry } = entry;
+  return publicEntry;
 }
 
 export interface TransportSendMetadata {
@@ -71,6 +80,10 @@ export interface TransportSendMetadata {
    * the tail of the FIFO queue.
    */
   queuePlacement?: 'normal' | 'front';
+  /** @internal: set when replaying entries that already have a visible user.message. */
+  timelineCommitted?: boolean;
+  /** @internal: set when replaying entries that already exist in runtime history. */
+  historyCommitted?: boolean;
 }
 
 export interface TransportRuntimeDiagnosticSnapshot {
@@ -114,6 +127,11 @@ const MAX_RECOVERABLE_DISPATCH_RETRIES = 15;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
+
+function isRecoverableProviderBusyError(error: ProviderError): boolean {
+  return error.code === PROVIDER_ERROR_CODES.PROVIDER_ERROR
+    && /already busy|session is busy|provider is busy/i.test(error.message);
+}
 
 type TimeoutOutcome<T> =
   | { timedOut: false; value: T }
@@ -638,9 +656,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Snapshot of queued messages waiting to be drained (legacy text-only view). */
   get pendingMessages(): string[] { return this._pendingMessages.map((entry) => entry.text); }
   /** Snapshot of queued messages waiting to be drained (stable entity ids for UI/edit/undo). */
-  get pendingEntries(): PendingTransportMessage[] { return this._pendingMessages.map((entry) => ({ ...entry })); }
+  get pendingEntries(): PendingTransportMessage[] { return this._pendingMessages.map(publicPendingEntry); }
+  /** Snapshot of queued messages for internal resend preservation, including idempotency markers. */
+  get pendingEntriesForResend(): PendingTransportMessage[] { return this._pendingMessages.map((entry) => ({ ...entry })); }
   /** Snapshot of the message entries currently being dispatched. */
-  get activeDispatchEntries(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
+  get activeDispatchEntries(): PendingTransportMessage[] { return this._activeDispatchEntries.map(publicPendingEntry); }
+  /** Snapshot of active entries for internal resend preservation, including idempotency markers. */
+  get activeDispatchEntriesForResend(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
 
   getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
     let providerDiagnostics: Record<string, unknown> | null | undefined;
@@ -925,6 +947,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
+      ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
+      ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
     };
 
     if (this.hasActiveTurnWork()) {
@@ -936,6 +960,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._pendingVersion++;
       return 'queued';
     }
+
+    // Direct sends are rendered by command-handler / resend-drain after
+    // runtime.send() returns 'sent'. If this provider-side send later fails
+    // recoverably and gets retried from the queue, do not render the same
+    // logical clientMessageId a second time during retry drain.
+    entry.timelineCommitted = true;
 
     // N-R8 defense-in-depth (audit 0419d1ac-1f4) — wrap direct dispatch so a
     // synchronous prologue throw inside `_dispatchTurn` (e.g. some future
@@ -1281,15 +1311,19 @@ export class TransportSessionRuntime implements SessionRuntime {
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
 
-    this._history.push({
-      id: randomUUID(),
-      sessionId: this._providerSessionId!,
-      kind: 'text',
-      role: 'user',
-      content: message,
-      timestamp: Date.now(),
-      status: 'complete',
-    });
+    const historyEntries = this._activeDispatchEntries.filter((entry) => !entry.historyCommitted);
+    if (historyEntries.length > 0) {
+      this._history.push({
+        id: randomUUID(),
+        sessionId: this._providerSessionId!,
+        kind: 'text',
+        role: 'user',
+        content: historyEntries.map((entry) => entry.text).join('\n\n'),
+        timestamp: Date.now(),
+        status: 'complete',
+      });
+      for (const entry of historyEntries) entry.historyCommitted = true;
+    }
 
     this.setStatus('thinking');
 
@@ -1498,6 +1532,21 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
           this._recoverableDispatchRetries = 0;
           this.clearRecoverableRetryTimer();
+          if (providerError.recoverable
+            && isRecoverableProviderBusyError(providerError)
+            && this._activeDispatchEntries.length > 0) {
+            // The provider repeatedly claimed "already busy" until the retry
+            // budget exhausted. This is usually a stale provider-side busy
+            // marker, not real daemon work. Keep the logical messages queued so
+            // session-manager can preserve them to resend before relaunching the
+            // provider runtime. Do NOT drain into the same wedged provider and
+            // do NOT drop the active entries.
+            this._pendingMessages.unshift(...this._activeDispatchEntries);
+            this._pendingVersion++;
+            this._activeDispatchEntries = [];
+            this.setStatus('error');
+            return;
+          }
           this._activeDispatchEntries = [];
           if (this._drainPending()) return;
           // Cancellation → idle (the user stopped). Recoverable budget exhausted
@@ -1531,6 +1580,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.clearRecoverableRetryTimer();
 
     const messages = this._pendingMessages.splice(0);
+    const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
+    for (const entry of timelineMessages) entry.timelineCommitted = true;
     // Bump the queue version the moment the queue empties. The onDrain
     // callback below emits this new version on both the per-entry
     // `user.message` events and the cleared `session.state`, so a stale
@@ -1551,7 +1602,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // `_pendingMessages` already spliced empty — runtime stuck forever,
     // user-visible as bug 2 "bot stays asleep".
     try {
-      this._onDrain?.(messages, merged, messages.length);
+      this._onDrain?.(timelineMessages.map(publicPendingEntry), merged, messages.length);
     } catch (err) {
       logger.warn(
         { err, providerSessionId: this._providerSessionId, count: messages.length },

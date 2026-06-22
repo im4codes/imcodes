@@ -70,7 +70,15 @@ function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'a
 function shouldAutoRelaunchTransportRuntimeAfterError(
   providerError: TransportSessionRuntime['lastProviderError'],
 ): boolean {
-  return providerError?.code === PROVIDER_ERROR_CODES.CONNECTION_LOST;
+  if (!providerError) return false;
+  if (providerError.code === PROVIDER_ERROR_CODES.CONNECTION_LOST) return true;
+  // Codex SDK can occasionally keep an internal "running turn" marker even
+  // though the daemon has no active work left. Manual daemon restart clears the
+  // stale provider state; treat repeated recoverable "already busy" failures as
+  // the same relaunchable provider-wedged condition instead of leaving the UI in
+  // a bare error state forever.
+  return providerError.code === PROVIDER_ERROR_CODES.PROVIDER_ERROR
+    && /already busy|session is busy|provider is busy/i.test(providerError.message);
 }
 
 function sanitizeCodexSdkStartupModel(value: string | null | undefined): string | undefined {
@@ -1156,7 +1164,7 @@ async function recoverTransportRuntimeAfterError(
           pendingCount: runtime.pendingCount,
           activeDispatchCount: runtime.activeDispatchEntries.length,
         },
-        'Transport runtime error did not indicate provider connection loss; skipping provider relaunch',
+        'Transport runtime error did not indicate a relaunchable provider failure; skipping provider relaunch',
       );
       return false;
     }
@@ -1169,7 +1177,7 @@ async function recoverTransportRuntimeAfterError(
         providerError,
         ...preservation,
       },
-      'Transport provider connection lost — preserving queues and relaunching provider runtime',
+      'Transport provider failure — preserving queues and relaunching provider runtime',
     );
 
     const now = Date.now();
@@ -1198,8 +1206,11 @@ async function recoverTransportRuntimeAfterError(
 
     if (pendingCount > 0) {
       const queued = getResendEntries(sessionName);
+      const recoveryReason = providerError?.code === PROVIDER_ERROR_CODES.CONNECTION_LOST
+        ? 'Provider connection lost'
+        : 'Provider became stuck busy';
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⏳ Provider connection lost — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
+        text: `⏳ ${recoveryReason} — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -1304,22 +1315,44 @@ async function drainTransportResendQueueIntoRuntime(
                 entry.commandId,
                 attachments.length > 0 ? attachments : undefined,
                 entry.messagePreamble,
-                sharedMetadata,
+                {
+                  ...sharedMetadata,
+                  ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+                  ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+                },
               )
               : runtime.send(
                 entry.text,
                 entry.commandId,
                 attachments.length > 0 ? attachments : undefined,
                 entry.messagePreamble,
+                {
+                  ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+                  ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+                },
               ))
           : (attachments.length > 0
               ? (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, sharedMetadata)
-                  : runtime.send(entry.text, entry.commandId, attachments))
+                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, {
+                    ...sharedMetadata,
+                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+                  })
+                  : runtime.send(entry.text, entry.commandId, attachments, undefined, {
+                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+                  }))
               : (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, sharedMetadata)
-                  : runtime.send(entry.text, entry.commandId)));
-        if (result === 'sent') {
+                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, {
+                    ...sharedMetadata,
+                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+                  })
+                  : runtime.send(entry.text, entry.commandId, undefined, undefined, {
+                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+                  })));
+        if (result === 'sent' && !entry.timelineCommitted) {
           timelineEmitter.emit(
             sessionName,
             'user.message',
@@ -1334,6 +1367,14 @@ async function drainTransportResendQueueIntoRuntime(
             },
             { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
           );
+          timelineEmitter.emit(sessionName, 'session.state', {
+            state: 'running',
+            pendingCount: runtime.pendingCount,
+            pendingMessages: runtime.pendingMessages,
+            pendingMessageEntries: runtime.pendingEntries,
+            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+          }, { source: 'daemon', confidence: 'high' });
+        } else if (result === 'sent') {
           timelineEmitter.emit(sessionName, 'session.state', {
             state: 'running',
             pendingCount: runtime.pendingCount,
@@ -1422,6 +1463,8 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.pendingMessages = runtime.pendingMessages;
       payload.pendingMessageEntries = runtime.pendingEntries;
       payload.pendingMessageVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
+    } else if (mapped === 'error' && runtime.lastProviderError?.message) {
+      payload.error = runtime.lastProviderError.message;
     }
     timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {
@@ -1448,7 +1491,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );
     }
-    if (messages.length === 0) {
+    if (messages.length === 0 && count === 0) {
       timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true, pendingMessageVersion: drainedVersion });
     }
     // Include authoritative pending state after drain. The drained messages have
