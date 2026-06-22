@@ -124,6 +124,11 @@ const MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS = 10_000;
 const RECOVERABLE_DISPATCH_RETRY_BASE_MS = 1_000;
 const RECOVERABLE_DISPATCH_RETRY_MAX_MS = 8_000;
 const MAX_RECOVERABLE_DISPATCH_RETRIES = 15;
+// "Provider/session is already busy" while this runtime has no active accepted
+// provider turn is almost always a stale SDK-side busy marker. Do not burn the
+// full generic retry budget (≈2 minutes): preserve the turn and let
+// session-manager relaunch the provider after a few confirmations.
+const MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES = 3;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
@@ -1526,8 +1531,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           // drop the message. Re-queue and auto-retry with backoff so the work
           // completes when the provider frees up; only give up (error) once the
           // bounded retry budget is exhausted (a genuinely wedged provider).
-          if (providerError.code !== PROVIDER_ERROR_CODES.CANCELLED
-            && this.requeueAndScheduleRecoverableRetry(providerError)) {
+          const isRecoverableBusy = isRecoverableProviderBusyError(providerError);
+          const canRetryRecoverable = providerError.code !== PROVIDER_ERROR_CODES.CANCELLED
+            && (!isRecoverableBusy || this._recoverableDispatchRetries < MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES);
+          if (canRetryRecoverable && this.requeueAndScheduleRecoverableRetry(providerError)) {
             return;
           }
           this._recoverableDispatchRetries = 0;

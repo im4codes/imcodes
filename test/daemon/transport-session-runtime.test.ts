@@ -883,6 +883,32 @@ describe('TransportSessionRuntime', () => {
     });
   });
 
+  it('uses a short retry budget for stale provider busy instead of the generic recoverable budget', async () => {
+    const send = mock.provider.send as ReturnType<typeof vi.fn>;
+    send.mockRejectedValue({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK session is already busy',
+      recoverable: true,
+    });
+
+    expect(runtime.send('stale busy should relaunch quickly', 'msg-short-busy')).toBe('sent');
+    for (let expectedCalls = 1; expectedCalls <= 4; expectedCalls++) {
+      if (expectedCalls > 1) {
+        (runtime as unknown as { _lastProviderOutputAt: number })._lastProviderOutputAt = Date.now() - 10_000;
+        await waitForProviderSendCount(mock.provider, expectedCalls);
+      } else {
+        await flushDispatch();
+      }
+    }
+    await flushDispatch();
+
+    expect(send).toHaveBeenCalledTimes(4);
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-short-busy', text: 'stale busy should relaunch quickly' },
+    ]);
+  });
+
   it('STOP during an auto-retry interrupts only the retried turn and keeps later-queued messages', async () => {
     // Regression (audit Medium): STOP must NOT clear the whole queue during an
     // auto-retry. Only the turn being retried is dropped; messages the user
