@@ -2844,6 +2844,136 @@ describe('CodexSdkProvider', () => {
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
   });
 
+  it('does not let late Codex item events re-adopt a cancelled turn after the cancel watchdog', async () => {
+    vi.useFakeTimers();
+    childProcessMock.setHoldTurnInterrupt(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-late-item-turnid', cwd: '/tmp/project' });
+
+    await provider.send('route-cancel-late-item-turnid', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-late-item-turnid');
+    await vi.advanceTimersByTimeAsync(1_600);
+
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'late-reasoning', type: 'reasoning', text: 'late' },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.getSessionDiagnostics('route-cancel-late-item-turnid')).toMatchObject({
+      runningTurnId: null,
+      runningCompact: false,
+    });
+    await provider.send('route-cancel-late-item-turnid', 'after-cancel');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not let late contextCompaction items re-enter compacting after cancel', async () => {
+    vi.useFakeTimers();
+    childProcessMock.setHoldTurnInterrupt(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-late-compact-item', cwd: '/tmp/project' });
+
+    await provider.send('route-cancel-late-compact-item', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-late-compact-item');
+    await vi.advanceTimersByTimeAsync(1_600);
+
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'late-compact', type: 'contextCompaction' },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.getSessionDiagnostics('route-cancel-late-compact-item')).toMatchObject({
+      runningTurnId: null,
+      runningCompact: false,
+    });
+    await provider.send('route-cancel-late-compact-item', 'after-cancel');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not let late Codex item events re-adopt a failed turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-failed-late-item-turnid', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+
+    await provider.send('route-failed-late-item-turnid', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'failed', error: { message: 'boom' } },
+      },
+    });
+    await flush();
+
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'late-msg', type: 'agentMessage', text: 'late text' },
+      },
+    });
+    await flush();
+
+    expect(provider.getSessionDiagnostics('route-failed-late-item-turnid')).toMatchObject({
+      runningTurnId: null,
+      runningCompact: false,
+    });
+    expect(deltas).toContain('late text');
+    await provider.send('route-failed-late-item-turnid', 'after-failure');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not render late plan updates for a failed turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-failed-late-plan', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-failed-late-plan', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'failed', error: { message: 'boom' } },
+      },
+    });
+    await flush();
+
+    child.emits({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        plan: { steps: [{ text: 'late plan', status: 'in_progress' }] },
+      },
+    });
+    await flush();
+
+    expect(tools).toEqual([]);
+  });
+
   it('emits WebSearch tool events for webSearch items (legacy top-level query)', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

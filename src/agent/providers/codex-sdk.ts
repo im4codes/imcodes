@@ -60,6 +60,8 @@ const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
+const TERMINATED_TURN_CACHE_LIMIT = 200;
+const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -435,6 +437,8 @@ interface CodexSdkSessionState {
   pendingSessionSystemTextUpdateTurnId?: string;
   completedTurnIds: Set<string>;
   completedCompactTurnIds: Set<string>;
+  terminatedTurnIds: Set<string>;
+  terminatedCompactTurnIds: Set<string>;
   generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
   rawChecklistStartedAt: number;
@@ -1570,6 +1574,8 @@ export class CodexSdkProvider implements TransportProvider {
       pendingSessionSystemTextUpdateTurnId: undefined,
       completedTurnIds: existing?.completedTurnIds ?? new Set(),
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
+      terminatedTurnIds: existing?.terminatedTurnIds ?? new Set(),
+      terminatedCompactTurnIds: existing?.terminatedCompactTurnIds ?? new Set(),
       generatedImageTracking: null,
       generatedImagePaths: [],
       rawChecklistStartedAt: Date.now(),
@@ -1739,6 +1745,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!this.sessions.has(sessionId)) return;
       if (state.runningTurnId !== turnId) return;
       this.clearStatus(sessionId, state);
+      this.rememberTerminatedTurn(state, turnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;      state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
@@ -1761,6 +1768,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCompactTimers(state);      this.clearRawChecklistPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
+        this.rememberTerminatedActiveTurn(state);
         state.loaded = false;
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -1926,6 +1934,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.nativePlanEventSeen = false;
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
+        state.terminatedTurnIds.delete(state.runningTurnId);
       }
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
@@ -1936,6 +1945,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
+      this.rememberTerminatedTurn(state, state.runningTurnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;      state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
@@ -1990,6 +2000,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
     } catch (err) {
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
+      this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
@@ -2557,6 +2568,7 @@ export class CodexSdkProvider implements TransportProvider {
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
+      if (turnId && (state.cancelled || this.isClosedCodexTurn(state, turnId))) return;
       if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
       // Native plan event (codex >= 0.139). Render it AND suppress the legacy
       // rollout-file scan for this session so old (file-scrape) + new never
@@ -2576,14 +2588,15 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       if (state.cancelled) return;
       const turnId = readParamTurnId(params);
-      if (turnId && state.completedTurnIds.has(turnId)) return;
+      const closedTurn = this.isClosedCodexTurn(state, turnId);
       // NEVER drop live assistant text. If our turn bookkeeping lags the
       // app-server (turn/start's result carried no turn id, so runningTurnId was
       // never set, or this delta's turnId is shaped differently), adopt the
       // delta's turnId and render anyway — a real text update must always reach
-      // the UI. Only a genuinely-completed turn (above) or an explicit cancel skips.
-      if (turnId && !state.runningTurnId) state.runningTurnId = turnId;
-      this.clearStatus(sessionId, state);
+      // the UI. Closed/terminated turns may still render late text, but they
+      // must never be adopted back into running state.
+      if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.clearStatus(sessionId, state);
       // Reset the streaming accumulator when a new agentMessage item starts so
       // its deltas don't render prefixed with the previous message's full text
       // (multi-message turns occur after every tool round). Guards the case
@@ -2609,17 +2622,20 @@ export class CodexSdkProvider implements TransportProvider {
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
-      if (turnId && (state.completedTurnIds.has(turnId) || state.completedCompactTurnIds.has(turnId))) return;
+      if (state.cancelled) return;
+      const closedTurn = this.isClosedCodexTurn(state, turnId);
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      if (closedTurn && item.type !== 'agentMessage') return;
       // NEVER drop a real provider item. If our turn bookkeeping lags the
       // app-server (turn/start's result carried no turn id, or this event's
       // turnId is shaped differently), adopt the event's turnId and process it
       // anyway rather than silently dropping tool calls / reasoning / final
-      // assistant text. Completed turns (above) and explicit cancels still skip.
-      if (turnId && !state.runningTurnId) state.runningTurnId = turnId;
-      this.trackCodexTurnItemActivity(sessionId, state, method, item);
+      // assistant text. Closed/terminated turns may still surface final
+      // assistant text, but they must never be adopted back into running state.
+      if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
         state.runningCompact = true;
@@ -2637,8 +2653,6 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
-      if (state.cancelled) return;
-
       if (item.type === 'reasoning') {
         this.emitStatus(sessionId, state, {
           status: 'thinking',
@@ -2647,7 +2661,7 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
-      this.clearStatus(sessionId, state);
+      if (!closedTurn) this.clearStatus(sessionId, state);
 
       const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
@@ -2689,14 +2703,15 @@ export class CodexSdkProvider implements TransportProvider {
       const status = turn.status;
       const turnId = readParamTurnId(params);
 
-      if (turnId && state.completedCompactTurnIds.has(turnId)) {
+      if (turnId && this.isClosedCompactTurn(state, turnId)) {
         return;
       }
-      if (turnId && state.completedTurnIds.has(turnId)) {
+      if (turnId && this.isClosedTurn(state, turnId)) {
         return;
       }
 
       if (status === 'failed') {
+        this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
@@ -2716,6 +2731,7 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (status === 'interrupted') {
+        this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
@@ -2740,6 +2756,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (state.cancelled) {
+        this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
@@ -2824,6 +2841,29 @@ export class CodexSdkProvider implements TransportProvider {
     if (oldest) state.completedTurnIds.delete(oldest);
   }
 
+  private rememberTerminatedTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.terminatedTurnIds.add(turnId);
+    if (state.terminatedTurnIds.size <= TERMINATED_TURN_CACHE_LIMIT) return;
+    const oldest = state.terminatedTurnIds.values().next().value;
+    if (oldest) state.terminatedTurnIds.delete(oldest);
+  }
+
+  private isClosedTurn(state: CodexSdkSessionState, turnId?: string): boolean {
+    return Boolean(turnId && (state.completedTurnIds.has(turnId) || state.terminatedTurnIds.has(turnId)));
+  }
+
+  private isClosedCompactTurn(state: CodexSdkSessionState, turnId?: string): boolean {
+    return Boolean(turnId && (
+      state.completedCompactTurnIds.has(turnId)
+      || state.terminatedCompactTurnIds.has(turnId)
+    ));
+  }
+
+  private isClosedCodexTurn(state: CodexSdkSessionState, turnId?: string): boolean {
+    return this.isClosedTurn(state, turnId) || this.isClosedCompactTurn(state, turnId);
+  }
+
   private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
     if (!this.child?.stdin.writable) {
       return Promise.reject(new Error('Codex app-server stdin is not writable'));
@@ -2891,6 +2931,24 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.completedCompactTurnIds.size <= 20) return;
     const oldest = state.completedCompactTurnIds.values().next().value;
     if (oldest) state.completedCompactTurnIds.delete(oldest);
+  }
+
+  private rememberTerminatedCompactTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.terminatedCompactTurnIds.add(turnId);
+    if (state.terminatedCompactTurnIds.size <= TERMINATED_COMPACT_TURN_CACHE_LIMIT) return;
+    const oldest = state.terminatedCompactTurnIds.values().next().value;
+    if (oldest) state.terminatedCompactTurnIds.delete(oldest);
+  }
+
+  private rememberTerminatedActiveTurn(state: CodexSdkSessionState, turnId?: string): void {
+    const resolvedTurnId = turnId ?? state.runningTurnId;
+    if (!resolvedTurnId) return;
+    if (state.runningCompact) {
+      this.rememberTerminatedCompactTurn(state, resolvedTurnId);
+      return;
+    }
+    this.rememberTerminatedTurn(state, resolvedTurnId);
   }
 
   /**
@@ -3030,6 +3088,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);    this.clearStatus(sessionId, state);
+    this.rememberTerminatedCompactTurn(state, state.runningTurnId);
     state.runningCompact = false;
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
@@ -3107,6 +3166,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!this.sessions.has(sessionId)) return;
       if (!state.runningCompact) return;
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
+      this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
