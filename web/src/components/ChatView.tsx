@@ -614,9 +614,20 @@ function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean
     event.type !== 'mode.state' &&
     event.type !== 'command.ack' &&
     event.type !== 'terminal.snapshot' &&
-    !(event.type === 'session.state' && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')) &&
+    !(event.type === 'session.state'
+      && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')
+      && !getSessionStateDetail(event)) &&
     (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(event.type))
   );
+}
+
+function getSessionStateDetail(event: TimelineEvent): string {
+  if (event.type !== 'session.state') return '';
+  for (const key of ['error', 'message', 'errorReason'] as const) {
+    const value = event.payload[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
 }
 
 function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean): string[] {
@@ -3288,9 +3299,7 @@ const ChatEvent = memo(function ChatEvent({
         : isUserCompactFeedback
           ? t('session.state_compacting')
           : (stateLabel[state] ?? state);
-      const errorDetail = state === 'error' && typeof event.payload.error === 'string'
-        ? event.payload.error.trim()
-        : '';
+      const errorDetail = getSessionStateDetail(event);
       const displayLabel = errorDetail
         ? t('session.state_error_detail', {
             error: errorDetail,

@@ -1475,7 +1475,8 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // authority. This keeps queued messages visible in the UI until the drained turn completes.
     const activity = runtime.getDiagnosticSnapshot();
     const effectiveMapped = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
-    persistTransportState(effectiveMapped, mapped === 'error' ? runtime.lastProviderError?.message : undefined);
+    const providerError = runtime.lastProviderError;
+    persistTransportState(effectiveMapped, mapped === 'error' ? providerError?.message : undefined);
     const payload: Record<string, unknown> = { state: effectiveMapped };
     if (effectiveMapped === 'running') {
       payload.activityGeneration = activity.activityGeneration;
@@ -1500,8 +1501,12 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.pendingMessageEntries = runtime.pendingEntries;
       payload.pendingVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
       payload.pendingMessageVersion = payload.pendingVersion;
-    } else if (mapped === 'error' && runtime.lastProviderError?.message) {
-      payload.error = runtime.lastProviderError.message;
+      if (providerError?.code === PROVIDER_ERROR_CODES.CANCELLED && providerError.message) {
+        payload.error = providerError.message;
+        payload.reason = 'user_cancelled';
+      }
+    } else if (mapped === 'error' && providerError?.message) {
+      payload.error = providerError.message;
     }
     timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {

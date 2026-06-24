@@ -1708,6 +1708,32 @@ describe('ChatView', () => {
     expect(container.textContent).toContain('Error: Codex compact cancelled');
   });
 
+  it('renders idle transport cancel details as visible Stop confirmation', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-cancelled-idle',
+            type: 'session.state',
+            ts: 1000,
+            payload: { state: 'idle', error: 'Turn cancelled by user stop' },
+          },
+          {
+            eventId: 'evt-normal-idle',
+            type: 'session.state',
+            ts: 1001,
+            payload: { state: 'idle' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('Error: Turn cancelled by user stop');
+    expect(container.textContent).not.toContain('Agent idle');
+  });
+
   it('renders transport Stop cancel feedback as a visible system row', () => {
     const { container } = render(
       <ChatView
