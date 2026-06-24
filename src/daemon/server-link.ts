@@ -138,8 +138,18 @@ const CONNECT_TIMEOUT_MS = 20_000;
  * server-side IP rate limiter together.
  */
 const RECONNECT_JITTER_RATIO = 0.4;
-const WATCHDOG_MS = 15_000;           // check connection health every 15s
-const SILENT_CONNECTION_RECYCLE_MS = 2 * 60_000;
+const WATCHDOG_MS = 10_000;           // check connection health every 10s
+// Lowered 120s → 30s (STOP-delivery fix). On a half-open/dead link the SERVER
+// still believes the daemon is connected and keeps forwarding control commands
+// (STOP, approvals, feedback) into a socket the daemon can no longer read — they
+// are silently lost until this recycle reconnects. At 120s that was up to a
+// 2-minute window where STOP "had no effect / no reaction" (front-end shows its
+// optimistic flicker, the agent never receives it). Heartbeats run every 5s and
+// a healthy server acks each one, so ~30s of total inbound silence (≈6 missed
+// acks) reliably means a dead link. The event-loop-stall guard in
+// getOpenSocketSilenceMs() still prevents this from false-reconnecting a healthy
+// socket during the daemon's own load spikes (it reports 0 silence then).
+const SILENT_CONNECTION_RECYCLE_MS = 30_000;
 // Event-loop stall guard. Under heavy local load the daemon's event loop can
 // freeze for tens of seconds. The silence-based reconnects measure
 // `now - lastPong`, which during a freeze blames the SERVER for the daemon's
