@@ -761,6 +761,42 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
+   * Health-poll safety net for a PHANTOM active turn — the provider finished a
+   * turn but never emitted a completion event (observed with Codex), so the
+   * runtime stays "working" forever and the session never returns to idle (and
+   * any queued work never drains). Unlike `cancelStaleActiveTurnWithPending`,
+   * this fires even when NOTHING is queued (a stuck spinner with no follow-up),
+   * which is the common case. Once the provider has been silent (no delta /
+   * completion / status / error) for `staleMs`, settle the dispatch locally to
+   * idle and drain any pending work. Uses the external-completion settle so the
+   * resulting provider CANCELLED is swallowed (clean idle, never an error). A
+   * genuine late reply (false positive on a long silent turn) still renders via
+   * the relay's no-active-turn path. Returns true if it recovered.
+   */
+  recoverSilentActiveTurn(options?: { staleMs?: number; nowMs?: number; reason?: string }): boolean {
+    if (!this.hasActiveTurnWork()) return false;
+    if (!this._providerSessionId) return false;
+    const nowMs = options?.nowMs ?? Date.now();
+    const staleMs = options?.staleMs ?? getTransportStalePendingRecoveryMs();
+    const lastActivityAgeMs = Math.max(0, nowMs - this._lastActivityAt);
+    if (lastActivityAgeMs < staleMs) return false;
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        reason: options?.reason ?? 'stale-silent-active-turn',
+        status: this._status,
+        sending: this._sending,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+        lastActivityAgeMs,
+        staleMs,
+      },
+      'transport runtime active turn is stale (provider silent past threshold); settling to idle so the session cannot stay "working" forever',
+    );
+    return this.settleActiveDispatchFromExternalCompletion(options?.reason ?? 'stale-silent-active-turn');
+  }
+
+  /**
    * Some daemon workflows have their own durable completion proof outside the
    * provider stream, such as an Auto Deliver or P2P marker file. Once that
    * proof is accepted, waiting for a late SDK onComplete/onError can keep the

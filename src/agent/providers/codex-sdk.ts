@@ -61,6 +61,11 @@ const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const TERMINATED_TURN_CACHE_LIMIT = 200;
+// Debounce before settling a turn purely from a thread-idle status (current
+// Codex app-server sometimes ends a turn without an explicit `turn/completed`).
+// Long enough that a transient mid-turn idle is cancelled by the activity that
+// follows it; short enough that a genuinely finished turn is never stuck.
+const CODEX_IDLE_SETTLE_DEBOUNCE_MS = 1_500;
 const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
@@ -439,6 +444,13 @@ interface CodexSdkSessionState {
   completedCompactTurnIds: Set<string>;
   terminatedTurnIds: Set<string>;
   terminatedCompactTurnIds: Set<string>;
+  // Debounced turn-end settle, armed when the thread reports idle and cancelled
+  // by any subsequent turn activity. Current Codex sometimes ends a turn with
+  // only a thread-idle status (no `turn/completed`); this fires that completion
+  // once the thread has been quiet for CODEX_IDLE_SETTLE_DEBOUNCE_MS, while a
+  // transient mid-turn idle is cancelled by the activity that follows it.
+  idleSettleTimer?: ReturnType<typeof setTimeout>;
+  idleSettleTurnId?: string;
   generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
   rawChecklistStartedAt: number;
@@ -2529,6 +2541,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
+        this.clearIdleSettleTimer(state); // turn resumed → cancel any pending idle settle
         if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -2539,13 +2552,26 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (isThreadIdleStatus(status)) {
-        // Compaction is the only turn-state we settle from a thread status
-        // change. Normal turn completion is driven solely by the explicit
-        // `turn/completed` app-server event below; a thread that momentarily
-        // reports idle mid-turn is NOT a completion signal and must not end the
-        // turn (no idle timers, no guessing when the turn ends).
         if (state.runningCompact) {
           this.completeCompact(sessionId, state, readParamTurnId(params));
+          return;
+        }
+        // Authoritative turn-end signal for the current Codex app-server: it
+        // reports the thread going idle when a turn finishes but does NOT always
+        // emit an explicit `turn/completed` (confirmed via DIAG logs: turns
+        // started, did their work, but no `turn/completed` ever arrived → the
+        // runtime stayed "working" forever and the queued message could not
+        // drain until a manual STOP). So settle the active normal turn on
+        // thread-idle. The `completedTurnIds` dedup makes this coexist safely
+        // with a later `turn/completed` for the same turn — whichever arrives
+        // first settles it; the other is dropped by the dedup gate.
+        if (
+          state.runningTurnId
+          && !state.cancelled
+          && !state.turnStartInFlight
+          && !this.isClosedCodexTurn(state, state.runningTurnId)
+        ) {
+          this.armIdleSettleTimer(sessionId, state, state.runningTurnId);
           return;
         }
       }
@@ -2587,6 +2613,7 @@ export class CodexSdkProvider implements TransportProvider {
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       if (state.cancelled) return;
+      this.clearIdleSettleTimer(state); // live token → turn active, cancel pending idle settle
       const turnId = readParamTurnId(params);
       const closedTurn = this.isClosedCodexTurn(state, turnId);
       // NEVER drop live assistant text. If our turn bookkeeping lags the
@@ -2623,6 +2650,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
       if (state.cancelled) return;
+      this.clearIdleSettleTimer(state); // item activity → turn active, cancel pending idle settle
       const closedTurn = this.isClosedCodexTurn(state, turnId);
 
       const item = params.item as Record<string, any> | undefined;
@@ -2702,6 +2730,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;      const turn = isRecord(params.turn) ? params.turn : {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
+      this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
 
       if (turnId && this.isClosedCompactTurn(state, turnId)) {
         return;
@@ -2784,6 +2813,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
+    this.clearIdleSettleTimer(state);
     this.clearCancelTimer(state);    this.clearStatus(sessionId, state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
@@ -2839,6 +2869,36 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.completedTurnIds.size <= 50) return;
     const oldest = state.completedTurnIds.values().next().value;
     if (oldest) state.completedTurnIds.delete(oldest);
+  }
+
+  /** Cancel a pending debounced thread-idle settle (turn activity resumed). */
+  private clearIdleSettleTimer(state: CodexSdkSessionState): void {
+    if (state.idleSettleTimer) {
+      clearTimeout(state.idleSettleTimer);
+      state.idleSettleTimer = undefined;
+    }
+    state.idleSettleTurnId = undefined;
+  }
+
+  /** Arm the debounced thread-idle settle for `turnId`. If no turn activity
+   *  arrives before the debounce elapses, the turn is completed (handles the
+   *  current Codex app-server ending a turn with only a thread-idle status). */
+  private armIdleSettleTimer(sessionId: string, state: CodexSdkSessionState, turnId: string): void {
+    this.clearIdleSettleTimer(state);
+    state.idleSettleTurnId = turnId;
+    state.idleSettleTimer = setTimeout(() => {
+      state.idleSettleTimer = undefined;
+      state.idleSettleTurnId = undefined;
+      if (
+        state.runningTurnId === turnId
+        && !state.cancelled
+        && !state.turnStartInFlight
+        && !this.isClosedCodexTurn(state, turnId)
+      ) {
+        void this.completeTurn(sessionId, state, turnId);
+      }
+    }, CODEX_IDLE_SETTLE_DEBOUNCE_MS);
+    state.idleSettleTimer.unref?.();
   }
 
   private rememberTerminatedTurn(state: CodexSdkSessionState, turnId?: string): void {

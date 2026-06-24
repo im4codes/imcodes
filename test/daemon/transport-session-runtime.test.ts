@@ -2218,6 +2218,32 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(resentPayload.userMessage).toBe('queued-after-stale-active');
   });
 
+  it('recoverSilentActiveTurn settles a phantom active turn with NO queued work to idle', async () => {
+    // Regression: a provider that started a turn but went silent and never sent
+    // a completion (Codex phantom) leaves the session "working" forever EVEN WITH
+    // AN EMPTY QUEUE (just a stuck spinner). The with-pending recovery would not
+    // fire here; recoverSilentActiveTurn must settle it to idle once stale.
+    runtime.send('only-turn', 'cmd-only');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).not.toBe('idle');
+
+    const internal = runtime as unknown as { _lastActivityAt: number };
+    internal._lastActivityAt = 1_000;
+
+    // Not yet stale → no-op.
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 5_000, staleMs: 10_000 })).toBe(false);
+    expect(runtime.getStatus()).not.toBe('idle');
+    // Stale (provider silent past threshold) + empty queue → settle to idle.
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 11_001, staleMs: 10_000 })).toBe(true);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.sending).toBe(false);
+    expect(runtime.activeDispatchEntries).toEqual([]);
+    expect(runtime.pendingCount).toBe(0);
+    // Idempotent — nothing left active to recover.
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 30_000, staleMs: 10_000 })).toBe(false);
+  });
+
   it('locally abandons stale active work when provider cancel never settles', async () => {
     vi.stubEnv('IMCODES_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS', '50');
     runtime.send('first', 'cmd-first');

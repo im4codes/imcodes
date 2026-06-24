@@ -1783,6 +1783,35 @@ describe('CodexSdkProvider', () => {
     expect(provider.getSessionDiagnostics('route-idle-not-completion')).toMatchObject({ runningTurnId: null });
   });
 
+  it('settles a turn from thread-idle when the app-server sends no turn/completed (debounced)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-settles', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-settles', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-settles')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    // The agent produces its message, then the thread goes idle — but the current
+    // Codex app-server emits NO `turn/completed`. With NOTHING following the idle,
+    // the debounced idle-settle must complete the turn so it can never get stuck
+    // "working" with the queue blocked (the phantom-active-turn regression).
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+
+    await waitForCondition(() => completed.length === 1);
+    expect(completed).toEqual(['Done']);
+    expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
+  });
+
   it('resumes with stored thread id on existing session', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

@@ -2129,6 +2129,11 @@ function cancelTransportTurnNow(
   clearResend(sessionName);
   if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
   emitSessionControlTimelineFeedback(sessionName, 'stop');
+  // Reflect idle PROMPTLY so the "working" spinner clears on STOP even when the
+  // provider's CANCELLED settle is slow or lost (notably Codex). Deferring this
+  // until after `await cancel()` left Codex sessions showing "working" until a
+  // slow interrupt settled — an idle-misjudgment / stuck-turn regression. The
+  // real cancel below still finalizes provider state.
   markTransportCancelIdle(sessionName);
 
   if (!stopRuntime) return true;
