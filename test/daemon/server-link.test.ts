@@ -223,7 +223,7 @@ describe('ServerLink', () => {
     openHandler?.(); // lastPong = 1000, loop-probe baseline = 1000
 
     const LOOP_PROBE_MS = 1_000;
-    const WATCHDOG_MS = 15_000;
+    const WATCHDOG_MS = 10_000;
     const SILENT_CONNECTION_RECYCLE_MS = 2 * 60_000;
     const probe = intervals.find((i) => i.ms === LOOP_PROBE_MS)?.fn;
     const watchdog = intervals.find((i) => i.ms === WATCHDOG_MS)?.fn;
