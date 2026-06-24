@@ -233,7 +233,11 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     });
 
     expect(result).toBe(false);
-    expect(updateSessionStateMock).toHaveBeenCalledWith('deck_loop_brain', 'error');
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      'deck_loop_brain',
+      'error',
+      'Restart loop detected: more than 3 restarts within 5 minutes',
+    );
     expect(timelineEmitMock).toHaveBeenCalledWith(
       'deck_loop_brain',
       'assistant.text',
@@ -261,7 +265,11 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     });
 
     expect(result).toBe(false);
-    expect(updateSessionStateMock).toHaveBeenCalledWith('deck_loop_w1', 'error');
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      'deck_loop_w1',
+      'error',
+      'Restart loop detected: more than 3 restarts within 5 minutes',
+    );
     expect(timelineEmitMock).toHaveBeenCalledWith(
       'deck_loop_w1',
       'assistant.text',
