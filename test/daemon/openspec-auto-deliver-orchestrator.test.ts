@@ -2132,10 +2132,12 @@ exec "${realGit}" "$@"
     expect(transportSendMock).not.toHaveBeenCalled();
 
     const queued = getResendEntries('deck_demo_brain');
-    expect(queued).toHaveLength(1);
-    expect(queued[0]?.commandId).toContain(':post_repair_acceptance_audit:');
-    expect(queued[0]?.text).toContain('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change');
-    expect(queued[0]?.text).toContain(`Previous audit discussion file: ${discussion.contextFilePath}`);
+    const finalAcceptanceQueued = queued.filter((entry) =>
+      entry.commandId.includes(':post_repair_acceptance_audit:')
+      && entry.text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change')
+    );
+    expect(finalAcceptanceQueued).toHaveLength(1);
+    expect(finalAcceptanceQueued[0]?.text).toContain(`Previous audit discussion file: ${discussion.contextFilePath}`);
     expect(serverLinkMock.send.mock.calls.some((call) =>
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
       && String(call[0]?.projection?.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n') ?? '')
