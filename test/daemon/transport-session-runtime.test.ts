@@ -2096,6 +2096,11 @@ ${PREFERENCE_CONTEXT_END}`;
   it('external completion settles the active turn and drains queued messages without waiting for provider callbacks', async () => {
     runtime.send('first marker-backed workflow turn', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
+    mock.fireTool('sess-1', {
+      id: 'tool-marker',
+      name: 'Bash',
+      status: 'running',
+    });
     runtime.send('queued continuation after marker', 'cmd-next');
     expect(runtime.pendingCount).toBe(1);
 
@@ -2110,6 +2115,20 @@ ${PREFERENCE_CONTEXT_END}`;
       userMessage: 'queued continuation after marker',
       assembledMessage: 'queued continuation after marker',
     }));
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-marker',
+        tool: 'Bash',
+        terminalStatus: 'stale',
+        terminalReason: 'provider_stale',
+      }),
+      expect.objectContaining({
+        source: 'daemon',
+        confidence: 'high',
+      }),
+    );
 
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'late cancellation from settled turn', recoverable: true });
     expect(runtime.sending).toBe(true);
@@ -2377,8 +2396,10 @@ ${PREFERENCE_CONTEXT_END}`;
 
     const internal = runtime as unknown as {
       _lastActivityAt: number;
+      _lastProviderOutputAt: number;
     };
     internal._lastActivityAt = 1_000;
+    internal._lastProviderOutputAt = 1_000;
 
     expect(runtime.cancelStaleActiveTurnWithPending({
       reason: 'test-stale-active',
@@ -2433,17 +2454,68 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.recoverSilentActiveTurn({ nowMs: 30_000, staleMs: 10_000 })).toBe(false);
   });
 
+  it('recoverSilentActiveTurn terminalizes orphaned open tools before draining queued work', async () => {
+    runtime.send('long codex command', 'cmd-long');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireTool('sess-1', {
+      id: 'tool-silent',
+      name: 'Bash',
+      status: 'running',
+    });
+    runtime.send('queued after silent tool', 'cmd-queued-silent');
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+
+    const internal = runtime as unknown as { _lastActivityAt: number };
+    internal._lastActivityAt = 1_000;
+
+    const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(runtime.recoverSilentActiveTurn({
+      reason: 'health-poll-stale-active-turn',
+      nowMs: 11_001,
+      staleMs: 10_000,
+    })).toBe(true);
+    await waitForProviderSendCount(mock.provider, beforeDrainSendCount + 1);
+
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-silent',
+        tool: 'Bash',
+        terminalStatus: 'stale',
+        terminalReason: 'provider_stale',
+      }),
+      expect.objectContaining({
+        source: 'daemon',
+        confidence: 'high',
+      }),
+    );
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('queued after silent tool');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+  });
+
   it('locally abandons stale active work when provider cancel never settles', async () => {
     vi.stubEnv('IMCODES_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS', '50');
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
+    mock.fireTool('sess-1', {
+      id: 'tool-cancel-fallback',
+      name: 'Bash',
+      status: 'running',
+    });
     runtime.send('queued-after-lost-cancel', 'cmd-queued-lost-cancel');
     expect(runtime.pendingCount).toBe(1);
 
     const internal = runtime as unknown as {
       _lastActivityAt: number;
+      _lastProviderOutputAt: number;
     };
     internal._lastActivityAt = 1_000;
+    internal._lastProviderOutputAt = 1_000;
 
     const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
     expect(runtime.cancelStaleActiveTurnWithPending({
@@ -2459,6 +2531,20 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
     expect(runtime.getDiagnosticSnapshot(11_200).stalePendingRecoveryActive).toBe(false);
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-cancel-fallback',
+        tool: 'Bash',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+      }),
+      expect.objectContaining({
+        source: 'daemon',
+        confidence: 'high',
+      }),
+    );
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('queued-after-lost-cancel');
   });

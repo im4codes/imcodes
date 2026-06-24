@@ -864,6 +864,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
+    this.closeOpenTools('stale', 'provider_stale');
 
     if (providerStarted && providerCanCancel) {
       try {
@@ -1932,6 +1933,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return;
     }
     if (!this._activeTurn && !this._sending) {
+      this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
@@ -1949,6 +1951,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchProviderStarted = false;
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
+    this.closeOpenTools('cancelled', 'user_cancelled');
     if (!this._drainPending()) {
       this.setStatus('idle');
     }
