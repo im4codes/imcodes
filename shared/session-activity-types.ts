@@ -261,11 +261,17 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
           anonymousOpenToolCount = 0;
           active = false;
           if (eventGeneration) currentGeneration = eventGeneration;
-        } else if (openToolIds.size + anonymousOpenToolCount > 0) {
+        } else if (openToolIds.size > 0) {
+          // Anonymous tool calls are common in legacy/process-backed histories and
+          // cannot be attributed to the current transport generation. Do not let
+          // old anonymous calls poison every reconnect as permanently working.
+          anonymousOpenToolCount = 0;
           active = true;
           degraded = true;
           degradedReasons.add('weak_idle_with_open_work');
         } else {
+          anonymousOpenToolCount = 0;
+          active = false;
           degraded = true;
           degradedReasons.add('weak_idle');
         }

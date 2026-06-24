@@ -100,19 +100,31 @@ describe('session activity shared contract', () => {
     }, currentGeneration)).toMatchObject({ state: 'stale', blocking: true, clear: false });
   });
 
-  it('keeps legacy idle weak over open tools and closes on authoritative idle', () => {
+  it('keeps legacy idle weak over keyed open tools and closes on authoritative idle', () => {
     expect(reduceTimelineActivity([
-      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
       { type: 'session.state', payload: { state: 'idle' } },
     ])).toMatchObject({ active: true, degraded: true, openToolCount: 1 });
 
     expect(reduceTimelineActivity([
-      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
       {
         type: 'session.state',
         payload: authoritativeIdlePayload,
       },
     ])).toMatchObject({ active: false, openToolCount: 0 });
+  });
+
+  it('does not keep anonymous legacy tool calls active across idle', () => {
+    expect(reduceTimelineActivity([
+      { type: 'tool.call', payload: { tool: 'Bash' } },
+      { type: 'session.state', payload: { state: 'idle' } },
+    ])).toMatchObject({
+      active: false,
+      degraded: true,
+      openToolCount: 0,
+      degradedReasons: ['weak_idle'],
+    });
   });
 
   it('treats stale-generation authoritative idle as weak over open tools', () => {

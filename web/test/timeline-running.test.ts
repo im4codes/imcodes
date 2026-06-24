@@ -70,12 +70,20 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(false);
   });
 
-  it('does not let legacy idle close an unmatched tool call', () => {
+  it('does not let legacy idle close a keyed unmatched tool call', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'usage.update', payload: { model: 'gpt-5.5' } },
+    ] as any)).toBe(true);
+  });
+
+  it('does not keep an anonymous legacy tool call active across idle', () => {
     expect(hasActiveTimelineTurn([
       { type: 'tool.call', payload: { tool: 'Bash' } },
       { type: 'session.state', payload: { state: 'idle' } },
       { type: 'usage.update', payload: { model: 'gpt-5.5' } },
-    ] as any)).toBe(true);
+    ] as any)).toBe(false);
   });
 
   it('lets authoritative clean idle close an unmatched tool call', () => {
@@ -95,13 +103,13 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(false);
   });
 
-  it('keeps a turn active when a tool result follows an unmatched tool call before idle', () => {
+  it('does not keep a turn active after a tool result closes an anonymous tool call', () => {
     expect(hasActiveTimelineTurn([
       { type: 'session.state', payload: { state: 'idle' } },
       { type: 'tool.call', payload: { tool: 'Bash' } },
       { type: 'tool.result', payload: { output: 'done' } },
       { type: 'usage.update', payload: { model: 'gpt-5.5' } },
-    ] as any)).toBe(true);
+    ] as any)).toBe(false);
   });
 
   it('keeps a turn active when a tool call is the latest running tail', () => {

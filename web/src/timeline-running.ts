@@ -67,6 +67,7 @@ export function hasActiveTimelineTurn(
       continue;
     }
     if (userMessageTailRequiresSessionState && isRunningTimelineEvent(event)) continue;
+    if (event.type === 'tool.result') return hasActiveWorkThrough(events, i);
     if (isRunningTimelineEvent(event)) return true;
     if (NEUTRAL_TAIL_EVENT_TYPES.has(event.type)) continue;
     return false;

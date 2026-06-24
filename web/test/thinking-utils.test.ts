@@ -42,12 +42,20 @@ describe('hasActiveToolCall', () => {
     ] as any)).toBe(false);
   });
 
-  it('keeps an unmatched tool call active across legacy idle', () => {
+  it('keeps a keyed unmatched tool call active across legacy idle', () => {
+    expect(hasActiveToolCall([
+      { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'usage.update', payload: { model: 'gpt-5.5' } },
+    ] as any)).toBe(true);
+  });
+
+  it('does not keep an anonymous legacy tool call active across idle', () => {
     expect(hasActiveToolCall([
       { type: 'tool.call', payload: { tool: 'Bash' } },
       { type: 'session.state', payload: { state: 'idle' } },
       { type: 'usage.update', payload: { model: 'gpt-5.5' } },
-    ] as any)).toBe(true);
+    ] as any)).toBe(false);
   });
 
   it('lets authoritative idle close an unmatched tool call', () => {

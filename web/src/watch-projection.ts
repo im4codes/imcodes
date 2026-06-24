@@ -406,7 +406,8 @@ export class WatchProjectionStore {
   onSessionIdle(sessionName: string, timestamp = this.now()): boolean {
     const row = this.sessionsByName.get(sessionName);
     if (!row) return false;
-    if ((this.openToolCountBySession.get(sessionName) ?? 0) > 0 || (this.openToolKeysBySession.get(sessionName)?.size ?? 0) > 0) {
+    this.openToolCountBySession.delete(sessionName);
+    if ((this.openToolKeysBySession.get(sessionName)?.size ?? 0) > 0) {
       if (row.state !== 'working') {
         this.sessionsByName.set(sessionName, { ...row, state: 'working' });
         this.maybePush();
@@ -462,6 +463,8 @@ export class WatchProjectionStore {
           this.openToolCountBySession.delete(event.sessionId);
           this.openToolKeysBySession.delete(event.sessionId);
           if (eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
+        } else {
+          this.openToolCountBySession.delete(event.sessionId);
         }
       }
     }

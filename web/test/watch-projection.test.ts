@@ -339,7 +339,7 @@ describe('watch projection store', () => {
     expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
   });
 
-  it('does not let legacy idle close an open watch tool call before its result', () => {
+  it('does not let legacy idle close a keyed open watch tool call before its result', () => {
     const { store } = makeSnapshotStore(3_000);
     store.updateFromSessionList(
       { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
@@ -357,7 +357,7 @@ describe('watch projection store', () => {
       source: 'daemon',
       confidence: 'high',
       type: 'tool.call',
-      payload: { tool: 'read_file' },
+      payload: { toolCallId: 'A', tool: 'read_file' },
     });
 
     store.onSessionIdle('deck_proj_brain', 101);
@@ -387,6 +387,32 @@ describe('watch projection store', () => {
     });
 
     store.onSessionIdle('deck_proj_brain', 103);
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+  });
+
+  it('does not keep anonymous legacy watch tool calls working across idle', () => {
+    const { store } = makeSnapshotStore(3_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'idle' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'legacy-call',
+      sessionId: 'deck_proj_brain',
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { tool: 'read_file' },
+    });
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+
+    store.onSessionIdle('deck_proj_brain', 101);
     expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
   });
 
