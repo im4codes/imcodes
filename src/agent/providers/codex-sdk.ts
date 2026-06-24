@@ -26,6 +26,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionControlCommandText,
@@ -84,6 +85,8 @@ const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
   'runtime/subagent_notification',
   'runtime/subagent/status',
 ]);
+
+const CODEX_TOOL_LIKE_ITEM_TYPES = new Set(['commandExecution', 'mcpToolCall']);
 const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'subagentnotification',
   'subagentstatus',
@@ -404,11 +407,14 @@ interface CodexSdkSessionState {
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
+  runtimeActivityGeneration?: ActivityGeneration;
   turnStartInFlight: boolean;
   runningCompact: boolean;
   currentMessageId: string | null;
   currentText: string;
   activeItemIds: Set<string>;
+  activeToolItemIds: Set<string>;
+  activeCompactionItemIds: Set<string>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
@@ -451,6 +457,8 @@ interface CodexSdkSessionState {
   // transient mid-turn idle is cancelled by the activity that follows it.
   idleSettleTimer?: ReturnType<typeof setTimeout>;
   idleSettleTurnId?: string;
+  deferredIdleSettleTurnId?: string;
+  deferredCompactSettleTurnId?: string;
   generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
   rawChecklistStartedAt: number;
@@ -1543,11 +1551,33 @@ export class CodexSdkProvider implements TransportProvider {
       currentTextLength: state.currentText.length,
       activeItemCount: state.activeItemIds.size,
       activeItemIds: [...state.activeItemIds].slice(-20),
+      activeToolItemCount: state.activeToolItemIds.size,
+      activeToolItemIds: [...state.activeToolItemIds].slice(-20),
+      activeCompactionItemCount: state.activeCompactionItemIds.size,
       compactObserved: state.compactObserved,
       compactSettleArmed: Boolean(state.compactSettleTimer),
       compactHardTimeoutArmed: Boolean(state.compactHardTimer),
       cancelTimerArmed: Boolean(state.cancelTimer),
+      deferredIdleSettleTurnId: state.deferredIdleSettleTurnId ?? null,
+      deferredCompactSettleTurnId: state.deferredCompactSettleTurnId ?? null,
       rawChecklistPollArmed: Boolean(state.rawChecklistPollTimer),
+    };
+  }
+
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const busyReasons: SessionActivityBusyReason[] = [];
+    const activeToolCount = state.activeToolItemIds.size;
+    const compactionActive = state.runningCompact || state.activeCompactionItemIds.size > 0;
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (compactionActive) busyReasons.push('provider_compaction');
+    return {
+      activeWorkCount: activeToolCount + (compactionActive ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+      activityGeneration: state.runtimeActivityGeneration,
+      providerDiagnosticGeneration: state.runningTurnId ?? state.deferredIdleSettleTurnId ?? state.deferredCompactSettleTurnId ?? null,
     };
   }
 
@@ -1574,6 +1604,8 @@ export class CodexSdkProvider implements TransportProvider {
       currentMessageId: null,
       currentText: '',
       activeItemIds: new Set(),
+      activeToolItemIds: new Set(),
+      activeCompactionItemIds: new Set(),
       cancelled: false,
       cancelTimer: null,
       compactSettleTimer: null,
@@ -1588,6 +1620,8 @@ export class CodexSdkProvider implements TransportProvider {
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
       terminatedTurnIds: existing?.terminatedTurnIds ?? new Set(),
       terminatedCompactTurnIds: existing?.terminatedCompactTurnIds ?? new Set(),
+      deferredIdleSettleTurnId: undefined,
+      deferredCompactSettleTurnId: undefined,
       generatedImageTracking: null,
       generatedImagePaths: [],
       rawChecklistStartedAt: Date.now(),
@@ -1705,6 +1739,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.generatedImageTracking = null;
     state.generatedImagePaths = [];
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    state.runtimeActivityGeneration = payload.activityGeneration;
     if (this.isCompactCommand(payload)) {
       await this.startCompact(sessionId, state);
       return;
@@ -2650,7 +2685,9 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
       if (state.cancelled) return;
-      this.clearIdleSettleTimer(state); // item activity → turn active, cancel pending idle settle
+      if (method === 'item/started') {
+        this.clearIdleSettleTimer(state); // new item activity → turn active, cancel pending idle settle
+      }
       const closedTurn = this.isClosedCodexTurn(state, turnId);
 
       const item = params.item as Record<string, any> | undefined;
@@ -2671,6 +2708,10 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearCompactSettleTimer(state);
         state.runningTurnId = turnId ?? state.runningTurnId;
         if (method === 'item/completed') {
+          if (this.hasActiveToolItems(state)) {
+            state.deferredCompactSettleTurnId = turnId ?? state.runningTurnId ?? `${sessionId}:context-compaction`;
+            return;
+          }
           this.completeCompact(sessionId, state, turnId);
           return;
         }
@@ -2697,6 +2738,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (item.type === 'agentMessage') {
+        if (method === 'item/completed') this.clearIdleSettleTimer(state);
         // A new agentMessage item begins: clear the accumulator so its stream
         // starts fresh (prevents the previous message's text from bleeding into
         // this message's bubble during streaming). item/completed for the SAME
@@ -2748,7 +2790,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
-        state.turnStartInFlight = false;        state.activeItemIds.clear();
+        state.turnStartInFlight = false;        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
         if (this.isCodexAuthError(error)) {
@@ -2768,13 +2810,13 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
-          state.activeItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
+          state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
           return;
         }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
-        state.activeItemIds.clear();        this.clearPendingSessionSystemTextUpdate(state);
+        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -2794,6 +2836,8 @@ export class CodexSdkProvider implements TransportProvider {
         state.currentMessageId = null;
         state.currentText = '';
         state.activeItemIds.clear();
+        state.activeToolItemIds.clear();
+        state.activeCompactionItemIds.clear();
         state.cancelled = false;        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
@@ -2805,6 +2849,11 @@ export class CodexSdkProvider implements TransportProvider {
           state.currentMessageId = completedAgentMessage.id;
           state.currentText = completedAgentMessage.text;
         }
+      }
+
+      if (this.hasActiveToolItems(state)) {
+        state.deferredIdleSettleTurnId = turnId ?? state.runningTurnId ?? `${sessionId}:turn-completed`;
+        return;
       }
 
       await this.completeTurn(sessionId, state, turnId);
@@ -2878,6 +2927,11 @@ export class CodexSdkProvider implements TransportProvider {
       state.idleSettleTimer = undefined;
     }
     state.idleSettleTurnId = undefined;
+    state.deferredIdleSettleTurnId = undefined;
+  }
+
+  private hasActiveToolItems(state: CodexSdkSessionState): boolean {
+    return state.activeToolItemIds.size > 0;
   }
 
   /** Arm the debounced thread-idle settle for `turnId`. If no turn activity
@@ -2890,15 +2944,41 @@ export class CodexSdkProvider implements TransportProvider {
       state.idleSettleTimer = undefined;
       state.idleSettleTurnId = undefined;
       if (
-        state.runningTurnId === turnId
+        (!state.runningTurnId || state.runningTurnId === turnId)
         && !state.cancelled
         && !state.turnStartInFlight
         && !this.isClosedCodexTurn(state, turnId)
       ) {
+        if (this.hasActiveToolItems(state)) {
+          state.deferredIdleSettleTurnId = turnId;
+          return;
+        }
         void this.completeTurn(sessionId, state, turnId);
       }
     }, CODEX_IDLE_SETTLE_DEBOUNCE_MS);
     state.idleSettleTimer.unref?.();
+  }
+
+  private maybeArmDeferredIdleSettle(sessionId: string, state: CodexSdkSessionState): void {
+    const turnId = state.deferredIdleSettleTurnId;
+    if (!turnId || this.hasActiveToolItems(state)) return;
+    if (
+      (!state.runningTurnId || state.runningTurnId === turnId)
+      && !state.cancelled
+      && !state.turnStartInFlight
+      && !this.isClosedCodexTurn(state, turnId)
+    ) {
+      this.armIdleSettleTimer(sessionId, state, turnId);
+      return;
+    }
+    state.deferredIdleSettleTurnId = undefined;
+  }
+
+  private maybeCompleteDeferredCompact(sessionId: string, state: CodexSdkSessionState): void {
+    const turnId = state.deferredCompactSettleTurnId;
+    if (!turnId || this.hasActiveToolItems(state)) return;
+    state.deferredCompactSettleTurnId = undefined;
+    this.completeCompact(sessionId, state, turnId);
   }
 
   private rememberTerminatedTurn(state: CodexSdkSessionState, turnId?: string): void {
@@ -2958,6 +3038,8 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCompactTimers(state);    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
+    state.deferredCompactSettleTurnId = undefined;
+    state.activeCompactionItemIds.clear();
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.compactObserved = false;
@@ -3204,11 +3286,21 @@ export class CodexSdkProvider implements TransportProvider {
   ): void {
     const itemId = meaningfulString(item.id);
     if (itemId) {
-      if (method === 'item/started') {        state.activeItemIds.add(itemId);
+      if (method === 'item/started') {
+        state.activeItemIds.add(itemId);
+        if (CODEX_TOOL_LIKE_ITEM_TYPES.has(String(item.type))) state.activeToolItemIds.add(itemId);
+        if (item.type === 'contextCompaction') state.activeCompactionItemIds.add(itemId);
       } else {
         state.activeItemIds.delete(itemId);
+        state.activeToolItemIds.delete(itemId);
+        state.activeCompactionItemIds.delete(itemId);
       }
-    }  }
+    }
+    if (method === 'item/completed') {
+      this.maybeCompleteDeferredCompact(sessionId, state);
+      this.maybeArmDeferredIdleSettle(sessionId, state);
+    }
+  }
 
   private armCompactNoSignalSettle(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCompactSettleTimer(state);

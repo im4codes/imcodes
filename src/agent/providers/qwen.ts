@@ -24,6 +24,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
@@ -163,6 +164,7 @@ interface QwenSessionState {
   settingsPath?: string;
   /** Internal Qwen CLI conversation ID — decoupled from provider session ID so cancel can start fresh. */
   qwenConversationId: string;
+  runtimeActivityGeneration?: ActivityGeneration;
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
@@ -630,6 +632,26 @@ export class QwenProvider implements TransportProvider {
     };
   }
 
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const childActive = Boolean(state.child && !state.child.killed);
+    const activeToolCount = state.toolUseById.size;
+    const terminalResultPending = typeof state.pendingFinalText === 'string' && state.pendingFinalText.length > 0;
+    const busyReasons: SessionActivityBusyReason[] = [];
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (childActive && activeToolCount === 0 && !terminalResultPending) busyReasons.push('provider_wait');
+    return {
+      status: 'current',
+      activeWorkCount: activeToolCount + (childActive && activeToolCount === 0 && !terminalResultPending ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+      activityGeneration: state.runtimeActivityGeneration,
+      providerDiagnosticGeneration: state.qwenConversationId,
+      updatedAt: Date.now(),
+    };
+  }
+
   async disconnect(): Promise<void> {
     for (const [sessionId, state] of this.sessions) {
       if (state.child && !state.child.killed) {
@@ -797,6 +819,7 @@ export class QwenProvider implements TransportProvider {
     state.emittedToolSignatures.clear();
     state.lastStatusSignature = null;
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+    state.runtimeActivityGeneration = payload.activityGeneration;
     const isCompactControl = isSessionCompactCommandText(payload.userMessage);
     const providerPayload = isCompactControl ? toQwenCompactPayload(payload) : payload;
     const compactCompletionMetadata = isCompactControl
@@ -1217,6 +1240,10 @@ export class QwenProvider implements TransportProvider {
           if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
           const output = stringifyToolResultContent(block.content);
           const tool = state.toolUseById.get(block.tool_use_id);
+          state.toolUseById.delete(block.tool_use_id);
+          for (const [index, indexedTool] of state.toolUseByIndex) {
+            if (indexedTool.id === block.tool_use_id) state.toolUseByIndex.delete(index);
+          }
           emitTool({
             id: block.tool_use_id,
             name: tool?.name ?? 'tool',

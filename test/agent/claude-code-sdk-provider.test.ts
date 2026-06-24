@@ -943,6 +943,37 @@ describe('ClaudeCodeSdkProvider', () => {
     ]);
   });
 
+  it('reports active-work snapshots while Claude tool calls are open', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'stream_event',
+        session_id: 'session-active-work',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'tool-active-1', name: 'Read', input: { file_path: 'a.ts' } },
+        },
+      },
+    ]);
+    sdkMock.setWaitForClose(true);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-active-work', cwd: '/tmp/project', resumeId: 'session-active-work' });
+    await provider.send('route-active-work', 'hello');
+    await flush();
+
+    expect(provider.getActiveWorkSnapshot('route-active-work')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 2,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item', 'background_monitor'],
+    });
+
+    sdkMock.runs.at(-1)?.resolveClose?.();
+    await flush();
+  });
+
   it('emits a running SDK subagent snapshot for Claude task_started', async () => {
     const sessionName = 'deck_project_claude_start';
     const taskId = 'task-start-1';

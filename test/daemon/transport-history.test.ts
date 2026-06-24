@@ -88,6 +88,49 @@ describe('transport-history', () => {
     expect(events[0]['text']).toBe('kept');
   });
 
+  it('preserves tool call/result identity for restore replay without raw tool input', async () => {
+    const session = `${TS}-tool-identity`;
+    await appendTransportEvent(session, {
+      type: 'tool.call',
+      sessionId: session,
+      toolCallId: 'tool-restore-1',
+      tool: 'Bash',
+      input: { command: 'SECRET_COMMAND_SHOULD_NOT_REPLAY' },
+      detail: { raw: 'SECRET_DETAIL_SHOULD_NOT_REPLAY' },
+    });
+    await appendTransportEvent(session, {
+      type: 'tool.result',
+      sessionId: session,
+      toolCallId: 'tool-restore-1',
+      tool: 'Bash',
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      output: 'ok',
+    });
+
+    const events = await replayTransportHistory(session);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      type: 'tool.call',
+      sessionId: session,
+      toolCallId: 'tool-restore-1',
+      tool: 'Bash',
+    });
+    expect(events[0]['input']).toBeUndefined();
+    expect(events[0]['detail']).toBeUndefined();
+    expect(events[1]).toMatchObject({
+      type: 'tool.result',
+      sessionId: session,
+      toolCallId: 'tool-restore-1',
+      tool: 'Bash',
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      output: 'ok',
+    });
+    expect(JSON.stringify(events)).not.toContain('SECRET_COMMAND_SHOULD_NOT_REPLAY');
+    expect(JSON.stringify(events)).not.toContain('SECRET_DETAIL_SHOULD_NOT_REPLAY');
+  });
+
   it('stores tool.result output as a 1KB replay preview', async () => {
     const session = `${TS}-tool-result-preview`;
     const output = 'x'.repeat(10_000);
@@ -108,7 +151,7 @@ describe('transport-history', () => {
     expect(byteLength(event['output'])).toBeLessThanOrEqual(TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES);
     expect(String(event['output'])).toContain('transport result truncated');
     expect(event['detail']).toBeUndefined();
-    expect(event['tool']).toBeUndefined();
+    expect(event['tool']).toBe('Bash');
     expect(event['transportHistoryTruncated']).toBe(true);
   });
 

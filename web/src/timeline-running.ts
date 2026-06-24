@@ -1,4 +1,5 @@
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
 
 const RUNNING_TIMELINE_EVENT_TYPES = new Set<TimelineEvent['type']>([
   'assistant.thinking',
@@ -31,6 +32,15 @@ export function isIdleSessionStateTimelineEvent(
   return event.type === 'session.state' && String(event.payload?.state ?? '') === 'idle';
 }
 
+function isAuthoritativeCleanIdle(event: TimelineTailEvent): boolean {
+  return isIdleSessionStateTimelineEvent(event)
+    && isAuthoritativeCleanIdlePayload(event.payload ?? undefined);
+}
+
+function hasActiveWorkThrough(events: TimelineTailEvent[], endIndex: number): boolean {
+  return reduceTimelineActivity(events.slice(0, endIndex + 1) as any).active;
+}
+
 export function isPendingUserMessageTimelineEvent(
   event: TimelineTailEvent,
 ): boolean {
@@ -43,7 +53,10 @@ export function hasActiveTimelineTurn(
   let userMessageTailRequiresSessionState = false;
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
-    if (isIdleSessionStateTimelineEvent(event)) return false;
+    if (isIdleSessionStateTimelineEvent(event)) {
+      if (isAuthoritativeCleanIdle(event)) return hasActiveWorkThrough(events, i);
+      return hasActiveWorkThrough(events, i);
+    }
     if (event.type === 'session.state') {
       const state = String(event.payload?.state ?? '');
       return state === 'running' || state === 'queued';

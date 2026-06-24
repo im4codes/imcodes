@@ -731,7 +731,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![2].streaming).toBe(false);
     });
 
-    it('emits session.state idle with error message', () => {
+    it('emits session.state error with error message', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -740,7 +740,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
       expect(stateCall).toBeDefined();
       expect(stateCall![0]).toBe('sess-err');
-      expect(stateCall![2].state).toBe('idle');
+      expect(stateCall![2].state).toBe('error');
       expect(stateCall![2].error).toBe('Too many requests');
     });
 
@@ -786,7 +786,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
       expect(stateCall).toBeDefined();
       expect(stateCall![0]).toBe('sess-cancelled');
-      expect(stateCall![2]).toEqual({ state: 'idle' });
+      expect(stateCall![2]).toEqual({ state: 'error', error: 'Cancelled' });
       expect(appendMock).not.toHaveBeenCalled();
     });
 
@@ -939,9 +939,14 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
+      expect(call![2]).toEqual({ toolCallId: 'tool-1', tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:call');
       expect(call![3].hidden).not.toBe(true);
+      expect(appendMock).toHaveBeenCalledWith('sess-tool', expect.objectContaining({
+        type: 'tool.call',
+        toolCallId: 'tool-1',
+        tool: 'list_directory',
+      }));
     });
 
     it('emits tool.result for completed tools with stable eventId', () => {
@@ -959,7 +964,13 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
+      expect(call![2]).toEqual({
+        toolCallId: 'tool-1',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+        output: 'done',
+        detail: { kind: 'tool_result', output: 'done' },
+      });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
       expect(call![3].hidden).not.toBe(true);
     });
@@ -995,6 +1006,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-plan');
       expect(call![2]).toMatchObject({
+        toolCallId: 'todo-1',
         tool: 'update_plan',
         input: {
           plan: [
@@ -1010,8 +1022,14 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(result?.[3]).toMatchObject({
         eventId: 'transport-tool:sess-plan:todo-1:result',
       });
+      expect(result?.[2]).toMatchObject({
+        toolCallId: 'todo-1',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      });
       expect(appendMock).toHaveBeenCalledWith('sess-plan', expect.objectContaining({
         type: 'tool.call',
+        toolCallId: 'todo-1',
         tool: 'update_plan',
       }));
     });
@@ -1103,6 +1121,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call?.[3]?.hidden).toBe(true);
       expect(result?.[3]?.hidden).toBe(true);
+      expect(call?.[2]).toMatchObject({ toolCallId: 'sdk-task-terminal' });
+      expect(result?.[2]).toMatchObject({
+        toolCallId: 'sdk-task-terminal',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      });
       expect(call?.[2]?.detail?.meta?.canonicalKey).toBe(canonicalKey);
       expect(result?.[2]?.detail?.meta?.canonicalKey).toBe(canonicalKey);
       expect(result?.[2]).toMatchObject({
@@ -1172,6 +1196,9 @@ describe('transport-relay (timeline-emitter based)', () => {
       const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(result).toBeDefined();
       expect(result![2]).toMatchObject({
+        toolCallId: 'sdk-task-error',
+        terminalStatus: 'errored',
+        terminalReason: 'provider_error',
         error: 'error',
         detail: {
           kind: SDK_SUBAGENT_DETAIL_KIND,

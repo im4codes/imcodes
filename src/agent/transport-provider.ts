@@ -21,6 +21,7 @@ import type {
   ProviderSupportClass,
   SharedScopePolicyOverride,
 } from '../../shared/context-types.js';
+import type { ProviderActiveWorkSnapshot } from '../../shared/session-activity-types.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -351,6 +352,14 @@ export interface TransportProvider {
    * @returns Unsubscribe function that removes the callback.
    */
   onError(cb: (sessionId: string, error: ProviderError) => void): () => void;
+
+  /**
+   * Strongly-typed active-work snapshot for lifecycle gating.
+   * This is separate from provider diagnostics: diagnostics are debug JSON,
+   * while this snapshot is a small contract that runtimes may use to defer
+   * clean idle/queue drain while provider-owned tool or background work is open.
+   */
+  getActiveWorkSnapshot?(sessionId: string): ProviderActiveWorkSnapshot | null;
 
   /**
    * Create a new session on the provider.

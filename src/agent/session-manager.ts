@@ -55,6 +55,7 @@ import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
@@ -1452,17 +1453,37 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     if (status === 'thinking') {
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
-    const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
-    persistTransportState(mapped);
+    const mapped = (status === 'streaming' || status === 'thinking' || status === 'tool_running') ? 'running' : status;
     // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
     // During running/streaming, command-handler's 'queued' event is the sole queue-update
     // authority. This keeps queued messages visible in the UI until the drained turn completes.
-    const payload: Record<string, unknown> = { state: mapped };
-    if (mapped === 'idle') {
+    const activity = runtime.getDiagnosticSnapshot();
+    const effectiveMapped = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
+    persistTransportState(effectiveMapped);
+    const payload: Record<string, unknown> = { state: effectiveMapped };
+    if (effectiveMapped === 'running') {
+      payload.activityGeneration = activity.activityGeneration;
+      payload.blockingWorkCount = activity.blockingWorkCount;
+      payload.activeWorkCount = activity.blockingWorkCount;
+      payload.activeToolCount = activity.activeToolCount;
+      payload.busyReasons = activity.busyReasons;
+    }
+    if (effectiveMapped === 'idle') {
+      payload.authoritative = true;
+      payload.activityGeneration = activity.activityGeneration;
+      payload.blockingWorkCount = 0;
+      payload.activeWorkCount = 0;
+      payload.activeToolCount = 0;
+      payload.busyReasons = [];
+      payload.decisionReason = 'activity_reconciler_clear';
+      payload.clearInputs = [
+        { source: 'transport-runtime', reason: 'clear', count: 0 },
+      ];
       payload.pendingCount = runtime.pendingCount;
       payload.pendingMessages = runtime.pendingMessages;
       payload.pendingMessageEntries = runtime.pendingEntries;
-      payload.pendingMessageVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
+      payload.pendingVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
+      payload.pendingMessageVersion = payload.pendingVersion;
     } else if (mapped === 'error' && runtime.lastProviderError?.message) {
       payload.error = runtime.lastProviderError.message;
     }
@@ -1471,7 +1492,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       void recoverTransportRuntimeAfterError(sessionName, runtime);
     }
   };
-  runtime.onDrain = (messages, merged, count) => {
+  runtime.onDrain = (messages, merged, count, metadata) => {
     // The post-drain queue version. Stamped on the per-entry user.message
     // events AND the cleared session.state below so the UI advances its
     // baseline even if one of those events is lost on a weak network — a
@@ -1501,9 +1522,12 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     persistTransportState('running');
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'running',
+      activityGeneration: metadata.activityGeneration,
+      drainMetadata: metadata,
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
+      pendingVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
       pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
     }, { source: 'daemon', confidence: 'high' });
   };
@@ -1730,6 +1754,73 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
   return transportRuntimes.get(name);
 }
 
+type RestoreOpenToolCall = {
+  id: string;
+  tool?: string;
+  activityGeneration?: unknown;
+};
+
+function readTransportToolCallId(event: Record<string, unknown>): string | null {
+  for (const key of ['toolCallId', 'toolUseId', 'callId', 'id']) {
+    const value = event[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime: TransportSessionRuntime): Promise<number> {
+  let events: Record<string, unknown>[] = [];
+  try {
+    events = await replayTransportHistory(sessionName);
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'transport restore orphan reconcile could not read transport history');
+    return 0;
+  }
+  if (events.length === 0) return 0;
+
+  const openTools = new Map<string, RestoreOpenToolCall>();
+  for (const event of events) {
+    if (event.type !== 'tool.call' && event.type !== 'tool.result') continue;
+    const id = readTransportToolCallId(event);
+    if (!id) continue;
+    if (event.type === 'tool.call') {
+      openTools.set(id, {
+        id,
+        ...(typeof event.tool === 'string' && event.tool.trim() ? { tool: event.tool.trim() } : {}),
+        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration } : {}),
+      });
+    } else {
+      openTools.delete(id);
+    }
+  }
+  if (openTools.size === 0) return 0;
+
+  const activityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  let closed = 0;
+  for (const tool of openTools.values()) {
+    const payload: Record<string, unknown> = {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      activityGeneration,
+    };
+    timelineEmitter.emit(sessionName, 'tool.result', payload, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-tool:${sessionName}:${tool.id}:daemon_restart_orphan`,
+    });
+    await appendTransportEvent(sessionName, {
+      type: 'tool.result',
+      sessionId: sessionName,
+      ...payload,
+    });
+    closed++;
+  }
+  logger.info({ sessionName, closed }, 'transport restore reconciled orphan tool calls');
+  return closed;
+}
+
 /**
  * Restore transport session runtimes for a specific provider.
  * Called after provider auto-reconnect succeeds (restoreFromStore runs before provider connects).
@@ -1941,12 +2032,21 @@ export async function restoreTransportSessions(
       };
       upsertSession(restoredRecord);
       emitSessionPersist(restoredRecord, s.name);
+      await reconcileTransportRestoreOrphanTools(s.name, runtime);
+      const restoredActivity = runtime.getDiagnosticSnapshot();
       timelineEmitter.emit(s.name, 'session.state', {
         state: 'idle',
+        activityGeneration: restoredActivity.activityGeneration,
+        blockingWorkCount: restoredActivity.blockingWorkCount,
+        activeWorkCount: restoredActivity.blockingWorkCount,
+        activeToolCount: restoredActivity.activeToolCount,
+        busyReasons: restoredActivity.busyReasons,
+        decisionReason: 'restore_reconnect_observed',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
         pendingCount: runtime.pendingCount,
         pendingMessages: runtime.pendingMessages,
         pendingMessageEntries: runtime.pendingEntries,
+        pendingVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
         pendingMessageVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
       }, { source: 'daemon', confidence: 'high' });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');

@@ -16,6 +16,15 @@ import {
 } from '../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
+  evaluateProviderSnapshot,
+  type ActivityDrainMetadata,
+  type ActivityGeneration,
+  type ProviderActiveWorkSnapshot,
+  type SessionActivityBusyReason,
+  type ToolTerminalReason,
+  type ToolTerminalStatus,
+} from '../../shared/session-activity-types.js';
+import {
   SharedContextDispatchError,
   dispatchSharedContextSend,
   resolveTransportDispatchAuthority,
@@ -103,6 +112,12 @@ export interface TransportRuntimeDiagnosticSnapshot {
   };
   lastActivityAt: number;
   lastActivityAgeMs: number;
+  lastProviderOutputAt: number;
+  lastProviderOutputAgeMs: number | null;
+  activityGeneration: ActivityGeneration;
+  blockingWorkCount: number;
+  activeToolCount: number;
+  busyReasons: SessionActivityBusyReason[];
 }
 
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
@@ -350,11 +365,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   // (only read while the retry timer is set, and re-queue always sets it first).
   private _recoverableRetryEntryCount = 0;
   private _nextDispatchId = 0;
+  private _activityGeneration = 0;
+  private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private _externalCompletionSettlementsToIgnore = 0;
 
   /** Callback fired when pending messages are drained into a new turn. */
-  private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
+  private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
   /** Fired when the provider session binds (a non-null providerSessionId is
    *  established) and the runtime is fully configured. The daemon uses this to
@@ -424,6 +441,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._activeDispatchEntries = [];
           this._activeDispatchCancelled = false;
           this._activeDispatchProviderStarted = false;
+          this.closeOpenTools('cancelled', 'user_cancelled');
           if (this._activeDispatchId !== null) {
             this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
           }
@@ -516,6 +534,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeTurn = null;
         this.clearStalePendingCancelFallbackTimer();
         this._activeDispatchProviderStarted = false;
+        this.closeOpenTools(error.code === 'CANCELLED' ? 'cancelled' : 'errored', error.code === 'CANCELLED' ? 'user_cancelled' : 'provider_error');
         if (this._activeDispatchId !== null) {
           this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
         }
@@ -558,10 +577,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._lastActivityAt = Date.now();
       })] : []),
     );
-    const unsubscribeToolCall = this.provider.onToolCall?.((sid: string) => {
+    const unsubscribeToolCall = this.provider.onToolCall?.((sid: string, tool) => {
       if (sid !== this._providerSessionId) return;
       this._lastActivityAt = Date.now();
       this._lastProviderOutputAt = this._lastActivityAt;
+      this.recordToolActivity(tool);
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -588,7 +608,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   set onStatusChange(cb: (status: AgentStatus) => void) { this._onStatusChange = cb; }
 
   /** Register a callback for when pending messages are drained into a new turn. */
-  set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void) { this._onDrain = cb; }
+  set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void) { this._onDrain = cb; }
   /** Register a callback fired exactly once when startup memory reaches the provider. */
   set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
   /** Register a callback for provider session metadata updates. */
@@ -682,6 +702,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         }, 'Transport provider diagnostics read failed');
       }
     }
+    const activitySnapshot = this.getActivitySnapshot();
     return {
       status: this._status,
       sending: this._sending,
@@ -694,6 +715,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(this.lastProviderError ? { lastProviderError: this.lastProviderError } : {}),
       lastActivityAt: this._lastActivityAt,
       lastActivityAgeMs: Math.max(0, nowMs - this._lastActivityAt),
+      lastProviderOutputAt: this._lastProviderOutputAt,
+      lastProviderOutputAgeMs: this._lastProviderOutputAt > 0 ? Math.max(0, nowMs - this._lastProviderOutputAt) : null,
+      activityGeneration: this.currentActivityGeneration(),
+      blockingWorkCount: activitySnapshot.blockingWorkCount,
+      activeToolCount: activitySnapshot.activeToolCount,
+      busyReasons: activitySnapshot.busyReasons,
     };
   }
 
@@ -705,7 +732,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * the queue moving without requiring a user Stop click.
    */
   drainPendingIfIdle(reason = 'idle-observed'): boolean {
-    if (this._status !== 'idle') return false;
+    if (this._status !== 'idle' && this._status !== 'tool_running') return false;
     return this.drainPendingIfNoActiveTurn(reason);
   }
 
@@ -729,7 +756,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._sending && !this._activeTurn && this._activeDispatchEntries.length === 0) return false;
     const nowMs = options?.nowMs ?? Date.now();
     const staleMs = options?.staleMs ?? getTransportStalePendingRecoveryMs();
-    const lastActivityAgeMs = Math.max(0, nowMs - this._lastActivityAt);
+    const providerOutputAt = this._lastProviderOutputAt || this._lastActivityAt;
+    const lastActivityAgeMs = Math.max(0, nowMs - providerOutputAt);
     if (lastActivityAgeMs < staleMs) return false;
 
     this._activeDispatchStaleRecoveryStarted = true;
@@ -743,6 +771,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         pendingCount: this._pendingMessages.length,
         pendingVersion: this._pendingVersion,
         lastActivityAgeMs,
+        lastProviderOutputAt: this._lastProviderOutputAt,
         staleMs,
       },
       'transport runtime active turn is stale with queued messages; cancelling once so pending work can drain',
@@ -861,6 +890,39 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private drainPendingIfNoActiveTurn(reason: string): boolean {
     if (this._sending || this._activeTurn) return false;
+    if (this._activeDispatchEntries.length > 0) {
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          pendingCount: this._pendingMessages.length,
+          pendingVersion: this._pendingVersion,
+          reason,
+          activeDispatchCount: this._activeDispatchEntries.length,
+        },
+        'transport runtime cleared stale active dispatch entries before idle/drain reconciliation',
+      );
+      this._activeDispatchEntries = [];
+      this._activeDispatchId = null;
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchCancelled = false;
+      this._activeDispatchStaleRecoveryStarted = false;
+    }
+    const activity = this.getActivitySnapshot();
+    if (activity.blockingWorkCount > 0) {
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          pendingCount: this._pendingMessages.length,
+          reason,
+          activityGeneration: this.currentActivityGeneration(),
+          blockingWorkCount: activity.blockingWorkCount,
+          busyReasons: activity.busyReasons,
+        },
+        'transport runtime idle drain deferred because provider still reports active work',
+      );
+      if (this._status === 'idle') this.setStatus('tool_running');
+      return false;
+    }
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
     logger.warn(
       {
@@ -875,13 +937,130 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private hasActiveTurnWork(): boolean {
-    return this._sending
-      || !!this._activeTurn
-      || this._activeDispatchEntries.length > 0
-      // A pending recoverable-retry means a turn is mid-delivery (re-queued,
-      // waiting on backoff). The session is busy: new sends must queue behind
-      // it, and status must read in-progress rather than idle.
-      || this._recoverableRetryTimer !== null;
+    return this.getActivitySnapshot().blockingWorkCount > 0;
+  }
+
+  private getProviderActiveWorkSnapshot(): ProviderActiveWorkSnapshot | null {
+    if (!this._providerSessionId || !this.provider.getActiveWorkSnapshot) return null;
+    try {
+      return this.provider.getActiveWorkSnapshot(this._providerSessionId);
+    } catch (err) {
+      logger.warn(
+        { err, sessionKey: this.sessionKey, providerSessionId: this._providerSessionId, provider: this.provider.id },
+        'transport runtime provider active-work snapshot read failed',
+      );
+      return {
+        status: 'error',
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: ['snapshot_error'],
+        activityGeneration: this.currentActivityGeneration(),
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
+  private currentActivityGeneration(): ActivityGeneration {
+    return {
+      scope: 'session',
+      sessionName: this.sessionKey,
+      generation: this._activityGeneration,
+    };
+  }
+
+  private activityGenerationFor(generation: number): ActivityGeneration {
+    return {
+      scope: 'session',
+      sessionName: this.sessionKey,
+      generation,
+    };
+  }
+
+  private emitSyntheticToolTerminal(
+    toolId: string,
+    tool: { generation: number; name: string },
+    terminalStatus: ToolTerminalStatus,
+    terminalReason: ToolTerminalReason,
+  ): void {
+    timelineEmitter.emit(this.sessionKey, 'tool.result', {
+      toolCallId: toolId,
+      tool: tool.name,
+      terminalStatus,
+      terminalReason,
+      activityGeneration: this.activityGenerationFor(tool.generation),
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-tool:${this.sessionKey}:${toolId}:${terminalReason}`,
+    });
+  }
+
+  private closeOpenTools(
+    terminalStatus: ToolTerminalStatus,
+    terminalReason: ToolTerminalReason,
+    options?: { olderThanGeneration?: number },
+  ): number {
+    let closed = 0;
+    for (const [toolId, tool] of [...this._openTools]) {
+      if (options?.olderThanGeneration !== undefined && tool.generation >= options.olderThanGeneration) continue;
+      this.emitSyntheticToolTerminal(toolId, tool, terminalStatus, terminalReason);
+      this._openTools.delete(toolId);
+      closed++;
+    }
+    return closed;
+  }
+
+  private getActivitySnapshot(): {
+    blockingWorkCount: number;
+    activeToolCount: number;
+    busyReasons: SessionActivityBusyReason[];
+    providerSnapshot: ProviderActiveWorkSnapshot | null;
+  } {
+    const busyReasons: SessionActivityBusyReason[] = [];
+    let blockingWorkCount = 0;
+    const add = (reason: SessionActivityBusyReason, count = 1) => {
+      if (count <= 0) return;
+      blockingWorkCount += count;
+      if (!busyReasons.includes(reason)) busyReasons.push(reason);
+    };
+
+    if (this._sending || this._activeTurn) add('runtime_dispatch');
+    add('active_dispatch_entry', this._activeDispatchEntries.length);
+    if (this._recoverableRetryTimer !== null) add('recoverable_retry');
+    const openToolCount = this._openTools.size;
+    add('open_tool_call', openToolCount);
+
+    const providerSnapshot = this.getProviderActiveWorkSnapshot();
+    if (providerSnapshot) {
+      const expectedGeneration = this._activityGeneration > 0 ? this.currentActivityGeneration() : undefined;
+      const evaluation = evaluateProviderSnapshot(providerSnapshot, expectedGeneration);
+      if (evaluation.blocking) {
+        const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
+        add(evaluation.reason, count);
+        for (const reason of providerSnapshot.busyReasons) {
+          if (!busyReasons.includes(reason)) busyReasons.push(reason);
+        }
+      }
+    }
+
+    return {
+      blockingWorkCount,
+      activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
+      busyReasons,
+      providerSnapshot,
+    };
+  }
+
+  private recordToolActivity(tool: { id: string; name: string; status: 'running' | 'complete' | 'error' }): void {
+    const generation = this._activityGeneration;
+    if (tool.status === 'running') {
+      this._openTools.set(tool.id, { generation, name: tool.name, status: 'running' });
+      return;
+    }
+    this._openTools.delete(tool.id);
+    if (this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
+      this.drainPendingIfNoActiveTurn(`tool-${tool.status}`);
+    }
   }
 
   private isInProgressStatus(status: AgentStatus): boolean {
@@ -1097,6 +1276,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._pendingMessages.splice(0, retriedEntryCount);
         this._pendingVersion++;
       }
+      this.closeOpenTools('cancelled', 'user_cancelled');
       // Remaining queued messages drain (deliver) after the cancelled turn;
       // settle idle when nothing is left.
       if (!this._drainPending()) this.setStatus('idle');
@@ -1132,7 +1312,18 @@ export class TransportSessionRuntime implements SessionRuntime {
     // nothing is queued — without draining here, since the callback owns the
     // drain, so a session with queued work keeps running through to its next
     // turn.
-    if (this.pendingCount === 0) this.setStatus('idle');
+    if (this.pendingCount === 0) {
+      this._sending = false;
+      this._activeTurn?.resolve();
+      this._activeTurn = null;
+      this._activeDispatchEntries = [];
+      this.closeOpenTools('cancelled', 'user_cancelled');
+      this.clearStalePendingCancelFallbackTimer();
+      this._activeDispatchProviderStarted = false;
+      this._activeDispatchId = null;
+      this._activeDispatchStaleRecoveryStarted = false;
+      this.setStatus('idle');
+    }
     await this.provider.cancel(this._providerSessionId);
   }
 
@@ -1154,10 +1345,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._activeTurn) {
       this._activeTurn.reject({ code: 'CANCELLED', message: 'Session killed', recoverable: false });
     }
-    this.setStatus('idle');
     this._sending = false;
     this._activeTurn = null;
     this._activeDispatchEntries = [];
+    this.closeOpenTools('cancelled', 'user_cancelled');
     this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
@@ -1175,6 +1366,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._pendingVersion++;
     }
     this._pendingMessages = [];
+    this.setStatus('idle');
     // Per-session memory injection history is daemon-scoped to this session;
     // a kill ends that scope. clear() is called on session.clear separately.
     clearRecentInjectionHistory(this.sessionKey);
@@ -1186,6 +1378,16 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private setStatus(status: AgentStatus): void {
     if (status === 'idle' && this.drainPendingIfNoActiveTurn('setStatus')) return;
+    if (status === 'idle') {
+      const activity = this.getActivitySnapshot();
+      if (activity.blockingWorkCount > 0) {
+        logger.warn(
+          { sessionKey: this.sessionKey, activity },
+          'transport runtime clean idle deferred because activity reconciler still reports blocking work',
+        );
+        status = 'tool_running';
+      }
+    }
     if (this._status === status) return;
     this._status = status;
     if (!this._onStatusChange) return;
@@ -1329,6 +1531,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     dispatchedEntries?: PendingTransportMessage[],
   ): void {
     const dispatchId = ++this._nextDispatchId;
+    this._activityGeneration++;
+    this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
     this._lastActivityAt = Date.now();
     this._sending = true;
     this._lastProviderError = null;
@@ -1427,6 +1631,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // it does NOT ride the per-turn payload at all.
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: message,
+        activityGeneration: this.currentActivityGeneration(),
         messagePreamble,
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
@@ -1619,6 +1824,22 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
+    const activity = this.getActivitySnapshot();
+    if (activity.blockingWorkCount > 0) {
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          pendingCount: this._pendingMessages.length,
+          pendingVersion: this._pendingVersion,
+          activityGeneration: this.currentActivityGeneration(),
+          blockingWorkCount: activity.blockingWorkCount,
+          busyReasons: activity.busyReasons,
+        },
+        'transport runtime pending drain deferred because activity reconciler still reports blocking work',
+      );
+      if (this._status === 'idle') this.setStatus('tool_running');
+      return false;
+    }
     // Draining now supersedes any pending recoverable-retry backoff.
     this.clearRecoverableRetryTimer();
 
@@ -1633,6 +1854,18 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._pendingVersion++;
     const merged = messages.map((entry) => entry.text).join('\n\n');
     const attachments = messages.flatMap((entry) => entry.attachments ?? []);
+    const drainMetadata: ActivityDrainMetadata = {
+      activityGeneration: this.currentActivityGeneration(),
+      pendingVersion: this._pendingVersion,
+      entries: messages.map((entry, index) => ({
+        clientMessageId: entry.clientMessageId,
+        ordinal: index,
+        ...(entry.sharedActor?.queuedAt ? { queuedAt: entry.sharedActor.queuedAt } : {}),
+        ...(entry.attachments?.length ? { attachmentIds: entry.attachments.map((attachment) => attachment.id) } : {}),
+        ...(entry.sharedActor?.snapshot?.target?.kind === 'main' ? { actorSessionName: entry.sharedActor.snapshot.target.sessionName } : {}),
+        ...(entry.sharedActor?.actionId ? { sharedActionId: entry.sharedActor.actionId } : {}),
+      })),
+    };
     // N1 defensive fix (audit f395d49c-78c) — set `_sending=true` BEFORE
     // calling `_onDrain` so any synchronous re-entrant `runtime.send` from
     // an onDrain listener queues into `_pendingMessages` instead of
@@ -1645,7 +1878,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // `_pendingMessages` already spliced empty — runtime stuck forever,
     // user-visible as bug 2 "bot stays asleep".
     try {
-      this._onDrain?.(timelineMessages.map(publicPendingEntry), merged, messages.length);
+      this._onDrain?.(timelineMessages.map(publicPendingEntry), merged, messages.length, drainMetadata);
     } catch (err) {
       logger.warn(
         { err, providerSessionId: this._providerSessionId, count: messages.length },

@@ -339,6 +339,115 @@ describe('watch projection store', () => {
     expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
   });
 
+  it('does not let legacy idle close an open watch tool call before its result', () => {
+    const { store } = makeSnapshotStore(3_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'idle' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'e1',
+      sessionId: 'deck_proj_brain',
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { tool: 'read_file' },
+    });
+
+    store.onSessionIdle('deck_proj_brain', 101);
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+
+    store.handleTimelineEvent({
+      eventId: 'e2',
+      sessionId: 'deck_proj_brain',
+      ts: 102,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: {
+        state: 'idle',
+        authoritative: true,
+        activityGeneration: 1,
+        blockingWorkCount: 0,
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        pendingCount: 0,
+        pendingVersion: 1,
+        decisionReason: 'activity_reconciler_clear',
+        clearInputs: [{ source: 'transport-runtime', reason: 'clear', count: 0 }],
+      },
+    });
+
+    store.onSessionIdle('deck_proj_brain', 103);
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+  });
+
+  it('keeps keyed watch tools active across duplicate or unknown terminals', () => {
+    const { store } = makeSnapshotStore(3_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex-sdk', state: 'idle' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'call-a',
+      sessionId: 'deck_proj_brain',
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { toolCallId: 'A', tool: 'Bash' },
+    });
+    store.handleTimelineEvent({
+      eventId: 'call-b',
+      sessionId: 'deck_proj_brain',
+      ts: 101,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { toolCallId: 'B', tool: 'Read' },
+    });
+    store.handleTimelineEvent({
+      eventId: 'result-a',
+      sessionId: 'deck_proj_brain',
+      ts: 102,
+      seq: 3,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { toolCallId: 'A', terminalStatus: 'succeeded' },
+    });
+    store.handleTimelineEvent({
+      eventId: 'result-unknown',
+      sessionId: 'deck_proj_brain',
+      ts: 103,
+      seq: 4,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { toolCallId: 'unknown', terminalStatus: 'succeeded' },
+    });
+
+    store.onSessionIdle('deck_proj_brain', 104);
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+  });
+
   it('updateFromSessionList triggers syncSnapshot after debounce with full payload', async () => {
     const { store, pushes } = makeSnapshotStore(5_000);
     store.setApiKey('test-key');

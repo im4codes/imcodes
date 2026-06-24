@@ -156,6 +156,7 @@ import { getTransportRuntime, launchTransportSession, relaunchSessionWithSetting
 import { newSession } from '../../src/agent/tmux.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
+import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 const flush = async () => {
@@ -329,6 +330,64 @@ describe('sdk transport session restore', () => {
       expect.objectContaining({ state: 'running' }),
       { source: 'daemon', confidence: 'high' },
     );
+  });
+
+  it('reconciles unmatched persisted transport tool calls as daemon restart orphans before restore idle observation', async () => {
+    const sessionName = `deck_sdk_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await appendTransportEvent(sessionName, {
+      type: 'tool.call',
+      sessionId: sessionName,
+      toolCallId: 'restore-tool-1',
+      tool: 'Bash',
+      input: { command: 'SECRET_RESTORE_COMMAND' },
+    });
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkorphan',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-orphan',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-orphan',
+      codexSessionId: 'codex-thread-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    const terminalIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'tool.result'
+      && call[2]?.toolCallId === 'restore-tool-1'
+      && call[2]?.terminalStatus === 'stale'
+      && call[2]?.terminalReason === 'daemon_restart_orphan'
+    );
+    const restoreStateIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'session.state'
+      && call[2]?.decisionReason === 'restore_reconnect_observed'
+    );
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(restoreStateIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeLessThan(restoreStateIndex);
+    expect(timelineEmitterEmitMock.mock.calls[restoreStateIndex]?.[2]).not.toHaveProperty('authoritative');
+
+    const replayed = await replayTransportHistory(sessionName);
+    expect(replayed).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'tool.result',
+        toolCallId: 'restore-tool-1',
+        terminalStatus: 'stale',
+        terminalReason: 'daemon_restart_orphan',
+      }),
+    ]));
+    expect(JSON.stringify(replayed)).not.toContain('SECRET_RESTORE_COMMAND');
   });
 
   it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {

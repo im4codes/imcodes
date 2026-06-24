@@ -1723,6 +1723,9 @@ describe('CodexSdkProvider', () => {
       'active',
       'activeItemCount',
       'activeItemIds',
+      'activeToolItemCount',
+      'activeToolItemIds',
+      'activeCompactionItemCount',
       'activeReason',
       'cancelTimerArmed',
       'cancelled',
@@ -1731,6 +1734,8 @@ describe('CodexSdkProvider', () => {
       'compactSettleArmed',
       'currentMessageId',
       'currentTextLength',
+      'deferredIdleSettleTurnId',
+      'deferredCompactSettleTurnId',
       'loaded',
       'provider',
       'rawChecklistPollArmed',
@@ -1810,6 +1815,133 @@ describe('CodexSdkProvider', () => {
     await waitForCondition(() => completed.length === 1);
     expect(completed).toEqual(['Done']);
     expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
+  });
+
+  it('defers thread-idle fallback while a Codex commandExecution item is active', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-active-command', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-active-command', 'run a long command');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-active-command')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'sleep 120',
+          status: 'inProgress',
+          processId: 45580,
+        },
+      },
+    });
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-active-command')?.activeItemCount === 1,
+    );
+
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
+      runningTurnId: 'turn-1',
+      activeItemCount: 1,
+      deferredIdleSettleTurnId: 'turn-1',
+    });
+
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'sleep 120',
+          status: 'completed',
+          processId: 45580,
+          exitCode: 0,
+          durationMs: 120000,
+        },
+      },
+    });
+
+    await waitForCondition(() => completed.length === 1);
+    expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
+      runningTurnId: null,
+      activeItemCount: 0,
+      deferredIdleSettleTurnId: null,
+    });
+  });
+
+  it('defers turn/completed while a Codex commandExecution item is active', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-turn-completed-active-command', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-turn-completed-active-command', 'run a long command');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-turn-completed-active-command')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 120', status: 'inProgress' },
+      },
+    });
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-turn-completed-active-command')?.activeToolItemCount === 1,
+    );
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        turn: {
+          id: 'turn-1',
+          status: 'completed',
+          items: [{ id: 'msg-1', type: 'agentMessage', text: 'Done after command' }],
+        },
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-turn-completed-active-command')).toMatchObject({
+      runningTurnId: 'turn-1',
+      activeToolItemCount: 1,
+      deferredIdleSettleTurnId: 'turn-1',
+    });
+
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'cmd-1', type: 'commandExecution', status: 'completed', exitCode: 0 },
+      },
+    });
+
+    await waitForCondition(() => completed.length === 1);
+    expect(completed[0]).toContain('Done after command');
   });
 
   it('resumes with stored thread id on existing session', async () => {

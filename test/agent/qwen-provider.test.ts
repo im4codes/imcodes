@@ -1331,9 +1331,29 @@ describe('QwenProvider', () => {
     const run = lastSpawn();
     run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-1', name: 'list_directory' } } })}\n`);
     run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{\"path\":\"/tmp/project\"}' } } })}\n`);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+    });
     run.child.stdout.write(`${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false }] } })}\n`);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
     run.child.emit('close', 0, null);
     await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
 
     expect(tools).toEqual([
       {

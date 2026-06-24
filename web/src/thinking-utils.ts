@@ -7,6 +7,7 @@
  * Only assistant.text, user.message, and session.state=idle end thinking.
  * Tool calls, status updates, and other events are skipped (don't end thinking).
  */
+import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
 
 const THINKING_SKIP_TYPES = new Set([
   'agent.status',
@@ -30,7 +31,9 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
     }
     // session.state: idle = agent finished (end thinking), running = skip (don't end thinking)
     if (e.type === 'session.state') {
-      if (e.payload?.state === 'idle') break;
+      if (e.payload?.state === 'idle'
+        && isAuthoritativeCleanIdlePayload(e.payload)
+        && !reduceTimelineActivity(events.slice(0, i + 1)).active) break;
       continue;
     }
     if (THINKING_SKIP_TYPES.has(e.type)) continue;
@@ -71,18 +74,7 @@ export function getActiveStatusText(events: Array<{ type: string; payload?: Reco
  * Only a trailing tool.call counts. A trailing tool.result means the tool already finished.
  */
 export function hasActiveToolCall(events: Array<{ type: string; payload?: Record<string, unknown> }>): boolean {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i];
-    if (e.type === 'tool.call') return true;
-    if (e.type === 'tool.result') return false;
-    if (e.type === 'session.state') {
-      if (e.payload?.state === 'idle') return false;
-      continue;
-    }
-    if (e.type === 'assistant.thinking' || THINKING_SKIP_TYPES.has(e.type)) continue;
-    return false;
-  }
-  return false;
+  return reduceTimelineActivity(events).openToolCount > 0;
 }
 
 /**
@@ -97,6 +89,7 @@ export function getTailSessionState(
     const e = events[i];
     if (e.type !== 'session.state') continue;
     const state = e.payload?.state;
+    if (state === 'idle' && reduceTimelineActivity(events.slice(0, i + 1)).active) return 'running';
     return typeof state === 'string' && state ? state : null;
   }
   return null;

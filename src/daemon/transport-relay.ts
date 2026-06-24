@@ -87,6 +87,7 @@ function isChecklistTool(tool: ToolCallEvent): boolean {
 
 function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
   timelineEmitter.emit(sessionName, 'tool.call', {
+    toolCallId: tool.id,
     tool: tool.name,
     ...(tool.input !== undefined ? { input: tool.input } : {}),
     ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -98,6 +99,7 @@ function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
   void appendTransportEvent(sessionName, {
     type: 'tool.call',
     sessionId: sessionName,
+    toolCallId: tool.id,
     tool: tool.name,
     ...(tool.input !== undefined ? { input: tool.input } : {}),
     ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -106,6 +108,9 @@ function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
 
 function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   timelineEmitter.emit(sessionName, 'tool.result', {
+    toolCallId: tool.id,
+    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
+    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -120,6 +125,9 @@ function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   void appendTransportEvent(sessionName, {
     type: 'tool.result',
     sessionId: sessionName,
+    toolCallId: tool.id,
+    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
+    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -357,7 +365,8 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
       timelineEmitter.emit(sessionName, 'session.state', {
-        state: 'idle',
+        state: 'error',
+        error: error.message,
       }, { source: 'daemon', confidence: 'high' });
       return;
     }
@@ -377,7 +386,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     });
 
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'idle',
+      state: 'error',
       error: error.message,
     }, { source: 'daemon', confidence: 'high' });
 
@@ -531,6 +540,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (fileChangeBatch) {
       timelineEmitter.emit(sessionName, 'tool.call', {
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
@@ -543,12 +553,16 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.call',
         sessionId: sessionName,
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
         hidden: true,
       });
       timelineEmitter.emit(sessionName, 'tool.result', {
+        toolCallId: effectiveTool.id,
+        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
+        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
         ...(effectiveTool.status === 'error'
           ? { error: effectiveTool.output ?? 'error' }
           : effectiveTool.output !== undefined
@@ -564,6 +578,9 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.result',
         sessionId: sessionName,
+        toolCallId: effectiveTool.id,
+        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
+        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
         tool: effectiveTool.name,
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
         ...(effectiveTool.status === 'error'
@@ -583,6 +600,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (pending && looksLikeStructuredFileTool) {
       timelineEmitter.emit(sessionName, 'tool.call', {
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
@@ -594,6 +612,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.call',
         sessionId: sessionName,
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
@@ -602,6 +621,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (tool.status === 'running') {
       timelineEmitter.emit(sessionName, 'tool.call', {
+        toolCallId: tool.id,
         tool: tool.name,
         ...(tool.input !== undefined ? { input: tool.input } : {}),
         ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -613,6 +633,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.call',
         sessionId: sessionName,
+        toolCallId: tool.id,
         tool: tool.name,
         ...(tool.input !== undefined ? { input: tool.input } : {}),
         ...(tool.detail !== undefined ? { detail: tool.detail } : {}),

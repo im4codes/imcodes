@@ -380,13 +380,19 @@ export function buildSdkSubagentTimelinePayload(
     return {
       detail,
       payload: {
+        toolCallId: tool.id,
         tool: tool.name,
         ...(detail.input !== undefined ? { input: detail.input } : {}),
         detail,
       },
     };
   }
-  const payload: Record<string, unknown> = { detail };
+  const payload: Record<string, unknown> = {
+    toolCallId: tool.id,
+    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
+    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    detail,
+  };
   if (tool.status === 'error') payload.error = detail.output ?? 'error';
   else if (detail.output !== undefined) payload.output = detail.output;
   return { detail, payload };

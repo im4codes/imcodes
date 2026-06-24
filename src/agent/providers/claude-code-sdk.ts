@@ -24,6 +24,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
 import { PendingQuestionRegistry, type InteractiveQuestionAnswerer } from '../pending-question-registry.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
@@ -144,6 +145,7 @@ interface ClaudeSdkSessionState {
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
   turnGeneration: number;
+  runtimeActivityGeneration?: ActivityGeneration;
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
   resultCompletionGeneration?: number;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
@@ -415,6 +417,26 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     };
   }
 
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeToolCount = state.toolCalls.size + Array.from(state.runtimeAgentToolCalls.values()).length;
+    const activeSubagentCount = Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal).length;
+    const backgroundActive = Boolean(state.currentQuery || (state.currentChild && !state.currentChild.killed) || state.resultCompletionTimer);
+    const busyReasons: SessionActivityBusyReason[] = [];
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (activeSubagentCount > 0 || backgroundActive) busyReasons.push('background_monitor');
+    return {
+      status: 'current',
+      activeWorkCount: activeToolCount + activeSubagentCount + (backgroundActive ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+      activityGeneration: state.runtimeActivityGeneration,
+      providerDiagnosticGeneration: state.turnGeneration,
+      updatedAt: Date.now(),
+    };
+  }
+
   async endSession(sessionId: string): Promise<void> {
     // Release any paused AskUserQuestion so a torn-down session never leaks a
     // pending timer / unresolved canUseTool promise. Keyed by sessionName.
@@ -497,6 +519,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Claude SDK session is already busy', true);
     }
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+    state.runtimeActivityGeneration = payload.activityGeneration;
     await this.startQuery(sessionId, state, payload, true);
   }
 

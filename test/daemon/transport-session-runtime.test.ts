@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -58,6 +58,7 @@ function makeMockProvider(id = 'mock') {
   let approvalCb: ((sid: string, req: { id: string; description: string; tool?: string }) => void) | null = null;
   let statusCb: ((sid: string, status: ProviderStatusUpdate) => void) | null = null;
   let usageCb: ((sid: string, update: ProviderUsageUpdate) => void) | null = null;
+  let toolCb: ((sid: string, tool: ToolCallEvent) => void) | null = null;
 
   const fireDelta = (sid: string) =>
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
@@ -80,6 +81,8 @@ function makeMockProvider(id = 'mock') {
     statusCb?.(sid, status);
   const fireUsage = (sid: string, update: ProviderUsageUpdate) =>
     usageCb?.(sid, update);
+  const fireTool = (sid: string, tool: ToolCallEvent) =>
+    toolCb?.(sid, tool);
 
   return {
     provider: {
@@ -93,9 +96,10 @@ function makeMockProvider(id = 'mock') {
       onApprovalRequest: (cb: (sid: string, req: { id: string; description: string; tool?: string }) => void) => { approvalCb = cb; },
       onStatus: (cb: (sid: string, status: ProviderStatusUpdate) => void) => { statusCb = cb; return () => { statusCb = null; }; },
       onUsage: (cb: (sid: string, update: ProviderUsageUpdate) => void) => { usageCb = cb; return () => { usageCb = null; }; },
+      onToolCall: (cb: (sid: string, tool: ToolCallEvent) => void) => { toolCb = cb; return () => { toolCb = null; }; },
       respondApproval: vi.fn().mockResolvedValue(undefined),
     } as unknown as TransportProvider,
-    fireDelta, fireComplete, fireError, fireApproval, fireStatus, fireUsage,
+    fireDelta, fireComplete, fireError, fireApproval, fireStatus, fireUsage, fireTool,
   };
 }
 
@@ -528,6 +532,177 @@ describe('TransportSessionRuntime', () => {
     await flushDispatch();
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.pendingVersion).toBe(5);
+  });
+
+  it('fails closed on provider active/stale snapshots and drains after current-clear without Stop', async () => {
+    runtime.send('first', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued while provider active', 'cmd-queued');
+
+    let snapshotMode: 'active' | 'stale' | 'clear' = 'active';
+    const currentGeneration = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => {
+      if (snapshotMode === 'active') {
+        return {
+          status: 'current',
+          activeWorkCount: 1,
+          activeToolCount: 1,
+          busyReasons: ['provider_tool_item'],
+          generation: currentGeneration,
+          updatedAt: Date.now(),
+        };
+      }
+      if (snapshotMode === 'stale') {
+        return {
+          status: 'stale',
+          activeWorkCount: 0,
+          activeToolCount: 0,
+          busyReasons: [],
+          generation: currentGeneration,
+          updatedAt: Date.now() - 60_000,
+        };
+      }
+      return {
+        status: 'current',
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+        generation: currentGeneration,
+        updatedAt: Date.now(),
+      };
+    });
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.getStatus()).toBe('tool_running');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('provider_tool_item');
+
+    snapshotMode = 'stale';
+    expect(runtime.drainPendingIfIdle('health-poll-stale')).toBe(false);
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('snapshot_stale');
+
+    snapshotMode = 'clear';
+    expect(runtime.drainPendingIfIdle('health-poll-clear')).toBe(true);
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('treats session-local stale provider generation as blocking evidence', async () => {
+    runtime.send('first generation turn', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(snapshot.blockingWorkCount).toBeGreaterThan(0);
+    expect(snapshot.busyReasons).toContain('snapshot_stale');
+  });
+
+  it('fails closed when provider clear snapshot lacks current runtime attribution', async () => {
+    runtime.send('first generation turn', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      providerDiagnosticGeneration: 'codex-turn-1',
+      updatedAt: Date.now(),
+    }));
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(snapshot.blockingWorkCount).toBeGreaterThan(0);
+    expect(snapshot.busyReasons).toContain('snapshot_unavailable');
+  });
+
+  it('fails closed when provider active-work snapshot throws', async () => {
+    runtime.send('first generation turn', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => {
+      throw new Error('SECRET_PROVIDER_PAYLOAD');
+    });
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(snapshot.blockingWorkCount).toBeGreaterThan(0);
+    expect(snapshot.busyReasons).toContain('snapshot_error');
+  });
+
+  it('does not let an unattributed pre-dispatch clear snapshot block the first send', async () => {
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      providerDiagnosticGeneration: 'codex-before-first-turn',
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('first turn must dispatch', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toMatchObject({
+      userMessage: 'first turn must dispatch',
+      activityGeneration: {
+        scope: 'session',
+        sessionName: 'deck_test_brain',
+        generation: 1,
+      },
+    });
+  });
+
+  it('attaches runtime activityGeneration to provider payloads', async () => {
+    runtime.send('turn with generation', 'cmd-gen');
+    await waitForProviderSendCount(mock.provider, 1);
+    const payload = mock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(payload.activityGeneration).toMatchObject({
+      scope: 'session',
+      sessionName: 'deck_test_brain',
+      generation: 1,
+    });
+  });
+
+  it('emits an abandoned synthetic tool terminal when dispatch generation rolls over', async () => {
+    runtime.send('first generation turn', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireTool('sess-1', {
+      id: 'tool-old',
+      name: 'Bash',
+      status: 'running',
+    });
+    expect(runtime.getDiagnosticSnapshot().activeToolCount).toBe(1);
+
+    const internal = runtime as unknown as {
+      _dispatchTurn: (message: string, clientMessageId?: string) => void;
+    };
+    internal._dispatchTurn('second generation turn', 'cmd-second');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-old',
+        tool: 'Bash',
+        terminalStatus: 'abandoned',
+        terminalReason: 'generation_rollover',
+        activityGeneration: {
+          scope: 'session',
+          sessionName: 'deck_test_brain',
+          generation: 1,
+        },
+      }),
+      expect.objectContaining({
+        source: 'daemon',
+        confidence: 'high',
+        eventId: 'transport-tool:deck_test_brain:tool-old:generation_rollover',
+      }),
+    );
   });
 
   it('injects stable preference context only once per provider conversation', async () => {
@@ -2050,15 +2225,17 @@ ${PREFERENCE_CONTEXT_END}`;
   it('T6 (G1 contract): onDrain receives per-entry PendingTransportMessage[] with original clientMessageIds intact', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
-    runtime.send('queued-a', 'cmd-a');
-    runtime.send('queued-b', 'cmd-b');
+    runtime.send('queued-a SECRET_BODY_SHOULD_NOT_LEAK', 'cmd-a', [
+      { id: 'att-a', daemonPath: '/tmp/private-secret.txt', originalName: 'private-secret.txt' },
+    ]);
+    runtime.send('queued-b', 'cmd-b', undefined, undefined, { sharedActor: sharedActorFixture });
     runtime.send('queued-c', 'cmd-c');
     expect(runtime.pendingCount).toBe(3);
 
-    let received: { messages: PendingTransportMessage[]; merged: string; count: number } | null = null;
-    runtime.onDrain = (messages, merged, count) => {
+    let received: { messages: PendingTransportMessage[]; merged: string; count: number; metadata: unknown } | null = null;
+    runtime.onDrain = (messages, merged, count, metadata) => {
       // Snapshot so test assertions can run after fireComplete returns.
-      received = { messages: messages.map((entry) => ({ ...entry })), merged, count };
+      received = { messages: messages.map((entry) => ({ ...entry })), merged, count, metadata };
     };
 
     mock.fireComplete('sess-1');
@@ -2067,9 +2244,21 @@ ${PREFERENCE_CONTEXT_END}`;
     const captured = received!;
     expect(captured.count).toBe(3);
     expect(captured.messages.map((entry) => entry.clientMessageId)).toEqual(['cmd-a', 'cmd-b', 'cmd-c']);
-    expect(captured.messages.map((entry) => entry.text)).toEqual(['queued-a', 'queued-b', 'queued-c']);
+    expect(captured.messages.map((entry) => entry.text)).toEqual(['queued-a SECRET_BODY_SHOULD_NOT_LEAK', 'queued-b', 'queued-c']);
     // The merged string also matches the join used by _drainPending.
-    expect(captured.merged).toBe('queued-a\n\nqueued-b\n\nqueued-c');
+    expect(captured.merged).toBe('queued-a SECRET_BODY_SHOULD_NOT_LEAK\n\nqueued-b\n\nqueued-c');
+    expect(captured.metadata).toMatchObject({
+      pendingVersion: expect.any(Number),
+      entries: [
+        { clientMessageId: 'cmd-a', ordinal: 0, attachmentIds: ['att-a'] },
+        { clientMessageId: 'cmd-b', ordinal: 1, actorSessionName: 'deck_test_brain', sharedActionId: 'action-shared' },
+        { clientMessageId: 'cmd-c', ordinal: 2 },
+      ],
+    });
+    const safeMetadata = JSON.stringify(captured.metadata);
+    expect(safeMetadata).not.toContain('SECRET_BODY_SHOULD_NOT_LEAK');
+    expect(safeMetadata).not.toContain('/tmp/private-secret.txt');
+    expect(safeMetadata).not.toContain('private-secret.txt');
   });
 
   it('preserves shared actor metadata on queued entries and drain callbacks without injecting it into provider text', async () => {
