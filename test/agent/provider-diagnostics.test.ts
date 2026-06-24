@@ -77,6 +77,9 @@ describe('provider session diagnostics', () => {
       turnStartInFlight: false,
       activeItemCount: 1,
       activeItemIds: ['item-1'],
+      activeToolItemCount: 0,
+      activeToolItemIds: [],
+      activeCompactionItemCount: 0,
       currentMessageId: 'msg-codex',
       currentTextLength: 'secret prompt'.length,
     });

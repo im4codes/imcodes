@@ -1525,13 +1525,16 @@ export class CodexSdkProvider implements TransportProvider {
   getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    const activeItemIds = state.activeItemIds ?? new Set<string>();
+    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
+    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
     const activeReason = state.runningCompact
       ? 'compact'
       : state.runningTurnId
         ? 'turn'
         : state.turnStartInFlight
           ? 'turn-start'
-          : state.activeItemIds.size > 0
+          : activeItemIds.size > 0
             ? 'item'
             : state.cancelTimer
               ? 'cancelling'
@@ -1549,11 +1552,11 @@ export class CodexSdkProvider implements TransportProvider {
       cancelled: state.cancelled,
       currentMessageId: state.currentMessageId,
       currentTextLength: state.currentText.length,
-      activeItemCount: state.activeItemIds.size,
-      activeItemIds: [...state.activeItemIds].slice(-20),
-      activeToolItemCount: state.activeToolItemIds.size,
-      activeToolItemIds: [...state.activeToolItemIds].slice(-20),
-      activeCompactionItemCount: state.activeCompactionItemIds.size,
+      activeItemCount: activeItemIds.size,
+      activeItemIds: [...activeItemIds].slice(-20),
+      activeToolItemCount: activeToolItemIds.size,
+      activeToolItemIds: [...activeToolItemIds].slice(-20),
+      activeCompactionItemCount: activeCompactionItemIds.size,
       compactObserved: state.compactObserved,
       compactSettleArmed: Boolean(state.compactSettleTimer),
       compactHardTimeoutArmed: Boolean(state.compactHardTimer),
@@ -1568,8 +1571,10 @@ export class CodexSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
     const busyReasons: SessionActivityBusyReason[] = [];
-    const activeToolCount = state.activeToolItemIds.size;
-    const compactionActive = state.runningCompact || state.activeCompactionItemIds.size > 0;
+    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
+    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
+    const activeToolCount = activeToolItemIds.size;
+    const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
     if (compactionActive) busyReasons.push('provider_compaction');
     return {
