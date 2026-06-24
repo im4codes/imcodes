@@ -38,6 +38,7 @@ export interface SessionInfo {
   agentType: string;
   agentVersion?: string;
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
+  error?: string | null;
   label?: string | null;
   userCreated?: boolean;
   projectDir?: string;

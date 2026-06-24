@@ -23,6 +23,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   agentType: string;
   agentVersion?: string;
   state: string;
+  error?: string;
   projectDir?: string;
   runtimeType?: string;
   providerId?: string;
@@ -128,6 +129,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     agentType: s.agentType,
     agentVersion: s.agentVersion,
     state,
+    error: state === 'error' ? s.error : undefined,
     projectDir: s.projectDir,
     runtimeType: s.runtimeType,
     providerId: s.providerId,

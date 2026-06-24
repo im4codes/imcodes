@@ -16,6 +16,7 @@ import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
+import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
@@ -285,6 +286,7 @@ export function SubSessionWindow({
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
+  const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
   const liveSessionState = useMemo(
     () => getTailSessionState(events) ?? sub.state ?? null,
     [events, sub.state],
@@ -942,6 +944,8 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
+          transportActivityDetail={transportActivityDetail}
+          sessionError={sessionInfo?.error}
           now={thinkingNow}
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}

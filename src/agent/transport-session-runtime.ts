@@ -835,13 +835,18 @@ export class TransportSessionRuntime implements SessionRuntime {
    * one-turn-at-a-time path.
    */
   settleActiveDispatchFromExternalCompletion(reason = 'external-completion'): boolean {
-    if (!this.hasActiveTurnWork()) return false;
+    const activity = this.getActivitySnapshot();
+    if (activity.blockingWorkCount <= 0) return false;
     const dispatchId = this._activeDispatchId;
     if (dispatchId !== null) this._locallyCancelledDispatchIds.add(dispatchId);
     const providerSessionId = this._providerSessionId;
     const providerStarted = this._activeDispatchProviderStarted;
     const providerCanCancel = !!this.provider.cancel && !!providerSessionId;
-    if (providerStarted && providerCanCancel) this._externalCompletionSettlementsToIgnore += 1;
+    const providerSnapshotHasActiveWork = (activity.providerSnapshot?.activeWorkCount ?? 0) > 0
+      || (activity.providerSnapshot?.activeToolCount ?? 0) > 0
+      || (activity.providerSnapshot?.busyReasons.length ?? 0) > 0;
+    const shouldCancelProvider = providerCanCancel && (providerStarted || providerSnapshotHasActiveWork);
+    if (shouldCancelProvider) this._externalCompletionSettlementsToIgnore += 1;
 
     logger.warn(
       {
@@ -851,6 +856,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         activeDispatchCount: this._activeDispatchEntries.length,
         pendingCount: this._pendingMessages.length,
         providerStarted,
+        providerSnapshotHasActiveWork,
+        busyReasons: activity.busyReasons,
       },
       'transport runtime active dispatch externally completed; settling locally',
     );
@@ -866,7 +873,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchStaleRecoveryStarted = false;
     this.closeOpenTools('stale', 'provider_stale');
 
-    if (providerStarted && providerCanCancel) {
+    if (shouldCancelProvider) {
       try {
         const cancelResult = this.provider.cancel!(providerSessionId);
         void Promise.resolve(cancelResult).catch((err) => {

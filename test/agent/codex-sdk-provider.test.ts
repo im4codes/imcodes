@@ -1749,6 +1749,54 @@ describe('CodexSdkProvider', () => {
     expect(JSON.stringify(diagnostics)).not.toContain('/tmp/project');
   });
 
+  it('clears provider compaction active-work evidence when compact is cancelled locally', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-cancel-snapshot', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-compact-cancel-snapshot', '/compact');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-compact-cancel-snapshot')?.runningCompact === true,
+    );
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-compact-1',
+        item: { id: 'compact-item-1', type: 'contextCompaction' },
+      },
+    });
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-compact-cancel-snapshot')?.activeCompactionItemCount === 1,
+    );
+
+    expect(provider.getActiveWorkSnapshot('route-compact-cancel-snapshot')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_compaction'],
+    });
+
+    await provider.cancel('route-compact-cancel-snapshot');
+
+    expect(errors).toContain('Codex compact cancelled');
+    expect(provider.getSessionDiagnostics('route-compact-cancel-snapshot')).toMatchObject({
+      runningCompact: false,
+      activeItemCount: 0,
+      activeToolItemCount: 0,
+      activeCompactionItemCount: 0,
+    });
+    expect(provider.getActiveWorkSnapshot('route-compact-cancel-snapshot')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
   it('completes a normal turn only from turn/completed; idle thread status mid-turn does not end it', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

@@ -75,6 +75,7 @@ vi.mock('react-i18next', () => ({
         'session.state_stop_requested': 'Stop requested',
         'session.state_stopping': 'Stopping...',
         'session.state_compacting': 'Compacting context...',
+        'session.state_error_detail': 'Error: {{error}}',
         'share.actorLabel': '{{name}} · {{role}}',
         'share.role.viewer': 'Viewer',
         'share.role.participant': 'Participant',
@@ -1686,6 +1687,25 @@ describe('ChatView', () => {
     );
 
     expect(container.textContent).toContain('Session stopped');
+  });
+
+  it('renders session error state with the concrete backend error message', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-error',
+            type: 'session.state',
+            ts: 1000,
+            payload: { state: 'error', error: 'Codex compact cancelled' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('Error: Codex compact cancelled');
   });
 
   it('renders transport Stop cancel feedback as a visible system row', () => {

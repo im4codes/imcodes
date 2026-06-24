@@ -66,6 +66,24 @@ function makeExisting(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe('mergeSessionListEntry — supervision preservation', () => {
+  it('keeps daemon-provided error reason for error session list entries and clears it on recovery', () => {
+    const errored = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'error',
+      error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+    }, undefined);
+
+    expect(errored.error).toBe('Restart loop detected: more than 3 restarts within 5 minutes');
+
+    const recovered = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+    }, errored);
+
+    expect(recovered.state).toBe('idle');
+    expect(recovered.error).toBeNull();
+  });
+
   it('preserves user-enabled supervision when daemon broadcasts an empty transportConfig', () => {
     const existing = makeExisting();
 

@@ -394,7 +394,12 @@ export async function stopSubSession(
       timelineEmitter.emit(sessionName, 'session.state', { state: 'error', error: message });
     },
     persistFailure: async (_record, failure) => {
-      upsertSession({ ...record, state: 'error', updatedAt: Date.now() });
+      upsertSession({
+        ...record,
+        state: 'error',
+        error: buildSubSessionCloseFailureMessage(failure),
+        updatedAt: Date.now(),
+      });
       logger.warn({ sessionName, stage: failure.stage, message: failure.message }, 'Sub-session shutdown failed');
     },
   });

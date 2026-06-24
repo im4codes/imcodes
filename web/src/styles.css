@@ -2533,6 +2533,9 @@ html.native-ios-mac .chat-dl-btn {
 .session-live-status-inline.waiting .session-live-status-emoji.wait { animation: status-wait-flip 1.2s ease-in-out infinite; transform-origin: 50% 50%; }
 .session-live-status-inline.result { color: #34d399; }
 .session-live-status-inline.result .session-live-status-emoji.result { filter: saturate(1.2); }
+.session-live-status-inline.error,
+.session-live-status-inline.error .session-live-status-text { color: #f87171; }
+.session-live-status-inline.error .session-live-status-emoji.error { filter: saturate(1.2); }
 .session-live-status-inline.idle .session-live-status-emoji.sleep { font-size: 9px; transform: translateY(-3px) translateX(-1px); opacity: 0.9; animation: status-sleep-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
 .session-usage-model { color: #c4b5fd; font-size: 10px; font-weight: 600; margin-right: 6px; text-shadow: 0 0 8px rgba(167,139,250,0.18); }
 .session-usage-tokens { color: #7b8797; }

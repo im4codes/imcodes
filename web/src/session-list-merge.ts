@@ -43,6 +43,7 @@ export interface IncomingSessionListEntry {
   agentType: string;
   agentVersion?: string;
   state: string;
+  error?: string | null;
   projectDir?: string;
   runtimeType?: string;
   label?: string | null;
@@ -169,6 +170,9 @@ export function mergeSessionListEntry(
     agentType: incoming.agentType,
     agentVersion: incoming.agentVersion,
     state: incoming.state as SessionInfo['state'],
+    error: incoming.state === 'error'
+      ? (incoming.error ?? existing?.error ?? null)
+      : null,
     projectDir: incoming.projectDir ?? existing?.projectDir,
     runtimeType: resolveRuntimeType({
       runtimeType: (incoming.runtimeType as SessionInfo['runtimeType']) ?? existing?.runtimeType,

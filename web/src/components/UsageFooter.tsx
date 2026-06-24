@@ -34,6 +34,10 @@ interface Props {
   activeToolCall?: boolean;
   /** Whether the current timeline tail still has an active transport turn. */
   activeTimelineTurn?: boolean;
+  /** Safe transport activity/error detail extracted from session.state payloads. */
+  transportActivityDetail?: string | null;
+  /** Session-list error reason when no timeline error detail is present. */
+  sessionError?: string | null;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
   /** Sends recent memory summaries into the current agent as sync-only context. */
@@ -53,7 +57,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount }: Props) {
   const { t } = useTranslation();
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
@@ -179,9 +183,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const inlineQuotaText = displayQuotaLabel;
+  const errorDetail = sessionState === 'error'
+    ? ((transportActivityDetail && !/^error$/i.test(transportActivityDetail) ? transportActivityDetail : null) ?? sessionError ?? null)
+    : null;
   const liveStatusMode = isAgentless
     ? null
-    : hasActiveLiveWork
+    : sessionState === 'error'
+      ? 'error'
+      : hasActiveLiveWork
       ? (activeToolCall ? 'tool' : 'thinking')
       : hasLiveTransportTurn || sessionState === 'running' || sessionState === 'queued'
         ? 'running'
@@ -190,15 +199,29 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           : 'idle';
   const liveStatusText = useMemo(() => {
     if (isAgentless) return null;
+    if (sessionState === 'error') {
+      return errorDetail
+        ? t('session.state_error_detail', {
+          error: errorDetail,
+          defaultValue: 'Error: {{error}}',
+        })
+        : t('session.state_error', { defaultValue: 'Session error' });
+    }
     if (hasActiveLiveWork || hasLiveTransportTurn || sessionState === 'running' || sessionState === 'queued') {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
+      if (transportActivityDetail) {
+        return t('session.state_running_detail', {
+          detail: transportActivityDetail,
+          defaultValue: 'Agent working: {{detail}}',
+        });
+      }
       return t('session.state_running');
     }
     if (statusText) return statusText;
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, hasLiveTransportTurn, isAgentless, now, sessionState, statusText, t]);
-  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result';
+  }, [activeThinkingTs, activeToolCall, errorDetail, hasActiveLiveWork, hasLiveTransportTurn, isAgentless, now, sessionState, statusText, t, transportActivityDetail]);
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK
   // rate_limit_event). Show an authorize affordance for claude-code-sdk until
@@ -258,6 +281,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
             {liveStatusMode === 'waiting' && <span class="session-live-status-emoji wait">⏳</span>}
             {liveStatusMode === 'result' && <span class="session-live-status-emoji result">✅</span>}
+            {liveStatusMode === 'error' && <span class="session-live-status-emoji error">⚠️</span>}
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
             {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>

@@ -3244,6 +3244,8 @@ export class CodexSdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     state.activeItemIds.clear();
+    state.activeToolItemIds.clear();
+    state.activeCompactionItemIds.clear();
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
 

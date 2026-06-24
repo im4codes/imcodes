@@ -338,7 +338,12 @@ export async function stopProject(
         emitSessionEvent('error', record.name, buildCloseFailureMessage(record, failure));
       },
       persistFailure: async (_record, failure) => {
-        const next: SessionRecord = { ...record, state: 'error', updatedAt: Date.now() };
+        const next: SessionRecord = {
+          ...record,
+          state: 'error',
+          error: buildCloseFailureMessage(record, failure),
+          updatedAt: Date.now(),
+        };
         upsertSession(next);
         emitSessionPersist(next, record.name);
         logger.warn({ session: record.name, stage: failure.stage, message: failure.message }, 'Project shutdown failed');
@@ -580,16 +585,18 @@ export async function restoreFromStore(): Promise<void> {
       logger.info({ session: hydrated.name }, 'Missing on restore, restarting');
       try { await restartSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
-        updateSessionState(hydrated.name, 'error');
-        emitSessionEvent('error', hydrated.name, err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        updateSessionState(hydrated.name, 'error', message);
+        emitSessionEvent('error', hydrated.name, message);
       }
     } else if (isLiveSession && !paneAlive) {
       // Session exists (remain-on-exit) but process is dead — respawn instead of creating a new session
       logger.info({ session: hydrated.name }, 'Pane dead on restore, respawning');
       try { await respawnSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to respawn session on restore — skipping');
-        updateSessionState(hydrated.name, 'error');
-        emitSessionEvent('error', hydrated.name, err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        updateSessionState(hydrated.name, 'error', message);
+        emitSessionEvent('error', hydrated.name, message);
       }
     } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
@@ -725,7 +732,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
   if (recentRestarts.length >= MAX_RESTARTS) {
     const message = `Restart loop detected: more than ${MAX_RESTARTS} restarts within 5 minutes`;
     logger.error({ session: record.name }, 'Restart loop detected — marking as error');
-    updateSessionState(record.name, 'error');
+    updateSessionState(record.name, 'error', message);
     emitSessionEvent('error', record.name, message);
     return false;
   }
@@ -781,7 +788,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   if (recentRestarts.length >= MAX_RESTARTS) {
     const message = `Restart loop detected: more than ${MAX_RESTARTS} restarts within 5 minutes`;
     logger.error({ session: record.name }, 'Restart loop detected — marking as error');
-    updateSessionState(record.name, 'error');
+    updateSessionState(record.name, 'error', message);
     emitSessionEvent('error', record.name, message);
     return false;
   }
@@ -1440,11 +1447,20 @@ async function drainTransportResendQueueIntoRuntime(
 
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
-  const persistTransportState = (state: unknown): void => {
+  const persistTransportState = (state: unknown, error?: string): void => {
     if (state !== 'running' && state !== 'idle' && state !== 'error') return;
     const existing = getSession(sessionName);
-    if (!existing || existing.state === state) return;
-    const next: SessionRecord = { ...existing, state: state as SessionState, updatedAt: Date.now() };
+    if (!existing) return;
+    const normalizedError = state === 'error' && typeof error === 'string' && error.trim()
+      ? error.trim()
+      : undefined;
+    if (existing.state === state && (existing.error ?? undefined) === normalizedError) return;
+    const next: SessionRecord = {
+      ...existing,
+      state: state as SessionState,
+      ...(normalizedError ? { error: normalizedError } : { error: undefined }),
+      updatedAt: Date.now(),
+    };
     upsertSession(next);
     emitSessionPersist(next, sessionName);
   };
@@ -1459,7 +1475,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // authority. This keeps queued messages visible in the UI until the drained turn completes.
     const activity = runtime.getDiagnosticSnapshot();
     const effectiveMapped = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
-    persistTransportState(effectiveMapped);
+    persistTransportState(effectiveMapped, mapped === 'error' ? runtime.lastProviderError?.message : undefined);
     const payload: Record<string, unknown> = { state: effectiveMapped };
     if (effectiveMapped === 'running') {
       payload.activityGeneration = activity.activityGeneration;

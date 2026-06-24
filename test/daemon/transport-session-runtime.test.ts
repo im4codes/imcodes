@@ -2135,6 +2135,42 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.getStatus()).not.toBe('idle');
   });
 
+  it('external completion cancels provider-only active snapshots before draining queued messages', async () => {
+    let providerActive = false;
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: providerActive ? 1 : 0,
+      activeToolCount: 0,
+      busyReasons: providerActive ? ['provider_compaction'] : [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      providerActive = false;
+      return Promise.resolve();
+    });
+
+    runtime.send('first turn with provider-only active work', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    providerActive = true;
+    // Reproduce the production log shape: the runtime has stale active work, but
+    // `_activeDispatchProviderStarted` is already false while the provider
+    // snapshot still reports provider-only activity such as Codex compaction.
+    (runtime as unknown as { _activeDispatchProviderStarted: boolean })._activeDispatchProviderStarted = false;
+    runtime.send('queued after stuck compact', 'cmd-next');
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stuck compact',
+      assembledMessage: 'queued after stuck compact',
+    }));
+    expect(runtime.pendingCount).toBe(0);
+  });
+
   it('recoverable provider errors drain pending messages into the next turn', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);

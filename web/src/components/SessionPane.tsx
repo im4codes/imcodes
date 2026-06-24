@@ -21,6 +21,7 @@ import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
+import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
@@ -248,6 +249,7 @@ export function SessionPane({
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
+  const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
   const liveSessionState = useMemo(
     () => getTailSessionState(timelineEvents) ?? session.state ?? null,
     [timelineEvents, session.state],
@@ -463,6 +465,8 @@ export function SessionPane({
           statusText={statusText}
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
+          transportActivityDetail={transportActivityDetail}
+          sessionError={session.error}
           now={thinkingNow}
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}

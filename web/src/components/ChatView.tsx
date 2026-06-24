@@ -3288,10 +3288,19 @@ const ChatEvent = memo(function ChatEvent({
         : isUserCompactFeedback
           ? t('session.state_compacting')
           : (stateLabel[state] ?? state);
+      const errorDetail = state === 'error' && typeof event.payload.error === 'string'
+        ? event.payload.error.trim()
+        : '';
+      const displayLabel = errorDetail
+        ? t('session.state_error_detail', {
+            error: errorDetail,
+            defaultValue: 'Error: {{error}}',
+          })
+        : label;
       const inline = state === 'idle' || state === 'running';
       return (
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
-          <span>{label}</span>
+          <span>{displayLabel}</span>
           {inline
             ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
             : <ChatTime ts={event.ts} />}

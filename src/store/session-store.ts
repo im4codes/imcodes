@@ -32,6 +32,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   agentVersion?: string;
   projectDir: string;
   state: SessionState;
+  /** Human-readable reason for the current error state. Cleared on non-error states. */
+  error?: string;
   restarts: number;
   restartTimestamps: number[];
   createdAt: number;
@@ -245,8 +247,13 @@ function reconcilePersistedSessions(): boolean {
     }
     if (session.state === 'error') {
       session.state = 'stopped';
+      delete session.error;
       session.restarts = 0;
       session.restartTimestamps = [];
+      session.updatedAt = Date.now();
+      mutated = true;
+    } else if (session.error) {
+      delete session.error;
       session.updatedAt = Date.now();
       mutated = true;
     }
@@ -354,8 +361,12 @@ export function upsertSession(record: SessionRecord): void {
     ?? (existing?.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND
       ? existing.executionCloneMetadata
       : undefined);
+  const normalizedError = record.state === 'error' && typeof record.error === 'string' && record.error.trim()
+    ? record.error.trim()
+    : undefined;
   store.sessions[record.name] = {
     ...record,
+    ...(normalizedError ? { error: normalizedError } : { error: undefined }),
     ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
     updatedAt: Date.now(),
   };
@@ -377,10 +388,15 @@ export function findSessionByProviderSessionId(providerSessionId: string): Sessi
   return Object.values(store.sessions).find((s) => s.providerSessionId === providerSessionId);
 }
 
-export function updateSessionState(name: string, state: SessionState): void {
+export function updateSessionState(name: string, state: SessionState, error?: string): void {
   const s = store.sessions[name];
   if (!s) return;
   s.state = state;
+  const normalizedError = state === 'error' && typeof error === 'string' && error.trim()
+    ? error.trim()
+    : undefined;
+  if (normalizedError) s.error = normalizedError;
+  else delete s.error;
   s.updatedAt = Date.now();
   scheduleWrite();
 }

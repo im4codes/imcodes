@@ -112,6 +112,34 @@ describe('buildSessionList', () => {
     });
   });
 
+  it('projects persisted error reasons in session_list items', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_error_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'error',
+      error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+      restarts: 3,
+      restartTimestamps: [1, 2, 3],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      projectDir: '/tmp/demo',
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_error_brain',
+        state: 'error',
+        error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+      }),
+    ]));
+  });
+
   it('preserves stored codex quota metadata when runtime quota probing is temporarily empty', async () => {
     getCodexRuntimeConfigMock.mockResolvedValue({
       availableModels: ['gpt-5.5'],

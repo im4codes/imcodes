@@ -1026,7 +1026,7 @@ export function App() {
     if (!auth || !selectedServerId || selectedShareTarget) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
-    apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
+    apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; error?: string | null; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
       `/api/server/${selectedServerId}/sessions`,
       { signal: ctrl.signal },
     ).then((data) => {
@@ -1040,6 +1040,7 @@ export function App() {
         // Start as 'unknown' — DB state may be stale (idle not persisted back to DB).
         // Daemon will send live state via WebSocket shortly after connecting.
         state: 'unknown' as SessionInfo['state'],
+        error: s.state === 'error' ? (s.error ?? null) : null,
         projectDir: s.project_dir,
         runtimeType: s.runtime_type,
         label: s.label ?? null,
@@ -3062,6 +3063,13 @@ export function App() {
                   : s.transportPendingMessageVersion,
               };
             }));
+          } else if (liveState === 'error') {
+            const errorDetail = typeof event.payload.error === 'string' && event.payload.error.trim()
+              ? event.payload.error.trim()
+              : null;
+            setSessions((prev) => prev.map((s) => s.name === event.sessionId
+              ? { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
+              : s));
           }
         }
         if (event.type === 'session.state') {
