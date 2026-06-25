@@ -127,6 +127,7 @@ interface CopilotSessionState {
   backgroundTainted: boolean;
   cancelRequested: boolean;
   cancelErrorEmitted: boolean;
+  cancelSettlement: Promise<void> | null;
   compactCompletionEmitted: boolean;
   rotationInProgress: boolean;
   generation: number;
@@ -461,6 +462,7 @@ export class CopilotSdkProvider implements TransportProvider {
       backgroundTainted: false,
       cancelRequested: false,
       cancelErrorEmitted: false,
+      cancelSettlement: null,
       compactCompletionEmitted: false,
       rotationInProgress: false,
       generation: 0,
@@ -589,6 +591,9 @@ export class CopilotSdkProvider implements TransportProvider {
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Copilot session: ${sessionId}`, false);
     }
+    if (state.cancelSettlement) {
+      await state.cancelSettlement;
+    }
     if (state.busy) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Copilot session is already busy', true);
     }
@@ -637,6 +642,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.backgroundTainted = false;
     state.cancelRequested = false;
     state.cancelErrorEmitted = false;
+    state.cancelSettlement = null;
     state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
     state.sessionSystemTextPending = undefined;
@@ -736,28 +742,38 @@ export class CopilotSdkProvider implements TransportProvider {
   async cancel(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
+    if (state.cancelSettlement) return state.cancelSettlement;
     const wasCompact = state.operation === 'compact';
-    state.cancelRequested = true;
-    state.operation = 'cancelling';
-    try {
-      await state.session.abort();
-    } finally {
-      state.busy = false;
-      state.operation = 'idle';
-      this.emitStatus(state.routeId, { status: null, label: null });
-      state.sessionSystemTextPending = undefined;
-      if (wasCompact) state.compactCompletionEmitted = true;
-      if (!state.cancelErrorEmitted) {
-        state.cancelErrorEmitted = true;
-        this.emitError(state.routeId, this.makeError(
-          PROVIDER_ERROR_CODES.CANCELLED,
-          wasCompact ? 'Copilot compact cancelled' : 'Copilot turn cancelled',
-          true,
-        ));
+    const settlement = (async () => {
+      state.cancelRequested = true;
+      state.operation = 'cancelling';
+      try {
+        await state.session.abort();
+      } finally {
+        state.busy = false;
+        state.operation = 'idle';
+        this.emitStatus(state.routeId, { status: null, label: null });
+        state.sessionSystemTextPending = undefined;
+        if (wasCompact) state.compactCompletionEmitted = true;
+        if (!state.cancelErrorEmitted) {
+          state.cancelErrorEmitted = true;
+          this.emitError(state.routeId, this.makeError(
+            PROVIDER_ERROR_CODES.CANCELLED,
+            wasCompact ? 'Copilot compact cancelled' : 'Copilot turn cancelled',
+            true,
+          ));
+        }
       }
+      if (state.backgroundTainted) {
+        await this.rotatePoisonedSession(state);
+      }
+    })();
+    state.cancelSettlement = settlement;
+    try {
+      await settlement;
+    } finally {
+      if (state.cancelSettlement === settlement) state.cancelSettlement = null;
     }
-    if (!state.backgroundTainted) return;
-    await this.rotatePoisonedSession(state);
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -1099,8 +1115,10 @@ export class CopilotSdkProvider implements TransportProvider {
       state.backgroundTainted = false;
       state.cancelRequested = false;
       state.cancelErrorEmitted = false;
+      state.cancelSettlement = null;
       state.compactCompletionEmitted = false;
       this.attachSession(state);
+      state.cancelSettlement = null;
       this.emitSessionInfo(state.routeId, {
         resumeId: state.sessionId,
         ...(state.model ? { model: state.model } : {}),
@@ -1156,6 +1174,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.backgroundTainted = false;
     state.cancelRequested = false;
     state.cancelErrorEmitted = false;
+    state.cancelSettlement = null;
     state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
     state.sessionSystemTextInjected = undefined;

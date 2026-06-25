@@ -1383,6 +1383,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       );
     }
     this.cancelActiveDispatchLocally(dispatchId);
+    // Give providers that rotate/attach a fresh underlying SDK session during
+    // cancel (for example Copilot poisoned-session recovery) one event-loop
+    // turn to publish that routing update before callers immediately enqueue
+    // the next message. This does not wait for provider.cancel to settle: the
+    // active turn is already locally released above, so queued work is not
+    // pinned behind a provider promise that may never resolve.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 
   getStatus(): AgentStatus { return this._status; }
