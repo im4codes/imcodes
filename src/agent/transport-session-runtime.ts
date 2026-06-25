@@ -384,6 +384,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private _externalCompletionSettlementsToIgnore = 0;
   private _cancelledProviderErrorsToIgnore = 0;
+  private _ignoreProviderSnapshotForNextLocalStopDrain = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
@@ -511,9 +512,28 @@ export class TransportSessionRuntime implements SessionRuntime {
               errorCode: error.code,
               errorMessage: error.message,
               recoverable: error.recoverable,
+              pendingCount: this._pendingMessages.length,
             },
             'transport runtime ignored late provider cancellation for locally stopped dispatch',
           );
+          // The cancellation belongs to the turn that STOP already settled
+          // locally, so do not surface it as a user-visible error. It is still
+          // an authoritative provider terminal signal: if the first local drain
+          // was deferred by a stale provider active-work snapshot, retry the
+          // pending queue now without letting that old snapshot pin the queue
+          // forever. Do not touch state when a newer drained turn is already
+          // active; provider callbacks are session-scoped and cannot identify
+          // the old dispatch.
+          if (!this.hasLocalActiveTurnWork() && this._pendingMessages.length > 0) {
+            this.clearStalePendingCancelFallbackTimer();
+            this._activeDispatchCancelled = false;
+            this._activeDispatchProviderStarted = false;
+            this._activeDispatchId = null;
+            this._activeDispatchStaleRecoveryStarted = false;
+            this._ignoreProviderSnapshotForNextLocalStopDrain = true;
+            if (this._drainPending()) return;
+            if (this.isInProgressStatus(this._status)) this.setStatus('idle');
+          }
           return;
         }
         if (!this.hasActiveTurnWork()) {
@@ -988,6 +1008,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     return this.getActivitySnapshot().blockingWorkCount > 0;
   }
 
+  private hasLocalActiveTurnWork(): boolean {
+    return Boolean(this._sending || this._activeTurn)
+      || this._activeDispatchEntries.length > 0
+      || this._recoverableRetryTimer !== null
+      || this._openTools.size > 0;
+  }
+
   private getProviderActiveWorkSnapshot(): ProviderActiveWorkSnapshot | null {
     if (!this._providerSessionId || !this.provider.getActiveWorkSnapshot) return null;
     try {
@@ -1058,7 +1085,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     return closed;
   }
 
-  private getActivitySnapshot(): {
+  private getActivitySnapshot(options?: { ignoreProviderSnapshot?: boolean }): {
     blockingWorkCount: number;
     activeToolCount: number;
     busyReasons: SessionActivityBusyReason[];
@@ -1078,7 +1105,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const openToolCount = this._openTools.size;
     add('open_tool_call', openToolCount);
 
-    const providerSnapshot = this.getProviderActiveWorkSnapshot();
+    const providerSnapshot = options?.ignoreProviderSnapshot ? null : this.getProviderActiveWorkSnapshot();
     if (providerSnapshot) {
       const expectedGeneration = this._activityGeneration > 0 ? this.currentActivityGeneration() : undefined;
       const evaluation = evaluateProviderSnapshot(providerSnapshot, expectedGeneration);
@@ -1890,7 +1917,9 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
-    const activity = this.getActivitySnapshot();
+    const ignoreProviderSnapshot = this._ignoreProviderSnapshotForNextLocalStopDrain;
+    this._ignoreProviderSnapshotForNextLocalStopDrain = false;
+    const activity = this.getActivitySnapshot({ ignoreProviderSnapshot });
     if (activity.blockingWorkCount > 0) {
       logger.warn(
         {

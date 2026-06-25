@@ -2068,6 +2068,63 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('uses a late provider CANCELLED callback to release pending work blocked by a stale provider snapshot', async () => {
+    let providerActive = false;
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: providerActive ? 1 : 0,
+      activeToolCount: 0,
+      busyReasons: providerActive ? ['provider_wait'] : [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    providerActive = true;
+    runtime.send('queued after stop', 'msg-q-after-provider-cancel');
+    expect(runtime.pendingCount).toBe(1);
+
+    await runtime.cancel();
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingCount).toBe(1);
+
+    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop callback', recoverable: true });
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stop',
+      assembledMessage: 'queued after stop',
+    }));
+  });
+
+  it('does not let a late provider CANCELLED callback from a stopped turn drain behind an already-active next turn', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after stop', 'msg-q-after-stop');
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    runtime.send('queued behind active next turn', 'msg-q-behind-next');
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.sending).toBe(true);
+
+    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop callback', recoverable: true });
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-q-behind-next', text: 'queued behind active next turn' },
+    ]);
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+  });
+
   it('cancel() with no queued messages settles to idle immediately, before the provider CANCELLED callback', async () => {
     runtime.send('only');
     await flushDispatch();
