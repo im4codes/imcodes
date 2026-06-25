@@ -147,6 +147,16 @@ const MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES = 3;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
+// A turn with a RUNNING TOOL can be legitimately silent for minutes — a command
+// that sleeps / polls / builds (e.g. a 180s `tcpdump` wait, a long test/build)
+// emits no provider events while it runs. The phantom-turn recovery must NOT
+// mistake that for a stuck turn and cancel real work. While a tool is still open,
+// require silence far longer than any realistic tool run before recovering.
+// Env override for tuning: IMCODES_TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS.
+const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
+  const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 15 * 60_000;
+})();
 
 function isRecoverableProviderBusyError(error: ProviderError): boolean {
   return error.code === PROVIDER_ERROR_CODES.PROVIDER_ERROR
@@ -806,7 +816,16 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this.hasActiveTurnWork()) return false;
     if (!this._providerSessionId) return false;
     const nowMs = options?.nowMs ?? Date.now();
-    const staleMs = options?.staleMs ?? getTransportStalePendingRecoveryMs();
+    const baseStaleMs = options?.staleMs ?? getTransportStalePendingRecoveryMs();
+    // A turn whose tool is still RUNNING is legitimately silent — the command is
+    // doing work outside the provider's event stream (a 180s `tcpdump` wait, a
+    // long build/test). Cancelling it at the short phantom threshold kills real
+    // work. Only the truly phantom case (provider quiet with NO tool open) uses
+    // the short threshold; while a tool is open, require a much longer silence.
+    const activeToolCount = this.getActivitySnapshot().activeToolCount;
+    const staleMs = activeToolCount > 0
+      ? Math.max(baseStaleMs, TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS)
+      : baseStaleMs;
     const lastActivityAgeMs = Math.max(0, nowMs - this._lastActivityAt);
     if (lastActivityAgeMs < staleMs) return false;
     logger.warn(
@@ -817,6 +836,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         sending: this._sending,
         activeDispatchCount: this._activeDispatchEntries.length,
         pendingCount: this._pendingMessages.length,
+        activeToolCount,
         lastActivityAgeMs,
         staleMs,
       },

@@ -2490,7 +2490,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.recoverSilentActiveTurn({ nowMs: 30_000, staleMs: 10_000 })).toBe(false);
   });
 
-  it('recoverSilentActiveTurn terminalizes orphaned open tools before draining queued work', async () => {
+  it('recoverSilentActiveTurn protects a RUNNING tool at the short threshold, recovers only after a long silence', async () => {
     runtime.send('long codex command', 'cmd-long');
     await waitForProviderSendCount(mock.provider, 1);
     mock.fireTool('sess-1', {
@@ -2505,11 +2505,25 @@ ${PREFERENCE_CONTEXT_END}`;
     const internal = runtime as unknown as { _lastActivityAt: number };
     internal._lastActivityAt = 1_000;
 
-    const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    // FIX: a turn whose tool is still RUNNING must NOT be cancelled at the short
+    // phantom threshold — a legitimate long tool (e.g. a 180s `tcpdump` wait) is
+    // silent but real. Recovery is suppressed while the tool is open + recent.
     expect(runtime.recoverSilentActiveTurn({
       reason: 'health-poll-stale-active-turn',
       nowMs: 11_001,
       staleMs: 10_000,
+    })).toBe(false);
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+
+    // After silence well past the tool-aware floor (>15min), a genuinely orphaned
+    // tool is terminalized and queued work drains.
+    const longStaleMs = 16 * 60_000;
+    const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(runtime.recoverSilentActiveTurn({
+      reason: 'health-poll-stale-active-turn',
+      nowMs: 1_000 + longStaleMs + 1,
+      staleMs: longStaleMs,
     })).toBe(true);
     await waitForProviderSendCount(mock.provider, beforeDrainSendCount + 1);
 
@@ -2532,6 +2546,18 @@ ${PREFERENCE_CONTEXT_END}`;
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('queued after silent tool');
     expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+  });
+
+  it('recoverSilentActiveTurn still settles a silent turn with NO open tool at the short threshold', async () => {
+    runtime.send('no-tool turn', 'cmd-no-tool');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.getDiagnosticSnapshot().activeToolCount).toBe(0);
+    const internal = runtime as unknown as { _lastActivityAt: number };
+    internal._lastActivityAt = 1_000;
+    // No tool open → the short phantom threshold still applies (a truly stuck
+    // turn with no tool is recovered promptly, unchanged by the fix).
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 11_001, staleMs: 10_000 })).toBe(true);
+    expect(runtime.getStatus()).toBe('idle');
   });
 
   it('locally abandons stale active work when provider cancel never settles', async () => {
