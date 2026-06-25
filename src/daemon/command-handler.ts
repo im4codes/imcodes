@@ -2768,6 +2768,41 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn({ sessionName, effectiveId }, 'session.send: missing commandId — using server-generated fallback');
   }
 
+// ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
+  const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  const p2pScopeSession = resolveP2pConfigScopeSession(sessionName);
+  let receiptAcked = false;
+  const emitAcceptedReceiptAck = (): void => {
+    if (receiptAcked) return;
+    const status = isLegacy ? 'accepted_legacy' : 'accepted';
+    emitCommandAck(sessionName, effectiveId, status, undefined, serverLink);
+    receiptAcked = true;
+  };
+  const trimmedText = text.trim();
+  const wantsStructuredP2pRouting = Boolean(
+    clientP2pSessionConfig ||
+    (cmd as any).p2pMode ||
+    directTargetSession ||
+    (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
+  );
+  const wantsLegacyP2pRouting = text.includes('@@discuss(')
+    || text.includes('@@all(')
+    || text.includes('@@p2p-config(');
+  const isDaemonHandledControlSend = trimmedText === '/stop'
+    || isDaemonHandledSessionControlSend(trimmedText)
+    || /^\/model\s+\S+/.test(trimmedText)
+    || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
+
+  // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
+  // once the daemon owns the commandId, the browser should stop waiting on the
+  // websocket round trip. This intentionally happens before the first async
+  // boundary in handleSend: no P2P preference reads, no pending relaunch wait,
+  // no per-session send lock, no live context bootstrap, no semantic recall, no
+  // embedding, and no provider send-start may delay it. Follow-up delivery,
+  // reconnect/restart, memory, and SDK failures surface through later timeline
+  // or session-state events. `/compact` is intentionally NOT a daemon-handled
+  // control and is acked here before being forwarded unchanged to the SDK.
+
   // Dedup: reject duplicate commandIds explicitly so the browser/server does
   // not wait for an ack timeout after the daemon has already seen this send.
   const dedup = getDedup(sessionName);
@@ -2780,11 +2815,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // owns and queued the message. (Idempotent: the ack just flips the bubble's
       // status, and session.state is a snapshot.)
       logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for owned commandId — re-acking + re-syncing state');
-      emitCommandAckReliable(serverLink, {
-        commandId: effectiveId,
-        sessionName,
-        status: isLegacy ? 'accepted_legacy' : 'accepted',
-      });
+      emitAcceptedReceiptAck();
       const retryRuntime = getTransportRuntime(sessionName);
       if (retryRuntime && retryRuntime.pendingCount > 0) {
         timelineEmitter.emit(sessionName, 'session.state', {
@@ -2813,16 +2844,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   dedup.add(effectiveId);
 
-// ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
-  const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
-  const p2pScopeSession = resolveP2pConfigScopeSession(sessionName);
-  let receiptAcked = false;
-  const emitAcceptedReceiptAck = (): void => {
-    if (receiptAcked) return;
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    emitCommandAck(sessionName, effectiveId, status, undefined, serverLink);
-    receiptAcked = true;
-  };
   const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
     // Always thread the client commandId through so the web UI can reconcile
     // its optimistic "sending" bubble deterministically. Callers that set
@@ -2840,29 +2861,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
   };
-  const trimmedText = text.trim();
-  const wantsStructuredP2pRouting = Boolean(
-    clientP2pSessionConfig ||
-    (cmd as any).p2pMode ||
-    directTargetSession ||
-    (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
-  );
-  const wantsLegacyP2pRouting = text.includes('@@discuss(')
-    || text.includes('@@all(')
-    || text.includes('@@p2p-config(');
-  const isDaemonHandledControlSend = trimmedText === '/stop'
-    || isDaemonHandledSessionControlSend(trimmedText)
-    || /^\/model\s+\S+/.test(trimmedText)
-    || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
-  // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
-  // once the daemon owns the commandId, the browser should stop waiting on the
-  // websocket round trip. This intentionally happens before the first async
-  // boundary in handleSend: no P2P preference reads, no pending relaunch wait,
-  // no per-session send lock, no live context bootstrap, no semantic recall, no
-  // embedding, and no provider send-start may delay it. Follow-up delivery,
-  // reconnect/restart, memory, and SDK failures surface through later timeline
-  // or session-state events. `/compact` is intentionally NOT a daemon-handled
-  // control and is acked here before being forwarded unchanged to the SDK.
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
   }
