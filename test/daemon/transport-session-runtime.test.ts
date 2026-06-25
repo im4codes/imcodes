@@ -1974,7 +1974,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.sending).toBe(false);
   });
 
-  it('cancel() delegates to provider.cancel without queueing behind pending messages', async () => {
+  it('cancel() delegates to provider.cancel and locally drains queued messages if no provider callback arrives', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued1', 'msg-q1');
@@ -1985,9 +1985,16 @@ ${PREFERENCE_CONTEXT_END}`;
       { clientMessageId: 'msg-q2', text: 'queued2' },
     ]);
 
-    runtime.cancel();
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
-    expect(runtime.pendingCount).toBe(2);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued1\n\nqueued2',
+      assembledMessage: 'queued1\n\nqueued2',
+    }));
+    expect(runtime.pendingCount).toBe(0);
   });
 
   it('cancel() with no queued messages settles to idle immediately, before the provider CANCELLED callback', async () => {
@@ -2091,6 +2098,44 @@ ${PREFERENCE_CONTEXT_END}`;
       assembledMessage: 'queued1\n\nqueued2',
     }));
     expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('cancel() closes open tools before draining queued messages when provider cancel is silent', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireTool('sess-1', {
+      id: 'tool-queued-cancel',
+      name: 'Agent',
+      status: 'running',
+    });
+    runtime.send('queued after stop', 'msg-q-stop');
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-queued-cancel',
+        tool: 'Agent',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+      }),
+      expect.objectContaining({
+        source: 'daemon',
+        confidence: 'high',
+      }),
+    );
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stop',
+      assembledMessage: 'queued after stop',
+    }));
   });
 
   it('external completion settles the active turn and drains queued messages without waiting for provider callbacks', async () => {
@@ -2477,11 +2522,15 @@ ${PREFERENCE_CONTEXT_END}`;
     const internal = runtime as unknown as { _lastActivityAt: number };
     internal._lastActivityAt = 1_000;
 
-    // Not yet stale → no-op.
+    // Not yet stale → no-op. The caller-supplied 10s threshold is floored by
+    // the production silent-turn floor so legitimate long Codex thinking does
+    // not get force-settled by a short health-poll threshold.
     expect(runtime.recoverSilentActiveTurn({ nowMs: 5_000, staleMs: 10_000 })).toBe(false);
     expect(runtime.getStatus()).not.toBe('idle');
-    // Stale (provider silent past threshold) + empty queue → settle to idle.
-    expect(runtime.recoverSilentActiveTurn({ nowMs: 11_001, staleMs: 10_000 })).toBe(true);
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 61_000, staleMs: 60_000 })).toBe(false);
+    // Truly stale (provider silent past the long last-resort threshold) + empty
+    // queue → settle to idle.
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 31 * 60_000, staleMs: 10_000 })).toBe(true);
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
     expect(runtime.activeDispatchEntries).toEqual([]);
@@ -2548,16 +2597,17 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
   });
 
-  it('recoverSilentActiveTurn still settles a silent turn with NO open tool at the short threshold', async () => {
+  it('recoverSilentActiveTurn does not force-settle a silent no-tool turn at the short threshold', async () => {
     runtime.send('no-tool turn', 'cmd-no-tool');
     await waitForProviderSendCount(mock.provider, 1);
     expect(runtime.getDiagnosticSnapshot().activeToolCount).toBe(0);
     const internal = runtime as unknown as { _lastActivityAt: number };
     internal._lastActivityAt = 1_000;
-    // No tool open → the short phantom threshold still applies (a truly stuck
-    // turn with no tool is recovered promptly, unchanged by the fix).
-    expect(runtime.recoverSilentActiveTurn({ nowMs: 11_001, staleMs: 10_000 })).toBe(true);
-    expect(runtime.getStatus()).toBe('idle');
+    // No tool open is still not proof of a phantom: Codex can legitimately
+    // think/generate silently for more than 60s. The health-poll safety net is
+    // last-resort only.
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 61_001, staleMs: 60_000 })).toBe(false);
+    expect(runtime.getStatus()).not.toBe('idle');
   });
 
   it('locally abandons stale active work when provider cancel never settles', async () => {

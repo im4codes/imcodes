@@ -364,10 +364,15 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     if (tracked) clearPendingStreamUpdate(tracked.eventId);
 
     if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
-      timelineEmitter.emit(sessionName, 'session.state', {
-        state: 'error',
-        error: error.message,
-      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        text: `⚠️ Turn cancelled: ${error.message}`,
+        streaming: false,
+        memoryExcluded: true,
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        ...(tracked ? { eventId: tracked.eventId } : {}),
+      });
       return;
     }
 

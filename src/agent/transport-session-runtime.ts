@@ -157,6 +157,10 @@ const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS ?? '', 10);
   return Number.isFinite(raw) && raw >= 60_000 ? raw : 15 * 60_000;
 })();
+const TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS = (() => {
+  const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 30 * 60_000;
+})();
 
 function isRecoverableProviderBusyError(error: ProviderError): boolean {
   return error.code === PROVIDER_ERROR_CODES.PROVIDER_ERROR
@@ -821,11 +825,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     // doing work outside the provider's event stream (a 180s `tcpdump` wait, a
     // long build/test). Cancelling it at the short phantom threshold kills real
     // work. Only the truly phantom case (provider quiet with NO tool open) uses
-    // the short threshold; while a tool is open, require a much longer silence.
+    // a long last-resort threshold; while a tool is open, require a long
+    // tool-aware silence as well.
     const activeToolCount = this.getActivitySnapshot().activeToolCount;
     const staleMs = activeToolCount > 0
       ? Math.max(baseStaleMs, TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS)
-      : baseStaleMs;
+      : Math.max(baseStaleMs, TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS);
     const lastActivityAgeMs = Math.max(0, nowMs - this._lastActivityAt);
     if (lastActivityAgeMs < staleMs) return false;
     logger.warn(
@@ -1352,7 +1357,18 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeDispatchStaleRecoveryStarted = false;
       this.setStatus('idle');
     }
-    await this.provider.cancel(this._providerSessionId);
+    try {
+      await this.provider.cancel(this._providerSessionId);
+    } finally {
+      // Some providers can acknowledge cancellation without producing a terminal
+      // callback when the foreground query has already ended but background work
+      // evidence remains (for example Claude SDK local_bash subagent monitors).
+      // In that shape, leaving settlement entirely to provider callbacks strands
+      // queued messages behind open-tool/provider activity. If the same dispatch
+      // is still current after provider.cancel returns, settle it locally and let
+      // the normal reconciler decide whether pending work may drain.
+      this.cancelActiveDispatchLocally(dispatchId);
+    }
   }
 
   getStatus(): AgentStatus { return this._status; }

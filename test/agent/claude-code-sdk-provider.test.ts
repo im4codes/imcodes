@@ -29,9 +29,9 @@ const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
   let waitForClose = false;
   let interruptNeverResolves = false;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; resolveClose?: () => void }> = [];
+  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
   const query = vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-    const run = { prompt, options, closed: false, interrupted: false, resolveClose: undefined as (() => void) | undefined };
+    const run = { prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
     async function* gen() {
       for (const message of nextMessages) yield message;
@@ -41,7 +41,7 @@ const sdkMock = vi.hoisted(() => {
         });
       }
     }
-    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
+    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
     iterator.close = () => {
       run.closed = true;
       run.resolveClose?.();
@@ -51,6 +51,9 @@ const sdkMock = vi.hoisted(() => {
       if (interruptNeverResolves) {
         await new Promise<void>(() => {});
       }
+    };
+    iterator.stopTask = async (taskId: string) => {
+      run.stoppedTasks.push(taskId);
     };
     return iterator;
   });
@@ -302,6 +305,47 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(completed.map((msg) => msg.content)).toEqual(['Done']);
     expect(completed[0]?.metadata).toMatchObject({ completionFallback: 'result-timeout' });
     expect(sdkMock.runs[0]?.closed).toBe(true);
+  });
+
+  it('does not close the SDK query after foreground result while a background Claude task is active', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-background-result', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-background-result',
+        uuid: 'uuid-background-result-start',
+        task_id: 'task-background-result',
+        tool_use_id: 'tool-use-background-result',
+        description: 'Run in background',
+      },
+      { type: 'result', session_id: 'session-background-result', subtype: 'success', is_error: false, result: 'Background task started', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-background-result',
+      sessionName: 'deck_project_claude_background_result',
+      cwd: '/tmp/project',
+      resumeId: 'session-background-result',
+    });
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+
+    await provider.send('route-background-result', 'hello');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed.map((msg) => msg.content)).toEqual(['Background task started']);
+    expect(completed[0]?.metadata).toMatchObject({ completionFallback: 'result-timeout' });
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+    expect(provider.getActiveWorkSnapshot('route-background-result')).toMatchObject({
+      activeWorkCount: 1,
+      busyReasons: ['background_monitor'],
+    });
   });
 
   it('emits cancelled on cancel()', async () => {
@@ -1097,6 +1141,125 @@ describe('ClaudeCodeSdkProvider', () => {
       if (previousStaleMs === undefined) delete process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
       else process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = previousStaleMs;
     }
+  });
+
+  it('stops active Claude tasks through SDK stopTask before local cancellation state', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-cancel-after-result', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-cancel-after-result',
+        uuid: 'uuid-task-cancel-after-result',
+        task_id: 'task-cancel-after-result',
+        tool_use_id: 'tool-use-cancel-after-result',
+        description: 'Run a background task that will be stopped later',
+      },
+      { type: 'result', session_id: 'session-route-subagent-cancel-after-result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-subagent-cancel-after-result',
+      sessionName: 'deck_project_claude_cancel_after_result',
+      cwd: '/tmp/project',
+      resumeId: 'session-route-subagent-cancel-after-result',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-subagent-cancel-after-result', 'hello');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.getActiveWorkSnapshot('route-subagent-cancel-after-result')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    await provider.cancel('route-subagent-cancel-after-result');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sdkMock.runs[0]?.stoppedTasks).toEqual(['task-cancel-after-result']);
+    expect(provider.getActiveWorkSnapshot('route-subagent-cancel-after-result')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    const cancelledTerminal = sdkSubagentTools(tools).at(-1);
+    expect(cancelledTerminal).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey('deck_project_claude_cancel_after_result', 'task-cancel-after-result'),
+      status: 'error',
+      detail: {
+        meta: {
+          rawStatus: 'interrupted',
+          normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
+  it('ignores task-notification result messages as foreground completions', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-task-notification-result', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-task-notification-result',
+        uuid: 'uuid-task-notification-result-start',
+        task_id: 'task-notification-result',
+        tool_use_id: 'tool-use-task-notification-result',
+        description: 'Run verification',
+      },
+      { type: 'result', session_id: 'session-task-notification-result', subtype: 'success', is_error: false, result: 'Main turn complete', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-task-notification-result',
+        uuid: 'uuid-task-notification-result',
+        task_id: 'task-notification-result',
+        status: 'completed',
+        summary: 'Background task complete',
+      },
+      {
+        type: 'result',
+        session_id: 'session-task-notification-result',
+        subtype: 'success',
+        is_error: false,
+        result: 'Synthetic task notification follow-up',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 },
+        origin: { kind: 'task-notification' },
+      },
+    ]);
+
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-task-notification-result',
+      sessionName: 'deck_project_claude_task_notification_result',
+      cwd: '/tmp/project',
+      resumeId: 'session-task-notification-result',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-task-notification-result', 'hello');
+    await flush();
+
+    expect(completed.map((msg) => msg.content)).toEqual(['Main turn complete']);
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey('deck_project_claude_task_notification_result', 'task-notification-result'),
+      status: 'complete',
+      output: 'Background task complete',
+    });
   });
 
   it('emits SDK subagent snapshots for Claude runtime subagent notifications', async () => {

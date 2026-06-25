@@ -772,7 +772,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.code).toBe('PROVIDER_ERROR');
     });
 
-    it('does not render or cache CANCELLED as assistant error text', async () => {
+    it('renders CANCELLED as a visible cancellation notice without session error state', async () => {
       const { provider, fireDelta, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -782,11 +782,15 @@ describe('transport-relay (timeline-emitter based)', () => {
       fireError('sess-cancelled', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
       await Promise.resolve();
 
-      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
-      const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
-      expect(stateCall).toBeDefined();
-      expect(stateCall![0]).toBe('sess-cancelled');
-      expect(stateCall![2]).toEqual({ state: 'error', error: 'Cancelled' });
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall).toBeDefined();
+      expect(textCall![0]).toBe('sess-cancelled');
+      expect(textCall![2]).toMatchObject({
+        text: '⚠️ Turn cancelled: Cancelled',
+        streaming: false,
+        memoryExcluded: true,
+      });
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
       expect(appendMock).not.toHaveBeenCalled();
     });
 

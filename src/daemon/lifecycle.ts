@@ -1447,13 +1447,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
 }
 
 const HEALTH_POLL_MS = 30_000;
-// A transport turn that has gone silent (no provider output) for this long is
-// treated as a stuck PHANTOM — e.g. a provider that finished a turn but never
-// emitted a completion event (observed with Codex) — and settled to idle on the
-// health tick (draining any queued work) so the session can't stay "working"
-// forever (the common case has an EMPTY queue: just a stuck spinner). Without
-// this only a manual STOP clears it. Provider-agnostic safety net.
-const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 60_000;
+// Last-resort recovery for a transport turn that has gone silent (no provider
+// output) long enough to look like a stuck PHANTOM. This must be conservative:
+// Codex/Claude can legitimately spend several minutes thinking or running a
+// quiet command with no deltas, and a 60s health-poll threshold falsely cancels
+// real turns. Queue-stuck flows have their own targeted recovery path; this
+// empty-queue spinner recovery should only fire after a very long silence.
+const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 30 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
 const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;

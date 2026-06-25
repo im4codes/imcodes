@@ -431,8 +431,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (!state) return null;
     this.expireStaleClaudeSubagentTasks(sessionId, state);
     const activeToolCount = state.toolCalls.size + Array.from(state.runtimeAgentToolCalls.values()).length;
-    const activeSubagentCount = Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal).length;
-    const backgroundActive = Boolean(state.currentQuery || (state.currentChild && !state.currentChild.killed) || state.resultCompletionTimer);
+    const activeSubagentCount = this.activeClaudeSubagentTasks(state).length;
+    const waitingForTaskNotification = state.completed && !state.pendingComplete && activeSubagentCount > 0;
+    const backgroundActive = Boolean(
+      state.resultCompletionTimer
+      || (state.currentQuery && !waitingForTaskNotification)
+      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification),
+    );
     const busyReasons: SessionActivityBusyReason[] = [];
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
     if (activeSubagentCount > 0 || backgroundActive) busyReasons.push('background_monitor');
@@ -535,7 +540,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.currentQuery) return;
+    if (!state) return;
+    await this.cancelActiveClaudeSubagentTasks(sessionId, state);
+    if (!state.currentQuery) return;
     state.cancelled = true;
     this.clearResultCompletionFallback(state);
     try {
@@ -942,6 +949,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
 
     if (msg.type === 'result') {
+      if ((msg as { origin?: { kind?: string } }).origin?.kind === 'task-notification') {
+        state.started = true;
+        return;
+      }
       if (msg.is_error) {
         const details = Array.isArray((msg as any).errors) ? (msg as any).errors.join('; ') : 'Claude execution failed';
         state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, false, msg);
@@ -994,6 +1005,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ...(pendingComplete.metadata ?? {}),
         completionFallback: 'result-timeout',
       };
+      if (this.activeClaudeSubagentTasks(state).length > 0) {
+        // The Claude Code SDK keeps the Query open while background tasks can
+        // later inject task-notification follow-up messages. Do not close it
+        // here: deliver the foreground result to IM.codes, but keep listening
+        // so task_notification can terminalize the background row.
+        for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
+        return;
+      }
       try { q.close(); } catch {}
       this.terminateChild(state);
       state.currentQuery = null;
@@ -1375,6 +1394,44 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       }, 'Claude SDK subagent task(s) stale without terminal update; closing provider active-work evidence');
     }
     return expired;
+  }
+
+  private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
+    return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+  }
+
+  private async cancelActiveClaudeSubagentTasks(sessionId: string, state: ClaudeSdkSessionState, now = Date.now()): Promise<number> {
+    let cancelled = 0;
+    const queryWithTaskStop = state.currentQuery as (ReturnType<typeof query> & { stopTask?: (taskId: string) => Promise<void> }) | null;
+    for (const task of this.activeClaudeSubagentTasks(state)) {
+      if (typeof queryWithTaskStop?.stopTask === 'function') {
+        try {
+          await Promise.race([
+            queryWithTaskStop.stopTask(task.taskId),
+            new Promise<void>((resolve) => setTimeout(resolve, CANCEL_INTERRUPT_TIMEOUT_MS)),
+          ]);
+        } catch (err) {
+          logger.warn({ err, provider: this.id, sessionId, taskId: task.taskId }, 'Claude SDK stopTask failed; marking task cancelled locally');
+        }
+      }
+      task.rawStatus = 'interrupted';
+      task.normalizedStatus = SDK_SUBAGENT_STATUS.INTERRUPTED;
+      task.summary = task.summary ?? 'Claude task cancelled';
+      task.error = 'Claude task cancelled by user stop';
+      task.terminal = true;
+      task.active = false;
+      task.lastUpdatedAt = now;
+      this.emitClaudeSubagentSnapshot(sessionId, state, task);
+      cancelled += 1;
+    }
+    if (cancelled > 0) {
+      logger.info({
+        provider: this.id,
+        sessionId,
+        cancelled,
+      }, 'Claude SDK subagent task(s) cancelled by user stop');
+    }
+    return cancelled;
   }
 
   private emitClaudeRuntimeSubagentFromAgentTool(
