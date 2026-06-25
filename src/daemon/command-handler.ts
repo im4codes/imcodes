@@ -2773,7 +2773,28 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const dedup = getDedup(sessionName);
   if (dedup.has(effectiveId)) {
     if ((cmd as any).__bridgeRetry === true) {
-      logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for commandId already owned by daemon, ignored');
+      // The bridge only retries session.send when it never saw our ack — so the
+      // original receipt ack was lost in transit. RE-EMIT it (reliably) plus the
+      // current queue snapshot instead of silently ignoring; otherwise the web's
+      // optimistic "sending" bubble spins forever even though the daemon already
+      // owns and queued the message. (Idempotent: the ack just flips the bubble's
+      // status, and session.state is a snapshot.)
+      logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for owned commandId — re-acking + re-syncing state');
+      emitCommandAckReliable(serverLink, {
+        commandId: effectiveId,
+        sessionName,
+        status: isLegacy ? 'accepted_legacy' : 'accepted',
+      });
+      const retryRuntime = getTransportRuntime(sessionName);
+      if (retryRuntime && retryRuntime.pendingCount > 0) {
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'queued',
+          pendingCount: retryRuntime.pendingCount,
+          pendingMessages: retryRuntime.pendingMessages,
+          pendingMessageEntries: retryRuntime.pendingEntries,
+          pendingMessageVersion: observeTransportQueueRevision(sessionName, retryRuntime.pendingVersion),
+        }, { source: 'daemon', confidence: 'high' });
+      }
       return;
     }
     logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, rejected');

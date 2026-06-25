@@ -698,6 +698,51 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
   });
 
+  it('re-acks a bridge-retried session.send for an already-owned commandId (recovers a lost ack, no stuck spinner)', async () => {
+    const send = vi.fn(() => 'queued');
+    getProviderMock.mockReturnValue({ id: 'mock-provider' });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 1,
+      pendingMessages: ['retry msg'],
+      pendingEntries: [{ clientMessageId: 'cmd-retry', text: 'retry msg' }],
+      pendingVersion: 3,
+    });
+
+    // First send → queued + accepted ack (registers the commandId in dedup).
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'retry msg', commandId: 'cmd-retry' }, serverLink as any);
+    await flushAsync();
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-retry', status: 'accepted' });
+
+    serverLink.send.mockClear();
+    emitMock.mockClear();
+
+    // The bridge retries the SAME commandId because it never saw the ack. The
+    // daemon must RE-ACK (accepted) + re-sync the queue snapshot, NOT silently
+    // ignore — otherwise the web's optimistic "sending" bubble spins forever.
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'retry msg', commandId: 'cmd-retry', __bridgeRetry: true } as any, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-retry',
+      status: 'accepted',
+    }));
+    // Must NOT be rejected as a duplicate error.
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-retry',
+      status: 'error',
+    }));
+    // Re-syncs the authoritative queue snapshot.
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'session.state', expect.objectContaining({
+      state: 'queued',
+      pendingMessageEntries: [{ clientMessageId: 'cmd-retry', text: 'retry msg' }],
+    }), expect.any(Object));
+    // The retry must NOT re-dispatch the message to the provider.
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('queues ask.answer at the front when no provider pending-question resolver accepts it', async () => {
     const send = vi.fn(() => 'queued');
     getProviderMock.mockReturnValue({ id: 'mock-provider' });
