@@ -2026,6 +2026,48 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('cancel() drains queued messages immediately even when provider.cancel never settles', async () => {
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise<void>(() => {}));
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued while stop is pending', 'msg-q-pending-stop');
+    expect(runtime.pendingCount).toBe(1);
+
+    const cancelPromise = runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    await cancelPromise;
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued while stop is pending',
+      assembledMessage: 'queued while stop is pending',
+    }));
+
+    mock.fireComplete('sess-1', { content: 'queued completed' });
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getHistory().some((message) => message.content === 'queued completed')).toBe(true);
+  });
+
+  it('ignores the late CANCELLED callback from the stopped dispatch after queued work drains', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after stop', 'msg-q-after-stop');
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+    const sendCountAfterDrain = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'late stop callback', recoverable: true });
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(sendCountAfterDrain);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.pendingCount).toBe(0);
+  });
+
   it('cancel() with no queued messages settles to idle immediately, before the provider CANCELLED callback', async () => {
     runtime.send('only');
     await flushDispatch();
@@ -2498,7 +2540,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(resentPayload.userMessage).toBe('queued-after-idle');
   });
 
-  it('cancels a stale active turn once so queued messages drain through the normal cancel callback', async () => {
+  it('cancels a stale active turn once so queued messages drain without waiting for the cancel callback', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued-after-stale-active', 'cmd-queued-stale');
@@ -2517,7 +2559,8 @@ ${PREFERENCE_CONTEXT_END}`;
       staleMs: 10_000,
     })).toBe(true);
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
-    expect(runtime.getDiagnosticSnapshot(11_001).stalePendingRecoveryActive).toBe(true);
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.getDiagnosticSnapshot(11_001).stalePendingRecoveryActive).toBe(false);
 
     expect(runtime.cancelStaleActiveTurnWithPending({
       reason: 'test-stale-active-duplicate',
@@ -2526,14 +2569,14 @@ ${PREFERENCE_CONTEXT_END}`;
     })).toBe(false);
     expect(mock.provider.cancel).toHaveBeenCalledTimes(1);
 
-    const beforeDrainSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
+    const beforeLateCancelSendCount = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length;
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled stale turn', recoverable: true });
-    await waitForProviderSendCount(mock.provider, beforeDrainSendCount + 1);
+    await flushDispatch();
 
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
     expect(runtime.getDiagnosticSnapshot(20_000).stalePendingRecoveryActive).toBe(false);
-    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(beforeDrainSendCount + 1);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(beforeLateCancelSendCount);
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('queued-after-stale-active');
   });

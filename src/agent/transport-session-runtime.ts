@@ -383,6 +383,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private _externalCompletionSettlementsToIgnore = 0;
+  private _cancelledProviderErrorsToIgnore = 0;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
@@ -498,6 +499,20 @@ export class TransportSessionRuntime implements SessionRuntime {
               recoverable: error.recoverable,
             },
             'transport runtime ignored late provider error for externally completed dispatch',
+          );
+          return;
+        }
+        if (error.code === PROVIDER_ERROR_CODES.CANCELLED && this._cancelledProviderErrorsToIgnore > 0) {
+          this._cancelledProviderErrorsToIgnore--;
+          logger.warn(
+            {
+              sessionKey: this.sessionKey,
+              status: this._status,
+              errorCode: error.code,
+              errorMessage: error.message,
+              recoverable: error.recoverable,
+            },
+            'transport runtime ignored late provider cancellation for locally stopped dispatch',
           );
           return;
         }
@@ -1343,39 +1358,31 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.cancelActiveDispatchLocally(dispatchId);
       return;
     }
-    // The provider's CANCELLED callback (onComplete/onError) settles the turn
-    // and owns the queue drain, but it can arrive late or not at all. Until it
-    // does, getStatus() stays at streaming/thinking — which makes
-    // resolveTransportSessionListState() report 'running' on the next
-    // session_list pass and resurrect the "working" sweep/pulse after the user
-    // stopped (the UI animation never syncs to idle). Reflect idle now when
-    // nothing is queued — without draining here, since the callback owns the
-    // drain, so a session with queued work keeps running through to its next
-    // turn.
-    if (this.pendingCount === 0) {
-      this._sending = false;
-      this._activeTurn?.resolve();
-      this._activeTurn = null;
-      this._activeDispatchEntries = [];
-      this.closeOpenTools('cancelled', 'user_cancelled');
-      this.clearStalePendingCancelFallbackTimer();
-      this._activeDispatchProviderStarted = false;
-      this._activeDispatchId = null;
-      this._activeDispatchStaleRecoveryStarted = false;
-      this.setStatus('idle');
-    }
+    // STOP is a local control-plane decision. The provider's interrupt/stopTask
+    // is still sent, but the runtime must not wait for that Promise before it
+    // releases the active turn: SDK task-notification listeners can stay open,
+    // and STOP must cut in front of queued user sends. If the provider later
+    // emits a CANCELLED callback for the old dispatch, ignore that cancellation
+    // so it cannot cancel the next drained queued turn. Do not ignore arbitrary
+    // completions; a silent provider cancel must not swallow the next turn's
+    // legitimate completion.
+    const providerSessionId = this._providerSessionId;
+    if (providerSessionId) this._cancelledProviderErrorsToIgnore += 1;
     try {
-      await this.provider.cancel(this._providerSessionId);
-    } finally {
-      // Some providers can acknowledge cancellation without producing a terminal
-      // callback when the foreground query has already ended but background work
-      // evidence remains (for example Claude SDK local_bash subagent monitors).
-      // In that shape, leaving settlement entirely to provider callbacks strands
-      // queued messages behind open-tool/provider activity. If the same dispatch
-      // is still current after provider.cancel returns, settle it locally and let
-      // the normal reconciler decide whether pending work may drain.
-      this.cancelActiveDispatchLocally(dispatchId);
+      const cancelResult = this.provider.cancel(providerSessionId);
+      void Promise.resolve(cancelResult).catch((err) => {
+        logger.warn(
+          { err, sessionKey: this.sessionKey, providerSessionId },
+          'transport runtime provider cancel failed after local STOP settlement',
+        );
+      });
+    } catch (err) {
+      logger.warn(
+        { err, sessionKey: this.sessionKey, providerSessionId },
+        'transport runtime provider cancel threw after local STOP settlement',
+      );
     }
+    this.cancelActiveDispatchLocally(dispatchId);
   }
 
   getStatus(): AgentStatus { return this._status; }
@@ -1407,6 +1414,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
     this._externalCompletionSettlementsToIgnore = 0;
+    this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
     this._recoverableDispatchRetries = 0;
     if (this._pendingMessages.length > 0) {
