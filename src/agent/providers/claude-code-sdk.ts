@@ -951,6 +951,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (msg.type === 'result') {
       if ((msg as { origin?: { kind?: string } }).origin?.kind === 'task-notification') {
         state.started = true;
+        this.closeSettledBackgroundQuery(sessionId, state, 'task-notification-result');
         return;
       }
       if (msg.is_error) {
@@ -1118,6 +1119,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.applyClaudeTaskStatus(task, this.pickString(msg.status));
     }
 
+    if (task.terminal) {
+      this.closeSettledBackgroundQuery(sessionId, state, `task-${task.rawStatus ?? task.normalizedStatus}`);
+    }
     this.emitClaudeSubagentSnapshot(sessionId, state, task);
   }
 
@@ -1398,6 +1402,25 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
     return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+  }
+
+  private closeSettledBackgroundQuery(sessionId: string, state: ClaudeSdkSessionState, reason: string): boolean {
+    if (!state.currentQuery) return false;
+    if (!state.completed) return false;
+    if (this.activeClaudeSubagentTasks(state).length > 0) return false;
+
+    this.clearResultCompletionFallback(state);
+    const q = state.currentQuery;
+    state.currentQuery = null;
+    try { q.close(); } catch {}
+    this.terminateChild(state);
+    state.currentChild = null;
+    logger.info({
+      provider: this.id,
+      sessionId,
+      reason,
+    }, 'Claude SDK background query settled; closing retained task-notification listener');
+    return true;
   }
 
   private async cancelActiveClaudeSubagentTasks(sessionId: string, state: ClaudeSdkSessionState, now = Date.now()): Promise<number> {

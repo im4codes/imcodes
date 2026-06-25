@@ -705,6 +705,35 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
+  it('emits clean idle after the last open tool terminal clears active work', async () => {
+    const statuses: string[] = [];
+    runtime.onStatusChange = (status) => {
+      statuses.push(status);
+    };
+
+    runtime.send('turn with background tool', 'cmd-tool-idle');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireTool('sess-1', {
+      id: 'tool-background',
+      name: 'Agent',
+      status: 'running',
+    });
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+
+    mock.fireTool('sess-1', {
+      id: 'tool-background',
+      name: 'Agent',
+      status: 'complete',
+    });
+    await flushDispatch();
+
+    expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+    expect(statuses.at(-1)).toBe('idle');
+  });
+
   it('injects stable preference context only once per provider conversation', async () => {
     const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
 

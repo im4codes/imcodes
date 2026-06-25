@@ -1501,10 +1501,6 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.pendingMessageEntries = runtime.pendingEntries;
       payload.pendingVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
       payload.pendingMessageVersion = payload.pendingVersion;
-      if (providerError?.code === PROVIDER_ERROR_CODES.CANCELLED && providerError.message) {
-        payload.error = providerError.message;
-        payload.reason = 'user_cancelled';
-      }
     } else if (mapped === 'error' && providerError?.message) {
       payload.error = providerError.message;
     }

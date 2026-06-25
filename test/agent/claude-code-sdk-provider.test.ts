@@ -35,7 +35,7 @@ const sdkMock = vi.hoisted(() => {
     runs.push(run);
     async function* gen() {
       for (const message of nextMessages) yield message;
-      if (waitForClose) {
+      if (waitForClose && !run.closed) {
         await new Promise<void>((resolve) => {
           run.resolveClose = resolve;
         });
@@ -1198,6 +1198,68 @@ describe('ClaudeCodeSdkProvider', () => {
         meta: {
           rawStatus: 'interrupted',
           normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
+  it('closes the retained background-task query after a stopped task notification settles active work', async () => {
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-stopped-notification', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-stopped-notification',
+        uuid: 'uuid-task-stopped-notification-start',
+        task_id: 'task-stopped-notification',
+        tool_use_id: 'tool-use-stopped-notification',
+        description: 'Run a background task that stops after the foreground result',
+      },
+      { type: 'result', session_id: 'session-route-subagent-stopped-notification', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-route-subagent-stopped-notification',
+        uuid: 'uuid-task-stopped-notification',
+        task_id: 'task-stopped-notification',
+        status: 'stopped',
+        summary: 'Background task stopped',
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-subagent-stopped-notification',
+      sessionName: 'deck_project_claude_stopped_notification',
+      cwd: '/tmp/project',
+      resumeId: 'session-route-subagent-stopped-notification',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-subagent-stopped-notification', 'hello');
+
+    await vi.waitFor(() => {
+      expect(sdkMock.runs[0]?.closed).toBe(true);
+      expect(completed.map((msg) => msg.content)).toEqual(['Foreground done']);
+    });
+    expect(provider.getActiveWorkSnapshot('route-subagent-stopped-notification')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey('deck_project_claude_stopped_notification', 'task-stopped-notification'),
+      status: 'error',
+      detail: {
+        meta: {
+          rawStatus: 'stopped',
           active: false,
           terminal: true,
         },

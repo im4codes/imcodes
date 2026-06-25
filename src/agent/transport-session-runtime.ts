@@ -1093,6 +1093,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._openTools.delete(tool.id);
     if (this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
       this.drainPendingIfNoActiveTurn(`tool-${tool.status}`);
+      return;
+    }
+    if (!this._sending && !this._activeTurn && this._status !== 'idle') {
+      const activity = this.getActivitySnapshot();
+      if (activity.blockingWorkCount === 0) {
+        this.setStatus('idle');
+      }
     }
   }
 

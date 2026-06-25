@@ -332,6 +332,62 @@ describe('sdk transport session restore', () => {
     );
   });
 
+  it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {
+    mocks.store.set('deck_sdk_cancel_idle_brain', {
+      name: 'deck_sdk_cancel_idle_brain',
+      projectName: 'sdkcancelidle',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cancel-idle',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-cancel-idle',
+      codexSessionId: 'codex-thread-cancel-idle',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    const runtime = getTransportRuntime('deck_sdk_cancel_idle_brain');
+    expect(runtime).toBeDefined();
+    timelineEmitterEmitMock.mockClear();
+
+    const internal = runtime as unknown as {
+      recordProviderError(error: ProviderError): void;
+      setStatus(status: 'thinking' | 'idle'): void;
+    };
+    internal.setStatus('thinking');
+    internal.recordProviderError({
+      code: PROVIDER_ERROR_CODES.CANCELLED,
+      message: 'Codex turn cancelled',
+      recoverable: true,
+    });
+    internal.setStatus('idle');
+
+    const idleCall = timelineEmitterEmitMock.mock.calls.find((call) =>
+      call[0] === 'deck_sdk_cancel_idle_brain'
+      && call[1] === 'session.state'
+      && call[2]?.state === 'idle'
+      && call[2]?.authoritative === true
+    );
+    expect(idleCall).toBeDefined();
+    expect(idleCall?.[2]).toMatchObject({
+      state: 'idle',
+      authoritative: true,
+      blockingWorkCount: 0,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      decisionReason: 'activity_reconciler_clear',
+    });
+    expect(idleCall?.[2]).not.toHaveProperty('error');
+    expect(idleCall?.[2]).not.toHaveProperty('reason');
+  });
+
   it('reconciles unmatched persisted transport tool calls as daemon restart orphans before restore idle observation', async () => {
     const sessionName = `deck_sdk_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     await appendTransportEvent(sessionName, {
