@@ -379,6 +379,25 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
   });
 
+  it('does not show Agent working when timeline tail has settled but the session snapshot is stale running', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        activeTimelineTurn={false}
+      />,
+    );
+
+    expect(container.textContent ?? '').not.toContain('Agent working');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
+  });
+
   it('shows tool-call icon when explicit running status text is present', () => {
     const { container } = render(
       <UsageFooter

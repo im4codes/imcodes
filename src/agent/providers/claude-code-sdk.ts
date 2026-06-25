@@ -57,6 +57,7 @@ const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const FORCE_KILL_TIMEOUT_MS = 500;
 const RESULT_COMPLETION_FALLBACK_MS = 5_000;
+const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -188,6 +189,7 @@ interface ClaudeTaskState {
   diagnosticCode?: SdkSubagentDiagnosticCode;
   terminal: boolean;
   active: boolean;
+  lastUpdatedAt: number;
 }
 
 type ClaudeToolBlock = {
@@ -226,6 +228,13 @@ function makeMessageId(state: ClaudeSdkSessionState): string {
 
 function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function getSubagentStaleWithoutTerminalMs(): number {
+  const raw = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+  if (!raw) return DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 1_000 ? parsed : DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS;
 }
 
 function parseRuntimeSubagentTag(line: string): Record<string, unknown> | null {
@@ -420,6 +429,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    this.expireStaleClaudeSubagentTasks(sessionId, state);
     const activeToolCount = state.toolCalls.size + Array.from(state.runtimeAgentToolCalls.values()).length;
     const activeSubagentCount = Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal).length;
     const backgroundActive = Boolean(state.currentQuery || (state.currentChild && !state.currentChild.killed) || state.resultCompletionTimer);
@@ -1056,6 +1066,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const existing = state.subagentTasks.get(taskId);
     const task = existing ?? this.createClaudeTaskState(sessionId, state, taskId);
     if (!existing) state.subagentTasks.set(taskId, task);
+    task.lastUpdatedAt = Date.now();
 
     const toolUseId = this.pickString(msg.tool_use_id);
     if (toolUseId) task.toolUseId = toolUseId;
@@ -1334,7 +1345,36 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
       terminal: false,
       active: true,
+      lastUpdatedAt: Date.now(),
     };
+  }
+
+  private expireStaleClaudeSubagentTasks(sessionId: string, state: ClaudeSdkSessionState, now = Date.now()): number {
+    const staleMs = getSubagentStaleWithoutTerminalMs();
+    let expired = 0;
+    for (const task of state.subagentTasks.values()) {
+      if (!task.active || task.terminal) continue;
+      if (now - task.lastUpdatedAt < staleMs) continue;
+      task.rawStatus = 'stale';
+      task.normalizedStatus = SDK_SUBAGENT_STATUS.STALE;
+      task.diagnosticCode = SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL;
+      task.summary = task.summary ?? 'Claude task did not report a terminal update';
+      task.error = `Claude task marked stale after ${Math.round((now - task.lastUpdatedAt) / 1000)}s without a terminal update`;
+      task.terminal = true;
+      task.active = false;
+      task.lastUpdatedAt = now;
+      this.emitClaudeSubagentSnapshot(sessionId, state, task);
+      expired += 1;
+    }
+    if (expired > 0) {
+      logger.warn({
+        provider: this.id,
+        sessionId,
+        expired,
+        staleMs,
+      }, 'Claude SDK subagent task(s) stale without terminal update; closing provider active-work evidence');
+    }
+    return expired;
   }
 
   private emitClaudeRuntimeSubagentFromAgentTool(
@@ -1455,6 +1495,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return { normalizedStatus: SDK_SUBAGENT_STATUS.ERROR, terminal: true };
       case 'interrupted':
         return { normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED, terminal: true };
+      case 'stale':
+        return {
+          normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+          terminal: true,
+          diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+        };
       default:
         return {
           normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,

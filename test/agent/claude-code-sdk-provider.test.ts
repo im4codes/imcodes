@@ -1031,6 +1031,74 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(tool?.detail?.raw).toBeUndefined();
   });
 
+  it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {
+    const previousStaleMs = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+    process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = '1000';
+    try {
+      sdkMock.setNextMessages([
+        { type: 'system', subtype: 'init', session_id: 'session-route-subagent-stale', model: 'claude-sonnet-4-6' },
+        {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: 'session-route-subagent-stale',
+          uuid: 'uuid-task-stale-start',
+          task_id: 'task-stale-1',
+          tool_use_id: 'tool-use-stale',
+          description: 'Run a background task that never reports terminal',
+        },
+        { type: 'result', session_id: 'session-route-subagent-stale', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ]);
+
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-subagent-stale',
+        sessionName: 'deck_project_claude_stale',
+        cwd: '/tmp/project',
+        resumeId: 'session-route-subagent-stale',
+      });
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+      await provider.send('route-subagent-stale', 'hello');
+      await flush();
+
+      expect(provider.getActiveWorkSnapshot('route-subagent-stale')).toMatchObject({
+        activeWorkCount: 1,
+        activeToolCount: 0,
+        busyReasons: ['background_monitor'],
+      });
+
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 1_001);
+      expect(provider.getActiveWorkSnapshot('route-subagent-stale')).toMatchObject({
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      vi.useRealTimers();
+
+      const staleTerminal = sdkSubagentTools(tools).at(-1);
+      expect(staleTerminal).toMatchObject({
+        id: makeClaudeSubagentCanonicalKey('deck_project_claude_stale', 'task-stale-1'),
+        status: 'error',
+        detail: {
+          meta: {
+            rawStatus: 'stale',
+            normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+            diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+            active: false,
+            terminal: true,
+          },
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+      if (previousStaleMs === undefined) delete process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+      else process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = previousStaleMs;
+    }
+  });
+
   it('emits SDK subagent snapshots for Claude runtime subagent notifications', async () => {
     const sessionName = 'deck_project_claude_runtime';
     const agentPath = '019e7f1c-cc';

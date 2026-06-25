@@ -90,6 +90,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const isAgentless = agentType === 'shell' || agentType === 'script';
   const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
   const hasLiveTransportTurn = !isAgentless && !!activeTimelineTurn;
+  const hasRunningSessionSnapshot = !isAgentless
+    && (sessionState === 'queued' || (sessionState === 'running' && activeTimelineTurn !== false));
   const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
   const [ctxBurning, setCtxBurning] = useState(false);
@@ -192,7 +194,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       ? 'error'
       : hasActiveLiveWork
       ? (activeToolCall ? 'tool' : 'thinking')
-      : hasLiveTransportTurn || sessionState === 'running' || sessionState === 'queued'
+      : hasLiveTransportTurn || hasRunningSessionSnapshot
         ? 'running'
         : statusText
           ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting')
@@ -207,7 +209,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         })
         : t('session.state_error', { defaultValue: 'Session error' });
     }
-    if (hasActiveLiveWork || hasLiveTransportTurn || sessionState === 'running' || sessionState === 'queued') {
+    if (hasActiveLiveWork || hasLiveTransportTurn || hasRunningSessionSnapshot) {
       if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       if (transportActivityDetail) {
@@ -220,7 +222,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     }
     if (statusText) return statusText;
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, errorDetail, hasActiveLiveWork, hasLiveTransportTurn, isAgentless, now, sessionState, statusText, t, transportActivityDetail]);
+  }, [activeThinkingTs, activeToolCall, errorDetail, hasActiveLiveWork, hasLiveTransportTurn, hasRunningSessionSnapshot, isAgentless, now, sessionState, statusText, t, transportActivityDetail]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK
