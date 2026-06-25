@@ -11,6 +11,9 @@ export const OPENAI_CONTEXT_WINDOWS = {
 } as const;
 
 export const CLAUDE_CONTEXT_WINDOWS = {
+  // Mythos-class (Claude Fable 5 / Claude Mythos 5, GA 2026-06-09): 1M-token
+  // context window by default, up to 128k output tokens per request.
+  MYTHOS_5_FAMILY: 1_000_000,
   OPUS_1M_ALIAS: 1_000_000,
   OPUS_4_FAMILY: 1_000_000,
   SONNET_4_FAMILY: 1_000_000,
@@ -55,6 +58,11 @@ export function inferContextWindow(model?: string | null): number | undefined {
 
   if (/^gpt-4\.1(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_41_FAMILY;
 
+  // Claude Fable 5 / Mythos 5 (Mythos-class, GA 2026-06-09). `fable` is the
+  // model-picker alias; `claude-fable-5` / `claude-mythos-5` are the API ids.
+  if (m == 'fable' || m == 'mythos') return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
+  if (/^claude-fable-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
+  if (/^claude-mythos-5(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.MYTHOS_5_FAMILY;
   if (m == 'opus[1m]') return CLAUDE_CONTEXT_WINDOWS.OPUS_1M_ALIAS;
   if (/^claude-opus-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.OPUS_4_FAMILY;
   if (m == 'sonnet') return CLAUDE_CONTEXT_WINDOWS.SONNET_4_FAMILY;

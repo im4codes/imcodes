@@ -126,6 +126,11 @@ describe('status lifecycle', () => {
     runtime.send('hi');
     mock.fireCancelled('sess-1');
     expect(statusLog).toEqual(['thinking', 'idle']);
+    expect(runtime.lastProviderError).toMatchObject({
+      code: 'CANCELLED',
+      message: 'cancelled',
+      recoverable: true,
+    });
   });
 
   it('idle → thinking → streaming → error (error during streaming)', () => {

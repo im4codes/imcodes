@@ -261,6 +261,11 @@ describe('ChatMarkdown', () => {
 
     fireEvent.click(image);
     expect(container.querySelector('.fb-lightbox')).not.toBeNull();
+    fireEvent.keyDown(container.querySelector('.fb-lightbox') as HTMLDivElement, { key: 'Escape' });
+    expect(container.querySelector('.fb-lightbox')).toBeNull();
+
+    fireEvent.click(image);
+    expect(container.querySelector('.fb-lightbox')).not.toBeNull();
     fireEvent.click(container.querySelector('.fb-lightbox-close') as HTMLButtonElement);
     expect(container.querySelector('.fb-lightbox')).toBeNull();
   });

@@ -594,6 +594,27 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(sh.match(/schedule_self_cleanup/g)?.length ?? 0).toBeGreaterThanOrEqual(6);
   });
 
+  it('repairs shell CLI wrappers after a successful install, even when no restart is needed', async () => {
+    const sh = await captureUpgradeScript();
+
+    const repairFnIdx = sh.indexOf('repair_cli_wrappers()');
+    const noRestartIdx = sh.indexOf('installed $INSTALLED_VER matches current — repairing CLI wrappers without restart');
+    const launchIdx = sh.indexOf('log "[step 3.5] regenerating launch chain"');
+    const repairIdx = sh.indexOf('log "[step 3.6] repairing CLI wrappers"', launchIdx);
+    const restartIdx = sh.indexOf('log "[step 4] running restart command"');
+
+    expect(sh).toContain('USER_BIN="$HOME/.local/bin"');
+    expect(sh).toContain('USER_SHIM="$USER_BIN/imcodes"');
+    expect(sh).toContain('GLOBAL_SHIM="/usr/local/bin/imcodes"');
+    expect(sh).toContain('printf \'exec "%s" "%s" "$@"\\n\' "$NODE" "$NEW_IMCODES_SCRIPT"');
+    expect(sh).toContain('sudo -n true');
+    expect(sh).toContain('sudo install -m 755 "$WRAPPER_TMP" "$GLOBAL_SHIM"');
+    expect(repairFnIdx).toBeGreaterThan(-1);
+    expect(noRestartIdx).toBeGreaterThan(repairFnIdx);
+    expect(repairIdx).toBeGreaterThan(launchIdx);
+    expect(repairIdx).toBeLessThan(restartIdx);
+  });
+
   it('generated bash is syntactically valid (`bash -n` passes)', async () => {
     const sh = await captureUpgradeScript();
     // Use vi.importActual to bypass the fs mock above (which captures

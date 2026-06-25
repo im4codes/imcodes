@@ -39,12 +39,13 @@ import {
   wireProviderToRelay,
   emitTransportUserMessage,
   broadcastProviderStatus,
+  __testing__ as relayTesting,
 } from '../../src/daemon/transport-relay.js';
 
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
-import type { TransportProvider } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -155,6 +156,9 @@ describe('transport-relay (timeline-emitter based)', () => {
   let appendMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    // Clear module-global per-session relay state so a prior test's in-flight
+    // message can't leak a finalize emit into the next test.
+    relayTesting.resetRelayState();
     send = vi.fn();
     setTransportRelaySend(send);
 
@@ -220,27 +224,64 @@ describe('transport-relay (timeline-emitter based)', () => {
       vi.useRealTimers();
     });
 
-    it('does not let a new message flush an old throttled delta later', () => {
+    it('finalizes the previous message (full text, streaming:false) when messageId changes', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
 
       const { provider, fireDelta } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-old', delta: 'old-a' }));
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-old', delta: 'old-ab' }));
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-new', delta: 'new-a' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-old', delta: 'old-a' }));   // emits streaming:true 'old-a'
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-old', delta: 'old-ab' }));  // throttled (buffered)
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-new', delta: 'new-a' }));   // boundary → finalize msg-old
 
-      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(2);
-      expect(emitMock.mock.calls[0][2].text).toBe('old-a');
-      expect(emitMock.mock.calls[1][2].text).toBe('new-a');
-
-      vi.advanceTimersByTime(500);
       const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
-      expect(textCalls).toHaveLength(2);
-      expect(textCalls.map(c => c[2].text)).not.toContain('old-ab');
+      // 1) live 'old-a' (streaming), 2) finalize 'old-ab' (streaming:false — the
+      //    buffered tail must NOT be lost), 3) live 'new-a' (streaming).
+      expect(textCalls).toHaveLength(3);
+      expect(textCalls[0][2]).toMatchObject({ text: 'old-a', streaming: true });
+      expect(textCalls[1][2]).toMatchObject({ text: 'old-ab', streaming: false });
+      expect(textCalls[2][2]).toMatchObject({ text: 'new-a', streaming: true });
+      // The finalized previous message is persisted (written to the timeline store).
+      expect(appendMock.mock.calls.some(c => c[1]?.type === 'assistant.text' && c[1]?.text === 'old-ab')).toBe(true);
+
+      // No DUPLICATE finalize/flush of the stale buffered update later.
+      vi.advanceTimersByTime(500);
+      const after = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(after).toHaveLength(3);
 
       vi.useRealTimers();
+    });
+
+    it('persists EVERY message of a multi-message turn (codex agentMessage-per-tool-round)', () => {
+      // Regression: codex emits multiple agentMessage items per turn (one per
+      // tool round), each a new messageId. The relay only finalized the LAST
+      // message (via onComplete); earlier messages stayed streaming:true and
+      // never reached the timeline store, so they vanished on refresh — the
+      // user got a push notification + live ctx but a blank/partial timeline.
+      const { provider, fireDelta, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      // Message 1 (before a tool round) — cumulative deltas.
+      fireDelta('sess-multi', makeDelta({ messageId: 'item-1', delta: 'Let me check.' }));
+      // Message 2 (after the tool round) — new messageId.
+      fireDelta('sess-multi', makeDelta({ messageId: 'item-2', delta: 'The answer is 42.' }));
+      // Turn completes on the last message.
+      fireComplete('sess-multi', makeMessage({ id: 'item-2', content: 'The answer is 42.' }));
+
+      // Both messages must be PERSISTED (streaming:false) to the timeline store.
+      const persisted = appendMock.mock.calls
+        .filter(c => c[1]?.type === 'assistant.text')
+        .map(c => c[1]?.text);
+      expect(persisted).toContain('Let me check.');   // finalized at the item-1→item-2 boundary
+      expect(persisted).toContain('The answer is 42.'); // finalized by onComplete
+
+      // Each persisted under its own stable eventId (separate bubbles).
+      const finals = emitMock.mock.calls
+        .filter(c => c[1] === 'assistant.text' && c[2]?.streaming === false);
+      expect(finals.map(c => c[3]?.eventId)).toEqual(
+        expect.arrayContaining(['transport:sess-multi:item-1', 'transport:sess-multi:item-2']),
+      );
     });
 
     it('throttles independently per session', () => {
@@ -690,7 +731,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![2].streaming).toBe(false);
     });
 
-    it('emits session.state idle with error message', () => {
+    it('emits session.state error with error message', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -699,7 +740,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
       expect(stateCall).toBeDefined();
       expect(stateCall![0]).toBe('sess-err');
-      expect(stateCall![2].state).toBe('idle');
+      expect(stateCall![2].state).toBe('error');
       expect(stateCall![2].error).toBe('Too many requests');
     });
 
@@ -729,6 +770,28 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.type).toBe('session.error');
       expect(event.error).toBe('Provider down');
       expect(event.code).toBe('PROVIDER_ERROR');
+    });
+
+    it('renders CANCELLED as a visible cancellation notice without session error state', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-cancelled', makeDelta({ messageId: 'msg-cancelled', delta: 'partial before stop' }));
+      emitMock.mockClear();
+
+      fireError('sess-cancelled', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall).toBeDefined();
+      expect(textCall![0]).toBe('sess-cancelled');
+      expect(textCall![2]).toMatchObject({
+        text: '⚠️ Turn cancelled: Cancelled',
+        streaming: false,
+        memoryExcluded: true,
+      });
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+      expect(appendMock).not.toHaveBeenCalled();
     });
 
     it('does NOT call sendToServer', () => {
@@ -880,9 +943,14 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
+      expect(call![2]).toEqual({ toolCallId: 'tool-1', tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:call');
       expect(call![3].hidden).not.toBe(true);
+      expect(appendMock).toHaveBeenCalledWith('sess-tool', expect.objectContaining({
+        type: 'tool.call',
+        toolCallId: 'tool-1',
+        tool: 'list_directory',
+      }));
     });
 
     it('emits tool.result for completed tools with stable eventId', () => {
@@ -900,7 +968,13 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
+      expect(call![2]).toEqual({
+        toolCallId: 'tool-1',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+        output: 'done',
+        detail: { kind: 'tool_result', output: 'done' },
+      });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
       expect(call![3].hidden).not.toBe(true);
     });
@@ -936,6 +1010,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-plan');
       expect(call![2]).toMatchObject({
+        toolCallId: 'todo-1',
         tool: 'update_plan',
         input: {
           plan: [
@@ -951,8 +1026,14 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(result?.[3]).toMatchObject({
         eventId: 'transport-tool:sess-plan:todo-1:result',
       });
+      expect(result?.[2]).toMatchObject({
+        toolCallId: 'todo-1',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      });
       expect(appendMock).toHaveBeenCalledWith('sess-plan', expect.objectContaining({
         type: 'tool.call',
+        toolCallId: 'todo-1',
         tool: 'update_plan',
       }));
     });
@@ -1044,6 +1125,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call?.[3]?.hidden).toBe(true);
       expect(result?.[3]?.hidden).toBe(true);
+      expect(call?.[2]).toMatchObject({ toolCallId: 'sdk-task-terminal' });
+      expect(result?.[2]).toMatchObject({
+        toolCallId: 'sdk-task-terminal',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      });
       expect(call?.[2]?.detail?.meta?.canonicalKey).toBe(canonicalKey);
       expect(result?.[2]?.detail?.meta?.canonicalKey).toBe(canonicalKey);
       expect(result?.[2]).toMatchObject({
@@ -1113,6 +1200,9 @@ describe('transport-relay (timeline-emitter based)', () => {
       const result = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(result).toBeDefined();
       expect(result![2]).toMatchObject({
+        toolCallId: 'sdk-task-error',
+        terminalStatus: 'errored',
+        terminalReason: 'provider_error',
         error: 'error',
         detail: {
           kind: SDK_SUBAGENT_DETAIL_KIND,

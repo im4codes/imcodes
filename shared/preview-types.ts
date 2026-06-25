@@ -73,9 +73,9 @@ export const PREVIEW_LIMITS = {
    * coupling guard).
    */
   PREVIEW_MAX_LIFETIME_HARD_MS: previewLimitFromEnv('PREVIEW_MAX_LIFETIME_HARD_MS', 8 * 60 * 60 * 1000),
-  RESPONSE_START_TIMEOUT_MS: 30_000,
-  STREAM_IDLE_TIMEOUT_MS: 120_000,
-  MAX_ACTIVE_PREVIEWS_PER_USER_PER_SERVER: 8,
+  RESPONSE_START_TIMEOUT_MS: previewLimitFromEnv('PREVIEW_RESPONSE_START_TIMEOUT_MS', 30_000),
+  STREAM_IDLE_TIMEOUT_MS: previewLimitFromEnv('PREVIEW_STREAM_IDLE_TIMEOUT_MS', 120_000),
+  MAX_ACTIVE_PREVIEWS_PER_USER_PER_SERVER: previewLimitFromEnv('PREVIEW_MAX_ACTIVE_PER_USER_PER_SERVER', 8),
   /**
    * Per-request COUNT rate-limit constants — DEPRECATED (run 85582241/8a975732):
    * the count-based limiter (`previewRateLimiter`) misfires on a real SPA first
@@ -96,10 +96,12 @@ export const PREVIEW_LIMITS = {
   MAX_INFLIGHT_PREVIEW_HTTP_PER_SERVER: previewLimitFromEnv('PREVIEW_MAX_INFLIGHT_PER_SERVER', 256),
   /**
    * Unconsumed-buffer high-watermark for a streaming response on the server side
-   * (run 8a975732-23a A7). Measured in BYTES (via ByteLengthQueuingStrategy or an
-   * explicit unconsumed-byte counter — NOT ReadableStreamDefaultController
-   * .desiredSize). Exceeding it deterministically closes the stream. MUST ship in
-   * the same PR as the streaming byte-cap exemption.
+   * (run 8a975732-23a A7 / D8). Measured in BYTES via an EXPLICIT unconsumed-byte
+   * counter (the external `pendingChunks` FIFO in bridge.ts) — NOT
+   * `ReadableStreamDefaultController.desiredSize`, and NOT `ByteLengthQueuingStrategy`
+   * (which only models backpressure and does not close on overflow). Exceeding it
+   * deterministically closes the stream. MUST ship in the same PR as the streaming
+   * byte-cap exemption.
    */
   MAX_PREVIEW_STREAM_BUFFER_BYTES: previewLimitFromEnv('PREVIEW_MAX_STREAM_BUFFER_BYTES', 16 * 1024 * 1024),
   MAX_WS_PER_PREVIEW: 8,

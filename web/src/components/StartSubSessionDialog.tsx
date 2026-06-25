@@ -5,7 +5,6 @@ import { useState, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
-import { FileBrowser } from './file-browser-lazy.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
@@ -66,12 +65,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [customProviderSdk, setCustomProviderSdk] = useState(false);
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
-  const [cwd, setCwd] = useState(defaultCwd ?? '');
+  const cwd = defaultCwd ?? '';
   const [label, setLabel] = useState('');
   const [scriptCmd, setScriptCmd] = useState('');
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
-  const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [thinking, setThinking] = useState<TransportEffortLevel>('high');
   const [requestedModel, setRequestedModel] = useState('');
 
@@ -754,30 +752,21 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
           {/* Working directory */}
           <div>
-            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Working directory (optional)</div>
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.subsessionWorkingDirectory')}</div>
             <div class="input-with-browse">
               <input
                 class="input"
-                placeholder="~/projects/myapp"
+                placeholder={t('session.subsessionWorkingDirectoryPlaceholder')}
                 value={cwd}
-                onInput={(e) => setCwd((e.target as HTMLInputElement).value)}
+                disabled
+                readOnly
+                aria-disabled="true"
               />
-              {ws && (
-                <button class="btn-browse" type="button" onClick={() => setShowDirBrowser(true)} title="Browse">📁</button>
-              )}
+            </div>
+            <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+              {t('session.subsessionWorkingDirectoryLocked')}
             </div>
           </div>
-
-          {showDirBrowser && ws && (
-            <FileBrowser
-              ws={ws}
-              mode="dir-only"
-              layout="modal"
-              initialPath={cwd || defaultCwd || '~'}
-              onConfirm={(paths) => { setCwd(paths[0] ?? ''); setShowDirBrowser(false); }}
-              onClose={() => setShowDirBrowser(false)}
-            />
-          )}
 
           {/* Label */}
           <div>

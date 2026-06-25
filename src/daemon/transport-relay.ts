@@ -5,7 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import type { TransportProvider, ProviderError, ProviderStatusUpdate, ProviderUsageUpdate } from '../agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type ProviderStatusUpdate, type ProviderUsageUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
@@ -87,6 +87,7 @@ function isChecklistTool(tool: ToolCallEvent): boolean {
 
 function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
   timelineEmitter.emit(sessionName, 'tool.call', {
+    toolCallId: tool.id,
     tool: tool.name,
     ...(tool.input !== undefined ? { input: tool.input } : {}),
     ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -98,6 +99,7 @@ function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
   void appendTransportEvent(sessionName, {
     type: 'tool.call',
     sessionId: sessionName,
+    toolCallId: tool.id,
     tool: tool.name,
     ...(tool.input !== undefined ? { input: tool.input } : {}),
     ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -106,6 +108,9 @@ function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
 
 function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   timelineEmitter.emit(sessionName, 'tool.result', {
+    toolCallId: tool.id,
+    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
+    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -120,6 +125,9 @@ function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   void appendTransportEvent(sessionName, {
     type: 'tool.result',
     sessionId: sessionName,
+    toolCallId: tool.id,
+    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
+    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -263,6 +271,24 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const previous = inFlightMessages.get(sessionName);
     if (previous && previous.messageId !== delta.messageId) {
       clearPendingStreamUpdate(previous.eventId);
+      // A new message started mid-turn (codex emits multiple agentMessage items
+      // per turn, one per tool round). FINALIZE the previous message now —
+      // emit it as streaming:false so it is written to the timeline store.
+      // Without this, only the LAST message of the turn (finalized by
+      // onComplete) is persisted; every earlier message stays streaming:true,
+      // never hits disk, and vanishes on refresh/reconnect — the user sees a
+      // push notification and live ctx updates but a blank/partial timeline.
+      if (previous.text) {
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: previous.text,
+          streaming: false,
+        }, { source: 'daemon', confidence: 'high', eventId: previous.eventId });
+        void appendTransportEvent(sessionName, {
+          type: 'assistant.text',
+          sessionId: sessionName,
+          text: previous.text,
+        });
+      }
     }
     inFlightMessages.set(sessionName, {
       messageId: delta.messageId,
@@ -336,6 +362,20 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const tracked = inFlightMessages.get(sessionName);
     inFlightMessages.delete(sessionName);
     if (tracked) clearPendingStreamUpdate(tracked.eventId);
+
+    if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        text: `⚠️ Turn cancelled: ${error.message}`,
+        streaming: false,
+        memoryExcluded: true,
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        ...(tracked ? { eventId: tracked.eventId } : {}),
+      });
+      return;
+    }
+
     const errorText = tracked?.text
       ? `${tracked.text}\n\n⚠️ Error: ${error.message}`
       : `⚠️ Error: ${error.message}`;
@@ -351,7 +391,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     });
 
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'idle',
+      state: 'error',
       error: error.message,
     }, { source: 'daemon', confidence: 'high' });
 
@@ -505,6 +545,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (fileChangeBatch) {
       timelineEmitter.emit(sessionName, 'tool.call', {
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
@@ -517,12 +558,16 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.call',
         sessionId: sessionName,
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
         hidden: true,
       });
       timelineEmitter.emit(sessionName, 'tool.result', {
+        toolCallId: effectiveTool.id,
+        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
+        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
         ...(effectiveTool.status === 'error'
           ? { error: effectiveTool.output ?? 'error' }
           : effectiveTool.output !== undefined
@@ -538,6 +583,9 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.result',
         sessionId: sessionName,
+        toolCallId: effectiveTool.id,
+        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
+        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
         tool: effectiveTool.name,
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
         ...(effectiveTool.status === 'error'
@@ -557,6 +605,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (pending && looksLikeStructuredFileTool) {
       timelineEmitter.emit(sessionName, 'tool.call', {
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
@@ -568,6 +617,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.call',
         sessionId: sessionName,
+        toolCallId: effectiveTool.id,
         tool: effectiveTool.name,
         ...(effectiveTool.input !== undefined ? { input: effectiveTool.input } : {}),
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
@@ -576,6 +626,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     if (tool.status === 'running') {
       timelineEmitter.emit(sessionName, 'tool.call', {
+        toolCallId: tool.id,
         tool: tool.name,
         ...(tool.input !== undefined ? { input: tool.input } : {}),
         ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -587,6 +638,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       void appendTransportEvent(sessionName, {
         type: 'tool.call',
         sessionId: sessionName,
+        toolCallId: tool.id,
         tool: tool.name,
         ...(tool.input !== undefined ? { input: tool.input } : {}),
         ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
@@ -692,4 +744,19 @@ async function pushProviderSessions(providerId: string): Promise<void> {
 /** @internal Exported for tests only — see test/daemon/transport-relay-usage-payload.test.ts. */
 export const __testing__ = {
   normalizeUsageUpdatePayload,
+  /**
+   * Clear all module-global per-session relay state. Tests reuse session names
+   * across cases; without this, a prior test's in-flight message leaks and the
+   * next test's first delta (different messageId) triggers a finalize emit.
+   * Production never needs this — onComplete/onError clear inFlightMessages,
+   * and an orphaned leftover finalizing on the next turn is the desired
+   * behavior (the orphan message gets persisted).
+   */
+  resetRelayState(): void {
+    for (const eventId of [...pendingStreamUpdates.keys()]) clearPendingStreamUpdate(eventId);
+    inFlightMessages.clear();
+    pendingFileLikeTools.clear();
+    completedFileLikeTools.clear();
+    askQuestionToolIds.clear();
+  },
 };

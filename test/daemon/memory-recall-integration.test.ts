@@ -34,6 +34,15 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
 
+// `startup-memory` sources `searchLocalMemory` from the worker-safe core
+// (`memory-recall-core`), not `memory-search`, so mock it there too — otherwise
+// the bootstrap path hits the real (empty) store. Spread the real module so the
+// other core exports remain intact.
+vi.mock('../../src/context/memory-recall-core.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/context/memory-recall-core.js')>()),
+  searchLocalMemory: searchLocalMemoryMock,
+}));
+
 vi.mock('../../src/context/embedding.js', () => ({
   generateEmbedding: generateEmbeddingMock,
   isEmbeddingAvailable: isEmbeddingAvailableMock,

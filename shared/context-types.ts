@@ -1,4 +1,5 @@
 import type { MemoryScoringWeights } from './memory-scoring.js';
+import type { ActivityGeneration } from './session-activity-types.js';
 import type {
   AuthoredContextScope,
   MemoryScope,
@@ -147,6 +148,8 @@ export type ProviderSupportClass =
 export interface ProviderContextPayload {
   userMessage: string;
   assembledMessage: string;
+  /** Runtime-minted transport activity generation for lifecycle attribution. */
+  activityGeneration?: ActivityGeneration;
   sessionSystemText?: string;
   turnSystemText?: string;
   /**

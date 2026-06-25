@@ -35,6 +35,18 @@ import type { ServerLink } from './server-link.js';
 import { startSubSession, stopSubSession } from './subsession-manager.js';
 import { sendSubSessionSync } from './subsession-sync.js';
 import { getPaneCwd } from '../agent/tmux.js';
+import { GitRemoteCloneError, cloneGitRemoteToDirectory } from './git-remote-clone.js';
+import { normalizeOptionalGitRemoteUrl } from '../../shared/git-remote-url.js';
+import { cloneTransportConfigWithoutRuntimeIdentity } from '../../shared/transport-identity-scrub.js';
+
+// Re-export the transport-identity scrub helpers (now living in shared/) so any
+// existing importers of this module continue to resolve them here.
+export {
+  CLONE_TRANSPORT_IDENTITY_KEY_NORMALIZED,
+  cloneTransportConfigWithoutRuntimeIdentity,
+  isCloneTransportIdentityKey,
+  scrubCloneTransportIdentity,
+} from '../../shared/transport-identity-scrub.js';
 
 const OPERATION_RETENTION_MS = 10 * 60 * 1000;
 
@@ -68,54 +80,6 @@ interface CreatedResources {
 const operationsByIdempotencyKey = new Map<string, CloneOperationSnapshot>();
 const activeTargetReservations = new Set<string>();
 const cancelledOperationIds = new Set<string>();
-const CLONE_TRANSPORT_IDENTITY_KEY_NORMALIZED = new Set([
-  'bindexistingkey',
-  'ccsessionid',
-  'codexsessionid',
-  'conversationid',
-  'geminisessionid',
-  'opencodesessionid',
-  'providersessionid',
-  'providerresumeid',
-  'resumeid',
-  'sessionid',
-  'sessionkey',
-  'threadid',
-]);
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isCloneTransportIdentityKey(key: string): boolean {
-  const normalized = key.replace(/[-_]/g, '').toLowerCase();
-  return CLONE_TRANSPORT_IDENTITY_KEY_NORMALIZED.has(normalized)
-    || normalized.endsWith('sessionid')
-    || normalized.endsWith('sessionkey')
-    || normalized.endsWith('resumeid')
-    || normalized.endsWith('threadid');
-}
-
-function scrubCloneTransportIdentity(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => scrubCloneTransportIdentity(item));
-  }
-  if (!isPlainRecord(value)) return value;
-
-  const cleaned: Record<string, unknown> = {};
-  for (const [key, nestedValue] of Object.entries(value)) {
-    if (isCloneTransportIdentityKey(key)) continue;
-    cleaned[key] = scrubCloneTransportIdentity(nestedValue);
-  }
-  return cleaned;
-}
-
-function cloneTransportConfigWithoutRuntimeIdentity(config: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
-  if (!isPlainRecord(config)) return null;
-  const cleaned = scrubCloneTransportIdentity(config);
-  return isPlainRecord(cleaned) ? cleaned : null;
-}
-
 function pruneOperations(now = Date.now()): void {
   for (const [key, operation] of operationsByIdempotencyKey.entries()) {
     if (now - operation.updatedAt > OPERATION_RETENTION_MS) operationsByIdempotencyKey.delete(key);
@@ -179,7 +143,7 @@ function assertNotCancelled(operation: CloneOperationSnapshot): void {
   throw new SessionGroupCloneValidationError('cancelled', 'Session group clone cancelled');
 }
 
-function requestFingerprint(request: Pick<SessionGroupCloneRequest, 'sourceMainSessionName' | 'targetProjectName' | 'cwdOverride' | 'serverId'>): string {
+function requestFingerprint(request: Pick<SessionGroupCloneRequest, 'sourceMainSessionName' | 'targetProjectName' | 'cwdOverride' | 'gitRemoteUrl' | 'serverId'>): string {
   return JSON.stringify({
     serverId: request.serverId ?? null,
     sourceMainSessionName: request.sourceMainSessionName.trim(),
@@ -189,6 +153,9 @@ function requestFingerprint(request: Pick<SessionGroupCloneRequest, 'sourceMainS
     cwdOverride: typeof request.cwdOverride === 'string'
       ? request.cwdOverride.trim()
       : request.cwdOverride ?? null,
+    gitRemoteUrl: typeof request.gitRemoteUrl === 'string'
+      ? request.gitRemoteUrl.trim()
+      : request.gitRemoteUrl ?? null,
   });
 }
 
@@ -349,8 +316,14 @@ async function buildCloneSpec(
   activeTargetReservations.add(target.targetMainSessionName);
   operation.reservedTargetName = target.targetMainSessionName;
 
+  const gitRemoteUrl = normalizeOptionalGitRemoteUrl(cmd.gitRemoteUrl);
+  if (gitRemoteUrl && !cmd.cwdOverride?.trim()) {
+    throw new SessionGroupCloneValidationError('invalid_cwd', 'gitRemoteUrl requires cwdOverride');
+  }
   const cwdOverride = cmd.cwdOverride?.trim()
-    ? await resolveUsableDirectory(cmd.cwdOverride, 'cwdOverride')
+    ? gitRemoteUrl
+      ? await cloneGitRemoteToDirectory({ gitRemoteUrl, targetDir: cmd.cwdOverride.trim() })
+      : await resolveUsableDirectory(cmd.cwdOverride, 'cwdOverride')
     : null;
   const mainProjectDir = cwdOverride ?? await resolveUsableDirectory(source.projectDir, `${source.name}.projectDir`);
   assertNotCancelled(operation);
@@ -409,7 +382,7 @@ async function buildCloneSpec(
     runtimeType: source.runtimeType ?? null,
     providerId: source.providerId ?? null,
     projectDir: mainProjectDir,
-    label: source.label ?? null,
+    label: target.rawTargetProjectName,
     description: source.description ?? null,
     requestedModel: source.requestedModel ?? null,
     activeModel: source.activeModel ?? null,
@@ -444,10 +417,19 @@ async function copyDaemonLocalP2pConfig(
   spec: CloneableSessionGroupSpec,
   resources: CreatedResources,
 ): Promise<SessionGroupCloneWarning[]> {
-  const sourceScope = getP2pConfigStoreScope(serverLink, spec.main.sourceSessionName);
+  const sourceSessionCandidates = [
+    spec.main.sourceSessionName,
+    ...spec.subSessions.map((sub) => sub.sourceSessionName),
+    ...spec.skippedMembers.map((member) => member.sessionName),
+  ];
   const targetScope = getP2pConfigStoreScope(serverLink, spec.main.targetMainSessionName);
-    const sourceConfig = await getSavedP2pConfig(sourceScope)
-    ?? (sourceScope === spec.main.sourceSessionName ? undefined : await getSavedP2pConfig(spec.main.sourceSessionName));
+  let sourceConfig: import('../../shared/p2p-modes.js').P2pSavedConfig | undefined;
+  for (const sourceSessionName of sourceSessionCandidates) {
+    const sourceScope = getP2pConfigStoreScope(serverLink, sourceSessionName);
+    sourceConfig = await getSavedP2pConfig(sourceScope)
+      ?? (sourceScope === sourceSessionName ? undefined : await getSavedP2pConfig(sourceSessionName));
+    if (sourceConfig) break;
+  }
   if (!sourceConfig) return [{ code: 'p2p_config_missing' }];
   const remapped = cloneP2pConfigWithSessionRemap(sourceConfig, spec.sessionNameMap, Date.now(), {
     sourceGroupSessionNames: [
@@ -519,8 +501,13 @@ async function launchCloneMembers(
     totalSubSessions: spec.subSessions.length,
     subSessionsCreated: 0,
   });
+  // Launch all cloned sub-sessions concurrently — each launch can take seconds
+  // (provider connect, CLI startup, tmux bootstrap), so sequential awaits make
+  // clones with several members painfully slow. Total wall-clock becomes the
+  // slowest single member instead of the sum of all members.
   let subSessionsCreated = 0;
-  for (const sub of spec.subSessions) {
+  const clonedSubRecords: Array<SessionRecord | null> = new Array(spec.subSessions.length).fill(null);
+  const subLaunchResults = await Promise.allSettled(spec.subSessions.map(async (sub, index) => {
     assertNotCancelled(operation);
     assertAgentType(sub.agentType);
     await startSubSession({
@@ -539,7 +526,7 @@ async function launchCloneMembers(
     });
     resources.clonedSubSessionNames.push(sub.clonedSessionName);
     const clonedSubRecord = patchClonedSubSessionRecord(sub, spec.main.targetMainSessionName);
-    recordsToPersist.push(clonedSubRecord);
+    clonedSubRecords[index] = clonedSubRecord;
     pushProviderSessionResource(resources, clonedSubRecord);
     await sendSubSessionSync(serverLink, sub.clonedId, clonedSubRecord);
     subSessionsCreated += 1;
@@ -548,6 +535,15 @@ async function launchCloneMembers(
       totalSubSessions: spec.subSessions.length,
       subSessionsCreated,
     });
+  }));
+  // Wait for every launch to settle before deciding the outcome so rollback
+  // never races an in-flight startSubSession.
+  const firstSubLaunchFailure = subLaunchResults.find(
+    (entry): entry is PromiseRejectedResult => entry.status === 'rejected',
+  );
+  if (firstSubLaunchFailure) throw firstSubLaunchFailure.reason;
+  for (const record of clonedSubRecords) {
+    if (record) recordsToPersist.push(record);
   }
   assertNotCancelled(operation);
 
@@ -737,6 +733,7 @@ async function rollbackClone(serverLink: ServerLink, resources: CreatedResources
 }
 
 function errorCodeFromUnknown(err: unknown): SessionGroupCloneErrorCode {
+  if (err instanceof GitRemoteCloneError) return err.code;
   if (err instanceof SessionGroupCloneValidationError) return err.code;
   return 'internal_error';
 }
@@ -760,6 +757,9 @@ export async function handleSessionGroupCloneCommand(cmd: Record<string, unknown
       : undefined,
     cwdOverride: typeof cmd.cwdOverride === 'string' || cmd.cwdOverride === null
       ? cmd.cwdOverride
+      : undefined,
+    gitRemoteUrl: typeof cmd.gitRemoteUrl === 'string' || cmd.gitRemoteUrl === null
+      ? cmd.gitRemoteUrl
       : undefined,
     unavailableSessionNames: Array.isArray(cmd.unavailableSessionNames)
       ? cmd.unavailableSessionNames.filter((name): name is string => typeof name === 'string')

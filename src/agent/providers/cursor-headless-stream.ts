@@ -216,11 +216,31 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
     const message = pickRecord(record.message);
     const text = extractTextFromContent(message?.content ?? record.text ?? record.content);
     if (!text) return null;
+    const messageId = extractMessageId(message ?? record);
+    // cursor-agent with --stream-partial-output emits the assistant response as
+    // a series of INCREMENTAL `type:"assistant"` fragments, each tagged with a
+    // `timestamp_ms`, followed by ONE consolidated full-text `type:"assistant"`
+    // message that has NO `timestamp_ms` (closing the segment), then a `result`.
+    // Verified against cursor-agent 2026.06 (e.g. "Hello", " there", " friend",
+    // "." → "Hello there friend."). Stream the timestamped fragments as deltas
+    // so the bubble fills incrementally; treat the untimestamped consolidated
+    // message as the segment final (buffered, not re-emitted). Without this the
+    // parser classified every fragment as `assistant.final`, so nothing streamed
+    // and the whole answer appeared at once only when `result` arrived.
+    if (typeof record.timestamp_ms === 'number') {
+      return {
+        kind: 'assistant.delta',
+        raw: record,
+        sessionId,
+        ...(messageId ? { messageId } : {}),
+        text,
+      };
+    }
     return {
       kind: 'assistant.final',
       raw: record,
       sessionId,
-      messageId: extractMessageId(message ?? record),
+      messageId,
       text,
     };
   }

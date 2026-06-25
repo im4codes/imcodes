@@ -3,6 +3,7 @@
  * Handles auth, reconnect, and message dispatch.
  */
 import type { TerminalDiff } from './types.js';
+import type { TransportPendingMessageEntry } from './transport-queue.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
@@ -14,7 +15,10 @@ import { TRANSPORT_EVENT } from '@shared/transport-events.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import type { ShareTarget } from './tab-sharing-ui.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -57,6 +61,8 @@ import type {
   FsWriteResponse,
   FsWriteOptions,
   FsMkdirResponse,
+  FsRenameResponse,
+  FsDeleteResponse,
 } from '../../src/shared/transport/fs.js';
 import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
 
@@ -66,6 +72,10 @@ export interface P2pWorkflowRequestScope {
   sessionName?: string;
   projectDir?: string;
   cwd?: string;
+}
+
+export interface FsListDirOptions {
+  includeOpenSpecTaskStats?: boolean;
 }
 
 /** Snapshot of the most recent `daemon.hello` capability handshake the browser
@@ -127,10 +137,11 @@ export type ServerMessage =
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'auto_deliver_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'toolchain_unavailable'; nodeBinPresent?: boolean; npmAvailable?: boolean }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[] }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | TimelineEventMessage
   | TimelineReplayResponseMessage
@@ -145,8 +156,8 @@ export type ServerMessage =
   | { type: 'pong' }
   | { type: 'subsession.shells'; shells: string[] }
   | { type: 'subsession.response'; sessionName: string; status: 'working' | 'idle'; response?: string }
-  | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }> }
-  | { type: 'discussion.update'; requestId?: string; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string | null; filePath?: string; lastResponse?: string }
+  | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }>; sharedActor?: SharedActorEnvelope }
+  | { type: 'discussion.update'; requestId?: string; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string | null; filePath?: string; lastResponse?: string; sharedActor?: SharedActorEnvelope }
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
@@ -157,14 +168,15 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.DAEMON_HELLO; daemonId: string; capabilities: string[]; helloEpoch: number; sentAt: number; timelineProtocolRevision?: number; timelineProtocolCapability?: string; buildInfo?: DaemonBuildInfo }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_UPDATE; run: any }
+  | { type: typeof P2P_WORKFLOW_MSG.RUN_SAVE; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
-  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_STARTED; runId: string; session: string }
   | { type: typeof P2P_WORKFLOW_MSG.CANCEL_RESPONSE; runId: string; ok: boolean }
-  | { type: typeof P2P_WORKFLOW_MSG.STATUS_RESPONSE; requestId: string; runId?: string; run?: any; runs?: any[] }
+  | { type: typeof P2P_WORKFLOW_MSG.STATUS_RESPONSE; requestId: string; runId?: string; run?: any; runs?: any[]; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE; requestId: string; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
   | { type: typeof P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE; id?: string; requestId: string; content?: string; error?: string }
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
@@ -174,6 +186,8 @@ export type ServerMessage =
   | FsGitDiffResponse
   | FsWriteResponse
   | FsMkdirResponse
+  | FsRenameResponse
+  | FsDeleteResponse
   | { type: 'repo.detect_response'; requestId: string; projectDir: string; context: any }
   | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
@@ -271,7 +285,7 @@ const POST_CONNECT_NON_CRITICAL_STAGGER_MS = 90;
 const PONG_TIMEOUT_MS = 8_000;
 const RESUME_PROBE_TIMEOUT_MS = 8_000;
 const PONG_MISSES_BEFORE_RECONNECT = 2;
-const WS_TICKET_TIMEOUT_MS = 15_000;
+const WS_TICKET_TIMEOUT_MS = 30_000;
 const WS_OPEN_TIMEOUT_MS = 15_000;
 const RESUME_FORCE_STALE_PONG_MS = 30_000;
 const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
@@ -323,6 +337,7 @@ export class WsClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private baseUrl: string;
   private serverId: string;
+  private shareTarget: ShareTarget | null;
   private _connected = false;
   private _connecting = false;
   private _destroyed = false;
@@ -401,9 +416,10 @@ export class WsClient {
     pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
 
-  constructor(baseUrl: string, serverId: string) {
+  constructor(baseUrl: string, serverId: string, options: { shareTarget?: ShareTarget | null } = {}) {
     this.baseUrl = baseUrl;
     this.serverId = serverId;
+    this.shareTarget = options.shareTarget ?? null;
   }
 
   get connected(): boolean {
@@ -465,6 +481,18 @@ export class WsClient {
   }
 
   send(msg: object): void {
+    // Fire-and-forget transport: NEVER throw to the caller when the socket is
+    // momentarily down. `send()` is invoked from React effects, render paths,
+    // and document event listeners (focus/visibility → requestSessionList,
+    // discussionList, …); an uncaught "WebSocket not connected" throw there
+    // propagates to the ErrorBoundary and crashes the whole ChatView. Probe
+    // logic flips `_connected=false` on every tab resume even while readyState
+    // is OPEN, so this window is hit constantly. Recovery is handled by the
+    // reconnect loop + per-request timeouts; urgent delivery that needs HTTP
+    // fallback uses sendUrgent() (which still throws by design).
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
     const json = this.serializeOutboundMessage(msg);
     if (this.shouldStaggerNonCriticalMessage(msg)) {
       this.enqueueNonCriticalSend(json);
@@ -702,17 +730,23 @@ export class WsClient {
       return;
     }
     this.terminalSubscriptions.set(sessionName, raw);
-    this.queueTerminalSubscriptionSync(sessionName);
+    this.queueTerminalSubscriptionSync(sessionName, raw ? 0 : TERMINAL_SUBSCRIPTION_DEBOUNCE_MS, raw);
   }
 
   private queueTerminalSubscriptionSync(
     sessionName: string,
     minDelayMs = TERMINAL_SUBSCRIPTION_DEBOUNCE_MS,
+    urgent = false,
   ): void {
     const existing = this.terminalSubscriptionTimers.get(sessionName);
     if (existing) clearTimeout(existing);
     this.terminalSubscriptionTimers.delete(sessionName);
     if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    if (urgent) {
+      this.flushTerminalSubscription(sessionName);
+      return;
+    }
 
     const now = Date.now();
     const earliest = now + minDelayMs;
@@ -863,6 +897,31 @@ export class WsClient {
     this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
+  sendExecutionClones(payload: object = {}): void {
+    const sessionName = (payload as { sessionName?: unknown }).sessionName;
+    if (typeof sessionName === 'string' && sessionName.trim()) {
+      this.setP2pWorkflowRequestScope({ sessionName });
+    }
+    this.send({ type: DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES, ...payload });
+  }
+
+  /**
+   * Globally delete (hide) one timeline message for every viewer of this session.
+   * The daemon re-emits the event with hidden:true — persisted (JSONL + SQLite) and
+   * broadcast — so it disappears for everyone and stays gone across refresh/restart.
+   * Acked via the normal command.ack path. Pod-routing is implicit: this WS is already
+   * connected to the session's owning server.
+   */
+  deleteTimelineMessage(sessionName: string, eventId: string): void {
+    if (!sessionName || !eventId) return;
+    this.send({
+      type: TIMELINE_MESSAGES.DELETE,
+      sessionName,
+      eventId,
+      commandId: crypto.randomUUID(),
+    });
+  }
+
   /**
    * Send session.send command with an auto-generated commandId for dedup/ack.
    * Only session.send injects commandId — session.input does not.
@@ -892,6 +951,7 @@ export class WsClient {
    *  weekly (7d) quota. Driven by the per-user `claude_weekly_quota` pref; sent
    *  on every (re)connect and on toggle so each server the user visits honors it. */
   setClaudeWeeklyQuotaOptIn(enabled: boolean): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.send({ type: CLAUDE_QUOTA_MSG.SET_OPT_IN, enabled });
   }
 
@@ -903,6 +963,7 @@ export class WsClient {
           idempotencyKey: payload.idempotencyKey,
           ...(payload.targetProjectName !== undefined ? { targetProjectName: payload.targetProjectName } : {}),
           ...(payload.cwdOverride !== undefined ? { cwdOverride: payload.cwdOverride } : {}),
+          ...(payload.gitRemoteUrl !== undefined ? { gitRemoteUrl: payload.gitRemoteUrl } : {}),
         }),
       });
       return;
@@ -1083,6 +1144,7 @@ export class WsClient {
   private static readonly DAEMON_ORIGIN_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>([
     P2P_WORKFLOW_MSG.DAEMON_HELLO,
     P2P_WORKFLOW_MSG.RUN_UPDATE,
+    P2P_WORKFLOW_MSG.RUN_SAVE,
     P2P_WORKFLOW_MSG.STATUS_RESPONSE,
     P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
@@ -1198,9 +1260,16 @@ export class WsClient {
   }
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
-  fsListDir(path: string, includeFiles = false, includeMetadata = false): string {
+  fsListDir(path: string, includeFiles = false, includeMetadata = false, options?: FsListDirOptions): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.ls', path, requestId, includeFiles, includeMetadata });
+    this.send({
+      type: 'fs.ls',
+      path,
+      requestId,
+      includeFiles,
+      includeMetadata,
+      ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+    });
     return requestId;
   }
 
@@ -1233,6 +1302,20 @@ export class WsClient {
   fsMkdir(path: string): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'fs.mkdir', path, requestId });
+    return requestId;
+  }
+
+  /** Rename a file or directory on the daemon. Returns requestId. */
+  fsRename(path: string, newPath: string, sessionName?: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: FS_TRANSPORT_MSG.RENAME, path, newPath, requestId, ...(sessionName ? { sessionName } : {}) });
+    return requestId;
+  }
+
+  /** Delete a file or directory on the daemon. Returns requestId. */
+  fsDelete(path: string, sessionName?: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: FS_TRANSPORT_MSG.DELETE, path, requestId, ...(sessionName ? { sessionName } : {}) });
     return requestId;
   }
 
@@ -1422,11 +1505,17 @@ export class WsClient {
         this.wsTicketTimer = ticketTimer;
       });
       const data = await Promise.race([
-        apiFetch<{ ticket: string }>('/api/auth/ws-ticket', {
-          method: 'POST',
-          body: JSON.stringify({ serverId: this.serverId }),
-          signal: ticketAbort.signal,
-        }),
+        this.shareTarget
+          ? apiFetch<{ ticket: string }>('/api/shares/ws-ticket', {
+            method: 'POST',
+            body: JSON.stringify({ target: this.shareTarget }),
+            signal: ticketAbort.signal,
+          })
+          : apiFetch<{ ticket: string }>('/api/auth/ws-ticket', {
+            method: 'POST',
+            body: JSON.stringify({ serverId: this.serverId }),
+            signal: ticketAbort.signal,
+          }),
         ticketTimeout,
       ]);
       ticket = data.ticket;

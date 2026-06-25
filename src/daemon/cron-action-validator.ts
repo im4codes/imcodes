@@ -1,6 +1,7 @@
 import type { CronAction, CronSendAction } from '../../shared/cron-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { attachMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance } from '../../shared/memory-mcp-provenance.js';
+import { EXECUTION_CLONE_ERROR_CODES } from '../../shared/execution-clone.js';
 
 export type CronActionValidationResult =
   | { ok: true; action: CronSendAction }
@@ -17,6 +18,18 @@ export function validateMcpCronAction(action: unknown, provenance: MemoryMcpSour
 
   if (action.type !== 'send') {
     return { ok: false, reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, message: 'MCP cron jobs may only use structured send actions' };
+  }
+
+  // Cron-scheduled sends can NEVER create execution clones — a `clone` key on a
+  // scheduled action is rejected outright (cron_clone_forbidden). The clone
+  // create path requires a live, authorized creator session; a scheduled job has
+  // no such anchor, so allowing it would orphan clones with no destroy authority.
+  if ('clone' in action && action.clone !== undefined) {
+    return {
+      ok: false,
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: `Cron send actions may not create execution clones (${EXECUTION_CLONE_ERROR_CODES.CRON_CLONE_FORBIDDEN})`,
+    };
   }
 
   const target = typeof action.target === 'string' ? action.target.trim() : '';

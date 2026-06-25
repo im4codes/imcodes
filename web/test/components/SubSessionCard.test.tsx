@@ -101,12 +101,12 @@ describe('SubSessionCard', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
     localStorage.clear();
-    vi.useRealTimers();
   });
 
-  it('defers timeline hydration for closed preview cards until after first paint', async () => {
+  it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(
       <SubSessionCard
@@ -122,9 +122,9 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    expect(useTimelineSpy).toHaveBeenLastCalledWith(null, null, undefined, {
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
-      isVisible: true,
+      isVisible: false,
     });
 
     await act(async () => {
@@ -135,6 +135,33 @@ describe('SubSessionCard', () => {
       isActiveSession: false,
       isVisible: true,
     });
+  });
+
+  it('passes streaming assistant text to the card ChatView before hydration delay completes', () => {
+    timelineEvents = [{
+      eventId: 'stream-1',
+      sessionId: 'deck_sub_sub-card-1',
+      type: 'assistant.text',
+      payload: { text: 'partial stream', streaming: true },
+    }];
+
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={false}
+        previewHydrateDelayMs={1200}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(props.events).toEqual(timelineEvents);
+    expect(props.events[0].payload).toMatchObject({ text: 'partial stream', streaming: true });
   });
 
   it('forces preview scroll to bottom after sending from the card input', async () => {
@@ -160,9 +187,15 @@ describe('SubSessionCard', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
 
     await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'hello' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_sub_sub-card-1',
+        text: 'hello',
+        commandId: expect.any(String),
+      }));
       expect(preview.scrollTop).toBe(1500);
     });
+    const sentPayload = ws.sendSessionCommand.mock.calls[0]?.[1];
+    expect(addOptimisticUserMessageSpy).toHaveBeenCalledWith('hello', sentPayload.commandId);
   });
 
   it('does not render idle-flash layer for idle cards by default', () => {
@@ -326,9 +359,14 @@ describe('SubSessionCard', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
 
     await waitFor(() => {
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'echo hi' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_sub_sub-card-1',
+        text: 'echo hi',
+        commandId: expect.any(String),
+      }));
       expect(terminalScrollBottomSpy).toHaveBeenCalled();
     });
+    expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 
   it('keeps shell cards in raw terminal preview mode', async () => {
@@ -357,6 +395,30 @@ describe('SubSessionCard', () => {
 
     view.unmount();
     expect(releaseRaw).toHaveBeenCalledOnce();
+  });
+
+  it('fallback shell card cleanup unsubscribes instead of entering passive mode', async () => {
+    const ws = { subscribeTerminal: vi.fn(), unsubscribeTerminal: vi.fn() } as any;
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.subscribeTerminal).toHaveBeenCalledWith('deck_sub_sub-card-1', true);
+    });
+
+    view.unmount();
+
+    expect(ws.unsubscribeTerminal).toHaveBeenCalledWith('deck_sub_sub-card-1');
+    expect(ws.subscribeTerminal).not.toHaveBeenCalledWith('deck_sub_sub-card-1', false);
   });
 
   it('renders the stop button in transport fallback input mode and sends direct cancel via the urgent path', async () => {

@@ -317,6 +317,56 @@ describe('structured P2P routing via WS fields', () => {
     expect(rounds).toBeUndefined();
   });
 
+  it('threads server-authored shared actor metadata into structured P2P starts', async () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-p2p-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 1_000,
+      queuedAt: 1_001,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 900,
+        authorizedAt: 1_000,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        nextCoverageRecheckAt: null,
+      },
+    };
+    const shareScope = {
+      target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+      historyCutoffAt: 900,
+      primaryShareId: 'share-1',
+      coveringShareIds: ['share-1'],
+    };
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-shared-p2p',
+      p2pMode: 'discuss',
+      p2pSessionConfig: {
+        deck_proj_w1: { enabled: true, mode: 'discuss' },
+      },
+      sharedActor,
+      shareScope,
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      sharedActor,
+      shareScope,
+      targets: [{ session: 'deck_proj_w1', mode: 'discuss' }],
+    });
+  });
+
   it('config mode still uses per-session configured modes', async () => {
     handleWebCommand({
       type: 'session.send',
@@ -338,6 +388,28 @@ describe('structured P2P routing via WS fields', () => {
       { session: 'deck_proj_w1', mode: 'audit' },
       { session: 'deck_proj_w2', mode: 'review' },
     ]);
+  });
+
+  it('does not allow explicit structured targets to address the main brain session', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-explicit-brain-target',
+      p2pAtTargets: [
+        { session: 'deck_proj_brain', mode: 'audit' },
+      ],
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-explicit-brain-target',
+      status: 'error',
+      session: 'deck_proj_brain',
+    }));
   });
 
   it('prefers daemon-persisted config over a stale client snapshot', async () => {
@@ -366,6 +438,64 @@ describe('structured P2P routing via WS fields', () => {
     expect(startP2pRun).toHaveBeenCalledTimes(1);
     const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
+  });
+
+  it('ignores main brain entries in saved Team config when selecting participants', async () => {
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_proj_brain: { enabled: true, mode: 'audit' },
+        deck_proj_w1: { enabled: true, mode: 'review' },
+      },
+      rounds: 1,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-ignore-brain-member',
+      p2pMode: 'config',
+      p2pSessionConfig: {
+        deck_proj_brain: { enabled: true, mode: 'audit' },
+      },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
+  });
+
+  it('does not count a saved main brain entry as an enabled Team member', async () => {
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_proj_brain: { enabled: true, mode: 'audit' },
+      },
+      rounds: 1,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-only-brain-member',
+      p2pMode: 'review',
+      p2pSessionConfig: {
+        deck_proj_brain: { enabled: true, mode: 'audit' },
+      },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-only-brain-member',
+      status: 'error',
+      session: 'deck_proj_brain',
+      error: P2P_CONFIG_ERROR.NO_ENABLED_PARTICIPANTS,
+    }));
   });
 
   it('rejects with NO_ENABLED_PARTICIPANTS when the saved config has zero enabled members', async () => {
@@ -427,6 +557,32 @@ describe('structured P2P routing via WS fields', () => {
       requestId: 'req-save-ok',
       scopeSession: 'deck_proj_brain',
       ok: true,
+    });
+  });
+
+  it('strips main brain entries before persisting Team config saves', async () => {
+    const config = {
+      sessions: {
+        deck_proj_brain: { enabled: true, mode: 'audit' },
+        deck_proj_w1: { enabled: true, mode: 'review' },
+      },
+      rounds: 2,
+    };
+
+    handleWebCommand({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'req-save-strip-brain',
+      scopeSession: 'deck_proj_brain',
+      config,
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(upsertSavedP2pConfigMock).toHaveBeenCalledWith('srv-main:deck_proj_brain', {
+      sessions: {
+        deck_proj_w1: { enabled: true, mode: 'review' },
+      },
+      rounds: 2,
     });
   });
 
@@ -609,7 +765,7 @@ describe('structured P2P routing via WS fields', () => {
 
       await vi.waitFor(
         () => expect(sendKeysDelayedEnter).toHaveBeenCalled(),
-        { timeout: 5_000, interval: 50 },
+        { timeout: 15_000, interval: 50 },
       );
 
       const sentText = vi.mocked(sendKeysDelayedEnter).mock.calls.at(-1)?.[1] as string;

@@ -29,11 +29,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   enqueueResend,
   getResendCount,
+  getResendEntries,
   clearAllResend,
   drainResend,
   MAX_RESEND_ENTRIES,
   RESEND_EXPIRY_MS,
 } from '../../src/daemon/transport-resend-queue.js';
+import { getTransportQueueRevision } from '../../src/daemon/transport-queue-revision.js';
+import { buildTransportPendingQueueSnapshot } from '../../src/daemon/transport-pending-snapshot.js';
 
 beforeEach(() => {
   clearAllResend();
@@ -52,8 +55,29 @@ describe('transport-resend-queue user-visible signals (audit 0419d1ac-1f4)', () 
     const overflow = enqueueResend('s1', { text: 'overflow', commandId: 'c-overflow', queuedAt: 999 });
     expect(overflow.accepted).toBe(true);
     expect(overflow.droppedOldest).toBe(true);
+    expect(typeof overflow.pendingVersion).toBe('number');
     // Count stays at cap.
     expect(getResendCount('s1')).toBe(MAX_RESEND_ENTRIES);
+  });
+
+  it('resend mutations advance a session queue revision', async () => {
+    const first = enqueueResend('s-version', { text: 'first', commandId: 'c1', queuedAt: Date.now() });
+    expect(first.pendingVersion).toBe(1);
+    const second = enqueueResend('s-version', { text: 'second', commandId: 'c2', queuedAt: Date.now() });
+    expect(second.pendingVersion).toBe(2);
+    expect(getTransportQueueRevision('s-version')).toBe(2);
+
+    await drainResend('s-version', () => 'sent');
+    expect(getResendEntries('s-version')).toEqual([]);
+    expect(getTransportQueueRevision('s-version')).toBe(3);
+  });
+
+  it('resend pending snapshots carry the queue revision', () => {
+    const result = enqueueResend('s-snapshot', { text: 'queued', commandId: 'cmd-q', queuedAt: Date.now() });
+    const snapshot = buildTransportPendingQueueSnapshot('s-snapshot', undefined);
+    expect(snapshot.source).toBe('resend');
+    expect(snapshot.pendingVersion).toBe(result.pendingVersion);
+    expect(snapshot.pendingEntries).toEqual([{ clientMessageId: 'cmd-q', text: 'queued' }]);
   });
 
   it('T-N6: drainResend invokes onExpired callback with count of TTL-dropped entries', async () => {
@@ -117,5 +141,27 @@ describe('transport-resend-queue user-visible signals (audit 0419d1ac-1f4)', () 
 
     expect(count).toBe(1);
     expect(dispatched).toHaveBeenCalledTimes(1);
+  });
+
+  it('T-N7: drainResend invokes onDispatchFailed once with failed dispatch count', async () => {
+    const now = Date.now();
+    enqueueResend('s1', { text: 'fail-1', commandId: 'c-fail-1', queuedAt: now });
+    enqueueResend('s1', { text: 'ok', commandId: 'c-ok', queuedAt: now });
+    enqueueResend('s1', { text: 'fail-2', commandId: 'c-fail-2', queuedAt: now });
+
+    const dispatched = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('boom 1'); })
+      .mockImplementationOnce(() => 'sent')
+      .mockImplementationOnce(() => { throw new Error('boom 2'); });
+    const onExpired = vi.fn();
+    const onDispatchFailed = vi.fn();
+
+    const count = await drainResend('s1', dispatched, onExpired, onDispatchFailed);
+
+    expect(count).toBe(1);
+    expect(onExpired).not.toHaveBeenCalled();
+    expect(onDispatchFailed).toHaveBeenCalledTimes(1);
+    expect(onDispatchFailed).toHaveBeenCalledWith({ failedCount: 2 });
+    expect(getResendCount('s1')).toBe(0);
   });
 });

@@ -327,6 +327,10 @@ describe('executeCronJob', () => {
       fileContents: [],
       serverLink: mockServerLink,
       rounds: 3,
+      launchOrigin: expect.objectContaining({
+        kind: 'cron',
+        cronJobId: 'job-1',
+      }),
     }));
   });
 
@@ -401,6 +405,10 @@ describe('executeCronJob', () => {
       fileContents: [],
       serverLink: mockServerLink,
       rounds: 1,
+      launchOrigin: expect.objectContaining({
+        kind: 'cron',
+        cronJobId: 'job-1',
+      }),
     }));
   });
 

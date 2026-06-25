@@ -32,11 +32,17 @@ import { LoginPage } from './pages/LoginPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
+import { ShareSessionDialog } from './components/ShareSessionDialog.js';
+import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
+import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar, SUBSESSION_BAR_COLLAPSED_STORAGE_KEY } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
+import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
+import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
 import { useSharedGitChanges, requestSharedChanges } from './git-status-store.js';
 import {
@@ -74,6 +80,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
+import { shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -95,6 +102,8 @@ import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import { isP2pMemberEligibleSession } from '@shared/p2p-modes.js';
 import { PREF_KEY_DEFAULT_SHELL, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from './constants/prefs.js';
 import {
   p2pSubSessionParentSignature,
@@ -115,8 +124,8 @@ import {
   type TeamDiscussionGuidePref,
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
-import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
+import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
+import { configure as configureApi, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications, resetPushBadge } from './push-notifications.js';
@@ -140,17 +149,17 @@ import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js
 import {
   extractTransportPendingMessages,
   extractTransportPendingVersion,
+  hasExplicitTransportPendingSnapshot,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
-  mergeTransportPendingMessagesForIdleState,
-  mergeTransportPendingMessagesForRunningState,
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
-  shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
+import { shouldUseIosMacTextScale } from './native-platform.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
@@ -218,6 +227,15 @@ type AppUpdateNotice = {
 const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
 const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
 const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
+const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
+
+function readOpenSpecAutoRunbarCompactPreference(): boolean {
+  try {
+    return localStorage.getItem(OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 
 function markFastServerSwitchSplash(): void {
   try {
@@ -340,6 +358,46 @@ interface WatchSessionRow {
   isSubSession?: boolean;
 }
 
+function formatSharedAccessError(error: unknown): string {
+  if (error instanceof ApiError) return error.body || error.message;
+  if (error instanceof Error) return error.message;
+  return String(error || 'share_failed');
+}
+
+function buildSharedOutStateFromShares(shares: ShareGrantSummary[]): SharedStateSummary | null {
+  const activeShares = shares.filter((share) => share.status === 'active');
+  if (activeShares.length === 0) return null;
+  return {
+    status: 'active',
+    effectiveRole: activeShares.some((share) => share.role === 'participant') ? 'participant' : 'viewer',
+    outgoing: true,
+    users: activeShares.map((share) => ({
+      id: share.targetUserId,
+      displayName: share.targetUserDisplayName,
+      role: share.role,
+      status: share.status,
+    })),
+  };
+}
+
+function indexManagedSharedStates(shares: ShareGrantSummary[]): Map<string, SharedStateSummary> {
+  const grouped = new Map<string, ShareGrantSummary[]>();
+  for (const share of shares) {
+    if (share.status !== 'active') continue;
+    const key = shareTargetKey(share.target);
+    if (!key) continue;
+    const existing = grouped.get(key);
+    if (existing) existing.push(share);
+    else grouped.set(key, [share]);
+  }
+  const states = new Map<string, SharedStateSummary>();
+  for (const [key, groupedShares] of grouped) {
+    const state = buildSharedOutStateFromShares(groupedShares);
+    if (state) states.set(key, state);
+  }
+  return states;
+}
+
 type RepoPanelTarget = {
   sessionId: string | null;
   projectDir: string;
@@ -369,6 +427,7 @@ export function App() {
       return null;
     }
   });
+  const [managedShares, setManagedShares] = useState<ShareGrantSummary[]>([]);
   const clearAuthState = useCallback(async (reason?: string) => {
     console.warn('[auth] clearing auth state', reason ?? '');
     clearApiKey();
@@ -387,6 +446,10 @@ export function App() {
     setServersSynced(false);
     setSelectedServerId(null);
     setSelectedServerName(null);
+    setSelectedShareTarget(null);
+    setSharedEntries([]);
+    setSharedEntriesError(null);
+    setManagedShares([]);
     setManualDashboard(false);
     setAutoEnteringRecent(false);
   }, []);
@@ -411,6 +474,12 @@ export function App() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
+  const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
+  const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
+  const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
+  const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileHideServerBar, setMobileHideServerBar] = useState(() => localStorage.getItem('mobile_hide_server_bar') === '1');
   const [mobileHideTabBar, setMobileHideTabBar] = useState(() => localStorage.getItem('mobile_hide_tab_bar') === '1');
@@ -490,8 +559,10 @@ export function App() {
   }, [selectedServerId]);
 
   const resolvedSelectedServerName = useMemo(
-    () => getSelectedServerName(selectedServerId, servers, selectedServerName),
-    [selectedServerId, selectedServerName, servers],
+    () => selectedShareTarget
+      ? selectedServerName
+      : getSelectedServerName(selectedServerId, servers, selectedServerName),
+    [selectedServerId, selectedServerName, servers, selectedShareTarget],
   );
 
   useEffect(() => {
@@ -507,6 +578,7 @@ export function App() {
 
   useEffect(() => {
     if (!serversSynced) return;
+    if (selectedShareTarget) return;
     if (!shouldResetSelectedServer(selectedServerId, servers, serversLoaded)) return;
     setSelectedServerId(null);
     setSelectedServerName(null);
@@ -515,7 +587,7 @@ export function App() {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
-  }, [selectedServerId, servers, serversLoaded]);
+  }, [selectedServerId, servers, serversLoaded, serversSynced, selectedShareTarget]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -540,6 +612,11 @@ export function App() {
 
   // Keep layout height within visual viewport on mobile (keyboard-aware)
   useEffect(() => {
+    if (shouldUseIosMacTextScale()) {
+      document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.classList.remove('kb-open', 'input-focused');
+      return;
+    }
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;
@@ -906,12 +983,50 @@ export function App() {
     return () => clearInterval(id);
   }, [auth, loadServers]);
 
+  const refreshSharedEntries = useCallback(async () => {
+    if (!auth) {
+      setSharedEntries([]);
+      setSharedEntriesError(null);
+      return;
+    }
+    setSharedEntriesLoading(true);
+    setSharedEntriesError(null);
+    try {
+      setSharedEntries(await discoverSharedEntries());
+    } catch (err) {
+      setSharedEntries([]);
+      setSharedEntriesError(formatSharedAccessError(err));
+    } finally {
+      setSharedEntriesLoading(false);
+    }
+  }, [auth]);
+
+  useEffect(() => {
+    void refreshSharedEntries();
+  }, [refreshSharedEntries]);
+
+  const refreshManagedShares = useCallback(async () => {
+    if (!auth || !selectedServerId || selectedShareTarget) {
+      setManagedShares([]);
+      return;
+    }
+    try {
+      setManagedShares(await listManagedSharesForServer(selectedServerId));
+    } catch {
+      setManagedShares([]);
+    }
+  }, [auth, selectedServerId, selectedShareTarget]);
+
+  useEffect(() => {
+    void refreshManagedShares();
+  }, [refreshManagedShares]);
+
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
-    if (!auth || !selectedServerId) return;
+    if (!auth || !selectedServerId || selectedShareTarget) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
-    apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
+    apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; error?: string | null; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
       `/api/server/${selectedServerId}/sessions`,
       { signal: ctrl.signal },
     ).then((data) => {
@@ -925,6 +1040,7 @@ export function App() {
         // Start as 'unknown' — DB state may be stale (idle not persisted back to DB).
         // Daemon will send live state via WebSocket shortly after connecting.
         state: 'unknown' as SessionInfo['state'],
+        error: s.state === 'error' ? (s.error ?? null) : null,
         projectDir: s.project_dir,
         runtimeType: s.runtime_type,
         label: s.label ?? null,
@@ -955,12 +1071,39 @@ export function App() {
       }
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
-  }, [auth, selectedServerId]);
+  }, [auth, selectedServerId, selectedShareTarget]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const navigableMainSessions = useMemo(
     () => sessions.filter(isNavigableMainSession),
     [sessions],
+  );
+  const managedSharedStateByTarget = useMemo(() => indexManagedSharedStates(managedShares), [managedShares]);
+  const selectedServerSharedOutState = useMemo(() => {
+    if (!selectedServerId) return null;
+    return managedSharedStateByTarget.get(`server:${selectedServerId}`) ?? null;
+  }, [managedSharedStateByTarget, selectedServerId]);
+  const managedSharedServerStateById = useMemo(() => {
+    const states = new Map<string, SharedStateSummary>();
+    if (selectedServerId && selectedServerSharedOutState) states.set(selectedServerId, selectedServerSharedOutState);
+    return states;
+  }, [selectedServerId, selectedServerSharedOutState]);
+  const managedSharedSessionStateByName = useMemo(() => {
+    const states = new Map<string, SharedStateSummary>();
+    if (!selectedServerId) return states;
+    for (const session of navigableMainSessions) {
+      const directState = managedSharedStateByTarget.get(`main:${selectedServerId}:${session.name}`);
+      const state = directState ?? selectedServerSharedOutState;
+      if (state) states.set(session.name, state);
+    }
+    return states;
+  }, [managedSharedStateByTarget, navigableMainSessions, selectedServerId, selectedServerSharedOutState]);
+  const visibleMainSessions = useMemo(
+    () => navigableMainSessions.map((session) => {
+      const sharedState = managedSharedSessionStateByName.get(session.name) ?? session.sharedState;
+      return sharedState === session.sharedState ? session : { ...session, sharedState };
+    }),
+    [managedSharedSessionStateByName, navigableMainSessions],
   );
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
@@ -1195,6 +1338,21 @@ export function App() {
     return {};
   });
 
+  // Resizable session-tree popup height (device-local, not synced) — same
+  // bottom drag-to-resize behavior as the pinned panels.
+  const [sessionTreeHeight, setSessionTreeHeight] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem('session_tree_height');
+      const n = raw ? parseInt(raw, 10) : NaN;
+      if (Number.isFinite(n) && n >= 140) return n;
+    } catch { /* ignore */ }
+    return 300;
+  });
+  const saveSessionTreeHeight = useCallback((h: number) => {
+    setSessionTreeHeight(h);
+    try { localStorage.setItem('session_tree_height', String(h)); } catch { /* ignore */ }
+  }, []);
+
   // ── Desktop floating window stack ────────────────────────────────────────────
   // Single shared ordering authority for all desktop, non-modal floating
   // workspace windows (sub-sessions, file preview, file browser, repo, cron,
@@ -1383,6 +1541,7 @@ export function App() {
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
   const [discussionInitialId, setDiscussionInitialId] = useState<string | null>(null);
+  const [discussionInitialTab, setDiscussionInitialTab] = useState<'auto' | 'team'>('team');
   // Swipe back for discussions is handled by FloatingPanel on mobile
   const [showDiscussionDialog, setShowDiscussionDialog] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -1453,7 +1612,11 @@ export function App() {
      *  hops). The bar matches against this set so any session involved
      *  in the discussion shows the bar. */
     participantSessions?: string[];
+    /** Server-authored actor metadata for share-originated discussions/P2P. */
+    sharedActor?: SharedActorEnvelope;
   }>>([]);
+  const discussionsRef = useRef(discussions);
+  discussionsRef.current = discussions;
 
   /** Set of session names enabled in the P2P config for the active root session. */
   const [p2pSessionNames, setP2pSessionNames] = useState<Set<string>>(new Set());
@@ -2017,12 +2180,148 @@ export function App() {
   }, [auth, selectedServerId]);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
-  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal } = useSubSessions(
+  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
     connected,
     activeSession,
+    Boolean(selectedShareTarget),
   );
+  const appOpenSpecAutoScopedSubSessionName = useMemo(() => {
+    if (!isMobileRef.current) return null;
+    const visibleById = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
+    const focusedSub = focusedSubId ? (visibleById.get(focusedSubId) ?? subSessions.find((sub) => sub.id === focusedSubId) ?? null) : null;
+    if (focusedSub?.sessionName) return focusedSub.sessionName;
+    const openIds = Array.from(openSubIds);
+    const activeOpenSubId = openIds.length > 0 ? openIds[openIds.length - 1] : null;
+    if (!activeOpenSubId) return null;
+    return (visibleById.get(activeOpenSubId) ?? subSessions.find((sub) => sub.id === activeOpenSubId))?.sessionName ?? null;
+  }, [focusedSubId, openSubIds, subSessions, visibleSubSessions]);
+  const appOpenSpecAutoSessionName = appOpenSpecAutoScopedSubSessionName ?? activeSession ?? visibleMainSessions[0]?.name ?? null;
+  const appOpenSpecAutoDeliver = useOpenSpecAutoDeliver({
+    ws: wsRef.current,
+    serverId: selectedServerId ?? undefined,
+    sessionName: appOpenSpecAutoSessionName,
+  });
+  const appOpenSpecAutoRequestStatusRef = useRef<() => string | null>(() => null);
+  appOpenSpecAutoRequestStatusRef.current = appOpenSpecAutoDeliver.requestStatus;
+  const confirmOpenSpecAutoStop = useCallback(() => {
+    if (typeof window !== 'undefined' && !window.confirm(transRef.current('openspec.auto.confirm_stop'))) return;
+    appOpenSpecAutoDeliver.stop();
+  }, [appOpenSpecAutoDeliver.stop]);
+  const requestP2pStatusWithCachedRunConfirmation = useCallback((ws: WsClient, scope?: P2pWorkflowRequestScope) => {
+    ws.p2pStatus(scope);
+    const seen = new Set<string>();
+    for (const discussion of discussionsRef.current) {
+      if (!discussion.id.startsWith('p2p_') || !isBarActiveDiscussion(discussion)) continue;
+      const runId = discussion.id.slice('p2p_'.length);
+      if (!runId || seen.has(runId)) continue;
+      seen.add(runId);
+      ws.p2pStatus(runId, scope);
+    }
+  }, []);
+  const [appOpenSpecAutoDetailsOpen, setAppOpenSpecAutoDetailsOpen] = useState(false);
+  const [appOpenSpecAutoRunbarCompact, setAppOpenSpecAutoRunbarCompact] = useState(readOpenSpecAutoRunbarCompactPreference);
+  const [appOpenSpecAutoRunbarHiddenRunId, setAppOpenSpecAutoRunbarHiddenRunId] = useState<string | null>(null);
+  const appOpenSpecAutoProjection = appOpenSpecAutoDeliver.projection;
+  const appOpenSpecAutoRunbarHidden = appOpenSpecAutoRunbarHiddenRunId === appOpenSpecAutoProjection?.runId;
+  const appOpenSpecAutoRunbarVisible = !!appOpenSpecAutoProjection
+    && appOpenSpecAutoProjection.visibility !== 'conflict'
+    && isOpenSpecAutoDeliverActiveProjection(appOpenSpecAutoProjection)
+    && !appOpenSpecAutoRunbarHidden;
+  useEffect(() => {
+    setAppOpenSpecAutoRunbarHiddenRunId(null);
+  }, [appOpenSpecAutoProjection?.runId]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY, appOpenSpecAutoRunbarCompact ? '1' : '0');
+    } catch { /* ignore */ }
+  }, [appOpenSpecAutoRunbarCompact]);
+  const managedSharedSubSessionStateById = useMemo(() => {
+    const states = new Map<string, SharedStateSummary>();
+    if (!selectedServerId) return states;
+    for (const sub of subSessions) {
+      const directState = managedSharedStateByTarget.get(`subsession:${selectedServerId}:${sub.id}`)
+        ?? managedSharedStateByTarget.get(`subsession:${selectedServerId}:${sub.sessionName}`);
+      const parentState = sub.parentSession ? managedSharedSessionStateByName.get(sub.parentSession) : null;
+      const state = directState ?? parentState ?? selectedServerSharedOutState;
+      if (!state) continue;
+      states.set(sub.id, state);
+      states.set(sub.sessionName, state);
+    }
+    return states;
+  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, subSessions]);
+
+  const handleOpenSharedEntry = useCallback(async (entry: SharedEntrySummary) => {
+    if (openingSharedEntryId) return;
+    setOpeningSharedEntryId(entry.id);
+    setSharedEntriesError(null);
+    try {
+      const opened = await openSharedEntry(entry.target);
+      const nextServer: ServerInfo = {
+        id: opened.server.id,
+        name: opened.server.name,
+        status: opened.server.status ?? 'online',
+        lastHeartbeatAt: opened.server.lastHeartbeatAt ?? Date.now(),
+        createdAt: Date.now(),
+      };
+      const mappedSessions: SessionInfo[] = opened.sessions.map((session) => {
+        const parsed = parseMainSessionName(session.sessionName);
+        return {
+          name: session.sessionName,
+          project: session.title || parsed?.project || session.sessionName,
+          role: parsed?.role ?? 'brain',
+          agentType: session.agentType || 'unknown',
+          state: session.state as SessionInfo['state'],
+          label: session.title,
+          sharedState: {
+            effectiveRole: opened.coverage.effectiveRole,
+            status: 'active',
+            scopeLabel: entry.targetLabel,
+          },
+        };
+      });
+
+      setSelectedShareTarget(opened.target);
+      setManualDashboard(false);
+      setSelectedServerId(opened.server.id);
+      setSelectedServerName(opened.server.name);
+      setServers((prev) => (
+        prev.some((server) => server.id === nextServer.id)
+          ? prev.map((server) => server.id === nextServer.id ? { ...server, ...nextServer } : server)
+          : [nextServer, ...prev]
+      ));
+      setServersLoaded(true);
+      setSessions(mappedSessions);
+      setSessionsLoaded(true);
+      hydrateSharedSubSessions(opened.server.id, opened.subSessions);
+
+      const openedTarget = opened.target;
+      const activeFromTarget = openedTarget.kind === 'main'
+        ? openedTarget.sessionName
+        : openedTarget.kind === 'subsession'
+          ? (opened.subSessions.find((sub) => sub.subSessionId === openedTarget.subSessionId)?.parentSessionName ?? null)
+          : (mappedSessions.find(isNavigableMainSession)?.name ?? null);
+      safeLocalStorageSetItem('rcc_server', opened.server.id);
+      safeLocalStorageSetItem('rcc_server_name', opened.server.name);
+      if (activeFromTarget) {
+        safeLocalStorageSetItem('rcc_session', activeFromTarget);
+      } else {
+        localStorage.removeItem('rcc_session');
+      }
+      setActiveSession(activeFromTarget, { keepSubWindows: true });
+      if (openedTarget.kind === 'subsession') {
+        setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
+      }
+      setShowMobileServerMenu(false);
+      setMobileSidebarOpen(false);
+    } catch (err) {
+      setSharedEntriesError(formatSharedAccessError(err));
+    } finally {
+      setOpeningSharedEntryId(null);
+    }
+  }, [hydrateSharedSubSessions, openingSharedEntryId, setActiveSession]);
+
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
     clearSubSessionMaximized(id);
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
@@ -2076,6 +2375,7 @@ export function App() {
   const prevActiveSessionRef = useRef<string | null>(null);
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
+    if (selectedShareTarget) return;
     if (!activeSession || activeSession === prev) return;
     if (!connected || loadedServerId !== selectedServerId) return;
     if (!defaultShellPref.loaded) return;
@@ -2084,13 +2384,14 @@ export function App() {
     if (visibleSubSessions.length > 0) return;
     const shell = defaultShellPref.value || '/bin/bash';
     void createSubSession('shell', shell);
-  }, [activeSession, connected, loadedServerId, selectedServerId, visibleSubSessions.length, createSubSession, defaultShellPref.loaded, defaultShellPref.value]);
+  }, [activeSession, connected, loadedServerId, selectedServerId, selectedShareTarget, visibleSubSessions.length, createSubSession, defaultShellPref.loaded, defaultShellPref.value]);
 
   // Load P2P config — determine which sessions are enabled for P2P tagging
   useEffect(() => {
     if (!activeRootSession || !p2pConfigPref.value?.sessions) { setP2pSessionNames(new Set()); return; }
     const names = new Set<string>();
     for (const [name, entry] of Object.entries(p2pConfigPref.value.sessions)) {
+      if (!isP2pMemberEligibleSession(name, { scopeSession: activeRootSession })) continue;
       if (entry.enabled && entry.mode !== 'skip') names.add(name);
     }
     setP2pSessionNames(names);
@@ -2374,7 +2675,7 @@ export function App() {
   useEffect(() => {
     if (!auth || !selectedServerId) return;
 
-    const ws = new WsClient(auth.baseUrl, selectedServerId);
+    const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
 
     const unsub = ws.onMessage((msg) => {
@@ -2406,7 +2707,8 @@ export function App() {
             const initialActive = activeSessionRef.current;
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);
-            ws.p2pStatus(initialScope);
+            requestP2pStatusWithCachedRunConfirmation(ws, initialScope);
+            appOpenSpecAutoRequestStatusRef.current();
             // Re-sync classic discussions too (not just the P2P path) so a run
             // that finished while backgrounded is reconciled out of the bar.
             ws.discussionList();
@@ -2538,6 +2840,7 @@ export function App() {
         const stripped = msg.diff.lines.map(([, l]: [unknown, string]) => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join(' ').toLowerCase();
         // Detect models from terminal output
         const claudeModel: string | null =
+          stripped.includes('fable') ? 'fable' :
           stripped.includes('opus') ? 'opus[1M]' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
@@ -2572,6 +2875,35 @@ export function App() {
             toolUseId: String(event.payload.toolUseId ?? ''),
             questions: (event.payload.questions as PendingQuestion['questions']) ?? [],
             ...(typeof event.payload.waitMs === 'number' ? { waitMs: event.payload.waitMs } : {}),
+          });
+          const questions = Array.isArray(event.payload.questions)
+            ? event.payload.questions as Array<Record<string, unknown>>
+            : [];
+          const firstQuestion = questions
+            .map((item) => typeof item.question === 'string' ? item.question.trim() : '')
+            .find(Boolean) ?? '';
+          const localSub = subSessions.find(s => s.sessionName === event.sessionId);
+          const localMain = sessionsRef.current.find((s) => s.name === event.sessionId);
+          const label = localSub?.label || localMain?.label || undefined;
+          const parentLabel = localSub?.parentSession
+            ? sessionsRef.current.find((s) => s.name === localSub.parentSession)?.label
+            : undefined;
+          const agentType = localSub?.type || localMain?.agentType || undefined;
+          const displayProject = buildSessionToastLabel(event.sessionId, {
+            label,
+            parentLabel,
+            project: localMain?.project ?? localSub?.parentSession ?? event.sessionId,
+            agentType,
+          });
+          void watchProjectionStore.pushDurableEvent({
+            type: 'ask.question',
+            session: event.sessionId,
+            serverId: selectedServerId,
+            title: displayProject,
+            message: firstQuestion || 'Waiting for your answer',
+            ...(agentType ? { agentType } : {}),
+            ...(label ? { label } : {}),
+            ...(parentLabel ? { parentLabel } : {}),
           });
         }
         // Auto-dismiss a stale question card only once the model's turn is
@@ -2625,21 +2957,28 @@ export function App() {
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
-          const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+          const hasPendingSnapshot = hasExplicitTransportPendingSnapshot(event.payload);
           const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           if (liveState === 'queued') {
-            const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+            const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
+            const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
+            const parsedPendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             const pendingEntries = normalizeTransportPendingEntries(
               event.payload.pendingMessageEntries,
-              pendingMessages,
+              parsedPendingMessages,
               event.sessionId,
+              { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
             );
+            const pendingMessages = hasPendingEntriesField ? pendingEntries.map((entry) => entry.text) : parsedPendingMessages;
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
               // Drop a stale `queued` snapshot wholesale: it would otherwise
               // both resurrect drained entries AND wrongly downgrade a session
               // that has since moved past queued.
-              if (!shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion)) return s;
+              if (!shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+                hasExplicitSnapshot: true,
+                isExplicitEmpty: pendingMessages.length === 0 && pendingEntries.length === 0,
+              })) return s;
               return {
                 ...s,
                 state: 'queued' as SessionInfo['state'],
@@ -2651,24 +2990,34 @@ export function App() {
           } else if (liveState === 'running') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
+              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
+              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+              const incomingEntries = normalizeTransportPendingEntries(
+                event.payload.pendingMessageEntries,
+                parsedIncomingMessages,
+                event.sessionId,
+                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
+              );
+              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
+              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+                hasExplicitSnapshot: hasPendingSnapshot,
+                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
+              });
               return {
                 ...s,
                 state: 'running' as SessionInfo['state'],
                 transportPendingMessages: applyPending
-                  ? mergeTransportPendingMessagesForRunningState(
-                      s.transportPendingMessages,
-                      event.payload.pendingMessages,
-                      hasPendingMessagesField,
-                    )
+                  ? incomingMessages
                   : (s.transportPendingMessages ?? []),
                 transportPendingMessageEntries: applyPending
                   ? mergeTransportPendingEntriesForRunningState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
-                      hasPendingMessagesField,
+                      hasPendingSnapshot,
                       event.sessionId,
+                      hasPendingEntriesField,
                     )
                   : (s.transportPendingMessageEntries ?? []),
                 transportPendingMessageVersion: applyPending
@@ -2679,24 +3028,34 @@ export function App() {
           } else if (liveState === 'idle') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              const applyPending = shouldApplyTransportQueueSnapshot(s.transportPendingMessageVersion, incomingVersion);
+              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
+              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
+              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+              const incomingEntries = normalizeTransportPendingEntries(
+                event.payload.pendingMessageEntries,
+                parsedIncomingMessages,
+                event.sessionId,
+                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
+              );
+              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
+              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
+                hasExplicitSnapshot: hasPendingSnapshot,
+                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
+              });
               return {
                 ...s,
                 state: liveState as SessionInfo['state'],
                 transportPendingMessages: applyPending
-                  ? mergeTransportPendingMessagesForIdleState(
-                      s.transportPendingMessages,
-                      event.payload.pendingMessages,
-                      hasPendingMessagesField,
-                    )
+                  ? incomingMessages
                   : (s.transportPendingMessages ?? []),
                 transportPendingMessageEntries: applyPending
                   ? mergeTransportPendingEntriesForIdleState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
                       event.payload.pendingMessages,
-                      hasPendingMessagesField,
+                      hasPendingSnapshot,
                       event.sessionId,
+                      hasPendingEntriesField,
                     )
                   : (s.transportPendingMessageEntries ?? []),
                 transportPendingMessageVersion: applyPending
@@ -2704,6 +3063,13 @@ export function App() {
                   : s.transportPendingMessageVersion,
               };
             }));
+          } else if (liveState === 'error') {
+            const errorDetail = typeof event.payload.error === 'string' && event.payload.error.trim()
+              ? event.payload.error.trim()
+              : null;
+            setSessions((prev) => prev.map((s) => s.name === event.sessionId
+              ? { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
+              : s));
           }
         }
         if (event.type === 'session.state') {
@@ -2853,6 +3219,7 @@ export function App() {
               maxRounds: msg.maxRounds,
               totalHops: msg.totalHops,
               filePath: msg.filePath,
+              sharedActor: msg.sharedActor,
             });
             return next;
           }
@@ -2860,6 +3227,7 @@ export function App() {
             id: msg.discussionId, requestId: msg.requestId, topic: msg.topic, state: 'setup',
             currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0,
             totalHops: msg.totalHops ?? 0, startedAt: Date.now(),
+            sharedActor: msg.sharedActor,
           }];
         });
       }
@@ -2878,6 +3246,7 @@ export function App() {
             totalHops: msg.totalHops,
             currentSpeaker: msg.currentSpeaker ?? undefined,
             filePath: msg.filePath,
+            sharedActor: msg.sharedActor,
           });
           return next;
         });
@@ -2946,7 +3315,7 @@ export function App() {
           );
         }
       }
-      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE && msg.run) {
+      if ((msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE || msg.type === P2P_WORKFLOW_MSG.RUN_SAVE) && msg.run) {
         const entry = mapP2pRunToDiscussion(msg.run as Record<string, any>);
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === entry.id);
@@ -2975,7 +3344,7 @@ export function App() {
         setDiscussions((prev) => mergeP2pStatusResponseDiscussions(prev, mapped, {
           runId: typeof msg.runId === 'string' ? msg.runId : undefined,
           runFound: !!msg.run,
-          fullList: Array.isArray(msg.runs),
+          fullList: Array.isArray(msg.runs) && typeof (msg as Record<string, unknown>).error !== 'string',
         }));
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
@@ -3031,6 +3400,8 @@ export function App() {
           ? trans('toast.upgrade_blocked_toolchain_unavailable')
           : msg.reason === 'transport_busy'
             ? trans('toast.upgrade_blocked_transport_busy')
+            : msg.reason === 'auto_deliver_active'
+              ? trans('toast.upgrade_blocked_auto_deliver_active')
             : trans('toast.upgrade_blocked_p2p_active');
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
@@ -3178,6 +3549,8 @@ export function App() {
           const reconnectActive = activeSessionRef.current;
           const reconnectScope = reconnectActive ? { sessionName: reconnectActive } : undefined;
           ws.p2pListDiscussions(reconnectScope);
+          requestP2pStatusWithCachedRunConfirmation(ws, reconnectScope);
+          appOpenSpecAutoRequestStatusRef.current();
         }
       }
     });
@@ -3230,7 +3603,11 @@ export function App() {
       // backgrounded disappears from the bar without a reload (absorbs alt-tab churn).
       if (now - lastDiscussionResyncAt > DISCUSSION_RECONCILE_HIDDEN_MS) {
         lastDiscussionResyncAt = now;
+        const session = activeSessionRef.current;
+        const scope = session ? { sessionName: session } : undefined;
         ws.discussionList();
+        requestP2pStatusWithCachedRunConfirmation(ws, scope);
+        appOpenSpecAutoRequestStatusRef.current();
       }
       if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
     };
@@ -3305,11 +3682,11 @@ export function App() {
       for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
       resubscribeTimersRef.current.clear();
     };
-  }, [auth, selectedServerId]);
+  }, [auth, selectedServerId, selectedShareTarget, requestP2pStatusWithCachedRunConfirmation]);
 
-  // Subscribe to terminal for ALL sessions when connected.
-  // SDK/transport sessions must remain passively subscribed so shared timeline
-  // updates keep flowing even when their chat controls are not mounted.
+  // Subscribe to terminal streams for process-backed sessions when connected.
+  // Transport/SDK sessions have no PTY stream; their timeline updates are
+  // covered by the dedicated chat.subscribe effect below.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
@@ -3332,9 +3709,9 @@ export function App() {
 
   // Subscribe to structured transport chat/timeline updates for ALL transport sessions.
   // SDK-backed sessions must remain globally subscribed regardless of which panel is active.
-  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'
-  // for copilot/cursor sessions loaded from a pre-migration DB (runtime_type was NULL).
-  const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}`).sort().join(',');
+  // Key includes runtimeType + agentType so effect re-runs when WebSocket merge
+  // corrects null→'transport' or a pre-migration row relies on agentType fallback.
+  const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}:${s.agentType}`).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
@@ -3354,11 +3731,11 @@ export function App() {
   // server's per-browser rate limit (120 msgs / 10s), collaterally dropping
   // `session.send` messages and leaving the chat bubble spinning for 30s.
   // `transportSessionKey` already captures every semantic change
-  // (session names + runtimeType), so the string key is sufficient.
+  // (session names + runtimeType + agentType), so the string key is sufficient.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, transportSessionKey]);
 
-  // Subscribe terminal for ALL sub-sessions in passive mode.
+  // Subscribe terminal for process-backed sub-sessions in passive mode.
   // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
   useEffect(() => {
@@ -3377,8 +3754,9 @@ export function App() {
   }, [connected, subSessionNamesKey]);
 
   // Subscribe to structured transport updates for ALL transport sub-sessions too.
-  // Key includes runtimeType so effect re-runs when WebSocket merge corrects null→'transport'.
-  const transportSubSessionKey = subSessions.map((s) => `${s.sessionName}:${s.runtimeType}`).sort().join(',');
+  // Key includes runtimeType + type so effect re-runs when WebSocket merge
+  // corrects null→'transport' or a pre-migration row relies on type fallback.
+  const transportSubSessionKey = subSessions.map((s) => `${s.sessionName}:${s.runtimeType}:${s.type}`).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
@@ -3585,6 +3963,9 @@ export function App() {
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
+    setSelectedShareTarget(null);
+    setSharedEntries([]);
+    setSharedEntriesError(null);
     setDiscussions([]);
     setRepoContexts(new Map());
     setManualDashboard(false);
@@ -3602,6 +3983,7 @@ export function App() {
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
     autoEntryRunRef.current++;
     setManualDashboard(false);
+    setSelectedShareTarget(null);
     // Save current active session for the server we're leaving
     const prevServer = localStorage.getItem('rcc_server');
     const currentSession = localStorage.getItem('rcc_session');
@@ -3741,6 +4123,7 @@ export function App() {
     localStorage.removeItem('rcc_session');
     setSelectedServerId(null);
     setSelectedServerName(null);
+    setSelectedShareTarget(null);
     setActiveSession(null);
     setShowMobileServerMenu(false);
   }, [setActiveSession]);
@@ -4001,6 +4384,25 @@ export function App() {
     subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
     [subSessions]
   );
+  const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
+    if (!selectedServerId) return;
+    const sub = subSessionId
+      ? visibleSubSessions.find((item) => item.id === subSessionId || item.sessionName === session.name)
+      : null;
+    const tabLabel = sub
+      ? (sub.label?.trim() || sub.sessionName)
+      : (session.label?.trim() || session.project || session.name);
+    setShareDialogTarget({
+      serverId: selectedServerId,
+      serverLabel: resolvedSelectedServerName,
+      sessionName: sub?.sessionName ?? session.name,
+      tabLabel,
+      ...(sub ? {
+        subSessionId: sub.id,
+        subSessionDisplayName: sub.sessionName,
+      } : {}),
+    });
+  }, [resolvedSelectedServerName, selectedServerId, visibleSubSessions]);
   const [subSessionVisualOrderIds, setSubSessionVisualOrderIds] = useState<string[]>([]);
   const handleSubSessionVisualOrderChange = useCallback((ids: string[]) => {
     setSubSessionVisualOrderIds((prev) => {
@@ -4193,6 +4595,7 @@ export function App() {
             onHome={handleBackToDashboard}
             isAdmin={isAdmin}
             onAdmin={() => setShowAdminPage(true)}
+            sharedServerStates={managedSharedServerStateById}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -4223,12 +4626,29 @@ export function App() {
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
+              {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
+              <button
+                class="btn"
+                style={{ background: '#334155', color: mobileHideTabBar ? '#64748b' : 'var(--chrome-accent)', fontSize: 12, marginLeft: 'auto' }}
+                onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
+                title={trans('sidebar.sessionTree', 'Session tree')}
+                aria-pressed={!mobileHideTabBar}
+              >⊞</button>
             </div>
-            {/* Session tree */}
-            <SessionTree
+            <SharedEntriesPanel
+              entries={sharedEntries}
+              loading={sharedEntriesLoading}
+              error={sharedEntriesError}
+              openingEntryId={openingSharedEntryId}
+              onOpen={(entry) => void handleOpenSharedEntry(entry)}
+              onRefresh={() => void refreshSharedEntries()}
+            />
+            {/* Session tree — hidden via the ⊞ list toggle above */}
+            {!mobileHideTabBar && <SessionTree
               serverId={selectedServerId}
-              sessions={navigableMainSessions}
+              sessions={visibleMainSessions}
               subSessions={subSessions}
+              sharedSubSessionStates={managedSharedSubSessionStateById}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
               idleFlashTokens={idleFlashTokens}
@@ -4240,9 +4660,9 @@ export function App() {
               onSelectSubSession={(sub) => {
                 selectSubSessionFromTree(sub);
               }}
-              onNewSession={() => setShowNewSession(true)}
-              onNewSubSession={() => setShowSubDialog(true)}
-            />
+              onNewSession={selectedShareTarget ? undefined : () => setShowNewSession(true)}
+              onNewSubSession={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
+            />}
 
             {/* P2P ring progress — show active P2P runs */}
             {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
@@ -4414,6 +4834,7 @@ export function App() {
                 >
                   <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
                   <span class="mobile-server-btn-name">{resolvedSelectedServerName ?? 'Server'}</span>
+                  <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
                   <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
                 </button>
                 {showMobileServerMenu && (
@@ -4436,10 +4857,26 @@ export function App() {
                           onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
-                          {' '}{s.name}
+                          <span class="mobile-server-menu-name">{s.name}</span>
+                          <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
                         </button>
                       );
                     })}
+                    {sharedEntries.length > 0 && (
+                      <div class="mobile-server-menu-shared">
+                        <div class="mobile-server-menu-shared-title">{trans('share.sharedWithMe.title')}</div>
+                        {sharedEntries.map((entry) => (
+                          <button
+                            key={entry.id}
+                            class="mobile-server-menu-item"
+                            onClick={() => { void handleOpenSharedEntry(entry); setShowMobileServerMenu(false); }}
+                          >
+                            <span>↗</span>
+                            {' '}{entry.targetLabel}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />
                     </div>
@@ -4487,7 +4924,7 @@ export function App() {
             {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
 
             <SessionTabs
-              sessions={navigableMainSessions}
+              sessions={visibleMainSessions}
               activeSession={activeSession}
               connected={connected}
               latencyMs={latencyMs}
@@ -4508,6 +4945,7 @@ export function App() {
                 transportConfig: session.transportConfig ?? null,
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
+              onShareSession={openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
               onRenameSession={handleRenameSession}
@@ -4584,6 +5022,7 @@ export function App() {
                 ws={wsRef.current}
                 connected={connected}
                 isActive={s.name === activeSession}
+                keyboardActive={s.name === activeSession && openSubIds.size === 0}
                 viewMode={(viewModes[s.name] ?? defaultViewMode) as ViewMode}
                 quickData={quickData}
                 detectedModel={detectedModels.get(s.name)}
@@ -4597,6 +5036,7 @@ export function App() {
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onShareSession={openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
                 onToggleSessionPin={togglePinnedTab}
@@ -4665,6 +5105,7 @@ export function App() {
                 <FileBrowser
                   ws={wsRef.current}
                   serverId={selectedServerId}
+                  sessionName={activeSession ?? undefined}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}
@@ -4720,10 +5161,22 @@ export function App() {
               </FloatingPanel>
             )}
 
+            {appOpenSpecAutoDetailsOpen && (
+              <OpenSpecAutoDeliverDetailsPanel
+                projection={appOpenSpecAutoProjection}
+                stopPending={appOpenSpecAutoDeliver.stopPending}
+                continuePending={appOpenSpecAutoDeliver.continuePending}
+                onClose={() => setAppOpenSpecAutoDetailsOpen(false)}
+                onStop={confirmOpenSpecAutoStop}
+                onContinue={() => { appOpenSpecAutoDeliver.continueRun(); }}
+              />
+            )}
+
             {/* Sub-session bar — hidden on desktop when sidebar is expanded (SessionTree shows sub-sessions there) */}
             {selectedServerId && (
               <SubSessionBar
                 subSessions={visibleSubSessions}
+                sharedSubSessionStates={managedSharedSubSessionStateById}
                 openIds={openSubIds}
                 maximizedIds={maximizedSubIds}
                 desktopLayoutCapable={desktopLayoutCapable}
@@ -4741,9 +5194,19 @@ export function App() {
                 onRestore={restoreSubSession}
                 onRestoreThenClose={minimizeSubSessionWindow}
                 onRestart={restartSubSession}
-                onNew={() => setShowSubDialog(true)}
-                onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setShowDiscussionsPage(true); })}
-                onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); })}
+                onNew={selectedShareTarget ? undefined : () => setShowSubDialog(true)}
+                onViewAutoDeliver={() => runVersionSensitiveAction(trans('openspec.auto.list_title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('auto'); setShowDiscussionsPage(true); })}
+                openSpecAutoProjection={appOpenSpecAutoRunbarVisible ? appOpenSpecAutoProjection : null}
+                openSpecAutoStopPending={appOpenSpecAutoDeliver.stopPending}
+                openSpecAutoCompact={appOpenSpecAutoRunbarCompact}
+                onOpenSpecAutoView={() => setAppOpenSpecAutoDetailsOpen(true)}
+                onOpenSpecAutoStop={confirmOpenSpecAutoStop}
+                onOpenSpecAutoToggleCompact={() => setAppOpenSpecAutoRunbarCompact((value) => !value)}
+                onOpenSpecAutoHide={() => {
+                  if (appOpenSpecAutoProjection) setAppOpenSpecAutoRunbarHiddenRunId(appOpenSpecAutoProjection.runId);
+                }}
+                onViewDiscussions={() => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(null); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
+                onViewDiscussion={(fileId) => runVersionSensitiveAction(trans('p2p.discussions.title'), () => { setDiscussionInitialId(fileId); setDiscussionInitialTab('team'); setShowDiscussionsPage(true); })}
                 discussions={discussions.filter((d) => isP2pDiscussionVisibleInSubSessionBar(d, {
                   activeSession,
                   activeRootSession,
@@ -4862,13 +5325,22 @@ export function App() {
                       </button>
                     );
                   })}
+                  <SharedEntriesPanel
+                    entries={sharedEntries}
+                    loading={sharedEntriesLoading}
+                    error={sharedEntriesError}
+                    openingEntryId={openingSharedEntryId}
+                    onOpen={(entry) => void handleOpenSharedEntry(entry)}
+                    onRefresh={() => void refreshSharedEntries()}
+                  />
                 </div>
               )}
               {/* Session tree — collapsible via sidebar toggle */}
               {!mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
-                sessions={navigableMainSessions}
+                sessions={visibleMainSessions}
                 subSessions={subSessions}
+                sharedSubSessionStates={managedSharedSubSessionStateById}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}
                 idleFlashTokens={idleFlashTokens}
@@ -4882,8 +5354,10 @@ export function App() {
                   selectSubSessionFromTree(sub);
                   closeSidebar();
                 }}
-                onNewSession={() => { setShowNewSession(true); closeSidebar(); }}
-                onNewSubSession={() => { setShowSubDialog(true); closeSidebar(); }}
+                onNewSession={selectedShareTarget ? undefined : () => { setShowNewSession(true); closeSidebar(); }}
+                onNewSubSession={selectedShareTarget ? undefined : () => { setShowSubDialog(true); closeSidebar(); }}
+                height={sessionTreeHeight}
+                onResizeHeight={saveSessionTreeHeight}
               />}
               {/* P2P ring progress */}
               {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
@@ -4984,7 +5458,7 @@ export function App() {
         <FloatingPanel
           id="discussions"
           title={trans('p2p.discussions.title')}
-          onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+          onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
           defaultW={800}
           defaultH={600}
           zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.discussions, isMobile ? 6500 : 5040)}
@@ -4993,8 +5467,9 @@ export function App() {
           <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
             <DiscussionsPage
               ws={wsRef.current}
-              onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+              onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); setDiscussionInitialTab('team'); }}
               initialSelectedId={discussionInitialId}
+              initialTab={discussionInitialTab}
               liveDiscussions={discussions}
               // Audit fix (e940d73f-a8e / M7-A) — wire the active session
               // into requestScope. Without this, multi-project daemons fail
@@ -5087,6 +5562,7 @@ export function App() {
             key={previewFileRequest.rootPath ?? getFilePreviewInitialPath(previewFileRequest)}
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
+            sessionName={previewFileRequest.sessionName ?? activeSession ?? undefined}
             mode="file-single"
             layout="panel"
             initialPath={getFilePreviewInitialPath(previewFileRequest)}
@@ -5295,6 +5771,14 @@ export function App() {
         />
       )}
 
+      {shareDialogTarget && (
+        <ShareSessionDialog
+          target={shareDialogTarget}
+          onClose={() => setShareDialogTarget(null)}
+          onSharesChanged={() => void refreshManagedShares()}
+        />
+      )}
+
       {/* Sub-session windows (floating) — only show if not pinned */}
       {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
@@ -5328,6 +5812,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onShareSession={openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
@@ -5416,7 +5901,7 @@ export function App() {
         />
       )}
 
-      {showSubDialog && (
+      {showSubDialog && !selectedShareTarget && (
         <StartSubSessionDialog
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}

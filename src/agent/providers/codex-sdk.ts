@@ -26,6 +26,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionControlCommandText,
@@ -60,6 +61,13 @@ const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
+const TERMINATED_TURN_CACHE_LIMIT = 200;
+// Debounce before settling a turn purely from a thread-idle status (current
+// Codex app-server sometimes ends a turn without an explicit `turn/completed`).
+// Long enough that a transient mid-turn idle is cancelled by the activity that
+// follows it; short enough that a genuinely finished turn is never stuck.
+const CODEX_IDLE_SETTLE_DEBOUNCE_MS = 1_500;
+const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -77,6 +85,8 @@ const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
   'runtime/subagent_notification',
   'runtime/subagent/status',
 ]);
+
+const CODEX_TOOL_LIKE_ITEM_TYPES = new Set(['commandExecution', 'mcpToolCall']);
 const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'subagentnotification',
   'subagentstatus',
@@ -99,6 +109,21 @@ const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
 const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
 const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 
+function readBoundedIntegerEnv(
+  envName: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw = process.env[envName];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback;
+  if (parsed < min) return min;
+  if (parsed > max) return max;
+  return parsed;
+}
+
 interface CodexRawSpawnAgentCall {
   sessionId: string;
   callId: string;
@@ -115,7 +140,6 @@ interface CodexTrackedSubagentThread {
   lastStatus?: unknown;
   usageTotalTokens?: number;
 }
-
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -383,10 +407,14 @@ interface CodexSdkSessionState {
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
+  runtimeActivityGeneration?: ActivityGeneration;
+  turnStartInFlight: boolean;
   runningCompact: boolean;
   currentMessageId: string | null;
   currentText: string;
-  pendingComplete?: AgentMessage;
+  activeItemIds: Set<string>;
+  activeToolItemIds: Set<string>;
+  activeCompactionItemIds: Set<string>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
@@ -420,6 +448,17 @@ interface CodexSdkSessionState {
   pendingSessionSystemTextUpdateTurnId?: string;
   completedTurnIds: Set<string>;
   completedCompactTurnIds: Set<string>;
+  terminatedTurnIds: Set<string>;
+  terminatedCompactTurnIds: Set<string>;
+  // Debounced turn-end settle, armed when the thread reports idle and cancelled
+  // by any subsequent turn activity. Current Codex sometimes ends a turn with
+  // only a thread-idle status (no `turn/completed`); this fires that completion
+  // once the thread has been quiet for CODEX_IDLE_SETTLE_DEBOUNCE_MS, while a
+  // transient mid-turn idle is cancelled by the activity that follows it.
+  idleSettleTimer?: ReturnType<typeof setTimeout>;
+  idleSettleTurnId?: string;
+  deferredIdleSettleTurnId?: string;
+  deferredCompactSettleTurnId?: string;
   generatedImageTracking: GeneratedImageTrackingSnapshot | null;
   generatedImagePaths: string[];
   rawChecklistStartedAt: number;
@@ -429,6 +468,9 @@ interface CodexSdkSessionState {
   rawChecklistScanPromise?: Promise<void>;
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
+  /** Set once a native codex>=0.139 `turn/plan/updated` event has rendered the
+   *  plan, so the legacy rollout-file scan is suppressed (no double-render). */
+  nativePlanEventSeen?: boolean;
 }
 
 function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
@@ -727,6 +769,35 @@ function mapCodexCollabStatus(
 
 function isRecord(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readAgentMessageText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return undefined;
+  const parts: string[] = [];
+  for (const part of value) {
+    if (typeof part === 'string') {
+      parts.push(part);
+      continue;
+    }
+    if (!isRecord(part)) continue;
+    const text = part.text ?? part.content ?? part.value;
+    if (typeof text === 'string') parts.push(text);
+  }
+  return parts.length > 0 ? parts.join('') : undefined;
+}
+
+function readTurnCompletedAgentMessage(turn: Record<string, any>): { id: string; text: string } | undefined {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isRecord(item) || item.type !== 'agentMessage') continue;
+    const text = readAgentMessageText(item.text) ?? readAgentMessageText(item.content);
+    if (typeof text !== 'string' || !text.trim()) continue;
+    const id = meaningfulString(item.id) ?? `${meaningfulString(turn.id) ?? 'turn'}:agent-message`;
+    return { id, text };
+  }
+  return undefined;
 }
 
 function readNestedRuntimeSubagentRecord(value: unknown): Record<string, any> | undefined {
@@ -1061,6 +1132,34 @@ function rawChecklistToolFromFunctionCall(sessionId: string, item: Record<string
     status: 'complete',
     input,
     detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
+  };
+}
+
+/**
+ * codex >= 0.139 surfaces the running plan via a dedicated `turn/plan/updated`
+ * event ({ plan: [{ step, status }] }) instead of an `update_plan` function call
+ * in the rollout file. Map it to the SAME `update_plan` tool.call the legacy
+ * rollout scan emits so the shared timeline + web checklist render it
+ * identically. Older codex (no native event) keeps using the rollout scan.
+ */
+function planToolFromTurnPlanEvent(sessionId: string, turnId: string | undefined, rawPlan: unknown): ToolCallEvent | null {
+  const entries = Array.isArray(rawPlan) ? rawPlan : [];
+  const plan = entries
+    .map((entry) => {
+      const e = isRecord(entry) ? entry : {};
+      const content = (meaningfulString(e.step) ?? meaningfulString(e.content) ?? meaningfulString(e.text) ?? '').trim();
+      return { content, status: rawChecklistStatus(e.status) };
+    })
+    .filter((entry) => entry.content);
+  if (plan.length === 0) return null;
+  const input = { plan };
+  const allDone = plan.every((entry) => entry.status === 'completed');
+  return {
+    id: `codex-plan-${turnId ?? sessionId}`,
+    name: 'update_plan',
+    status: allDone ? 'complete' : 'running',
+    input,
+    detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: { plan: entries } },
   };
 }
 
@@ -1423,6 +1522,70 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeItemIds = state.activeItemIds ?? new Set<string>();
+    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
+    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
+    const activeReason = state.runningCompact
+      ? 'compact'
+      : state.runningTurnId
+        ? 'turn'
+        : state.turnStartInFlight
+          ? 'turn-start'
+          : activeItemIds.size > 0
+            ? 'item'
+            : state.cancelTimer
+              ? 'cancelling'
+              : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      threadId: state.threadId ?? null,
+      runningTurnId: state.runningTurnId ?? null,
+      turnStartInFlight: state.turnStartInFlight,
+      runningCompact: state.runningCompact,
+      loaded: state.loaded,
+      cancelled: state.cancelled,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      activeItemCount: activeItemIds.size,
+      activeItemIds: [...activeItemIds].slice(-20),
+      activeToolItemCount: activeToolItemIds.size,
+      activeToolItemIds: [...activeToolItemIds].slice(-20),
+      activeCompactionItemCount: activeCompactionItemIds.size,
+      compactObserved: state.compactObserved,
+      compactSettleArmed: Boolean(state.compactSettleTimer),
+      compactHardTimeoutArmed: Boolean(state.compactHardTimer),
+      cancelTimerArmed: Boolean(state.cancelTimer),
+      deferredIdleSettleTurnId: state.deferredIdleSettleTurnId ?? null,
+      deferredCompactSettleTurnId: state.deferredCompactSettleTurnId ?? null,
+      rawChecklistPollArmed: Boolean(state.rawChecklistPollTimer),
+    };
+  }
+
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const busyReasons: SessionActivityBusyReason[] = [];
+    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
+    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
+    const activeToolCount = activeToolItemIds.size;
+    const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (compactionActive) busyReasons.push('provider_compaction');
+    return {
+      activeWorkCount: activeToolCount + (compactionActive ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+      activityGeneration: state.runtimeActivityGeneration,
+      providerDiagnosticGeneration: state.runningTurnId ?? state.deferredIdleSettleTurnId ?? state.deferredCompactSettleTurnId ?? null,
+    };
+  }
+
   async disconnect(): Promise<void> {
     await this.stopAppServer({ clearSessions: true });
   }
@@ -1441,10 +1604,13 @@ export class CodexSdkProvider implements TransportProvider {
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
+      turnStartInFlight: false,
       runningCompact: false,
       currentMessageId: null,
       currentText: '',
-      pendingComplete: undefined,
+      activeItemIds: new Set(),
+      activeToolItemIds: new Set(),
+      activeCompactionItemIds: new Set(),
       cancelled: false,
       cancelTimer: null,
       compactSettleTimer: null,
@@ -1457,6 +1623,10 @@ export class CodexSdkProvider implements TransportProvider {
       pendingSessionSystemTextUpdateTurnId: undefined,
       completedTurnIds: existing?.completedTurnIds ?? new Set(),
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
+      terminatedTurnIds: existing?.terminatedTurnIds ?? new Set(),
+      terminatedCompactTurnIds: existing?.terminatedCompactTurnIds ?? new Set(),
+      deferredIdleSettleTurnId: undefined,
+      deferredCompactSettleTurnId: undefined,
       generatedImageTracking: null,
       generatedImagePaths: [],
       rawChecklistStartedAt: Date.now(),
@@ -1566,8 +1736,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     state.currentText = '';
-    state.currentMessageId = null;
-    state.pendingComplete = undefined;
+    state.currentMessageId = null;    state.activeItemIds.clear();
     state.cancelled = false;
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
@@ -1575,6 +1744,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.generatedImageTracking = null;
     state.generatedImagePaths = [];
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    state.runtimeActivityGeneration = payload.activityGeneration;
     if (this.isCompactCommand(payload)) {
       await this.startCompact(sessionId, state);
       return;
@@ -1627,8 +1797,9 @@ export class CodexSdkProvider implements TransportProvider {
       if (!this.sessions.has(sessionId)) return;
       if (state.runningTurnId !== turnId) return;
       this.clearStatus(sessionId, state);
+      this.rememberTerminatedTurn(state, turnId);
       state.runningTurnId = undefined;
-      state.pendingComplete = undefined;
+      state.turnStartInFlight = false;      state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
@@ -1646,17 +1817,18 @@ export class CodexSdkProvider implements TransportProvider {
     this.rl = null;
     for (const [sessionId, state] of this.sessions) {
       this.clearCancelTimer(state);
-      this.clearCompactTimers(state);
-      this.clearRawChecklistPollTimer(state);
+      this.clearCompactTimers(state);      this.clearRawChecklistPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
+        this.rememberTerminatedActiveTurn(state);
         state.loaded = false;
         state.runningTurnId = undefined;
+        state.turnStartInFlight = false;
         state.runningCompact = false;
         state.compactObserved = false;
         state.currentMessageId = null;
         state.currentText = '';
-        state.pendingComplete = undefined;
+        state.activeItemIds.clear();
         state.cancelled = false;
         state.lastStatusSignature = null;
         this.clearPendingSessionSystemTextUpdate(state);
@@ -1792,6 +1964,7 @@ export class CodexSdkProvider implements TransportProvider {
       await this.ensureThreadLoaded(sessionId, state, payload);
       await this.prepareGeneratedImageTracking(sessionId, state);
       const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
+      state.turnStartInFlight = true;
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
@@ -1801,10 +1974,19 @@ export class CodexSdkProvider implements TransportProvider {
         sandboxPolicy: { type: 'dangerFullAccess' },
         ...(state.model ? { model: state.model } : {}),
         ...(state.effort ? { effort: state.effort } : {}),
+      }).finally(() => {
+        state.turnStartInFlight = false;
       });
-      state.runningTurnId = result?.turn?.id;
+      // Extract the app-server-assigned turn id defensively — provider versions
+      // have shifted the field shape (turn.id / turnId / turn.turnId). Never
+      // clobber an id already learned from streamed items/deltas with undefined,
+      // or the turn-id guards below would start dropping live assistant text.
+      const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
+      if (startedTurnId) state.runningTurnId = startedTurnId;
+      state.nativePlanEventSeen = false;
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
+        state.terminatedTurnIds.delete(state.runningTurnId);
       }
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
@@ -1815,7 +1997,9 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
+      this.rememberTerminatedTurn(state, state.runningTurnId);
       state.runningTurnId = undefined;
+      state.turnStartInFlight = false;      state.activeItemIds.clear();
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
@@ -1867,10 +2051,11 @@ export class CodexSdkProvider implements TransportProvider {
         this.armCompactNoSignalSettle(sessionId, state, readParamTurnId(result ?? {}));
       }
     } catch (err) {
-      this.clearCompactTimers(state);
-      this.clearStatus(sessionId, state);
+      this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
+      this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
       state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
       state.compactObserved = false;
       this.emitError(sessionId, this.normalizeError(err));
     }
@@ -2162,6 +2347,10 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async scanRawChecklistHistory(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    // codex >= 0.139 emits the plan natively via `turn/plan/updated`; once we've
+    // seen that for this session, skip the legacy rollout-file scrape so the
+    // plan is never rendered twice.
+    if (state.nativePlanEventSeen) return;
     const chunk = await this.readRawChecklistHistoryChunk(state);
     if (!chunk) return;
     const minTimestamp = state.rawChecklistStartedAt - CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS;
@@ -2215,7 +2404,6 @@ export class CodexSdkProvider implements TransportProvider {
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
     if (state.cancelled) return true;
-
     if (item.type === 'function_call') {
       const name = meaningfulString(item.name);
       const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
@@ -2365,8 +2553,7 @@ export class CodexSdkProvider implements TransportProvider {
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      if (!sessionId || !state) return;
-      const normalizedUsage = normalizeCodexTokenUsage(params);
+      if (!sessionId || !state) return;      const normalizedUsage = normalizeCodexTokenUsage(params);
       if (!normalizedUsage) return;
       state.lastUsage = normalizedUsage;
       for (const cb of this.usageCallbacks) cb(sessionId, {
@@ -2394,6 +2581,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
+        this.clearIdleSettleTimer(state); // turn resumed → cancel any pending idle settle
         if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -2408,8 +2596,23 @@ export class CodexSdkProvider implements TransportProvider {
           this.completeCompact(sessionId, state, readParamTurnId(params));
           return;
         }
-        if (state.runningTurnId) {
-          await this.completeTurn(sessionId, state, readParamTurnId(params) ?? state.runningTurnId);
+        // Authoritative turn-end signal for the current Codex app-server: it
+        // reports the thread going idle when a turn finishes but does NOT always
+        // emit an explicit `turn/completed` (confirmed via DIAG logs: turns
+        // started, did their work, but no `turn/completed` ever arrived → the
+        // runtime stayed "working" forever and the queued message could not
+        // drain until a manual STOP). So settle the active normal turn on
+        // thread-idle. The `completedTurnIds` dedup makes this coexist safely
+        // with a later `turn/completed` for the same turn — whichever arrives
+        // first settles it; the other is dropped by the dedup gate.
+        if (
+          state.runningTurnId
+          && !state.cancelled
+          && !state.turnStartInFlight
+          && !this.isClosedCodexTurn(state, state.runningTurnId)
+        ) {
+          this.armIdleSettleTimer(sessionId, state, state.runningTurnId);
+          return;
         }
       }
       return;
@@ -2425,13 +2628,49 @@ export class CodexSdkProvider implements TransportProvider {
       return;
     }
 
+    if (method === 'turn/plan/updated') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+      const turnId = readParamTurnId(params);
+      if (turnId && (state.cancelled || this.isClosedCodexTurn(state, turnId))) return;
+      if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+      // Native plan event (codex >= 0.139). Render it AND suppress the legacy
+      // rollout-file scan for this session so old (file-scrape) + new never
+      // double-render the same plan.
+      state.nativePlanEventSeen = true;
+      const tool = planToolFromTurnPlanEvent(sessionId, turnId ?? state.runningTurnId, params.plan);
+      if (tool) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+      }
+      return;
+    }
+
     if (method === 'item/agentMessage/delta') {
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       if (state.cancelled) return;
-      this.clearStatus(sessionId, state);
+      this.clearIdleSettleTimer(state); // live token → turn active, cancel pending idle settle
+      const turnId = readParamTurnId(params);
+      const closedTurn = this.isClosedCodexTurn(state, turnId);
+      // NEVER drop live assistant text. If our turn bookkeeping lags the
+      // app-server (turn/start's result carried no turn id, so runningTurnId was
+      // never set, or this delta's turnId is shaped differently), adopt the
+      // delta's turnId and render anyway — a real text update must always reach
+      // the UI. Closed/terminated turns may still render late text, but they
+      // must never be adopted back into running state.
+      if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.clearStatus(sessionId, state);
+      // Reset the streaming accumulator when a new agentMessage item starts so
+      // its deltas don't render prefixed with the previous message's full text
+      // (multi-message turns occur after every tool round). Guards the case
+      // where item/started was not observed before the first delta.
+      if (state.currentMessageId !== params.itemId) {
+        state.currentText = '';
+      }
       state.currentMessageId = params.itemId;
       state.currentText += String(params.delta ?? '');
       const delta: MessageDelta = {
@@ -2449,17 +2688,36 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      const turnId = readParamTurnId(params);
+      if (state.cancelled) return;
+      if (method === 'item/started') {
+        this.clearIdleSettleTimer(state); // new item activity → turn active, cancel pending idle settle
+      }
+      const closedTurn = this.isClosedCodexTurn(state, turnId);
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      if (closedTurn && item.type !== 'agentMessage') return;
+      // NEVER drop a real provider item. If our turn bookkeeping lags the
+      // app-server (turn/start's result carried no turn id, or this event's
+      // turnId is shaped differently), adopt the event's turnId and process it
+      // anyway rather than silently dropping tool calls / reasoning / final
+      // assistant text. Closed/terminated turns may still surface final
+      // assistant text, but they must never be adopted back into running state.
+      if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
         state.runningCompact = true;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
-        state.runningTurnId = readParamTurnId(params) ?? state.runningTurnId;
+        state.runningTurnId = turnId ?? state.runningTurnId;
         if (method === 'item/completed') {
-          this.completeCompact(sessionId, state, readParamTurnId(params));
+          if (this.hasActiveToolItems(state)) {
+            state.deferredCompactSettleTurnId = turnId ?? state.runningTurnId ?? `${sessionId}:context-compaction`;
+            return;
+          }
+          this.completeCompact(sessionId, state, turnId);
           return;
         }
         this.emitStatus(sessionId, state, {
@@ -2469,8 +2727,6 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
-      if (state.cancelled) return;
-
       if (item.type === 'reasoning') {
         this.emitStatus(sessionId, state, {
           status: 'thinking',
@@ -2479,7 +2735,7 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
 
-      this.clearStatus(sessionId, state);
+      if (!closedTurn) this.clearStatus(sessionId, state);
 
       const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
@@ -2487,6 +2743,15 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (item.type === 'agentMessage') {
+        if (method === 'item/completed') this.clearIdleSettleTimer(state);
+        // A new agentMessage item begins: clear the accumulator so its stream
+        // starts fresh (prevents the previous message's text from bleeding into
+        // this message's bubble during streaming). item/completed for the SAME
+        // id must NOT clear (currentMessageId already matches), so the final
+        // text overwrite below is preserved.
+        if (state.currentMessageId !== item.id) {
+          state.currentText = '';
+        }
         state.currentMessageId = item.id;
         if (method === 'item/completed' && typeof item.text === 'string') {
           const prior = state.currentText;
@@ -2499,8 +2764,7 @@ export class CodexSdkProvider implements TransportProvider {
               role: 'assistant',
             };
             for (const cb of this.deltaCallbacks) cb(sessionId, delta);
-          }
-        }
+          }        }
       }
       return;
     }
@@ -2510,19 +2774,20 @@ export class CodexSdkProvider implements TransportProvider {
       const threadId = readParamThreadId(params);
       const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
       const state = sessionId ? this.sessions.get(sessionId) : null;
-      if (!sessionId || !state) return;
-      const turn = params.turn ?? {};
+      if (!sessionId || !state) return;      const turn = isRecord(params.turn) ? params.turn : {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
+      this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
 
-      if (turnId && state.completedCompactTurnIds.has(turnId)) {
+      if (turnId && this.isClosedCompactTurn(state, turnId)) {
         return;
       }
-      if (turnId && state.completedTurnIds.has(turnId)) {
+      if (turnId && this.isClosedTurn(state, turnId)) {
         return;
       }
 
       if (status === 'failed') {
+        this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
@@ -2530,6 +2795,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
+        state.turnStartInFlight = false;        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
         if (this.isCodexAuthError(error)) {
@@ -2541,6 +2807,7 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (status === 'interrupted') {
+        this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
@@ -2548,12 +2815,13 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
-          this.clearPendingSessionSystemTextUpdate(state);
+          state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
           return;
         }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
-        this.clearPendingSessionSystemTextUpdate(state);
+        state.turnStartInFlight = false;
+        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -2564,16 +2832,32 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (state.cancelled) {
+        this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearRawChecklistPollTimer(state);
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
-        state.pendingComplete = undefined;
+        state.turnStartInFlight = false;
         state.currentMessageId = null;
         state.currentText = '';
-        state.cancelled = false;
-        this.clearPendingSessionSystemTextUpdate(state);
+        state.activeItemIds.clear();
+        state.activeToolItemIds.clear();
+        state.activeCompactionItemIds.clear();
+        state.cancelled = false;        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
+      }
+
+      if (!state.currentText) {
+        const completedAgentMessage = readTurnCompletedAgentMessage(turn);
+        if (completedAgentMessage) {
+          state.currentMessageId = completedAgentMessage.id;
+          state.currentText = completedAgentMessage.text;
+        }
+      }
+
+      if (this.hasActiveToolItems(state)) {
+        state.deferredIdleSettleTurnId = turnId ?? state.runningTurnId ?? `${sessionId}:turn-completed`;
         return;
       }
 
@@ -2583,8 +2867,8 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
-    this.clearCancelTimer(state);
-    this.clearStatus(sessionId, state);
+    this.clearIdleSettleTimer(state);
+    this.clearCancelTimer(state);    this.clearStatus(sessionId, state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
     this.commitPendingSessionSystemTextUpdate(state, turnId);
@@ -2597,8 +2881,12 @@ export class CodexSdkProvider implements TransportProvider {
     const generatedImageTracking = state.generatedImageTracking;
     const alreadyDetectedImagePaths = [...state.generatedImagePaths];
     state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    state.activeItemIds.clear();
     state.generatedImageTracking = null;
-    const newlyDetectedImagePaths = await this.detectNewGeneratedImagePaths(generatedImageTracking);
+    const newlyDetectedImagePaths = generatedImageTracking
+      ? await this.detectNewGeneratedImagePaths(generatedImageTracking)
+      : [];
     const generatedImagePaths = [
       ...alreadyDetectedImagePaths,
       ...newlyDetectedImagePaths.filter((path) => !alreadyDetectedImagePaths.includes(path)),
@@ -2626,8 +2914,6 @@ export class CodexSdkProvider implements TransportProvider {
         ...(resumeId ? { resumeId } : {}),
       },
     };
-    state.pendingComplete = completed;
-    state.pendingComplete = undefined;
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
   }
 
@@ -2637,6 +2923,90 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.completedTurnIds.size <= 50) return;
     const oldest = state.completedTurnIds.values().next().value;
     if (oldest) state.completedTurnIds.delete(oldest);
+  }
+
+  /** Cancel a pending debounced thread-idle settle (turn activity resumed). */
+  private clearIdleSettleTimer(state: CodexSdkSessionState): void {
+    if (state.idleSettleTimer) {
+      clearTimeout(state.idleSettleTimer);
+      state.idleSettleTimer = undefined;
+    }
+    state.idleSettleTurnId = undefined;
+    state.deferredIdleSettleTurnId = undefined;
+  }
+
+  private hasActiveToolItems(state: CodexSdkSessionState): boolean {
+    return state.activeToolItemIds.size > 0;
+  }
+
+  /** Arm the debounced thread-idle settle for `turnId`. If no turn activity
+   *  arrives before the debounce elapses, the turn is completed (handles the
+   *  current Codex app-server ending a turn with only a thread-idle status). */
+  private armIdleSettleTimer(sessionId: string, state: CodexSdkSessionState, turnId: string): void {
+    this.clearIdleSettleTimer(state);
+    state.idleSettleTurnId = turnId;
+    state.idleSettleTimer = setTimeout(() => {
+      state.idleSettleTimer = undefined;
+      state.idleSettleTurnId = undefined;
+      if (
+        (!state.runningTurnId || state.runningTurnId === turnId)
+        && !state.cancelled
+        && !state.turnStartInFlight
+        && !this.isClosedCodexTurn(state, turnId)
+      ) {
+        if (this.hasActiveToolItems(state)) {
+          state.deferredIdleSettleTurnId = turnId;
+          return;
+        }
+        void this.completeTurn(sessionId, state, turnId);
+      }
+    }, CODEX_IDLE_SETTLE_DEBOUNCE_MS);
+    state.idleSettleTimer.unref?.();
+  }
+
+  private maybeArmDeferredIdleSettle(sessionId: string, state: CodexSdkSessionState): void {
+    const turnId = state.deferredIdleSettleTurnId;
+    if (!turnId || this.hasActiveToolItems(state)) return;
+    if (
+      (!state.runningTurnId || state.runningTurnId === turnId)
+      && !state.cancelled
+      && !state.turnStartInFlight
+      && !this.isClosedCodexTurn(state, turnId)
+    ) {
+      this.armIdleSettleTimer(sessionId, state, turnId);
+      return;
+    }
+    state.deferredIdleSettleTurnId = undefined;
+  }
+
+  private maybeCompleteDeferredCompact(sessionId: string, state: CodexSdkSessionState): void {
+    const turnId = state.deferredCompactSettleTurnId;
+    if (!turnId || this.hasActiveToolItems(state)) return;
+    state.deferredCompactSettleTurnId = undefined;
+    this.completeCompact(sessionId, state, turnId);
+  }
+
+  private rememberTerminatedTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.terminatedTurnIds.add(turnId);
+    if (state.terminatedTurnIds.size <= TERMINATED_TURN_CACHE_LIMIT) return;
+    const oldest = state.terminatedTurnIds.values().next().value;
+    if (oldest) state.terminatedTurnIds.delete(oldest);
+  }
+
+  private isClosedTurn(state: CodexSdkSessionState, turnId?: string): boolean {
+    return Boolean(turnId && (state.completedTurnIds.has(turnId) || state.terminatedTurnIds.has(turnId)));
+  }
+
+  private isClosedCompactTurn(state: CodexSdkSessionState, turnId?: string): boolean {
+    return Boolean(turnId && (
+      state.completedCompactTurnIds.has(turnId)
+      || state.terminatedCompactTurnIds.has(turnId)
+    ));
+  }
+
+  private isClosedCodexTurn(state: CodexSdkSessionState, turnId?: string): boolean {
+    return this.isClosedTurn(state, turnId) || this.isClosedCompactTurn(state, turnId);
   }
 
   private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
@@ -2670,11 +3040,13 @@ export class CodexSdkProvider implements TransportProvider {
 
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCancelTimer(state);
-    this.clearCompactTimers(state);
-    this.clearRawChecklistPollTimer(state);
+    this.clearCompactTimers(state);    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
+    state.deferredCompactSettleTurnId = undefined;
+    state.activeCompactionItemIds.clear();
     state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
     state.compactObserved = false;
     state.generatedImageTracking = null;
     this.rememberCompletedCompactTurn(state, turnId);
@@ -2706,6 +3078,24 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.completedCompactTurnIds.size <= 20) return;
     const oldest = state.completedCompactTurnIds.values().next().value;
     if (oldest) state.completedCompactTurnIds.delete(oldest);
+  }
+
+  private rememberTerminatedCompactTurn(state: CodexSdkSessionState, turnId?: string): void {
+    if (!turnId) return;
+    state.terminatedCompactTurnIds.add(turnId);
+    if (state.terminatedCompactTurnIds.size <= TERMINATED_COMPACT_TURN_CACHE_LIMIT) return;
+    const oldest = state.terminatedCompactTurnIds.values().next().value;
+    if (oldest) state.terminatedCompactTurnIds.delete(oldest);
+  }
+
+  private rememberTerminatedActiveTurn(state: CodexSdkSessionState, turnId?: string): void {
+    const resolvedTurnId = turnId ?? state.runningTurnId;
+    if (!resolvedTurnId) return;
+    if (state.runningCompact) {
+      this.rememberTerminatedCompactTurn(state, resolvedTurnId);
+      return;
+    }
+    this.rememberTerminatedTurn(state, resolvedTurnId);
   }
 
   /**
@@ -2844,15 +3234,18 @@ export class CodexSdkProvider implements TransportProvider {
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
-    this.clearRawChecklistPollTimer(state);
-    this.clearStatus(sessionId, state);
+    this.clearRawChecklistPollTimer(state);    this.clearStatus(sessionId, state);
+    this.rememberTerminatedCompactTurn(state, state.runningTurnId);
     state.runningCompact = false;
     state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
     state.compactObserved = false;
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
-    state.pendingComplete = undefined;
+    state.activeItemIds.clear();
+    state.activeToolItemIds.clear();
+    state.activeCompactionItemIds.clear();
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
 
@@ -2892,6 +3285,30 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelTimer = null;
   }
 
+  private trackCodexTurnItemActivity(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    method: 'item/started' | 'item/completed',
+    item: Record<string, any>,
+  ): void {
+    const itemId = meaningfulString(item.id);
+    if (itemId) {
+      if (method === 'item/started') {
+        state.activeItemIds.add(itemId);
+        if (CODEX_TOOL_LIKE_ITEM_TYPES.has(String(item.type))) state.activeToolItemIds.add(itemId);
+        if (item.type === 'contextCompaction') state.activeCompactionItemIds.add(itemId);
+      } else {
+        state.activeItemIds.delete(itemId);
+        state.activeToolItemIds.delete(itemId);
+        state.activeCompactionItemIds.delete(itemId);
+      }
+    }
+    if (method === 'item/completed') {
+      this.maybeCompleteDeferredCompact(sessionId, state);
+      this.maybeArmDeferredIdleSettle(sessionId, state);
+    }
+  }
+
   private armCompactNoSignalSettle(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCompactSettleTimer(state);
     state.compactSettleTimer = setTimeout(() => {
@@ -2907,14 +3324,16 @@ export class CodexSdkProvider implements TransportProvider {
     state.compactHardTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
       if (!state.runningCompact) return;
-      this.clearCompactTimers(state);
-      this.clearStatus(sessionId, state);
+      this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
+      this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
       state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
       state.compactObserved = false;
       this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;
       state.currentText = '';
+      state.activeItemIds.clear();
       this.emitError(sessionId, this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         `Codex SDK compact did not complete within ${Math.round(COMPACT_HARD_TIMEOUT_MS)}ms`,

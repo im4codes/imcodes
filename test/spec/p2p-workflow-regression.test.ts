@@ -1769,7 +1769,10 @@ describe('p2p-workflow reverse-regression', () => {
       "Props.initialTab must include 'advanced' so callers can open directly on the canvas tab",
     ).toBe(true);
     expect(
-      /useState<'participants'\s*\|\s*'combos'\s*\|\s*'advanced'>/.test(file.text),
+      // Match the required members in order but allow the union to carry
+      // additional tabs after 'advanced' (e.g. 'execution') — the guarantee is
+      // that 'advanced' is a valid activeTab value, not that it is the last.
+      /useState<'participants'\s*\|\s*'combos'\s*\|\s*'advanced'(?:\s*\|\s*'[^']+')*>/.test(file.text),
       "activeTab useState type union must include 'advanced'",
     ).toBe(true);
 
@@ -2697,8 +2700,8 @@ describe('p2p-workflow reverse-regression', () => {
 
     expect(
       dispatchWindow.indexOf('discussionFileContainsSectionHeader(watchPath, sectionHeader)')
-        < dispatchWindow.indexOf('transportRuntime.send(prompt)'),
-      'duplicate-heading short-circuit must run before transportRuntime.send(prompt)',
+        < dispatchWindow.indexOf('dispatchP2pPromptToSession({'),
+      'duplicate-heading short-circuit must run before queue-aware P2P prompt dispatch',
     ).toBe(true);
 
     expect(
@@ -2712,25 +2715,26 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
   });
 
-  it('#81 P2P marker gates MUST watchdog stale queues without blind prompt retry (R3 v2 PR-ρ)', () => {
+  it('#81 P2P marker gates MUST settle marker-proven turns without blind prompt retry (R3 v2 PR-ρ)', () => {
     const orchestrator = read('src/daemon/p2p-orchestrator.ts');
 
     expect(
-      orchestrator.text.includes('QUEUE_STUCK_STOP_AFTER_MS = 300_000'),
-      'P2P stale queue watchdog must default to 5 minutes',
+      orchestrator.text.includes('QUEUE_STUCK_STOP_AFTER_MS = 120_000'),
+      'P2P stale queue watchdog must default to a bounded short recovery window',
     ).toBe(true);
     expect(
-      orchestrator.text.includes('MARKER_PROMPT_RETRY_AFTER_MS = 60_000'),
+      orchestrator.text.includes('MARKER_PROMPT_RETRY_AFTER_MS = 30_000'),
       'marker-missing retries must be throttled',
     ).toBe(true);
     expect(
-      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000'),
-      'execution follow-up confirmation must wait briefly after the execution marker is observed',
-    ).toBe(true);
+      orchestrator.text.includes('POST_SUMMARY_CONFIRMATION_DELAY_MS'),
+      'execution marker proof must not keep a stale delay hook that stalls the confirmation follow-up',
+    ).toBe(false);
     expect(
       /async\s+function\s+maybeStopStaleP2pTransportQueue\s*\(/.test(orchestrator.text)
-        && /runtime\.cancel\(\)/.test(orchestrator.text),
-      'P2P must stop a stale active transport turn once so queued work can drain',
+        && /runtime\.cancelStaleActiveTurnWithPending\(/.test(orchestrator.text)
+        && !/await\s+runtime\.cancel\(\)/.test(orchestrator.text),
+      'P2P stale recovery must use pending-aware runtime recovery instead of raw cancelling active turns',
     ).toBe(true);
     expect(
       /async\s+function\s+isPostSummaryMarkerRetryReady\s*\(/.test(orchestrator.text)
@@ -2742,8 +2746,8 @@ describe('p2p-workflow reverse-regression', () => {
     expect(executionGateAnchor, 'runPostSummaryExecutionGate must exist').toBeGreaterThan(0);
     const executionGateWindow = orchestrator.text.slice(executionGateAnchor, executionGateAnchor + 5200);
     expect(
-      /POST_SUMMARY_CONFIRMATION_DELAY_MS[\s\S]{0,360}runPostSummaryExecutionConfirmationGate/.test(executionGateWindow),
-      'execution gate must delay the follow-up prompt after observing the execution marker',
+      /markerState\?\.ok[\s\S]{0,360}settlePostSummaryRuntimeFromMarker\([\s\S]{0,360}runPostSummaryExecutionConfirmationGate/.test(executionGateWindow),
+      'execution marker proof must settle the active runtime and advance directly to confirmation',
     ).toBe(true);
     expect(
       /maybeStopStaleP2pTransportQueue\([\s\S]{0,260}reason:\s*'execution_marker_missing'/.test(executionGateWindow),
@@ -2790,6 +2794,46 @@ describe('p2p-workflow reverse-regression', () => {
     expect(
       /\.\.\.\(isTerminalRun\s*\?\s*\{\}\s*:\s*\{\s*active_phase:\s*run\.activePhase\s*\}\)/.test(orchestrator.text),
       'serializeP2pRun must omit active_phase for terminal runs retained during cleanup grace',
+    ).toBe(true);
+  });
+
+  it('#83 P2P transport dispatch MUST be queue-aware instead of treating queued prompts as delivered', () => {
+    const orchestrator = read('src/daemon/p2p-orchestrator.ts');
+
+    expect(
+      orchestrator.text.includes('QUEUED_PROMPT_STOP_AFTER_MS = 20_000'),
+      'P2P queued prompt watchdog must use a shorter threshold than generic stale queue recovery',
+    ).toBe(true);
+    expect(
+      /async\s+function\s+dispatchP2pPromptToSession\s*\(/.test(orchestrator.text),
+      'P2P must dispatch transport prompts through a queue-aware helper',
+    ).toBe(true);
+    expect(
+      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId)?\)/.test(orchestrator.text)
+        && /if\s*\(result\s*===\s*'queued'\)/.test(orchestrator.text),
+      'P2P must inspect transportRuntime.send() and handle queued results explicitly',
+    ).toBe(true);
+    expect(
+      /emitP2pTransportQueuedState\(args\.run,\s*args\.session,\s*transportRuntime,\s*args\.reason\)/.test(orchestrator.text)
+        && /transportRuntime\.drainPendingIfIdle\(`p2p-\$\{args\.reason\}-post-send`\)/.test(orchestrator.text),
+      'queued P2P prompts must emit an authoritative queue snapshot and immediately nudge idle runtimes',
+    ).toBe(true);
+
+    const dispatchAnchor = orchestrator.text.indexOf('async function dispatchHop');
+    expect(dispatchAnchor, 'dispatchHop must exist').toBeGreaterThan(0);
+    const dispatchWindow = orchestrator.text.slice(dispatchAnchor, dispatchAnchor + 14500);
+    expect(
+      /const\s+dispatchResult\s*=\s*await\s+dispatchP2pPromptToSession\(/.test(dispatchWindow)
+        && /queuedDispatch\s*=\s*dispatchResult\.mode\s*===\s*'queued'/.test(dispatchWindow),
+      'dispatchHop must remember whether the P2P prompt entered the transport pending queue',
+    ).toBe(true);
+    expect(
+      /staleAfterMs:\s*queuedDispatch\s*\?\s*QUEUED_PROMPT_STOP_AFTER_MS\s*:\s*undefined/.test(dispatchWindow),
+      'queued P2P prompts must use the short queued-prompt watchdog while waiting for discussion output',
+    ).toBe(true);
+    expect(
+      /runtime\.cancelStaleActiveTurnWithPending\(/.test(orchestrator.text),
+      'P2P stale recovery should prefer runtime pending-message recovery before raw cancel',
     ).toBe(true);
   });
 });

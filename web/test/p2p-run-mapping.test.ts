@@ -272,6 +272,39 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.fileId).toBe('disc_nav');
   });
 
+  it('preserves server-authored shared actor metadata from run payloads', () => {
+    const sharedActor = {
+      actorUserId: 'user-shared',
+      actorDisplayName: 'Ada Shared',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-action-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 2_000,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_alpha_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-1'],
+        primaryShareId: 'share-1',
+        authorizedAt: 2_000,
+      },
+    };
+
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_shared_actor',
+      status: 'running',
+      mode_key: 'review',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      sharedActor,
+    });
+
+    expect(discussion.sharedActor).toEqual(sharedActor);
+  });
+
   it('preserves timeout serialization for round and summary boundary failures', () => {
     const summaryTimeout = mapP2pRunToDiscussion({
       id: 'run_summary_timeout',
@@ -540,7 +573,7 @@ describe('mapP2pRunToDiscussion', () => {
     expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
   });
 
-  it('removes stale active P2P entries that are absent from a full status response', () => {
+  it('keeps cached active P2P entries that are absent from a full status response', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
@@ -571,10 +604,10 @@ describe('mapP2pRunToDiscussion', () => {
 
     const merged = mergeP2pStatusResponseDiscussions(existing, [], { fullList: true });
 
-    expect(merged.map((d) => d.id)).toEqual(['p2p_run_done', 'local_manual_discussion']);
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_done', 'local_manual_discussion']);
   });
 
-  it('keeps active P2P entries present in a full status response and removes absent ones', () => {
+  it('updates active P2P entries present in a full status response without removing absent cached entries', () => {
     const existing = [
       {
         id: 'p2p_run_alpha',
@@ -603,7 +636,7 @@ describe('mapP2pRunToDiscussion', () => {
         state: 'running',
         currentRound: 1,
         maxRounds: 1,
-        completedHops: 0,
+        completedHops: 1,
         totalHops: 1,
         startedAt: undefined,
       },
@@ -611,7 +644,8 @@ describe('mapP2pRunToDiscussion', () => {
 
     const merged = mergeP2pStatusResponseDiscussions(existing, incoming, { fullList: true });
 
-    expect(merged.map((d) => d.id)).toEqual(['p2p_run_beta']);
+    expect(merged.map((d) => d.id)).toEqual(['p2p_run_alpha', 'p2p_run_beta']);
+    expect(merged.find((d) => d.id === 'p2p_run_beta')?.completedHops).toBe(1);
   });
 
   it('removes only an explicitly missing status run', () => {

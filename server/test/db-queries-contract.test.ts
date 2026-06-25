@@ -223,6 +223,37 @@ describe('db queries contracts', () => {
       response: 'hello',
     });
     await queries.getDiscussionRounds(db, 'disc-1', 'srv-1');
+    const commentSnapshot = {
+      target: { kind: 'server' as const, serverId: 'srv-1' },
+      effectiveRole: 'viewer' as const,
+      historyCutoffAt: 100,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['share-1'],
+      primaryShareId: 'share-1',
+      authorizedAt: 200,
+    };
+    db.queryOne.mockResolvedValueOnce({ id: 'comment-1', server_id: 'srv-1' });
+    await queries.insertDiscussionComment(db, {
+      id: 'comment-1',
+      serverId: 'srv-1',
+      threadId: 'disc-1',
+      scope: { kind: 'server', serverId: 'srv-1' },
+      createdByUserId: 'user-1',
+      actorEnvelope: {
+        actorUserId: 'user-1',
+        actorDisplayName: 'User One',
+        snapshot: commentSnapshot,
+        primaryShareId: 'share-1',
+        effectiveActorRole: 'viewer',
+        actionId: 'action-1',
+        origin: 'shared-server',
+        authorizedAt: 200,
+      },
+      authorizationSnapshot: commentSnapshot,
+      body: 'comment',
+      createdAt: 300,
+    });
+    await queries.getDiscussionCommentsByThread(db, 'srv-1', 'disc-1');
 
     const run: queries.DbOrchestrationRun = {
       id: 'run-1',
@@ -251,6 +282,9 @@ describe('db queries contracts', () => {
     await queries.getOrchestrationRunById(db, 'run-1', 'srv-1');
     await queries.getActiveOrchestrationRuns(db, 'srv-1');
     await queries.getRecentOrchestrationRuns(db, 'srv-1', 5);
+    await queries.getShareScopedOrchestrationRunsByDiscussion(db, 'disc-1', 'srv-1');
+    await queries.getShareScopedOrchestrationRunById(db, 'run-1', 'srv-1');
+    await queries.getShareScopedRecentOrchestrationRuns(db, 'srv-1', 5);
     await queries.writeAuditLog(db, 'audit-1', 'user-1', 'srv-1', 'server.rename', { ok: true }, '127.0.0.1');
 
     expect(db.execute).toHaveBeenCalled();

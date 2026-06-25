@@ -24,6 +24,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
+import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
@@ -64,6 +65,7 @@ const QWEN_BIN = 'qwen';
 const QWEN_COMPACT_SLASH_COMMAND = '/compress' as const;
 const TRANSIENT_RETRY_DELAY_MS = 250;
 const TRANSIENT_RETRY_MAX_ATTEMPTS = 1;
+const QWEN_RESULT_COMPLETION_FALLBACK_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const QWEN_COMPATIBLE_API_CLI_AUTH_TYPES = new Set([
   'openai',
@@ -162,6 +164,7 @@ interface QwenSessionState {
   settingsPath?: string;
   /** Internal Qwen CLI conversation ID — decoupled from provider session ID so cancel can start fresh. */
   qwenConversationId: string;
+  runtimeActivityGeneration?: ActivityGeneration;
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
@@ -599,6 +602,56 @@ export class QwenProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const childActive = Boolean(state.child && !state.child.killed);
+    const pendingFinal = typeof state.pendingFinalText === 'string';
+    const activeReason = childActive
+      ? 'child'
+      : pendingFinal
+        ? 'pending-final'
+        : null;
+    return {
+      provider: this.id,
+      routeId: sessionId,
+      active: activeReason !== null,
+      activeReason,
+      started: state.started,
+      conversationId: state.qwenConversationId,
+      childActive,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      pendingFinalTextLength: state.pendingFinalText?.length ?? 0,
+      pendingFinalMetadata: Boolean(state.pendingFinalMetadata),
+      cancelled: state.cancelled === true,
+      toolUseCount: state.toolUseById.size,
+      toolUseIndexCount: state.toolUseByIndex.size,
+      emittedToolSignatureCount: state.emittedToolSignatures.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+    };
+  }
+
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const childActive = Boolean(state.child && !state.child.killed);
+    const activeToolCount = state.toolUseById.size;
+    const terminalResultPending = typeof state.pendingFinalText === 'string' && state.pendingFinalText.length > 0;
+    const busyReasons: SessionActivityBusyReason[] = [];
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (childActive && activeToolCount === 0 && !terminalResultPending) busyReasons.push('provider_wait');
+    return {
+      status: 'current',
+      activeWorkCount: activeToolCount + (childActive && activeToolCount === 0 && !terminalResultPending ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+      activityGeneration: state.runtimeActivityGeneration,
+      providerDiagnosticGeneration: state.qwenConversationId,
+      updatedAt: Date.now(),
+    };
+  }
+
   async disconnect(): Promise<void> {
     for (const [sessionId, state] of this.sessions) {
       if (state.child && !state.child.killed) {
@@ -766,6 +819,7 @@ export class QwenProvider implements TransportProvider {
     state.emittedToolSignatures.clear();
     state.lastStatusSignature = null;
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+    state.runtimeActivityGeneration = payload.activityGeneration;
     const isCompactControl = isSessionCompactCommandText(payload.userMessage);
     const providerPayload = isCompactControl ? toQwenCompactPayload(payload) : payload;
     const compactCompletionMetadata = isCompactControl
@@ -846,12 +900,37 @@ export class QwenProvider implements TransportProvider {
     let stderrBuf = '';
     let retryScheduled = false;
     let reasoningFallbackScheduled = false;
+    let resultCompletionTimer: ReturnType<typeof setTimeout> | null = null;
 
     const sawVisibleTurnProgress = (): boolean => {
       return (state.currentText.length > 0 && !startsWithSyntheticApiError(state.currentText))
         || !!state.pendingFinalText
         || state.toolUseById.size > 0
         || state.emittedToolSignatures.size > 0;
+    };
+
+    const clearResultCompletionFallback = (): void => {
+      if (!resultCompletionTimer) return;
+      clearTimeout(resultCompletionTimer);
+      resultCompletionTimer = null;
+    };
+
+    const armResultCompletionFallback = (): void => {
+      if (state.cancelled || !state.pendingFinalText) return;
+      clearResultCompletionFallback();
+      resultCompletionTimer = setTimeout(() => {
+        resultCompletionTimer = null;
+        if (completed || sawError || state.cancelled || !state.pendingFinalText) return;
+        const finalText = state.pendingFinalText;
+        const messageId = state.currentMessageId ?? undefined;
+        const metadata = state.pendingFinalMetadata;
+        if (state.child === child) {
+          state.child = null;
+          void killProcessTree(child, { gracefulMs: 500 });
+        }
+        emitComplete(finalText, messageId, metadata);
+      }, QWEN_RESULT_COMPLETION_FALLBACK_MS);
+      resultCompletionTimer.unref?.();
     };
 
     const maybeRetryTransientError = async (messageText: string, _details?: unknown): Promise<boolean> => {
@@ -907,6 +986,7 @@ export class QwenProvider implements TransportProvider {
     const emitError = (messageText: string, details?: unknown): void => {
       if (sawError || completed) return;
       sawError = true;
+      clearResultCompletionFallback();
       this.clearStatus(sessionId, state);
       const errorCode = state.cancelled
         ? PROVIDER_ERROR_CODES.CANCELLED
@@ -917,8 +997,9 @@ export class QwenProvider implements TransportProvider {
     };
 
     const emitComplete = (text: string, messageId?: string, metadata?: Record<string, unknown>): void => {
-      if (completed || sawError) return;
+      if (completed || sawError || state.cancelled) return;
       completed = true;
+      clearResultCompletionFallback();
       state.started = true;
       state.currentMessageId = null;
       state.currentText = '';
@@ -945,6 +1026,7 @@ export class QwenProvider implements TransportProvider {
     };
 
     const emitTool = (tool: ToolCallEvent): void => {
+      if (state.cancelled) return;
       const signature = JSON.stringify({
         status: tool.status,
         name: tool.name,
@@ -971,6 +1053,8 @@ export class QwenProvider implements TransportProvider {
       } catch {
         return;
       }
+
+      if (state.cancelled) return;
 
       if (isRuntimeSubagentPayload(payload as unknown as Record<string, unknown>)) {
         emitRuntimeSubagent(payload as unknown as Record<string, unknown>);
@@ -1156,6 +1240,10 @@ export class QwenProvider implements TransportProvider {
           if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
           const output = stringifyToolResultContent(block.content);
           const tool = state.toolUseById.get(block.tool_use_id);
+          state.toolUseById.delete(block.tool_use_id);
+          for (const [index, indexedTool] of state.toolUseByIndex) {
+            if (indexedTool.id === block.tool_use_id) state.toolUseByIndex.delete(index);
+          }
           emitTool({
             id: block.tool_use_id,
             name: tool?.name ?? 'tool',
@@ -1197,6 +1285,7 @@ export class QwenProvider implements TransportProvider {
             ...(!assistantUsage && sanitizedResultUsage ? { usage: sanitizedResultUsage } : {}),
             ...(compactCompletionMetadata ?? {}),
           };
+          armResultCompletionFallback();
         }
       }
     });
@@ -1209,6 +1298,7 @@ export class QwenProvider implements TransportProvider {
 
     child.once('close', (code, signal) => {
       setTimeout(() => {
+        clearResultCompletionFallback();
         rl.close();
         if (state.child === child) state.child = null;
         if (state.cancelled) {

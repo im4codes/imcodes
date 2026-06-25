@@ -5,14 +5,8 @@ import type {
   ProcessedContextReplicationBody,
   ReplicableProcessedContextClass,
 } from '../../shared/context-types.js';
-import {
-  getReplicationState,
-  listProcessedProjections,
-  listReplicationStates,
-  setReplicationState,
-  listAllProcessedProjectionsByNamespace,
-  parseNamespaceKey,
-} from '../store/context-store.js';
+import { parseNamespaceKey } from '../../shared/memory-namespace.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { getContextModelConfig } from './context-model-config.js';
 import logger from '../util/logger.js';
 
@@ -36,7 +30,10 @@ export async function replicatePendingProcessedContext(
 ): Promise<ProcessedContextReplicationResult> {
   const config = getContextModelConfig();
   const personalSyncEnabled = config.enablePersonalMemorySync === true;
-  const states = resolveStates(namespaces);
+  const client = getContextStoreClient();
+  const updateReplState = (namespace: ContextNamespace, replState: Omit<ContextReplicationState, 'namespace'>) =>
+    client.run<ContextReplicationState>('setReplicationState', [namespace, replState]);
+  const states = await resolveStates(namespaces);
   if (states.length > 0) {
     logger.info({ personalSyncEnabled, stateCount: states.length }, 'Replication poller: found pending states');
   }
@@ -48,7 +45,7 @@ export async function replicatePendingProcessedContext(
     if (state.pendingProjectionIds.length === 0) continue;
     // Personal namespaces skip replication unless cloud sync is enabled
     if (state.namespace.scope === 'personal' && !personalSyncEnabled) continue;
-    const projections = selectPendingProjections(state.namespace, state.pendingProjectionIds);
+    const projections = await selectPendingProjections(state.namespace, state.pendingProjectionIds);
     // Cloud only stores processed projections — filter out any raw/staged content
     const processedProjections = projections.filter(isReplicableProjection);
     if (processedProjections.length === 0 && projections.length > 0) {
@@ -56,7 +53,7 @@ export async function replicatePendingProcessedContext(
       continue;
     }
     if (projections.length === 0) {
-      setReplicationState(state.namespace, {
+      await updateReplState(state.namespace, {
         pendingProjectionIds: state.pendingProjectionIds,
         lastReplicatedAt: state.lastReplicatedAt,
         lastError: 'pending_projection_missing_locally',
@@ -72,14 +69,14 @@ export async function replicatePendingProcessedContext(
       });
       replicatedNamespaces += 1;
       replicatedProjections += processedProjections.length;
-      setReplicationState(state.namespace, {
+      await updateReplState(state.namespace, {
         pendingProjectionIds: state.pendingProjectionIds.filter((id) => !processedProjections.some((projection) => projection.id === id)),
         lastReplicatedAt: Date.now(),
         lastError: undefined,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setReplicationState(state.namespace, {
+      await updateReplState(state.namespace, {
         pendingProjectionIds: state.pendingProjectionIds,
         lastReplicatedAt: state.lastReplicatedAt,
         lastError: message,
@@ -100,50 +97,55 @@ export async function replicatePendingProcessedContext(
  * what was previously marked as sent. Use when the server-side data is
  * suspected to be missing despite the daemon believing it was replicated.
  */
-export function requeueAllForReplication(): number {
-  const allProjections = listAllProcessedProjectionsByNamespace();
+export async function requeueAllForReplication(): Promise<number> {
+  const client = getContextStoreClient();
+  const allProjections = await client.run<Map<string, string[]>>('listAllProcessedProjectionsByNamespace', []);
   let requeued = 0;
   for (const [namespaceKey, ids] of allProjections) {
     if (ids.length === 0) continue;
-    const existing = getReplicationState(parseNamespaceKey(namespaceKey));
-    setReplicationState(parseNamespaceKey(namespaceKey), {
-      pendingProjectionIds: ids,
-      lastReplicatedAt: existing?.lastReplicatedAt,
-      lastError: undefined,
-    });
+    const namespace = parseNamespaceKey(namespaceKey);
+    const existing = await client.run<ContextReplicationState | undefined>('getReplicationState', [namespace]);
+    const next = { pendingProjectionIds: ids, lastReplicatedAt: existing?.lastReplicatedAt, lastError: undefined };
+    await client.run<ContextReplicationState>('setReplicationState', [namespace, next]);
     requeued += ids.length;
   }
   logger.info({ requeued }, 'Re-queued all projections for replication');
   return requeued;
 }
 
-function resolveStates(namespaces?: ContextNamespace[]): ContextReplicationState[] {
+async function resolveStates(namespaces?: ContextNamespace[]): Promise<ContextReplicationState[]> {
   const allowPersonalSync = getContextModelConfig().enablePersonalMemorySync === true;
+  const client = getContextStoreClient();
   if (!namespaces || namespaces.length === 0) {
-    return listReplicationStates().filter((state) => (
+    const all = await client.run<ContextReplicationState[]>('listReplicationStates', []);
+    return all.filter((state) => (
       state.pendingProjectionIds.length > 0
       && (allowPersonalSync || state.namespace.scope !== 'personal')
     ));
   }
-  return namespaces
-    .map((namespace) => getReplicationState(namespace))
-    .filter((state): state is ContextReplicationState => (
-      !!state
-      && state.pendingProjectionIds.length > 0
-      && (allowPersonalSync || state.namespace.scope !== 'personal')
-    ));
+  const states = await Promise.all(
+    namespaces.map((namespace) =>
+      client.run<ContextReplicationState | undefined>('getReplicationState', [namespace]),
+    ),
+  );
+  return states.filter((state): state is ContextReplicationState => (
+    !!state
+    && state.pendingProjectionIds.length > 0
+    && (allowPersonalSync || state.namespace.scope !== 'personal')
+  ));
 }
 
-function selectPendingProjections(namespace: ContextNamespace, pendingIds: string[]): ProcessedContextProjection[] {
-  const wanted = new Set(pendingIds);
-  return listProcessedProjections(namespace)
-    .filter((projection) => wanted.has(projection.id))
-    .map((projection) => ({
-      ...projection,
-      // Legacy rows created before post-1.1 origin metadata are backfilled at
-      // the replication boundary; new materialization/write paths set origin explicitly.
-      origin: projection.origin ?? 'chat_compacted',
-    }));
+async function selectPendingProjections(namespace: ContextNamespace, pendingIds: string[]): Promise<ProcessedContextProjection[]> {
+  const projections = await getContextStoreClient().run<ProcessedContextProjection[]>(
+    'listProcessedProjectionsByIds',
+    [namespace, pendingIds],
+  );
+  return projections.map((projection) => ({
+    ...projection,
+    // Legacy rows created before post-1.1 origin metadata are backfilled at
+    // the replication boundary; new materialization/write paths set origin explicitly.
+    origin: projection.origin ?? 'chat_compacted',
+  }));
 }
 
 function isReplicableProjection(projection: ProcessedContextProjection): projection is ReplicableProcessedProjection {

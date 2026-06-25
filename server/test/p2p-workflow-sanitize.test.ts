@@ -51,6 +51,68 @@ describe('p2p workflow server sanitizer', () => {
     expect(Object.prototype).not.toHaveProperty('polluted');
   });
 
+  it('preserves normalized share scope for P2P broadcast filtering and DB upsert metadata', () => {
+    const sharedActor = {
+      actorUserId: 'user-shared',
+      actorDisplayName: 'Ada Shared',
+      effectiveActorRole: 'participant',
+      actionId: 'action-shared',
+      origin: 'shared-tab',
+      authorizedAt: 2_000,
+      snapshot: {
+        target: { kind: 'main', serverId: 'server-1', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        authorizedAt: 2_000,
+      },
+    };
+    const run = sanitizeP2pRunUpdateForBroadcast({
+      id: 'run-shared',
+      discussion_id: 'disc-shared',
+      mode_key: 'review',
+      status: 'running',
+      sharedActor,
+      shareScope: {
+        target: { kind: 'main', serverId: 'server-1', sessionName: 'deck_proj_brain' },
+        historyCutoffAt: 0,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+      },
+    }, { serverId: 'server-1' });
+
+    expect(run.shareScope).toEqual({
+      target: { kind: 'main', serverId: 'server-1', sessionName: 'deck_proj_brain' },
+      historyCutoffAt: 0,
+      primaryShareId: 'share-1',
+      coveringShareIds: ['share-1'],
+    });
+    expect(run.sharedActor).toMatchObject({
+      actorUserId: 'user-shared',
+      actorDisplayName: 'Ada Shared',
+      effectiveActorRole: 'participant',
+      snapshot: expect.objectContaining({ primaryShareId: 'share-1' }),
+    });
+    expect(run).toMatchObject({
+      scope_kind: 'main',
+      scope_server_id: 'server-1',
+      scope_session_name: 'deck_proj_brain',
+      scope_sub_session_id: null,
+      created_by_user_id: 'user-shared',
+      primary_share_id: 'share-1',
+      covering_share_ids: ['share-1'],
+      visible_after_ms: 0,
+      history_cutoff_at_ms: 0,
+      share_target_snapshot: { kind: 'main', serverId: 'server-1', sessionName: 'deck_proj_brain' },
+    });
+    expect(run.authorization_snapshot).toMatchObject({
+      target: { kind: 'main', serverId: 'server-1', sessionName: 'deck_proj_brain' },
+      primaryShareId: 'share-1',
+    });
+  });
+
   it('normalizes malformed status projection safely', () => {
     const projection = sanitizeP2pWorkflowStatusProjection({
       runId: 'run-3',

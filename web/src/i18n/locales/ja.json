@@ -13,7 +13,7 @@
     "quote_block": "全文引用",
     "copied": "コピーしました！",
     "generating": "生成中...",
-    "starting": "起動中...",
+    "starting": "開始中...",
     "yes": "はい",
     "connected": "接続済み",
     "disconnected": "切断済み",
@@ -22,6 +22,87 @@
     "show": "表示",
     "hide": "隠す",
     "this_feature": "この機能"
+  },
+  "share": {
+    "menu": {
+      "shareTab": "共有"
+    },
+    "dialogTitle": "アクセスを共有",
+    "dialogSubtitle": "{{target}} へのスコープ付きアクセスを付与します。",
+    "target": {
+      "label": "対象",
+      "currentTab": "現在のタブ",
+      "server": "ソースサーバー全体",
+      "serverFallback": "このサーバー"
+    },
+    "role": {
+      "label": "ロール",
+      "viewer": "閲覧者",
+      "participant": "参加者",
+      "serverMember": "サーバーメンバー",
+      "serverManager": "サーバー管理者",
+      "system": "システム"
+    },
+    "roleHelp": {
+      "viewer": "スコープ内の状態を閲覧し、エージェントを操作せずにスコープ内の議論へ参加できます。",
+      "participant": "スコープ内の状態を閲覧し、対象の具体的なタブへプロンプトを送信できます。"
+    },
+    "trust": {
+      "title": "参加者への信頼に関する開示",
+      "body": "エージェントはサンドボックス化されていません。UI/API の制限は直接操作を減らしますが、参加者のプロンプトは、アクセス可能な環境で動作するエージェントに影響する可能性があります。"
+    },
+    "recipient": {
+      "label": "受信者",
+      "placeholder": "ユーザー ID またはメール"
+    },
+    "list": {
+      "label": "共有ユーザー",
+      "title": "共有ユーザー",
+      "empty": "共有ユーザーはまだいません"
+    },
+    "manage": {
+      "roleFor": "{{user}} のロール",
+      "revoke": "取り消し",
+      "revokeConfirm": "{{user}} のアクセスを取り消しますか？"
+    },
+    "sharedWithMe": {
+      "title": "自分に共有",
+      "empty": "共有されたタブまたはサーバーはありません",
+      "refresh": "共有アクセスを更新",
+      "kind": {
+        "server": "サーバー",
+        "tab": "タブ",
+        "subsession": "サブセッション"
+      }
+    },
+    "create": "共有を作成",
+    "creating": "作成中...",
+    "scope": {
+      "current": "共有スコープ"
+    },
+    "indicator": "{{scope}} は {{role}} として共有中 · {{status}}",
+    "indicatorCompact": "{{role}} として共有中 · {{status}}",
+    "indicatorSharedOut": "他のユーザーと共有中",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "有効",
+      "revoked": "取り消し済み",
+      "expired": "期限切れ",
+      "target-unavailable": "対象を利用できません"
+    },
+    "reason": {
+      "share-role-denied": "このロールではその操作を使用できません。",
+      "share-direct-surface-denied": "この画面は共有アクセスでは利用できません。",
+      "share-rate-limited": "共有操作が多すぎます。しばらくしてから再試行してください。",
+      "share-revoked": "この共有は取り消されました。",
+      "share-expired": "この共有は期限切れです。",
+      "share-target-unavailable": "共有対象を利用できません。",
+      "share-role-changed": "共有ロールが変更されました。",
+      "share-ticket-invalid": "共有アクセスチケットが無効です。",
+      "share-cancel-unsupported": "この共有タブではキャンセルはサポートされていません。",
+      "share-audit-duplicate": "この操作はすでに記録されています。",
+      "share-comment-invalid": "コメントを投稿できませんでした。"
+    }
   },
   "window": {
     "maximize": "最大化",
@@ -45,7 +126,18 @@
     "reload": "再読み込み",
     "retry": "再試行"
   },
+  "askQuestion": {
+    "waiting": "回答を待っています。モデルは {{seconds}} 秒後に自動で続行します。",
+    "retained": "モデルはすでに続行しました。あと {{seconds}} 秒はこの回答で割り込めます。",
+    "customPlaceholder": "カスタム / 補足（任意）",
+    "answerPlaceholder": "回答を入力",
+    "dismiss": "閉じる",
+    "answer": "回答",
+    "interrupt": "この回答で割り込む"
+  },
   "chat": {
+    "delete_message": "メッセージを削除",
+    "delete_message_confirm": "このメッセージを全員から削除しますか?この操作は取り消せません。",
     "dpad": {
       "title": "矢印キー — ドラッグで移動"
     },
@@ -170,6 +262,13 @@
     "zoom_title": "メッセージ",
     "zoom_copy_all": "すべてコピー",
     "zoom_hint": "長押しで選択し、ハンドルをドラッグして範囲を調整してからコピーします。",
+    "image_download": "画像をダウンロード",
+    "image_downloading": "ダウンロード中...",
+    "image_downloaded": "ダウンロード済み",
+    "image_download_failed": "ダウンロードに失敗しました",
+    "image_copy": "画像をコピー",
+    "image_copied": "画像をコピーしました",
+    "image_copy_failed": "コピーに失敗しました",
     "tool_detail_toggle": "詳細",
     "tool_detail_input": "入力",
     "tool_detail_output": "出力",
@@ -250,7 +349,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "実行クローンで現在のタスクを実行",
+    "execution_clone_run_with_template": "{{name}} のクローン {{count}} 個で現在のタスクを並列実行",
+    "execution_clone_run_no_template": "Team 設定で実行セッションを有効化して選択してください",
+    "execution_clone_run_empty": "先にタスクを入力してください",
+    "execution_clone_run_offline": "再接続してから実行クローンを起動してください"
   },
   "session": {
     "restart": "↺ 再起動",
@@ -292,6 +396,9 @@
     "type": "タイプ",
     "label": "ラベル",
     "workingDir": "作業ディレクトリ",
+    "subsessionWorkingDirectory": "作業ディレクトリ",
+    "subsessionWorkingDirectoryPlaceholder": "現在のセッションディレクトリ",
+    "subsessionWorkingDirectoryLocked": "サブセッションは現在のディレクトリを使用し、起動時には変更できません。",
     "parentSession": "親セッション",
     "rename": "✎ 名前を変更",
     "rename_plain": "名前を変更",
@@ -316,6 +423,10 @@
       "overrideDirectories": "複製されたセッションに新しい作業ディレクトリを使う",
       "cwdOverride": "置換作業ディレクトリ",
       "cwdOverridePlaceholder": "/work/new-checkout",
+      "gitRemoteUrl": "Git remote URL（任意）",
+      "gitRemoteUrlPlaceholder": "https://github.com/org/repo.git",
+      "gitRemoteUrlHelp": "入力すると、daemon はグループをコピーする前に、この remote を置換作業ディレクトリへ clone します。",
+      "gitRemoteCapabilityMissing": "接続中の daemon は、コピーグループ向けの Git remote clone にまだ対応していません。daemon を更新または再接続してから再試行してください。",
       "browseCwd": "作業ディレクトリを参照",
       "daemonHostValidation": "作業ディレクトリは、リソース作成前に daemon ホスト上で検証されます。",
       "runningWarning": "コピーされたグループは新しい状態から始まります。コピー元の保留メッセージ、ターミナル履歴、実行中の作業はコピーされません。",
@@ -363,6 +474,8 @@
         "blank_target_project": "コピー先プロジェクト名は必須です。",
         "name_taken": "そのコピー先セッション名はすでに使用されています。",
         "invalid_cwd": "その作業ディレクトリは daemon ホストで使用できません。",
+        "invalid_git_remote": "その Git remote URL はサポートされていません。",
+        "git_clone_failed": "daemon は Git remote を作業ディレクトリへ clone できませんでした。",
         "incomplete_clone_spec": "実行中の子セッションにコピー可能な起動設定が不足しています。",
         "unsupported_session_type": "いずれかのセッションはまだコピーできません。",
         "p2p_config_invalid": "Team 設定をコピーできませんでした。",
@@ -541,7 +654,17 @@
       "deny": "拒否",
       "tool": "{{tool}} の承認が必要"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "このセッションで、要求された実装／実行作業を行ってください。",
+      "useConfigured": "{{name}} を使用",
+      "useConfiguredNone": "実行セッションを使用",
+      "setSession": "実行セッションを設定…"
+    },
+    "executionGroup": {
+      "title": "実行ワーカー（実行 {{run}}）",
+      "unknownRun": "保留中"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",
@@ -604,12 +727,18 @@
     "tab_files": "ファイル",
     "tab_changes": "変更",
     "changes_title": "変更 ({{count}})",
-    "no_changes": "変更なし"
+    "no_changes": "変更なし",
+    "rename_prompt": "{{name}} の名前を変更",
+    "rename_failed": "項目の名前変更に失敗しました",
+    "delete_confirm": "{{name}} を削除しますか？この操作は元に戻せません。",
+    "delete_failed": "項目の削除に失敗しました",
+    "invalid_name": "名前にパス区切り文字は使用できません"
   },
   "toast": {
     "finished": "完了",
     "upgrade_blocked_title": "アップグレードはブロックされました",
     "upgrade_blocked_p2p_active": "Team がまだ実行中です。daemon をアップグレードする前に停止してください。",
+    "upgrade_blocked_auto_deliver_active": "Auto Deliver がまだ実行中です。daemon をアップグレードする前に停止してください。",
     "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。"
   },
   "discussion": {
@@ -649,6 +778,10 @@
     "title": "新しいセッションを開始",
     "project_name": "プロジェクト名",
     "working_directory": "作業ディレクトリ",
+    "git_remote_url": "Git remote URL（任意）",
+    "git_remote_url_placeholder": "https://github.com/org/repo.git",
+    "git_remote_url_help": "入力すると、daemon はセッションを開始する前に、この remote を作業ディレクトリへ clone します。",
+    "git_remote_capability_missing": "接続中の daemon は Git remote clone にまだ対応していません。daemon を更新または再接続してから再試行してください。",
     "browse": "参照",
     "agent_type": "エージェント種別",
     "agent_flavor_cli": "CLI: 元のUIを好む人向けのネイティブ画面です。チャットモードはストリーミング非対応です。",
@@ -1060,6 +1193,8 @@
     "title": "OpenSpec",
     "changes": "変更",
     "empty": "OpenSpec の変更はありません",
+    "no_tasks": "タスクなし",
+    "task_status_title": "{{checked}}/{{total}} タスク完了",
     "load_timeout": "OpenSpec の変更の読み込みがタイムアウトしました。daemon の再接続後にもう一度試してください。",
     "load_unavailable": "daemon 接続の準備ができるまで OpenSpec の変更は利用できません。",
     "load_error": "OpenSpec の変更をスキャンできません",
@@ -1069,6 +1204,213 @@
     "implement_action": "実装",
     "achieve_action": "完了",
     "propose_action": "提案",
+    "execute": {
+      "action": "実行",
+      "dispatch_heading": "現在の変更を実行するセッション",
+      "dispatch_to": "{{name}}",
+      "default_heading": "既定の実行セッション",
+      "set_default": "{{name}} を既定に設定",
+      "clear_default": "既定の実行セッションをクリア",
+      "no_change": "変更を開いて実行対象を選択してください。",
+      "no_sessions": "このプロジェクトには利用可能な実行セッションがまだありません。"
+    },
+    "auto": {
+      "action": "Auto",
+      "kicker": "自動デリバリー",
+      "custom": "カスタム",
+      "launcher_title": "自動デリバリー",
+      "details_title": "Auto Deliver 詳細",
+      "current_run": "現在の Auto Deliver",
+      "list_title": "自動デリバリー",
+      "list_empty": "自動デリバリーの実行はまだありません。",
+      "list_select": "自動デリバリーの実行を選択してください。",
+      "no_change": "変更が選択されていません",
+      "start": "Auto Deliver を開始",
+      "stop": "停止",
+      "stopping": "停止中...",
+      "view": "表示",
+      "compact": "コンパクト",
+      "expand": "展開",
+      "tasks": "Tasks",
+      "tasks_unknown": "タスク不明",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "overall_progress": "全体の進捗",
+      "current_stage_progress": "現在のステージ",
+      "progress_count": "{{current}}/{{total}}",
+      "progress_percent": "{{percent}}%",
+      "prompt_count": "{{count}} prompts",
+      "prompt_progress": "{{count}}/{{total}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "latest_message": "最新メッセージ",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "同じグループの別セッションで Auto Deliver が実行中です。",
+      "conflict_summary": "詳細は参加セッションでのみ表示されます。",
+      "lock_manual_actions": "このセッショングループで Auto Deliver が実行中です。",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "経過時間",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Team コンボ",
+      "active_prompt": "OpenSpec prompt",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "final_scores": "Final acceptance scores",
+      "pre_repair_scores": "Pre-repair audit scores",
+      "score_snapshot_meta": "Round {{round}} · {{reason}}",
+      "scores_empty": "スコアはまだありません",
+      "scores_pending_repair_rescore": "These scores are from the previous implementation audit. Auto Deliver is repairing those findings now and will rescore after implementation finishes.",
+      "audit_results": "監査ラウンド結果",
+      "audit_results_empty": "完了した監査ラウンドはまだありません",
+      "round_index": "ラウンド {{count}}",
+      "required_changes": "必要な変更",
+      "evidence": "証跡",
+      "evidence_stale": "古い",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "このセッショングループでは Auto Deliver がすでに実行中です。",
+        "manual_team_busy": "手動 Team 実行がこのセッショングループを使用中です。",
+        "unsupported_runtime": "Auto Deliver には transport ベースのコーディングセッションが必要です。",
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "ラウンド数が許可範囲外です。",
+        "daemon_offline": "Daemon がオフラインです。再接続後にもう一度試してください。",
+        "launch_timeout": "自動デリバリーの起動がタイムアウトしました。もう一度試してください。",
+        "stop_timeout": "自動デリバリーの停止がタイムアウトしました。もう一度試してください。",
+        "custom_combo_unsupported": "自動デリバリーはまだカスタム Team コンボに対応していません。",
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "Auto Deliver の続行がタイムアウトしました。もう一度試してください。"
+      },
+      "preset": {
+        "fast": "高速",
+        "standard": "標準",
+        "strict": "厳格",
+        "deep": "深い"
+      },
+      "status": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementing",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
+        "stopping": "Stopping",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      },
+      "ask": {
+        "header": "OpenSpec Auto Deliver",
+        "needs_human_question": "Auto Deliver には人の対応が必要です: {{reason}} このセッションで次にどうしますか？",
+        "review_continue": "失敗を確認して手動で続行",
+        "review_continue_desc": "停止した実行を調べ、問題を修正し、結果を報告するよう指示します。",
+        "stop_summarize": "ここで停止して現在の状態を要約",
+        "stop_summarize_desc": "進行中の作業を止め、短い引き継ぎを出すよう依頼します。"
+      },
+      "reason": {
+        "auto_deliver_active": "このセッションでは Auto Deliver がすでに実行中です。",
+        "audit_p2p_failed": "Team/P2P 監査実行は結果を生成する前に失敗しました。",
+        "missing_authoritative_json": "監査が最終の権威 JSON 結果を出力しませんでした。",
+        "invalid_authoritative_json": "最終の権威 JSON 結果が無効です。",
+        "audit_metadata_mismatch": "監査結果のメタデータがこの Auto Deliver 実行と一致しません。",
+        "invalid_authoritative_result_path": "権威結果ファイルのパスが許可された discussion ディレクトリ外にあります。",
+        "invalid_audit_verdict": "監査判定ペイロードが無効です。",
+        "audit_blocked": "監査がブロック結果を報告しました。スコアを確認し、Auto Deliver を再実行するか判断してください。",
+        "tasks_unreadable": "tasks.md を読み取れませんでした。",
+        "tasks_missing_checkboxes": "tasks.md に検証対象のチェックボックスがありません。",
+        "implementation_audit_required": "完了前に実装監査が必要です。",
+        "implementation_prompt_limit_reached": "実装プロンプト上限に達しました。",
+        "max_elapsed_time_reached": "Auto Deliver の制限時間に達しました。",
+        "out_of_band_target_session_input": "Auto Deliver 中に実装セッションへ手動入力が送信されました。",
+        "spec_audit_rework_reported": "仕様監査が追加対応を報告しました。スコアを確認し、Auto Deliver を再実行するか判断してください。",
+        "implementation_audit_rework_reported": "実装監査が追加対応を報告しました。スコアを確認し、Auto Deliver を再実行するか判断してください。",
+        "spec_audit_rework_rounds_exhausted": "仕様監査修復ラウンドを使い切りました。",
+        "implementation_audit_rework_rounds_exhausted": "実装監査修復ラウンドを使い切りました。",
+        "audit_pass_with_unchecked_tasks": "tasks.md に未完了タスクが残ったまま監査が PASS しました。",
+        "audit_pass_with_required_changes": "必要な変更が残ったまま監査が PASS しました。",
+        "audit_pass_without_scores": "完全なモジュールスコアなしで監査が PASS しました。",
+        "audit_pass_with_changed_files_without_repairs": "ファイル変更後、修復サマリーなしで監査が PASS しました。",
+        "audit_pass_with_uncovered_changes": "監査修復サマリーがすべての変更ファイルをカバーしていません。",
+        "quality_gate_low_score": "A quality gate paused for low module score: {{modules}}. Auto Deliver will run an implementation repair prompt, then audit and score again.",
+        "final_audit_passed": "最終監査に合格しました。",
+        "final_audit_rework_scored": "最終監査が完了し、追加作業のスコアが記録されました。モジュールスコアを確認して Auto Deliver を再実行するか判断してください。",
+        "final_audit_blocked_scored": "最終監査が完了し、ブロック判定のスコアが記録されました。モジュールスコアを確認して Auto Deliver を再実行するか判断してください。",
+        "auto_commit_push_failed": "自動 commit/push に失敗しました: {{detail}}",
+        "auto_commit_push_git_status_failed": "自動 commit/push のための git status を読み取れませんでした: {{detail}}",
+        "auto_commit_push_preexisting_changes": "起動前から製品ファイルに変更があったため、自動 commit/push をスキップしました: {{files}}",
+        "auto_commit_push_incomplete": "commit/push ステップ後も製品ファイルが dirty のため、人の確認が必要です: {{files}}",
+        "auto_commit_push_no_upstream": "このブランチに upstream がないため、人の確認が必要です。",
+        "auto_commit_push_not_pushed": "{{count}} 件の commit がまだ upstream より先行しているため、人の確認が必要です。",
+        "auto_commit_push_no_commit": "新しい commit が作成されなかったため、人の確認が必要です。",
+        "auto_commit_push_forbidden_paths": "ローカル計画ファイルが commit されたため、人の確認が必要です: {{files}}",
+        "auto_commit_push_unexpected_files": "commit に今回の Auto Deliver 変更外のファイルが含まれているため、人の確認が必要です: {{files}}",
+        "spec_audit_blocked": "Spec 監査がブロックされています。結果を確認して修正後に続行してください。",
+        "implementation_audit_blocked": "実装監査がブロックされています。結果を確認して修正後に続行してください。",
+        "spec_audit_rework_requires_repair": "Spec 監査で修正が必要と報告されました。Auto Deliver は次の監査修復サイクルを続行します。",
+        "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
+        "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
+        "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."
+      },
+      "lifecycle": {
+        "spec_audit_repair_started": "仕様監査修復を開始しました。",
+        "spec_audit_repair_p2p_started": "仕様監査の Team 実行を開始しました。",
+        "implementation_prompt_dispatched": "実装プロンプトを送信しました。",
+        "spec_repair_prompt_dispatched": "Spec repair prompt sent from audit findings: {{reason}}",
+        "implementation_repair_prompt_dispatched": "Implementation repair prompt sent from audit findings: {{reason}}",
+        "implementation_idle_incomplete": "実装はまだタスクを処理中です。",
+        "implementation_idle_all_checked": "すべての実装タスクがチェック済みです。",
+        "implementation_audit_repair_started": "実装監査修復を開始しました。",
+        "implementation_audit_repair_p2p_started": "実装監査の Team 実行を開始しました。",
+        "auto_commit_push_prompt_dispatched": "Commit/push プロンプトを送信しました。",
+        "post_repair_acceptance_audit_dispatched": "Final acceptance audit sent.",
+        "post_repair_result_file_repair_prompt_dispatched": "最終受け入れ結果ファイル修復プロンプトを送信しました。",
+        "authoritative_result_file_repair_prompt_dispatched": "結果ファイル修復プロンプトを送信しました。",
+        "spec_audit_passed": "仕様監査に合格しました。",
+        "spec_audit_rework_scored": "仕様監査が完了し、追加作業のスコアが記録されました。",
+        "spec_audit_blocked_scored": "仕様監査が完了し、ブロック判定のスコアが記録されました。",
+        "continue_requested": "続行が要求されました。"
+      },
+      "spec_rounds": "仕様監査ラウンド",
+      "impl_rounds": "実装監査ラウンド",
+      "team_combo": "Team コンボ",
+      "auto_commit_push": "監査通過後に自動で commit & push",
+      "auto_commit_push_help": "ユーザー設定として保存されます。監査通過後、agent に commit&push を実行させます。",
+      "continue": "続行",
+      "continuing": "続行中..."
+    },
     "propose_from_discussion_action": "直近の議論から生成",
     "propose_from_description_action": "下の説明から生成",
     "audit_implementation_prompt": "{{reference}} について、OpenSpec の成果物に照らした厳格な実装監査を実施してください。不一致、抜け漏れ、回帰リスク、境界ケースの欠落、未整備のテストをすべて洗い出し、そのうえでコード、テスト、必要な関連修正まで直してください。実装に合わせて仕様成果物も動かす必要がある場合は、同じ作業の中で {{reference}} 配下の OpenSpec ファイルも直接更新してください。レポートだけで終わらせず、実装を仕様完全準拠まで持っていってください。",
@@ -1141,7 +1483,27 @@
     "passkey_verify_wrong_account": "そのパスキーは別のアカウントに紐づいています。このアカウントに登録されたパスキーを使ってください。",
     "passkey_verify_no_passkeys": "このアカウントにはパスキーが登録されていません。",
     "native_status_verifying_passkey": "パスキーを確認中…",
-    "native_status_saving_password": "パスワードログインを保存中…"
+    "native_status_saving_password": "パスワードログインを保存中…",
+    "executionRouting": {
+      "title": "実行ルーティング",
+      "enableLabel": "専用の実行セッションを使用",
+      "enableHint": "有効にすると、実装/実行作業はオーケストレーターではなく、下のテンプレートセッションから複製された短命のクローンワーカーにディスパッチされます。これを保存しても設定が保存されるだけで、実行は開始されません。",
+      "templateLabel": "実行テンプレートセッション",
+      "templateNone": "未選択",
+      "templateHint": "クローンはこのセッションのプロバイダー・モデル・ツールを継承しますが、アイデンティティや履歴は決して継承しません。このプロジェクト内の適格な非メインセッションのみが表示されます。",
+      "noCandidates": "このプロジェクトにはまだ適格なテンプレートセッションがありません。テンプレートとして使うワーカーまたはサブセッションを起動してください。",
+      "reselectRequired": "ルーティングは有効ですが、このプロジェクトに有効なテンプレートが選択されていません。下で実行テンプレートセッションを選択してください。",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "容量上限に達しています",
+        "template_ineligible": "テンプレートとして使用できません",
+        "clone_of_clone_forbidden": "すでに実行クローンです",
+        "worker_clone_forbidden": "ワーカーはテンプレートにできません",
+        "cron_clone_forbidden": "スケジュールされたセッションはテンプレートにできません",
+        "target_not_found": "セッションが見つかりません",
+        "destroy_forbidden": "許可されていません"
+      }
+    }
   },
   "admin": {
     "title": "管理パネル",
@@ -1293,6 +1655,7 @@
     "restore_quick_closed": "直前に閉じたサブセッションウィンドウを復元",
     "quick_close_unavailable": "先にサブセッションウィンドウを開いてください",
     "p2p_discussions": "Team ディスカッション",
+    "auto_deliver": "Auto Deliver",
     "p2p_compact_show": "コンパクトな Team バーを表示",
     "p2p_compact_hide": "Team バーをコンパクト化",
     "p2p_compact_expand": "詳細な Team バーを表示",

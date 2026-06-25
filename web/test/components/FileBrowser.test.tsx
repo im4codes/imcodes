@@ -55,6 +55,13 @@ vi.mock('react-i18next', () => {
     'file_browser.mkdir_failed': 'Failed to create folder',
     'file_browser.create_file_failed': 'Failed to create file',
     'file_browser.file_exists': 'File already exists',
+    'file_browser.rename_prompt': 'Rename file',
+    'file_browser.rename_failed': 'Failed to rename item',
+    'file_browser.delete_confirm': 'Delete this item?',
+    'file_browser.delete_failed': 'Failed to delete item',
+    'file_browser.invalid_name': 'Invalid name',
+    'common.rename': 'Rename',
+    'common.delete': 'Delete',
     'fileBrowser.copyPath': 'Copy path',
     'fileBrowser.copied': 'Copied!',
     'common.cancel': 'Cancel',
@@ -80,9 +87,11 @@ function makeWsFactory() {
   let lastRequestId = 'mock-req-id';
   let lastSentPath = '';
   let lastSentIncludeFiles = false;
-  const fsListDir = vi.fn((path: string, includeFiles = false) => {
+  let lastSentIncludeMetadata = false;
+  const fsListDir = vi.fn((path: string, includeFiles = false, includeMetadata = false) => {
     lastSentPath = path;
     lastSentIncludeFiles = includeFiles;
+    lastSentIncludeMetadata = includeMetadata;
     return lastRequestId;
   });
   const fsMkdir = vi.fn((path: string) => {
@@ -95,6 +104,16 @@ function makeWsFactory() {
     lastRequestId = 'mock-write-id';
     return lastRequestId;
   });
+  const fsRename = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-rename-id';
+    return lastRequestId;
+  });
+  const fsDelete = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-delete-id';
+    return lastRequestId;
+  });
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
@@ -104,6 +123,8 @@ function makeWsFactory() {
     fsListDir,
     fsMkdir,
     fsWriteFile,
+    fsRename,
+    fsDelete,
     fsReadFile: vi.fn(() => 'mock-read-id'),
     fsGitStatus: vi.fn(() => 'mock-git-status-id'),
     fsGitDiff: vi.fn(() => 'mock-git-diff-id'),
@@ -134,7 +155,7 @@ function makeWsFactory() {
     for (const messageHandler of messageHandlers) messageHandler(msg);
   };
 
-  return { ws, fsListDir, fsMkdir, fsWriteFile, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, fsWriteFile, fsRename, fsDelete, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles, getIncludeMetadata: () => lastSentIncludeMetadata };
 }
 
 describe('FileBrowser', () => {
@@ -176,6 +197,14 @@ describe('FileBrowser', () => {
   });
 
   // ── Layout ─────────────────────────────────────────────────────────────
+
+
+  it('requests lightweight directory listings even when hidden files are visible by default', () => {
+    const { ws, fsListDir } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
+  });
 
   it('renders modal overlay in modal layout', () => {
     const { ws } = makeWsFactory();
@@ -279,7 +308,7 @@ describe('FileBrowser', () => {
     render(
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, true);
+    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
   });
 
   it('does NOT include files for dir-only mode', () => {
@@ -300,7 +329,7 @@ describe('FileBrowser', () => {
       <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />,
     );
 
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
     expect(getByTitle('Hidden').querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
     expect(getByTitle('New file').querySelector('.fb-create-icon-file')).not.toBeNull();
     expect(getByTitle('New folder').querySelector('.fb-create-icon-folder')).not.toBeNull();
@@ -346,7 +375,7 @@ describe('FileBrowser', () => {
 
     expect(getByText('projects')).toBeDefined();
     expect(getByText('documents')).toBeDefined();
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, true);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', false, false);
   });
 
   it('keeps the initial list request lightweight even when downloads are enabled', () => {
@@ -362,7 +391,7 @@ describe('FileBrowser', () => {
       />,
     );
 
-    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, true);
+    expect(fsListDir).toHaveBeenCalledWith('/home/user', true, false);
   });
 
   it('uses entry.path from a Windows drive root listing', async () => {
@@ -525,7 +554,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.mkdir_response', requestId: 'mock-mkdir-id', path: '/home/user/newdir', resolvedPath: '/home/user/newdir', status: 'ok' } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, true);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
     expect(onDirectoryCreated).toHaveBeenCalledWith('/home/user/newdir');
   });
 
@@ -556,7 +585,7 @@ describe('FileBrowser', () => {
       sendMsg({ type: 'fs.write_response', requestId: 'mock-write-id', path: '/home/user/new-file.ts', resolvedPath: '/home/user/new-file.ts', status: 'ok', mtime: 2000 } as any);
     });
 
-    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, true);
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', true, false);
     expect(fsReadFile).toHaveBeenCalledWith('/home/user/new-file.ts');
   });
 
@@ -674,7 +703,7 @@ describe('FileBrowser', () => {
     });
 
     expect(factory.fsListDir.mock.calls.length).toBe(callsBefore + 1);
-    expect(factory.fsListDir).toHaveBeenLastCalledWith(longSegmentPath, true, true);
+    expect(factory.fsListDir).toHaveBeenLastCalledWith(longSegmentPath, true, false);
   });
 
   it('copies the current directory path from the footer next to Select', async () => {
@@ -774,6 +803,142 @@ describe('FileBrowser', () => {
       });
     });
     expect(document.querySelector('.fb-node-git-badge')).not.toBeNull();
+  });
+
+  it('renders gitignored files as muted ignored nodes', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+    await act(async () => { respond([{ name: 'cache.log', isDir: false }], '/home/user'); });
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/cache.log', code: '!!' }],
+      });
+    });
+
+    const row = screen.getByText('cache.log').closest('.fb-node');
+    expect(row?.classList.contains('git-ignored')).toBe(true);
+    expect(document.querySelector('.git-badge-ignored')?.textContent).toBe('I');
+  });
+
+  it('renames a file from the right-click menu', async () => {
+    const { ws, respond, fsRename } = makeWsFactory();
+    const originalPrompt = window.prompt;
+    window.prompt = vi.fn(() => 'renamed.ts');
+    try {
+      render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Rename'));
+
+      expect(fsRename).toHaveBeenCalledWith('/home/user/foo.ts', '/home/user/renamed.ts');
+    } finally {
+      window.prompt = originalPrompt;
+    }
+  });
+
+  it('passes the owning session when renaming from the right-click menu', async () => {
+    const { ws, respond, fsRename } = makeWsFactory();
+    const originalPrompt = window.prompt;
+    window.prompt = vi.fn(() => 'renamed.ts');
+    try {
+      render(
+        <FileBrowser
+          ws={ws}
+          mode="file-single"
+          layout="panel"
+          initialPath="/home/user"
+          sessionName="deck_proj_brain"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Rename'));
+
+      expect(fsRename).toHaveBeenCalledWith('/home/user/foo.ts', '/home/user/renamed.ts', 'deck_proj_brain');
+    } finally {
+      window.prompt = originalPrompt;
+    }
+  });
+
+  it('closes the right-click menu when clicking outside it', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+    const row = screen.getByText('foo.ts').closest('.fb-node');
+    expect(row).not.toBeNull();
+    fireEvent.contextMenu(row!);
+    expect(screen.getByText('Rename')).toBeTruthy();
+
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByText('Rename')).toBeNull();
+  });
+
+  it('does not delete from the right-click menu until the confirmation is accepted', async () => {
+    const { ws, respond, fsDelete } = makeWsFactory();
+    const originalConfirm = window.confirm;
+    window.confirm = vi.fn(() => false);
+    try {
+      render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user" onConfirm={vi.fn()} />);
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Delete'));
+
+      expect(window.confirm).toHaveBeenCalled();
+      expect(fsDelete).not.toHaveBeenCalled();
+
+      window.confirm = vi.fn(() => true);
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Delete'));
+
+      expect(fsDelete).toHaveBeenCalledWith('/home/user/foo.ts');
+    } finally {
+      window.confirm = originalConfirm;
+    }
+  });
+
+  it('passes the owning session when deleting from the right-click menu', async () => {
+    const { ws, respond, fsDelete } = makeWsFactory();
+    const originalConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    try {
+      render(
+        <FileBrowser
+          ws={ws}
+          mode="file-single"
+          layout="panel"
+          initialPath="/home/user"
+          sessionName="deck_proj_brain"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+      const row = screen.getByText('foo.ts').closest('.fb-node');
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByText('Delete'));
+
+      expect(fsDelete).toHaveBeenCalledWith('/home/user/foo.ts', 'deck_proj_brain');
+    } finally {
+      window.confirm = originalConfirm;
+    }
   });
 
   it('requests stats only for shared changes queries, not tree git badges', async () => {
@@ -2053,6 +2218,40 @@ describe('getParentDir', () => {
 });
 
 describe('FileBrowser — file-manager preview/folder sync', () => {
+  it('previewing a file already present in the current tree does not collapse sibling branches', async () => {
+    localStorage.setItem(
+      'rcc_fb_snapshot_v1:local:files:hidden:/home/user',
+      JSON.stringify({
+        savedAt: Date.now(),
+        currentLabel: '/home/user',
+        rootChildren: [
+          {
+            id: '/home/user/sub',
+            name: 'sub',
+            isDir: true,
+            children: [
+              { id: '/home/user/sub/deep.ts', name: 'deep.ts', isDir: false },
+            ],
+          },
+          { id: '/home/user/docs', name: 'docs', isDir: true, children: [] },
+        ],
+      }),
+    );
+    const { ws } = makeWsFactory();
+
+    await act(async () => {
+      render(
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+          autoPreviewPath="/home/user/sub/deep.ts" onConfirm={vi.fn()} />,
+      );
+    });
+
+    await waitFor(() => expect(ws.fsReadFile).toHaveBeenCalledWith('/home/user/sub/deep.ts'));
+    expect(screen.getByText('sub')).toBeTruthy();
+    expect(screen.getAllByText('deep.ts').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('docs')).toBeTruthy();
+  });
+
   it('previewing a file re-roots the left list to the file\'s parent directory (bug A)', async () => {
     const { ws, fsListDir } = makeWsFactory();
     await act(async () => {
@@ -2062,7 +2261,7 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       );
     });
     // The left tree navigated to the previewed file's folder (its siblings).
-    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/sub', true, true));
+    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/sub', true, false));
   });
 
   it('previewing a folder opens its listing instead of "preview failed" (bug B)', async () => {
@@ -2084,7 +2283,7 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       } as unknown as ServerMessage);
     });
     // The folder's listing is opened in the left tree (navigated into it)...
-    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/somedir', true, true));
+    await waitFor(() => expect(fsListDir).toHaveBeenCalledWith('/home/user/somedir', true, false));
     // ...and no "preview failed" error is rendered.
     expect(screen.queryByText('file_browser.preview_error')).toBeNull();
   });

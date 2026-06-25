@@ -8,6 +8,7 @@ import { sha256Hex, signJwt } from '../src/security/crypto.js';
 import { COOKIE_CSRF, COOKIE_PREVIEW_ACCESS, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
 import {
   PREVIEW_ACCESS_TOKEN_QUERY_PARAM,
+  PREVIEW_ERROR,
   PREVIEW_MSG,
   PREVIEW_BINARY_FRAME,
   packPreviewBinaryFrame,
@@ -54,18 +55,32 @@ class MockDaemonWs extends EventEmitter {
 
 type ServerRow = { id: string; user_id: string; team_id: string | null; token_hash: string };
 type ApiKeyRow = { id: string; user_id: string; key_hash: string; revoked_at: number | null; grace_expires_at: number | null };
+type ServerShareRow = {
+  id: string;
+  server_id: string;
+  target_user_id: string;
+  role: 'viewer' | 'participant';
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+};
 
 function makeMemDb() {
   const servers = new Map<string, ServerRow>();
   const apiKeys = new Map<string, ApiKeyRow>();
+  const serverShares = new Map<string, ServerShareRow>();
 
   const db: Database & {
     seedServer: (row: ServerRow) => void;
     seedApiKey: (row: ApiKeyRow) => void;
+    seedServerShare: (row: ServerShareRow) => void;
     setServerOwner: (serverId: string, userId: string) => void;
   } = {
     seedServer: (row) => servers.set(row.id, row),
     seedApiKey: (row) => apiKeys.set(row.id, row),
+    seedServerShare: (row) => serverShares.set(row.id, row),
     setServerOwner: (serverId, userId) => {
       const row = servers.get(serverId);
       if (row) row.user_id = userId;
@@ -95,7 +110,30 @@ function makeMemDb() {
       }
       return null;
     },
-    query: async <T = unknown>() => [] as T[],
+    query: async <T = unknown>(sql: string, params: unknown[] = []) => {
+      const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (s.includes('from server_shares') && s.includes('target_user_id = $2')) {
+        const now = params[0] as number;
+        const targetUserId = params[1] as string;
+        return [...serverShares.values()]
+          .filter((row) => row.target_user_id === targetUserId && row.revoked_at === null && (row.expires_at === null || row.expires_at > now))
+          .map((row) => ({
+            target_kind: 'server',
+            id: row.id,
+            server_id: row.server_id,
+            session_name: null,
+            sub_session_id: null,
+            target_user_id: row.target_user_id,
+            role: row.role,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
+          })) as T[];
+      }
+      return [] as T[];
+    },
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
     close: async () => {},
@@ -185,6 +223,45 @@ describe('local web preview routes', () => {
       },
     });
     expect(closeOk.status).toBe(200);
+  });
+
+  it('denies share-only preview create and close with the direct-surface reason', async () => {
+    const ownerId = userId;
+    const shareUserId = `share-preview-${Math.random().toString(36).slice(2)}`;
+    db.seedServerShare({
+      id: 'share-preview-1',
+      server_id: serverId,
+      target_user_id: shareUserId,
+      role: 'participant',
+      created_by: ownerId,
+      created_at: Date.now() - 1_000,
+      updated_at: Date.now() - 1_000,
+      expires_at: null,
+      revoked_at: null,
+    });
+    userId = shareUserId;
+
+    const createRes = await app.request(`/api/server/${serverId}/local-web-preview`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: sessionCookie(),
+        [HEADER_CSRF]: 'csrf-token',
+      },
+      body: JSON.stringify({ port: 3000, path: '/' }),
+    });
+    expect(createRes.status).toBe(403);
+    await expect(createRes.json()).resolves.toEqual({ error: PREVIEW_ERROR.FORBIDDEN, reason: 'share-direct-surface-denied' });
+
+    const closeRes = await app.request(`/api/server/${serverId}/local-web-preview/preview-share-only`, {
+      method: 'DELETE',
+      headers: {
+        Cookie: sessionCookie(),
+        [HEADER_CSRF]: 'csrf-token',
+      },
+    });
+    expect(closeRes.status).toBe(403);
+    await expect(closeRes.json()).resolves.toEqual({ error: PREVIEW_ERROR.FORBIDDEN, reason: 'share-direct-surface-denied' });
   });
 
   it('revalidates access on every proxied request after preview creation', async () => {

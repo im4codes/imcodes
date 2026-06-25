@@ -7,14 +7,21 @@ export function shortModelLabel(model?: string | null): string | null {
     lower.includes('opus') ? 'opus'
     : lower.includes('sonnet') ? 'sonnet'
     : lower.includes('haiku') ? 'haiku'
+    : lower.includes('fable') ? 'fable'
+    : lower.includes('mythos') ? 'mythos'
     : null;
   if (claudeFamily) {
     // Surface the version: new-style `claude-opus-4-8` (digits AFTER the
     // family) or old-style `claude-3-5-sonnet` (digits BEFORE the family).
     // Capture at most major[-minor] so trailing date suffixes like
     // `-20260514` are not swallowed. `-`/`_` separators render as `.`.
-    const before = lower.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
-    const after = lower.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
+    // Strip a trailing release-date suffix first so a single-segment version
+    // like `claude-fable-5-20260609` reads as `fable-5`, not `fable-5.20260609`
+    // (multi-segment ids like opus-4-8 are already protected by the 2-segment
+    // capture, but single-segment ones would otherwise swallow the date).
+    const verSrc = lower.replace(/[-_]\d{6,8}$/, '');
+    const before = verSrc.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
+    const after = verSrc.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
     const ver = before?.[1] ?? after?.[1] ?? null;
     return ver ? `${claudeFamily}-${ver.replace(/[-_]/g, '.')}` : claudeFamily;
   }

@@ -21,6 +21,8 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
+import { SharedStateIndicator } from './SharedStateIndicator.js';
+import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
@@ -34,6 +36,8 @@ import {
   DEFAULT_SUBSESSION_ACCENT_COLOR,
   getSubSessionAccentColorMap,
 } from '../subsession-accent-colors.js';
+import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
+import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -61,6 +65,7 @@ interface CollapsedSubSessionButtonProps {
   idleFlashToken: number;
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
+  sharedState?: SharedStateSummary | null;
   inP2p: boolean;
   draggable?: boolean;
   onEntryPointerDown: (id: string, event: JSX.TargetedPointerEvent<HTMLButtonElement>) => void;
@@ -79,6 +84,7 @@ interface Props {
   maximizedIds?: ReadonlySet<string>;
   desktopLayoutCapable?: boolean;
   idleFlashTokens?: Map<string, number>;
+  sharedSubSessionStates?: ReadonlyMap<string, SharedStateSummary>;
   onOpen: (id: string) => void;
   onFocus?: (id: string) => void;
   onClose: (id: string) => void;
@@ -89,11 +95,19 @@ interface Props {
   onRestore?: (id: string) => void;
   onRestoreThenClose?: (id: string) => void;
   onRestart: (id: string) => void;
-  onNew: () => void;
+  onNew?: () => void;
+  onViewAutoDeliver?: () => void;
   onViewDiscussions?: () => void;
   onViewDiscussion?: (fileId: string) => void;
   onViewRepo?: () => void;
   onViewCron?: () => void;
+  openSpecAutoProjection?: OpenSpecAutoDeliverProjection | null;
+  openSpecAutoStopPending?: boolean;
+  openSpecAutoCompact?: boolean;
+  onOpenSpecAutoView?: () => void;
+  onOpenSpecAutoStop?: () => void;
+  onOpenSpecAutoToggleCompact?: () => void;
+  onOpenSpecAutoHide?: () => void;
 
   discussions?: DiscussionSummary[];
   /**
@@ -196,7 +210,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -235,6 +249,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
       <span class="subsession-card-icon">{abbr}</span>
       <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
       {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      <SharedStateIndicator state={sharedState} iconOnly />
       {model && <span class="subsession-card-model">{model}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
       {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
@@ -247,7 +262,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
   );
 }
 
-function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
+function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
@@ -266,12 +281,13 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, inP2p, t }:
         <span class="subcard-icon">{abbr}</span>
         <span class="subcard-label">{label}</span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+        <SharedStateIndicator state={sharedState} iconOnly />
       </div>
     </div>
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
@@ -818,6 +834,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   };
 
   const discussionButtonLabel = t('subsessionBar.p2p_discussions');
+  const autoDeliverButtonLabel = t('subsessionBar.auto_deliver');
   const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
   const cronButtonLabel = t('subsessionBar.scheduled_tasks');
 
@@ -930,17 +947,31 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             </span>
           );
         })()}
-        <button
-          class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
-          data-onboarding="new-sub-session"
-          onClick={onNew}
-          title={t('subsessionBar.new_sub_session')}
-        >
-          {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
-        </button>
+        {onNew && (
+          <button
+            class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
+            data-onboarding="new-sub-session"
+            onClick={onNew}
+            title={t('subsessionBar.new_sub_session')}
+          >
+            {desktopLayoutCapable ? t('subsessionBar.add_sub_session_short') : '+'}
+          </button>
+        )}
+        {onViewAutoDeliver && !isMobile && (
+          <button
+            class={`subcard-toolbar-btn subcard-toolbar-btn-auto${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
+            data-testid="subsession-auto-deliver-status"
+            onClick={onViewAutoDeliver}
+            title={autoDeliverButtonLabel}
+            aria-label={autoDeliverButtonLabel}
+          >
+            <span aria-hidden="true">⟲</span>
+            {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{autoDeliverButtonLabel}</span>}
+          </button>
+        )}
         {onViewDiscussions && (
           <button
-            class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
+            class={`subcard-toolbar-btn subcard-toolbar-btn-discussions${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-onboarding="discussion-history"
             data-running-discussions={totalRunningDiscussions}
             onClick={onViewDiscussions}
@@ -959,7 +990,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   )
                 : t('subsessionBar.p2p_discussions')
             }
-            style={{ marginLeft: 4, fontSize: 11, position: 'relative' }}
           >
             <span aria-hidden="true">👥</span>
             {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{discussionButtonLabel}</span>}
@@ -1058,8 +1088,22 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         </div>
       )}
 
+      {openSpecAutoProjection && openSpecAutoProjection.visibility !== 'conflict' && (
+        <div class="openspec-auto-subsession-progress">
+          <OpenSpecAutoDeliverRunBar
+            projection={openSpecAutoProjection}
+            stopPending={openSpecAutoStopPending}
+            compact={openSpecAutoCompact}
+            onView={onOpenSpecAutoView ?? onViewAutoDeliver ?? (() => {})}
+            onStop={onOpenSpecAutoStop ?? (() => {})}
+            onToggleCompact={onOpenSpecAutoToggleCompact}
+            onHide={onOpenSpecAutoHide}
+          />
+        </div>
+      )}
+
       {/* Empty state: no sub-sessions and expanded */}
-      {!collapsed && subSessions.length === 0 && discussions.length === 0 && (
+      {!collapsed && subSessions.length === 0 && discussions.length === 0 && onNew && (
         <div class="subcard-empty-state">
           {t('subsessionBar.empty_prefix')} <strong>+</strong> {t('subsessionBar.empty_suffix')}
         </div>
@@ -1114,6 +1158,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 usage={subUsages?.get(`deck_sub_${sub.id}`)}
                 detectedModel={detectedModels?.get(sub.sessionName)}
+                sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
                 inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                 draggable={desktopLayoutCapable}
                 onEntryPointerDown={handleEntryPointerDown}
@@ -1212,6 +1257,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     subSessions={allSubSessions}
                     serverId={serverId}
                     onTransportConfigSaved={onSubTransportConfigSaved}
+                    sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
                     inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                     accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                     previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
@@ -1221,6 +1267,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     sub={sub}
                     accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                     cardSize={cardSize}
+                    sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
                     inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                     t={t}
                   />

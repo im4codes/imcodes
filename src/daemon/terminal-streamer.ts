@@ -451,20 +451,31 @@ export class TerminalStreamer {
     this.requestSnapshot(sessionName);
   }
 
-  destroy(): void {
-    for (const [sessionName] of this.subscribers) {
-      void this.stopPipe(sessionName);
-      this.clearIdleTimer(sessionName);
-    }
+  async destroyAsync(): Promise<void> {
+    const sessionNames = new Set([
+      ...this.subscribers.keys(),
+      ...this.pipes.keys(),
+    ]);
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     for (const timer of this.pipeStopGraceTimers.values()) clearTimeout(timer);
+    for (const sessionName of sessionNames) {
+      this.clearIdleTimer(sessionName);
+    }
+    await Promise.all([...sessionNames].map((sessionName) => this.stopPipe(sessionName)));
     this.subscribers.clear();
     this.pipes.clear();
+    this.pipeStartLocks.clear();
     this.retryTimers.clear();
     this.pipeStopGraceTimers.clear();
     this.lastRawAt.clear();
     this.idleTimers.clear();
     this.idleState.clear();
+    this.sizeCache.clear();
+    this.frameSeqs.clear();
+  }
+
+  destroy(): void {
+    void this.destroyAsync();
   }
 
   // ── Pipe lifecycle ──────────────────────────────────────────────────────────

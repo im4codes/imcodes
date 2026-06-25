@@ -5,12 +5,20 @@
 import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { usePref } from '../hooks/usePref.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { buildExecutionTemplateLabel } from '../execution-template-label.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { AdvancedWorkflowCanvasEditor } from './AdvancedWorkflowCanvasEditor.js';
-import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
+import {
+  isP2pMemberEligibleSession,
+  sanitizeP2pSavedConfig,
+  sanitizeP2pSessionConfig,
+  type P2pSavedConfig,
+  type P2pSessionConfig,
+} from '@shared/p2p-modes.js';
 import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
 import { MAX_P2P_PARTICIPANTS } from '@shared/p2p-config-events.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '@shared/p2p-workflow-materialize.js';
@@ -43,11 +51,24 @@ import type {
   P2pContextReducerConfig,
   P2pContextReducerMode,
 } from '@shared/p2p-advanced.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 
 interface SessionRow {
   name: string;
   agentType: string;
   state: string;
+  project?: string | null;
+  role?: string | null;
+  label?: string | null;
+  ccPreset?: string | null;
+  qwenModel?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  modelDisplay?: string | null;
+  /** DAEMON-AUTHORITATIVE execution-template eligibility (optional; absent on
+   *  legacy daemons). When present it overrides client-side recomputation. */
+  executionTemplateEligible?: boolean;
+  executionTemplateIneligibleReason?: string;
 }
 
 interface SubSessionRow {
@@ -56,6 +77,16 @@ interface SubSessionRow {
   label?: string | null;
   parentSession?: string | null;
   state: string;
+  ccPresetId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  modelDisplay?: string | null;
+  qwenModel?: string | null;
+  executionCloneKind?: string | null;
+  parentRunId?: string | null;
+  /** DAEMON-AUTHORITATIVE execution-template eligibility (optional). */
+  executionTemplateEligible?: boolean;
+  executionTemplateIneligibleReason?: string;
 }
 
 /** Daemon capability snapshot view used by the panel to gate advanced launch.
@@ -105,7 +136,7 @@ interface Props {
   activeSession?: string | null;
   /** Active server ID — P2P participant names are server-local, so saved config must be too. */
   serverId?: string | null;
-  initialTab?: 'participants' | 'combos' | 'advanced';
+  initialTab?: 'participants' | 'combos' | 'advanced' | 'execution';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
   onPersistDaemonConfig?: (scopeSession: string, config: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
@@ -120,6 +151,22 @@ const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
 const DEFAULT_P2P_ROUNDS = 1;
 type AgentFlavorFilter = 'sdk' | 'cli';
+
+function isExecutionCloneCandidate(sub: Pick<SubSessionRow, 'executionCloneKind' | 'parentRunId'>): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
+
+function formatExecutionTemplateLabel(sub: SubSessionRow): string {
+  return buildExecutionTemplateLabel({
+    shortName: sub.label || sub.sessionName.split('_').pop() || sub.sessionName,
+    agentType: sub.type,
+    ccPreset: sub.ccPresetId,
+    qwenModel: sub.qwenModel,
+    requestedModel: sub.requestedModel,
+    activeModel: sub.activeModel,
+    modelDisplay: sub.modelDisplay,
+  });
+}
 
 export interface P2pWorkflowLaunchContextInput {
   sessionName?: string;
@@ -446,7 +493,7 @@ export function P2pConfigPanel({
 }: Props) {
   const { t } = useTranslation();
   const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
-  const [activeTab, setActiveTab] = useState<'participants' | 'combos' | 'advanced'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'participants' | 'combos' | 'advanced' | 'execution'>(initialTab);
   const { customCombos, saveCustomCombos } = useP2pCustomCombos();
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
 
@@ -464,13 +511,13 @@ export function P2pConfigPanel({
     }
     return activeSession;
   })();
-
   const allEligible: Array<{ key: string; shortName: string; agentType: string; flavor: AgentFlavorFilter }> = [];
   const seen = new Set<string>();
 
   for (const s of sessions) {
     if (EXCLUDED_TYPES.has(s.agentType)) continue;
     if (scopeSession && s.name !== scopeSession) continue;
+    if (!isP2pMemberEligibleSession(s.name, { scopeSession, role: s.role })) continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
     const shortName = s.name.split('_').pop() || s.name;
@@ -480,6 +527,7 @@ export function P2pConfigPanel({
   for (const s of subSessions) {
     if (EXCLUDED_TYPES.has(s.type)) continue;
     if (scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
+    if (!isP2pMemberEligibleSession(s.sessionName, { scopeSession })) continue;
     if (seen.has(s.sessionName)) continue;
     seen.add(s.sessionName);
     const shortName = s.label || s.sessionName;
@@ -487,6 +535,57 @@ export function P2pConfigPanel({
   }
 
   const visibleEligible = allEligible.filter((entry) => entry.flavor === agentFlavorFilter);
+
+  // ── Dedicated execution routing (clone) preference ──────────────────────
+  // GLOBAL enabled flag + per-project template session. Reading/saving here
+  // only persists the preference; it NEVER dispatches an execution.
+  const executionRouting = useExecutionRouting(serverId ?? null);
+  // Eligibility is DAEMON-AUTHORITATIVE: the daemon computes
+  // `executionTemplateEligible` (+ an ineligibility reason code) per session and
+  // the UI renders that rather than recomputing eligibility client-side.
+  //
+  // Candidate population:
+  //   - Sub-sessions in scope are the real templates → daemon flag applied; a
+  //     missing flag (legacy daemon that doesn't project it onto sub-sessions)
+  //     falls back to eligible so an old daemon doesn't hide every candidate.
+  //     Execution clones are structural non-templates and are never listed.
+  //   - MAIN sessions (brain/orchestrator/worker `wN`) are structural
+  //     non-templates for this setting and are hidden rather than shown disabled.
+  // shell/script types and the current calling session are always excluded.
+  const executionTemplateScan = useMemo(() => {
+    const eligible: Array<{ key: string; label: string }> = [];
+    const ineligible: Array<{ key: string; label: string; reason?: string }> = [];
+    const seenExec = new Set<string>();
+    const pushEligible = (key: string, label: string) => {
+      if (seenExec.has(key)) return;
+      seenExec.add(key);
+      eligible.push({ key, label });
+    };
+    const pushIneligible = (key: string, label: string, reason?: string) => {
+      if (seenExec.has(key)) return;
+      seenExec.add(key);
+      ineligible.push({ key, label, reason });
+    };
+    // Main sessions are never execution-template sessions for this setting.
+    // Sub-sessions in scope: the primary template source.
+    for (const s of subSessions) {
+      if (EXCLUDED_TYPES.has(s.type)) continue;
+      if (scopeSession && s.parentSession !== scopeSession) continue;
+      if (activeSession && s.sessionName === activeSession) continue;
+      if (isExecutionCloneCandidate(s)) continue;
+      const optionLabel = formatExecutionTemplateLabel(s);
+      if (s.executionTemplateEligible === false) pushIneligible(s.sessionName, optionLabel, s.executionTemplateIneligibleReason);
+      else pushEligible(s.sessionName, optionLabel); // true OR legacy-undefined
+    }
+    return { eligible, ineligible };
+  }, [subSessions, scopeSession, activeSession]);
+  const executionTemplateCandidates = executionTemplateScan.eligible;
+  const executionTemplateIneligible = executionTemplateScan.ineligible;
+  const selectedTemplate = executionRouting.templateSessionName;
+  // "reselect required" when routing is enabled but the saved template is
+  // missing or no longer a valid (daemon-eligible) candidate in the project.
+  const templateReselectRequired = executionRouting.enabled
+    && (!selectedTemplate || !executionTemplateCandidates.some((c) => c.key === selectedTemplate));
 
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
@@ -705,20 +804,21 @@ export function P2pConfigPanel({
     const parsed = p2pConfigPref.value;
     if (!parsed) return;
     if (formDirtyRef.current && seededConfigKeyRef.current === configKey) return;
+    const sanitized = sanitizeP2pSavedConfig(parsed, { scopeSession });
     seededConfigKeyRef.current = configKey;
     formDirtyRef.current = false;
-    setSessionCfg(parsed.sessions ?? {});
-    setRounds(parsed.rounds ?? DEFAULT_P2P_ROUNDS);
-    setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
-    setExtraPrompt(parsed.extraPrompt ?? '');
-    setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
-    setAdvancedRounds(parsed.advancedRounds);
-    setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
-    setContextReducerMode(parsed.contextReducer?.mode ?? '');
-    setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
-    setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
-    setAllowedExecutables(Array.isArray(parsed.allowedExecutables)
-      ? parsed.allowedExecutables.filter((entry): entry is string => typeof entry === 'string')
+    setSessionCfg(sanitized.sessions ?? {});
+    setRounds(sanitized.rounds ?? DEFAULT_P2P_ROUNDS);
+    setHopTimeoutMinutes(sanitized.hopTimeoutMinutes ?? 8);
+    setExtraPrompt(sanitized.extraPrompt ?? '');
+    setAdvancedPresetKey(sanitized.advancedPresetKey ?? '');
+    setAdvancedRounds(sanitized.advancedRounds);
+    setAdvancedRunTimeoutMinutes(sanitized.advancedRunTimeoutMinutes ?? 30);
+    setContextReducerMode(sanitized.contextReducer?.mode ?? '');
+    setContextReducerSession(sanitized.contextReducer?.sessionName ?? '');
+    setContextReducerTemplate(sanitized.contextReducer?.templateSession ?? '');
+    setAllowedExecutables(Array.isArray(sanitized.allowedExecutables)
+      ? sanitized.allowedExecutables.filter((entry): entry is string => typeof entry === 'string')
       : []);
     setAllowedExecutableDraft('');
     // R3 v2 PR-ι — Lift any legacy single `workflowDraft` into the
@@ -726,7 +826,7 @@ export function P2pConfigPanel({
     // idempotent + non-destructive, so users with mixed-shape configs
     // (saved by older clients still on the rolling-deploy window) load
     // cleanly into the library editor.
-    const migrated = migrateLegacyWorkflowDraft(parsed);
+    const migrated = migrateLegacyWorkflowDraft(sanitized);
     const materializedEnvelope = buildP2pWorkflowLaunchEnvelopeFromConfig(migrated, {
       sessionName: scopeSession ?? undefined,
     });
@@ -736,11 +836,11 @@ export function P2pConfigPanel({
     );
     setWorkflowLibrary(initialLibrary);
     const desiredActive = migrated.activeWorkflowId
-      ?? initialLibrary.find((entry) => entry.id === parsed.activeWorkflowId)?.id
+      ?? initialLibrary.find((entry) => entry.id === sanitized.activeWorkflowId)?.id
       ?? initialLibrary[0]?.id;
     setActiveWorkflowId(desiredActive);
-    setWorkflowLaunchEnvelope(parsed.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
-    const needsMigration = hasOldAdvancedConfig(parsed) && !parsed.workflowDraft && !parsed.workflowLaunchEnvelope && initialLibrary.length === 0;
+    setWorkflowLaunchEnvelope(sanitized.workflowLaunchEnvelope ?? materializedEnvelope ?? undefined);
+    const needsMigration = hasOldAdvancedConfig(sanitized) && !sanitized.workflowDraft && !sanitized.workflowLaunchEnvelope && initialLibrary.length === 0;
     setAdvancedMigrationNeeded(needsMigration);
   }, [configKey, p2pConfigPref.value, scopeSession]);
 
@@ -798,6 +898,7 @@ export function P2pConfigPanel({
     markFormDirty();
     const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
+      const sanitizedPrev = sanitizeP2pSessionConfig(prev, { scopeSession });
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       const willEnable = !cur.enabled;
       const willCountAsParticipant = willEnable && cur.mode !== 'skip';
@@ -807,7 +908,7 @@ export function P2pConfigPanel({
         // sessions: old saved configs can contain stale/closed/other-scope
         // entries, and those are pruned on save, so they must not block a
         // user from selecting the visible in-scope participants.
-        const currentlyEnabledCount = Object.entries(prev).filter(
+        const currentlyEnabledCount = Object.entries(sanitizedPrev).filter(
           ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
@@ -820,7 +921,7 @@ export function P2pConfigPanel({
         }
         setSaveError(null);
       }
-      return { ...prev, [key]: { ...cur, enabled: willEnable } };
+      return { ...sanitizedPrev, [key]: { ...cur, enabled: willEnable } };
     });
   };
 
@@ -828,11 +929,12 @@ export function P2pConfigPanel({
     markFormDirty();
     const eligibleKeys = new Set(allEligible.map((entry) => entry.key));
     setSessionCfg((prev) => {
+      const sanitizedPrev = sanitizeP2pSessionConfig(prev, { scopeSession });
       const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       const willCountAsParticipant = cur.enabled && mode !== 'skip';
       const didCountAsParticipant = cur.enabled && cur.mode !== 'skip';
       if (willCountAsParticipant && !didCountAsParticipant) {
-        const currentlyEnabledCount = Object.entries(prev).filter(
+        const currentlyEnabledCount = Object.entries(sanitizedPrev).filter(
           ([k, e]) => k !== key && eligibleKeys.has(k) && e?.enabled === true && e.mode !== 'skip',
         ).length;
         if (currentlyEnabledCount >= MAX_P2P_PARTICIPANTS) {
@@ -845,7 +947,7 @@ export function P2pConfigPanel({
         }
       }
       setSaveError(null);
-      return { ...prev, [key]: { ...cur, mode } };
+      return { ...sanitizedPrev, [key]: { ...cur, mode } };
     });
   };
 
@@ -1049,6 +1151,14 @@ export function P2pConfigPanel({
               <span class="p2p-alpha-badge">{t('p2p.alpha_badge', 'Alpha')}</span>
             </span>
           </button>
+          <button
+            type="button"
+            style={tabStyle(activeTab === 'execution')}
+            onClick={() => setActiveTab('execution')}
+            data-testid="p2p-tab-execution"
+          >
+            {t('settings.executionRouting.title')}
+          </button>
         </div>
 
         {/* Body */}
@@ -1217,6 +1327,95 @@ export function P2pConfigPanel({
                     customCombos={customCombos}
                     onCustomCombosChange={saveCustomCombos}
                   />
+                </div>
+              </>
+            ) : activeTab === 'execution' ? (
+              /*
+               * Dedicated execution routing (clone) tab. Toggling/selecting
+               * here only persists the preference — it never dispatches an
+               * execution. The template select lists only eligible non-main
+               * sessions of the current project (the current session is
+               * excluded; shell/script and brain/host are already filtered).
+               */
+              <>
+                <div style={sectionCardStyle} data-testid="exec-routing-section">
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>
+                    {t('settings.executionRouting.title')}
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      style={checkboxStyle}
+                      checked={executionRouting.enabled}
+                      data-testid="exec-routing-enabled"
+                      onChange={(e) => {
+                        void executionRouting.setEnabled((e.target as HTMLInputElement).checked);
+                      }}
+                    />
+                    <span style={{ fontSize: 13, color: '#e2e8f0', fontWeight: 600 }}>
+                      {t('settings.executionRouting.enableLabel')}
+                    </span>
+                  </label>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 6, lineHeight: 1.5 }}>
+                    {t('settings.executionRouting.enableHint')}
+                  </div>
+
+                  <div style={{ ...sectionLabelStyle, marginBottom: 6 }}>
+                    {t('settings.executionRouting.templateLabel')}
+                  </div>
+                  <select
+                    style={{ ...selectStyle, width: '100%', minWidth: 0, fontSize: 13, padding: '6px 8px' }}
+                    value={selectedTemplate ?? ''}
+                    disabled={!executionRouting.enabled}
+                    data-testid="exec-routing-template"
+                    onChange={(ev) => {
+                      const v = (ev.target as HTMLSelectElement).value;
+                      void executionRouting.setTemplateSessionName(v || null);
+                    }}
+                  >
+                    <option value="">{t('settings.executionRouting.templateNone')}</option>
+                    {executionTemplateCandidates.map((c) => (
+                      <option key={c.key} value={c.key}>
+                        {c.label}
+                      </option>
+                    ))}
+                    {/* Daemon-authoritative ineligible sessions are shown
+                        (disabled) with their reason so the user understands
+                        why a session is not selectable, instead of it silently
+                        vanishing. The reason is an EXECUTION_CLONE error code;
+                        localize it, falling back to the raw code. */}
+                    {executionTemplateIneligible.map((c) => {
+                      const reasonText = c.reason
+                        ? t(`settings.executionRouting.ineligibleReason.${c.reason}`, c.reason)
+                        : '';
+                      return (
+                        <option key={c.key} value={c.key} disabled>
+                          {reasonText
+	                            ? t('settings.executionRouting.ineligibleOption', '{{name}} — {{reason}}', {
+	                                name: c.label,
+	                                reason: reasonText,
+	                              })
+	                            : c.label}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {executionTemplateCandidates.length === 0 && (
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
+                      {t('settings.executionRouting.noCandidates')}
+                    </div>
+                  )}
+                  {templateReselectRequired && (
+                    <div
+                      style={{ fontSize: 11, color: '#fbbf24', marginTop: 6, lineHeight: 1.5 }}
+                      data-testid="exec-routing-reselect"
+                    >
+                      {t('settings.executionRouting.reselectRequired')}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 6, lineHeight: 1.5 }}>
+                    {t('settings.executionRouting.templateHint')}
+                  </div>
                 </div>
               </>
             ) : (

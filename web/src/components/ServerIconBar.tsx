@@ -1,5 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { isServerOnline } from '../server-selection.js';
+import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import { SharedStateIndicator } from './SharedStateIndicator.js';
 
 interface ServerInfo {
   id: string;
@@ -21,13 +23,14 @@ interface Props {
   onHome?: () => void;
   isAdmin?: boolean;
   onAdmin?: () => void;
+  sharedServerStates?: ReadonlyMap<string, SharedStateSummary>;
 }
 
 function getInitial(name: string): string {
   return (name || '?').charAt(0).toUpperCase();
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin }: Props) {
+export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin, sharedServerStates }: Props) {
   const { t } = useTranslation();
 
   return (
@@ -45,6 +48,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
       {servers.map((server) => {
         const isActive = server.id === activeServerId;
         const isOnline = isServerOnline(server);
+        const sharedState = sharedServerStates?.get(server.id) ?? null;
         return (
           <button
             key={server.id}
@@ -56,6 +60,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
             onContextMenu={(e: MouseEvent) => { e.preventDefault(); onServerContextMenu?.(server, e.clientX, e.clientY); }}
           >
             <span class="server-icon-letter">{getInitial(server.name)}</span>
+            <SharedStateIndicator state={sharedState} iconOnly variant="shared-out" />
             <span
               class="server-icon-dot"
               style={{ background: isOnline ? '#4ade80' : '#475569' }}

@@ -6,6 +6,7 @@ import { buildContextDiagnostics } from './context-diagnostics.js';
 import { getSharedContextCutoverFlags, type SharedContextCutoverFlags } from '../context/shared-context-flags.js';
 import type { ProviderError } from './transport-provider.js';
 import { incrementCounter } from '../util/metrics.js';
+import type { ActivityGeneration } from '../../shared/session-activity-types.js';
 import type {
   CompiledAgentContextArtifact,
   ContextAuthorityDecision,
@@ -57,6 +58,8 @@ export interface TransportRuntimeAssemblyInput {
    * 300-char cap. See p2p audit 37bfbb85-430 N-A.
    */
   sessionIdentity?: { sessionName: string; label?: string | null };
+  /** Runtime-minted lifecycle generation for provider active-work attribution. */
+  activityGeneration?: ActivityGeneration;
 }
 
 export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
@@ -227,6 +230,7 @@ export function buildProviderContextPayload(
   return {
     userMessage: input.userMessage,
     assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
+    ...(input.activityGeneration ? { activityGeneration: input.activityGeneration } : {}),
     sessionSystemText: compiledContext.sessionSystemText,
     turnSystemText: compiledContext.turnSystemText,
     systemText: compiledContext.systemText,

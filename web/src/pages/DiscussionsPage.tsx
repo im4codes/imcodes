@@ -4,7 +4,20 @@ import type { WsClient, ServerMessage, P2pWorkflowRequestScope } from '../ws-cli
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 import { FilePreviewPane } from '../components/FilePreviewPane.js';
+import {
+  OpenSpecAutoDeliverDetailsPanel,
+} from '../components/OpenSpecAutoDeliver.js';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
+import {
+  OPENSPEC_AUTO_DELIVER_MSG,
+  type OpenSpecAutoDeliverListRow,
+  type OpenSpecAutoDeliverProjection,
+} from '../openspec-auto-deliver.js';
+import {
+  normalizeOpenSpecAutoDeliverListRow,
+  normalizeOpenSpecAutoDeliverProjection,
+  openSpecAutoDeliverRowFromProjection,
+} from '../openspec-auto-deliver-normalize.js';
 
 interface P2pDiscussion {
   id: string;
@@ -18,6 +31,7 @@ interface Props {
   ws: WsClient | null;
   onBack?: () => void;
   initialSelectedId?: string | null;
+  initialTab?: 'auto' | 'team';
   requestScope?: P2pWorkflowRequestScope;
   /** Live discussion state from app (progress, nodes). */
   liveDiscussions?: P2pProgressDiscussion[];
@@ -26,11 +40,15 @@ interface Props {
 
 // Global marked config (breaks, gfm, target=_blank) is set in main.tsx
 
-export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
+export function DiscussionsPage({ ws, initialSelectedId, initialTab = 'team', requestScope, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const [progressHidden, setProgressHidden] = useState(false);
+  const [listTab, setListTab] = useState<'auto' | 'team'>(initialTab);
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
+  const [selectedAutoRunId, setSelectedAutoRunId] = useState<string | null>(null);
+  const [autoDeliverRows, setAutoDeliverRows] = useState<OpenSpecAutoDeliverListRow[]>([]);
+  const [autoDeliverProjections, setAutoDeliverProjections] = useState<Record<string, OpenSpecAutoDeliverProjection>>({});
   const [content, setContent] = useState<string | null>(null);
   const [autoFollow, setAutoFollow] = useState(true);
   const [copyMenuId, setCopyMenuId] = useState<string | null>(null);
@@ -43,6 +61,14 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollAnimFrameRef = useRef<number | null>(null);
   const detailScrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setListTab(initialTab);
+    if (initialTab === 'auto') {
+      setSelected(null);
+      setContent(null);
+    }
+  }, [initialTab]);
 
   const stopDetailScrollAnimation = useCallback(() => {
     if (scrollAnimFrameRef.current !== null) {
@@ -127,6 +153,87 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
 
   useEffect(() => { loadList(); }, [loadList]);
 
+  const loadAutoDeliverRows = useCallback(() => {
+    if (!ws) return;
+    ws.send({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LIST_REQUEST,
+      requestId: `openspec-auto-list-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    });
+  }, [ws]);
+
+  useEffect(() => { loadAutoDeliverRows(); }, [loadAutoDeliverRows]);
+
+  const upsertAutoDeliverRow = useCallback((row: OpenSpecAutoDeliverListRow) => {
+    if (!row.runId) return;
+    setAutoDeliverRows((current) => {
+      const existing = current.find((entry) => entry.runId === row.runId);
+      if (existing && existing.projectionVersion > row.projectionVersion) return current;
+      const next = [row, ...current.filter((entry) => entry.runId !== row.runId)];
+      return next
+        .sort((a, b) => b.projectionVersion - a.projectionVersion)
+        .slice(0, 20);
+    });
+  }, []);
+
+  const upsertAutoDeliverProjection = useCallback((projection: OpenSpecAutoDeliverProjection) => {
+    if (!projection.runId) return;
+    setAutoDeliverProjections((current) => {
+      const existing = current[projection.runId];
+      if (existing && existing.projectionVersion > projection.projectionVersion) return current;
+      return { ...current, [projection.runId]: projection };
+    });
+  }, []);
+
+  const projectionFromAutoDeliverRow = useCallback((row: OpenSpecAutoDeliverListRow): OpenSpecAutoDeliverProjection => {
+    if (row.visibility === 'conflict') {
+      const reason = row.reason ?? 'auto_deliver_active';
+      return {
+        visibility: 'conflict',
+        projectionVersion: row.projectionVersion,
+        runId: row.runId,
+        owningMainSessionName: row.owningMainSessionName,
+        status: row.status,
+        stage: row.stage,
+        busy: true,
+        reason,
+        conflictReason: reason,
+        canStop: false,
+      };
+    }
+    return {
+      visibility: 'full',
+      projectionVersion: row.projectionVersion,
+      generation: row.generation ?? 0,
+      runId: row.runId,
+      changeName: row.changeName ?? row.runId,
+      presetId: row.presetId,
+      status: row.status,
+      stage: row.stage,
+      owningMainSessionName: row.owningMainSessionName,
+      launchedFromSessionName: row.launchedFromSessionName,
+      targetImplementationSessionName: row.targetImplementationSessionName,
+      elapsedMs: row.elapsedMs,
+      selectedTeamComboId: row.selectedTeamComboId ?? null,
+      recentFinding: row.recentFinding ?? null,
+      terminalReason: row.terminalReason ?? null,
+      terminal: row.viewMode === 'compactRecovery',
+      canStop: row.viewMode !== 'compactRecovery',
+    };
+  }, []);
+
+  const requestAutoDeliverDetails = useCallback((row: OpenSpecAutoDeliverListRow | null | undefined) => {
+    if (!ws || !row || row.visibility === 'conflict') return;
+    const sessionName = row.targetImplementationSessionName
+      ?? row.launchedFromSessionName
+      ?? row.owningMainSessionName;
+    if (!sessionName) return;
+    ws.send({
+      type: OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST,
+      requestId: `openspec-auto-detail-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      sessionName,
+    });
+  }, [ws]);
+
   // Audit fix (spam-fetch loop) — even though `loadList` itself is
   // stable when `requestScope` has a stable identity, the
   // `RUN_UPDATE` handler below calls `loadList()` on every P2P run
@@ -147,6 +254,8 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
   }, []);
 
   const selectDiscussion = useCallback((id: string) => {
+    setListTab('team');
+    setSelectedAutoRunId(null);
     setSelected(id);
     setContent(null);
     setAutoFollow(true);
@@ -154,6 +263,14 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
     pendingReadIdRef.current = id;
     pendingReadRequestIdRef.current = sendReadDiscussion(id);
   }, [sendReadDiscussion]);
+
+  const selectAutoDeliverRun = useCallback((runId: string) => {
+    setListTab('auto');
+    setSelected(null);
+    setContent(null);
+    setSelectedAutoRunId(runId);
+    requestAutoDeliverDetails(autoDeliverRows.find((row) => row.runId === runId));
+  }, [autoDeliverRows, requestAutoDeliverDetails]);
 
   const markCopied = useCallback((id: string) => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -226,43 +343,76 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg: ServerMessage) => {
-      if (msg.type === P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE) {
-        setDiscussions((msg.discussions ?? []) as P2pDiscussion[]);
+      const messageType = typeof (msg as { type?: unknown }).type === 'string'
+        ? (msg as { type: string }).type
+        : '';
+      if (messageType === P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE) {
+        const response = msg as { discussions?: unknown };
+        setDiscussions((Array.isArray(response.discussions) ? response.discussions : []) as P2pDiscussion[]);
         setLoading(false);
       }
-      if (msg.type === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE) {
-        const responseRequestId = msg.requestId;
+      if (messageType === OPENSPEC_AUTO_DELIVER_MSG.LIST_RESPONSE) {
+        const rawRows = Array.isArray((msg as { rows?: unknown }).rows)
+          ? ((msg as unknown as { rows: unknown[] }).rows)
+          : [];
+        const rows = rawRows
+          .map(normalizeOpenSpecAutoDeliverListRow)
+          .filter((row): row is OpenSpecAutoDeliverListRow => row !== null);
+        setAutoDeliverRows(rows);
+        if (!selectedAutoRunId && rows[0]?.runId) {
+          setSelectedAutoRunId(rows[0].runId);
+          requestAutoDeliverDetails(rows[0]);
+        }
+      }
+      if (
+        messageType === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.STATUS_PROJECTION
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.CONFLICT_SUMMARY
+        || messageType === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      ) {
+        const projection = normalizeOpenSpecAutoDeliverProjection((msg as { projection?: unknown }).projection);
+        if (projection) {
+          upsertAutoDeliverProjection(projection);
+          upsertAutoDeliverRow(openSpecAutoDeliverRowFromProjection(projection));
+          if (!selectedAutoRunId) setSelectedAutoRunId(projection.runId);
+        }
+      }
+      if (messageType === P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE) {
+        const response = msg as { requestId?: string; error?: unknown; content?: unknown; id?: unknown };
+        const responseRequestId = response.requestId;
         const pendingCopy = pendingCopyRef.current;
         if (pendingCopy && responseRequestId === pendingCopy.requestId) {
           pendingCopyRef.current = null;
-          if (!msg.error && typeof msg.content === 'string') {
-            void copyText(pendingCopy.id, msg.content);
+          if (!response.error && typeof response.content === 'string') {
+            void copyText(pendingCopy.id, response.content);
           }
           return;
         }
         if (responseRequestId && pendingReadRequestIdRef.current && responseRequestId !== pendingReadRequestIdRef.current) return;
         // Only accept response matching the most recent request (prevent stale overwrite)
-        const responseId = (msg as any).id as string | undefined;
+        const responseId = typeof response.id === 'string' ? response.id : undefined;
         if (responseId && pendingReadIdRef.current && responseId !== pendingReadIdRef.current) return;
         pendingReadRequestIdRef.current = null;
         pendingReadIdRef.current = null;
-        if (msg.error) {
+        if (response.error) {
           setContent(t('p2p.discussions.load_failed'));
         } else {
-          setContent(msg.content as string);
+          setContent(typeof response.content === 'string' ? response.content : '');
         }
       }
       // Auto-refresh: when a P2P run updates and we're viewing that discussion, reload content
-      if (msg.type === P2P_WORKFLOW_MSG.RUN_UPDATE) {
-        const run = (msg as any).run;
+      if (messageType === P2P_WORKFLOW_MSG.RUN_UPDATE) {
+        const run = (msg as { run?: { id?: string; discussion_id?: unknown } }).run;
         if (!run) return;
         // Refresh list to pick up new/updated discussions — debounced
         // so a burst of run updates doesn't saturate the bridge's
         // per-socket pending cap.
         requestListRefresh();
         // If we're viewing this discussion's file, reload content
-        const runFileId = run.discussion_id ? String(run.discussion_id) : run.id;
-        if (selected && (selected === runFileId || selected.includes(run.id))) {
+        const runId = typeof run.id === 'string' ? run.id : '';
+        const runFileId = run.discussion_id ? String(run.discussion_id) : runId;
+        if (selected && runId && (selected === runFileId || selected.includes(runId))) {
           // Debounce: don't reload if we already have a pending read
           if (!pendingReadIdRef.current) {
             pendingReadIdRef.current = selected;
@@ -271,7 +421,7 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
         }
       }
     });
-  }, [copyText, requestListRefresh, selected, sendReadDiscussion, t, ws]);
+  }, [copyText, requestAutoDeliverDetails, requestListRefresh, selected, selectedAutoRunId, sendReadDiscussion, t, upsertAutoDeliverProjection, upsertAutoDeliverRow, ws]);
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -297,6 +447,8 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
   }, [selected, content, autoFollow, scrollDetailToBottom]);
 
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
+  const formatAutoStatus = (status: string) => t(`openspec.auto.status.${status}`, status);
+  const formatAutoStage = (stage: string) => t(`openspec.auto.stage.${stage}`, stage);
 
   // Find matching live discussion for progress display
   const activeLive = useMemo(
@@ -307,6 +459,15 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
     () => (selected ? discussions.find((d) => d.id === selected) ?? null : null),
     [discussions, selected],
   );
+  const selectedAutoDeliverRow = useMemo(
+    () => (selectedAutoRunId ? autoDeliverRows.find((row) => row.runId === selectedAutoRunId) ?? null : null),
+    [autoDeliverRows, selectedAutoRunId],
+  );
+  const selectedAutoDeliverProjection = useMemo(() => {
+    if (!selectedAutoDeliverRow) return null;
+    return autoDeliverProjections[selectedAutoDeliverRow.runId]
+      ?? projectionFromAutoDeliverRow(selectedAutoDeliverRow);
+  }, [autoDeliverProjections, projectionFromAutoDeliverRow, selectedAutoDeliverRow]);
 
   return (
     <div class="discussions-page">
@@ -357,24 +518,94 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
 
       <div class="discussions-layout">
         <div class="discussions-list" style={initialSelectedId && selected ? { display: window.innerWidth < 768 ? 'none' : undefined } : undefined}>
-          {loading && <div class="discussions-empty">{t('common.loading')}</div>}
-          {!loading && discussions.length === 0 && <div class="discussions-empty">{t('p2p.discussions.empty')}</div>}
-          {discussions.map((d) => (
-            <div
-              key={d.id}
-              class={`discussions-list-item${selected === d.id ? ' active' : ''}`}
-              onClick={() => selectDiscussion(d.id)}
+          <div class="discussions-list-tabs">
+            <button
+              type="button"
+              class={`discussions-list-tab${listTab === 'auto' ? ' active' : ''}`}
+              onClick={() => setListTab('auto')}
             >
-              <div class="discussions-list-topic">{d.preview}</div>
-              <div class="discussions-list-meta">
-                <span style={{ color: '#64748b', fontSize: 11 }}>{d.id}</span>
-                <span class="discussions-list-time">{formatTime(d.mtime)}</span>
-              </div>
-            </div>
-          ))}
+              {t('openspec.auto.list_title')}
+            </button>
+            <button
+              type="button"
+              class={`discussions-list-tab${listTab === 'team' ? ' active' : ''}`}
+              onClick={() => setListTab('team')}
+            >
+              {t('p2p.discussions.title')}
+            </button>
+          </div>
+          {listTab === 'auto' ? (
+            <>
+              {autoDeliverRows.length === 0 && <div class="discussions-empty">{t('openspec.auto.list_empty')}</div>}
+              {autoDeliverRows.map((row) => (
+                <div
+                  key={row.runId}
+                  class={`discussions-list-item${selectedAutoRunId === row.runId ? ' active' : ''}`}
+                  onClick={() => selectAutoDeliverRun(row.runId)}
+                >
+                  <div class="discussions-list-topic">
+                    {row.visibility === 'conflict' ? row.owningMainSessionName : (row.changeName ?? row.runId)}
+                  </div>
+                  <div class="discussions-list-meta">
+                    <span style={{ color: '#64748b', fontSize: 11 }}>{formatAutoStage(row.stage)}</span>
+                    <span class="discussions-list-time">{formatAutoStatus(row.status)}</span>
+                  </div>
+                </div>
+              ))}
+            </>
+          ) : (
+            <>
+              {loading && <div class="discussions-empty">{t('common.loading')}</div>}
+              {!loading && discussions.length === 0 && <div class="discussions-empty">{t('p2p.discussions.empty')}</div>}
+              {discussions.map((d) => (
+                <div
+                  key={d.id}
+                  class={`discussions-list-item${selected === d.id ? ' active' : ''}`}
+                  onClick={() => selectDiscussion(d.id)}
+                >
+                  <div class="discussions-list-topic">{d.preview}</div>
+                  <div class="discussions-list-meta">
+                    <span style={{ color: '#64748b', fontSize: 11 }}>{d.id}</span>
+                    <span class="discussions-list-time">{formatTime(d.mtime)}</span>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
         </div>
 
-        <div class={`discussions-detail${selected ? ' discussions-detail-fullscreen' : ''}`}>
+        <div class={`discussions-detail${selected || selectedAutoRunId ? ' discussions-detail-fullscreen' : ''}`}>
+          {selectedAutoDeliverProjection && listTab === 'auto' && (
+            <div class="discussions-nav-row">
+              <button
+                class="discussions-back-btn"
+                onClick={() => setSelectedAutoRunId(null)}
+              >
+                ← {t('p2p.picker.back')}
+              </button>
+            </div>
+          )}
+          {selectedAutoDeliverProjection && listTab === 'auto' && (
+            <div class="discussions-detail-scroll">
+              <div class="discussions-file-preview">
+                <OpenSpecAutoDeliverDetailsPanel
+                  projection={selectedAutoDeliverProjection}
+                  embedded
+                  showActions={false}
+                  onClose={() => setSelectedAutoRunId(null)}
+                  onStop={() => {}}
+                  onContinue={() => {}}
+                />
+              </div>
+            </div>
+          )}
+          {listTab === 'auto' && !selectedAutoDeliverRow && (
+            <div class="discussions-detail-scroll">
+              <div class="discussions-empty">{t('openspec.auto.list_select')}</div>
+            </div>
+          )}
+          {listTab === 'team' && (
+            <>
           {selected && (
             <div class="discussions-nav-row">
               <button
@@ -453,6 +684,8 @@ export function DiscussionsPage({ ws, initialSelectedId, requestScope, liveDiscu
               </div>
             )}
           </div>
+            </>
+          )}
         </div>
       </div>
     </div>

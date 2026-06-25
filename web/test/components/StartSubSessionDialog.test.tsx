@@ -121,6 +121,26 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
+  it('locks sub-session cwd to the current directory', () => {
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp/current"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const cwdInput = screen.getByPlaceholderText('subsessionWorkingDirectoryPlaceholder') as HTMLInputElement;
+    expect(cwdInput.value).toBe('/tmp/current');
+    expect(cwdInput.disabled).toBe(true);
+    expect(screen.queryByTitle('Browse')).toBeNull();
+    expect(screen.queryByPlaceholderText('git_remote_url_placeholder')).toBeNull();
+  });
+
   it('passes requestedModel for codex-sdk sub-sessions', () => {
     const onStart = vi.fn();
     render(

@@ -12,6 +12,7 @@ import type {
   ProcessedContextProjectionStatus,
 } from '../../../shared/context-types.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
+import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
 
 export type TimelineEventType =
@@ -34,7 +35,11 @@ export type TimelineEventType =
   // did the compression plus token telemetry. Persisted to JSONL history for
   // operator queries; the web UI renders this event COLLAPSED by default —
   // a small one-liner in the chat stream that the user clicks to expand.
-  | 'memory.compression';
+  | 'memory.compression'
+  // Emitted when an ephemeral execution clone reaches a terminal state
+  // (reply collected, pane death, hard timeout, explicit destroy, or GC sweep).
+  // Lets orchestrators stop waiting on a worker that ended without a reply.
+  | typeof EXECUTION_CLONE_TIMELINE.TERMINAL;
 
 export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'user.message',

@@ -1,15 +1,14 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
-import type { MemorySearchResultItem } from './memory-search.js';
-import { searchLocalMemory } from './memory-search.js';
+// Source recall from the worker-safe core (memory-search re-exports these), so
+// this module can run inside the context-store worker without pulling the
+// main-thread embedding model / config-resolver graph.
+import type { MemorySearchResultItem } from './memory-recall-core.js';
+import { searchLocalMemory } from './memory-recall-core.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { MEMORY_DEFAULTS } from '../../shared/memory-defaults.js';
-import {
-  listContextNamespaces,
-  listContextObservations,
-  LEGACY_DAEMON_LOCAL_USER_ID,
-  type ContextNamespaceRow,
-  type ContextObservationRow,
-} from '../store/context-store.js';
+import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
+import type { ContextNamespaceRow, ContextObservationRow } from '../store/context-store.js';
 
 export const STARTUP_MEMORY_DURABLE_LIMIT = 20;
 export const STARTUP_MEMORY_RECENT_LIMIT = 30;
@@ -327,23 +326,37 @@ function observationToItem(observation: ContextObservationRow, namespaceRow: Con
   };
 }
 
-export function selectStartupObservationItems(
+export async function selectStartupObservationItems(
   namespace: ContextNamespace,
   options: Pick<StartupMemorySelectionOptions, 'observationLimit'> = {},
-): MemorySearchResultItem[] {
+): Promise<MemorySearchResultItem[]> {
   const limit = options.observationLimit ?? STARTUP_OBSERVATION_INDEX_LIMIT;
-  const namespaceRows = listContextNamespaces();
+  const client = getContextStoreClient();
+  let namespaceRows: ContextNamespaceRow[];
+  try {
+    namespaceRows = await client.run<ContextNamespaceRow[]>('listContextNamespaces', []);
+  } catch (error) {
+    if (client.isProductionOwner) return [];
+    throw error;
+  }
   const allowedRows = new Map(
     namespaceRows
       .filter((row) => canUseObservationForStartup(row, namespace))
       .map((row) => [row.id, row]),
   );
   if (allowedRows.size === 0) return [];
-  return listContextObservations({
-    state: ['active', 'promoted'],
-  })
-    .filter((observation) => !observation.projectionId)
-    .filter((observation) => observation.class !== 'skill_candidate')
+  const observationIds = [...allowedRows.keys()];
+  let observations: ContextObservationRow[];
+  try {
+    observations = await client.run<ContextObservationRow[]>(
+      'listStartupContextObservations',
+      [observationIds, limit],
+    );
+  } catch (error) {
+    if (client.isProductionOwner) return [];
+    throw error;
+  }
+  return observations
     .map((observation) => {
       const row = allowedRows.get(observation.namespaceId);
       return row ? observationToItem(observation, row) : undefined;

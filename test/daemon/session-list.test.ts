@@ -48,6 +48,8 @@ describe('buildSessionList', () => {
     });
     const store = await import('../../src/store/session-store.js');
     for (const s of store.listSessions()) store.removeSession(s.name);
+    const resend = await import('../../src/daemon/transport-resend-queue.js');
+    resend.clearAllResend();
   });
 
   it('hydrates missing qwen display metadata from runtime config', async () => {
@@ -108,6 +110,34 @@ describe('buildSessionList', () => {
       }),
       codexAvailableModels: ['gpt-5.5', 'gpt-5.4-mini'],
     });
+  });
+
+  it('projects persisted error reasons in session_list items', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_error_brain',
+      projectName: 'demo',
+      role: 'brain',
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'error',
+      error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+      restarts: 3,
+      restartTimestamps: [1, 2, 3],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      projectDir: '/tmp/demo',
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    const sessions = await buildSessionList();
+    expect(sessions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'deck_error_brain',
+        state: 'error',
+        error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+      }),
+    ]));
   });
 
   it('preserves stored codex quota metadata when runtime quota probing is temporarily empty', async () => {
@@ -230,88 +260,76 @@ describe('buildSessionList', () => {
     ]));
   });
 
-  it('nudges a stale active transport runtime with queued messages before returning the list', async () => {
+  it('surfaces resend queue entries when a transport runtime is missing', async () => {
     const store = await import('../../src/store/session-store.js');
+    const { enqueueResend } = await import('../../src/daemon/transport-resend-queue.js');
     store.upsertSession({
-      name: 'deck_codex_stale_pending_brain',
+      name: 'deck_codex_missing_runtime_brain',
       projectName: 'demo',
       role: 'brain',
       agentType: 'codex-sdk',
       runtimeType: 'transport',
       providerId: 'codex-sdk',
-      providerSessionId: 'sid-stale-pending',
+      providerSessionId: 'sid-missing-runtime',
       state: 'running',
       restarts: 0,
       restartTimestamps: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
-    const cancelStaleActiveTurnWithPending = vi.fn(() => true);
-    getTransportRuntimeMock.mockReturnValue({
-      getStatus: () => 'streaming',
-      drainPendingIfIdle: vi.fn(() => false),
-      cancelStaleActiveTurnWithPending,
-      pendingMessages: ['queued while phantom active'],
-      pendingEntries: [{ clientMessageId: 'msg-stale-pending', text: 'queued while phantom active' }],
-      pendingVersion: 7,
+    enqueueResend('deck_codex_missing_runtime_brain', {
+      commandId: 'cmd-offline',
+      text: 'queued while offline',
+      queuedAt: Date.now(),
     });
+    getTransportRuntimeMock.mockReturnValue(undefined);
 
     const { buildSessionList } = await import('../../src/daemon/session-list.js');
     const sessions = await buildSessionList();
 
-    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith({ reason: 'session-list' });
     expect(sessions).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        name: 'deck_codex_stale_pending_brain',
-        state: 'running',
-        transportPendingMessages: ['queued while phantom active'],
-        transportPendingMessageVersion: 7,
+        name: 'deck_codex_missing_runtime_brain',
+        state: 'queued',
+        transportPendingMessages: ['queued while offline'],
+        transportPendingMessageEntries: [{ clientMessageId: 'cmd-offline', text: 'queued while offline' }],
       }),
     ]));
   });
 
-  it('settles an inactive in-progress transport runtime before returning the list', async () => {
+  it('does not surface expired resend queue entries as pending work', async () => {
     const store = await import('../../src/store/session-store.js');
+    const { enqueueResend, RESEND_EXPIRY_MS } = await import('../../src/daemon/transport-resend-queue.js');
     store.upsertSession({
-      name: 'deck_codex_inactive_streaming_brain',
+      name: 'deck_codex_expired_resend_brain',
       projectName: 'demo',
       role: 'brain',
       agentType: 'codex-sdk',
       runtimeType: 'transport',
       providerId: 'codex-sdk',
-      providerSessionId: 'sid-inactive-streaming',
+      providerSessionId: 'sid-expired-resend',
       state: 'running',
       restarts: 0,
       restartTimestamps: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
-    let status = 'streaming';
-    const settleInactiveInProgressStatus = vi.fn(() => {
-      status = 'idle';
-      return true;
+    enqueueResend('deck_codex_expired_resend_brain', {
+      commandId: 'cmd-expired',
+      text: 'expired queued while offline',
+      queuedAt: Date.now() - RESEND_EXPIRY_MS - 1,
     });
-    getTransportRuntimeMock.mockReturnValue({
-      getStatus: () => status,
-      drainPendingIfIdle: vi.fn(() => false),
-      settleInactiveInProgressStatus,
-      cancelStaleActiveTurnWithPending: vi.fn(() => false),
-      pendingMessages: [],
-      pendingEntries: [],
-      pendingVersion: 3,
-    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
 
     const { buildSessionList } = await import('../../src/daemon/session-list.js');
     const sessions = await buildSessionList();
 
-    expect(settleInactiveInProgressStatus).toHaveBeenCalledWith('session-list');
     expect(sessions).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        name: 'deck_codex_inactive_streaming_brain',
-        state: 'idle',
+        name: 'deck_codex_expired_resend_brain',
+        state: 'running',
         transportPendingMessages: [],
         transportPendingMessageEntries: [],
-        transportPendingMessageVersion: 3,
       }),
     ]));
   });
@@ -356,6 +374,7 @@ describe('buildSessionList', () => {
     const sessions = await buildSessionList();
     expect(sessions).toHaveLength(1);
     expect(sessions[0]).toMatchObject({
+      ccPreset: 'minimax',
       qwenAuthType: 'api-key',
       qwenAvailableModels: ['MiniMax-M2.7'],
       qwenModel: 'MiniMax-M2.7',

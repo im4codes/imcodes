@@ -54,5 +54,9 @@ export function getCodexSdkAvailableModels(): readonly string[] {
 }
 
 export function normalizeClaudeSdkModelForProvider(model: string): string {
-  return model === 'opus[1M]' ? 'opus' : model;
+  if (model === 'opus[1M]') return 'opus';
+  // The `fable` picker alias maps to the documented API id so launch works on
+  // any CC build, even before `fable` is registered as a CLI alias.
+  if (model === 'fable') return 'claude-fable-5';
+  return model;
 }

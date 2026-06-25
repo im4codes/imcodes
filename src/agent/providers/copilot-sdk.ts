@@ -127,6 +127,7 @@ interface CopilotSessionState {
   backgroundTainted: boolean;
   cancelRequested: boolean;
   cancelErrorEmitted: boolean;
+  cancelSettlement: Promise<void> | null;
   compactCompletionEmitted: boolean;
   rotationInProgress: boolean;
   generation: number;
@@ -359,6 +360,40 @@ export class CopilotSdkProvider implements TransportProvider {
     };
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.getSessionState(sessionId);
+    if (!state) return null;
+    const activeReason = state.busy
+      ? state.operation
+      : state.pendingApprovals.size > 0
+        ? 'approval'
+        : state.rotationInProgress
+          ? 'rotation'
+          : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      providerSessionId: state.sessionId,
+      busy: state.busy,
+      operation: state.operation,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      completionEmittedForCurrentTurn: state.completionEmittedForCurrentTurn,
+      cancelRequested: state.cancelRequested,
+      cancelErrorEmitted: state.cancelErrorEmitted,
+      compactCompletionEmitted: state.compactCompletionEmitted,
+      rotationInProgress: state.rotationInProgress,
+      backgroundTainted: state.backgroundTainted,
+      generation: state.generation,
+      pendingApprovalCount: state.pendingApprovals.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+      sessionSystemTextPending: Boolean(state.sessionSystemTextPending),
+      poisoned: this.poisonedSessionIds.has(state.sessionId),
+    };
+  }
+
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
       state.unsubscribes.forEach((fn) => fn());
@@ -427,6 +462,7 @@ export class CopilotSdkProvider implements TransportProvider {
       backgroundTainted: false,
       cancelRequested: false,
       cancelErrorEmitted: false,
+      cancelSettlement: null,
       compactCompletionEmitted: false,
       rotationInProgress: false,
       generation: 0,
@@ -555,6 +591,9 @@ export class CopilotSdkProvider implements TransportProvider {
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Copilot session: ${sessionId}`, false);
     }
+    if (state.cancelSettlement) {
+      await state.cancelSettlement;
+    }
     if (state.busy) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Copilot session is already busy', true);
     }
@@ -603,6 +642,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.backgroundTainted = false;
     state.cancelRequested = false;
     state.cancelErrorEmitted = false;
+    state.cancelSettlement = null;
     state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
     state.sessionSystemTextPending = undefined;
@@ -702,28 +742,38 @@ export class CopilotSdkProvider implements TransportProvider {
   async cancel(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
+    if (state.cancelSettlement) return state.cancelSettlement;
     const wasCompact = state.operation === 'compact';
-    state.cancelRequested = true;
-    state.operation = 'cancelling';
-    try {
-      await state.session.abort();
-    } finally {
-      state.busy = false;
-      state.operation = 'idle';
-      this.emitStatus(state.routeId, { status: null, label: null });
-      state.sessionSystemTextPending = undefined;
-      if (wasCompact) state.compactCompletionEmitted = true;
-      if (!state.cancelErrorEmitted) {
-        state.cancelErrorEmitted = true;
-        this.emitError(state.routeId, this.makeError(
-          PROVIDER_ERROR_CODES.CANCELLED,
-          wasCompact ? 'Copilot compact cancelled' : 'Copilot turn cancelled',
-          true,
-        ));
+    const settlement = (async () => {
+      state.cancelRequested = true;
+      state.operation = 'cancelling';
+      try {
+        await state.session.abort();
+      } finally {
+        state.busy = false;
+        state.operation = 'idle';
+        this.emitStatus(state.routeId, { status: null, label: null });
+        state.sessionSystemTextPending = undefined;
+        if (wasCompact) state.compactCompletionEmitted = true;
+        if (!state.cancelErrorEmitted) {
+          state.cancelErrorEmitted = true;
+          this.emitError(state.routeId, this.makeError(
+            PROVIDER_ERROR_CODES.CANCELLED,
+            wasCompact ? 'Copilot compact cancelled' : 'Copilot turn cancelled',
+            true,
+          ));
+        }
       }
+      if (state.backgroundTainted) {
+        await this.rotatePoisonedSession(state);
+      }
+    })();
+    state.cancelSettlement = settlement;
+    try {
+      await settlement;
+    } finally {
+      if (state.cancelSettlement === settlement) state.cancelSettlement = null;
     }
-    if (!state.backgroundTainted) return;
-    await this.rotatePoisonedSession(state);
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -804,7 +854,15 @@ export class CopilotSdkProvider implements TransportProvider {
       case 'assistant.message_delta': {
         const chunk = String(event.data?.deltaContent ?? '');
         if (!chunk) return;
-        state.currentMessageId = String(event.data?.messageId ?? state.currentMessageId ?? randomUUID());
+        const incomingMessageId = String(event.data?.messageId ?? state.currentMessageId ?? randomUUID());
+        // Reset the accumulator at a new-message boundary so message 2's deltas
+        // don't render prefixed with message 1's full text (multi-message turns
+        // occur after every tool round). Without this the new bubble flickers,
+        // showing the prior message's text until this one completes.
+        if (incomingMessageId !== state.currentMessageId) {
+          state.currentText = '';
+        }
+        state.currentMessageId = incomingMessageId;
         state.currentText += chunk;
         const delta: MessageDelta = {
           messageId: state.currentMessageId,
@@ -1057,8 +1115,10 @@ export class CopilotSdkProvider implements TransportProvider {
       state.backgroundTainted = false;
       state.cancelRequested = false;
       state.cancelErrorEmitted = false;
+      state.cancelSettlement = null;
       state.compactCompletionEmitted = false;
       this.attachSession(state);
+      state.cancelSettlement = null;
       this.emitSessionInfo(state.routeId, {
         resumeId: state.sessionId,
         ...(state.model ? { model: state.model } : {}),
@@ -1114,6 +1174,7 @@ export class CopilotSdkProvider implements TransportProvider {
     state.backgroundTainted = false;
     state.cancelRequested = false;
     state.cancelErrorEmitted = false;
+    state.cancelSettlement = null;
     state.compactCompletionEmitted = false;
     state.rotationInProgress = false;
     state.sessionSystemTextInjected = undefined;

@@ -248,7 +248,7 @@ export async function getMemorySourcesOrchestrated(
   if (goLocal) {
     let local: MemoryGetSourcesResult;
     try {
-      local = localGetSources(trimmed, caller);
+      local = await localGetSources(trimmed, caller);
     } catch (err) {
       logger.debug({ projectionId: trimmed, err: err instanceof Error ? err.message : String(err) }, 'local memoryGetSources failed');
       return { status: 'error', reason: TIMELINE_HISTORY_ERROR_REASONS.INTERNAL_ERROR, projectionId: trimmed };

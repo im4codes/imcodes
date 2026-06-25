@@ -66,6 +66,24 @@ function makeExisting(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe('mergeSessionListEntry — supervision preservation', () => {
+  it('keeps daemon-provided error reason for error session list entries and clears it on recovery', () => {
+    const errored = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'error',
+      error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+    }, undefined);
+
+    expect(errored.error).toBe('Restart loop detected: more than 3 restarts within 5 minutes');
+
+    const recovered = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+    }, errored);
+
+    expect(recovered.state).toBe('idle');
+    expect(recovered.error).toBeNull();
+  });
+
   it('preserves user-enabled supervision when daemon broadcasts an empty transportConfig', () => {
     const existing = makeExisting();
 
@@ -105,6 +123,32 @@ describe('mergeSessionListEntry — supervision preservation', () => {
       someServerOnlyKey: 'x',
       [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT,
     });
+  });
+
+  it('preserves and updates qwen preset metadata from session_list broadcasts', () => {
+    const existing = makeExisting({
+      agentType: 'qwen',
+      ccPreset: 'OldPreset',
+      qwenModel: 'old-model',
+    });
+
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'qwen',
+      ccPreset: 'MiniMax',
+      qwenModel: 'MiniMax-M2.7',
+    }, existing);
+
+    expect(merged.ccPreset).toBe('MiniMax');
+    expect(merged.qwenModel).toBe('MiniMax-M2.7');
+
+    const preserved = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'qwen',
+    }, merged);
+
+    expect(preserved.ccPreset).toBe('MiniMax');
+    expect(preserved.qwenModel).toBe('MiniMax-M2.7');
   });
 
   it('replaces supervision with the broadcast value when daemon sends an authoritative snapshot', () => {
@@ -449,7 +493,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('accepts a fresh-runtime snapshot (version 0) even when the baseline is higher', () => {
+  it('rejects version 0 snapshots when the baseline is higher', () => {
     // After a provider restart the runtime version resets to 0; that snapshot
     // must win so the queue does not get stuck behind a stale-high baseline.
     const merged = mergeSessionListEntry({
@@ -459,10 +503,10 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [],
       transportPendingMessageVersion: 0,
     }, existing);
-    expect(merged.transportPendingMessageVersion).toBe(0);
+    expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('applies snapshots from a legacy daemon that omits the version (backward compatible)', () => {
+  it('rejects unversioned queue snapshots after a versioned baseline exists', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
       state: 'queued',
@@ -470,7 +514,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'mL', text: 'legacy one' }],
       // no transportPendingMessageVersion
     }, existing);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'mL', text: 'legacy one' }]);
+    expect(merged.transportPendingMessageEntries).toEqual(existing.transportPendingMessageEntries);
     // Baseline unchanged when the snapshot is unversioned.
     expect(merged.transportPendingMessageVersion).toBe(7);
   });

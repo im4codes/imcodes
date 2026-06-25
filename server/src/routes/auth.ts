@@ -56,7 +56,7 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket') {
+    if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket' && jwt.type !== 'share-ws-ticket') {
       const user = await getUserById(c.env.DB, jwt.sub);
       if (user && user.status === 'active') return user.id;
     }
@@ -68,7 +68,7 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
 
   // Try JWT first (web session tokens) — reject single-use ws-ticket tokens
   const jwtBearer = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-  if (jwtBearer && typeof jwtBearer.sub === 'string' && jwtBearer.type !== 'ws-ticket') {
+  if (jwtBearer && typeof jwtBearer.sub === 'string' && jwtBearer.type !== 'ws-ticket' && jwtBearer.type !== 'share-ws-ticket') {
     const user = await getUserById(c.env.DB, jwtBearer.sub);
     if (user && user.status === 'active') return user.id;
   }

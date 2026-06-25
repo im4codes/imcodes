@@ -938,6 +938,67 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('surfaces codex>=0.139 native turn/plan/updated events as checklist tool events (new+old compatible)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-native-plan', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-native-plan', 'make a plan');
+    const child = childProcessMock.children[0];
+    // 0.139 payload: { plan: [{ step, status }] } with camelCase `inProgress`.
+    child.emits({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        explanation: null,
+        plan: [
+          { step: 'Read notes.txt', status: 'completed' },
+          { step: 'Append a line', status: 'inProgress' },
+          { step: 'Summarize', status: 'pending' },
+        ],
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'codex-plan-turn-1',
+      name: 'update_plan',
+      status: 'running',
+      input: {
+        plan: [
+          { content: 'Read notes.txt', status: 'completed' },
+          { content: 'Append a line', status: 'in_progress' },
+          { content: 'Summarize', status: 'pending' },
+        ],
+      },
+      detail: { kind: 'plan', summary: 'Plan' },
+    });
+
+    // A follow-up update with all steps done reuses the SAME id (in-place
+    // update) and flips status to complete.
+    child.emits({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        plan: [
+          { step: 'Read notes.txt', status: 'completed' },
+          { step: 'Append a line', status: 'completed' },
+          { step: 'Summarize', status: 'completed' },
+        ],
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[1]).toMatchObject({ id: 'codex-plan-turn-1', name: 'update_plan', status: 'complete' });
+  });
+
   it('surfaces raw update_plan calls from the Codex rollout when app-server omits the item', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-'));
     try {
@@ -1511,49 +1572,424 @@ describe('CodexSdkProvider', () => {
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
 
-  it('completes a normal turn from idle thread status when turn/completed is missing', async () => {
+  it('uses final agentMessage from turn/completed items when item/completed was not observed', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-status-complete', cwd: '/tmp/project' });
+    await provider.createSession({ sessionKey: 'route-turn-items-final', cwd: '/tmp/project' });
 
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    const deltas: string[] = [];
+    const completedMessages: any[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, msg) => completedMessages.push(msg));
 
-    await provider.send('route-idle-status-complete', 'hello');
+    await provider.send('route-turn-items-final', 'hello');
     const child = childProcessMock.children[0];
     child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'completed',
+          items: [
+            { id: 'cmd-1', type: 'commandExecution', command: 'echo ignored', status: 'completed' },
+            { id: 'msg-final', type: 'agentMessage', text: 'Final answer from completed turn.' },
+          ],
+          error: null,
+        },
+      },
     });
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-    await waitForCondition(() => completed.length === 1);
 
-    expect(completed).toEqual(['Done']);
-    await provider.send('route-idle-status-complete', 'next');
+    await waitForCondition(() => completedMessages.length === 1);
+
+    expect(deltas).toEqual([]);
+    expect(completedMessages[0]).toMatchObject({
+      id: 'msg-final',
+      content: 'Final answer from completed turn.',
+      status: 'complete',
+    });
+    expect(provider.getSessionDiagnostics('route-turn-items-final')).toMatchObject({
+      runningTurnId: null,
+      currentTextLength: 'Final answer from completed turn.'.length,
+      activeItemCount: 0,
+    });
+
+    await provider.send('route-turn-items-final', 'next');
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
   });
 
-  it('does not duplicate a normal completion after idle status fallback', async () => {
+  it('resets the streaming accumulator across agentMessages so a second message is not prefixed with the first', async () => {
+    // A turn with a tool round produces TWO agentMessage items. The second
+    // message's deltas must start fresh, not carry the first message's text.
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-status-no-duplicate', cwd: '/tmp/project' });
+    await provider.createSession({ sessionKey: 'route-multi', cwd: '/tmp/project' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    await provider.send('route-multi', 'hello');
+    const child = childProcessMock.children[0];
+
+    child.emits({ method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: '' } } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'First.' } });
+    child.emits({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'First.' } } });
+    // ── tool round, then the model continues in a NEW agentMessage ──
+    child.emits({ method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-2', type: 'agentMessage', text: '' } } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-2', delta: 'Second' } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-2', delta: ' part.' } });
+    child.emits({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-2', type: 'agentMessage', text: 'Second part.' } } });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+
+    await waitForCondition(() => deltas.filter((d) => d.id === 'msg-2').length >= 2);
+
+    const msg2Deltas = deltas.filter((d) => d.id === 'msg-2').map((d) => d.text);
+    expect(msg2Deltas).toEqual(['Second', 'Second part.']);
+    expect(deltas.every((d) => !d.text.includes('First.Second'))).toBe(true);
+  });
+
+  it('never drops an agentMessage delta whose turnId differs from runningTurnId (provider field-shape drift)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-mismatch-delta', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    provider.onDelta((_sid, d) => deltas.push(d.delta));
+
+    await provider.send('route-mismatch-delta', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-mismatch-delta')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    // turnId 'turn-XYZ' differs from the tracked 'turn-1' (e.g. codex shifted the
+    // turn-id field shape). Live text MUST still render, not be silently dropped.
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-XYZ', itemId: 'm1', delta: 'Mismatch text' },
+    });
+    await waitForCondition(() => deltas.some((d) => d.includes('Mismatch text')));
+    expect(deltas.at(-1)).toBe('Mismatch text');
+  });
+
+  it('never drops an agentMessage delta when runningTurnId is unset (turn/start result had no turn id) and backfills it', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-unset-turnid', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    provider.onDelta((_sid, d) => deltas.push(d.delta));
+
+    await provider.send('route-unset-turnid', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-unset-turnid')?.runningTurnId === 'turn-1',
+    );
+
+    // Simulate turn/start having returned no usable turn id (provider field-shape
+    // drift): clear runningTurnId + turnStartInFlight, mimicking result?.turn?.id === undefined.
+    const state = (provider as unknown as {
+      sessions: Map<string, { runningTurnId?: string; turnStartInFlight: boolean }>;
+    }).sessions.get('route-unset-turnid')!;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'm1', delta: 'Live text' },
+    });
+    await waitForCondition(() => deltas.some((d) => d.includes('Live text')));
+    expect(deltas.at(-1)).toBe('Live text');
+    // The delta's turnId was adopted so the rest of the turn lifecycle still works.
+    expect(provider.getSessionDiagnostics('route-unset-turnid')).toMatchObject({ runningTurnId: 'turn-1' });
+  });
+
+  it('exposes only safe allowlisted Codex session diagnostics', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({
+      binaryPath: 'codex',
+      env: { SHOULD_NOT_LEAK: 'secret-env-value' },
+    });
+    await provider.createSession({
+      sessionKey: 'route-safe-diagnostics',
+      cwd: '/tmp/project',
+      env: { ALSO_SHOULD_NOT_LEAK: 'secret-session-env' },
+    });
+
+    await provider.send('route-safe-diagnostics', 'secret user prompt');
+    const diagnostics = provider.getSessionDiagnostics('route-safe-diagnostics');
+
+    expect(Object.keys(diagnostics ?? {}).sort()).toEqual([
+      'active',
+      'activeItemCount',
+      'activeItemIds',
+      'activeToolItemCount',
+      'activeToolItemIds',
+      'activeCompactionItemCount',
+      'activeReason',
+      'cancelTimerArmed',
+      'cancelled',
+      'compactHardTimeoutArmed',
+      'compactObserved',
+      'compactSettleArmed',
+      'currentMessageId',
+      'currentTextLength',
+      'deferredIdleSettleTurnId',
+      'deferredCompactSettleTurnId',
+      'loaded',
+      'provider',
+      'rawChecklistPollArmed',
+      'routeId',
+      'runningCompact',
+      'runningTurnId',
+      'threadId',
+      'turnStartInFlight',
+    ].sort());
+    expect(JSON.stringify(diagnostics)).not.toContain('secret');
+    expect(JSON.stringify(diagnostics)).not.toContain('/tmp/project');
+  });
+
+  it('clears provider compaction active-work evidence when compact is cancelled locally', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-compact-cancel-snapshot', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-compact-cancel-snapshot', '/compact');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-compact-cancel-snapshot')?.runningCompact === true,
+    );
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-compact-1',
+        item: { id: 'compact-item-1', type: 'contextCompaction' },
+      },
+    });
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-compact-cancel-snapshot')?.activeCompactionItemCount === 1,
+    );
+
+    expect(provider.getActiveWorkSnapshot('route-compact-cancel-snapshot')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_compaction'],
+    });
+
+    await provider.cancel('route-compact-cancel-snapshot');
+
+    expect(errors).toContain('Codex compact cancelled');
+    expect(provider.getSessionDiagnostics('route-compact-cancel-snapshot')).toMatchObject({
+      runningCompact: false,
+      activeItemCount: 0,
+      activeToolItemCount: 0,
+      activeCompactionItemCount: 0,
+    });
+    expect(provider.getActiveWorkSnapshot('route-compact-cancel-snapshot')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('completes a normal turn only from turn/completed; idle thread status mid-turn does not end it', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-not-completion', cwd: '/tmp/project' });
 
     const completed: string[] = [];
     provider.onComplete((_sid, msg) => completed.push(msg.content));
 
-    await provider.send('route-idle-status-no-duplicate', 'hello');
+    await provider.send('route-idle-not-completion', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-not-completion')?.runningTurnId === 'turn-1',
+    );
+
     const child = childProcessMock.children[0];
+    // A thread that momentarily reports idle is NOT a turn-completion signal and
+    // must not end the turn (no idle timers, no guessing when the turn ends).
+    // Emit idle BEFORE the agent message: if idle wrongly completed the turn,
+    // the later turn/completed would be de-duped and 'Done' would never surface.
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    // Once the stream-ordered agent message is processed (currentText='Done'),
+    // the idle event before it has also been processed — yet the turn is still
+    // running and nothing has completed.
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-not-completion')?.currentTextLength === 4,
+    );
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-idle-not-completion')).toMatchObject({ runningTurnId: 'turn-1' });
+
+    // The explicit turn/completed event is the sole completion signal.
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await waitForCondition(() => completed.length === 1);
+    expect(completed).toEqual(['Done']);
+    expect(provider.getSessionDiagnostics('route-idle-not-completion')).toMatchObject({ runningTurnId: null });
+  });
+
+  it('settles a turn from thread-idle when the app-server sends no turn/completed (debounced)', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-settles', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-settles', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-settles')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    // The agent produces its message, then the thread goes idle — but the current
+    // Codex app-server emits NO `turn/completed`. With NOTHING following the idle,
+    // the debounced idle-settle must complete the turn so it can never get stuck
+    // "working" with the queue blocked (the phantom-active-turn regression).
     child.emits({
       method: 'item/completed',
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
     });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+
     await waitForCondition(() => completed.length === 1);
-
-    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
-    await flush();
-
     expect(completed).toEqual(['Done']);
+    expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
+  });
+
+  it('defers thread-idle fallback while a Codex commandExecution item is active', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-idle-active-command', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-idle-active-command', 'run a long command');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-active-command')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'sleep 120',
+          status: 'inProgress',
+          processId: 45580,
+        },
+      },
+    });
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-idle-active-command')?.activeItemCount === 1,
+    );
+
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
+      runningTurnId: 'turn-1',
+      activeItemCount: 1,
+      deferredIdleSettleTurnId: 'turn-1',
+    });
+
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          id: 'cmd-1',
+          type: 'commandExecution',
+          command: 'sleep 120',
+          status: 'completed',
+          processId: 45580,
+          exitCode: 0,
+          durationMs: 120000,
+        },
+      },
+    });
+
+    await waitForCondition(() => completed.length === 1);
+    expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
+      runningTurnId: null,
+      activeItemCount: 0,
+      deferredIdleSettleTurnId: null,
+    });
+  });
+
+  it('defers turn/completed while a Codex commandExecution item is active', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-turn-completed-active-command', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-turn-completed-active-command', 'run a long command');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-turn-completed-active-command')?.runningTurnId === 'turn-1',
+    );
+
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 120', status: 'inProgress' },
+      },
+    });
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-turn-completed-active-command')?.activeToolItemCount === 1,
+    );
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        turn: {
+          id: 'turn-1',
+          status: 'completed',
+          items: [{ id: 'msg-1', type: 'agentMessage', text: 'Done after command' }],
+        },
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-turn-completed-active-command')).toMatchObject({
+      runningTurnId: 'turn-1',
+      activeToolItemCount: 1,
+      deferredIdleSettleTurnId: 'turn-1',
+    });
+
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'cmd-1', type: 'commandExecution', status: 'completed', exitCode: 0 },
+      },
+    });
+
+    await waitForCondition(() => completed.length === 1);
+    expect(completed[0]).toContain('Done after command');
   });
 
   it('resumes with stored thread id on existing session', async () => {
@@ -2615,6 +3051,136 @@ describe('CodexSdkProvider', () => {
 
     await provider.send('route-cancel-timeout', 'after-cancel');
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not let late Codex item events re-adopt a cancelled turn after the cancel watchdog', async () => {
+    vi.useFakeTimers();
+    childProcessMock.setHoldTurnInterrupt(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-late-item-turnid', cwd: '/tmp/project' });
+
+    await provider.send('route-cancel-late-item-turnid', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-late-item-turnid');
+    await vi.advanceTimersByTimeAsync(1_600);
+
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'late-reasoning', type: 'reasoning', text: 'late' },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.getSessionDiagnostics('route-cancel-late-item-turnid')).toMatchObject({
+      runningTurnId: null,
+      runningCompact: false,
+    });
+    await provider.send('route-cancel-late-item-turnid', 'after-cancel');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not let late contextCompaction items re-enter compacting after cancel', async () => {
+    vi.useFakeTimers();
+    childProcessMock.setHoldTurnInterrupt(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-late-compact-item', cwd: '/tmp/project' });
+
+    await provider.send('route-cancel-late-compact-item', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel-late-compact-item');
+    await vi.advanceTimersByTimeAsync(1_600);
+
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'late-compact', type: 'contextCompaction' },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.getSessionDiagnostics('route-cancel-late-compact-item')).toMatchObject({
+      runningTurnId: null,
+      runningCompact: false,
+    });
+    await provider.send('route-cancel-late-compact-item', 'after-cancel');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not let late Codex item events re-adopt a failed turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-failed-late-item-turnid', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+
+    await provider.send('route-failed-late-item-turnid', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'failed', error: { message: 'boom' } },
+      },
+    });
+    await flush();
+
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'late-msg', type: 'agentMessage', text: 'late text' },
+      },
+    });
+    await flush();
+
+    expect(provider.getSessionDiagnostics('route-failed-late-item-turnid')).toMatchObject({
+      runningTurnId: null,
+      runningCompact: false,
+    });
+    expect(deltas).toContain('late text');
+    await provider.send('route-failed-late-item-turnid', 'after-failure');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('does not render late plan updates for a failed turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-failed-late-plan', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-failed-late-plan', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'failed', error: { message: 'boom' } },
+      },
+    });
+    await flush();
+
+    child.emits({
+      method: 'turn/plan/updated',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        plan: { steps: [{ text: 'late plan', status: 'in_progress' }] },
+      },
+    });
+    await flush();
+
+    expect(tools).toEqual([]);
   });
 
   it('emits WebSearch tool events for webSearch items (legacy top-level query)', async () => {

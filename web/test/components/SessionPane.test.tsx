@@ -13,6 +13,7 @@ let activeToolCallMock = false;
 const useTimelineMock = vi.fn();
 const terminalViewSpy = vi.fn(() => null);
 const chatViewSpy = vi.fn(() => null);
+const sessionControlsSpy = vi.fn();
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -29,15 +30,22 @@ vi.mock('../../src/components/SessionControls.js', () => ({
       text: string,
       meta?: { commandId: string; attachments?: Array<Record<string, unknown>>; extra?: Record<string, unknown>; localFailure?: string },
     ) => void;
-    activeSession?: { name: string } | null;
+    activeSession?: { name: string; state?: string | null } | null;
+    activeTransportTurn?: boolean;
   }) => (
+    sessionControlsSpy(props),
     <button
       type="button"
-      onClick={() => props.onSend?.(
-        props.activeSession?.name ?? 'session',
-        'queued text',
-        { commandId: 'test-cmd-1' },
-      )}
+      data-active-transport-turn={String(!!props.activeTransportTurn)}
+      data-active-session-state={props.activeSession?.state ?? ''}
+      onClick={() => {
+        if (props.activeSession?.state === 'running' || props.activeTransportTurn) return;
+        props.onSend?.(
+          props.activeSession?.name ?? 'session',
+          'queued text',
+          { commandId: 'test-cmd-1' },
+        );
+      }}
     >
       send
     </button>
@@ -77,6 +85,7 @@ vi.mock('../../src/components/UsageFooter.js', () => ({
     <div
       data-testid="usage-footer"
       data-state={props.sessionState}
+      data-active-timeline-turn={String(!!props.activeTimelineTurn)}
       data-model={props.modelOverride ?? ''}
     >
       {props.quotaLabel ?? props.planLabel ?? 'footer'}
@@ -92,6 +101,7 @@ describe('SessionPane', () => {
     markOptimisticFailedMock.mockReset();
     retryOptimisticMessageMock.mockReset();
     useTimelineMock.mockReset();
+    sessionControlsSpy.mockReset();
     timelineEventsMock = [];
     activeToolCallMock = false;
     terminalViewSpy.mockClear();
@@ -219,7 +229,7 @@ describe('SessionPane', () => {
           project: 'test',
           role: 'brain',
           agentType: 'claude-code-sdk',
-          state: 'running',
+          state: 'idle',
           runtimeType: 'transport',
           projectDir: '/tmp/test',
         } as any}
@@ -237,6 +247,185 @@ describe('SessionPane', () => {
     expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });
 
+  it('passes active transport turn when timeline tail has assistant text but no idle state', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'text', sessionId: 'deck_test_brain', ts: 2, type: 'assistant.text', payload: { text: 'still streaming', streaming: true } },
+      { eventId: 'ack', sessionId: 'deck_test_brain', ts: 3, type: 'command.ack', payload: { ok: true } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      activeTransportTurn: true,
+    }));
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+    expect(screen.getByTestId('usage-footer').getAttribute('data-active-timeline-turn')).toBe('true');
+  });
+
+  it('passes live timeline state to ChatView instead of stale outer session state', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'running', sessionId: 'deck_test_brain', ts: 2, type: 'session.state', payload: { state: 'running' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(chatViewSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessionState: 'running',
+    }));
+  });
+
+  it('keeps active transport turn through a pending optimistic user message tail', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'text', sessionId: 'deck_test_brain', ts: 2, type: 'assistant.text', payload: { text: 'still streaming', streaming: true } },
+      { eventId: 'pending-user', sessionId: 'deck_test_brain', ts: 3, type: 'user.message', payload: { text: 'queued first', pending: true, commandId: 'cmd-1' } },
+      { eventId: 'ack', sessionId: 'deck_test_brain', ts: 4, type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      activeTransportTurn: true,
+    }));
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+  });
+
+  it('keeps active transport turn through a confirmed user message after running state', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'running', sessionId: 'deck_test_brain', ts: 2, type: 'session.state', payload: { state: 'running' } },
+      { eventId: 'user', sessionId: 'deck_test_brain', ts: 3, type: 'user.message', payload: { text: 'sent first', pending: false, commandId: 'cmd-1' } },
+      { eventId: 'ack', sessionId: 'deck_test_brain', ts: 4, type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      activeTransportTurn: true,
+    }));
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+  });
+
+  it('keeps stale outer idle transport sends out of the timeline when the timeline tail is running', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'running', sessionId: 'deck_test_brain', ts: 2, type: 'session.state', payload: { state: 'running' } },
+      { eventId: 'tool', sessionId: 'deck_test_brain', ts: 3, type: 'tool.call', payload: { name: 'shell' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      activeSession: expect.objectContaining({ state: 'running' }),
+    }));
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-session-state')).toBe('running');
+
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
+  });
+
   it('forces copilot-sdk sessions into chat mode when runtimeType is omitted', () => {
     render(
       <SessionPane
@@ -246,7 +435,7 @@ describe('SessionPane', () => {
           project: 'test',
           role: 'brain',
           agentType: 'copilot-sdk',
-          state: 'running',
+          state: 'idle',
           runtimeType: undefined,
           projectDir: '/tmp/test',
         } as any}

@@ -28,7 +28,7 @@ import {
   extractTransportPendingVersion,
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
-  shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from './transport-queue.js';
 
 /**
@@ -43,11 +43,13 @@ export interface IncomingSessionListEntry {
   agentType: string;
   agentVersion?: string;
   state: string;
+  error?: string | null;
   projectDir?: string;
   runtimeType?: string;
   label?: string | null;
   userCreated?: boolean;
   description?: string | null;
+  ccPreset?: string | null;
   qwenModel?: string;
   requestedModel?: string;
   activeModel?: string;
@@ -67,6 +69,14 @@ export interface IncomingSessionListEntry {
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   transportPendingMessageVersion?: unknown;
+  sharedState?: SessionInfo['sharedState'];
+  /** DAEMON-AUTHORITATIVE: whether this session may serve as an execution-clone
+   *  template. Computed by the daemon; the UI renders it rather than recomputing
+   *  eligibility client-side. */
+  executionTemplateEligible?: boolean;
+  /** DAEMON-AUTHORITATIVE: reason the session is NOT eligible as an execution
+   *  template (only meaningful when `executionTemplateEligible === false`). */
+  executionTemplateIneligibleReason?: string;
 }
 
 export function isSubSessionName(sessionName: string): boolean {
@@ -113,10 +123,14 @@ export function mergeSessionListEntry(
     incoming.transportPendingMessageEntries,
     parsedMessages,
     incoming.name,
+    {
+      hasEntriesField: hasPendingEntriesField,
+      hasMessagesField: hasPendingMessagesField,
+    },
   );
-  const normalizedMessages = parsedMessages.length > 0
-    ? parsedMessages
-    : normalizedEntries.map((entry) => entry.text);
+  const normalizedMessages = hasPendingEntriesField
+    ? normalizedEntries.map((entry) => entry.text)
+    : parsedMessages;
 
   // Monotonic version guard: a `session_list` heartbeat can be built before
   // a drain but delivered after it. If this snapshot's queue version is older
@@ -125,7 +139,10 @@ export function mergeSessionListEntry(
   const incomingVersion = extractTransportPendingVersion(incoming.transportPendingMessageVersion);
   const existingVersion = existing?.transportPendingMessageVersion;
   const applyPendingSnapshot = hasExplicitPendingSnapshot
-    && shouldApplyTransportQueueSnapshot(existingVersion, incomingVersion);
+    && shouldApplyTransportQueueSnapshotForPayload(existingVersion, incomingVersion, {
+      hasExplicitSnapshot: true,
+      isExplicitEmpty: normalizedMessages.length === 0 && normalizedEntries.length === 0,
+    });
 
   const nextPendingMessages = applyPendingSnapshot
     ? normalizedMessages
@@ -153,6 +170,9 @@ export function mergeSessionListEntry(
     agentType: incoming.agentType,
     agentVersion: incoming.agentVersion,
     state: incoming.state as SessionInfo['state'],
+    error: incoming.state === 'error'
+      ? (incoming.error ?? existing?.error ?? null)
+      : null,
     projectDir: incoming.projectDir ?? existing?.projectDir,
     runtimeType: resolveRuntimeType({
       runtimeType: (incoming.runtimeType as SessionInfo['runtimeType']) ?? existing?.runtimeType,
@@ -161,6 +181,7 @@ export function mergeSessionListEntry(
     label: incoming.label ?? existing?.label,
     userCreated: incoming.userCreated ?? existing?.userCreated,
     description: incoming.description ?? existing?.description,
+    ccPreset: incoming.ccPreset !== undefined ? incoming.ccPreset : existing?.ccPreset,
     qwenModel: incoming.qwenModel ?? existing?.qwenModel,
     requestedModel: incoming.requestedModel ?? existing?.requestedModel,
     activeModel: incoming.activeModel ?? existing?.activeModel,
@@ -183,5 +204,9 @@ export function mergeSessionListEntry(
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
     transportPendingMessageVersion: nextPendingVersion,
+    sharedState: incoming.sharedState ?? existing?.sharedState,
+    executionTemplateEligible: incoming.executionTemplateEligible ?? existing?.executionTemplateEligible,
+    executionTemplateIneligibleReason:
+      incoming.executionTemplateIneligibleReason ?? existing?.executionTemplateIneligibleReason,
   };
 }

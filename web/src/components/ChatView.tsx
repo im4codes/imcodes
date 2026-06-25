@@ -33,7 +33,7 @@ import { ChatMarkdown } from './ChatMarkdown.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import { computeFollowThresholds } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
-import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
+import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
 import { FontPrefsDropdown, useFontPrefs, DEFAULT_CHAT_FONT } from './FontPrefsDropdown.js';
 import { SessionRepoBranchSummary } from './SessionRepoBranchSummary.js';
@@ -52,6 +52,7 @@ import {
 import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js';
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
+import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -200,6 +201,10 @@ function formatMemoryContextScore(score: number | undefined): string | null {
 
 function formatMemoryContextTimestamp(ts: number | undefined): string | null {
   if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
+  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function formatChatDateTime(ts: number): string {
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
@@ -609,9 +614,20 @@ function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean
     event.type !== 'mode.state' &&
     event.type !== 'command.ack' &&
     event.type !== 'terminal.snapshot' &&
-    !(event.type === 'session.state' && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')) &&
+    !(event.type === 'session.state'
+      && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')
+      && !getSessionStateDetail(event)) &&
     (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(event.type))
   );
+}
+
+function getSessionStateDetail(event: TimelineEvent): string {
+  if (event.type !== 'session.state') return '';
+  for (const key of ['error', 'message', 'errorReason'] as const) {
+    const value = event.payload[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
 }
 
 function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean): string[] {
@@ -859,6 +875,8 @@ interface SelectionMenu {
   anchorClientX: number;
   anchorClientY: number;
   text: string;
+  /** eventId of the message the menu was opened on, if any — enables "Delete message". */
+  eventId?: string;
 }
 
 const FILE_PANEL_MIN = 220;
@@ -1299,6 +1317,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
+  const [revealingOlder, setRevealingOlder] = useState(false);
+  const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
   // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
@@ -1361,10 +1381,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       if (p.pending === true || p.failed === true) continue;
       const text = typeof p.text === 'string' ? p.text : '';
       if (!text.trim()) continue;
-      return { eventId: e.eventId, text };
+      return { eventId: e.eventId, text, ts: e.ts, actorLabel: formatSharedActorLabel(t, p.sharedActor) };
     }
     return null;
-  }, [events]);
+  }, [events, t]);
   // Reset the expand state whenever the pinned target changes so a new
   // message never inherits the expanded state of an older one.
   useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
@@ -1466,6 +1486,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     const viewMode = previewViewMode ?? (preferDiff ? 'diff' : 'source');
     onPreviewFile({
       path: resolvedPath,
+      sessionName: sessionId ?? undefined,
       preferDiff: viewMode === 'diff' && preferDiff,
       previewViewMode: viewMode,
       preview: { status: 'loading', path: resolvedPath },
@@ -1482,12 +1503,35 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     openFilePreview(path, preferDiff);
   }, [openFilePreview]);
 
+  const mapPreviewDispatchError = useCallback((err: unknown): string => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('WebSocket not connected') || msg.includes('daemon_offline') || msg.includes('503')) {
+      return t('upload.daemon_offline');
+    }
+    return t('file_browser.preview_error');
+  }, [t]);
+
   const handleHtmlPreview = useCallback((path: string) => {
-    if (!ws || typeof ws.fsReadFile !== 'function') return;
     const resolvedPath = resolvePreviewPath(path, workdir);
-    const requestId = ws.fsReadFile(resolvedPath);
-    setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
-  }, [workdir, ws]);
+    if (!ws || typeof ws.fsReadFile !== 'function') {
+      setHtmlFullscreenPreview({
+        status: 'error',
+        path: resolvedPath,
+        error: t('file_browser.preview_error'),
+      });
+      return;
+    }
+    try {
+      const requestId = ws.fsReadFile(resolvedPath);
+      setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+    } catch (err) {
+      setHtmlFullscreenPreview({
+        status: 'error',
+        path: resolvedPath,
+        error: mapPreviewDispatchError(err),
+      });
+    }
+  }, [mapPreviewDispatchError, t, workdir, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1505,7 +1549,8 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
         }
-        return { status: 'ok', path: current.path, content: msg.content ?? '' };
+        const next = { status: 'ok' as const, path: current.path, content: msg.content ?? '' };
+        return openHtmlPreviewInNewWindow(next) ? null : next;
       });
     });
   }, [t, ws]);
@@ -1708,8 +1753,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
 
   useEffect(() => {
+    if (revealingOlderTimerRef.current) {
+      clearTimeout(revealingOlderTimerRef.current);
+      revealingOlderTimerRef.current = null;
+    }
+    setRevealingOlder(false);
     setRenderItemLimit(CHAT_INITIAL_RENDER_ITEM_LIMIT);
   }, [sessionId]);
+
+  useEffect(() => () => {
+    if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+  }, []);
 
   const markProgrammaticScroll = () => {
     // Bounded one-shot: skip exactly one upcoming synthetic scroll event.
@@ -1717,6 +1771,16 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     // Watchdog: if the synthetic event is throttled or never fires, release
     // the guard after 200ms so legitimate user input never gets swallowed.
     programmaticIgnoreUntilRef.current = Date.now() + 200;
+  };
+
+  const revealHiddenOlderItems = () => {
+    if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
+    setRevealingOlder(true);
+    setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+    revealingOlderTimerRef.current = setTimeout(() => {
+      revealingOlderTimerRef.current = null;
+      setRevealingOlder(false);
+    }, 450);
   };
 
   // Pure motion + optional policy. Default `engageFollow=true` preserves the
@@ -2098,10 +2162,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;
-        scrollAnchorRef.current = { scrollHeight };
         if (hiddenRenderedItemCount > 0) {
-          setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+          revealHiddenOlderItems();
         } else {
+          scrollAnchorRef.current = { scrollHeight };
           onLoadOlder?.();
         }
       }
@@ -2244,11 +2308,17 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     if (!mainRect) return;
     const position = positionChatActionMenu(clientX, clientY, mainRect);
     menuOpenedAtRef.current = Date.now();
+    // Resolve the message this menu was opened on so we can offer "Delete message".
+    // The id lives on the `.chat-event` wrapper (user msgs) or a descendant (assistant block).
+    const eventId = target.getAttribute('data-event-id')
+      ?? target.querySelector('[data-event-id]')?.getAttribute('data-event-id')
+      ?? undefined;
     setCtxMenu({
       ...position,
       anchorClientX: clientX,
       anchorClientY: clientY,
       text,
+      eventId,
     });
   }, [getActionMenuContainerRect]);
 
@@ -2521,7 +2591,13 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               }
             }}
           >
-            <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+            <span class="chat-pinned-last-sent-meta">
+              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              {lastSentUserMessage.actorLabel && (
+                <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
+              )}
+              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts)}</span>
+            </span>
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
         )}
@@ -2605,23 +2681,28 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
             </div>
           )}
-          {!loading && !preview && viewItems.length > 0 && (hiddenRenderedItemCount > 0 || (onLoadOlder && hasOlderHistory)) && (
+          {!loading && !preview && viewItems.length > 0 && (loadingOlder || revealingOlder) && (
+            <div class="chat-load-older-status" role="status" aria-live="polite">
+              <span class="chat-refreshing-spinner" aria-hidden="true" />
+              <span>{t('chat.loading_older')}</span>
+            </div>
+          )}
+          {!loading && !preview && viewItems.length > 0 && (hiddenRenderedItemCount > 0 || (!loadingOlder && onLoadOlder && hasOlderHistory)) && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button
                 class="btn btn-sm"
                 style={{ fontSize: 11, opacity: 0.7 }}
                 onClick={() => {
                   const el = scrollRef.current;
-                  if (el) scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
                   if (hiddenRenderedItemCount > 0) {
-                    setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
+                    revealHiddenOlderItems();
                   } else {
+                    if (el) scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
                     onLoadOlder?.();
                   }
                 }}
-                disabled={hiddenRenderedItemCount === 0 && loadingOlder}
               >
-                {hiddenRenderedItemCount === 0 && loadingOlder ? t('chat.loading_older') : t('chat.load_older')}
+                {t('chat.load_older')}
               </button>
             </div>
           )}
@@ -2766,6 +2847,27 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               </button>
               </>
             )}
+            {ctxMenu.eventId && ws && sessionId && (
+              <button
+                class="chat-sel-btn"
+                style={{ color: '#e5484d' }}
+                onClick={() => {
+                  const eid = ctxMenu.eventId;
+                  if (!eid || !sessionId || !ws) return;
+                  // Destructive + global → keep an explicit confirmation (no click-to-delete).
+                  if (!window.confirm(t('chat.delete_message_confirm'))) return;
+                  try {
+                    ws.deleteTimelineMessage(sessionId, eid);
+                  } catch (err) {
+                    console.warn('delete timeline message failed', err);
+                  }
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {t('chat.delete_message')}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -2789,6 +2891,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             <FileBrowser
               ws={ws}
               serverId={serverId}
+              sessionName={sessionId ?? undefined}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}
@@ -2899,6 +3002,10 @@ function ToolCallGroup({
   const first = events[0];
   const last = events.length > 1 ? events[events.length - 1] : null;
   const middle = events.slice(1, last ? -1 : undefined);
+
+  // Defensive: an empty consolidated group would crash ChatEvent on
+  // `event.type` and take the whole session pane down with it.
+  if (!first) return null;
 
   return (
     <div class="chat-tool-group">
@@ -3062,11 +3169,17 @@ const ChatEvent = memo(function ChatEvent({
       const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
+      const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
       return (
         // data-event-id lets the pinned-last-message banner target this bubble
         // with an IntersectionObserver so the banner only shows when the real
         // bubble has scrolled off the top of the viewport.
         <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
+          {sharedActorLabel && (
+            <div class="chat-shared-actor-label" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </div>
+          )}
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
           ))}
@@ -3186,10 +3299,17 @@ const ChatEvent = memo(function ChatEvent({
         : isUserCompactFeedback
           ? t('session.state_compacting')
           : (stateLabel[state] ?? state);
+      const errorDetail = getSessionStateDetail(event);
+      const displayLabel = errorDetail
+        ? t('session.state_error_detail', {
+            error: errorDetail,
+            defaultValue: 'Error: {{error}}',
+          })
+        : label;
       const inline = state === 'idle' || state === 'running';
       return (
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
-          <span>{label}</span>
+          <span>{displayLabel}</span>
           {inline
             ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
             : <ChatTime ts={event.ts} />}

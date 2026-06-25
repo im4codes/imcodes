@@ -88,6 +88,16 @@ describe('normalizeTodoInput', () => {
     ]);
   });
 
+  it('normalizes CC SDK update_plan bare arrays ([{content,status}])', () => {
+    expect(normalizeTodoInput([
+      { content: '梳理重启恢复入口和活跃信号', status: 'in_progress' },
+      { content: '实现优先/延迟恢复与提示语', status: 'pending' },
+    ])).toEqual([
+      { text: '梳理重启恢复入口和活跃信号', status: 'in_progress' },
+      { text: '实现优先/延迟恢复与提示语', status: 'pending' },
+    ]);
+  });
+
   it('returns null for non-checklist input and empty array for a cleared list', () => {
     expect(normalizeTodoInput({ file_path: '/x', content: 'hi' })).toBeNull();
     expect(normalizeTodoInput(undefined)).toBeNull();
@@ -118,6 +128,8 @@ describe('deriveLatestTodoList', () => {
   it('detects update_plan by known checklist tool name', () => {
     const byName = deriveLatestTodoList([toolCall({ plan: [{ step: 'X', status: 'pending' }] }, 'update_plan')]);
     expect(byName?.items).toEqual([{ text: 'X', status: 'pending' }]);
+    const bareArray = deriveLatestTodoList([toolCall([{ content: 'Y', status: 'done' }], 'updatePlan')]);
+    expect(bareArray?.items).toEqual([{ text: 'Y', status: 'completed' }]);
     const unknownTool = deriveLatestTodoList([toolCall({ todos: [{ content: 'Y', status: 'done' }] }, 'mystery_tool')]);
     expect(unknownTool).toBeNull();
   });

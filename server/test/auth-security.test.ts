@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
+import { COOKIE_SESSION } from '../../shared/cookie-names.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
@@ -160,6 +161,32 @@ async function seedRefreshToken(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe('share ticket auth boundary', () => {
+  it('does not accept share-ws-ticket JWTs as ordinary API auth', async () => {
+    const env = makeEnv();
+    const { resolveAuth } = await import('../src/security/authorization.js');
+    const { signJwt } = await import('../src/security/crypto.js');
+    const token = signJwt({
+      type: 'share-ws-ticket',
+      sub: 'user-share',
+      serverId: 'srv-1',
+      target: { kind: 'server', serverId: 'srv-1' },
+    }, env.JWT_SIGNING_KEY, 60);
+
+    const bearerAuth = await resolveAuth({
+      env,
+      req: { header: (name: string) => name.toLowerCase() === 'authorization' ? `Bearer ${token}` : undefined },
+    } as never);
+    const cookieAuth = await resolveAuth({
+      env,
+      req: { header: (name: string) => name.toLowerCase() === 'cookie' ? `${COOKIE_SESSION}=${encodeURIComponent(token)}` : undefined },
+    } as never);
+
+    expect(bearerAuth).toBeNull();
+    expect(cookieAuth).toBeNull();
+  });
+});
 
 describe('Fix 1: rcc_refresh cookie path', () => {
   let app: ReturnType<typeof buildApp>;

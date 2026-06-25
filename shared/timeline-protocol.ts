@@ -8,6 +8,9 @@ export const TIMELINE_MESSAGES = {
   DETAIL_REQUEST: 'timeline.detail_request',
   DETAIL: 'timeline.detail',
   EVENT: 'timeline.event',
+  /** Web → daemon: globally delete (hide) one timeline message for every viewer,
+   *  durably across refresh/restart. Acked via the normal `command.ack`. */
+  DELETE: 'timeline.delete',
 } as const;
 
 export type TimelineMessageType = (typeof TIMELINE_MESSAGES)[keyof typeof TIMELINE_MESSAGES];

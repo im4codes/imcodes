@@ -1,5 +1,11 @@
 import type { Database } from './client.js';
 import type { ContextModelConfig } from '../../../shared/context-types.js';
+import type {
+  ShareAuthorizationSnapshot,
+  SharedActorEnvelope,
+  ShareTarget,
+} from '../../../shared/tab-sharing.js';
+import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -791,13 +797,92 @@ export interface DbSubSession {
   active_model: string | null;
   effort: string | null;
   transport_config: Record<string, unknown> | string | null;
+  execution_clone_metadata: Record<string, unknown> | string | null;
+  /**
+   * Projected from `execution_clone_metadata` by {@link projectSubSessionRow}.
+   * Present only for execution-clone rows; lets the grouped execution-detail
+   * view discriminate clones and group them by `parentRunId`. Never persisted
+   * as its own column.
+   */
+  executionCloneKind?: typeof EXECUTION_CLONE_KIND;
+  /** Projected parent run id from `execution_clone_metadata`; clones only. */
+  parentRunId?: string;
 }
 
-export async function getSubSessionsByServer(db: Database, serverId: string): Promise<DbSubSession[]> {
-  return db.query<DbSubSession>(
+/**
+ * Coerce the `execution_clone_metadata` JSONB column (which the driver may hand
+ * back as a parsed object OR a raw JSON string) into a plain record, or null.
+ */
+function coerceExecutionCloneMetadata(
+  raw: Record<string, unknown> | string | null | undefined,
+): Record<string, unknown> | null {
+  if (raw == null) return null;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  return null;
+}
+
+/**
+ * Pure predicate: is this sub-session row a dedicated execution clone? True only
+ * when `execution_clone_metadata.kind === EXECUTION_CLONE_KIND`. Tolerant of the
+ * column arriving as either a parsed object or a JSON string.
+ */
+export function isExecutionCloneRow(row: Pick<DbSubSession, 'execution_clone_metadata'>): boolean {
+  const meta = coerceExecutionCloneMetadata(row.execution_clone_metadata);
+  return meta?.kind === EXECUTION_CLONE_KIND;
+}
+
+/**
+ * Pure projection: derive `executionCloneKind` / `parentRunId` from
+ * `execution_clone_metadata` onto a copy of the row. Non-clone rows are returned
+ * with the projected fields absent. Existing fields are preserved verbatim.
+ */
+export function projectSubSessionRow(row: DbSubSession): DbSubSession {
+  const meta = coerceExecutionCloneMetadata(row.execution_clone_metadata);
+  if (meta?.kind !== EXECUTION_CLONE_KIND) return row;
+  const parentRunId = typeof meta.parentRunId === 'string' ? meta.parentRunId : undefined;
+  return {
+    ...row,
+    executionCloneKind: EXECUTION_CLONE_KIND,
+    ...(parentRunId !== undefined ? { parentRunId } : {}),
+  };
+}
+
+export interface GetSubSessionsOptions {
+  /**
+   * When false (default), execution clones
+   * (`execution_clone_metadata.kind === 'execution_clone'`) are EXCLUDED so they
+   * never clutter the normal session/sub-session listing surfaces. Set true only
+   * for the grouped execution-detail projection, which groups by `parentRunId`.
+   */
+  includeExecutionClones?: boolean;
+}
+
+export async function getSubSessionsByServer(
+  db: Database,
+  serverId: string,
+  opts?: GetSubSessionsOptions,
+): Promise<DbSubSession[]> {
+  const rows = await db.query<DbSubSession>(
     'SELECT * FROM sub_sessions WHERE server_id = $1 AND closed_at IS NULL ORDER BY sort_order ASC NULLS LAST, created_at ASC',
     [serverId],
   );
+  const includeClones = opts?.includeExecutionClones === true;
+  const result: DbSubSession[] = [];
+  for (const row of rows) {
+    if (!includeClones && isExecutionCloneRow(row)) continue;
+    result.push(projectSubSessionRow(row));
+  }
+  return result;
 }
 
 export async function getSubSessionByProviderSessionId(
@@ -838,12 +923,18 @@ export async function createSubSession(
   activeModel: string | null = null,
   effort: string | null = null,
   transportConfig: Record<string, unknown> | null = null,
+  executionCloneMetadata: Record<string, unknown> | null = null,
 ): Promise<DbSubSession> {
   const now = Date.now();
+  // Clone-aware identity upsert: when the INCOMING row is an execution clone
+  // (its execution_clone_metadata.kind === 'execution_clone'), the runtime
+  // identity columns are written from EXCLUDED (expected NULL) WITHOUT the
+  // COALESCE fallback to the prior row — so stale identity never survives a
+  // conflict for a clone. Non-clone rows keep the existing COALESCE behavior.
   await db.execute(
-    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config)
-     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb)
-     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id), gemini_session_id = COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id), parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id), description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END`,
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config, execution_clone_metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21::jsonb)
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.cc_session_id ELSE COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id) END, gemini_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.gemini_session_id ELSE COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id) END, parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.provider_session_id ELSE COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id) END, description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END, execution_clone_metadata = EXCLUDED.execution_clone_metadata`,
     [
       id,
       serverId,
@@ -865,6 +956,7 @@ export async function createSubSession(
       activeModel,
       effort,
       JSON.stringify(transportConfig ?? {}),
+      executionCloneMetadata == null ? null : JSON.stringify(executionCloneMetadata),
     ],
   );
   return {
@@ -890,6 +982,7 @@ export async function createSubSession(
     active_model: activeModel,
     effort,
     transport_config: transportConfig ?? {},
+    execution_clone_metadata: executionCloneMetadata,
   };
 }
 
@@ -1116,6 +1209,17 @@ export interface DbOrchestrationRun {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  scope_kind?: ShareTarget['kind'] | null;
+  scope_server_id?: string | null;
+  scope_session_name?: string | null;
+  scope_sub_session_id?: string | null;
+  created_by_user_id?: string | null;
+  authorization_snapshot?: ShareAuthorizationSnapshot | string | null;
+  primary_share_id?: string | null;
+  covering_share_ids?: string[] | string | null;
+  visible_after_ms?: number | null;
+  history_cutoff_at_ms?: number | null;
+  share_target_snapshot?: ShareTarget | string | null;
 }
 
 export async function upsertOrchestrationRun(db: Database, r: DbOrchestrationRun): Promise<void> {
@@ -1123,8 +1227,12 @@ export async function upsertOrchestrationRun(db: Database, r: DbOrchestrationRun
     INSERT INTO discussion_orchestration_runs
       (id, discussion_id, server_id, main_session, initiator_session, current_target_session, final_return_session,
        remaining_targets, mode_key, status, request_message_id, callback_message_id, context_ref, timeout_ms,
-       result_summary, error, progress_snapshot, created_at, updated_at, completed_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb, $18, $19, $20)
+       result_summary, error, progress_snapshot, created_at, updated_at, completed_at,
+       scope_kind, scope_server_id, scope_session_name, scope_sub_session_id, created_by_user_id,
+       authorization_snapshot, primary_share_id, covering_share_ids, visible_after_ms,
+       history_cutoff_at_ms, share_target_snapshot)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb, $18, $19, $20,
+            $21, $22, $23, $24, $25, $26::jsonb, $27, $28::jsonb, $29, $30, $31::jsonb)
     ON CONFLICT (id, server_id) DO UPDATE SET
       current_target_session = EXCLUDED.current_target_session,
       remaining_targets = EXCLUDED.remaining_targets,
@@ -1134,11 +1242,39 @@ export async function upsertOrchestrationRun(db: Database, r: DbOrchestrationRun
       error = EXCLUDED.error,
       progress_snapshot = EXCLUDED.progress_snapshot,
       updated_at = EXCLUDED.updated_at,
-      completed_at = EXCLUDED.completed_at
+      completed_at = EXCLUDED.completed_at,
+      scope_kind = COALESCE(EXCLUDED.scope_kind, discussion_orchestration_runs.scope_kind),
+      scope_server_id = COALESCE(EXCLUDED.scope_server_id, discussion_orchestration_runs.scope_server_id),
+      scope_session_name = COALESCE(EXCLUDED.scope_session_name, discussion_orchestration_runs.scope_session_name),
+      scope_sub_session_id = COALESCE(EXCLUDED.scope_sub_session_id, discussion_orchestration_runs.scope_sub_session_id),
+      created_by_user_id = COALESCE(EXCLUDED.created_by_user_id, discussion_orchestration_runs.created_by_user_id),
+      authorization_snapshot = COALESCE(EXCLUDED.authorization_snapshot, discussion_orchestration_runs.authorization_snapshot),
+      primary_share_id = COALESCE(EXCLUDED.primary_share_id, discussion_orchestration_runs.primary_share_id),
+      covering_share_ids = CASE
+        WHEN EXCLUDED.scope_kind IS NULL
+          AND EXCLUDED.authorization_snapshot IS NULL
+          AND EXCLUDED.primary_share_id IS NULL
+        THEN discussion_orchestration_runs.covering_share_ids
+        ELSE EXCLUDED.covering_share_ids
+      END,
+      visible_after_ms = COALESCE(EXCLUDED.visible_after_ms, discussion_orchestration_runs.visible_after_ms),
+      history_cutoff_at_ms = COALESCE(EXCLUDED.history_cutoff_at_ms, discussion_orchestration_runs.history_cutoff_at_ms),
+      share_target_snapshot = COALESCE(EXCLUDED.share_target_snapshot, discussion_orchestration_runs.share_target_snapshot)
   `, [
     r.id, r.discussion_id, r.server_id, r.main_session, r.initiator_session, r.current_target_session, r.final_return_session,
     r.remaining_targets, r.mode_key, r.status, r.request_message_id, r.callback_message_id, r.context_ref, r.timeout_ms,
     r.result_summary, r.error, r.progress_snapshot, r.created_at, r.updated_at, r.completed_at,
+    r.scope_kind ?? null,
+    r.scope_server_id ?? null,
+    r.scope_session_name ?? null,
+    r.scope_sub_session_id ?? null,
+    r.created_by_user_id ?? null,
+    r.authorization_snapshot == null ? null : JSON.stringify(r.authorization_snapshot),
+    r.primary_share_id ?? null,
+    r.covering_share_ids == null ? JSON.stringify([]) : JSON.stringify(r.covering_share_ids),
+    r.visible_after_ms ?? null,
+    r.history_cutoff_at_ms ?? null,
+    r.share_target_snapshot == null ? null : JSON.stringify(r.share_target_snapshot),
   ]);
 }
 
@@ -1164,6 +1300,115 @@ export async function getRecentOrchestrationRuns(db: Database, serverId: string,
   return db.query<DbOrchestrationRun>(
     'SELECT * FROM discussion_orchestration_runs WHERE server_id = $1 ORDER BY updated_at DESC LIMIT $2',
     [serverId, limit],
+  );
+}
+
+export async function getShareScopedOrchestrationRunsByDiscussion(db: Database, discussionId: string, serverId: string): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE discussion_id = $1 AND server_id = $2 AND scope_kind IS NOT NULL ORDER BY created_at DESC',
+    [discussionId, serverId],
+  );
+}
+
+export async function getShareScopedRecentOrchestrationRuns(db: Database, serverId: string, limit = 50): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE server_id = $1 AND scope_kind IS NOT NULL ORDER BY updated_at DESC LIMIT $2',
+    [serverId, limit],
+  );
+}
+
+export async function getShareScopedOrchestrationRunById(db: Database, id: string, serverId: string): Promise<DbOrchestrationRun | null> {
+  return db.queryOne<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE id = $1 AND server_id = $2 AND scope_kind IS NOT NULL',
+    [id, serverId],
+  );
+}
+
+export interface DbDiscussionComment {
+  id: string;
+  server_id: string;
+  thread_id: string | null;
+  scope_kind: ShareTarget['kind'];
+  scope_server_id: string;
+  scope_session_name: string | null;
+  scope_sub_session_id: string | null;
+  created_by_user_id: string;
+  actor_envelope: SharedActorEnvelope | string;
+  authorization_snapshot: ShareAuthorizationSnapshot | string;
+  primary_share_id: string | null;
+  covering_share_ids: string[] | string;
+  visible_after_ms: number;
+  history_cutoff_at_ms: number;
+  body: string;
+  created_at: number;
+}
+
+export async function insertDiscussionComment(db: Database, params: {
+  id: string;
+  serverId: string;
+  threadId?: string | null;
+  scope: ShareTarget;
+  createdByUserId: string;
+  actorEnvelope: SharedActorEnvelope;
+  authorizationSnapshot: ShareAuthorizationSnapshot;
+  body: string;
+  createdAt: number;
+}): Promise<DbDiscussionComment> {
+  await db.execute(
+    `INSERT INTO discussion_comments (
+       id, server_id, thread_id, scope_kind, scope_server_id, scope_session_name,
+       scope_sub_session_id, created_by_user_id, actor_envelope, authorization_snapshot,
+       primary_share_id, covering_share_ids, visible_after_ms, history_cutoff_at_ms,
+       body, created_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12::jsonb, $13, $14, $15, $16)`,
+    [
+      params.id,
+      params.serverId,
+      params.threadId ?? null,
+      params.scope.kind,
+      params.scope.serverId,
+      params.scope.kind === 'main' ? params.scope.sessionName : null,
+      params.scope.kind === 'subsession' ? params.scope.subSessionId : null,
+      params.createdByUserId,
+      JSON.stringify(params.actorEnvelope),
+      JSON.stringify(params.authorizationSnapshot),
+      params.authorizationSnapshot.primaryShareId,
+      JSON.stringify(params.authorizationSnapshot.coveringShareIds),
+      params.createdAt,
+      params.authorizationSnapshot.historyCutoffAt,
+      params.body,
+      params.createdAt,
+    ],
+  );
+  const row = await db.queryOne<DbDiscussionComment>(
+    'SELECT * FROM discussion_comments WHERE id = $1 AND server_id = $2',
+    [params.id, params.serverId],
+  );
+  if (!row) throw new Error('discussion_comment_insert_failed');
+  return row;
+}
+
+export async function getDiscussionCommentsByThread(db: Database, serverId: string, threadId: string): Promise<DbDiscussionComment[]> {
+  return db.query<DbDiscussionComment>(
+    'SELECT * FROM discussion_comments WHERE server_id = $1 AND thread_id = $2 ORDER BY created_at ASC',
+    [serverId, threadId],
+  );
+}
+
+export async function getDiscussionCommentsByScope(db: Database, serverId: string, scope: ShareTarget): Promise<DbDiscussionComment[]> {
+  const scopeSessionName = scope.kind === 'main' ? scope.sessionName : null;
+  const scopeSubSessionId = scope.kind === 'subsession' ? scope.subSessionId : null;
+  return db.query<DbDiscussionComment>(
+    `SELECT *
+       FROM discussion_comments
+      WHERE server_id = $1
+        AND scope_kind = $2
+        AND scope_server_id = $3
+        AND ($4::text IS NULL OR scope_session_name = $4)
+        AND ($5::text IS NULL OR scope_sub_session_id = $5)
+      ORDER BY created_at ASC`,
+    [serverId, scope.kind, scope.serverId, scopeSessionName, scopeSubSessionId],
   );
 }
 

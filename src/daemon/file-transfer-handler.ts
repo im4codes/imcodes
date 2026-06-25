@@ -2,7 +2,7 @@
  * Daemon-side file transfer handler.
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
-import { createWriteStream, realpathSync } from 'node:fs';
+import { createReadStream, createWriteStream, realpathSync } from 'node:fs';
 import { mkdir, writeFile, readFile, readdir, stat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -12,6 +12,7 @@ import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_MSG,
   type AttachmentRef,
   type FileUploadRequest,
   type FileUploadFetchRequest,
@@ -19,7 +20,9 @@ import {
   type FileUploadError,
   type FileUploadProgress,
   type FileDownloadRequest,
+  type FileDownloadStreamRequest,
   type FileDownloadDone,
+  type FileDownloadStreamReady,
   type FileDownloadError,
 } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -54,6 +57,14 @@ interface AttachmentEntry {
   expiresAt: number;
 }
 
+interface DownloadTarget {
+  entry: AttachmentEntry;
+  readPath: string;
+  filename: string;
+  mime?: string;
+  size: number;
+}
+
 const attachmentRegistry = new Map<string, AttachmentEntry>();
 
 function randomHex(bytes: number): string {
@@ -84,6 +95,81 @@ function isNotFoundError(err: unknown): boolean {
 
 function sanitizeLocalDownloadError(err: unknown): LocalDownloadErrorMessage {
   return isNotFoundError(err) ? 'not_found' : 'download_failed';
+}
+
+function sendDownloadError(
+  serverLink: ServerLink,
+  downloadId: string,
+  attachmentId: string,
+  entry: AttachmentEntry | undefined,
+  err: unknown,
+): void {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  logger.error({ downloadId, attachmentId, err }, 'File download failed');
+  const response: FileDownloadError = {
+    type: 'file.download_error',
+    downloadId,
+    message: entry?.source === 'local'
+      ? sanitizeLocalDownloadError(err)
+      : (errMsg.includes('ENOENT') ? 'not_found' : errMsg),
+  };
+  serverLink.send(response);
+}
+
+async function resolveDownloadTarget(
+  attachmentId: string,
+  serverLink: ServerLink,
+  downloadId: string,
+): Promise<DownloadTarget | null> {
+  const entry = attachmentRegistry.get(attachmentId);
+
+  if (!entry) {
+    const response: FileDownloadError = {
+      type: 'file.download_error',
+      downloadId,
+      message: 'not_found',
+    };
+    serverLink.send(response);
+    return null;
+  }
+
+  if (Date.now() > entry.expiresAt) {
+    attachmentRegistry.delete(attachmentId);
+    const response: FileDownloadError = {
+      type: 'file.download_error',
+      downloadId,
+      message: 'expired',
+    };
+    serverLink.send(response);
+    return null;
+  }
+
+  const resolved = path.resolve(entry.daemonPath);
+  const uploadDirResolved = path.resolve(UPLOAD_DIR);
+  const isUpload = resolved.startsWith(uploadDirResolved + path.sep);
+  if (!isUpload && entry.source !== 'local') {
+    const response: FileDownloadError = {
+      type: 'file.download_error',
+      downloadId,
+      message: 'not_found',
+    };
+    serverLink.send(response);
+    return null;
+  }
+
+  const readPath = entry.source === 'local'
+    ? await validateProjectFilePath(entry.daemonPath)
+    : resolved;
+  const fileStat = await stat(readPath);
+  if (!fileStat.isFile()) throw new Error('download_failed');
+
+  return {
+    entry,
+    readPath,
+    filename: entry.originalName || attachmentId,
+    mime: entry.mime,
+    size: fileStat.size,
+  };
 }
 
 function resolveUploadPath(filename: string): string {
@@ -351,77 +437,87 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
 
 // ── Download ────────────────────────────────────────────────────────────────
 
+/**
+ * Read a download target fully and send it back INLINE as base64 over the daemon
+ * WS (`file.download_done`). Shared by the legacy `file.download` path and the
+ * small-file fast path of `handleFileDownloadStream` — for small files a single
+ * inline round-trip is far faster than the relay's PUT + readiness handshake
+ * (repo rule: never copy code).
+ */
+async function sendInlineDownload(serverLink: ServerLink, downloadId: string, target: DownloadTarget): Promise<void> {
+  const buffer = await readFile(target.readPath);
+  const response: FileDownloadDone = {
+    type: 'file.download_done',
+    downloadId,
+    content: buffer.toString('base64'),
+    mime: target.mime,
+    filename: target.filename,
+    size: buffer.length,
+  };
+  serverLink.send(response);
+}
+
 export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const msg = cmd as unknown as FileDownloadRequest;
   const { downloadId, attachmentId } = msg;
-  let entry: AttachmentEntry | undefined;
+  let target: DownloadTarget | null = null;
 
   try {
-    entry = attachmentRegistry.get(attachmentId);
-
-    if (!entry) {
-      const response: FileDownloadError = {
-        type: 'file.download_error',
-        downloadId,
-        message: 'not_found',
-      };
-      serverLink.send(response);
-      return;
-    }
-
-    // Check expiry
-    if (Date.now() > entry.expiresAt) {
-      attachmentRegistry.delete(attachmentId);
-      const response: FileDownloadError = {
-        type: 'file.download_error',
-        downloadId,
-        message: 'expired',
-      };
-      serverLink.send(response);
-      return;
-    }
-
-    // Validate path is in allowed ranges
-    const resolved = path.resolve(entry.daemonPath);
-    const uploadDirResolved = path.resolve(UPLOAD_DIR);
-    const isUpload = resolved.startsWith(uploadDirResolved + path.sep);
-    // For 'local' source, the path must exist and is validated at handle creation time
-    if (!isUpload && entry.source !== 'local') {
-      const response: FileDownloadError = {
-        type: 'file.download_error',
-        downloadId,
-        message: 'not_found',
-      };
-      serverLink.send(response);
-      return;
-    }
-
-    const readPath = entry.source === 'local'
-      ? await validateProjectFilePath(entry.daemonPath)
-      : resolved;
-    const buffer = await readFile(readPath);
-    const content = buffer.toString('base64');
-
-    const response: FileDownloadDone = {
-      type: 'file.download_done',
-      downloadId,
-      content,
-      mime: entry.mime,
-      filename: entry.originalName || attachmentId,
-      size: buffer.length,
-    };
-    serverLink.send(response);
+    target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
+    if (!target) return;
+    await sendInlineDownload(serverLink, downloadId, target);
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error({ downloadId, attachmentId, err }, 'File download failed');
-    const response: FileDownloadError = {
-      type: 'file.download_error',
+    sendDownloadError(serverLink, downloadId, attachmentId, target?.entry, err);
+  }
+}
+
+export async function handleFileDownloadStream(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const msg = cmd as unknown as FileDownloadStreamRequest;
+  const { downloadId, attachmentId, uploadUrl } = msg;
+  let target: DownloadTarget | null = null;
+
+  try {
+    if (!uploadUrl || typeof uploadUrl !== 'string') {
+      throw new Error('missing_upload_url');
+    }
+    target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
+    if (!target) return;
+
+    // Small files: skip the relay and reply inline in a single round-trip. The
+    // relay's PUT + readiness handshake is pure latency for these (and times out
+    // entirely if the relay is unhealthy), so only genuinely large files stream.
+    // The server returns the inline bytes immediately on receiving this.
+    if (typeof target.size === 'number' && target.size >= 0
+        && target.size <= FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES) {
+      await sendInlineDownload(serverLink, downloadId, target);
+      return;
+    }
+
+    const ready: FileDownloadStreamReady = {
+      type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
       downloadId,
-      message: entry?.source === 'local'
-        ? sanitizeLocalDownloadError(err)
-        : (errMsg.includes('ENOENT') ? 'not_found' : errMsg),
+      mime: target.mime,
+      filename: target.filename,
+      size: target.size,
     };
-    serverLink.send(response);
+    serverLink.send(ready);
+
+    const headers: Record<string, string> = {
+      'content-type': target.mime || 'application/octet-stream',
+      'content-length': String(target.size),
+      'x-imcodes-filename': encodeURIComponent(target.filename),
+    };
+    const response = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers,
+      body: createReadStream(target.readPath) as never,
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+    if (!response.ok) {
+      throw new Error(`relay_upload_${response.status}`);
+    }
+  } catch (err) {
+    sendDownloadError(serverLink, downloadId, attachmentId, target?.entry, err);
   }
 }
 

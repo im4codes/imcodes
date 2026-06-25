@@ -1,4 +1,5 @@
 import type { FsReadErrorCode, FsReadPreviewReason } from '../../../shared/fs-read-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 
 export interface FsEntry {
   name: string;
@@ -12,6 +13,14 @@ export interface FsEntry {
   mime?: string;
   /** Controlled download handle ID (only when includeMetadata requested). */
   downloadId?: string;
+  /** OpenSpec task checkbox summary, only when explicitly requested for openspec/changes. */
+  openSpecTaskStats?: OpenSpecTaskStats;
+}
+
+export interface OpenSpecTaskStats {
+  total: number;
+  checked: number;
+  unchecked: number;
 }
 
 export interface GitStatusEntry {
@@ -96,4 +105,30 @@ export interface FsGitDiffResponse extends FsBaseResponse {
 
 export interface FsMkdirResponse extends FsBaseResponse {
   type: 'fs.mkdir_response';
+}
+
+export interface FsRenameRequest {
+  type: typeof FS_TRANSPORT_MSG.RENAME;
+  requestId: string;
+  path: string;
+  newPath: string;
+  /** Session whose project directory scopes this write, when available. */
+  sessionName?: string;
+}
+
+export interface FsRenameResponse extends FsBaseResponse {
+  type: typeof FS_TRANSPORT_MSG.RENAME_RESPONSE;
+  newPath?: string;
+}
+
+export interface FsDeleteRequest {
+  type: typeof FS_TRANSPORT_MSG.DELETE;
+  requestId: string;
+  path: string;
+  /** Session whose project directory scopes this write, when available. */
+  sessionName?: string;
+}
+
+export interface FsDeleteResponse extends FsBaseResponse {
+  type: typeof FS_TRANSPORT_MSG.DELETE_RESPONSE;
 }

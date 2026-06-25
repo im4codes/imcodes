@@ -161,6 +161,9 @@ describe('SupervisionAutomation', () => {
     // union (escape hatch). Assertions read the rounds from `advanced.advancedRounds`.
     expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
       initiatorSession: 'deck_supervision_brain',
+      launchOrigin: expect.objectContaining({
+        kind: 'supervision',
+      }),
       advanced: expect.objectContaining({
         kind: 'supervision_internal',
         advancedRounds: [expect.objectContaining({

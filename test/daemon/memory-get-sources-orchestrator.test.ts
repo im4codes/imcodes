@@ -31,7 +31,7 @@ function fakeCredentials() {
 }
 
 function localResolvesTo(result: Partial<MemoryGetSourcesResult>): typeof import('../../src/context/memory-read-tools.js').memoryGetSources {
-  return ((projectionId: string) => ({
+  return (async (projectionId: string) => ({
     projectionId,
     sourceEventCount: 0,
     sources: [],

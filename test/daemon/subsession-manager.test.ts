@@ -555,6 +555,45 @@ describe('readSubSessionResponse()', () => {
   });
 });
 
+describe('rebuildSubSessions — transport sessions are lazy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSessionMock.mockReturnValue(null);
+    getTransportRuntimeMock.mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('persists transport sub-session metadata without launching the provider runtime', async () => {
+    await rebuildSubSessions([{
+      id: 'lazy-codex',
+      type: 'codex-sdk',
+      cwd: '/proj',
+      label: 'Cx1',
+      providerSessionId: 'codex-provider-session',
+      requestedModel: 'gpt-5.5',
+      parentSession: 'deck_cd_brain',
+      runtimeType: 'transport',
+    }]);
+
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_lazy-codex',
+      agentType: 'codex-sdk',
+      projectDir: '/proj',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'codex-provider-session',
+      requestedModel: 'gpt-5.5',
+      label: 'Cx1',
+      parentSession: 'deck_cd_brain',
+      state: 'idle',
+    }));
+  });
+});
+
 // ── rebuildSubSessions: geminiSessionId preserved ────────────────────────────
 // Regression: rebuildSubSessions overwrote the session record without
 // geminiSessionId, causing the watcher to fall back to findLatestSessionFile

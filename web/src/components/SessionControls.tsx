@@ -16,6 +16,17 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { buildExecutionTemplateLabel } from '../execution-template-label.js';
+import {
+  OpenSpecAutoDeliverCurrentRunEntry,
+  OpenSpecAutoDeliverDetailsPanel,
+  OpenSpecAutoDeliverLauncher,
+} from './OpenSpecAutoDeliver.js';
+import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
+import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
+import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
+import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
 import {
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
@@ -34,12 +45,15 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
+import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
   COMBO_SEPARATOR,
+  getEnabledP2pMemberNames,
   isComboMode,
+  sanitizeP2pSavedConfig,
 } from '@shared/p2p-modes.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
@@ -65,6 +79,12 @@ import {
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+
+function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 interface Props {
   ws: WsClient | null;
@@ -78,6 +98,8 @@ interface Props {
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
   onSettings?: () => void;
+  /** Called when Share is selected in the send-adjacent more menu. */
+  onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   /** Whether the active session tab is pinned. */
   sessionPinned?: boolean;
   /** Whether stopping the active project is blocked because one of its tabs is pinned. */
@@ -117,13 +139,35 @@ interface Props {
   onSubStop?: () => void;
   /** Legacy prop retained for callers that still pass thinking state for labels/timers. */
   activeThinking?: boolean;
+  /** True while transport timeline tail shows an in-flight turn, even if session.state has not caught up. */
+  activeTransportTurn?: boolean;
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
   /** All sessions — for @ picker agent list. */
   sessions?: SessionInfo[];
-  /** Sub-sessions — for @ picker agent list (includes deck_sub_*). */
-  subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  /** Sub-sessions — for @ picker agent list (includes deck_sub_*).
+   *  `executionTemplateEligible` / `executionTemplateIneligibleReason` are
+   *  DAEMON-AUTHORITATIVE flags (optional; absent on legacy daemons) consumed
+   *  by the OpenSpec Execute dropdown and the Team Settings template picker. */
+  subSessions?: Array<{
+    sessionName: string;
+    type: string;
+    /** Provider/env preset name (e.g. a custom-API preset). Optional/graceful —
+     *  shown in the OpenSpec Execute candidate label when present. */
+    ccPresetId?: string | null;
+    label?: string | null;
+    state: string;
+    parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
+    qwenModel?: string | null;
+    requestedModel?: string | null;
+    activeModel?: string | null;
+    modelDisplay?: string | null;
+    executionTemplateEligible?: boolean;
+    executionTemplateIneligibleReason?: string;
+  }>;
   /** Server ID — required for file upload. */
   serverId?: string;
   /** Optional larger drop target that should behave like the composer upload area. */
@@ -138,6 +182,8 @@ interface Props {
   onPendingPrefillApplied?: () => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
+  /** Whether this full control surface is the active keyboard target for window-level shortcuts. */
+  keyboardActive?: boolean;
   /** Notifies parent when the quick input panel opens/closes. */
   onQuickOpenChange?: (open: boolean) => void;
   /** Notifies parent when any floating overlay/dropdown is open. */
@@ -146,16 +192,93 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
+  /** Reports the current composer text to parent surfaces (e.g. footer actions). */
+  onComposerTextChange?: (text: string) => void;
 }
 
 const MAX_UPLOAD_SIZE_MB = Math.round(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE / (1024 * 1024));
 export const OPENSPEC_LIST_REQUEST_TIMEOUT_MS = 12_000;
 const OPENSPEC_NON_CHANGE_DIR_NAMES = new Set(['archive']);
+// Agent types never offered as execution-clone templates (no cloneable runtime).
+// Mirrors `EXCLUDED_TYPES` in P2pConfigPanel's execution-template scan.
+const OPENSPEC_EXEC_EXCLUDED_TYPES = new Set(['shell', 'script']);
+
+/** OpenSpec Execute candidate label: session short name + SDK (agent type) +
+ *  preset name, so identical-looking workers (w2…wN) are distinguishable. */
+function formatExecLabel(shortName: string, sdk?: string | null, preset?: string | null, model?: string | null): string {
+  return buildExecutionTemplateLabel({
+    shortName,
+    agentType: sdk,
+    ccPreset: preset,
+    modelDisplay: model,
+  });
+}
+
+type OpenSpecTaskStatsSummary = {
+  total: number;
+  checked: number;
+  unchecked: number;
+};
+
+type OpenSpecChangeListItem = {
+  name: string;
+  taskStats?: OpenSpecTaskStatsSummary;
+};
+
+type OpenSpecChangeListCacheEntry = {
+  changes: OpenSpecChangeListItem[];
+};
+
+function buildOpenSpecChangeListCacheKey(serverId: string | undefined, changesPath: string): string {
+  return `${serverId ?? 'local'}:${changesPath.replace(/[\\/]+$/, '')}`;
+}
+
+function normalizeOpenSpecTaskStats(value: unknown): OpenSpecTaskStatsSummary | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as { total?: unknown; checked?: unknown; unchecked?: unknown };
+  const total = typeof record.total === 'number' && Number.isFinite(record.total) ? Math.max(0, Math.trunc(record.total)) : null;
+  const checked = typeof record.checked === 'number' && Number.isFinite(record.checked) ? Math.max(0, Math.trunc(record.checked)) : null;
+  const unchecked = typeof record.unchecked === 'number' && Number.isFinite(record.unchecked) ? Math.max(0, Math.trunc(record.unchecked)) : null;
+  if (total === null || checked === null || unchecked === null) return undefined;
+  const safeChecked = Math.min(checked, total);
+  return {
+    total,
+    checked: safeChecked,
+    unchecked: Math.min(unchecked, total - safeChecked),
+  };
+}
+
+function collectOpenSpecTaskStats(entries: ReadonlyArray<{ isDir?: unknown; name?: unknown; openSpecTaskStats?: unknown }> | undefined): Map<string, OpenSpecTaskStatsSummary> {
+  const stats = new Map<string, OpenSpecTaskStatsSummary>();
+  for (const entry of entries ?? []) {
+    if (entry.isDir !== true || typeof entry.name !== 'string') continue;
+    const normalized = normalizeOpenSpecTaskStats(entry.openSpecTaskStats);
+    if (normalized) stats.set(entry.name, normalized);
+  }
+  return stats;
+}
+
+function openSpecTaskStatsCacheKey(changesPath: string, changeName: string): string {
+  return `${changesPath.replace(/[\\/]+$/, '')}/${changeName}`;
+}
+
+function mergeOpenSpecTaskStats(
+  changes: OpenSpecChangeListItem[],
+  stats: Map<string, OpenSpecTaskStatsSummary> | null,
+): OpenSpecChangeListItem[] {
+  if (!stats || stats.size === 0) return changes;
+  return changes.map((change) => {
+    const taskStats = stats.get(change.name);
+    return taskStats ? { ...change, taskStats } : change;
+  });
+}
+
 const TRANSPORT_QUEUE_HIDDEN_KEY_PREFIX = 'imcodes:transport-queue-hidden:';
 type LocalQueuedTransportEntry = {
   clientMessageId: string;
   text: string;
   status?: 'sending' | 'queued' | 'failed';
+  sharedActor?: SharedActorEnvelope;
 };
 
 function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
@@ -182,10 +305,27 @@ function writeTransportQueueHidden(storageKey: string | null, hidden: boolean): 
   }
 }
 
+function isModalKeyboardOwnerOpen(): boolean {
+  if (typeof document === 'undefined') return false;
+  return !!document.querySelector('[role="dialog"][aria-modal="true"], .fb-lightbox, .html-fullscreen-preview');
+}
+
+function isTextEntryKeyboardOwner(node: EventTarget | Node | null | undefined): boolean {
+  if (!(node instanceof HTMLElement)) return false;
+  const tag = node.tagName;
+  return tag === 'INPUT'
+    || tag === 'TEXTAREA'
+    || tag === 'SELECT'
+    || node.isContentEditable
+    || node.getAttribute('contenteditable') === 'true'
+    || node.classList.contains('xterm-helper-textarea');
+}
+
 type MenuAction = 'restart' | 'new' | 'stop';
-type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
+type ModelChoice = 'fable' | 'opus[1M]' | 'sonnet' | 'haiku';
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
+const IME_ESCAPE_CANCEL_GRACE_MS = 800;
 
 /*
  * R3 v2 PR-ρ — Composer attachments now carry a per-composer sequence
@@ -269,9 +409,15 @@ function appendStoredComposerAttachment(storageKey: string, attachment: Composer
 }
 
 type ComposerUploadSnapshot = {
-  uploading: boolean;
-  progress: number;
+  uploads: ComposerUploadItem[];
   error: string | null;
+};
+
+type ComposerUploadItem = {
+  id: string;
+  name: string;
+  progress: number;
+  status: 'uploading' | 'done' | 'error';
 };
 
 type ComposerUploadEntry = {
@@ -280,11 +426,16 @@ type ComposerUploadEntry = {
 };
 
 const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
-  uploading: false,
-  progress: 0,
+  uploads: [],
   error: null,
 };
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
+let composerUploadIdCounter = 0;
+
+function createComposerUploadId(): string {
+  composerUploadIdCounter += 1;
+  return `upload-${composerUploadIdCounter}`;
+}
 
 function getComposerUploadEntry(key: string): ComposerUploadEntry {
   let entry = composerUploadStore.get(key);
@@ -296,23 +447,54 @@ function getComposerUploadEntry(key: string): ComposerUploadEntry {
 }
 
 function getComposerUploadSnapshot(key: string): ComposerUploadSnapshot {
-  return { ...getComposerUploadEntry(key).snapshot };
+  const snapshot = getComposerUploadEntry(key).snapshot;
+  return { ...snapshot, uploads: snapshot.uploads.map((item) => ({ ...item })) };
 }
 
 function updateComposerUploadSnapshot(key: string, patch: Partial<ComposerUploadSnapshot>): void {
   const entry = getComposerUploadEntry(key);
-  entry.snapshot = { ...entry.snapshot, ...patch };
-  const next = { ...entry.snapshot };
+  entry.snapshot = {
+    ...entry.snapshot,
+    ...patch,
+    uploads: patch.uploads ? patch.uploads.map((item) => ({ ...item })) : entry.snapshot.uploads,
+  };
+  const next = getComposerUploadSnapshot(key);
   for (const listener of entry.listeners) listener(next);
+}
+
+function addComposerUploadItems(key: string, items: ComposerUploadItem[]): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    error: null,
+    uploads: [...entry.snapshot.uploads, ...items],
+  });
+}
+
+function updateComposerUploadItem(key: string, id: string, patch: Partial<ComposerUploadItem>): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.map((item) => (
+      item.id === id ? { ...item, ...patch } : item
+    )),
+  });
+}
+
+function removeComposerUploadItems(key: string, ids: readonly string[]): void {
+  if (ids.length === 0) return;
+  const idSet = new Set(ids);
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.filter((item) => !idSet.has(item.id)),
+  });
 }
 
 function subscribeComposerUploadSnapshot(key: string, listener: (snapshot: ComposerUploadSnapshot) => void): () => void {
   const entry = getComposerUploadEntry(key);
   entry.listeners.add(listener);
-  listener({ ...entry.snapshot });
+  listener(getComposerUploadSnapshot(key));
   return () => {
     entry.listeners.delete(listener);
-    if (entry.listeners.size === 0 && !entry.snapshot.uploading && !entry.snapshot.error) {
+    if (entry.listeners.size === 0 && entry.snapshot.uploads.length === 0 && !entry.snapshot.error) {
       composerUploadStore.delete(key);
     }
   };
@@ -440,7 +622,7 @@ type ManualP2pResolveResult = {
   cleanText: string;
 };
 
-type P2pConfigTab = 'participants' | 'combos' | 'advanced';
+type P2pConfigTab = 'participants' | 'combos' | 'advanced' | 'execution';
 
 type P2pConfigPersistResult = { ok: boolean; error?: string };
 
@@ -594,7 +776,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -618,13 +800,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pConfigInitialTab, setP2pConfigInitialTab] = useState<P2pConfigTab>('participants');
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [openSpecOpen, setOpenSpecOpen] = useState(false);
-  const [openSpecChanges, setOpenSpecChanges] = useState<string[]>([]);
+  const [openSpecChanges, setOpenSpecChanges] = useState<OpenSpecChangeListItem[]>([]);
   const [openSpecLoading, setOpenSpecLoading] = useState(false);
   const [openSpecError, setOpenSpecError] = useState<string | null>(null);
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
   const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
+  // Per-change OpenSpec Execute dropdown: holds the change name whose Execute
+  // menu is open (null = none), mirroring the per-change audit menu state.
+  const [openSpecExecuteMenu, setOpenSpecExecuteMenu] = useState<string | null>(null);
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
   const [openSpecFolderPath, setOpenSpecFolderPath] = useState<string | null>(null);
+  const [openSpecAutoLauncherChange, setOpenSpecAutoLauncherChange] = useState<string | null>(null);
+  const [openSpecAutoLaunchingChange, setOpenSpecAutoLaunchingChange] = useState<string | null>(null);
+  const [openSpecAutoDetailsOpen, setOpenSpecAutoDetailsOpen] = useState(false);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModelPreference);
@@ -644,6 +832,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
+  const queuedMutationRollbackRef = useRef<Map<string, { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }>>(new Map());
+  // Command ids that have reached the timeline (a `user.message` event) and are
+  // therefore NO LONGER queued — the timeline is the authoritative truth for
+  // "delivered". The displayed queue filters these out so a delivered message
+  // can never linger as an undismissable "Queued" zombie even when a stale
+  // daemon `session.state` snapshot still lists it as pending (e.g. the resend /
+  // auto-deliver "queued" emit that isn't superseded until the turn goes idle).
+  // Only DELIVERED ids are added, so in-flight sends (no user.message yet) are
+  // never hidden. Per-session: reset on session switch (the timeline replay
+  // rebuilds it). Bounded to the most recent ids to cap long-session growth.
+  const [settledQueuedIds, setSettledQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -666,33 +866,77 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const openSpecExecuteButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecRequestIdRef = useRef<string | null>(null);
+  const openSpecTaskStatsRequestIdRef = useRef<string | null>(null);
+  const openSpecTaskStatsCacheRef = useRef<Map<string, OpenSpecTaskStatsSummary>>(new Map());
+  const openSpecChangeListCacheRef = useRef<Map<string, OpenSpecChangeListCacheEntry>>(new Map());
   const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
+  const openSpecAutoDeliver = useOpenSpecAutoDeliver({
+    ws,
+    serverId,
+    sessionName: activeSession?.name,
+    openSpecOpen,
+  });
+  const openSpecAutoProjection = openSpecAutoDeliver.projection;
+  const openSpecAutoActive = isOpenSpecAutoDeliverActiveProjection(openSpecAutoProjection);
+  const openSpecAutoActionLockReason = openSpecAutoActive ? t('openspec.auto.lock_manual_actions') : undefined;
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
-    && (isRunningSessionState(activeSession.state) || activeThinking);
+    && (isRunningSessionState(activeSession.state) || activeThinking || activeTransportTurn);
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
         activeSession?.transportPendingMessages,
         activeSession?.name ?? '',
+        {
+          // This is already-normalized session state, not a raw daemon payload.
+          // Keep legacy messages visible when older state lacks structured
+          // entries, but do not synthesize tails for partial structured entries.
+          hasEntriesField: Array.isArray(activeSession?.transportPendingMessageEntries)
+            && (activeSession.transportPendingMessageEntries.length > 0
+              || typeof activeSession.transportPendingMessageVersion === 'number'),
+          hasMessagesField: Array.isArray(activeSession?.transportPendingMessages),
+        },
       )
     : [];
+  const incomingQueuedTransportVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
+    ? activeSession.transportPendingMessageVersion
+    : undefined;
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
-    if (optimisticQueuedEntries === null) return incomingQueuedTransportEntries;
-    if (optimisticQueuedEntries.length === 0) return [];
-    if (incomingQueuedTransportEntries.length === 0) return optimisticQueuedEntries;
-    const byId = new Map<string, LocalQueuedTransportEntry>();
-    for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
-    for (const entry of optimisticQueuedEntries) {
-      byId.set(entry.clientMessageId, entry);
+    let merged: LocalQueuedTransportEntry[];
+    if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
+    else if (optimisticQueuedEntries.length === 0) merged = [];
+    else if (incomingQueuedTransportEntries.length === 0) merged = optimisticQueuedEntries;
+    else {
+      const byId = new Map<string, LocalQueuedTransportEntry>();
+      for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
+      for (const entry of optimisticQueuedEntries) {
+        byId.set(entry.clientMessageId, entry);
+      }
+      merged = [...byId.values()];
     }
-    return [...byId.values()];
-  }, [incomingQueuedTransportEntries, optimisticQueuedEntries]);
+    // Authoritative override: a message that reached the timeline is delivered,
+    // so drop it from the queue even if a stale daemon snapshot still lists it.
+    if (settledQueuedIds.size === 0) return merged;
+    const filtered = merged.filter((entry) => !settledQueuedIds.has(entry.clientMessageId));
+    return filtered.length === merged.length ? merged : filtered;
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds]);
+
+  // Settled ids and optimistic queue overlays are scoped to the active session.
+  // Reset the local overlay on switch; canonical session/app state remains
+  // responsible for retaining or clearing authoritative pending entries.
+  useEffect(() => {
+    setSettledQueuedIds(new Set());
+    setOptimisticQueuedEntries(null);
+    setEditingQueuedMessageId(null);
+    queuedMutationRollbackRef.current.clear();
+    failedQueuedCommandIdsRef.current.clear();
+  }, [activeSession?.name]);
 
   const clearOpenSpecRequestTimer = useCallback(() => {
     if (openSpecRequestTimerRef.current) {
@@ -724,10 +968,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   ), [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
+  const publishComposerText = useCallback((text: string) => {
+    onComposerTextChange?.(text);
+  }, [onComposerTextChange]);
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
   const imeComposingRef = useRef(false);
+  const lastImeCompositionAtRef = useRef(0);
   const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
   const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
@@ -739,8 +987,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
-  const uploading = uploadSnapshot.uploading;
-  const uploadProgress = uploadSnapshot.progress;
+  const uploadRows = uploadSnapshot.uploads;
+  const uploading = uploadRows.some((item) => item.status === 'uploading');
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
@@ -755,12 +1003,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     const el = divRef.current;
     if (!el) return;
-    const handleCompositionStart = () => { imeComposingRef.current = true; };
-    const handleCompositionEnd = () => { imeComposingRef.current = false; };
+    const markImeActivity = () => { lastImeCompositionAtRef.current = Date.now(); };
+    const handleCompositionStart = () => {
+      imeComposingRef.current = true;
+      markImeActivity();
+    };
+    const handleCompositionEnd = () => {
+      imeComposingRef.current = false;
+      markImeActivity();
+    };
     el.addEventListener('compositionstart', handleCompositionStart);
+    el.addEventListener('compositionupdate', markImeActivity);
     el.addEventListener('compositionend', handleCompositionEnd);
     return () => {
       el.removeEventListener('compositionstart', handleCompositionStart);
+      el.removeEventListener('compositionupdate', markImeActivity);
       el.removeEventListener('compositionend', handleCompositionEnd);
     };
   }, []);
@@ -776,6 +1033,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!pendingPrefillText || !divRef.current) return;
     divRef.current.textContent = (divRef.current.textContent || '') + pendingPrefillText;
     setHasText(!!divRef.current.textContent.trim());
+    publishComposerText(divRef.current.textContent ?? '');
     divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
     divRef.current.focus();
     try {
@@ -787,7 +1045,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       sel?.addRange(range);
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
-  }, [pendingPrefillText, onPendingPrefillApplied]);
+  }, [pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -814,12 +1072,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (saved) {
       divRef.current.textContent = saved;
       setHasText(!!saved.trim());
+      publishComposerText(saved);
+    } else {
+      publishComposerText('');
     }
     return () => {
       const text = divRef.current?.textContent ?? '';
       if (draftKey) sessionStorage.setItem(draftKey, text);
     };
-  }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [draftKey, publishComposerText]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setHydratedAttachmentDraftKey(null);
@@ -924,10 +1185,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     && !subSessionId
     && !compact
     && !!onToggleSessionPin;
-  // Input only disabled when there's no session at all (can type while disconnected)
-  const inputDisabled = !hasSession;
-  // Send/action buttons disabled when disconnected or no session
-  const disabled = !connected || !hasSession;
+  const sharedState = activeSession?.sharedState ?? null;
+  const isShareScopedSession = !!sharedState;
+  const canSharedSessionSend = !isShareScopedSession
+    || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+  // Input only disabled when there's no session or the active share cannot dispatch messages.
+  const inputDisabled = !hasSession || !canSharedSessionSend;
+  // Send/action buttons disabled when disconnected, missing a session, or share-scoped direct controls are unavailable.
+  const disabled = !connected || !hasSession || isShareScopedSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
@@ -1142,17 +1407,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
   const lastIncomingQueuedTransportEntriesCountRef = useRef(incomingQueuedTransportEntries.length);
   const lastIncomingQueuedTransportEntryIdsRef = useRef(new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId)));
+  const lastIncomingQueuedTransportVersionRef = useRef(incomingQueuedTransportVersion);
   useEffect(() => {
     if (effectiveRuntimeType !== 'transport') {
       setOptimisticQueuedEntries(null);
       lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
       lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
       lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
+      lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
       return;
     }
     const previousIds = lastIncomingQueuedTransportEntryIdsRef.current;
     const previousCount = lastIncomingQueuedTransportEntriesCountRef.current;
+    const previousVersion = lastIncomingQueuedTransportVersionRef.current;
     const incomingChanged = lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey;
+    const versionChanged = previousVersion !== incomingQueuedTransportVersion;
+    const emptySnapshotAdvanced = incomingQueuedTransportEntries.length === 0
+      && incomingQueuedTransportVersion !== undefined
+      && versionChanged
+      && (
+        previousVersion === undefined
+          ? incomingQueuedTransportVersion > 0
+          : incomingQueuedTransportVersion === 0 || incomingQueuedTransportVersion >= previousVersion
+      );
     if (incomingChanged && incomingQueuedTransportEntries.length > 0) {
       const incomingIds = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
       setOptimisticQueuedEntries((prev) => {
@@ -1160,9 +1437,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const remaining = prev.filter((entry) => !incomingIds.has(entry.clientMessageId));
         return remaining.length > 0 ? remaining : null;
       });
-    } else if (incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) {
+    } else if ((incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) || emptySnapshotAdvanced) {
       setOptimisticQueuedEntries((prev) => {
         if (!prev) return null;
+        if (emptySnapshotAdvanced) return null;
         const remaining = prev.filter((entry) => !previousIds.has(entry.clientMessageId));
         return remaining.length > 0 ? remaining : null;
       });
@@ -1170,7 +1448,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
     lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
     lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
-  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey]);
+    lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion]);
 
   useEffect(() => {
     if (!ws || !activeSession) return;
@@ -1180,11 +1459,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
-          const next = prev.filter((entry) => {
-            if (commandId && entry.clientMessageId === commandId) return false;
-            if (!commandId && normalizedText && normalizeQueuedText(entry.text) === normalizedText) return false;
-            return true;
-          });
+          const matchIndex = commandId
+            ? prev.findIndex((entry) => entry.clientMessageId === commandId)
+            : -1;
+          const fallbackIndex = matchIndex >= 0
+            ? matchIndex
+            : (() => {
+                // If a stable id/command id was provided but did not match, do
+                // not fall back to text: duplicate prompts would remove the
+                // wrong queued card and leave the real one stuck.
+                if (commandId || !normalizedText) return -1;
+                const matches = prev
+                  .map((entry, index) => ({ entry, index }))
+                  .filter(({ entry }) => normalizeQueuedText(entry.text) === normalizedText);
+                return matches.length === 1 ? matches[0].index : -1;
+              })();
+          if (fallbackIndex < 0) return prev;
+          const next = prev.filter((_, index) => index !== fallbackIndex);
           return next.length > 0 ? next : null;
         });
       };
@@ -1204,9 +1495,26 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== activeSession.name) return;
+        const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         if (msg.status === 'error' || msg.status === 'conflict') {
-          markLocalQueuedEntry(msg.commandId, 'failed');
+          if (rollback) {
+            setOptimisticQueuedEntries((prev) => {
+              const source = prev ?? incomingQueuedTransportEntries;
+              if (rollback.type === 'edit') {
+                return source.map((entry) => (
+                  entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
+                ));
+              }
+              if (source.some((entry) => entry.clientMessageId === rollback.entry.clientMessageId)) return source;
+              return [...source, rollback.entry];
+            });
+            queuedMutationRollbackRef.current.delete(msg.commandId);
+          } else {
+            markLocalQueuedEntry(msg.commandId, 'failed');
+          }
         } else {
+          failedQueuedCommandIdsRef.current.delete(msg.commandId);
+          if (rollback) queuedMutationRollbackRef.current.delete(msg.commandId);
           markLocalQueuedEntry(msg.commandId, 'queued');
         }
         return;
@@ -1225,7 +1533,35 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           : typeof event.payload.clientMessageId === 'string'
             ? event.payload.clientMessageId
             : '';
-        removeLocalQueuedEntry(commandId, typeof event.payload.text === 'string' ? event.payload.text : undefined);
+        const deliveredText = typeof event.payload.text === 'string' ? event.payload.text : undefined;
+        removeLocalQueuedEntry(commandId, deliveredText);
+        // Record the delivered id so a stale daemon pending snapshot can't keep
+        // showing it as queued (the incoming snapshot is not under our control,
+        // unlike the optimistic set cleared above).  Legacy snapshots synthesize
+        // ids from text, so also settle the single matching legacy id when the
+        // authoritative timeline echo carries a newer real command/client id.
+        const idsToSettle = commandId ? [commandId] : [];
+        const normalizedDeliveredText = typeof deliveredText === 'string' ? normalizeQueuedText(deliveredText) : '';
+        if (normalizedDeliveredText) {
+          const legacyTextMatches = incomingQueuedTransportEntries
+            .filter((entry) => isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
+              && normalizeQueuedText(entry.text) === normalizedDeliveredText)
+            .map((entry) => entry.clientMessageId);
+          if (legacyTextMatches.length === 1) idsToSettle.push(legacyTextMatches[0]);
+        }
+        if (idsToSettle.length > 0) {
+          setSettledQueuedIds((prev) => {
+            let changed = false;
+            const ids = [...prev];
+            for (const id of idsToSettle) {
+              if (!id || prev.has(id)) continue;
+              ids.push(id);
+              changed = true;
+            }
+            if (!changed) return prev;
+            return new Set(ids.length > 500 ? ids.slice(-500) : ids);
+          });
+        }
       } else if (event.type === 'session.state') {
         const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries')
           || Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
@@ -1246,7 +1582,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         });
       }
     });
-  }, [activeSession, ws]);
+  }, [activeSession, incomingQueuedTransportEntries, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1266,7 +1602,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecProposeMenuOpen(false);
     setOpenSpecExpandedChange(null);
     setOpenSpecFolderPath(null);
+    setOpenSpecAutoLauncherChange(null);
+    setOpenSpecAutoDetailsOpen(false);
     openSpecRequestIdRef.current = null;
+    openSpecTaskStatsRequestIdRef.current = null;
   }, [activeSession?.projectDir, clearOpenSpecRequestTimer]);
 
   // Close menus as soon as the pointer starts outside. On Android Chrome, waiting
@@ -1308,6 +1647,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
         setOpenSpecProposeMenuOpen(false);
+        setOpenSpecExecuteMenu(null);
+        setOpenSpecAutoLauncherChange(null);
       }
     };
     const handlePointerDown = (e: PointerEvent) => handleOutsidePointer(e.target);
@@ -1471,6 +1812,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(!!text.trim());
+    publishComposerText(text);
     syncMobileComposerMetrics();
   };
 
@@ -1489,6 +1831,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(true);
+    publishComposerText(divRef.current?.textContent ?? suffix);
     syncMobileComposerMetrics();
   };
 
@@ -1508,14 +1851,46 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!cwd) return null;
     return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
   }, [activeSession?.projectDir]);
+  const openSpecChangeListCacheKey = useMemo(() => (
+    openSpecChangesPath ? buildOpenSpecChangeListCacheKey(serverId, openSpecChangesPath) : null
+  ), [openSpecChangesPath, serverId]);
 
   const openOpenSpecChangeFolder = useCallback((changeName: string) => {
     if (!openSpecChangesPath) return;
     setOpenSpecFolderPath(`${openSpecChangesPath}/${changeName}`);
     setOpenSpecAuditMenu(null);
     setOpenSpecProposeMenuOpen(false);
+    setOpenSpecExecuteMenu(null);
+    setOpenSpecAutoLauncherChange(null);
     setOpenSpecOpen(false);
   }, [openSpecChangesPath]);
+
+  const openOpenSpecAutoLauncher = useCallback((changeName: string) => {
+    setOpenSpecAuditMenu(null);
+    setOpenSpecProposeMenuOpen(false);
+    setOpenSpecExecuteMenu(null);
+    setOpenSpecAutoLauncherChange(changeName);
+  }, []);
+
+  const launchOpenSpecAutoDeliver = useCallback((changeName: string, presetId: OpenSpecAutoDeliverPresetId, options?: {
+    selectedTeamComboId: string;
+    materializedLimits: OpenSpecAutoDeliverMaterializedLimits;
+    locale?: string;
+    autoCommitPush: boolean;
+  }) => {
+    const requestId = openSpecAutoDeliver.launch({ changeName, presetId, ...options });
+    if (!requestId) return;
+    setOpenSpecAutoLaunchingChange(changeName);
+  }, [openSpecAutoDeliver]);
+
+  useEffect(() => {
+    if (!openSpecAutoLaunchingChange || !openSpecAutoProjection) return;
+    if (openSpecAutoProjection.changeName !== openSpecAutoLaunchingChange) return;
+    setOpenSpecAutoLaunchingChange(null);
+    setOpenSpecAutoLauncherChange(null);
+    setOpenSpecOpen(false);
+    setOpenSpecAutoDetailsOpen(true);
+  }, [openSpecAutoLaunchingChange, openSpecAutoProjection]);
 
   const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
     const open = () => {
@@ -1529,11 +1904,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const refreshOpenSpecChanges = useCallback(() => {
     clearOpenSpecRequestTimer();
     openSpecRequestIdRef.current = null;
+    openSpecTaskStatsRequestIdRef.current = null;
     if (!ws || !openSpecChangesPath) {
       setOpenSpecLoading(false);
       setOpenSpecChanges([]);
       setOpenSpecError(null);
       return;
+    }
+    const cached = openSpecChangeListCacheKey
+      ? openSpecChangeListCacheRef.current.get(openSpecChangeListCacheKey)
+      : undefined;
+    if (cached) {
+      setOpenSpecChanges(cached.changes);
     }
     setOpenSpecLoading(true);
     setOpenSpecError(null);
@@ -1542,7 +1924,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       requestId = ws.fsListDir(openSpecChangesPath, false, false);
     } catch {
       setOpenSpecLoading(false);
-      setOpenSpecChanges([]);
+      if (!cached) setOpenSpecChanges([]);
       setOpenSpecError(t('openspec.load_unavailable'));
       return;
     }
@@ -1550,12 +1932,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     openSpecRequestTimerRef.current = setTimeout(() => {
       if (openSpecRequestIdRef.current !== requestId) return;
       openSpecRequestIdRef.current = null;
+      openSpecTaskStatsRequestIdRef.current = null;
       openSpecRequestTimerRef.current = null;
       setOpenSpecLoading(false);
-      setOpenSpecChanges([]);
+      if (!cached) setOpenSpecChanges([]);
       setOpenSpecError(t('openspec.load_timeout'));
     }, OPENSPEC_LIST_REQUEST_TIMEOUT_MS);
-  }, [clearOpenSpecRequestTimer, openSpecChangesPath, t, ws]);
+  }, [clearOpenSpecRequestTimer, openSpecChangeListCacheKey, openSpecChangesPath, t, ws]);
 
   const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement' | 'propose_from_discussion' | 'propose_from_description', reference?: string) => {
     const prompt = kind === 'audit_implementation'
@@ -1659,10 +2042,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               onClick={() => {
                 clearOpenSpecRequestTimer();
                 openSpecRequestIdRef.current = null;
+                openSpecTaskStatsRequestIdRef.current = null;
                 setOpenSpecLoading(false);
                 setOpenSpecOpen(false);
                 setOpenSpecAuditMenu(null);
                 setOpenSpecProposeMenuOpen(false);
+                setOpenSpecExecuteMenu(null);
               }}
             >
               ✕
@@ -1702,10 +2087,188 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+
+  // ── Dedicated execution routing preference ──────────────────────────────
+  // Reads the SHARED preference (the same one Team Settings edits). Generic
+  // execution dispatch now lives in UsageFooter next to the summary-sync
+  // action; SessionControls still consumes the preference for P2P/Team and
+  // OpenSpec-specific execution surfaces.
+  const executionRouting = useExecutionRouting(serverId ?? null);
+  const configuredExecutionSession = executionRouting.templateSessionName;
+  const executionSessionDisplayName = useMemo(() => {
+    if (!configuredExecutionSession) return null;
+    const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
+    if (sub && !isExecutionCloneTemplateLike(sub)) return buildExecutionTemplateLabel({
+      shortName: sub.label || sub.sessionName.split('_').pop() || sub.sessionName,
+      agentType: sub.type,
+      ccPreset: sub.ccPresetId,
+      qwenModel: sub.qwenModel,
+      requestedModel: sub.requestedModel,
+      activeModel: sub.activeModel,
+      modelDisplay: sub.modelDisplay,
+    });
+    return null;
+  }, [configuredExecutionSession, subSessions]);
+  const hasValidExecutionDefault = Boolean(
+    configuredExecutionSession
+    && executionSessionDisplayName
+    && configuredExecutionSession !== activeSession?.name,
+  );
+
+  // ── OpenSpec left-panel Execute dropdown routing (task 2.4) ──────────────
+  // Unlike the GENERIC dropdown, the OpenSpec Execute dropdown is an ACTION +
+  // contextual-editor surface for the SAME shared dedicated-execution-routing
+  // preference. It:
+  //   - pins the valid saved execution template session FIRST,
+  //   - lists eligible non-current / non-main sub-sessions below it,
+  //   - can SET or CLEAR the shared default (clear is allowed HERE per design
+  //     Decision 2 — it is NOT allowed in the generic dropdown), and
+  //   - dispatches the OpenSpec-specific implement prompt (current change) to a
+  //     chosen session.
+  // Eligibility is DAEMON-AUTHORITATIVE (`executionTemplateEligible` + reason);
+  // the UI renders the flag and never recomputes eligibility client-side. This
+  // mirrors the P2pConfigPanel template scan.
+  const openSpecExecutionTemplateScan = useMemo(() => {
+    const eligible: Array<{ sessionName: string; shortName: string; sdk: string; preset: string | null; model: string | null }> = [];
+    const seen = new Set<string>();
+    const push = (sessionName: string, shortName: string, sdk: string, preset: string | null, model: string | null) => {
+      if (seen.has(sessionName)) return;
+      seen.add(sessionName);
+      eligible.push({ sessionName, shortName, sdk, preset, model });
+    };
+    // GROUP-SCOPED: execution targets are attached non-main sub-sessions only.
+    // Main sessions (brain/orchestrator/worker `wN`) are not execution templates.
+    // Attached sub-sessions of THIS group only (strict parentSession === group root;
+    // a sub-session with no/other parent is NOT in the current group and is excluded).
+    for (const s of subSessions ?? []) {
+      if (OPENSPEC_EXEC_EXCLUDED_TYPES.has(s.type)) continue;
+      if (s.sessionName === activeSession?.name) continue;
+      if (!rootSession || s.parentSession !== rootSession) continue;
+      if (isExecutionCloneTemplateLike(s)) continue;
+      if (s.executionTemplateEligible === false) continue;
+      push(
+        s.sessionName,
+        s.label || s.sessionName.split('_').pop() || s.sessionName,
+        s.type,
+        s.ccPresetId ?? null,
+        resolveEffectiveSessionModel(s) ?? null,
+      );
+    }
+    return eligible;
+  }, [subSessions, activeSession?.name, rootSession]);
+
+  // The pinned/default item: the saved template, but only when it still resolves
+  // to a valid (display-resolvable, non-current) session in this project.
+  const openSpecPinnedExecutionSession = useMemo(() => {
+    if (!hasValidExecutionDefault || !configuredExecutionSession || !executionSessionDisplayName) return null;
+    const sub = (subSessions ?? []).find((s) => s.sessionName === configuredExecutionSession);
+    if (!sub || isExecutionCloneTemplateLike(sub)) return null;
+    return {
+      sessionName: configuredExecutionSession,
+      shortName: sub.label || sub.sessionName.split('_').pop() || sub.sessionName,
+      sdk: sub.type,
+      preset: sub.ccPresetId ?? null,
+      model: resolveEffectiveSessionModel(sub) ?? null,
+    };
+  }, [hasValidExecutionDefault, configuredExecutionSession, executionSessionDisplayName, subSessions]);
+
+  // Eligible sessions to list BELOW the pinned default (de-duplicated against it).
+  const openSpecExecutionCandidates = useMemo(() => (
+    openSpecExecutionTemplateScan.filter((c) => c.sessionName !== openSpecPinnedExecutionSession?.sessionName)
+  ), [openSpecExecutionTemplateScan, openSpecPinnedExecutionSession]);
+
+  // Dispatch the OpenSpec implement prompt for `changeNameArg` to `target`.
+  // This is OpenSpec-specific wording (reuses `openspec.implement_prompt`), in
+  // contrast to the generic dispatch above. Reuses the plain cross-session send.
+  // The change is now always known per-row (passed in by the Execute button).
+  const dispatchOpenSpecExecution = useCallback((target: string, changeNameArg: string) => {
+    if (!ws || !openSpecChangesPath || !changeNameArg) return;
+    const reference = toComposerReference(`${openSpecChangesPath}/${changeNameArg}`);
+    const prompt = t('openspec.implement_prompt', { reference });
+    ws.sendSessionMessage(target, prompt);
+  }, [ws, openSpecChangesPath, toComposerReference, t]);
+
+  // Build the per-change Execute dropdown content. Same dispatch/set-default/
+  // clear menu the global footer used to render, but the change is bound per
+  // row so there is no "no change selected" state and no disabled guards.
+  const buildOpenSpecExecuteMenuContent = useCallback((changeName: string): ComponentChildren => (
+    <div role="menu" data-testid={`openspec-execute-menu-${changeName}`}>
+      <div class="p2p-menu-section-label">{t('openspec.execute.dispatch_heading')}</div>
+      {openSpecPinnedExecutionSession && (
+        <button
+          type="button"
+          role="menuitem"
+          class="menu-item openspec-execute-pinned"
+          data-testid="openspec-execute-pinned"
+          onClick={() => {
+            dispatchOpenSpecExecution(openSpecPinnedExecutionSession.sessionName, changeName);
+            setOpenSpecExecuteMenu(null);
+            setOpenSpecOpen(false);
+          }}
+        >
+          <span aria-hidden="true">★ </span>
+          {t('openspec.execute.dispatch_to', { name: formatExecLabel(openSpecPinnedExecutionSession.shortName, openSpecPinnedExecutionSession.sdk, openSpecPinnedExecutionSession.preset, openSpecPinnedExecutionSession.model) })}
+        </button>
+      )}
+      {openSpecExecutionCandidates.map((candidate) => (
+        <button
+          key={candidate.sessionName}
+          type="button"
+          role="menuitem"
+          class="menu-item"
+          data-testid={`openspec-execute-session-${candidate.sessionName}`}
+          onClick={() => {
+            dispatchOpenSpecExecution(candidate.sessionName, changeName);
+            setOpenSpecExecuteMenu(null);
+            setOpenSpecOpen(false);
+          }}
+        >
+          {t('openspec.execute.dispatch_to', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset, candidate.model) })}
+        </button>
+      ))}
+      {!openSpecPinnedExecutionSession && openSpecExecutionCandidates.length === 0 && (
+        <div class="p2p-menu-section-label openspec-section-meta" data-testid="openspec-execute-empty">
+          {t('openspec.execute.no_sessions')}
+        </div>
+      )}
+      <div class="openspec-execute-divider" role="separator" />
+      <div class="p2p-menu-section-label">{t('openspec.execute.default_heading')}</div>
+      {openSpecExecutionCandidates.map((candidate) => (
+        <button
+          key={`set-${candidate.sessionName}`}
+          type="button"
+          role="menuitem"
+          class="menu-item"
+          data-testid={`openspec-execute-set-${candidate.sessionName}`}
+          onClick={() => {
+            void executionRouting.setTemplateSessionName(candidate.sessionName);
+            setOpenSpecExecuteMenu(null);
+          }}
+        >
+          {t('openspec.execute.set_default', { name: formatExecLabel(candidate.shortName, candidate.sdk, candidate.preset, candidate.model) })}
+        </button>
+      ))}
+      {openSpecPinnedExecutionSession && (
+        <button
+          type="button"
+          role="menuitem"
+          class="menu-item openspec-execute-clear"
+          data-testid="openspec-execute-clear"
+          onClick={() => {
+            void executionRouting.setTemplateSessionName(null);
+            setOpenSpecExecuteMenu(null);
+          }}
+        >
+          {t('openspec.execute.clear_default')}
+        </button>
+      )}
+    </div>
+  ), [t, openSpecPinnedExecutionSession, openSpecExecutionCandidates, dispatchOpenSpecExecution, executionRouting]);
+
   const hasConfiguredP2pParticipants = useMemo(() => {
     if (!p2pSavedConfig?.sessions) return false;
-    return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
-  }, [p2pSavedConfig]);
+    return getEnabledP2pMemberNames(p2pSavedConfig.sessions, { scopeSession: rootSession }).length > 0;
+  }, [p2pSavedConfig, rootSession]);
 
   // A session that is itself an enabled P2P participant ("member") must not
   // start its own Team discussion from its Team dropdown — discussions spawn
@@ -1716,7 +2279,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isCurrentSessionP2pMember = useMemo(() => {
     const name = activeSession?.name;
     if (!name || name === rootSession) return false;
-    const entry = p2pSavedConfig?.sessions?.[name];
+    const entry = sanitizeP2pSavedConfig(p2pSavedConfig ?? { sessions: {}, rounds: 1 }, { scopeSession: rootSession }).sessions[name];
     return !!entry?.enabled && entry.mode !== 'skip';
   }, [activeSession?.name, rootSession, p2pSavedConfig]);
 
@@ -1773,11 +2336,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [resolvePendingP2pConfigSave, ws]);
 
   const handleP2pDropdownRoundsChange = useCallback((nextRounds: number) => {
-    const cfg: P2pSavedConfig = {
+    const cfg: P2pSavedConfig = sanitizeP2pSavedConfig({
       ...(p2pSavedConfig ?? { sessions: {}, rounds: 1 }),
       rounds: nextRounds,
       updatedAt: Date.now(),
-    };
+    }, { scopeSession: rootSession });
     setP2pSavedConfig(cfg);
     void p2pSavedConfigPref.save(cfg).catch(() => {});
     if (rootSession) {
@@ -1786,8 +2349,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [p2pSavedConfig, p2pSavedConfigPref, persistP2pConfigToDaemon, rootSession]);
 
   useEffect(() => {
-    setP2pSavedConfig(p2pSavedConfigPref.value);
-  }, [p2pSavedConfigPref.value]);
+    setP2pSavedConfig(p2pSavedConfigPref.value
+      ? sanitizeP2pSavedConfig(p2pSavedConfigPref.value, { scopeSession: rootSession })
+      : null);
+  }, [p2pSavedConfigPref.value, rootSession]);
 
   useEffect(() => {
     if (!ws || !rootSession || !p2pSavedConfig) return;
@@ -1818,8 +2383,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (openSpecRequestIdRef.current) {
           clearOpenSpecRequestTimer();
           openSpecRequestIdRef.current = null;
+          openSpecTaskStatsRequestIdRef.current = null;
           setOpenSpecLoading(false);
-          setOpenSpecChanges([]);
           setOpenSpecError(t('openspec.load_unavailable'));
         }
         return;
@@ -1836,30 +2401,65 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (openSpecOpen) refreshOpenSpecChanges();
         return;
       }
+      if (msg.type !== 'fs.ls_response') return;
+      const statsRequestId = openSpecTaskStatsRequestIdRef.current;
+      if (statsRequestId && msg.requestId === statsRequestId) {
+        openSpecTaskStatsRequestIdRef.current = null;
+        if (msg.status !== 'ok') return;
+        const stats = collectOpenSpecTaskStats(msg.entries);
+        if (openSpecChangesPath && stats.size > 0) {
+          for (const [changeName, taskStats] of stats.entries()) {
+            openSpecTaskStatsCacheRef.current.set(openSpecTaskStatsCacheKey(openSpecChangesPath, changeName), taskStats);
+          }
+        }
+        setOpenSpecChanges((current) => {
+          const next = mergeOpenSpecTaskStats(current, stats);
+          if (openSpecChangeListCacheKey && next.length > 0) {
+            openSpecChangeListCacheRef.current.set(openSpecChangeListCacheKey, { changes: next });
+          }
+          return next;
+        });
+        return;
+      }
       const requestId = openSpecRequestIdRef.current;
-      if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
+      if (!requestId || msg.requestId !== requestId) return;
       openSpecRequestIdRef.current = null;
       clearOpenSpecRequestTimer();
       setOpenSpecLoading(false);
       if (msg.status === 'error') {
         const errorText = msg.error ?? null;
         if (errorText === FS_READ_ERROR_CODES.FORBIDDEN_PATH || /enoent|not found|no such file/i.test(errorText ?? '')) {
+          if (openSpecChangeListCacheKey) openSpecChangeListCacheRef.current.delete(openSpecChangeListCacheKey);
           setOpenSpecChanges([]);
           setOpenSpecError(null);
           return;
         }
-        setOpenSpecChanges([]);
         setOpenSpecError(formatOpenSpecLoadError(errorText));
         return;
       }
-      const changeNames = (msg.entries ?? [])
+      const changes = (msg.entries ?? [])
         .filter((entry) => entry.isDir && !OPENSPEC_NON_CHANGE_DIR_NAMES.has(entry.name))
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-      setOpenSpecChanges(changeNames);
+        .map((entry) => ({
+          name: entry.name,
+          taskStats: openSpecChangesPath
+            ? openSpecTaskStatsCacheRef.current.get(openSpecTaskStatsCacheKey(openSpecChangesPath, entry.name))
+            : undefined,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      setOpenSpecChanges(changes);
+      if (openSpecChangeListCacheKey) {
+        openSpecChangeListCacheRef.current.set(openSpecChangeListCacheKey, { changes });
+      }
       setOpenSpecError(null);
+      if (ws && openSpecChangesPath && changes.length > 0) {
+        try {
+          openSpecTaskStatsRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false, { includeOpenSpecTaskStats: true });
+        } catch {
+          openSpecTaskStatsRequestIdRef.current = null;
+        }
+      }
     });
-  }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
+  }, [clearOpenSpecRequestTimer, formatOpenSpecLoadError, openSpecChangeListCacheKey, openSpecChangesPath, openSpecOpen, persistP2pConfigToDaemon, p2pSavedConfig, refreshOpenSpecChanges, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, serverId, t, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -1916,7 +2516,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string, userText?: string) => {
     if (!p2pSavedConfig || (mode !== P2P_CONFIG_MODE && !isComboMode(mode))) return;
-    const selection = buildP2pConfigSelection(p2pSavedConfig, mode);
+    const selection = buildP2pConfigSelection(sanitizeP2pSavedConfig(p2pSavedConfig, { scopeSession: rootSession }), mode);
     extra.p2pSessionConfig = selection.config.sessions;
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
@@ -1927,7 +2527,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       userText,
       locale: i18n?.language ?? 'en',
     }, computeAdvancedLaunchCapabilityGate(ws, selection.config));
-  }, [activeSession?.name, activeSession?.projectDir, i18n?.language, p2pSavedConfig, ws]);
+  }, [activeSession?.name, activeSession?.projectDir, i18n?.language, p2pSavedConfig, rootSession, ws]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
     const normalizedOptions: BuildSendPayloadOptions =
@@ -1962,7 +2562,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
       if (extra.p2pAtTargets && hasConfigTarget) {
         const override = normalizedOptions.syntheticConfigOverride ?? pendingConfigOverrideRef.current;
-        const cfg = override?.config ?? p2pSavedConfig;
+        const cfg = override?.config
+          ? sanitizeP2pSavedConfig(override.config, { scopeSession: rootSession })
+          : (p2pSavedConfig ? sanitizeP2pSavedConfig(p2pSavedConfig, { scopeSession: rootSession }) : null);
         if (cfg) {
           extra.p2pSessionConfig = cfg.sessions;
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
@@ -2000,6 +2602,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     // Pass user locale for P2P language instruction
     if (extra.p2pAtTargets || extra.p2pMode) {
       extra.p2pLocale = i18n?.language ?? 'en';
+      // Dedicated execution routing (task 2.7): forward the resolved per-project
+      // routing preference so the daemon final-execution stage can delegate
+      // implementation work to an ephemeral execution clone. Disabled/absent
+      // keeps the run's existing in-session execution path byte-identical.
+      // Carry the resolved global limits alongside the template identity so the
+      // daemon normalizer can honor user-configured caps/timeouts instead of
+      // falling back to fixed defaults (item 14).
+      if (executionRouting.enabled && executionRouting.templateSessionName) {
+        extra.dedicatedExecutionRouting = {
+          enabled: true,
+          templateSessionName: executionRouting.templateSessionName,
+          maxParallelClones: executionRouting.limits.maxParallelClones,
+          maxQueuedClones: executionRouting.limits.maxQueuedClones,
+          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
+          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
+        };
+      }
     }
 
     // Prepend quotes
@@ -2016,7 +2635,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -2052,6 +2671,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const payload = {
       sessionName: activeSession.name,
       commandId,
+      ...(activeSession.sharedState?.activeDispatchId ? { observedDispatchId: activeSession.sharedState.activeDispatchId } : {}),
     };
     if (!ws) {
       if (!serverId) return null;
@@ -2093,6 +2713,66 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     cancelActiveTransportTurn();
   }, [cancelActiveTransportTurn, showStopFeedback]);
 
+  const escapeKeyboardOwnerOpen = atPickerOpen
+    || quickOpen
+    || modelOpen
+    || autoOpen
+    || thinkingOpen
+    || cloneDialogOpen
+    || voiceOpen
+    || p2pOpen
+    || p2pConfigOpen
+    || openSpecOpen
+    || !!mobileFileBrowserOpen;
+
+  const shouldProtectTransportEscape = useCallback((e: KeyboardEvent): boolean => {
+    if (e.key !== 'Escape') return true;
+    if (e.defaultPrevented) return true;
+    if (imeComposingRef.current || isImeComposingKeyEvent(e)) return true;
+    if (Date.now() - lastImeCompositionAtRef.current < IME_ESCAPE_CANCEL_GRACE_MS) return true;
+    if (escapeKeyboardOwnerOpen || isModalKeyboardOwnerOpen()) return true;
+
+    const composer = divRef.current;
+    const target = e.target instanceof Node ? e.target : null;
+    const active = typeof document !== 'undefined' && document.activeElement instanceof Node
+      ? document.activeElement
+      : null;
+    const targetIsComposer = !!composer && !!target && composer.contains(target);
+    const activeIsComposer = !!composer && !!active && composer.contains(active);
+
+    // If a different text entry owns focus (rename input, picker field, hidden
+    // terminal helper textarea, etc.), Esc belongs to that owner, not to the
+    // transport turn. Window/body/chat-surface focus is allowed to cancel.
+    if (target && isTextEntryKeyboardOwner(target) && !targetIsComposer) return true;
+    if (active && isTextEntryKeyboardOwner(active) && !activeIsComposer) return true;
+
+    return false;
+  }, [escapeKeyboardOwnerOpen]);
+
+  const handleTransportEscapeCancel = useCallback((e: KeyboardEvent): boolean => {
+    if (
+      effectiveRuntimeType !== 'transport'
+      || !isRunningSessionState(activeSession?.state)
+      || shouldProtectTransportEscape(e)
+    ) {
+      return false;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    handleStopPress();
+    return true;
+  }, [activeSession?.state, effectiveRuntimeType, handleStopPress, shouldProtectTransportEscape]);
+
+  useEffect(() => {
+    const enabled = !compact && (keyboardActive ?? true);
+    if (!enabled) return;
+    const handler = (e: KeyboardEvent) => {
+      handleTransportEscapeCancel(e);
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [compact, handleTransportEscapeCancel, keyboardActive]);
+
   // Clear the optimistic state once the turn actually settles (session leaves
   // the running state) or after a safety timeout so a stuck turn re-enables it.
   useEffect(() => {
@@ -2114,20 +2794,30 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ...extra,
       commandId,
     };
+    const markSendFailed = (err: unknown) => {
+      console.warn('session.send HTTP fallback failed', err);
+      failedQueuedCommandIdsRef.current.add(commandId);
+      setOptimisticQueuedEntries((prev) => {
+        if (!prev) return prev;
+        let changed = false;
+        const next = prev.map((entry) => {
+          if (entry.clientMessageId !== commandId || entry.status === 'failed') return entry;
+          changed = true;
+          return { ...entry, status: 'failed' as const };
+        });
+        return changed ? next : prev;
+      });
+    };
     if (!ws) {
       if (!serverId) return null;
-      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
-        console.warn('session.send HTTP fallback failed', fallbackErr);
-      });
+      void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
       return commandId;
     }
     try {
       ws.sendSessionCommand('send', payload);
     } catch (err) {
       if (!serverId) throw err;
-      void sendSessionViaHttp(serverId, payload).catch((fallbackErr) => {
-        console.warn('session.send HTTP fallback failed', fallbackErr);
-      });
+      void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
     }
     return commandId;
   }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
@@ -2141,11 +2831,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       commandId,
       ...payload,
     });
-    return true;
+    return commandId;
   }, [activeSession, ws]);
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
+    if (uploading) {
+      showSendWarning(t('upload.uploading'));
+      return;
+    }
     const isP2pSend = (
       Array.isArray(payload.extra.p2pAtTargets) && payload.extra.p2pAtTargets.length > 0
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
@@ -2156,6 +2850,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       pendingConfigOverrideRef.current = null;
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
+      publishComposerText('');
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
       setAttachments([]);
@@ -2176,20 +2871,26 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
+      const previousEntry = queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId);
+      let mutationCommandId: string | false = false;
       try {
-        if (!sendQueuedMessageMutation('session.edit_queued_message', {
+        mutationCommandId = sendQueuedMessageMutation('session.edit_queued_message', {
           clientMessageId: editingQueuedMessageId,
           text: payload.text,
-        })) return;
+        });
+        if (!mutationCommandId) return;
       } catch {
         return;
       }
+      if (previousEntry) {
+        queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'edit', entry: previousEntry });
+      }
       setEditingQueuedMessageId(null);
       setOptimisticQueuedEntries((prev) => {
-        const source = prev ?? incomingQueuedTransportEntries;
-        return source.map((entry) => (
-          entry.clientMessageId === editingQueuedMessageId
-            ? { ...entry, text: payload.text }
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.map((entry) => (
+        entry.clientMessageId === editingQueuedMessageId
+          ? { ...entry, text: payload.text }
             : entry
         ));
       });
@@ -2214,7 +2915,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries((prev) => {
         const source = prev ?? incomingQueuedTransportEntries;
         if (source.some((entry) => entry.clientMessageId === commandId)) return source;
-        return [...source, { clientMessageId: commandId, text: payload.text, status: localFailure ? 'failed' : 'sending' }];
+        return [...source, {
+          clientMessageId: commandId,
+          text: payload.text,
+          status: localFailure || failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+        }];
       });
     }
     // Snapshot attachments before clearComposer wipes them so the optimistic
@@ -2238,7 +2943,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage, showStopFeedback, transportSendShouldQueue]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -2251,23 +2956,33 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (editingQueuedMessageId === entry.clientMessageId || (!editingQueuedMessageId && getText() === entry.text)) {
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
+      publishComposerText('');
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
+    if (isLocalQueuedEntry(entry)) {
+      setOptimisticQueuedEntries((prev) => {
+        const source = prev ?? incomingQueuedTransportEntries;
+        return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+      });
+      return;
+    }
+    let mutationCommandId: string | false = false;
+    try {
+      mutationCommandId = sendQueuedMessageMutation('session.undo_queued_message', {
+        clientMessageId: entry.clientMessageId,
+      });
+    } catch {
+      return;
+    }
+    if (!mutationCommandId) return;
+    queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? incomingQueuedTransportEntries;
       return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
     });
-    if (isLocalQueuedEntry(entry)) return;
-    try {
-      sendQueuedMessageMutation('session.undo_queued_message', {
-        clientMessageId: entry.clientMessageId,
-      });
-    } catch {
-      /* ignore */
-    }
-  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
@@ -2281,7 +2996,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? [];
       const next = source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-      next.push({ clientMessageId: commandId, text: entry.text, status: 'sending' });
+      next.push({
+        clientMessageId: commandId,
+        text: entry.text,
+        status: failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+      });
       return next;
     });
   }, [sendSessionMessage]);
@@ -2346,7 +3065,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     const selection = p2pSavedConfig
-      ? buildP2pConfigSelection(p2pSavedConfig, mode, roundsOverride ?? p2pSavedConfig.rounds ?? 1)
+      ? buildP2pConfigSelection(sanitizeP2pSavedConfig(p2pSavedConfig, { scopeSession: rootSession }), mode, roundsOverride ?? p2pSavedConfig.rounds ?? 1)
       : null;
     const payloadOptions: BuildSendPayloadOptions = selection
       ? {
@@ -2360,7 +3079,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }
       : { modeOverride: mode };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, rootSession, showSendWarning, t]);
 
   /*
    * R3 v2 PR-κ — Click-to-launch a saved workflow from the P2P dropdown.
@@ -2381,7 +3100,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!p2pSavedConfig || workflowLibraryItems.length === 0) return;
     const target = workflowLibraryItems.find((entry) => entry.id === workflowId);
     if (!target) return;
-    const chosenConfig: P2pSavedConfig = { ...p2pSavedConfig, activeWorkflowId: workflowId };
+    const chosenConfig: P2pSavedConfig = sanitizeP2pSavedConfig({ ...p2pSavedConfig, activeWorkflowId: workflowId }, { scopeSession: rootSession });
     const selection = buildP2pConfigSelection(chosenConfig, P2P_CONFIG_MODE);
     const titleLabel = (target.title?.trim() || workflowId).slice(0, 40);
     const payloadOptions: BuildSendPayloadOptions = {
@@ -2394,7 +3113,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       syntheticConfigOverride: selection,
     };
     requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
-  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, showSendWarning, t, workflowLibraryItems]);
+  }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, rootSession, showSendWarning, t, workflowLibraryItems]);
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
@@ -2423,18 +3142,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
 
-    if (e.key === 'Escape' && effectiveRuntimeType === 'transport' && isRunningSessionState(activeSession?.state)) {
+    // When @ picker is open, it owns Enter/Arrow/Escape.
+    if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
       e.preventDefault();
-      handleStopPress();
+      e.stopPropagation();
       return;
     }
 
-    // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
-    // AtPicker registers a document-level capture handler that fires BEFORE this bubble handler.
-    // AtPicker calls preventDefault + stopPropagation, so this code only runs if AtPicker didn't handle it.
-    if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
+    if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
       return;
     }
+
     // Block Enter right after picker closes (prevents accidental send from the same Enter that selected)
     if (e.key === 'Enter' && (atJustClosedRef.current || atSelectionLockRef.current)) {
       e.preventDefault();
@@ -2504,23 +3222,25 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (files.length === 0 || !serverId) return false;
     const uploadKey = composerUploadKey;
     const uploadAttachmentDraftKey = attachmentDraftKey;
-    updateComposerUploadSnapshot(uploadKey, { uploading: true, progress: 0, error: null });
-    let uploadedAny = false;
-    for (const file of files) {
+    const uploadItems = files.map((file) => ({
+      id: createComposerUploadId(),
+      name: file.name || 'file',
+      progress: 0,
+      status: 'uploading' as const,
+    }));
+    addComposerUploadItems(uploadKey, uploadItems);
+
+    const uploadedAttachments = await Promise.all(files.map(async (file, index) => {
+      const uploadItem = uploadItems[index];
       try {
-        const result = await uploadFile(serverId, file, (pct) => updateComposerUploadSnapshot(uploadKey, { progress: pct }));
+        const result = await uploadFile(serverId, file, (pct) => {
+          updateComposerUploadItem(uploadKey, uploadItem.id, { progress: pct });
+        });
+        updateComposerUploadItem(uploadKey, uploadItem.id, { progress: 100, status: 'done' });
         if (result.attachment?.daemonPath) {
-          uploadedAny = true;
-          const attachment = { path: result.attachment.daemonPath, name: file.name, seq: 0 };
-          if (uploadAttachmentDraftKey) {
-            const next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
-            if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
-              setAttachments(next);
-            }
-          } else {
-            setAttachments((prev) => renumberAttachments([...prev, attachment]));
-          }
+          return { path: result.attachment.daemonPath, name: file.name, seq: 0 };
         }
+        return null;
       } catch (err) {
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
@@ -2532,12 +3252,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         } else {
           errorMessage = t('upload.upload_failed');
         }
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'error' });
         updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
         setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
+        return null;
+      }
+    }));
+
+    const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachment => !!entry);
+    if (successfulAttachments.length > 0) {
+      if (uploadAttachmentDraftKey) {
+        let next: ComposerAttachment[] = [];
+        for (const attachment of successfulAttachments) {
+          next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
+        }
+        if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
+          setAttachments(next);
+        }
+      } else {
+        setAttachments((prev) => renumberAttachments([...prev, ...successfulAttachments]));
       }
     }
-    updateComposerUploadSnapshot(uploadKey, { uploading: false, progress: uploadedAny ? 100 : 0 });
-    return uploadedAny;
+    removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
+    return successfulAttachments.length > 0;
   }, [attachmentDraftKey, composerUploadKey, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
@@ -2782,10 +3519,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <span style={{ fontSize: 13, fontWeight: 600 }}>📁 Files</span>
           <button class="fb-close" onClick={onMobileFileBrowserClose}>✕</button>
         </div>
-        <FileBrowser
-          ws={ws}
-          serverId={serverId}
-          mode="file-multi"
+          <FileBrowser
+            ws={ws}
+            serverId={serverId}
+            sessionName={activeSession.name}
+            mode="file-multi"
           layout="panel"
           initialPath={activeSession.projectDir ?? '~'}
           changesRootPath={activeSession.projectDir ?? undefined}
@@ -2813,6 +3551,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             key={`${serverId ?? 'local'}:${openSpecFolderPath}`}
             ws={ws}
             serverId={serverId}
+            sessionName={activeSession.name}
             mode="file-multi"
             layout="panel"
             initialPath={openSpecFolderPath}
@@ -2837,6 +3576,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </div>
         </div>,
         document.body,
+      )}
+      {openSpecAutoDetailsOpen && (
+        <OpenSpecAutoDeliverDetailsPanel
+          projection={openSpecAutoProjection}
+          stopPending={openSpecAutoDeliver.stopPending}
+          continuePending={openSpecAutoDeliver.continuePending}
+          onClose={() => setOpenSpecAutoDetailsOpen(false)}
+          onStop={() => { openSpecAutoDeliver.stop(); }}
+          onContinue={() => { openSpecAutoDeliver.continueRun(); }}
+        />
       )}
       {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
       {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
@@ -2962,9 +3711,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   if (!next) {
                     clearOpenSpecRequestTimer();
                     openSpecRequestIdRef.current = null;
+                    openSpecTaskStatsRequestIdRef.current = null;
                     setOpenSpecLoading(false);
                     setOpenSpecAuditMenu(null);
                     setOpenSpecProposeMenuOpen(false);
+                    setOpenSpecExecuteMenu(null);
                   }
                   if (next) refreshOpenSpecChanges();
                   return next;
@@ -2979,11 +3730,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             {openSpecOpen && renderOpenSpecDropdown(
               <>
                 <div class="openspec-dropdown-scroll">
+                {openSpecAutoProjection && (
+                  <OpenSpecAutoDeliverCurrentRunEntry
+                    projection={openSpecAutoProjection}
+                    onView={() => setOpenSpecAutoDetailsOpen(true)}
+                  />
+                )}
                 <div class="p2p-menu-section-label openspec-section-label">{t('openspec.changes')}</div>
                 {openSpecLoading && (
                   <div class="p2p-menu-section-label openspec-section-meta">{t('common.loading')}</div>
                 )}
-                {!openSpecLoading && openSpecError && (
+                {!openSpecLoading && openSpecError && openSpecChanges.length === 0 && (
                   <div class="p2p-menu-section-label openspec-section-meta openspec-section-error">
                     {openSpecError}
                   </div>
@@ -2991,129 +3748,115 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {!openSpecLoading && !openSpecError && openSpecChanges.length === 0 && (
                   <div class="p2p-menu-section-label openspec-section-meta">{t('openspec.empty')}</div>
                 )}
-                {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
-                  <div
+                {openSpecChanges.length > 0 && openSpecChanges.map((change) => {
+                  const changeName = change.name;
+                  return (
+                  <OpenSpecChangeRow
                     key={changeName}
-                    class={`openspec-change-row${isOpenSpecMobile ? ' openspec-change-row-mobile' : ''}${openSpecExpandedChange === changeName ? ' openspec-change-row-expanded' : ''}`}
-                  >
-                    <div class="openspec-change-header">
-                      <button
-                        class="menu-item openspec-change-name"
-                        onClick={() => {
-                          if (!openSpecChangesPath) return;
-                          appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
-                          setOpenSpecAuditMenu(null);
-                          setOpenSpecProposeMenuOpen(false);
-                          setOpenSpecOpen(false);
-                        }}
-                      >
-                        <span class="openspec-change-ref-prefix" aria-hidden="true">@</span>
-                        <span class="openspec-change-name-text">{changeName}</span>
-                      </button>
-                      <button
-                        type="button"
-                        class="openspec-change-folder-btn"
-                        title={t('sidebar.pinned_repo')}
-                        aria-label={t('sidebar.pinned_repo')}
-                        onClick={() => openOpenSpecChangeFolder(changeName)}
-                      >
-                        <span class="fb-create-icon fb-create-icon-folder" aria-hidden="true" />
-                      </button>
-                      {isOpenSpecMobile && (
-                        <button
-                          type="button"
-                          class="openspec-change-toggle"
-                          aria-label={openSpecExpandedChange === changeName ? `collapse ${changeName}` : `expand ${changeName}`}
-                          aria-expanded={openSpecExpandedChange === changeName}
-                          onClick={() => {
-                            setOpenSpecAuditMenu(null);
-                            setOpenSpecProposeMenuOpen(false);
-                            setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
-                          }}
-                        >
-                          {openSpecExpandedChange === changeName ? '▾' : '▸'}
-                        </button>
-                      )}
-                    </div>
-                    <div
-                      class={`openspec-change-actions${!isOpenSpecMobile || openSpecExpandedChange === changeName ? ' openspec-change-actions-visible' : ''}`}
-                      hidden={isOpenSpecMobile && openSpecExpandedChange !== changeName}
-                    >
-                      <div class="openspec-change-action-wrap">
-                        <button
-                          class="btn btn-secondary openspec-change-action-btn"
-                          ref={(el) => {
-                            if (el) openSpecAuditButtonRefs.current.set(changeName, el);
-                            else openSpecAuditButtonRefs.current.delete(changeName);
-                          }}
-                          onClick={() => {
-                            setOpenSpecProposeMenuOpen(false);
-                            setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
-                          }}
-                        >
-                          {t('openspec.audit_action')}
-                        </button>
-                        {openSpecAuditMenu === changeName && renderOpenSpecSubmenu(
-                          <>
-                            <button
-                              class="menu-item"
-                              onClick={() => {
-                                if (!openSpecChangesPath) return;
-                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                                insertOpenSpecPrompt('audit_implementation', reference);
-                                setOpenSpecAuditMenu(null);
-                                setOpenSpecOpen(false);
-                              }}
-                            >
-                              {t('openspec.audit_implementation_action')}
-                            </button>
-                            <button
-                              class="menu-item"
-                              onClick={() => {
-                                if (!openSpecChangesPath) return;
-                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                                insertOpenSpecPrompt('audit_spec', reference);
-                                setOpenSpecAuditMenu(null);
-                                setOpenSpecOpen(false);
-                              }}
-                            >
-                              {t('openspec.audit_spec_action')}
-                            </button>
-                          </>,
-                          openSpecAuditButtonRefs.current.get(changeName) ?? null,
-                          180,
-                        )}
-                      </div>
-                      <button
-                        class="btn btn-secondary openspec-change-action-btn"
-                        onClick={() => {
-                          if (!openSpecChangesPath) return;
-                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                          insertOpenSpecPrompt('implement', reference);
-                          setOpenSpecAuditMenu(null);
-                          setOpenSpecProposeMenuOpen(false);
-                          setOpenSpecOpen(false);
-                        }}
-                      >
-                        {t('openspec.implement_action')}
-                      </button>
-                      <button
-                        class="btn btn-secondary openspec-change-action-btn"
-                        onClick={() => {
-                          if (!openSpecChangesPath) return;
-                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                          sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
-                          setOpenSpecAuditMenu(null);
-                          setOpenSpecProposeMenuOpen(false);
-                          setOpenSpecOpen(false);
-                        }}
-                      >
-                        {t('openspec.achieve_action')}
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                    changeName={changeName}
+                    taskStats={change.taskStats}
+                    mobile={isOpenSpecMobile}
+                    expanded={openSpecExpandedChange === changeName}
+                    auditMenuOpen={openSpecAuditMenu === changeName}
+                    actionsDisabled={openSpecAutoActive}
+                    disabledReason={openSpecAutoActionLockReason}
+                    onAppendReference={() => {
+                      if (!openSpecChangesPath) return;
+                      appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecOpen(false);
+                    }}
+                    onOpenFolder={() => openOpenSpecChangeFolder(changeName)}
+                    onToggleExpanded={() => {
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecExecuteMenu(null);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
+                    }}
+                    onToggleAuditMenu={() => {
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecExecuteMenu(null);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
+                    }}
+                    onAuditImplementation={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      insertOpenSpecPrompt('audit_implementation', reference);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecOpen(false);
+                    }}
+                    onAuditSpec={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      insertOpenSpecPrompt('audit_spec', reference);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecOpen(false);
+                    }}
+                    onImplement={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      insertOpenSpecPrompt('implement', reference);
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecOpen(false);
+                    }}
+                    onAchieve={() => {
+                      if (!openSpecChangesPath) return;
+                      const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                      sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecOpen(false);
+                    }}
+                    onAuto={() => openOpenSpecAutoLauncher(changeName)}
+                    auditButtonRef={(el) => {
+                      if (el) openSpecAuditButtonRefs.current.set(changeName, el);
+                      else openSpecAuditButtonRefs.current.delete(changeName);
+                    }}
+                    renderAuditSubmenu={(content, minWidth) => renderOpenSpecSubmenu(
+                      content,
+                      openSpecAuditButtonRefs.current.get(changeName) ?? null,
+                      minWidth,
+                    )}
+                    executeMenuOpen={openSpecExecuteMenu === changeName}
+                    onToggleExecuteMenu={() => {
+                      setOpenSpecAuditMenu(null);
+                      setOpenSpecProposeMenuOpen(false);
+                      setOpenSpecAutoLauncherChange(null);
+                      setOpenSpecExecuteMenu((current) => current === changeName ? null : changeName);
+                    }}
+                    executeButtonRef={(el) => {
+                      if (el) openSpecExecuteButtonRefs.current.set(changeName, el);
+                      else openSpecExecuteButtonRefs.current.delete(changeName);
+                    }}
+                    renderExecuteSubmenu={(content, minWidth) => renderOpenSpecSubmenu(
+                      content,
+                      openSpecExecuteButtonRefs.current.get(changeName) ?? null,
+                      minWidth,
+                    )}
+                    executeMenuContent={buildOpenSpecExecuteMenuContent(changeName)}
+                  />
+                  );
+                })}
                 </div>
+                <OpenSpecAutoDeliverLauncher
+                  open={!!openSpecAutoLauncherChange}
+                  changeName={openSpecAutoLauncherChange}
+                  conflictProjection={openSpecAutoProjection}
+                  launchPending={openSpecAutoDeliver.launchPending}
+                  error={openSpecAutoDeliver.lastError}
+                  onClose={() => {
+                    openSpecAutoDeliver.clearError();
+                    setOpenSpecAutoLaunchingChange(null);
+                    setOpenSpecAutoLauncherChange(null);
+                  }}
+                  onLaunch={launchOpenSpecAutoDeliver}
+                  onViewCurrent={() => setOpenSpecAutoDetailsOpen(true)}
+                />
                 <div class="openspec-dropdown-footer">
                   <div class="openspec-change-action-wrap openspec-footer-action-wrap">
                     <button
@@ -3122,8 +3865,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       ref={(el) => {
                         openSpecProposeButtonRef.current = el;
                       }}
+                      disabled={openSpecAutoActive}
+                      title={openSpecAutoActionLockReason}
                       onClick={() => {
+                        if (openSpecAutoActive) return;
                         setOpenSpecAuditMenu(null);
+                        setOpenSpecAutoLauncherChange(null);
+                        setOpenSpecExecuteMenu(null);
                         setOpenSpecProposeMenuOpen((open) => !open);
                       }}
                     >
@@ -3301,9 +4049,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class={`shortcut-btn p2p-mode-btn${p2pMode === 'solo' ? ' p2p-mode-btn-solo' : ''}`}
             data-onboarding="p2p-mode"
-            onClick={() => setP2pOpen((o) => !o)}
-            disabled={disabled}
-            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`}
+            onClick={() => {
+              if (openSpecAutoActive) return;
+              setP2pOpen((o) => !o);
+            }}
+            disabled={disabled || openSpecAutoActive}
+            title={openSpecAutoActionLockReason ?? (p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}: ${getP2pModeLabel(p2pMode, t)}`)}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
             {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `${t('p2p.team_button', 'Team')}:${getP2pModeLabel(p2pMode, t)}`}
@@ -3311,12 +4062,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class="shortcut-btn p2p-settings-btn"
             onClick={() => { setP2pOpen(false); openP2pConfigPanel('participants'); }}
-            disabled={disabled}
-            title={t('p2p.settings_title')}
+            disabled={disabled || openSpecAutoActive}
+            title={openSpecAutoActionLockReason ?? t('p2p.settings_title')}
             aria-label={t('p2p.settings_button')}
           >
             <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
-            <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && renderP2pDropdown(
             <>
@@ -3582,13 +4332,42 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
 
-      {/* Upload progress bar */}
-      {uploading && (
-        <div style={{ margin: '0 8px 4px', height: 18, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div style={{ flex: 1, height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}>
-            <div style={{ width: `${uploadProgress}%`, height: '100%', background: '#3b82f6', borderRadius: 2, transition: 'width 0.2s ease' }} />
-          </div>
-          <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 32 }}>{uploadProgress}%</span>
+      {/* Upload progress bars */}
+      {uploadRows.length > 0 && (
+        <div style={{ margin: '0 8px 4px', display: 'grid', gap: 6 }}>
+          {uploadRows.map((item) => (
+            <div
+              key={item.id}
+              data-testid="composer-upload-row"
+              style={{ minHeight: 24, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 38px', alignItems: 'center', columnGap: 8, rowGap: 4 }}
+            >
+              <span
+                title={item.name}
+                style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#94a3b8' }}
+              >
+                {item.name}
+              </span>
+              <div
+                role="progressbar"
+                aria-label={`${item.name} upload progress`}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={item.progress}
+                style={{ gridColumn: '1 / -1', height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}
+              >
+                <div
+                  style={{
+                    width: `${item.progress}%`,
+                    height: '100%',
+                    background: item.status === 'error' ? '#ef4444' : '#3b82f6',
+                    borderRadius: 2,
+                    transition: 'width 0.2s ease',
+                  }}
+                />
+              </div>
+              <span data-testid="composer-upload-progress" style={{ fontSize: 11, color: '#94a3b8', textAlign: 'right' }}>{item.progress}%</span>
+            </div>
+          ))}
         </div>
       )}
 
@@ -3711,6 +4490,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 name: s.name,
                 agentType: s.agentType,
                 state: s.state,
+                role: s.role,
                 label: s.label ?? null,
                 parentSession: null,
                 isSelf: s.name === activeSession.name,
@@ -3842,6 +4622,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onInput={() => {
               const currentText = divRef.current?.textContent ?? '';
               setHasText(!!currentText.trim());
+              publishComposerText(currentText);
               syncMobileComposerMetrics();
               if (sendWarning) clearSendWarning();
               if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
@@ -3966,7 +4747,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class="btn btn-primary"
             onClick={handleSend}
-            disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
+            disabled={inputDisabled || uploading || (!hasText && attachments.length === 0) || !connected}
           >
             {t('common.send')}
           </button>
@@ -4063,6 +4844,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   <span class="session-action-menu-label">{t('session.clone.menu')}</span>
                 </button>
               )}
+              {onShareSession && activeSession && (
+                <button
+                  class="menu-item session-action-menu-item"
+                  onClick={() => {
+                    onShareSession(activeSession, subSessionId ?? null);
+                    setMenuOpen(false);
+                    resetConfirm();
+                  }}
+                >
+                  <SessionActionMenuIcon kind="share" />
+                  <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
+                </button>
+              )}
               <div class="menu-divider" />
               <button
                 class={`menu-item session-action-menu-item ${stopBlockedByPinned || confirm === 'stop' ? 'menu-item-danger' : ''}`}
@@ -4103,9 +4897,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               </button>
             </div>
             <div class="controls-queued-list">
-              {queuedTransportEntries.map((entry) => (
+              {queuedTransportEntries.map((entry) => {
+                const sharedActorLabel = formatSharedActorLabel(t, entry.sharedActor);
+                return (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
                   <span class="controls-queued-item-text">{entry.text}</span>
+                  {sharedActorLabel && (
+                    <span class="controls-queued-item-actor" title={sharedActorLabel}>
+                      {sharedActorLabel}
+                    </span>
+                  )}
                   <span
                     class={`controls-queued-item-status controls-queued-item-status-${entry.status ?? 'queued'}`}
                     aria-label={
@@ -4140,7 +4941,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     </span>
                   )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ) : (
@@ -4197,7 +4999,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel
-        sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
+        sessions={(sessions ?? []).map(s => ({
+          name: s.name,
+          agentType: s.agentType,
+          state: s.state,
+          project: s.project,
+          role: s.role,
+          executionTemplateEligible: s.executionTemplateEligible,
+          executionTemplateIneligibleReason: s.executionTemplateIneligibleReason,
+        }))}
         subSessions={subSessions ?? []}
         activeSession={activeSession?.name}
         serverId={serverId}
@@ -4205,7 +5015,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         onClose={() => setP2pConfigOpen(false)}
         onPersistDaemonConfig={(scopeSession, cfg) => persistP2pConfigToDaemon(scopeSession, cfg)}
         onSave={(cfg) => {
-          setP2pSavedConfig(cfg);
+          setP2pSavedConfig(sanitizeP2pSavedConfig(cfg, { scopeSession: rootSession }));
         }}
         daemonCapabilitySource={ws ? {
           getSnapshot: () => ws.getDaemonCapabilitySnapshot(),

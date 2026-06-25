@@ -23,6 +23,87 @@
     "hide": "隱藏",
     "this_feature": "此功能"
   },
+  "share": {
+    "menu": {
+      "shareTab": "分享"
+    },
+    "dialogTitle": "分享存取權",
+    "dialogSubtitle": "授予 {{target}} 受限存取權。",
+    "target": {
+      "label": "目標",
+      "currentTab": "目前標籤",
+      "server": "整個來源伺服器",
+      "serverFallback": "此伺服器"
+    },
+    "role": {
+      "label": "角色",
+      "viewer": "檢視者",
+      "participant": "參與者",
+      "serverMember": "伺服器成員",
+      "serverManager": "伺服器管理員",
+      "system": "系統"
+    },
+    "roleHelp": {
+      "viewer": "可檢視範圍內狀態並加入範圍內討論，但不能驅動代理。",
+      "participant": "可檢視範圍內狀態，並向涵蓋的具體標籤傳送提示。"
+    },
+    "trust": {
+      "title": "參與者信任說明",
+      "body": "代理未被沙箱隔離。UI/API 限制會減少直接控制面，但參與者提示仍可能影響代理在其可存取環境中的行為。"
+    },
+    "recipient": {
+      "label": "接收者",
+      "placeholder": "使用者 ID 或電子郵件"
+    },
+    "list": {
+      "label": "分享使用者",
+      "title": "分享使用者",
+      "empty": "尚無分享使用者"
+    },
+    "manage": {
+      "roleFor": "{{user}} 的角色",
+      "revoke": "撤銷",
+      "revokeConfirm": "撤銷 {{user}} 的存取？"
+    },
+    "sharedWithMe": {
+      "title": "別人分享給我",
+      "empty": "沒有分享的標籤或伺服器",
+      "refresh": "重新整理分享存取",
+      "kind": {
+        "server": "伺服器",
+        "tab": "標籤",
+        "subsession": "子工作階段"
+      }
+    },
+    "create": "建立分享",
+    "creating": "正在建立...",
+    "scope": {
+      "current": "分享範圍"
+    },
+    "indicator": "{{scope}} 以 {{role}} 分享 · {{status}}",
+    "indicatorCompact": "以 {{role}} 分享 · {{status}}",
+    "indicatorSharedOut": "已分享給別人",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "有效",
+      "revoked": "已撤銷",
+      "expired": "已過期",
+      "target-unavailable": "目標不可用"
+    },
+    "reason": {
+      "share-role-denied": "此角色不能使用該操作。",
+      "share-direct-surface-denied": "分享存取中不可使用此介面。",
+      "share-rate-limited": "分享操作過多，請稍後再試。",
+      "share-revoked": "此分享已撤銷。",
+      "share-expired": "此分享已過期。",
+      "share-target-unavailable": "分享目標不可用。",
+      "share-role-changed": "分享角色已變更。",
+      "share-ticket-invalid": "分享存取票證無效。",
+      "share-cancel-unsupported": "此分享標籤不支援取消。",
+      "share-audit-duplicate": "此操作已記錄。",
+      "share-comment-invalid": "無法發布留言。"
+    }
+  },
   "window": {
     "maximize": "最大化",
     "restore": "還原",
@@ -45,7 +126,18 @@
     "reload": "重新載入",
     "retry": "重試"
   },
+  "askQuestion": {
+    "waiting": "正在等待你的回答，模型會在 {{seconds}} 秒後自行繼續。",
+    "retained": "模型已經繼續執行；你仍可在 {{seconds}} 秒內用這個回答打斷它。",
+    "customPlaceholder": "自訂/補充（可選）",
+    "answerPlaceholder": "輸入你的回答",
+    "dismiss": "關閉",
+    "answer": "回答",
+    "interrupt": "用此回答打斷"
+  },
   "chat": {
+    "delete_message": "刪除訊息",
+    "delete_message_confirm": "為所有人刪除此訊息?此操作無法復原。",
     "dpad": {
       "title": "方向鍵 — 拖曳發送方向鍵"
     },
@@ -170,6 +262,13 @@
     "zoom_title": "訊息",
     "zoom_copy_all": "全部複製",
     "zoom_hint": "長按以選取文字，拖曳控制點調整範圍後再複製。",
+    "image_download": "下載圖片",
+    "image_downloading": "正在下載...",
+    "image_downloaded": "已下載",
+    "image_download_failed": "下載失敗",
+    "image_copy": "複製圖片",
+    "image_copied": "已複製圖片",
+    "image_copy_failed": "複製失敗",
     "tool_detail_toggle": "詳情",
     "tool_detail_input": "輸入",
     "tool_detail_output": "輸出",
@@ -250,7 +349,12 @@
         "fangsong": "仿宋",
         "microsoft-jhenghei": "微軟正黑體"
       }
-    }
+    },
+    "execution_clone_run": "用執行複製會話執行目前任務",
+    "execution_clone_run_with_template": "複製 {{name}} ×{{count}} 並行執行目前任務",
+    "execution_clone_run_no_template": "請先在 Team 設定啟用並選擇執行會話",
+    "execution_clone_run_empty": "請先輸入任務",
+    "execution_clone_run_offline": "重新連線後才能執行複製會話"
   },
   "session": {
     "restart": "↺ 重新啟動",
@@ -292,6 +396,9 @@
     "type": "類型",
     "label": "標籤",
     "workingDir": "工作目錄",
+    "subsessionWorkingDirectory": "工作目錄",
+    "subsessionWorkingDirectoryPlaceholder": "目前工作階段目錄",
+    "subsessionWorkingDirectoryLocked": "子工作階段固定使用目前目錄，啟動時不能修改。",
     "parentSession": "父工作階段",
     "rename": "✎ 重新命名",
     "rename_plain": "重新命名",
@@ -316,6 +423,10 @@
       "overrideDirectories": "為複製出的工作階段指定新工作目錄",
       "cwdOverride": "替換工作目錄",
       "cwdOverridePlaceholder": "/work/new-checkout",
+      "gitRemoteUrl": "Git remote 位址（可選）",
+      "gitRemoteUrlPlaceholder": "https://github.com/org/repo.git",
+      "gitRemoteUrlHelp": "填寫後，daemon 會先把該 remote clone 到替換工作目錄，再複製工作階段群組。",
+      "gitRemoteCapabilityMissing": "目前連線中的 daemon 尚不支援為複製群組 clone Git remote。請更新或重新連線 daemon 後再試。",
       "browseCwd": "瀏覽工作目錄",
       "daemonHostValidation": "工作目錄會先在 daemon 主機上驗證，然後才會建立任何資源。",
       "runningWarning": "複製後的群組會從全新狀態開始。來源的待傳送訊息、終端歷史和正在執行的工作不會被複製。",
@@ -363,6 +474,8 @@
         "blank_target_project": "目標專案名稱為必填。",
         "name_taken": "該目標工作階段名稱已被使用。",
         "invalid_cwd": "該工作目錄無法在 daemon 主機上使用。",
+        "invalid_git_remote": "不支援該 Git remote 位址。",
+        "git_clone_failed": "daemon 無法將 Git remote clone 到工作目錄。",
         "incomplete_clone_spec": "某個正在執行的子工作階段缺少可複製的啟動設定。",
         "unsupported_session_type": "其中一個工作階段尚不支援複製。",
         "p2p_config_invalid": "團隊 設定無法複製。",
@@ -541,7 +654,17 @@
       "deny": "拒絕",
       "tool": "{{tool}} 需要核准"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "請在本工作階段中執行所要求的實作／執行工作。",
+      "useConfigured": "使用 {{name}}",
+      "useConfiguredNone": "使用執行工作階段",
+      "setSession": "設定執行工作階段…"
+    },
+    "executionGroup": {
+      "title": "執行工作階段（執行 {{run}}）",
+      "unknownRun": "待定"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",
@@ -604,12 +727,18 @@
     "tab_files": "檔案",
     "tab_changes": "變更",
     "changes_title": "變更 ({{count}})",
-    "no_changes": "無變更"
+    "no_changes": "無變更",
+    "rename_prompt": "重新命名 {{name}}",
+    "rename_failed": "重新命名失敗",
+    "delete_confirm": "刪除 {{name}}？此操作無法復原。",
+    "delete_failed": "刪除失敗",
+    "invalid_name": "名稱不能包含路徑分隔符"
   },
   "toast": {
     "finished": "已完成",
     "upgrade_blocked_title": "升級已阻止",
     "upgrade_blocked_p2p_active": "團隊 仍在執行中。請先停止，再升級 daemon。",
+    "upgrade_blocked_auto_deliver_active": "自動交付仍在執行中。請先停止，再升級 daemon。",
     "upgrade_blocked_transport_busy": "還有 transport session 正在 turn 中。等它回到 idle 再升級 daemon。",
     "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。"
   },
@@ -650,6 +779,10 @@
     "title": "啟動新工作階段",
     "project_name": "專案名稱",
     "working_directory": "工作目錄",
+    "git_remote_url": "Git remote 位址（可選）",
+    "git_remote_url_placeholder": "https://github.com/org/repo.git",
+    "git_remote_url_help": "填寫後，daemon 會先把該 remote clone 到工作目錄，再啟動工作階段。",
+    "git_remote_capability_missing": "目前連線中的 daemon 尚不支援 clone Git remote。請更新或重新連線 daemon 後再試。",
     "browse": "瀏覽",
     "agent_type": "Agent 類型",
     "agent_flavor_cli": "CLI：適合喜歡原生介面的使用者。聊天模式不支援串流輸出。",
@@ -1061,6 +1194,8 @@
     "title": "OpenSpec",
     "changes": "變更",
     "empty": "目前沒有 OpenSpec 變更",
+    "no_tasks": "無任務",
+    "task_status_title": "已完成 {{checked}}/{{total}} 個任務",
     "load_timeout": "OpenSpec 變更載入逾時。請在 daemon 重新連線後再試。",
     "load_unavailable": "daemon 連線就緒前暫時無法載入 OpenSpec 變更。",
     "load_error": "無法掃描 OpenSpec 變更",
@@ -1070,6 +1205,214 @@
     "implement_action": "實作",
     "achieve_action": "完成",
     "propose_action": "Propose",
+    "execute": {
+      "action": "執行",
+      "dispatch_heading": "在以下工作階段執行目前變更",
+      "dispatch_to": "{{name}}",
+      "default_heading": "預設執行工作階段",
+      "set_default": "將 {{name}} 設為預設",
+      "clear_default": "清除預設執行工作階段",
+      "no_change": "展開一個變更以選擇其執行目標。",
+      "no_sessions": "此專案尚無可用的執行工作階段。"
+    },
+    "auto": {
+      "action": "Auto",
+      "kicker": "自動交付",
+      "custom": "自訂",
+      "launcher_title": "自動交付",
+      "details_title": "自動交付詳情",
+      "current_run": "目前自動交付",
+      "list_title": "自動交付",
+      "list_empty": "還沒有自動交付執行。",
+      "list_select": "選擇一個自動交付執行。",
+      "no_change": "未选择变更",
+      "start": "啟動自動交付",
+      "stop": "停止",
+      "confirm_stop": "停止這個自動交付執行？正在進行的 Team/審計任務會被取消。",
+      "stopping": "停止中...",
+      "view": "查看",
+      "compact": "緊湊",
+      "expand": "展開",
+      "tasks": "任务",
+      "tasks_unknown": "任务未知",
+      "tasks_progress": "{{checked}}/{{total}} 個任務",
+      "overall_progress": "整體進度",
+      "current_stage_progress": "目前階段",
+      "progress_count": "{{current}}/{{total}}",
+      "progress_percent": "{{percent}}%",
+      "prompt_count": "{{count}} 次提示",
+      "prompt_progress": "{{count}}/{{total}} 次提示",
+      "prompt_count_label": "实现提示次数",
+      "latest_message": "最新訊息",
+      "materialized_limits": "Spec 审计 {{spec}} · 实现审计 {{impl}}",
+      "preset_limits": "Spec {{spec}} · 实现 {{impl}}",
+      "conflict_active": "{{change}} 正在自动交付。",
+      "redacted_conflict": "同一會話群組已有 Auto Deliver 在執行。",
+      "conflict_summary": "詳細資訊僅參與會話可見。",
+      "lock_manual_actions": "Auto Deliver 正在執行，已鎖定該會話群組的 Team 操作。",
+      "status_label": "状态",
+      "stage_label": "阶段",
+      "elapsed": "耗时",
+      "preset_label": "预设",
+      "owning_session": "所屬主會話",
+      "launched_from": "啟動會話",
+      "execution_session": "執行會話",
+      "spec_round": "Spec 审计轮次",
+      "impl_round": "实现审计轮次",
+      "active_p2p": "活跃 Team 运行",
+      "combo_id": "團隊組合流程",
+      "active_prompt": "OpenSpec 提示詞",
+      "verdict": "结论",
+      "terminal_reason": "結束原因",
+      "task_stats": "任務狀態",
+      "scores": "评分",
+      "final_scores": "最終驗收評分",
+      "pre_repair_scores": "修復前審計評分",
+      "score_snapshot_meta": "第 {{round}} 輪 · {{reason}}",
+      "scores_empty": "暂无评分",
+      "scores_pending_repair_rescore": "這些分數來自上一輪實作審計。Auto Deliver 正在根據審計結論執行修復，修復完成後會重新審計並刷新評分。",
+      "audit_results": "審計輪次結果",
+      "audit_results_empty": "暫無已完成審計輪次",
+      "round_index": "第 {{count}} 輪",
+      "required_changes": "要求修改",
+      "evidence": "证据",
+      "evidence_stale": "已過期",
+      "error": {
+        "missing_change": "请先选择一个 OpenSpec 变更。",
+        "active_run": "該會話群組已有 Auto Deliver 在執行。",
+        "manual_team_busy": "該會話群組已有手動 Team 執行占用中。",
+        "unsupported_runtime": "Auto Deliver 需要基於 transport 的編碼會話。",
+        "launch_failed": "启动 Auto Deliver 失败。",
+        "invalid_rounds": "稽核輪數超出允許範圍。",
+        "daemon_offline": "Daemon 離線，重新連線後再試。",
+        "launch_timeout": "自動交付啟動逾時，請重試。",
+        "stop_timeout": "自動交付停止逾時，請重試。",
+        "custom_combo_unsupported": "自動交付暫不支援自訂團隊組合流程。",
+        "strict_result_failed": "稽核沒有回傳有效的嚴格結果。",
+        "continue_timeout": "自動交付繼續逾時，請重試。"
+      },
+      "preset": {
+        "fast": "快速",
+        "standard": "标准",
+        "strict": "严格",
+        "deep": "深度"
+      },
+      "status": {
+        "proposed": "已提案",
+        "spec_audit_repair": "Spec 審計",
+        "implementation_task_loop": "實作中",
+        "implementation_audit_repair": "實作審計",
+        "commit_push": "提交並推送",
+        "stopping": "停止中",
+        "passed": "通过",
+        "needs_human": "需要人工",
+        "failed": "失败",
+        "stopped": "已停止"
+      },
+      "stage": {
+        "proposed": "提案",
+        "spec_audit_repair": "Spec 审计",
+        "implementation_task_loop": "实现",
+        "implementation_audit_repair": "实现审计",
+        "commit_push": "提交並推送",
+        "passed": "通过",
+        "needs_human": "需要人工",
+        "failed": "失败",
+        "stopped": "已停止",
+        "stopping": "停止中"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "任务",
+        "implementation": "实现",
+        "tests": "测试",
+        "risk": "风险"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "实现侧报告",
+        "audit_reported": "审计侧报告",
+        "none": "无"
+      },
+      "ask": {
+        "header": "OpenSpec 自動交付",
+        "needs_human_question": "自動交付需要人工處理：{{reason}} 這個會話接下來要怎麼做？",
+        "review_continue": "查看失敗原因並手動繼續",
+        "review_continue_desc": "傳送指令，讓代理檢查已停止的自動交付、修復問題並回報結果。",
+        "stop_summarize": "停在這裡並總結目前狀態",
+        "stop_summarize_desc": "讓代理停止目前工作，並給出簡短交接說明。"
+      },
+      "reason": {
+        "auto_deliver_active": "此會話已經有 Auto Deliver 正在執行。",
+        "audit_p2p_failed": "Team/P2P 審計執行在產出結果前失敗。",
+        "missing_authoritative_json": "審計沒有產出最終權威 JSON 結果。",
+        "invalid_authoritative_json": "最終權威 JSON 結果無效。",
+        "audit_metadata_mismatch": "審計結果元資料與本次 Auto Deliver 執行不匹配。",
+        "invalid_authoritative_result_path": "權威結果檔案路徑位於允許的討論目錄之外。",
+        "invalid_audit_verdict": "審計結論載荷無效。",
+        "audit_blocked": "審計報告為阻塞結果。請查看評分後決定是否重新執行 Auto Deliver。",
+        "tasks_unreadable": "無法讀取 tasks.md。",
+        "tasks_missing_checkboxes": "tasks.md 沒有可驗證的任務複選框。",
+        "implementation_audit_required": "完成前必須執行實現審計。",
+        "implementation_prompt_limit_reached": "已達到實現提示次數上限。",
+        "max_elapsed_time_reached": "已達到 Auto Deliver 時間上限。",
+        "out_of_band_target_session_input": "Auto Deliver 執行期間實現會話收到了人工輸入。",
+        "spec_audit_rework_reported": "Spec 審計報告仍有後續工作。請查看評分後決定是否重新執行 Auto Deliver。",
+        "implementation_audit_rework_reported": "實現審計報告仍有後續工作。請查看評分後決定是否重新執行 Auto Deliver。",
+        "spec_audit_rework_rounds_exhausted": "Spec 審計修復輪次已用盡。",
+        "implementation_audit_rework_rounds_exhausted": "實現審計修復輪次已用盡。",
+        "audit_pass_with_unchecked_tasks": "審計通過時 tasks.md 仍有未勾選任務。",
+        "audit_pass_with_required_changes": "審計通過時仍存在必需修改。",
+        "audit_pass_without_scores": "審計通過但缺少完整模組評分。",
+        "audit_pass_with_changed_files_without_repairs": "文件發生變更但審計通過結果沒有修復摘要。",
+        "audit_pass_with_uncovered_changes": "審計修復摘要未覆蓋所有變更文件。",
+        "quality_gate_low_score": "品質門控因模組低分暫停：{{modules}}。Auto Deliver 會先送出實作修復提示，然後重新審計並評分。",
+        "final_audit_passed": "最終審計已通過。",
+        "final_audit_rework_scored": "最終審計已完成並給出後續工作評分。請查看模組分數決定是否再執行 Auto Deliver。",
+        "final_audit_blocked_scored": "最終審計已完成並給出阻塞判定評分。請查看模組分數決定是否再執行 Auto Deliver。",
+        "auto_commit_push_failed": "自動提交/推送失敗：{{detail}}",
+        "auto_commit_push_git_status_failed": "自動提交/推送無法讀取 git 狀態：{{detail}}",
+        "auto_commit_push_preexisting_changes": "啟動前已有產品檔案改動，已略過自動提交/推送：{{files}}",
+        "auto_commit_push_incomplete": "提交/推送步驟後仍有產品檔案未提交，需要人工檢查：{{files}}",
+        "auto_commit_push_no_upstream": "目前分支沒有 upstream，需要人工檢查後推送。",
+        "auto_commit_push_not_pushed": "仍有 {{count}} 個 commit 領先 upstream，需要人工檢查推送。",
+        "auto_commit_push_no_commit": "沒有產生新的 commit，需要人工檢查。",
+        "auto_commit_push_forbidden_paths": "本機規劃檔案被提交了，需要人工檢查：{{files}}",
+        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 變更之外的檔案，需要人工檢查：{{files}}",
+        "spec_audit_blocked": "規格稽核被阻塞。請查看結果、修復問題後繼續。",
+        "implementation_audit_blocked": "實作稽核被阻塞。請查看結果、修復問題後繼續。",
+        "spec_audit_rework_requires_repair": "規格稽核回報仍需修復。自動交付會繼續下一次稽核修復流程。",
+        "implementation_audit_rework_requires_repair": "實作稽核回報仍需修復。自動交付會先執行實作修復，然後重新審計並評分。",
+        "spec_audit_followup_repair": "規格稽核討論已完成。自動交付會先修復變更文件，再進行最終驗收評分。",
+        "implementation_audit_followup_repair": "實作稽核討論已完成。自動交付會先執行最終修復，再進行驗收評分。"
+      },
+      "lifecycle": {
+        "spec_audit_repair_started": "Spec 審計修復已開始。",
+        "spec_audit_repair_p2p_started": "Spec 審計 Team 執行已開始。",
+        "implementation_prompt_dispatched": "實現提示已送出。",
+        "spec_repair_prompt_dispatched": "已根據審計結論送出規格修復提示：{{reason}}",
+        "implementation_repair_prompt_dispatched": "已根據審計結論送出實作修復提示：{{reason}}",
+        "implementation_idle_incomplete": "實現仍在處理任務。",
+        "implementation_idle_all_checked": "所有實現任務已勾選。",
+        "implementation_audit_repair_started": "實現審計修復已開始。",
+        "implementation_audit_repair_p2p_started": "實現審計 Team 執行已開始。",
+        "auto_commit_push_prompt_dispatched": "提交/推送提示已送出。",
+        "post_repair_acceptance_audit_dispatched": "最終驗收審計已送出。",
+        "post_repair_result_file_repair_prompt_dispatched": "最終驗收結果檔案修復提示已送出。",
+        "authoritative_result_file_repair_prompt_dispatched": "結果檔案修復提示已送出。",
+        "spec_audit_passed": "Spec 審計已通過。",
+        "spec_audit_rework_scored": "Spec 審計已完成，並記錄了後續工作評分。",
+        "spec_audit_blocked_scored": "Spec 審計已完成，並記錄了阻塞 verdict 評分。",
+        "continue_requested": "已要求繼續。"
+      },
+      "spec_rounds": "Spec 審計輪次",
+      "impl_rounds": "實作審計輪次",
+      "team_combo": "團隊組合流程",
+      "auto_commit_push": "審計通過後自動提交並推送",
+      "auto_commit_push_help": "會儲存為你的偏好。審計通過後會讓 agent 執行 commit&push。",
+      "continue": "繼續",
+      "continuing": "繼續中..."
+    },
     "propose_from_discussion_action": "根據最近討論生成",
     "propose_from_description_action": "根據下面的描述生成",
     "audit_implementation_prompt": "對 {{reference}} 執行嚴格的實作審計，逐項對照其 OpenSpec 產物。找出所有不一致、遺漏、回歸風險、邊界情境缺口與缺失測試；然後直接修復程式碼、測試以及必要的配套改動。如果實作推進過程需要同步調整規格產物，也要在同一次任務裡直接更新 {{reference}} 下的 OpenSpec 檔案。不要停留在報告層面，必須把實作修到與規格完全一致。",
@@ -1142,7 +1485,27 @@
     "passkey_verify_wrong_account": "你驗證的是另一個帳號的 Passkey，請使用目前帳號綁定的 Passkey。",
     "passkey_verify_no_passkeys": "目前帳號尚未綁定 Passkey。",
     "native_status_verifying_passkey": "正在驗證 Passkey…",
-    "native_status_saving_password": "正在儲存密碼登入…"
+    "native_status_saving_password": "正在儲存密碼登入…",
+    "executionRouting": {
+      "title": "執行路由",
+      "enableLabel": "使用專用執行會話",
+      "enableHint": "啟用後，實作/執行工作將從下方模板會話複製出的短生命複製 worker 中執行，而不是在編排器中執行。儲存此選項僅儲存偏好設定，不會啟動任何執行。",
+      "templateLabel": "執行模板會話",
+      "templateNone": "未選擇",
+      "templateHint": "複製會繼承該會話的提供者、模型和工具，但絕不會繼承其身份或歷史紀錄。僅列出本專案中符合條件的非主會話。",
+      "noCandidates": "本專案暫無符合條件的模板會話。請啟動一個 worker 或子會話作為模板。",
+      "reselectRequired": "路由已啟用，但本專案尚未選擇有效的模板。請在下方選擇一個執行模板會話。",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "已達容量上限",
+        "template_ineligible": "不可用作範本",
+        "clone_of_clone_forbidden": "已是執行複本",
+        "worker_clone_forbidden": "工作階段不能作為範本",
+        "cron_clone_forbidden": "排程階段不能作為範本",
+        "target_not_found": "找不到工作階段",
+        "destroy_forbidden": "不允許"
+      }
+    }
   },
   "admin": {
     "title": "管理面板",
@@ -1294,6 +1657,7 @@
     "restore_quick_closed": "恢復剛才關閉的子會話視窗",
     "quick_close_unavailable": "先開啟子會話視窗後才能快速關閉",
     "p2p_discussions": "團隊討論",
+    "auto_deliver": "自動交付",
     "p2p_compact_show": "顯示 團隊 緊湊列",
     "p2p_compact_hide": "收合 團隊 為緊湊列",
     "p2p_compact_expand": "顯示 團隊 詳細列",

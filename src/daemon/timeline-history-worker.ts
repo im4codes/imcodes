@@ -167,7 +167,7 @@ export async function handleTimelineHistoryWorkerRequest(
     const substantive = queryByTypes(
       message.sessionName,
       message.contentTypes,
-      limit,
+      limit + 1,
       message.afterTs,
       message.beforeTs,
     );
@@ -186,7 +186,8 @@ export async function handleTimelineHistoryWorkerRequest(
 
     const events = [...substantive, ...stateEvents].sort(compareTimelineEventsForReplay);
     const readMs = Date.now() - tRead;
-    const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
+    const hasMoreSubstantive = substantive.length > limit;
+    const trimmedSubstantive = hasMoreSubstantive ? substantive.slice(substantive.length - limit) : substantive;
     let trimmed: TimelineEvent[];
     if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
       const cutoffTs = trimmedSubstantive[0]!.ts;
@@ -215,6 +216,7 @@ export async function handleTimelineHistoryWorkerRequest(
       payloadBytes: sanitized.payloadBytes,
       droppedEvents: sanitized.droppedEvents,
       truncatedEvents: sanitized.truncatedEvents,
+      hasMore: hasMoreSubstantive || sanitized.droppedEvents > 0,
       readMs,
       sanitizeMs,
     };

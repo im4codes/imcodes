@@ -18,6 +18,7 @@ import {
   type SessionGroupCloneState,
   type SessionGroupCloneWarning,
 } from '@shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '@shared/git-remote-url.js';
 import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
 
 interface Props {
@@ -148,6 +149,14 @@ function canUseKnownCloneCapability(ws: WsClient | null): boolean {
   return snapshot.capabilities.includes(SESSION_GROUP_CLONE_CAPABILITY_V1);
 }
 
+function canUseKnownGitRemoteCloneCapability(ws: WsClient | null): boolean {
+  if (!ws) return false;
+  const snapshot = ws.getDaemonCapabilitySnapshot?.() ?? null;
+  if (!snapshot) return false;
+  if (ws.isDaemonCapabilityStale?.()) return false;
+  return snapshot.capabilities.includes(GIT_REMOTE_CLONE_CAPABILITY_V1);
+}
+
 function cloneErrorCodeFromError(error: unknown): SessionGroupCloneErrorCode {
   if (error instanceof ApiError) {
     if (error.code) return error.code as SessionGroupCloneErrorCode;
@@ -186,6 +195,7 @@ export function CloneSessionGroupDialog({
   });
   const [useCwdOverride, setUseCwdOverride] = useState(false);
   const [cwdOverride, setCwdOverride] = useState('');
+  const [gitRemoteUrl, setGitRemoteUrl] = useState('');
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [uiState, setUiState] = useState<CloneUiState>(INITIAL_UI_STATE);
@@ -272,10 +282,11 @@ export function CloneSessionGroupDialog({
           } catch {
             // CustomEvent can be unavailable in very old embedded webviews.
           }
+          onClose();
         }
       }
     });
-  }, [idempotencyKey, serverId, ws]);
+  }, [idempotencyKey, onClose, serverId, ws]);
 
   const submit = () => {
     if (busy) return;
@@ -304,6 +315,10 @@ export function CloneSessionGroupDialog({
       setLocalError(t('session.clone.cwdRequired'));
       return;
     }
+    if (useCwdOverride && gitRemoteUrl.trim() && !canUseKnownGitRemoteCloneCapability(ws)) {
+      setLocalError(t('session.clone.gitRemoteCapabilityMissing'));
+      return;
+    }
 
     try {
       resolveCloneTargetProject(trimmed);
@@ -323,6 +338,7 @@ export function CloneSessionGroupDialog({
         sourceMainSessionName: sourceSession.name,
         targetProjectName: trimmed,
         cwdOverride: useCwdOverride ? cwdOverride.trim() : null,
+        gitRemoteUrl: useCwdOverride && gitRemoteUrl.trim() ? gitRemoteUrl.trim() : null,
         idempotencyKey,
       })).catch((error) => {
         setUiState({
@@ -422,7 +438,9 @@ export function CloneSessionGroupDialog({
               checked={useCwdOverride}
               disabled={busy}
               onChange={(event) => {
-                setUseCwdOverride((event.target as HTMLInputElement).checked);
+                const checked = (event.target as HTMLInputElement).checked;
+                setUseCwdOverride(checked);
+                if (!checked) setGitRemoteUrl('');
                 setLocalError(null);
               }}
               style={{ marginTop: 2 }}
@@ -475,6 +493,31 @@ export function CloneSessionGroupDialog({
                     ...
                   </button>
                 )}
+              </div>
+            </div>
+          )}
+
+          {useCwdOverride && (
+            <div class="form-group">
+              <label>{t('session.clone.gitRemoteUrl')}</label>
+              <input
+                type="text"
+                value={gitRemoteUrl}
+                disabled={busy}
+                placeholder={t('session.clone.gitRemoteUrlPlaceholder')}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellcheck={false}
+                data-lpignore="true"
+                data-1p-ignore
+                onInput={(event) => {
+                  setGitRemoteUrl((event.target as HTMLInputElement).value);
+                  setLocalError(null);
+                }}
+              />
+              <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+                {t('session.clone.gitRemoteUrlHelp')}
               </div>
             </div>
           )}

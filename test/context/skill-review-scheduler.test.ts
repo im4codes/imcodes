@@ -234,8 +234,8 @@ describe('background skill review scheduler', () => {
       },
     });
 
-    coordinator.ingestEvent({ id: 'user-1', target, eventType: 'user.turn', content: 'I keep iterating on tools.', createdAt: 100 });
-    coordinator.ingestEvent({ id: 'assistant-1', target, eventType: 'assistant.text', content: 'Done after several tool loops.', createdAt: 101 });
+    await coordinator.ingestEvent({ id: 'user-1', target, eventType: 'user.turn', content: 'I keep iterating on tools.', createdAt: 100 });
+    await coordinator.ingestEvent({ id: 'assistant-1', target, eventType: 'assistant.text', content: 'Done after several tool loops.', createdAt: 101 });
     coordinator.recordSkillReviewToolIteration(target, 10);
 
     const result = await Promise.race([
@@ -266,8 +266,8 @@ describe('background skill review scheduler', () => {
       },
     });
 
-    coordinator.ingestEvent({ id: 'user-low-tools', target, eventType: 'user.turn', content: 'Small workflow.', createdAt: 100 });
-    coordinator.ingestEvent({ id: 'assistant-low-tools', target, eventType: 'assistant.text', content: 'Done.', createdAt: 101 });
+    await coordinator.ingestEvent({ id: 'user-low-tools', target, eventType: 'user.turn', content: 'Small workflow.', createdAt: 100 });
+    await coordinator.ingestEvent({ id: 'assistant-low-tools', target, eventType: 'assistant.text', content: 'Done.', createdAt: 101 });
     coordinator.recordSkillReviewToolIteration(target, 9);
     await coordinator.materializeTarget(target, 'manual', 200);
 
@@ -275,15 +275,15 @@ describe('background skill review scheduler', () => {
     expect(getCounter('mem.skill.review_not_eligible', { reason: 'below_trigger_threshold' })).toBe(1);
     expect(getCounter('mem.skill.review_throttled', { reason: 'below_trigger_threshold' })).toBe(0);
 
-    coordinator.ingestEvent({ id: 'user-more-tools', target, eventType: 'user.turn', content: 'Continue workflow.', createdAt: 300 });
-    coordinator.ingestEvent({ id: 'assistant-more-tools', target, eventType: 'assistant.text', content: 'Done again.', createdAt: 301 });
+    await coordinator.ingestEvent({ id: 'user-more-tools', target, eventType: 'user.turn', content: 'Continue workflow.', createdAt: 300 });
+    await coordinator.ingestEvent({ id: 'assistant-more-tools', target, eventType: 'assistant.text', content: 'Done again.', createdAt: 301 });
     coordinator.recordSkillReviewToolIteration(target, 1);
     await coordinator.materializeTarget(target, 'manual', 400);
 
     expect(enqueued).toHaveLength(0);
 
-    coordinator.ingestEvent({ id: 'user-enough-tools', target, eventType: 'user.turn', content: 'Continue workflow again.', createdAt: 500 });
-    coordinator.ingestEvent({ id: 'assistant-enough-tools', target, eventType: 'assistant.text', content: 'Done again.', createdAt: 501 });
+    await coordinator.ingestEvent({ id: 'user-enough-tools', target, eventType: 'user.turn', content: 'Continue workflow again.', createdAt: 500 });
+    await coordinator.ingestEvent({ id: 'assistant-enough-tools', target, eventType: 'assistant.text', content: 'Done again.', createdAt: 501 });
     coordinator.recordSkillReviewToolIteration(target, 10);
     await coordinator.materializeTarget(target, 'manual', 600);
 
@@ -301,8 +301,8 @@ describe('background skill review scheduler', () => {
         enqueue: (job) => { enqueued.push(job); },
       },
     });
-    disabledCoordinator.ingestEvent({ id: 'user-disabled', target, eventType: 'user.turn', content: 'x', createdAt: 100 });
-    disabledCoordinator.ingestEvent({ id: 'assistant-disabled', target, eventType: 'assistant.text', content: 'y', createdAt: 101 });
+    await disabledCoordinator.ingestEvent({ id: 'user-disabled', target, eventType: 'user.turn', content: 'x', createdAt: 100 });
+    await disabledCoordinator.ingestEvent({ id: 'assistant-disabled', target, eventType: 'assistant.text', content: 'y', createdAt: 101 });
     disabledCoordinator.recordSkillReviewToolIteration(target, 10);
     await disabledCoordinator.materializeTarget(target, 'manual', 200);
 
@@ -321,8 +321,8 @@ describe('background skill review scheduler', () => {
         enqueue: (job) => { enqueued.push(job); },
       },
     });
-    failingCoordinator.ingestEvent({ id: 'user-failed', target, eventType: 'user.turn', content: 'x', createdAt: 300 });
-    failingCoordinator.ingestEvent({ id: 'assistant-failed', target, eventType: 'assistant.text', content: 'y', createdAt: 301 });
+    await failingCoordinator.ingestEvent({ id: 'user-failed', target, eventType: 'user.turn', content: 'x', createdAt: 300 });
+    await failingCoordinator.ingestEvent({ id: 'assistant-failed', target, eventType: 'assistant.text', content: 'y', createdAt: 301 });
     failingCoordinator.recordSkillReviewToolIteration(target, 10);
     await failingCoordinator.materializeTarget(target, 'manual', 400);
 

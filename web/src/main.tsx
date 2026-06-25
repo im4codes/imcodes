@@ -1,6 +1,7 @@
 import { render } from 'preact';
 import { marked } from 'marked';
 import { App } from './app.js';
+import { applyNativePlatformClasses } from './native-platform.js';
 import './styles.css';
 import './i18n/index.js';
 // Bundled programmer webfonts (OFL 1.1). JetBrains Mono is the default;
@@ -24,5 +25,7 @@ marked.use({
     },
   },
 });
+
+applyNativePlatformClasses();
 
 render(<App />, document.getElementById('app')!);

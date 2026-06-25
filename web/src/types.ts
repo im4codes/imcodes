@@ -1,4 +1,5 @@
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { SharedStateSummary } from './tab-sharing-ui.js';
 
 export type Priority = 0 | 1 | 2 | 3;
 
@@ -37,6 +38,7 @@ export interface SessionInfo {
   agentType: string;
   agentVersion?: string;
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
+  error?: string | null;
   label?: string | null;
   userCreated?: boolean;
   projectDir?: string;
@@ -68,6 +70,14 @@ export interface SessionInfo {
   /** Newest pending-queue version the UI has applied for this session.
    *  Used to drop stale out-of-order snapshots. See transport-queue.ts. */
   transportPendingMessageVersion?: number;
+  /** Passive, share-scoped state supplied by share-aware server/bootstrap paths. */
+  sharedState?: SharedStateSummary | null;
+  /** DAEMON-AUTHORITATIVE: whether this session may serve as an execution-clone
+   *  template. The UI renders this flag rather than recomputing eligibility. */
+  executionTemplateEligible?: boolean;
+  /** DAEMON-AUTHORITATIVE: ineligibility reason (meaningful only when
+   *  `executionTemplateEligible === false`). */
+  executionTemplateIneligibleReason?: string;
 }
 
 export interface ServerInfo {

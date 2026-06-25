@@ -21,6 +21,11 @@
 
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import {
+  bumpTransportQueueRevision,
+  clearAllTransportQueueRevisions,
+} from './transport-queue-revision.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -36,6 +41,12 @@ export interface ResendEntry {
   commandId: string;
   /** Attachment refs at enqueue time. Not resolved lazily — we do not re-walk the store. */
   attachments?: TransportAttachment[];
+  /** Server-authored share actor for attribution only; never injected into provider prompts. */
+  sharedActor?: SharedActorEnvelope;
+  /** @internal: this logical user event has already been written to the timeline. */
+  timelineCommitted?: boolean;
+  /** @internal: this logical user event has already been written to runtime history. */
+  historyCommitted?: boolean;
   /** Enqueue timestamp for expiry calculation. */
   queuedAt: number;
 }
@@ -46,7 +57,7 @@ const queues = new Map<string, ResendEntry[]>();
  * Append an entry. If the queue is already at MAX_RESEND_ENTRIES the oldest
  * entry is discarded (FIFO) so newly-typed messages always take priority.
  */
-export function enqueueResend(sessionName: string, entry: ResendEntry): { accepted: true; droppedOldest: boolean } {
+export function enqueueResend(sessionName: string, entry: ResendEntry): { accepted: true; droppedOldest: boolean; pendingVersion: number } {
   const list = queues.get(sessionName) ?? [];
   let droppedOldest = false;
   if (list.length >= MAX_RESEND_ENTRIES) {
@@ -59,12 +70,17 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): { accept
   }
   list.push(entry);
   queues.set(sessionName, list);
-  return { accepted: true, droppedOldest };
+  return { accepted: true, droppedOldest, pendingVersion: bumpTransportQueueRevision(sessionName) };
 }
 
 /** Non-mutating snapshot of the queue for UI / diagnostics. */
 export function getResendEntries(sessionName: string): ResendEntry[] {
   return [...(queues.get(sessionName) ?? [])];
+}
+
+/** Non-mutating snapshot of non-expired entries for UI / diagnostics. */
+export function getFreshResendEntries(sessionName: string, nowMs: number = Date.now()): ResendEntry[] {
+  return (queues.get(sessionName) ?? []).filter((entry) => nowMs - entry.queuedAt <= RESEND_EXPIRY_MS);
 }
 
 /** Non-mutating snapshot of every resend queue for daemon status diagnostics. */
@@ -75,19 +91,49 @@ export function listResendQueues(): Array<{ sessionName: string; entries: Resend
   }));
 }
 
+/** Non-mutating snapshot of every queue, excluding TTL-expired zombie entries. */
+export function listFreshResendQueues(nowMs: number = Date.now()): Array<{ sessionName: string; entries: ResendEntry[] }> {
+  return [...queues.entries()]
+    .map(([sessionName, entries]) => ({
+      sessionName,
+      entries: entries.filter((entry) => nowMs - entry.queuedAt <= RESEND_EXPIRY_MS),
+    }))
+    .filter((queue) => queue.entries.length > 0);
+}
+
 /** Number of entries currently queued for a session. */
 export function getResendCount(sessionName: string): number {
   return queues.get(sessionName)?.length ?? 0;
 }
 
+/** Drop queued entries matching a predicate. Returns the number removed. */
+export function removeResendEntries(
+  sessionName: string,
+  predicate: (entry: ResendEntry) => boolean,
+): number {
+  const list = queues.get(sessionName);
+  if (!list || list.length === 0) return 0;
+  const kept = list.filter((entry) => !predicate(entry));
+  const removed = list.length - kept.length;
+  if (kept.length === 0) {
+    queues.delete(sessionName);
+  } else if (removed > 0) {
+    queues.set(sessionName, kept);
+  }
+  if (removed > 0) bumpTransportQueueRevision(sessionName);
+  return removed;
+}
+
 /** Drop every queued entry for a session. Used by /stop, /clear, session delete. */
 export function clearResend(sessionName: string): void {
+  if (queues.has(sessionName)) bumpTransportQueueRevision(sessionName);
   queues.delete(sessionName);
 }
 
 /** Drop every queued entry everywhere. Test helper. */
 export function clearAllResend(): void {
   queues.clear();
+  clearAllTransportQueueRevisions();
 }
 
 export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknown;
@@ -108,6 +154,7 @@ export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknow
  * trail.
  */
 export type ResendExpireCallback = (info: { expiredCount: number }) => void;
+export type ResendDispatchFailureCallback = (info: { failedCount: number }) => void;
 
 /**
  * Drain and dispatch. The internal queue is cleared BEFORE calling `dispatch`
@@ -126,14 +173,17 @@ export async function drainResend(
   sessionName: string,
   dispatch: ResendDispatcher,
   onExpired?: ResendExpireCallback,
+  onDispatchFailed?: ResendDispatchFailureCallback,
 ): Promise<number> {
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
   queues.delete(sessionName);
+  bumpTransportQueueRevision(sessionName);
 
   const now = Date.now();
   let dispatched = 0;
   let expiredCount = 0;
+  let failedCount = 0;
   for (const entry of list) {
     if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
       expiredCount += 1;
@@ -151,6 +201,7 @@ export async function drainResend(
         'transport resend delivered after reconnect',
       );
     } catch (err) {
+      failedCount += 1;
       logger.warn(
         { err, sessionName, commandId: entry.commandId },
         'transport resend dispatch failed — dropping entry to avoid loops',
@@ -162,6 +213,13 @@ export async function drainResend(
       onExpired({ expiredCount });
     } catch (err) {
       logger.warn({ err, sessionName, expiredCount }, 'drainResend: onExpired callback threw');
+    }
+  }
+  if (failedCount > 0 && onDispatchFailed) {
+    try {
+      onDispatchFailed({ failedCount });
+    } catch (err) {
+      logger.warn({ err, sessionName, failedCount }, 'drainResend: onDispatchFailed callback threw');
     }
   }
   return dispatched;

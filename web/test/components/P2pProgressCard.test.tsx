@@ -7,7 +7,17 @@ import { render, screen, cleanup, fireEvent, act } from '@testing-library/preact
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key.split('.').pop() ?? key,
+    t: (key: string, options?: Record<string, unknown> | string) => {
+      if (key === 'share.actorLabel' && typeof options === 'object') {
+        return `${String(options.name ?? '')} · ${String(options.role ?? '')}`;
+      }
+      if (key === 'share.role.viewer') return 'Viewer';
+      if (key === 'share.role.participant') return 'Participant';
+      if (key === 'share.role.serverMember') return 'Server member';
+      if (key === 'share.role.serverManager') return 'Server manager';
+      if (key === 'share.role.system') return 'System';
+      return typeof options === 'string' ? options : key.split('.').pop() ?? key;
+    },
   }),
 }));
 
@@ -55,6 +65,45 @@ describe('P2pProgressCard', () => {
 
     expect(screen.getAllByText('H2/2').length).toBeGreaterThan(0);
     expect(screen.queryByText('H4/2')).toBeNull();
+  });
+
+  it('renders server-authored actor labels for scoped P2P runs', () => {
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_shared_actor',
+          topic: 'Team audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 1,
+          completedHops: 0,
+          totalHops: 1,
+          activePhase: 'hop',
+          nodes: [],
+          sharedActor: {
+            actorUserId: 'user-shared',
+            actorDisplayName: 'Ada Shared',
+            effectiveActorRole: 'participant',
+            origin: 'shared-tab',
+            actionId: 'action-shared',
+            primaryShareId: 'share-1',
+            authorizedAt: 1,
+            snapshot: {
+              target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_alpha_brain' },
+              effectiveRole: 'participant',
+              historyCutoffAt: 1,
+              authorizedAt: 1,
+              primaryShareId: 'share-1',
+              coveringShareIds: ['share-1'],
+              nextCoverageRecheckAt: null,
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('Ada Shared · Participant')).toBeTruthy();
   });
 
   it('shows legacy combo cycle progress in the P2P bar instead of raw execution steps', () => {

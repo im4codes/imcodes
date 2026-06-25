@@ -299,6 +299,42 @@ describe('SubSessionWindow metadata wiring', () => {
     });
   });
 
+  it('passes streaming assistant text through to the sub-session window ChatView', async () => {
+    timelineEventsMock = [{
+      eventId: 'stream-1',
+      sessionId: 'deck_sub_sub-1',
+      type: 'assistant.text',
+      payload: { text: 'window partial stream', streaming: true },
+    }];
+
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          state: 'running',
+        } as any)}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+      expect(props.events).toEqual(timelineEventsMock);
+      expect(props.events[0].payload).toMatchObject({ text: 'window partial stream', streaming: true });
+    });
+  });
+
   it('keeps the usage footer mounted for idle-looking agent sub-sessions without usage', async () => {
     const sub = makeSubSession({
       type: 'codex-sdk',
@@ -908,7 +944,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
-  it('subscribes raw=false when minimized, upgrades to raw=true when active, and downgrades back to raw=false', async () => {
+  it('keeps shell windows unsubscribed while inactive and raw-subscribes only while active', async () => {
     const sub = makeSubSession();
 
     const view = render(
@@ -928,9 +964,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       />,
     );
 
-    await waitFor(() => {
-      expect(ws.subscribeTerminal).toHaveBeenCalledWith(sub.sessionName, false);
-    });
+    expect(ws.subscribeTerminal).not.toHaveBeenCalled();
 
     view.rerender(
       <SubSessionWindow
@@ -971,7 +1005,32 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     );
 
     await waitFor(() => {
-      expect(ws.subscribeTerminal.mock.calls.at(-1)).toEqual([sub.sessionName, false]);
+      expect(ws.unsubscribeTerminal).toHaveBeenCalledWith(sub.sessionName);
+    });
+  });
+
+  it('keeps non-shell windows passively subscribed when inactive', async () => {
+    const sub = makeSubSession({ type: 'codex', shellBin: null });
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(ws.subscribeTerminal).toHaveBeenCalledWith(sub.sessionName, false);
     });
   });
 

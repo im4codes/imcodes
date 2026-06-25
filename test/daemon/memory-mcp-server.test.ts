@@ -3,12 +3,27 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
-import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
+import { createMemoryMcpServerFromEnv, mergeDefaultToolDeps } from '../../src/daemon/memory-mcp-server.js';
+import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+
+// Hoisted mock: prove the production run-authoritative limit resolver is wired
+// into the composed deps WITHOUT a manual inject. A tight cap=1 (distinct from
+// the cap=3 default) lets the assertion confirm the daemon resolver — not a
+// default — is what backs the merged `resolveExecutionCloneLimits`.
+vi.mock('../../src/daemon/execution-clone-limits-resolver.js', () => ({
+  resolveExecutionCloneLimitsForParentRun: vi.fn(() => ({
+    enabled: false,
+    maxParallelClones: 1,
+    maxQueuedClones: 1,
+    cloneHardTimeoutMs: 1000,
+    cloneRetentionMs: 1000,
+  })),
+}));
 
 const namespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
 
@@ -305,5 +320,40 @@ describe('memory MCP stdio server', () => {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
+  });
+});
+
+describe('mergeDefaultToolDeps per-field composition', () => {
+  const caller: McpRuntimeCaller = {
+    userId: 'user-1',
+    namespace: namespace as McpRuntimeCaller['namespace'],
+    sessionName: 'deck_sub_worker',
+    projectName: 'proj',
+    projectRoot: '/tmp/proj',
+    serverId: 'srv-1',
+    transport: 'stdio',
+  };
+
+  it('composes default cancelSession, capability + limit resolvers when only dispatchMessage is injected', () => {
+    const dispatchSpy = vi.fn(async () => {});
+    const merged = mergeDefaultToolDeps(caller, {
+      // ONLY a custom dispatcher — no cancelSession, no resolveExecutionCloneLimits,
+      // no isExecutionCloneCapabilityEnabled. The old early-return dropped all three.
+      sendDeps: { dispatchMessage: dispatchSpy },
+    });
+
+    // The injected dispatcher must be the one preserved (not clobbered by the default).
+    expect(merged.sendDeps?.dispatchMessage).toBe(dispatchSpy);
+
+    // ...and the other three production defaults must STILL compose.
+    expect(typeof merged.sendDeps?.cancelSession).toBe('function');
+    expect(typeof merged.sendDeps?.resolveExecutionCloneLimits).toBe('function');
+    expect(typeof merged.sendDeps?.isExecutionCloneCapabilityEnabled).toBe('function');
+
+    // The composed limit resolver is backed by the daemon resolver (mocked cap=1),
+    // proving it is wired without a manual inject.
+    expect(merged.sendDeps?.resolveExecutionCloneLimits?.('run-x')).toMatchObject({
+      maxParallelClones: 1,
+    });
   });
 });

@@ -135,7 +135,13 @@ vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn().mo
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({ getQwenRuntimeConfig: vi.fn(async () => null) }));
-vi.mock('../../src/agent/sdk-runtime-config.js', () => ({ getClaudeSdkRuntimeConfig: vi.fn(async () => ({})) }));
+// Keep the REAL exports (notably normalizeClaudeSdkModelForProvider, used by the
+// restore/launch model resolution); only stub getClaudeSdkRuntimeConfig so the
+// test doesn't read ~/.claude credentials.
+vi.mock('../../src/agent/sdk-runtime-config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/agent/sdk-runtime-config.js')>()),
+  getClaudeSdkRuntimeConfig: vi.fn(async () => ({})),
+}));
 vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: vi.fn(async () => ({})) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
@@ -148,12 +154,69 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
+import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 };
+
+function claudeRunForSession(sessionName: string, prompt?: string) {
+  return mocks.claudeRuns.find((run) => {
+    const env = run.options.env;
+    return !!env
+      && typeof env === 'object'
+      && (env as Record<string, unknown>).IMCODES_SESSION === sessionName
+      && (!prompt || run.prompt === prompt);
+  });
+}
+
+async function settleClaudeRun(sessionName: string, prompt?: string) {
+  await flush();
+  const deadline = Date.now() + 5_000;
+  while (!claudeRunForSession(sessionName, prompt) && Date.now() < deadline) {
+    await flush();
+  }
+  return claudeRunForSession(sessionName, prompt);
+}
+
+function codexRunForSession(sessionName: string, mode?: 'start' | 'resume') {
+  return mocks.codexRuns.find((run) => {
+    const env = run.options.env;
+    return !!env
+      && typeof env === 'object'
+      && (env as Record<string, unknown>).IMCODES_SESSION === sessionName
+      && (!mode || run.mode === mode);
+  });
+}
+
+/** Poll until the codex run for this session/mode is registered (or 5s elapses),
+ *  so a single `flush()` can't be starved past the assertion under full-suite CPU
+ *  contention (real context-store Worker threads delay setTimeout(0) macrotasks).
+ *  Preserves the original initial flush, then keeps flushing ONLY if the async
+ *  send→provider→run-registration chain hasn't completed yet — uncontended runs
+ *  are unchanged (the run is present after the first flush, the loop exits at once). */
+async function settleCodexRun(sessionName: string, mode: 'start' | 'resume') {
+  await flush();
+  const deadline = Date.now() + 5_000;
+  while (!codexRunForSession(sessionName, mode) && Date.now() < deadline) {
+    await flush();
+  }
+}
+
+function forceRuntimeProviderError(
+  runtime: NonNullable<ReturnType<typeof getTransportRuntime>>,
+  error: ProviderError,
+): void {
+  const internal = runtime as unknown as {
+    recordProviderError(error: ProviderError): void;
+    setStatus(status: 'error'): void;
+  };
+  internal.recordProviderError(error);
+  internal.setStatus('error');
+}
 
 describe('sdk transport session restore', () => {
   let tempDir: string;
@@ -208,23 +271,220 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe('route-cc-restore');
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    const run = await settleClaudeRun('deck_sdk_cc_brain', 'What token did I ask you to remember?');
 
     expect(mocks.claudeRuns).toHaveLength(1);
-    expect(mocks.claudeRuns[0].options.resume).toBe('cc-session-restore');
-    expect(mocks.claudeRuns[0].options.model).toBe('sonnet');
-    expect(mocks.claudeRuns[0].options.effort).toBe('high');
-    expect(mocks.claudeRuns[0].options.env).toMatchObject({
+    expect(run?.options.resume).toBe('cc-session-restore');
+    expect(run?.options.model).toBe('sonnet');
+    expect(run?.options.effort).toBe('high');
+    expect(run?.options.env).toMatchObject({
       IMCODES_SESSION: 'deck_sdk_cc_brain',
       IMCODES_SESSION_LABEL: 'deck_sdk_cc_brain',
     });
-    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
+    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
     expect(mocks.store.get('deck_sdk_cc_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('persists transport runtime running status so session snapshots do not stay idle while tools run', async () => {
+    const persistedRecords: Array<Record<string, any> | null> = [];
+    setSessionPersistCallback(async (record) => {
+      persistedRecords.push(record);
+    });
+    mocks.store.set('deck_sdk_status_brain', {
+      name: 'deck_sdk_status_brain',
+      projectName: 'sdkstatus',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-status',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-status',
+      codexSessionId: 'codex-thread-status',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    const runtime = getTransportRuntime('deck_sdk_status_brain');
+    expect(runtime).toBeDefined();
+    (runtime as unknown as { setStatus(status: 'thinking'): void }).setStatus('thinking');
+
+    expect(mocks.store.get('deck_sdk_status_brain')?.state).toBe('running');
+    expect(persistedRecords.at(-1)).toMatchObject({
+      name: 'deck_sdk_status_brain',
+      state: 'running',
+    });
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_sdk_status_brain',
+      'session.state',
+      expect.objectContaining({ state: 'running' }),
+      { source: 'daemon', confidence: 'high' },
+    );
+  });
+
+  it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {
+    mocks.store.set('deck_sdk_cancel_idle_brain', {
+      name: 'deck_sdk_cancel_idle_brain',
+      projectName: 'sdkcancelidle',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cancel-idle',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-cancel-idle',
+      codexSessionId: 'codex-thread-cancel-idle',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    const runtime = getTransportRuntime('deck_sdk_cancel_idle_brain');
+    expect(runtime).toBeDefined();
+    timelineEmitterEmitMock.mockClear();
+
+    const internal = runtime as unknown as {
+      recordProviderError(error: ProviderError): void;
+      setStatus(status: 'thinking' | 'idle'): void;
+    };
+    internal.setStatus('thinking');
+    internal.recordProviderError({
+      code: PROVIDER_ERROR_CODES.CANCELLED,
+      message: 'Codex turn cancelled',
+      recoverable: true,
+    });
+    internal.setStatus('idle');
+
+    const idleCall = timelineEmitterEmitMock.mock.calls.find((call) =>
+      call[0] === 'deck_sdk_cancel_idle_brain'
+      && call[1] === 'session.state'
+      && call[2]?.state === 'idle'
+      && call[2]?.authoritative === true
+    );
+    expect(idleCall).toBeDefined();
+    expect(idleCall?.[2]).toMatchObject({
+      state: 'idle',
+      authoritative: true,
+      blockingWorkCount: 0,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      decisionReason: 'activity_reconciler_clear',
+    });
+    expect(idleCall?.[2]).not.toHaveProperty('error');
+    expect(idleCall?.[2]).not.toHaveProperty('reason');
+  });
+
+  it('reconciles unmatched persisted transport tool calls as daemon restart orphans before restore idle observation', async () => {
+    const sessionName = `deck_sdk_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await appendTransportEvent(sessionName, {
+      type: 'tool.call',
+      sessionId: sessionName,
+      toolCallId: 'restore-tool-1',
+      tool: 'Bash',
+      input: { command: 'SECRET_RESTORE_COMMAND' },
+    });
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkorphan',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-orphan',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-orphan',
+      codexSessionId: 'codex-thread-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    const terminalIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'tool.result'
+      && call[2]?.toolCallId === 'restore-tool-1'
+      && call[2]?.terminalStatus === 'stale'
+      && call[2]?.terminalReason === 'daemon_restart_orphan'
+    );
+    const restoreStateIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'session.state'
+      && call[2]?.decisionReason === 'restore_reconnect_observed'
+    );
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(restoreStateIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeLessThan(restoreStateIndex);
+    expect(timelineEmitterEmitMock.mock.calls[restoreStateIndex]?.[2]).not.toHaveProperty('authoritative');
+
+    const replayed = await replayTransportHistory(sessionName);
+    expect(replayed).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'tool.result',
+        toolCallId: 'restore-tool-1',
+        terminalStatus: 'stale',
+        terminalReason: 'daemon_restart_orphan',
+      }),
+    ]));
+    expect(JSON.stringify(replayed)).not.toContain('SECRET_RESTORE_COMMAND');
+  });
+
+  it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {
+    // A claude-code-sdk session whose persisted model is the picker alias "fable".
+    // Restore does NOT take the model-change command path (which normalizes), so
+    // without normalization at the SDK boundary the raw "fable" reached the SDK and
+    // failed: "There's an issue with the selected model (fable). It may not exist."
+    mocks.store.set('deck_sdk_cc_fable', {
+      name: 'deck_sdk_cc_fable',
+      projectName: 'sdkcc',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-cc-fable',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-cc-fable',
+      ccSessionId: 'cc-session-fable',
+      requestedModel: 'fable',
+      activeModel: 'fable',
+      modelDisplay: 'fable',
+      effort: 'high',
+      transportConfig: { provider: { mode: 'safe' }, sharedContextNamespace: { scope: 'personal', projectId: 'sdk-cc-fable' } },
+    });
+
+    await connectProvider('claude-code-sdk', {});
+    await restoreTransportSessions('claude-code-sdk');
+
+    const runtime = getTransportRuntime('deck_sdk_cc_fable');
+    expect(runtime).toBeDefined();
+
+    runtime!.send('hello after restart');
+    const run = await settleClaudeRun('deck_sdk_cc_fable', 'hello after restart');
+
+    expect(mocks.claudeRuns).toHaveLength(1);
+    // The picker alias must be resolved to the documented API id before the SDK sees it.
+    expect(run?.options.model).toBe('claude-fable-5');
   });
 
   it('restoreTransportSessions awaits drainResend — pre-populated resend queue is fully transferred to runtime before resolve (audit cae1de69-826)', async () => {
@@ -391,10 +651,9 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe('route-cx-restore');
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    await settleCodexRun('deck_sdk_cx_brain', 'resume');
 
-    expect(mocks.codexRuns).toHaveLength(1);
-    expect(mocks.codexRuns[0]).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
+    expect(codexRunForSession('deck_sdk_cx_brain', 'resume')).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cx_brain')?.requestedModel).toBe('gpt-5.4');
     expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
@@ -420,9 +679,9 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_cx_launch_opus_brain');
     expect(runtime).toBeDefined();
     runtime!.send('launch with sanitized model');
-    await flush();
+    await settleCodexRun('deck_sdk_cx_launch_opus_brain', 'start');
 
-    expect(mocks.codexRuns[0]).toMatchObject({
+    expect(codexRunForSession('deck_sdk_cx_launch_opus_brain', 'start')).toMatchObject({
       mode: 'start',
       options: expect.objectContaining({ model: 'gpt-5.5' }),
     });
@@ -457,9 +716,9 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_cx_opus_brain');
     expect(runtime).toBeDefined();
     runtime!.send('resume with sanitized model');
-    await flush();
+    await settleCodexRun('deck_sdk_cx_opus_brain', 'resume');
 
-    expect(mocks.codexRuns[0]).toMatchObject({
+    expect(codexRunForSession('deck_sdk_cx_opus_brain', 'resume')).toMatchObject({
       mode: 'resume',
       id: 'codex-thread-opus-restore',
       options: expect.objectContaining({ model: 'gpt-5.5' }),
@@ -544,15 +803,15 @@ describe('sdk transport session restore', () => {
     const runtime = getTransportRuntime('deck_sdk_new_brain');
     expect(runtime).toBeDefined();
     runtime!.send('verify sdk env identity');
-    await flush();
-    expect(mocks.claudeRuns.at(-1)?.options.env).toMatchObject({
+    const run = await settleClaudeRun('deck_sdk_new_brain', 'verify sdk env identity');
+    expect(run?.options.env).toMatchObject({
       IMCODES_SESSION: 'deck_sdk_new_brain',
       IMCODES_SESSION_LABEL: 'CC1',
     });
-    expect(String(mocks.claudeRuns.at(-1)?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
+    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
   });
 
-  it('auto-restarts an errored transport runtime and replays the failed turn', async () => {
+  it('does not auto-restart ordinary provider errors', async () => {
     await connectProvider('claude-code-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_retry_brain',
@@ -569,27 +828,25 @@ describe('sdk transport session restore', () => {
 
     firstRuntime!.send('Please retry me [transport-retry-once]', 'cmd-retry-1');
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      if (mocks.claudeRuns.length >= 2 && getResendCount('deck_sdk_retry_brain') === 0) break;
+      if (firstRuntime!.getStatus() === 'error') break;
       await flush();
     }
 
-    expect(mocks.claudeRuns).toHaveLength(2);
+    expect(firstRuntime!.getStatus()).toBe('error');
+    await flush();
+    expect(mocks.claudeRuns).toHaveLength(1);
     expect(mocks.claudeRuns[0]).toMatchObject({
       prompt: 'Please retry me [transport-retry-once]',
       options: expect.objectContaining({ resume: 'cc-session-retry' }),
     });
-    expect(mocks.claudeRuns[1]).toMatchObject({
-      prompt: 'Please retry me [transport-retry-once]',
-      options: expect.objectContaining({ resume: 'cc-session-retry' }),
-    });
     expect(getResendCount('deck_sdk_retry_brain')).toBe(0);
-    expect(getTransportRuntime('deck_sdk_retry_brain')).toBeDefined();
-    expect(getTransportRuntime('deck_sdk_retry_brain')).not.toBe(firstRuntime);
+    expect(getTransportRuntime('deck_sdk_retry_brain')).toBe(firstRuntime);
+    expect(firstRuntime!.activeDispatchEntries).toEqual([]);
   });
 
-  it('auto-restart preserves messages queued behind the failed active turn', async () => {
+  it('auto-restart preserves messages queued behind a lost provider connection', async () => {
     await connectProvider('claude-code-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_retry_pending_brain',
@@ -604,27 +861,37 @@ describe('sdk transport session restore', () => {
     const firstRuntime = getTransportRuntime('deck_sdk_retry_pending_brain');
     expect(firstRuntime).toBeDefined();
 
-    expect(firstRuntime!.send('Please retry me [transport-retry-once]', 'cmd-retry-active')).toBe('sent');
+    expect(firstRuntime!.send('Please replay after connection loss', 'cmd-retry-active')).toBe('sent');
     expect(firstRuntime!.send('follow up one', 'cmd-retry-pending-1')).toBe('queued');
     expect(firstRuntime!.send('follow up two', 'cmd-retry-pending-2')).toBe('queued');
 
+    forceRuntimeProviderError(firstRuntime!, {
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'simulated provider connection loss',
+      recoverable: false,
+    });
+
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      if (mocks.claudeRuns.length >= 3 && getResendCount('deck_sdk_retry_pending_brain') === 0) break;
+      const relaunched = getTransportRuntime('deck_sdk_retry_pending_brain') !== firstRuntime;
+      const prompts = mocks.claudeRuns.map((run) => run.prompt);
+      if (relaunched
+        && getResendCount('deck_sdk_retry_pending_brain') === 0
+        && prompts.includes('Please replay after connection loss')
+        && prompts.includes('follow up one\n\nfollow up two')) break;
       await flush();
     }
 
-    expect(mocks.claudeRuns.map((run) => run.prompt)).toEqual([
-      'Please retry me [transport-retry-once]',
-      'Please retry me [transport-retry-once]',
+    expect(mocks.claudeRuns.map((run) => run.prompt)).toEqual(expect.arrayContaining([
+      'Please replay after connection loss',
       'follow up one\n\nfollow up two',
-    ]);
+    ]));
     expect(getResendCount('deck_sdk_retry_pending_brain')).toBe(0);
     expect(getTransportRuntime('deck_sdk_retry_pending_brain')).toBeDefined();
     expect(getTransportRuntime('deck_sdk_retry_pending_brain')).not.toBe(firstRuntime);
   });
 
-  it('rate-limited auto-recovery still preserves active and pending messages for later resend', async () => {
+  it('does not feed ordinary provider failures into the auto-recovery loop', async () => {
     await connectProvider('claude-code-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_retry_limited_brain',
@@ -643,32 +910,23 @@ describe('sdk transport session restore', () => {
     expect(firstRuntime!.send('limited follow up one', 'cmd-retry-limit-pending-1')).toBe('queued');
     expect(firstRuntime!.send('limited follow up two', 'cmd-retry-limit-pending-2')).toBe('queued');
 
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      const recoveryStopped = timelineEmitterEmitMock.mock.calls.some((call) => (
-        call[0] === 'deck_sdk_retry_limited_brain'
-          && call[1] === 'assistant.text'
-          && typeof call[2]?.text === 'string'
-          && call[2].text.includes('Transport recovery stopped')
-      ));
-      if (recoveryStopped && getResendCount('deck_sdk_retry_limited_brain') >= 3) break;
+      if (firstRuntime!.getStatus() === 'error') break;
       await flush();
     }
 
-    expect(timelineEmitterEmitMock.mock.calls).toEqual(expect.arrayContaining([
-      expect.arrayContaining([
-        'deck_sdk_retry_limited_brain',
-        'assistant.text',
-        expect.objectContaining({
-          text: expect.stringContaining('Transport recovery stopped'),
-        }),
-      ]),
-    ]));
-    expect(getResendEntries('deck_sdk_retry_limited_brain').map((entry) => entry.commandId)).toEqual([
-      'cmd-retry-limit-active',
-      'cmd-retry-limit-pending-1',
-      'cmd-retry-limit-pending-2',
-    ]);
+    expect(firstRuntime!.getStatus()).toBe('error');
+    await flush();
+    expect(mocks.claudeRuns).toHaveLength(1);
+    expect(getTransportRuntime('deck_sdk_retry_limited_brain')).toBe(firstRuntime);
+    expect(getResendEntries('deck_sdk_retry_limited_brain')).toEqual([]);
+    expect(timelineEmitterEmitMock.mock.calls.some((call) => (
+      call[0] === 'deck_sdk_retry_limited_brain'
+        && call[1] === 'assistant.text'
+        && typeof call[2]?.text === 'string'
+        && call[2].text.includes('Transport recovery stopped')
+    ))).toBe(false);
   });
 
   it('emits startup memory.context when the first transport turn carries the seeded memory', { timeout: 30_000 }, async () => {
@@ -824,10 +1082,10 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.ccSessionId).toBe('cc-session-switch');
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    const run = await settleClaudeRun(name, 'What token did I ask you to remember?');
 
-    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-switch');
-    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+    expect(run?.options.resume).toBe('cc-session-switch');
+    expect(run?.options.sessionId).toBeUndefined();
   });
 
   it('relaunches claude-code-sdk with a fresh provider route key while preserving the Claude resume id', async () => {
@@ -863,10 +1121,10 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe(next?.providerSessionId);
 
     runtime!.send('What token did I ask you to remember?');
-    await flush();
+    const run = await settleClaudeRun(name, 'What token did I ask you to remember?');
 
-    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-restart');
-    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+    expect(run?.options.resume).toBe('cc-session-restart');
+    expect(run?.options.sessionId).toBeUndefined();
   });
 
   it('starts a fresh claude-code cli conversation when relaunching with fresh', async () => {

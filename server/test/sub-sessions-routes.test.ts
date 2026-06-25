@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
+const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 const mockCreateSubSession = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -11,6 +12,10 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
@@ -26,6 +31,7 @@ describe('sub-session routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
   });
 
   async function buildApp() {

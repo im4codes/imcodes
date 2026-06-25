@@ -24,6 +24,12 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   /^imcodes-test-p2p-workflow[-_][a-z0-9-]+$/i,
   /^deck_sub_(?:cxsdk_e2e|cxsdk_effort|ccsdk_minimax_sub)$/i,
   /^deck_sub_e2e_[a-z0-9_-]+$/i,
+  // Execution-clone (deck_sub_*) lifecycle TEST sessions. Clone lifecycle tests
+  // create ephemeral clones under an explicit, guarded clone-test naming family
+  // so a leaked clone is excluded from persistence and reaped on startup. Scoped
+  // strictly to the TEST prefix `deck_sub_(e2e_)?execclone_` so REAL production
+  // clones (random `deck_sub_<hex>` ids from subSessionName) are NEVER matched.
+  /^deck_sub_(?:e2e_)?execclone_[a-z0-9_-]+$/i,
 ];
 
 const PROJECT_NAME_PATTERNS: RegExp[] = [
@@ -53,6 +59,8 @@ const PROJECT_DIR_PATTERNS: RegExp[] = [
   /[/\\]tmp[/\\].*imcodes-test-preview/i,
   /[/\\]tmp[/\\].*imcodes-test-p2p-workflow/i,
   /[/\\]tmp[/\\].*imc_p2p_wf_test_/i,
+  // Temporary cwd/project dirs used by execution-clone lifecycle TESTS.
+  /[/\\]tmp[/\\].*execclone[-_]/i,
 ];
 
 function normalize(value: string | null | undefined): string | undefined {

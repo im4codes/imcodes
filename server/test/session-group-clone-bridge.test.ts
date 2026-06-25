@@ -9,6 +9,7 @@ import {
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   SESSION_GROUP_CLONE_MSG,
 } from '../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -99,6 +100,22 @@ function makeDb(options: {
     close: () => {},
   } as unknown as import('../src/db/client.js').Database;
   return { db, auditRows, userPrefs };
+}
+
+/**
+ * Web clients serialize the P2P session config to a JSON string before calling
+ * PUT /api/preferences/:key, and that route JSON.stringifies the body value
+ * again — so the canonical stored form in user_preferences is DOUBLE-encoded.
+ * Seeding tests with this real format is what catches reader bugs.
+ */
+function encodeStoredP2pPref(config: unknown): string {
+  return JSON.stringify(JSON.stringify(config));
+}
+
+function decodeStoredP2pPref(raw: string | undefined): unknown {
+  if (raw === undefined) return null;
+  const once = JSON.parse(raw) as unknown;
+  return typeof once === 'string' ? JSON.parse(once) : once;
 }
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -329,7 +346,8 @@ describe('WsBridge session group clone routing', () => {
   it('copies server-synced P2P preference on successful clone and forwards the daemon-local save', async () => {
     const { serverId, daemon, browserA, userPrefs, auditRows } = await setup();
     const sourceKey = p2pSessionConfigPrefKey('deck_cd_brain', serverId);
-    userPrefs.set(`user-owner:${sourceKey}`, JSON.stringify({
+    // Seed in the REAL stored format (double-encoded by the preferences route).
+    userPrefs.set(`user-owner:${sourceKey}`, encodeStoredP2pPref({
       sessions: {
         deck_cd_brain: { enabled: true, mode: 'audit' },
         deck_sub_a: { enabled: true, mode: 'review' },
@@ -379,7 +397,7 @@ describe('WsBridge session group clone routing', () => {
     await flush();
 
     const targetKey = p2pSessionConfigPrefKey('deck_cd_1_brain', serverId);
-    expect(JSON.parse(userPrefs.get(`user-owner:${targetKey}`) ?? 'null')).toMatchObject({
+    expect(decodeStoredP2pPref(userPrefs.get(`user-owner:${targetKey}`))).toMatchObject({
       sessions: {
         deck_cd_1_brain: { enabled: true, mode: 'audit' },
         deck_sub_b: { enabled: true, mode: 'review' },
@@ -402,13 +420,143 @@ describe('WsBridge session group clone routing', () => {
     expect(JSON.stringify(auditRows)).toContain('session_group_clone.p2p_config_copied');
   });
 
+  it('copies server-synced P2P preference saved under a source Team member scope', async () => {
+    const { serverId, daemon, browserA, userPrefs } = await setup();
+    const sourceMemberKey = p2pSessionConfigPrefKey('deck_sub_a', serverId);
+    // Intentionally single-encoded: covers legacy values written server-side
+    // before the canonical double-encoded form — the reader accepts both.
+    userPrefs.set(`user-owner:${sourceMemberKey}`, JSON.stringify({
+      sessions: {
+        deck_sub_a: { enabled: true, mode: 'audit' },
+        deck_sub_reviewer: { enabled: true, mode: 'review' },
+      },
+      rounds: 3,
+      contextReducer: {
+        mode: 'reuse_existing_session',
+        sessionName: 'deck_sub_reviewer',
+      },
+    }));
+
+    browserA.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-p2p-member-pref',
+      targetProjectName: 'cd_1',
+    }));
+    await flush();
+    daemon.clearSent();
+
+    daemon.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.EVENT,
+      operationId: 'op-p2p-member-pref',
+      idempotencyKey: 'idem-p2p-member-pref',
+      state: 'succeeded',
+      sourceMainSessionName: 'deck_cd_brain',
+      clonedMainSessionName: 'deck_cd_1_brain',
+      result: {
+        operationId: 'op-p2p-member-pref',
+        idempotencyKey: 'idem-p2p-member-pref',
+        sourceMainSession: 'deck_cd_brain',
+        clonedMainSession: 'deck_cd_1_brain',
+        targetProjectName: 'cd_1',
+        targetProjectSlug: 'cd_1',
+        sessionNameMap: {
+          deck_cd_brain: 'deck_cd_1_brain',
+          deck_sub_a: 'deck_sub_b',
+          deck_sub_reviewer: 'deck_sub_reviewer_clone',
+        },
+        copiedSubSessionIds: [
+          { sourceId: 'a', clonedId: 'b' },
+          { sourceId: 'reviewer', clonedId: 'reviewer_clone' },
+        ],
+        skippedMembers: [],
+        skippedCronJobs: 0,
+        skippedOrchestrationRuns: 0,
+        warnings: [],
+      },
+    }));
+    await flush();
+
+    const targetKey = p2pSessionConfigPrefKey('deck_cd_1_brain', serverId);
+    expect(decodeStoredP2pPref(userPrefs.get(`user-owner:${targetKey}`))).toMatchObject({
+      sessions: {
+        deck_sub_b: { enabled: true, mode: 'audit' },
+        deck_sub_reviewer_clone: { enabled: true, mode: 'review' },
+      },
+      rounds: 3,
+      contextReducer: {
+        sessionName: 'deck_sub_reviewer_clone',
+      },
+    });
+    expect(daemon.sentJson()).toContainEqual(expect.objectContaining({
+      type: P2P_CONFIG_MSG.SAVE,
+      scopeSession: 'deck_cd_1_brain',
+      config: expect.objectContaining({
+        sessions: {
+          deck_sub_b: { enabled: true, mode: 'audit' },
+          deck_sub_reviewer_clone: { enabled: true, mode: 'review' },
+        },
+      }),
+    }));
+  });
+
+  it('surfaces p2p_config_missing warning when no server-synced source preference exists', async () => {
+    const { serverId, daemon, browserA } = await setup();
+
+    browserA.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-p2p-pref-missing',
+      targetProjectName: 'cd_1',
+    }));
+    await flush();
+    daemon.clearSent();
+    browserA.clearSent();
+
+    daemon.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.EVENT,
+      operationId: 'op-p2p-pref-missing',
+      idempotencyKey: 'idem-p2p-pref-missing',
+      state: 'succeeded',
+      sourceMainSessionName: 'deck_cd_brain',
+      clonedMainSessionName: 'deck_cd_1_brain',
+      result: {
+        operationId: 'op-p2p-pref-missing',
+        idempotencyKey: 'idem-p2p-pref-missing',
+        sourceMainSession: 'deck_cd_brain',
+        clonedMainSession: 'deck_cd_1_brain',
+        targetProjectName: 'cd_1',
+        targetProjectSlug: 'cd_1',
+        sessionNameMap: { deck_cd_brain: 'deck_cd_1_brain' },
+        copiedSubSessionIds: [],
+        skippedMembers: [],
+        skippedCronJobs: 0,
+        skippedOrchestrationRuns: 0,
+        warnings: [],
+      },
+    }));
+    await flush();
+
+    expect(browserA.sentJson()).toContainEqual(expect.objectContaining({
+      type: SESSION_GROUP_CLONE_MSG.EVENT,
+      operationId: 'op-p2p-pref-missing',
+      state: 'succeeded',
+      warnings: expect.arrayContaining([
+        expect.objectContaining({ code: 'p2p_config_missing', fieldPath: 'server_pref' }),
+      ]),
+    }));
+    expect(daemon.sentJson().some((msg) => msg.type === P2P_CONFIG_MSG.SAVE)).toBe(false);
+  });
+
   it('converts server-synced P2P preference write failure into cleanup_required instead of success', async () => {
     const { serverId, daemon, browserA, userPrefs, auditRows } = await setup(
       [SESSION_GROUP_CLONE_CAPABILITY_V1],
       { failUserPreferenceWrites: true },
     );
     const sourceKey = p2pSessionConfigPrefKey('deck_cd_brain', serverId);
-    userPrefs.set(`user-owner:${sourceKey}`, JSON.stringify({
+    userPrefs.set(`user-owner:${sourceKey}`, encodeStoredP2pPref({
       sessions: {
         deck_cd_brain: { enabled: true, mode: 'audit' },
       },
@@ -472,7 +620,7 @@ describe('WsBridge session group clone routing', () => {
   it('replays cloned-root daemon-local P2P save when daemon reconnects after server preference success', async () => {
     const { serverId, daemon, browserA, userPrefs, auditRows } = await setup();
     const sourceKey = p2pSessionConfigPrefKey('deck_cd_brain', serverId);
-    userPrefs.set(`user-owner:${sourceKey}`, JSON.stringify({
+    userPrefs.set(`user-owner:${sourceKey}`, encodeStoredP2pPref({
       sessions: {
         deck_cd_brain: { enabled: true, mode: 'audit' },
       },
@@ -515,7 +663,7 @@ describe('WsBridge session group clone routing', () => {
     daemon.close();
     await flush();
 
-    expect(JSON.parse(userPrefs.get(`user-owner:${p2pSessionConfigPrefKey('deck_cd_1_brain', serverId)}`) ?? 'null')).toMatchObject({
+    expect(decodeStoredP2pPref(userPrefs.get(`user-owner:${p2pSessionConfigPrefKey('deck_cd_1_brain', serverId)}`))).toMatchObject({
       sessions: { deck_cd_1_brain: { enabled: true, mode: 'audit' } },
     });
     expect(daemon.sentJson().some((msg) => msg.type === P2P_CONFIG_MSG.SAVE)).toBe(false);
@@ -615,6 +763,27 @@ describe('WsBridge session group clone routing', () => {
       code: 'unsupported_command',
       originalType: SESSION_GROUP_CLONE_MSG.START,
       missingCapability: SESSION_GROUP_CLONE_CAPABILITY_V1,
+    }));
+  });
+
+  it('rejects browser git remote clone commands when daemon git clone capability is missing', async () => {
+    const { serverId, daemon, browserA } = await setup([SESSION_GROUP_CLONE_CAPABILITY_V1]);
+    browserA.emit('message', JSON.stringify({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      serverId,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: 'idem-missing-git-capability',
+      cwdOverride: '/work/copied',
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
+    }));
+    await flush();
+
+    expect(daemon.sentJson().some((msg) => msg.type === SESSION_GROUP_CLONE_MSG.START)).toBe(false);
+    expect(browserA.sentJson()).toContainEqual(expect.objectContaining({
+      type: 'error',
+      code: 'unsupported_command',
+      originalType: SESSION_GROUP_CLONE_MSG.START,
+      missingCapability: GIT_REMOTE_CLONE_CAPABILITY_V1,
     }));
   });
 

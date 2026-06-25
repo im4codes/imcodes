@@ -23,6 +23,87 @@
     "hide": "隐藏",
     "this_feature": "此功能"
   },
+  "share": {
+    "menu": {
+      "shareTab": "共享"
+    },
+    "dialogTitle": "共享访问",
+    "dialogSubtitle": "向 {{target}} 授予受限访问。",
+    "target": {
+      "label": "目标",
+      "currentTab": "当前标签",
+      "server": "整个源服务器",
+      "serverFallback": "此服务器"
+    },
+    "role": {
+      "label": "角色",
+      "viewer": "查看者",
+      "participant": "参与者",
+      "serverMember": "服务器成员",
+      "serverManager": "服务器管理员",
+      "system": "系统"
+    },
+    "roleHelp": {
+      "viewer": "可查看范围内状态并加入范围内讨论，但不能驱动代理。",
+      "participant": "可查看范围内状态，并向覆盖的具体标签发送提示。"
+    },
+    "trust": {
+      "title": "参与者信任说明",
+      "body": "代理未被沙箱隔离。UI/API 限制会减少直接控制面，但参与者提示仍可能影响代理在其可访问环境中的行为。"
+    },
+    "recipient": {
+      "label": "接收者",
+      "placeholder": "用户 ID 或邮箱"
+    },
+    "list": {
+      "label": "共享用户",
+      "title": "共享用户",
+      "empty": "还没有共享用户"
+    },
+    "manage": {
+      "roleFor": "{{user}} 的角色",
+      "revoke": "撤销",
+      "revokeConfirm": "撤销 {{user}} 的访问？"
+    },
+    "sharedWithMe": {
+      "title": "别人共享给我",
+      "empty": "没有共享的标签或服务器",
+      "refresh": "刷新共享访问",
+      "kind": {
+        "server": "服务器",
+        "tab": "标签",
+        "subsession": "子会话"
+      }
+    },
+    "create": "创建共享",
+    "creating": "正在创建...",
+    "scope": {
+      "current": "共享范围"
+    },
+    "indicator": "{{scope}} 以 {{role}} 共享 · {{status}}",
+    "indicatorCompact": "以 {{role}} 共享 · {{status}}",
+    "indicatorSharedOut": "已共享给别人",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "有效",
+      "revoked": "已撤销",
+      "expired": "已过期",
+      "target-unavailable": "目标不可用"
+    },
+    "reason": {
+      "share-role-denied": "此角色不能使用该操作。",
+      "share-direct-surface-denied": "共享访问中不可使用此界面。",
+      "share-rate-limited": "共享操作过多，请稍后再试。",
+      "share-revoked": "此共享已撤销。",
+      "share-expired": "此共享已过期。",
+      "share-target-unavailable": "共享目标不可用。",
+      "share-role-changed": "共享角色已变更。",
+      "share-ticket-invalid": "共享访问票据无效。",
+      "share-cancel-unsupported": "此共享标签不支持取消。",
+      "share-audit-duplicate": "此操作已记录。",
+      "share-comment-invalid": "无法发布评论。"
+    }
+  },
   "window": {
     "maximize": "最大化",
     "restore": "还原",
@@ -45,7 +126,18 @@
     "reload": "重新加载",
     "retry": "重试"
   },
+  "askQuestion": {
+    "waiting": "正在等待你的回答，模型会在 {{seconds}} 秒后自行继续。",
+    "retained": "模型已经继续运行；你仍可在 {{seconds}} 秒内用这个回答打断它。",
+    "customPlaceholder": "自定义/补充（可选）",
+    "answerPlaceholder": "输入你的回答",
+    "dismiss": "关闭",
+    "answer": "回答",
+    "interrupt": "用此回答打断"
+  },
   "chat": {
+    "delete_message": "删除消息",
+    "delete_message_confirm": "为所有人删除此消息?此操作无法撤销。",
     "dpad": {
       "title": "方向键 — 拖动发送方向键"
     },
@@ -170,6 +262,13 @@
     "zoom_title": "消息",
     "zoom_copy_all": "全部复制",
     "zoom_hint": "长按选中文本，拖动手柄调整范围后复制。",
+    "image_download": "下载图片",
+    "image_downloading": "正在下载...",
+    "image_downloaded": "已下载",
+    "image_download_failed": "下载失败",
+    "image_copy": "复制图片",
+    "image_copied": "已复制图片",
+    "image_copy_failed": "复制失败",
     "tool_detail_toggle": "详情",
     "tool_detail_input": "输入",
     "tool_detail_output": "输出",
@@ -250,7 +349,12 @@
         "fangsong": "仿宋",
         "microsoft-jhenghei": "微软正黑体"
       }
-    }
+    },
+    "execution_clone_run": "用执行克隆运行当前任务",
+    "execution_clone_run_with_template": "克隆 {{name}} ×{{count}} 并行执行当前任务",
+    "execution_clone_run_no_template": "先在 Team 设置里启用并选择执行会话",
+    "execution_clone_run_empty": "请先输入任务",
+    "execution_clone_run_offline": "重连后才能运行执行克隆"
   },
   "session": {
     "restart": "↺ 重启",
@@ -292,6 +396,9 @@
     "type": "类型",
     "label": "标签",
     "workingDir": "工作目录",
+    "subsessionWorkingDirectory": "工作目录",
+    "subsessionWorkingDirectoryPlaceholder": "当前会话目录",
+    "subsessionWorkingDirectoryLocked": "子会话固定使用当前目录，启动时不能修改。",
     "parentSession": "父会话",
     "rename": "✎ 重命名",
     "rename_plain": "重命名",
@@ -316,6 +423,10 @@
       "overrideDirectories": "为克隆会话指定新工作目录",
       "cwdOverride": "替换工作目录",
       "cwdOverridePlaceholder": "/work/new-checkout",
+      "gitRemoteUrl": "Git remote 地址（可选）",
+      "gitRemoteUrlPlaceholder": "https://github.com/org/repo.git",
+      "gitRemoteUrlHelp": "填写后，daemon 会先把该 remote clone 到替换工作目录，再复制会话组。",
+      "gitRemoteCapabilityMissing": "当前连接的 daemon 暂不支持为复制组 clone Git remote。请更新或重连 daemon 后再试。",
       "browseCwd": "浏览工作目录",
       "daemonHostValidation": "工作目录会先在 daemon 主机上验证，然后才会创建任何资源。",
       "runningWarning": "复制后的组会从全新状态开始。源会话的待发送消息、终端历史和正在运行的工作不会被复制。",
@@ -363,6 +474,8 @@
         "blank_target_project": "目标项目名不能为空。",
         "name_taken": "该目标会话名已被使用。",
         "invalid_cwd": "该工作目录无法在 daemon 主机上使用。",
+        "invalid_git_remote": "不支持该 Git remote 地址。",
+        "git_clone_failed": "daemon 无法将 Git remote clone 到工作目录。",
         "incomplete_clone_spec": "某个正在运行的子会话缺少可复制的启动设置。",
         "unsupported_session_type": "其中一个会话暂不支持复制。",
         "p2p_config_invalid": "团队 配置无法复制。",
@@ -541,7 +654,17 @@
       "deny": "拒绝",
       "tool": "{{tool}} 需要审批"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "请在本会话中执行所请求的实现/执行工作。",
+      "useConfigured": "使用 {{name}}",
+      "useConfiguredNone": "使用执行会话",
+      "setSession": "设置执行会话…"
+    },
+    "executionGroup": {
+      "title": "执行工作会话（运行 {{run}}）",
+      "unknownRun": "待定"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
@@ -604,12 +727,18 @@
     "tab_files": "文件",
     "tab_changes": "变更",
     "changes_title": "变更 ({{count}})",
-    "no_changes": "无变更"
+    "no_changes": "无变更",
+    "rename_prompt": "重命名 {{name}}",
+    "rename_failed": "重命名失败",
+    "delete_confirm": "删除 {{name}}？此操作无法撤销。",
+    "delete_failed": "删除失败",
+    "invalid_name": "名称不能包含路径分隔符"
   },
   "toast": {
     "finished": "完成了",
     "upgrade_blocked_title": "升级已阻止",
     "upgrade_blocked_p2p_active": "团队 仍在运行。请先停止，再升级 daemon。",
+    "upgrade_blocked_auto_deliver_active": "自动交付仍在运行。请先停止，再升级 daemon。",
     "upgrade_blocked_transport_busy": "还有 transport session 正在 turn 中。等它回到 idle 再升级 daemon。",
     "upgrade_blocked_toolchain_unavailable": "daemon 主机上的 Node 已丢失（工具链被删除）。请重新安装 Node——在此之前自动升级已禁用。"
   },
@@ -650,6 +779,10 @@
     "title": "启动新会话",
     "project_name": "项目名",
     "working_directory": "工作目录",
+    "git_remote_url": "Git remote 地址（可选）",
+    "git_remote_url_placeholder": "https://github.com/org/repo.git",
+    "git_remote_url_help": "填写后，daemon 会先把该 remote clone 到工作目录，再启动会话。",
+    "git_remote_capability_missing": "当前连接的 daemon 暂不支持 clone Git remote。请更新或重连 daemon 后再试。",
     "browse": "浏览",
     "agent_type": "Agent 类型",
     "agent_flavor_cli": "CLI：适合喜欢原生界面的用户。聊天模式不支持流式输出。",
@@ -1061,6 +1194,8 @@
     "title": "OpenSpec",
     "changes": "变更",
     "empty": "暂无 OpenSpec 变更",
+    "no_tasks": "无任务",
+    "task_status_title": "已完成 {{checked}}/{{total}} 个任务",
     "load_timeout": "OpenSpec 变更加载超时。请在 daemon 重连后重试。",
     "load_unavailable": "daemon 连接就绪前暂时无法加载 OpenSpec 变更。",
     "load_error": "无法扫描 OpenSpec 变更",
@@ -1070,6 +1205,214 @@
     "implement_action": "实现",
     "achieve_action": "完成",
     "propose_action": "Propose",
+    "execute": {
+      "action": "执行",
+      "dispatch_heading": "在以下会话执行当前变更",
+      "dispatch_to": "{{name}}",
+      "default_heading": "默认执行会话",
+      "set_default": "将 {{name}} 设为默认",
+      "clear_default": "清除默认执行会话",
+      "no_change": "展开一个变更以选择其执行目标。",
+      "no_sessions": "本项目暂无可用的执行会话。"
+    },
+    "auto": {
+      "action": "Auto",
+      "kicker": "自动交付",
+      "custom": "自定义",
+      "launcher_title": "自动交付",
+      "details_title": "自动交付详情",
+      "current_run": "当前自动交付",
+      "list_title": "自动交付",
+      "list_empty": "还没有自动交付运行。",
+      "list_select": "选择一个自动交付运行。",
+      "no_change": "未选择变更",
+      "start": "启动自动交付",
+      "stop": "停止",
+      "confirm_stop": "停止这个自动交付运行？正在进行的 Team/审计任务会被取消。",
+      "stopping": "停止中...",
+      "view": "查看",
+      "compact": "紧凑",
+      "expand": "展开",
+      "tasks": "任务",
+      "tasks_unknown": "任务未知",
+      "tasks_progress": "{{checked}}/{{total}} 个任务",
+      "overall_progress": "整体进度",
+      "current_stage_progress": "当前阶段",
+      "progress_count": "{{current}}/{{total}}",
+      "progress_percent": "{{percent}}%",
+      "prompt_count": "{{count}} 次提示",
+      "prompt_progress": "{{count}}/{{total}} 次提示",
+      "prompt_count_label": "实现提示次数",
+      "latest_message": "最新消息",
+      "materialized_limits": "Spec 审计 {{spec}} · 实现审计 {{impl}}",
+      "preset_limits": "Spec {{spec}} · 实现 {{impl}}",
+      "conflict_active": "{{change}} 正在自动交付。",
+      "redacted_conflict": "同一会话组已有 Auto Deliver 在运行。",
+      "conflict_summary": "详细信息仅参与会话可见。",
+      "lock_manual_actions": "Auto Deliver 正在运行，已锁定该会话组的 Team 操作。",
+      "status_label": "状态",
+      "stage_label": "阶段",
+      "elapsed": "耗时",
+      "preset_label": "预设",
+      "owning_session": "所属主会话",
+      "launched_from": "启动会话",
+      "execution_session": "执行会话",
+      "spec_round": "Spec 审计轮次",
+      "impl_round": "实现审计轮次",
+      "active_p2p": "活跃 Team 运行",
+      "combo_id": "团队组合流程",
+      "active_prompt": "OpenSpec 提示词",
+      "verdict": "结论",
+      "terminal_reason": "结束原因",
+      "task_stats": "任务状态",
+      "scores": "评分",
+      "final_scores": "最终验收评分",
+      "pre_repair_scores": "修复前审计评分",
+      "score_snapshot_meta": "第 {{round}} 轮 · {{reason}}",
+      "scores_empty": "暂无评分",
+      "scores_pending_repair_rescore": "这些分数来自上一轮实现审计。Auto Deliver 正在根据审计结论执行修复，修复完成后会重新审计并刷新评分。",
+      "audit_results": "审计轮次结果",
+      "audit_results_empty": "暂无已完成审计轮次",
+      "round_index": "第 {{count}} 轮",
+      "required_changes": "要求修改",
+      "evidence": "证据",
+      "evidence_stale": "已过期",
+      "error": {
+        "missing_change": "请先选择一个 OpenSpec 变更。",
+        "active_run": "该会话组已有 Auto Deliver 在运行。",
+        "manual_team_busy": "该会话组已有手动 Team 运行占用中。",
+        "unsupported_runtime": "Auto Deliver 需要基于 transport 的编码会话。",
+        "launch_failed": "启动 Auto Deliver 失败。",
+        "invalid_rounds": "审计轮数超出允许范围。",
+        "daemon_offline": "Daemon 离线，重连后再试。",
+        "launch_timeout": "自动交付启动超时，请重试。",
+        "stop_timeout": "自动交付停止超时，请重试。",
+        "custom_combo_unsupported": "自动交付暂不支持自定义团队组合流程。",
+        "strict_result_failed": "审计没有返回有效的严格结果。",
+        "continue_timeout": "自动交付继续超时，请重试。"
+      },
+      "preset": {
+        "fast": "快速",
+        "standard": "标准",
+        "strict": "严格",
+        "deep": "深度"
+      },
+      "status": {
+        "proposed": "已提案",
+        "spec_audit_repair": "Spec 审计",
+        "implementation_task_loop": "实现中",
+        "implementation_audit_repair": "实现审计",
+        "commit_push": "提交并推送",
+        "stopping": "停止中",
+        "passed": "通过",
+        "needs_human": "需要人工",
+        "failed": "失败",
+        "stopped": "已停止"
+      },
+      "stage": {
+        "proposed": "提案",
+        "spec_audit_repair": "Spec 审计",
+        "implementation_task_loop": "实现",
+        "implementation_audit_repair": "实现审计",
+        "commit_push": "提交并推送",
+        "passed": "通过",
+        "needs_human": "需要人工",
+        "failed": "失败",
+        "stopped": "已停止",
+        "stopping": "停止中"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "任务",
+        "implementation": "实现",
+        "tests": "测试",
+        "risk": "风险"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "实现侧报告",
+        "audit_reported": "审计侧报告",
+        "none": "无"
+      },
+      "ask": {
+        "header": "OpenSpec 自动交付",
+        "needs_human_question": "自动交付需要人工处理：{{reason}} 这个会话接下来要怎么做？",
+        "review_continue": "查看失败原因并手动继续",
+        "review_continue_desc": "发送指令，让代理检查已停止的自动交付、修复问题并回报结果。",
+        "stop_summarize": "停在这里并总结当前状态",
+        "stop_summarize_desc": "让代理停止当前工作，并给出简短交接说明。"
+      },
+      "reason": {
+        "auto_deliver_active": "此会话已经有 Auto Deliver 正在运行。",
+        "audit_p2p_failed": "Team/P2P 审计运行在产出结果前失败。",
+        "missing_authoritative_json": "审计没有产出最终权威 JSON 结果。",
+        "invalid_authoritative_json": "最终权威 JSON 结果无效。",
+        "audit_metadata_mismatch": "审计结果元数据与本次 Auto Deliver 运行不匹配。",
+        "invalid_authoritative_result_path": "权威结果文件路径位于允许的讨论目录之外。",
+        "invalid_audit_verdict": "审计结论载荷无效。",
+        "audit_blocked": "审计报告为阻塞结果。请查看评分后决定是否重新运行 Auto Deliver。",
+        "tasks_unreadable": "无法读取 tasks.md。",
+        "tasks_missing_checkboxes": "tasks.md 没有可验证的任务复选框。",
+        "implementation_audit_required": "完成前必须执行实现审计。",
+        "implementation_prompt_limit_reached": "已达到实现提示次数上限。",
+        "max_elapsed_time_reached": "已达到 Auto Deliver 时间上限。",
+        "out_of_band_target_session_input": "Auto Deliver 运行期间执行会话收到了人工输入。",
+        "spec_audit_rework_reported": "Spec 审计报告仍有后续工作。请查看评分后决定是否重新运行 Auto Deliver。",
+        "implementation_audit_rework_reported": "实现审计报告仍有后续工作。请查看评分后决定是否重新运行 Auto Deliver。",
+        "spec_audit_rework_rounds_exhausted": "Spec 审计修复轮次已用尽。",
+        "implementation_audit_rework_rounds_exhausted": "实现审计修复轮次已用尽。",
+        "audit_pass_with_unchecked_tasks": "审计通过时 tasks.md 仍有未勾选任务。",
+        "audit_pass_with_required_changes": "审计通过时仍存在必需修改。",
+        "audit_pass_without_scores": "审计通过但缺少完整模块评分。",
+        "audit_pass_with_changed_files_without_repairs": "文件发生变更但审计通过结果没有修复摘要。",
+        "audit_pass_with_uncovered_changes": "审计修复摘要未覆盖所有变更文件。",
+        "quality_gate_low_score": "质量门控因模块低分暂停：{{modules}}。Auto Deliver 会先发送实现修复提示，然后重新审计并打分。",
+        "final_audit_passed": "最终审计已通过。",
+        "final_audit_rework_scored": "最终审计已完成并给出后续工作评分。请查看模块分数决定是否再运行 Auto Deliver。",
+        "final_audit_blocked_scored": "最终审计已完成并给出阻塞判定评分。请查看模块分数决定是否再运行 Auto Deliver。",
+        "auto_commit_push_failed": "自动提交/推送失败：{{detail}}",
+        "auto_commit_push_git_status_failed": "自动提交/推送无法读取 git 状态：{{detail}}",
+        "auto_commit_push_preexisting_changes": "启动前已有产品文件改动，已跳过自动提交/推送：{{files}}",
+        "auto_commit_push_incomplete": "提交/推送步骤后仍有产品文件未提交，需要人工检查：{{files}}",
+        "auto_commit_push_no_upstream": "当前分支没有 upstream，需要人工检查后推送。",
+        "auto_commit_push_not_pushed": "仍有 {{count}} 个 commit 领先 upstream，需要人工检查推送。",
+        "auto_commit_push_no_commit": "没有产生新的 commit，需要人工检查。",
+        "auto_commit_push_forbidden_paths": "本地规划文件被提交了，需要人工检查：{{files}}",
+        "auto_commit_push_unexpected_files": "commit 包含了本次 Auto Deliver 变更之外的文件，需要人工检查：{{files}}",
+        "spec_audit_blocked": "规格审计被阻塞。请查看结果、修复问题后继续。",
+        "implementation_audit_blocked": "实现审计被阻塞。请查看结果、修复问题后继续。",
+        "spec_audit_rework_requires_repair": "规格审计报告仍需修复。自动交付会继续下一次审计修复流程。",
+        "implementation_audit_rework_requires_repair": "实现审计报告仍需修复。自动交付会先执行实现修复，然后重新审计并打分。",
+        "spec_audit_followup_repair": "规格审计讨论已完成。自动交付会先修复变更文档，再进行最终验收评分。",
+        "implementation_audit_followup_repair": "实现审计讨论已完成。自动交付会先执行最终修复，再进行验收评分。"
+      },
+      "lifecycle": {
+        "spec_audit_repair_started": "Spec 审计修复已开始。",
+        "spec_audit_repair_p2p_started": "Spec 审计 Team 运行已开始。",
+        "implementation_prompt_dispatched": "实现提示已发送。",
+        "spec_repair_prompt_dispatched": "已根据审计结论发送规格修复提示：{{reason}}",
+        "implementation_repair_prompt_dispatched": "已根据审计结论发送实现修复提示：{{reason}}",
+        "implementation_idle_incomplete": "实现仍在处理任务。",
+        "implementation_idle_all_checked": "所有实现任务已勾选。",
+        "implementation_audit_repair_started": "实现审计修复已开始。",
+        "implementation_audit_repair_p2p_started": "实现审计 Team 运行已开始。",
+        "auto_commit_push_prompt_dispatched": "提交/推送提示已发送。",
+        "post_repair_acceptance_audit_dispatched": "最终验收审计已发送。",
+        "post_repair_result_file_repair_prompt_dispatched": "最终验收结果文件修复提示已发送。",
+        "authoritative_result_file_repair_prompt_dispatched": "结果文件修复提示已发送。",
+        "spec_audit_passed": "Spec 审计已通过。",
+        "spec_audit_rework_scored": "Spec 审计已完成，并记录了后续工作评分。",
+        "spec_audit_blocked_scored": "Spec 审计已完成，并记录了阻塞 verdict 评分。",
+        "continue_requested": "已请求继续。"
+      },
+      "spec_rounds": "Spec 审计轮次",
+      "impl_rounds": "实现审计轮次",
+      "team_combo": "团队组合流程",
+      "auto_commit_push": "审计通过后自动提交并推送",
+      "auto_commit_push_help": "会保存为你的偏好。审计通过后会让 agent 执行 commit&push。",
+      "continue": "继续",
+      "continuing": "继续中..."
+    },
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",
     "audit_implementation_prompt": "对 {{reference}} 执行严格的实现审计，逐项对照其 OpenSpec 产物。找出所有不一致、遗漏、回归风险、边界场景缺口和缺失测试；然后直接修复代码、测试以及必要的配套改动。如果实现推进过程中需要同步变更规范产物，也要在同一次任务里直接更新 {{reference}} 下的 OpenSpec 文件。不要停留在报告层面，必须把实现修到与规范完全一致。",
@@ -1142,7 +1485,27 @@
     "passkey_verify_wrong_account": "你验证的是另一个账号的 Passkey，请使用当前账号绑定的 Passkey。",
     "passkey_verify_no_passkeys": "当前账号还没有绑定 Passkey。",
     "native_status_verifying_passkey": "正在验证 Passkey…",
-    "native_status_saving_password": "正在保存密码登录…"
+    "native_status_saving_password": "正在保存密码登录…",
+    "executionRouting": {
+      "title": "执行路由",
+      "enableLabel": "使用专用执行会话",
+      "enableHint": "启用后，实现/执行工作将从下方模板会话复制出的短生命克隆 worker 中运行，而不是在编排器中运行。保存此选项仅保存偏好设置，不会启动任何执行。",
+      "templateLabel": "执行模板会话",
+      "templateNone": "未选择",
+      "templateHint": "克隆会继承该会话的提供商、模型和工具，但绝不会继承其身份或历史记录。仅列出本项目中符合条件的非主会话。",
+      "noCandidates": "本项目暂无符合条件的模板会话。请启动一个 worker 或子会话作为模板。",
+      "reselectRequired": "路由已启用，但本项目尚未选择有效的模板。请在下方选择一个执行模板会话。",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "已达容量上限",
+        "template_ineligible": "不可用作模板",
+        "clone_of_clone_forbidden": "已是执行克隆",
+        "worker_clone_forbidden": "工作会话不能作为模板",
+        "cron_clone_forbidden": "定时会话不能作为模板",
+        "target_not_found": "未找到会话",
+        "destroy_forbidden": "不允许"
+      }
+    }
   },
   "admin": {
     "title": "管理面板",
@@ -1294,6 +1657,7 @@
     "restore_quick_closed": "恢复刚才关闭的子会话窗口",
     "quick_close_unavailable": "先打开子会话窗口后才能快速关闭",
     "p2p_discussions": "团队讨论",
+    "auto_deliver": "自动交付",
     "p2p_compact_show": "显示 团队 紧凑栏",
     "p2p_compact_hide": "收起 团队 为紧凑栏",
     "p2p_compact_expand": "显示 团队 详细栏",

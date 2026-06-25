@@ -1,4 +1,4 @@
-export type SessionActionIconKind = 'pin' | 'unpin' | 'restart' | 'new' | 'rename' | 'settings' | 'clone' | 'stop';
+export type SessionActionIconKind = 'pin' | 'unpin' | 'restart' | 'new' | 'rename' | 'settings' | 'clone' | 'share' | 'stop';
 
 export function SessionActionMenuIcon({ kind }: { kind: SessionActionIconKind }) {
   const common = {
@@ -67,6 +67,15 @@ export function SessionActionMenuIcon({ kind }: { kind: SessionActionIconKind })
       {kind === 'stop' && (
         <svg {...common}>
           <rect width="14" height="14" x="5" y="5" rx="2" />
+        </svg>
+      )}
+      {kind === 'share' && (
+        <svg {...common}>
+          <circle cx="18" cy="5" r="3" />
+          <circle cx="6" cy="12" r="3" />
+          <circle cx="18" cy="19" r="3" />
+          <path d="m8.6 13.5 6.8 4" />
+          <path d="m15.4 6.5-6.8 4" />
         </svg>
       )}
     </span>

@@ -12,6 +12,8 @@ import {
   SESSION_TEXT_TAIL_CACHE_LIMIT,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { shareTargetFromSessionName, targetExists } from '../db/tab-sharing.js';
+import { resolveHttpShareAccess } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
@@ -255,7 +257,7 @@ function sanitizeWatchTimelineEvent(raw: unknown): {
   sessionId: string;
   ts: number;
   type: string;
-  payload: { text?: string };
+  payload: { text?: string; sharedActor?: unknown };
 } | null {
   if (!raw || typeof raw !== 'object') return null;
   const event = raw as Record<string, unknown>;
@@ -268,16 +270,22 @@ function sanitizeWatchTimelineEvent(raw: unknown): {
     ? event.payload as Record<string, unknown>
     : null;
   const text = typeof payload?.text === 'string' ? payload.text : undefined;
+  const sharedActor = payload?.sharedActor && typeof payload.sharedActor === 'object'
+    ? payload.sharedActor
+    : undefined;
   return {
     eventId,
     sessionId,
     ts,
     type,
-    payload: text !== undefined ? { text } : {},
+    payload: {
+      ...(text !== undefined ? { text } : {}),
+      ...(sharedActor !== undefined ? { sharedActor } : {}),
+    },
   };
 }
 
-function timelineResponseMetadata(response: Record<string, unknown>): Record<string, unknown> {
+function timelineResponseMetadata(response: Record<string, unknown>, visibleEventIds?: Set<string>): Record<string, unknown> {
   const metadata: Record<string, unknown> = {};
   for (const key of ['status', 'errorReason', 'source'] as const) {
     if (typeof response[key] === 'string') metadata[key] = response[key];
@@ -288,30 +296,37 @@ function timelineResponseMetadata(response: Record<string, unknown>): Record<str
   for (const key of ['payloadTruncated', 'cursorReset'] as const) {
     if (typeof response[key] === 'boolean') metadata[key] = response[key];
   }
-  if (Array.isArray(response.detailRefs)) metadata.detailRefs = response.detailRefs;
+  if (Array.isArray(response.detailRefs)) {
+    metadata.detailRefs = visibleEventIds
+      ? response.detailRefs.filter((ref) => {
+          if (!ref || typeof ref !== 'object') return false;
+          const eventId = (ref as Record<string, unknown>).eventId;
+          return typeof eventId === 'string' && visibleEventIds.has(eventId);
+        })
+      : response.detailRefs;
+  }
   if (response.nextCursor && typeof response.nextCursor === 'object') metadata.timelineCursor = response.nextCursor;
   return metadata;
 }
 
-async function verifyWatchSessionOwnership(db: Env['DB'], serverId: string, sessionName: string): Promise<boolean> {
-  try {
-    const mainRow = await db.queryOne<Record<string, unknown>>(
-      'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-      [serverId, sessionName],
-    );
-    if (mainRow) return true;
-
-    const subMatch = sessionName.match(/^deck_sub_(.+)$/);
-    if (!subMatch) return false;
-    const subRow = await db.queryOne<Record<string, unknown>>(
-      'SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
-      [serverId, subMatch[1]],
-    );
-    return !!subRow;
-  } catch (err) {
-    logger.warn({ serverId, sessionHash: hashSessionName(sessionName), err }, 'watch timeline session ownership check failed');
-    return false;
+async function authorizeWatchTimelineSession(
+  db: Env['DB'],
+  params: { serverId: string; userId: string; sessionName: string },
+): Promise<{ ok: true } | { ok: false; reason?: string }> {
+  const target = shareTargetFromSessionName(params.serverId, params.sessionName);
+  if (!target) return { ok: false, reason: 'share-target-unavailable' };
+  const access = await resolveHttpShareAccess(db, {
+    serverId: params.serverId,
+    userId: params.userId,
+    target,
+  });
+  if (access.actor.kind === 'server-member') {
+    return await targetExists(db, target)
+      ? { ok: true }
+      : { ok: false };
   }
+  if (access.actor.kind === 'share') return { ok: true };
+  return { ok: false };
 }
 
 function structuredTimelineCursor(response: Record<string, unknown>): Record<string, unknown> | null {
@@ -389,7 +404,8 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
   const bridge = WsBridge.get(serverId);
   const [dbMainSessions, subSessions, tabPrefs] = await Promise.all([
     getDbSessionsByServer(c.env.DB, serverId),
-    getSubSessionsByServer(c.env.DB, serverId),
+    // Watch listing surface: exclude ephemeral execution clones (default).
+    getSubSessionsByServer(c.env.DB, serverId, { includeExecutionClones: false }),
     loadTabPreferences(c.env.DB, userId),
   ]);
 
@@ -460,14 +476,10 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
 watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
-
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
-    return c.json({ error: 'forbidden' }, 403);
-  }
+  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 200) : 50;
@@ -501,7 +513,7 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
-      ...timelineResponseMetadata(response),
+      ...timelineResponseMetadata(response, new Set(events.map((event) => event.eventId as string))),
       hasMore: responseHasMore,
       nextCursor,
       earliestTs,
@@ -542,14 +554,10 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
 watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
-
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
-    return c.json({ error: 'forbidden' }, 403);
-  }
+  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 500) : 50;
@@ -607,7 +615,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
       sessionName,
       epoch: typeof response.epoch === 'number' ? response.epoch : null,
       events,
-      ...timelineResponseMetadata(response),
+      ...timelineResponseMetadata(response, new Set(events.map((event) => event.eventId as string))),
       hasMore: responseHasMore,
       nextCursor,
       earliestTs,
@@ -627,14 +635,10 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
 watchRoutes.get('/server/:id/timeline/text-tail', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
-
   const sessionName = c.req.query('sessionName')?.trim();
   if (!sessionName) return c.json({ error: 'session_name_required' }, 400);
-  if (!await verifyWatchSessionOwnership(c.env.DB, serverId, sessionName)) {
-    return c.json({ error: 'forbidden' }, 403);
-  }
+  const authorization = await authorizeWatchTimelineSession(c.env.DB, { serverId, userId, sessionName });
+  if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   try {
     const cached = await getSessionTextTailCache(c.env.DB, serverId, sessionName);

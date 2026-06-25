@@ -1,20 +1,18 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import type { ContextNamespace, LocalContextEvent } from '../../shared/context-types.js';
+import type { ContextNamespace, LocalContextEvent, ProcessedContextProjection } from '../../shared/context-types.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance, type MemoryMcpSourceProvenanceInput } from '../../shared/memory-mcp-provenance.js';
 import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
 import { serializeContextNamespace } from './context-keys.js';
-import {
-  LEGACY_DAEMON_LOCAL_USER_ID,
-  getArchivedEvent,
-  getContextObservationById,
-  getProcessedProjectionById,
-  getStagedEvent,
-  listContextNamespaces,
-  listProjectionSources,
-  searchArchiveFts,
+import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
+import type {
+  ArchiveSearchResult,
+  ContextNamespaceRow,
+  ContextObservationRow,
+  ProjectionSourceRow,
 } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 
 const MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('MemoryToolCaller');
 const INTERNAL_MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('InternalMemoryToolCaller');
@@ -179,9 +177,11 @@ function canReturnEvent(event: LocalContextEvent | undefined, caller: AnyCaller)
 // accepted here so a JSON-deserialized request body cannot smuggle the
 // `allowGlobalOwnerSearch` flag through a public surface.
 
-export function chatGetEvent(id: string, caller: MemoryToolCaller): ReturnType<typeof getArchivedEvent> {
+export async function chatGetEvent(id: string, caller: MemoryToolCaller): Promise<LocalContextEvent | undefined> {
   const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
-  const event = getArchivedEvent(id) ?? getStagedEvent(id);
+  const client = getContextStoreClient();
+  const event = await client.run<LocalContextEvent | undefined>('getArchivedEvent', [id])
+    ?? await client.run<LocalContextEvent | undefined>('getStagedEvent', [id]);
   if (!event) return undefined;
   assertCanAccessNamespace(event.target.namespace, checkedCaller);
   return event;
@@ -205,8 +205,9 @@ export type MemoryGetSourcesInput =
     kind?: 'projection' | 'observation';
   };
 
-function observationNamespaceById(namespaceId: string, scope: ContextNamespace['scope']): ContextNamespace | undefined {
-  const row = listContextNamespaces().find((candidate) => candidate.id === namespaceId);
+async function observationNamespaceById(namespaceId: string, scope: ContextNamespace['scope']): Promise<ContextNamespace | undefined> {
+  const rows = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
+  const row = rows.find((candidate) => candidate.id === namespaceId);
   if (!row) return undefined;
   return {
     scope,
@@ -240,10 +241,10 @@ function shouldUseProjectionFallback(sources: NonNullable<MemoryGetSourcesResult
     || sources.every((source) => source.content === null && source.status === 'missing');
 }
 
-function memoryGetObservationSources(observationId: string, caller: MemoryToolCaller): MemoryGetSourcesResult {
+async function memoryGetObservationSources(observationId: string, caller: MemoryToolCaller): Promise<MemoryGetSourcesResult> {
   const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
-  const observation = getContextObservationById(observationId);
-  const namespace = observation ? observationNamespaceById(observation.namespaceId, observation.scope) : undefined;
+  const observation = await getContextStoreClient().run<ContextObservationRow | null>('getContextObservationById', [observationId]);
+  const namespace = observation ? await observationNamespaceById(observation.namespaceId, observation.scope) : undefined;
   if (!observation || !canAccessObservationNamespace(namespace, checkedCaller)) {
     return { observationId, sourceEventCount: 0, sources: [] };
   }
@@ -271,14 +272,15 @@ function resolveGetSourcesInput(input: MemoryGetSourcesInput): { projectionId?: 
   return { projectionId, observationId };
 }
 
-export function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToolCaller): MemoryGetSourcesResult {
+export async function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToolCaller): Promise<MemoryGetSourcesResult> {
   const resolved = resolveGetSourcesInput(input);
   if (resolved.observationId && !resolved.projectionId) {
     return memoryGetObservationSources(resolved.observationId, caller);
   }
   const projectionId = resolved.projectionId ?? '';
   const checkedCaller = assertOwner(assertPublicCallerHasNamespace(caller));
-  const projection = getProcessedProjectionById(projectionId);
+  const client = getContextStoreClient();
+  const projection = await client.run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [projectionId]);
   if (!projection) return { projectionId, sourceEventCount: 0, sources: [] };
   if (!canAccessNamespace(projection.namespace, checkedCaller)) {
     // Fail closed and keep the response isomorphic with a missing projection.
@@ -286,7 +288,7 @@ export function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToo
     // projection for a guessed id and how many raw events backed it.
     return { projectionId, sourceEventCount: 0, sources: [] };
   }
-  const sources = listProjectionSources(projectionId).map((source) => {
+  const sources = (await client.run<ProjectionSourceRow[]>('listProjectionSources', [projectionId])).map((source) => {
     const event = canReturnEvent(source.event, checkedCaller) ? source.event : undefined;
     return {
       eventId: source.eventId,
@@ -308,22 +310,23 @@ export function memoryGetSources(input: MemoryGetSourcesInput, caller: MemoryToo
   };
 }
 
-export function chatSearchFts(query: string, caller: MemoryToolCaller): ReturnType<typeof searchArchiveFts>;
-export function chatSearchFts(query: string, limit: number | undefined, caller: MemoryToolCaller): ReturnType<typeof searchArchiveFts>;
+export function chatSearchFts(query: string, caller: MemoryToolCaller): Promise<ArchiveSearchResult[]>;
+export function chatSearchFts(query: string, limit: number | undefined, caller: MemoryToolCaller): Promise<ArchiveSearchResult[]>;
 export function chatSearchFts(
   query: string,
   limitOrCaller: number | MemoryToolCaller | undefined,
   caller?: MemoryToolCaller,
-): ReturnType<typeof searchArchiveFts> {
+): Promise<ArchiveSearchResult[]> {
   const resolvedCaller = typeof limitOrCaller === 'object' ? limitOrCaller : caller;
   const checkedCaller = assertOwner(assertPublicCallerHasNamespace(resolvedCaller));
   const requestedLimit = typeof limitOrCaller === 'number'
     ? Math.max(1, Math.min(100, Math.floor(limitOrCaller)))
     : 20;
-  return searchArchiveFts(query, requestedLimit, {
+  const opts = {
     namespace: checkedCaller.namespace,
     userId: checkedCaller.userId,
-  });
+  };
+  return getContextStoreClient().run<ArchiveSearchResult[]>('searchArchiveFts', [query, requestedLimit, opts]);
 }
 
 // ── Internal-only owner-wide search (NOT exposed on public read-tool surface) ──
@@ -337,13 +340,14 @@ export function _internalChatSearchFtsGlobal(
   query: string,
   limit: number | undefined,
   caller: InternalMemoryToolCaller,
-): ReturnType<typeof searchArchiveFts> {
+): Promise<ArchiveSearchResult[]> {
   const checkedCaller = assertOwner(caller);
   const requestedLimit = typeof limit === 'number'
     ? Math.max(1, Math.min(100, Math.floor(limit)))
     : 20;
-  return searchArchiveFts(query, requestedLimit, {
+  const opts = {
     namespace: undefined,
     userId: checkedCaller.userId,
-  });
+  };
+  return getContextStoreClient().run<ArchiveSearchResult[]>('searchArchiveFts', [query, requestedLimit, opts]);
 }

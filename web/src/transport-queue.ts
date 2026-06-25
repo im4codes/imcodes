@@ -1,6 +1,9 @@
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+
 export interface TransportPendingMessageEntry {
   clientMessageId: string;
   text: string;
+  sharedActor?: SharedActorEnvelope;
 }
 
 export interface TransportPendingQueueSnapshot {
@@ -33,9 +36,10 @@ export function synthesizeTransportPendingMessageEntries(
 
 /**
  * Extract a pending-queue version from a daemon event/snapshot payload.
- * Returns `undefined` when absent (legacy daemon, or the resend/relaunch
- * paths that emit unversioned snapshots) — callers treat `undefined` as
- * "always apply", preserving pre-versioning behavior.
+ * Returns `undefined` when absent (legacy daemon, or a stale resend/relaunch
+ * snapshot from older daemons). Once the UI has observed a versioned baseline,
+ * unversioned snapshots are no longer allowed to overwrite it because they
+ * cannot be ordered against already-drained messages.
  */
 export function extractTransportPendingVersion(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
@@ -53,36 +57,53 @@ export function extractTransportPendingVersion(value: unknown): number | undefin
  * queue desync.
  *
  * Rules:
- *   - `next === undefined`  → apply (unversioned legacy/resend snapshot)
+ *   - `next === undefined`  → apply only before a versioned baseline exists
  *   - `prev === undefined`  → apply (no baseline yet)
- *   - `next === 0`          → apply (a fresh runtime restarts the sequence at
- *                             0; accept it and let callers reset the baseline)
  *   - otherwise             → apply only if `next >= prev`
  */
 export function shouldApplyTransportQueueSnapshot(
   prev: number | undefined,
   next: number | undefined,
 ): boolean {
-  if (next === undefined) return true;
+  if (next === undefined) return prev === undefined;
   if (prev === undefined) return true;
-  if (next === 0) return true;
   return next >= prev;
 }
 
+export function shouldApplyTransportQueueSnapshotForPayload(
+  prev: number | undefined,
+  next: number | undefined,
+  options: {
+    hasExplicitSnapshot: boolean;
+    isExplicitEmpty: boolean;
+  },
+): boolean {
+  void options;
+  return shouldApplyTransportQueueSnapshot(prev, next);
+}
+
 /**
- * Fold an applied snapshot's version into the stored baseline. A fresh
- * runtime (`next === 0`) resets the baseline; an unversioned snapshot
- * (`next === undefined`) leaves the baseline untouched; otherwise the
- * baseline advances monotonically.
+ * Fold an applied snapshot's version into the stored baseline. Unversioned
+ * snapshots leave the baseline untouched; versioned snapshots advance
+ * monotonically. Version 0 is no longer a magic reset value — accepting an
+ * arbitrary 0 after a higher baseline lets stale queued snapshots resurrect
+ * drained queue cards.
  */
 export function nextTransportQueueVersion(
   prev: number | undefined,
   next: number | undefined,
 ): number | undefined {
   if (next === undefined) return prev;
-  if (next === 0) return 0;
   if (prev === undefined) return next;
   return Math.max(prev, next);
+}
+
+export function hasExplicitTransportPendingSnapshot(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object') return false;
+  return Object.prototype.hasOwnProperty.call(payload, 'pendingMessages')
+    || Object.prototype.hasOwnProperty.call(payload, 'pendingMessageEntries')
+    || Object.prototype.hasOwnProperty.call(payload, 'transportPendingMessages')
+    || Object.prototype.hasOwnProperty.call(payload, 'transportPendingMessageEntries');
 }
 
 export function extractTransportPendingMessages(value: unknown): string[] {
@@ -103,7 +124,12 @@ export function extractTransportPendingMessageEntries(value: unknown): Transport
       ? (entry as { text: string }).text.trim()
       : '';
     if (!clientMessageId || !text) return [];
-    return [{ clientMessageId, text }];
+    const sharedActor = (entry as { sharedActor?: unknown }).sharedActor;
+    return [{
+      clientMessageId,
+      text,
+      ...(sharedActor && typeof sharedActor === 'object' ? { sharedActor: sharedActor as SharedActorEnvelope } : {}),
+    }];
   });
 }
 
@@ -111,19 +137,23 @@ export function normalizeTransportPendingEntries(
   entries: unknown,
   messages: unknown,
   scopeKey: string,
+  options: {
+    hasEntriesField?: boolean;
+    hasMessagesField?: boolean;
+  } = {},
 ): TransportPendingMessageEntry[] {
-  const normalizedMessages = extractTransportPendingMessages(messages);
+  const hasEntriesField = options.hasEntriesField ?? Array.isArray(entries);
+  const hasMessagesField = options.hasMessagesField ?? Array.isArray(messages);
   const normalizedEntries = extractTransportPendingMessageEntries(entries);
-  if (normalizedMessages.length === 0) return normalizedEntries;
-  if (normalizedEntries.length === 0) return synthesizeTransportPendingMessageEntries(normalizedMessages, scopeKey);
-  return normalizedMessages.map((text, index) => {
-    const matchingEntry = normalizedEntries[index];
-    if (matchingEntry && matchingEntry.text === text) return matchingEntry;
-    return {
-      clientMessageId: `${scopeKey}:legacy:${index}:${text}`,
-      text,
-    };
-  });
+
+  // New transport snapshots treat the structured entries field as authoritative.
+  // If entries is present, including an explicit empty array, never synthesize a
+  // legacy tail from messages: those messages may be stale display data from an
+  // earlier snapshot and would resurrect already-drained queue cards.
+  if (hasEntriesField) return normalizedEntries;
+
+  if (!hasMessagesField) return [];
+  return synthesizeTransportPendingMessageEntries(extractTransportPendingMessages(messages), scopeKey);
 }
 
 export function removeTransportPendingEntryForUserMessage(
@@ -133,7 +163,13 @@ export function removeTransportPendingEntryForUserMessage(
   scopeKey: string,
 ): TransportPendingQueueSnapshot {
   const messages = extractTransportPendingMessages(existingMessages);
-  const entries = normalizeTransportPendingEntries(existingEntries, messages, scopeKey);
+  const entries = normalizeTransportPendingEntries(existingEntries, messages, scopeKey, {
+    // This is stored state, not an incoming authoritative snapshot. Older
+    // clients may have messages without structured entries; keep legacy
+    // fallback alive when the stored entry list is empty but messages exist.
+    hasEntriesField: Array.isArray(existingEntries) && existingEntries.length > 0,
+    hasMessagesField: Array.isArray(existingMessages),
+  });
   const candidateIds = [
     payload.clientMessageId,
     payload.commandId,
@@ -142,10 +178,29 @@ export function removeTransportPendingEntryForUserMessage(
   const normalizedText = typeof payload.text === 'string'
     ? normalizeTransportPendingText(payload.text)
     : '';
-  const matchIndex = entries.findIndex((entry) => {
-    if (candidateIdSet.has(entry.clientMessageId)) return true;
-    return !!normalizedText && normalizeTransportPendingText(entry.text) === normalizedText;
-  });
+  const idMatchIndex = candidateIdSet.size > 0
+    ? entries.findIndex((entry) => candidateIdSet.has(entry.clientMessageId))
+    : -1;
+  const textFallbackIndex = (() => {
+    if (!normalizedText) return -1;
+    const matches = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => normalizeTransportPendingText(entry.text) === normalizedText);
+    if (matches.length !== 1) return -1;
+    const match = matches[0];
+    // Stable ids normally win.  However, legacy snapshots synthesize ids from
+    // text (`session:legacy:*`) and can survive across client/daemon upgrades; a
+    // later authoritative user.message carries the real command/client id, so an
+    // id-only match leaves the old yellow queue card stuck beside the delivered
+    // user bubble.  Allow text fallback only for those synthetic legacy ids (or
+    // when no id was provided at all), preserving the duplicate-text safety for
+    // real structured queue entries.
+    if (candidateIdSet.size === 0 || isLegacyTransportPendingMessageId(match.entry.clientMessageId, scopeKey)) {
+      return match.index;
+    }
+    return -1;
+  })();
+  const matchIndex = idMatchIndex >= 0 ? idMatchIndex : textFallbackIndex;
   if (matchIndex < 0) return { messages, entries, changed: false };
   const nextEntries = entries.filter((_, index) => index !== matchIndex);
   return {
@@ -176,15 +231,20 @@ export function mergeTransportPendingEntriesForRunningState(
   pendingMessagesFromEvent: unknown,
   hasPendingMessagesField: boolean,
   scopeKey: string,
+  hasPendingEntriesField = hasPendingMessagesField && Array.isArray(pendingFromEvent),
 ): TransportPendingMessageEntry[] {
   const existingEntries = Array.isArray(existing)
     ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
     : [];
-  if (!hasPendingMessagesField) return existingEntries;
+  if (!hasPendingMessagesField && !hasPendingEntriesField) return existingEntries;
   return normalizeTransportPendingEntries(
     pendingFromEvent,
     pendingMessagesFromEvent,
     scopeKey,
+    {
+      hasEntriesField: hasPendingEntriesField,
+      hasMessagesField: hasPendingMessagesField,
+    },
   );
 }
 
@@ -204,14 +264,69 @@ export function mergeTransportPendingEntriesForIdleState(
   pendingMessagesFromEvent: unknown,
   hasPendingMessagesField: boolean,
   scopeKey: string,
+  hasPendingEntriesField = hasPendingMessagesField && Array.isArray(pendingFromEvent),
 ): TransportPendingMessageEntry[] {
   const existingEntries = Array.isArray(existing)
     ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
     : [];
-  if (!hasPendingMessagesField) return existingEntries;
+  if (!hasPendingMessagesField && !hasPendingEntriesField) return existingEntries;
   return normalizeTransportPendingEntries(
     pendingFromEvent,
     pendingMessagesFromEvent,
     scopeKey,
+    {
+      hasEntriesField: hasPendingEntriesField,
+      hasMessagesField: hasPendingMessagesField,
+    },
   );
+}
+
+
+export interface TransportPendingQueueSyncState {
+  transportPendingMessages?: string[] | null;
+  transportPendingMessageEntries?: TransportPendingMessageEntry[] | null;
+  transportPendingMessageVersion?: number | null;
+}
+
+export function hasTransportPendingSyncSnapshot(value: Record<string, unknown>): boolean {
+  return Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages')
+    || Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries');
+}
+
+export function buildTransportPendingSyncPatch(
+  existing: TransportPendingQueueSyncState,
+  value: Record<string, unknown>,
+  scopeKey: string,
+): Partial<TransportPendingQueueSyncState> {
+  if (!hasTransportPendingSyncSnapshot(value)) return {};
+  const incomingVersion = extractTransportPendingVersion(value.transportPendingMessageVersion);
+  const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessages');
+  const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(value, 'transportPendingMessageEntries');
+  const parsedMessages = extractTransportPendingMessages(value.transportPendingMessages);
+  const pendingEntries = normalizeTransportPendingEntries(
+    value.transportPendingMessageEntries,
+    parsedMessages,
+    scopeKey,
+    {
+      hasEntriesField: hasPendingEntriesField,
+      hasMessagesField: hasPendingMessagesField,
+    },
+  );
+  const pendingMessages = hasPendingEntriesField
+    ? pendingEntries.map((entry) => entry.text)
+    : parsedMessages;
+  if (!shouldApplyTransportQueueSnapshotForPayload(existing.transportPendingMessageVersion ?? undefined, incomingVersion, {
+    hasExplicitSnapshot: hasPendingMessagesField || hasPendingEntriesField,
+    isExplicitEmpty: (hasPendingMessagesField || hasPendingEntriesField) && pendingMessages.length === 0 && pendingEntries.length === 0,
+  })) {
+    return {};
+  }
+  return {
+    transportPendingMessages: pendingMessages,
+    transportPendingMessageEntries: pendingEntries,
+    transportPendingMessageVersion: nextTransportQueueVersion(
+      existing.transportPendingMessageVersion ?? undefined,
+      incomingVersion,
+    ),
+  };
 }

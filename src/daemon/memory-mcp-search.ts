@@ -1,7 +1,9 @@
 import type { ContextNamespace, ProcessedContextClass } from '../../shared/context-types.js';
 import type { ObservationClass, ObservationState } from '../../shared/memory-observation.js';
 import { normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
-import { searchLocalMemory, searchLocalMemorySemantic, type MemorySearchQuery } from '../context/memory-search.js';
+import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
+import type { MemorySearchQuery, MemorySearchResultItem } from '../context/memory-search.js';
+import { searchLocalMemoryForManagement, searchLocalMemorySemanticForManagement } from '../context/memory-recall-client.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 
 export type MemoryMcpListProjectionClass = Extract<ProcessedContextClass, 'recent_summary' | 'durable_memory_candidate'>;
@@ -34,6 +36,8 @@ export interface MemoryMcpSearchHit {
 
 export interface MemoryMcpSearchResult {
   items: MemoryMcpSearchHit[];
+  localUnavailable?: boolean;
+  degradedReasons?: string[];
 }
 
 export interface MemoryMcpListSummariesQuery {
@@ -54,6 +58,18 @@ export interface MemoryMcpSearchOptions {
     token: string;
   } | null;
   loadCredentials?: () => Promise<MemoryMcpSearchOptions['credentials']>;
+}
+
+function localMemoryDegradedReason(error: unknown): string {
+  const degradedReason = error && typeof error === 'object'
+    ? (error as { degradedReason?: unknown }).degradedReason
+    : undefined;
+  if (typeof degradedReason === 'string' && degradedReason.trim()) return degradedReason;
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (message.includes('semantic memory query embedding unavailable')) {
+    return MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE;
+  }
+  return MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE;
 }
 
 interface CloudRecallResponse {
@@ -240,43 +256,65 @@ async function searchLocalRecall(
   query: MemorySearchQuery,
   localServerId: string | undefined,
 ): Promise<MemoryMcpSearchHit[]> {
-  const result = await searchLocalMemorySemantic(query);
-  return result.items
-    .map((item) => ({
-      recordKind: item.type === 'observation' ? 'observation' as const : 'projection' as const,
-      projectionId: item.id,
-      ...(item.type === 'observation' ? { observationId: item.id } : {}),
-      summary: item.summary,
-      projectionClass: item.projectionClass,
-      observationClass: item.observationClass,
-      observationState: item.observationState,
-      matchKind: item.matchKind,
-      projectId: item.projectId,
-      scope: item.scope,
-      createdAt: item.createdAt,
-      updatedAt: item.updatedAt,
-      relevanceScore: item.relevanceScore,
-      source: 'local' as const,
-      // Local-source hits live in this daemon's own SQLite file, so they are
-      // implicitly owned by this server. Stamping the local daemon's bound
-      // serverId here keeps the hit shape uniform with cloud results — every
-      // hit a consumer sees can be routed (eventually) to the right daemon
-      // without per-source-type branching downstream.
-      ...(localServerId ? { originServerId: localServerId } : {}),
-    }));
+  // R5 MCP recall via the context-store worker. Do not reuse the R1
+  // front-of-turn facade: local unavailable/timeout must be reported as
+  // degraded metadata by the caller rather than silently returning empty.
+  try {
+    const result = await searchLocalMemorySemanticForManagement(query);
+    return mapLocalSearchItems(result.items, localServerId);
+  } catch (error) {
+    if (localMemoryDegradedReason(error) !== MEMORY_MCP_DEGRADED_REASON.SEMANTIC_EMBEDDING_UNAVAILABLE) {
+      throw error;
+    }
+    // MCP `search_memory` is also used for exact/source lookup workflows. A
+    // cold or unavailable embedding model should degrade semantic ranking, not
+    // make freshly persisted exact text undiscoverable. Fall back to the R5
+    // bounded substring worker while preserving the stronger failure behavior
+    // for real context-store outages.
+    const fallback = await searchLocalMemoryForManagement(query);
+    return mapLocalSearchItems(fallback.items, localServerId);
+  }
 }
 
-function listLocalMemorySummaries(
+function mapLocalSearchItems(
+  items: MemorySearchResultItem[],
+  localServerId: string | undefined,
+): MemoryMcpSearchHit[] {
+  return items.map((item) => ({
+    recordKind: item.type === 'observation' ? 'observation' as const : 'projection' as const,
+    projectionId: item.id,
+    ...(item.type === 'observation' ? { observationId: item.id } : {}),
+    summary: item.summary,
+    projectionClass: item.projectionClass,
+    observationClass: item.observationClass,
+    observationState: item.observationState,
+    matchKind: item.matchKind,
+    projectId: item.projectId,
+    scope: item.scope,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    relevanceScore: item.relevanceScore,
+    source: 'local' as const,
+    // Local-source hits live in this daemon's own SQLite file, so they are
+    // implicitly owned by this server. Stamping the local daemon's bound
+    // serverId here keeps the hit shape uniform with cloud results — every
+    // hit a consumer sees can be routed (eventually) to the right daemon
+    // without per-source-type branching downstream.
+    ...(localServerId ? { originServerId: localServerId } : {}),
+  }));
+}
+
+async function listLocalMemorySummaries(
   query: MemoryMcpListSummariesQuery,
   localServerId: string | undefined,
   limit: number,
-): MemoryMcpSearchHit[] {
+): Promise<MemoryMcpSearchHit[]> {
   const requestedProjectId = currentProjectId(query);
   if (!requestedProjectId) return [];
   const namespace = query.namespace
     ? { ...query.namespace, projectId: requestedProjectId }
     : undefined;
-  const local = searchLocalMemory({
+  const local = await searchLocalMemoryForManagement({
     namespace,
     currentEnterpriseId: query.currentEnterpriseId,
     repo: requestedProjectId,
@@ -372,11 +410,17 @@ export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: M
   const localServerId = credentials?.serverId && credentials.serverId.trim()
     ? credentials.serverId.trim()
     : undefined;
+  let localUnavailable = false;
+  const degradedReasons = new Set<string>();
   const [cloud, local] = await Promise.all([
     credentials
       ? searchCloudMemoryRecall(scopedQuery, options, credentials).catch(() => [])
       : Promise.resolve([] as MemoryMcpSearchHit[]),
-    searchLocalRecall(scopedQuery, localServerId).catch(() => []),
+    searchLocalRecall(scopedQuery, localServerId).catch((error) => {
+      localUnavailable = true;
+      degradedReasons.add(localMemoryDegradedReason(error));
+      return [] as MemoryMcpSearchHit[];
+    }),
   ]);
   const items = dedupeAndLimit([...cloud, ...local].filter((item) => item.projectId === requestedProjectId), limit);
   // Populate the projection-owner LRU. This is what makes
@@ -390,7 +434,7 @@ export async function searchMcpMemoryRecall(query: MemorySearchQuery, options: M
       projectionOwnerCache.set(item.projectionId, item.originServerId);
     }
   }
-  return { items };
+  return { items, ...(localUnavailable ? { localUnavailable: true, degradedReasons: [...degradedReasons] } : {}) };
 }
 
 export async function listMcpMemorySummaries(query: MemoryMcpListSummariesQuery, options: MemoryMcpSearchOptions = {}): Promise<MemoryMcpSearchResult> {
@@ -408,11 +452,17 @@ export async function listMcpMemorySummaries(query: MemoryMcpListSummariesQuery,
   const localServerId = credentials?.serverId && credentials.serverId.trim()
     ? credentials.serverId.trim()
     : undefined;
+  let localUnavailable = false;
+  const degradedReasons = new Set<string>();
   const [cloud, local] = await Promise.all([
     credentials
       ? listCloudMemorySummaries(scopedQuery, options, credentials, limit).catch(() => [])
       : Promise.resolve([] as MemoryMcpSearchHit[]),
-    Promise.resolve().then(() => listLocalMemorySummaries(scopedQuery, localServerId, limit)).catch(() => []),
+    listLocalMemorySummaries(scopedQuery, localServerId, limit).catch((error) => {
+      localUnavailable = true;
+      degradedReasons.add(localMemoryDegradedReason(error));
+      return [] as MemoryMcpSearchHit[];
+    }),
   ]);
   const items = dedupeSummaryListAndLimit([...cloud, ...local].filter((item) => item.projectId === requestedProjectId), limit);
   for (const item of items) {
@@ -420,5 +470,5 @@ export async function listMcpMemorySummaries(query: MemoryMcpListSummariesQuery,
       projectionOwnerCache.set(item.projectionId, item.originServerId);
     }
   }
-  return { items };
+  return { items, ...(localUnavailable ? { localUnavailable: true, degradedReasons: [...degradedReasons] } : {}) };
 }

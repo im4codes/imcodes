@@ -95,17 +95,19 @@ describe('normalizeTransportPendingMessageEntries', () => {
     ]);
   });
 
-  it('fills missing queued entries from pendingMessages when entries are partial', () => {
+  it('treats present entries as authoritative instead of filling legacy tails', () => {
     expect(normalizeTransportPendingEntries([
       { clientMessageId: 'msg-1', text: 'queued one' },
-    ], ['queued one', 'queued two'], 'deck_test')).toEqual([
+    ], ['queued one', 'queued two'], 'deck_test', { hasEntriesField: true, hasMessagesField: true })).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
-      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
   });
 
   it('synthesizes legacy entries when only pending messages are present', () => {
-    expect(normalizeTransportPendingEntries([], ['queued one', 'queued two'], 'deck_test')).toEqual([
+    expect(normalizeTransportPendingEntries(undefined, ['queued one', 'queued two'], 'deck_test', {
+      hasEntriesField: false,
+      hasMessagesField: true,
+    })).toEqual([
       { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
       { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
@@ -190,14 +192,13 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ]);
   });
 
-  it('fills missing running queued entries from pendingMessages when entries are partial', () => {
+  it('treats running entries as authoritative instead of filling legacy tails', () => {
     expect(mergeTransportPendingEntriesForRunningState([
       { clientMessageId: 'msg-1', text: 'queued one' },
     ], [
       { clientMessageId: 'msg-1', text: 'queued one' },
-    ], ['queued one', 'queued two'], true, 'deck_test')).toEqual([
+    ], ['queued one', 'queued two'], true, 'deck_test', true)).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
-      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
   });
 
@@ -283,8 +284,8 @@ describe('extractTransportPendingVersion', () => {
 });
 
 describe('shouldApplyTransportQueueSnapshot', () => {
-  it('applies unversioned snapshots (legacy / resend path)', () => {
-    expect(shouldApplyTransportQueueSnapshot(5, undefined)).toBe(true);
+  it('applies unversioned snapshots only before a versioned baseline exists', () => {
+    expect(shouldApplyTransportQueueSnapshot(5, undefined)).toBe(false);
     expect(shouldApplyTransportQueueSnapshot(undefined, undefined)).toBe(true);
   });
   it('applies when there is no baseline yet', () => {
@@ -298,8 +299,8 @@ describe('shouldApplyTransportQueueSnapshot', () => {
     expect(shouldApplyTransportQueueSnapshot(3, 3)).toBe(true);
     expect(shouldApplyTransportQueueSnapshot(3, 4)).toBe(true);
   });
-  it('always applies version 0 — a fresh runtime restarts the sequence', () => {
-    expect(shouldApplyTransportQueueSnapshot(9, 0)).toBe(true);
+  it('rejects version 0 after a higher baseline instead of treating it as a reset', () => {
+    expect(shouldApplyTransportQueueSnapshot(9, 0)).toBe(false);
   });
 });
 
@@ -308,8 +309,8 @@ describe('nextTransportQueueVersion', () => {
     expect(nextTransportQueueVersion(5, undefined)).toBe(5);
     expect(nextTransportQueueVersion(undefined, undefined)).toBeUndefined();
   });
-  it('resets to 0 on a fresh-runtime snapshot', () => {
-    expect(nextTransportQueueVersion(9, 0)).toBe(0);
+  it('does not reset to 0 after a higher baseline', () => {
+    expect(nextTransportQueueVersion(9, 0)).toBe(9);
   });
   it('advances monotonically', () => {
     expect(nextTransportQueueVersion(undefined, 2)).toBe(2);

@@ -3,10 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { evaluateUpgradeDeferralBackstop } from '../../src/daemon/command-handler.js';
 
 // The session-busy gate prevents a daemon self-upgrade from killing a session
-// mid-turn. But a wedged session (phantom transport turn the staleness guard
-// hasn't yet aged out, or a process-agent CLI stuck in 'running') could pin the
-// daemon on an old version forever. This backstop measures CONTINUOUS deferral
-// across upgrade attempts and forces the upgrade through past MAX_UPGRADE_DEFER.
+// mid-turn. This tracker measures CONTINUOUS deferral across upgrade attempts
+// for observability, but it must never force an upgrade through active work.
 
 describe('evaluateUpgradeDeferralBackstop', () => {
   const MAX = 30 * 60 * 1000; // 30 min
@@ -38,7 +36,7 @@ describe('evaluateUpgradeDeferralBackstop', () => {
     expect(r.deferredMs).toBe(MAX - 1);
   });
 
-  it('forces the upgrade through once deferral reaches the cap, and resets the tracker', () => {
+  it('keeps blocking once deferral reaches the cap and preserves the tracker', () => {
     const since = 5_000;
     const r = evaluateUpgradeDeferralBackstop({
       blocked: true,
@@ -46,9 +44,9 @@ describe('evaluateUpgradeDeferralBackstop', () => {
       now: since + MAX, // exactly at the cap
       maxDeferMs: MAX,
     });
-    expect(r.proceed).toBe(true);
-    expect(r.forced).toBe(true);
-    expect(r.nextDeferredSince).toBeNull(); // fresh start next cycle
+    expect(r.proceed).toBe(false);
+    expect(r.forced).toBe(false);
+    expect(r.nextDeferredSince).toBe(since);
     expect(r.deferredMs).toBe(MAX);
   });
 

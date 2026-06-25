@@ -15,6 +15,8 @@ import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { useTimeline } from '../hooks/useTimeline.js';
+import { hasActiveTimelineTurn } from '../timeline-running.js';
+import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
 import { useSharedGitChanges } from '../git-status-store.js';
@@ -25,6 +27,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
@@ -41,6 +44,11 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+
+function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
@@ -63,6 +71,7 @@ interface Props {
   onRestart: () => void;
   onRename: () => void;
   onSettings?: () => void;
+  onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Open a file preview in the shared floating preview host. */
@@ -86,7 +95,17 @@ interface Props {
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
-  subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  subSessions?: Array<{
+    sessionName: string;
+    type: string;
+    label?: string | null;
+    state: string;
+    parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
+    executionTemplateEligible?: boolean;
+    executionTemplateIneligibleReason?: string;
+  }>;
   serverId?: string;
   pendingPrefillText?: string | null;
   onPendingPrefillApplied?: () => void;
@@ -225,7 +244,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -266,6 +285,8 @@ export function SubSessionWindow({
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
+  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
+  const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
   const liveSessionState = useMemo(
     () => getTailSessionState(events) ?? sub.state ?? null,
     [events, sub.state],
@@ -291,6 +312,9 @@ export function SubSessionWindow({
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
+  const [composerText, setComposerText] = useState('');
+  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
+  const executionRouting = useExecutionRouting(serverId ?? null);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
@@ -389,6 +413,7 @@ export function SubSessionWindow({
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
+    transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
 
   useEffect(() => {
@@ -430,15 +455,19 @@ export function SubSessionWindow({
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
     if (!ws || !connected || isTransport) return;
+    if (isShell && !active) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
     if (!raw) {
       return;
     }
     return () => {
-      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+      try {
+        if (isShell) ws.unsubscribeTerminal(sub.sessionName);
+        else ws.subscribeTerminal(sub.sessionName, false);
+      } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active, isTransport]);
+  }, [ws, connected, sub.sessionName, active, isTransport, isShell]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
@@ -454,6 +483,55 @@ export function SubSessionWindow({
       ?? parent?.contextNamespace?.projectId
       ?? null;
   }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
+
+  const executionTemplateDisplayName = useMemo(() => {
+    const template = executionRouting.templateSessionName;
+    if (!template) return null;
+    const candidateSub = subSessions?.find((item) => item.sessionName === template);
+    if (candidateSub && !isExecutionCloneTemplateLike(candidateSub)) return candidateSub.label || candidateSub.sessionName.split('_').pop() || candidateSub.sessionName;
+    return null;
+  }, [executionRouting.templateSessionName, subSessions]);
+  const hasValidExecutionTemplate = Boolean(
+    executionRouting.enabled
+    && executionRouting.templateSessionName
+    && executionTemplateDisplayName
+    && executionRouting.templateSessionName !== sub.sessionName,
+  );
+  const executionCloneCount = executionRouting.limits.maxParallelClones;
+  const runExecutionClonesTitle = !connected || !ws
+    ? t('chat.execution_clone_run_offline')
+    : !hasValidExecutionTemplate
+      ? t('chat.execution_clone_run_no_template')
+      : !(composerText.trim() || inputRef.current?.textContent?.trim())
+        ? t('chat.execution_clone_run_empty')
+        : t('chat.execution_clone_run_with_template', {
+            count: executionCloneCount,
+            name: executionTemplateDisplayName,
+          });
+  const handleRunExecutionClones = useCallback(() => {
+    const text = (inputRef.current?.textContent ?? composerText).trim();
+    if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
+    const commandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setExecutionClonesBusy(true);
+    try {
+      ws.sendExecutionClones({
+        sessionName: sub.sessionName,
+        text,
+        commandId,
+        dedicatedExecutionRouting: {
+          enabled: true,
+          templateSessionName: executionRouting.templateSessionName,
+          maxParallelClones: executionRouting.limits.maxParallelClones,
+          maxQueuedClones: executionRouting.limits.maxQueuedClones,
+          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
+          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
+        },
+      });
+    } finally {
+      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
+    }
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sub.sessionName, ws]);
 
   const handleSyncMemorySummaries = useCallback(async () => {
     if (!ws || !connected || syncingMemorySummaries) return;
@@ -865,10 +943,24 @@ export function SubSessionWindow({
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
+          transportActivityDetail={transportActivityDetail}
+          sessionError={sessionInfo?.error}
           now={thinkingNow}
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}
           syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
+          onRunExecutionClones={handleRunExecutionClones}
+          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesDisabled={
+            executionClonesBusy
+            || !connected
+            || !ws
+            || !hasValidExecutionTemplate
+            || !(composerText.trim() || inputRef.current?.textContent?.trim())
+          }
+          runExecutionClonesTitle={runExecutionClonesTitle}
+          runExecutionClonesCount={executionCloneCount}
         />
       )}
 
@@ -879,6 +971,7 @@ export function SubSessionWindow({
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}
+        keyboardActive={active}
         onSend={(_name, text, meta) => {
           // Inject the optimistic "sending" bubble so the user sees the
           // message with a spinner immediately, instead of waiting for the
@@ -910,6 +1003,7 @@ export function SubSessionWindow({
         onSubStop={handleClose}
         onRenameSession={onRename}
         onSettings={onSettings}
+        onShareSession={onShareSession}
         subSessionId={sub.id}
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
@@ -924,6 +1018,7 @@ export function SubSessionWindow({
         pendingPrefillText={pendingPrefillText}
         onPendingPrefillApplied={onPendingPrefillApplied}
         onVersionSensitiveAction={onVersionSensitiveAction}
+        onComposerTextChange={setComposerText}
       />
       </div>
 
@@ -943,6 +1038,7 @@ export function SubSessionWindow({
             <FileBrowser
               ws={ws}
               serverId={serverId}
+              sessionName={sub.sessionName}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}
@@ -977,6 +1073,7 @@ export function SubSessionWindow({
             <FileBrowser
               ws={ws}
               serverId={serverId}
+              sessionName={sub.sessionName}
               mode="file-multi"
               layout="panel"
               initialPath={sub.cwd ?? '~'}

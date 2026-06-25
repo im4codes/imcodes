@@ -3,6 +3,7 @@ import { MEMORY_FEATURE_FLAGS_BY_NAME } from './feature-flags.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from './memory-mcp-feature-flags.js';
 import { MEMORY_MCP_SOURCE_FIELDS } from './memory-mcp-provenance.js';
 import { PREFERENCE_MAX_BYTES } from './preference-ingest.js';
+import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES } from './execution-clone.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -13,6 +14,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SEND_LIST_TARGETS: 'send_list_targets',
   SEND_MESSAGE: 'send_message',
   SEND_STOP: 'send_stop',
+  DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
   CRON_CREATE: 'cron_create',
   CRON_LIST: 'cron_list',
   CRON_UPDATE: 'cron_update',
@@ -30,6 +32,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+  MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
@@ -209,28 +212,37 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
-    description: 'List sendable sibling sessions in the caller project that send_message may address. The current caller session and stopped sessions are excluded; if this returns no items, direct send_message cannot succeed until another sibling session is available. Use it before sending when the target name is unclear; copy the returned target field exactly into send_message. Labels are display-only metadata and are not valid MCP targets.',
+    description: 'List sendable sibling sessions in the caller project that send_message may address. The current caller session and stopped sessions are excluded; if this returns no items, direct send_message cannot succeed until another sibling session is available. Use it to find another agent or peer session to delegate to or invite, for example "ask CC to audit", "invite a reviewer to discuss", or "ask another session to plan or implement"; optionally filter with the named agent/session hint, match by display label or target name, then copy the returned target field exactly into send_message. If no matching target is returned, report that no such running peer session is available. Labels are display-only metadata and are not valid MCP targets.',
     inputSchema: objectSchema({
-      query: stringSchema('Optional text filter over target labels and names.'),
+      query: stringSchema('Optional case-insensitive text filter over target display labels and names, such as "cc", "codex", "reviewer", or a session label mentioned by the user.'),
       limit: numberSchema('Optional maximum number of targets to return; implementations may clamp it.'),
     }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send a plain message to a caller-project sibling session using the exact target value returned by send_list_targets. The caller session is not a valid target, and an empty send_list_targets result means there is no direct send target in scope. Optional files are sanitized path references under the caller project root, not file bytes; accepted sends return shared dispatch and message ids plus per-target delivery status.',
+    description: 'Use this to ask, delegate to, or invite another caller-project sibling agent/session using the exact target value returned by send_list_targets, for example asking a CC session to audit something or inviting a reviewer to discuss. send_message delivers a plain text invite/request and does not start a structured Team/P2P discussion run by itself; if a structured discussion run is required, use the dedicated discussion-launch path instead. The caller session is not a valid target, and an empty send_list_targets result means there is no direct send target in scope. Optional files are sanitized path references under the caller project root, not file bytes; accepted sends return shared dispatch and message ids plus per-target delivery status.',
     inputSchema: objectSchema({
-      target: stringSchema('Required exact target value returned by send_list_targets.target. Do not use label or agentType values.'),
-      message: stringSchema(`Required message text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes.`),
+      target: stringSchema('Required exact target session value. For an ordinary peer, use the exact send_list_targets.target value. For a follow-up to an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may address them. Always use the exact target name; never a label or agentType value.'),
+      message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
       files: {
         type: 'array',
         description: `Optional file path references under the caller project root; at most ${MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT}; contents are not read or transferred by MCP.`,
         items: stringSchema(`Relative path or in-root absolute path reference, at most ${MEMORY_MCP_CAPS.SEND_FILE_PATH_MAX_CHARS} characters and without control characters.`),
         maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
       },
-      reply: booleanSchema('Optional request for the target to reply to the runtime-bound caller session.'),
-      broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers.'),
+      reply: booleanSchema('Optional request for the target to reply to the runtime-bound caller session. Set true when you expect the target to respond or report back, such as audit/review requests or discussion invites; leave false for fire-and-forget notifications.'),
+      broadcast: booleanSchema('Optional project-scoped broadcast request; unavailable for unscoped callers. Use targeted sends for singular requests like "ask a reviewer"; use broadcast only when the user asks every/all available sessions.'),
       idempotencyKey: stringSchema(`Optional retry key; duplicate sends within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
+      clone: {
+        ...objectSchema({
+          kind: { type: 'string', enum: [EXECUTION_CLONE_KIND], description: 'Must be the literal execution-clone kind discriminant.' },
+          ephemeral: booleanSchema('Must be true — managed execution clones are always ephemeral.'),
+          parentRunId: stringSchema('Non-empty id of the parent run that owns the created clone.'),
+          parentStage: { type: 'string', enum: [...EXECUTION_CLONE_PARENT_STAGES], description: 'Execution entry-point stage creating the clone; one of the fixed parent stages.' },
+        }, ['kind', 'ephemeral', 'parentRunId', 'parentStage']),
+        description: 'Optional strict execution-clone request. When present, the message is routed to a freshly created ephemeral clone of the resolved target template (never the target directly) and the result includes clone.target; broadcast is not allowed with clone.',
+      },
     }, ['target', 'message']),
     outputSchema: statusSchema,
   },
@@ -238,10 +250,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     name: MEMORY_MCP_TOOL_NAMES.SEND_STOP,
     description: 'Force-stop the active turn of a caller-project sibling session, using the exact target value returned by send_list_targets. Unlike send_message (which queues behind a busy session), this interrupts the session immediately: transport/SDK sessions cancel the in-flight turn on a priority lane, and terminal sessions receive an interrupt (ESC / Ctrl+C). Use it when a sibling is stuck or running the wrong work and a queued message will not reach it. The caller session is not a valid target. Queued user messages are preserved; only the currently active turn is interrupted.',
     inputSchema: objectSchema({
-      target: stringSchema('Exact target value returned by send_list_targets.target. Required unless broadcast is true. Do not use label or agentType values.'),
+      target: stringSchema('Exact target session value. Required unless broadcast is true. For an ordinary peer, use the exact send_list_targets.target value. To stop an execution clone you created, use the exact result.clone.target from the originating clone send — execution clones are NOT returned by send_list_targets and only their creator may stop them. Always use the exact target name; never a label or agentType value.'),
       broadcast: booleanSchema('Optional project-scoped request to stop every sendable sibling session; unavailable for unscoped callers.'),
       idempotencyKey: stringSchema(`Optional retry key; duplicate stops within ${MEMORY_MCP_CAPS.SEND_MESSAGE_IDEMPOTENCY_WINDOW_MS} ms reuse the original ids.`),
     }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: {
+    name: MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
+    description: 'Destroy a dedicated execution-clone sub-session that you created via send_message with a clone request. Only the creator session may destroy its clone; the runtime resolves authorization. A replay after the clone is already gone returns target_not_found and never recreates it.',
+    inputSchema: objectSchema({
+      target: stringSchema('Required exact execution-clone session name returned by the original clone send (result.clone.target).'),
+      idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same destroy.'),
+    }, ['target']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: {

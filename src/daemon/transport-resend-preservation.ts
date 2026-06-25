@@ -22,6 +22,9 @@ function preserveEntries(
       ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
       commandId: entry.clientMessageId,
       ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
+      ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+      ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+      ...(entry.historyCommitted ? { historyCommitted: true } : {}),
       queuedAt: Date.now(),
     });
     seenCommandIds.add(entry.clientMessageId);
@@ -34,8 +37,8 @@ export function preserveTransportRuntimeQueuesToResend(
   sessionName: string,
   runtime: TransportSessionRuntime,
 ): TransportRuntimeQueuePreservationResult {
-  const activeEntries = runtime.activeDispatchEntries ?? [];
-  const pendingEntries = runtime.pendingEntries ?? [];
+  const activeEntries = runtime.activeDispatchEntriesForResend ?? runtime.activeDispatchEntries ?? [];
+  const pendingEntries = runtime.pendingEntriesForResend ?? runtime.pendingEntries ?? [];
   const beforeCount = getResendCount(sessionName);
   const seenCommandIds = new Set(getResendEntries(sessionName).map((entry) => entry.commandId));
   const preservedActiveCount = preserveEntries(sessionName, activeEntries, seenCommandIds);

@@ -21,6 +21,7 @@ import type {
   ProviderSupportClass,
   SharedScopePolicyOverride,
 } from '../../shared/context-types.js';
+import type { ProviderActiveWorkSnapshot } from '../../shared/session-activity-types.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -353,6 +354,14 @@ export interface TransportProvider {
   onError(cb: (sessionId: string, error: ProviderError) => void): () => void;
 
   /**
+   * Strongly-typed active-work snapshot for lifecycle gating.
+   * This is separate from provider diagnostics: diagnostics are debug JSON,
+   * while this snapshot is a small contract that runtimes may use to defer
+   * clean idle/queue drain while provider-owned tool or background work is open.
+   */
+  getActiveWorkSnapshot?(sessionId: string): ProviderActiveWorkSnapshot | null;
+
+  /**
    * Create a new session on the provider.
    * @param config - Session creation parameters.
    * @returns The provider-assigned session ID to pass to subsequent calls.
@@ -451,6 +460,13 @@ export interface TransportProvider {
    * The daemon status surface uses this instead of assuming provider readiness.
    */
   getMemoryMcpStatus?(): MemoryMcpProviderStatusView;
+
+  /**
+   * Return provider-owned live state for a bound session, if the provider can
+   * expose it safely. This is diagnostic-only and must not include prompts,
+   * user text, API keys, environment variables, or raw MCP configuration.
+   */
+  getSessionDiagnostics?(sessionId: string): Record<string, unknown> | null;
 }
 
 /** A single model entry returned by listModels(). */

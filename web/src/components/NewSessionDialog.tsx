@@ -40,6 +40,7 @@ import {
 } from "@shared/cc-presets.js";
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from "../../../src/shared/models/options.js";
 import { loadCodexModelPreference } from "../codex-model-preference.js";
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
@@ -93,6 +94,14 @@ interface PendingStart {
   sessionName: string;
 }
 
+function canUseGitRemoteClone(ws: WsClient | null): boolean {
+  if (!ws) return false;
+  const snapshot = ws.getDaemonCapabilitySnapshot?.() ?? null;
+  if (!snapshot) return false;
+  if (ws.isDaemonCapabilityStale?.()) return false;
+  return snapshot.capabilities.includes(GIT_REMOTE_CLONE_CAPABILITY_V1);
+}
+
 export function NewSessionDialog({
   ws,
   onClose,
@@ -103,6 +112,7 @@ export function NewSessionDialog({
   const { t } = useTranslation();
   const [project, setProject] = useState("");
   const [dir, setDir] = useState("~/");
+  const [gitRemoteUrl, setGitRemoteUrl] = useState("");
   const [agentType, setAgentType] = useState<AgentType>("claude-code-sdk");
   const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>("claude-code-sdk");
   const [customProviderSdk, setCustomProviderSdk] = useState(false);
@@ -406,6 +416,11 @@ export function NewSessionDialog({
       setShowPresetEditor(true);
       return;
     }
+    const trimmedGitRemoteUrl = gitRemoteUrl.trim();
+    if (trimmedGitRemoteUrl && !canUseGitRemoteClone(ws)) {
+      setError(t("new_session.git_remote_capability_missing"));
+      return;
+    }
 
     const slug = sanitizeProjectName(project.trim());
     pendingStartRef.current = {
@@ -430,6 +445,7 @@ export function NewSessionDialog({
         project: project.trim(),
         dir: dir.trim(),
         agentType,
+        ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
         ...extra,
         thinking,
       });
@@ -455,6 +471,7 @@ export function NewSessionDialog({
         project: project.trim(),
         dir: dir.trim(),
         agentType,
+        ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
         ...extra,
         ...(agentType === "claude-code-sdk" ||
         agentType === "codex-sdk" ||
@@ -647,6 +664,26 @@ export function NewSessionDialog({
             onClose={() => setShowDirBrowser(false)}
           />
         )}
+
+        <div class="form-group">
+          <label>{t("new_session.git_remote_url")}</label>
+          <input
+            type="text"
+            placeholder={t("new_session.git_remote_url_placeholder")}
+            value={gitRemoteUrl}
+            disabled={starting}
+            onInput={(e) => setGitRemoteUrl((e.target as HTMLInputElement).value)}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellcheck={false}
+            data-lpignore="true"
+            data-1p-ignore
+          />
+          <div style={{ color: "#94a3b8", fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+            {t("new_session.git_remote_url_help")}
+          </div>
+        </div>
 
         <div class="form-group">
           <label>{t("new_session.agent_type")}</label>

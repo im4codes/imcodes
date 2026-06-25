@@ -132,7 +132,7 @@ describe('command-handler timeline.history_request SQLite parity', () => {
 
     expect(readByTypesPreferredMock).toHaveBeenCalledTimes(2);
     expect(readByTypesPreferredMock.mock.calls[0][0]).toBe('deck_proj_brain');
-    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 2, afterTs: undefined, beforeTs: undefined });
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: 3, afterTs: undefined, beforeTs: undefined });
     expect(readByTypesPreferredMock.mock.calls[1][0]).toBe('deck_proj_brain');
     expect(readByTypesPreferredMock.mock.calls[1][1]).toEqual(['session.state']);
     expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({ limit: 100, afterTs: 99, beforeTs: undefined });

@@ -16,6 +16,7 @@ import type {
   RepoPRDetail,
   RepoListResult,
   RepoActionDetail,
+  RepoActionJob,
   RepoWorkflowRun,
 } from './types.js';
 import type {
@@ -36,6 +37,19 @@ function mapMRState(state: string): 'open' | 'merged' | 'closed' {
   if (state === 'opened') return 'open';
   if (state === 'merged') return 'merged';
   return 'closed';
+}
+
+/** Map a GitLab pipeline/job status to our normalized workflow status. */
+function mapPipelineStatus(status: unknown): RepoWorkflowRun['status'] {
+  switch (status) {
+    case 'success': return 'success';
+    case 'failed': return 'failure';
+    case 'canceled':
+    case 'skipped': return 'cancelled';
+    case 'running': return 'running';
+    // created | waiting_for_resource | preparing | pending | manual | scheduled
+    default: return 'queued';
+  }
 }
 
 /** Translate glab stderr into a typed RepoError. */
@@ -220,15 +234,82 @@ export class GitLabProvider implements RepoProvider {
   }
 
   /* ------------------------------------------------------------------ */
-  /*  Actions (pipelines) — stub                                         */
+  /*  Actions (CI/CD pipelines)                                          */
   /* ------------------------------------------------------------------ */
 
-  async listActions(_opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>> {
-    return { items: [], page: 1, hasMore: false, projectDir: this.projectDir };
+  /** Best-effort commit title for a pipeline's SHA (the pipelines list omits it). */
+  private async commitTitle(sha: unknown): Promise<string> {
+    if (typeof sha !== 'string' || !sha) return '';
+    try {
+      const raw = await this.glab(['api', `/projects/${this.encodedProject}/repository/commits/${encodeURIComponent(sha)}`]);
+      const c = JSON.parse(raw);
+      if (typeof c.title === 'string' && c.title) return c.title;
+      if (typeof c.message === 'string') return c.message.split('\n')[0] ?? '';
+      return '';
+    } catch {
+      return '';
+    }
+  }
+
+  async listActions(opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>> {
+    const page = opts?.page ?? 1;
+    const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
+
+    const params = new URLSearchParams({ per_page: String(perPage), page: String(page) });
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/pipelines?${params}`]);
+    const data = parseGitLabArray(raw);
+
+    // The pipelines list omits the commit title + triggerer that the UI shows for
+    // GitHub runs. Enrich the visible page best-effort, in parallel (bounded), and
+    // degrade gracefully to the branch ref when a lookup fails.
+    const ENRICH_CAP = 15;
+    const titles = await Promise.all(
+      data.map((p, i) => (i < ENRICH_CAP ? this.commitTitle(p.sha) : Promise.resolve(''))),
+    );
+
+    const items: RepoWorkflowRun[] = data.map((p, idx) => ({
+      id: p.id,
+      name: titles[idx] || (typeof p.ref === 'string' ? p.ref : '') || `#${p.iid}`,
+      status: mapPipelineStatus(p.status),
+      branch: typeof p.ref === 'string' ? p.ref : '',
+      commitSha: typeof p.sha === 'string' ? p.sha.slice(0, 8) : '',
+      commitMessage: '',
+      actor: '',
+      url: typeof p.web_url === 'string' ? p.web_url : '',
+      createdAt: p.created_at ? new Date(p.created_at).getTime() : 0,
+      updatedAt: p.updated_at ? new Date(p.updated_at).getTime() : 0,
+      runNumber: typeof p.iid === 'number' ? p.iid : undefined,
+      event: typeof p.source === 'string' ? p.source : undefined,
+      conclusion: typeof p.status === 'string' ? p.status : undefined,
+    }));
+
+    return { items, page, hasMore: data.length === perPage, projectDir: this.projectDir };
   }
 
   async getActionDetail(runId: number): Promise<RepoActionDetail> {
-    return { runId, jobs: [] };
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/pipelines/${runId}/jobs?per_page=100`]);
+    const data = parseGitLabArray(raw);
+
+    // GitLab jobs are the atomic CI unit (no GitHub-style sub-steps). Map each job to
+    // a RepoActionJob, labelled "stage / job", sorted by id ascending so earlier
+    // stages render first.
+    const jobs: RepoActionJob[] = data
+      .slice()
+      .sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0))
+      .map((j) => ({
+        id: j.id,
+        name: typeof j.stage === 'string' && j.stage && j.stage !== j.name
+          ? `${j.stage} / ${j.name}`
+          : String(j.name ?? ''),
+        status: mapPipelineStatus(j.status),
+        conclusion: typeof j.status === 'string' ? j.status : null,
+        startedAt: j.started_at ? new Date(j.started_at).getTime() : undefined,
+        completedAt: j.finished_at ? new Date(j.finished_at).getTime() : undefined,
+        url: typeof j.web_url === 'string' ? j.web_url : undefined,
+        steps: [],
+      }));
+
+    return { runId, jobs };
   }
 
   /* ------------------------------------------------------------------ */

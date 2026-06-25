@@ -22,6 +22,7 @@ import {
   parseSupervisorDefaultConfig,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
+import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -490,6 +491,188 @@ export async function cancelSessionViaHttp(
   });
 }
 
+export interface CreateShareRequest {
+  target: ShareTarget;
+  targetUserId: string;
+  /** Backward-compatible alias for older callers; createShare sends targetUserId on the wire. */
+  targetUser?: string;
+  role: ShareRole;
+}
+
+export interface CreateShareResponse {
+  share: ShareGrantSummary;
+}
+
+export interface ListSharesResponse {
+  shares: ShareGrantSummary[];
+}
+
+export interface UpdateShareRequest {
+  role?: ShareRole;
+  expiresAt?: number | null;
+}
+
+function normalizeShareGrantSummary(value: unknown): ShareGrantSummary {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const targetUser = raw.targetUser && typeof raw.targetUser === 'object'
+    ? raw.targetUser as Record<string, unknown>
+    : {};
+  const targetUserId = typeof raw.targetUserId === 'string'
+    ? raw.targetUserId
+    : typeof targetUser.id === 'string'
+      ? targetUser.id
+      : '';
+  const targetUserDisplayName = typeof raw.targetUserDisplayName === 'string'
+    ? raw.targetUserDisplayName
+    : typeof targetUser.displayName === 'string'
+      ? targetUser.displayName
+      : targetUserId;
+  return {
+    ...(raw as Partial<ShareGrantSummary>),
+    id: typeof raw.id === 'string' ? raw.id : '',
+    targetUserId,
+    targetUserDisplayName,
+    role: raw.role === 'participant' ? 'participant' : 'viewer',
+    status: typeof raw.status === 'string' ? raw.status as ShareGrantSummary['status'] : 'active',
+  };
+}
+
+function buildShareTargetParams(target: ShareTarget): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set('targetKind', target.kind);
+  if (target.kind === 'main') params.set('sessionName', target.sessionName);
+  if (target.kind === 'subsession') params.set('subSessionId', target.subSessionId);
+  return params;
+}
+
+export async function listSharesForTarget(serverId: string, target: ShareTarget): Promise<ShareGrantSummary[]> {
+  const params = buildShareTargetParams(target);
+  const res = await apiFetch<ListSharesResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/shares?${params.toString()}`,
+  );
+  return Array.isArray(res.shares) ? res.shares.map(normalizeShareGrantSummary) : [];
+}
+
+export async function listManagedSharesForServer(serverId: string): Promise<ShareGrantSummary[]> {
+  const res = await apiFetch<ListSharesResponse>(`/api/server/${encodeURIComponent(serverId)}/shares`);
+  return Array.isArray(res.shares) ? res.shares.map(normalizeShareGrantSummary) : [];
+}
+
+export async function createShare(serverId: string, request: CreateShareRequest): Promise<ShareGrantSummary> {
+  const targetUserId = request.targetUserId || request.targetUser || '';
+  const res = await apiFetch<CreateShareResponse>(`/api/server/${encodeURIComponent(serverId)}/shares`, {
+    method: 'POST',
+    body: JSON.stringify({
+      target: request.target,
+      targetUserId,
+      role: request.role,
+    }),
+  });
+  return normalizeShareGrantSummary(res.share);
+}
+
+export async function updateShare(serverId: string, shareId: string, request: UpdateShareRequest): Promise<ShareGrantSummary> {
+  const res = await apiFetch<CreateShareResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/shares/${encodeURIComponent(shareId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(request),
+    },
+  );
+  return normalizeShareGrantSummary(res.share);
+}
+
+export async function revokeShare(serverId: string, shareId: string): Promise<ShareGrantSummary> {
+  const res = await apiFetch<CreateShareResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/shares/${encodeURIComponent(shareId)}`,
+    { method: 'DELETE' },
+  );
+  return normalizeShareGrantSummary(res.share);
+}
+
+export interface SharedEntrySummary {
+  id: string;
+  serverId: string;
+  serverName: string;
+  role: ShareRole;
+  status: 'active' | 'revoked' | 'expired' | 'target-unavailable';
+  target: ShareTarget;
+  targetLabel: string;
+}
+
+function shareTargetFallbackLabel(target: ShareTarget): string {
+  if (target.kind === 'server') return target.serverId;
+  if (target.kind === 'main') return target.sessionName;
+  return target.subSessionDisplayName || `deck_sub_${target.subSessionId}`;
+}
+
+function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
+  const raw = value && typeof value === 'object' ? value as Partial<SharedEntrySummary> & Record<string, unknown> : {};
+  const fallbackTarget: ShareTarget = { kind: 'server', serverId: typeof raw.serverId === 'string' ? raw.serverId : '' };
+  const target: ShareTarget = raw.target && typeof raw.target === 'object'
+    ? raw.target as ShareTarget
+    : fallbackTarget;
+  const serverId = typeof raw.serverId === 'string'
+    ? raw.serverId
+    : target.serverId;
+  const targetLabel = typeof raw.targetLabel === 'string' && raw.targetLabel.trim()
+    ? raw.targetLabel
+    : shareTargetFallbackLabel(target);
+  return {
+    id: typeof raw.id === 'string' ? raw.id : '',
+    serverId,
+    serverName: typeof raw.serverName === 'string' && raw.serverName.trim() ? raw.serverName : serverId,
+    role: raw.role === 'participant' ? 'participant' : 'viewer',
+    status: typeof raw.status === 'string' ? raw.status as SharedEntrySummary['status'] : 'active',
+    target,
+    targetLabel,
+  };
+}
+
+export async function discoverSharedEntries(): Promise<SharedEntrySummary[]> {
+  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>('/api/shares');
+  const entries = res.shares ?? res.entries;
+  return Array.isArray(entries) ? entries.map(normalizeSharedEntrySummary) : [];
+}
+
+export interface OpenSharedEntryResponse {
+  server: {
+    id: string;
+    name: string;
+    status: string | null;
+    lastHeartbeatAt: number | null;
+  };
+  target: ShareTarget;
+  coverage: {
+    effectiveRole: ShareRole;
+    historyCutoffAt: number;
+    nextCoverageRecheckAt: number | null;
+    coveringShareIds: string[];
+    primaryShareId: string | null;
+    authorizedAt: number;
+  };
+  sessions: Array<{
+    sessionName: string;
+    title: string;
+    state: string;
+    agentType: string;
+  }>;
+  subSessions: Array<{
+    subSessionId: string;
+    sessionName: string;
+    title: string;
+    type: string;
+    parentSessionName: string | null;
+  }>;
+}
+
+export async function openSharedEntry(target: ShareTarget): Promise<OpenSharedEntryResponse> {
+  return apiFetch<OpenSharedEntryResponse>('/api/shares/open', {
+    method: 'POST',
+    body: JSON.stringify({ target }),
+  });
+}
+
 function isRetryableNonceExchangeError(error: unknown): boolean {
   if (error instanceof ApiError) {
     if (error.code === 'invalid_or_expired_nonce') return false;
@@ -623,6 +806,14 @@ export interface SubSessionData {
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
   transportPendingMessageVersion?: number | null;
+  /** Execution-clone discriminant projection (the canonical
+   *  `EXECUTION_CLONE_KIND` value) when this sub-session is an ephemeral
+   *  execution clone. Absent for ordinary sub-sessions. Drives grouped
+   *  execution-detail rendering — clones never render as flat top-level peers. */
+  executionCloneKind?: string | null;
+  /** The owning parent execution run id for an execution clone. Clones sharing a
+   *  `parentRunId` are grouped together in the execution-detail view. */
+  parentRunId?: string | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {

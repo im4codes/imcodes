@@ -2,14 +2,14 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**エージェントのための IM。共有メモリ、管理対象 MCP ツール、監督付き実行、そして AI プロバイダー横断の監査。**
+**エージェントのための IM。共有メモリ、OpenSpec Auto Deliver、管理対象 MCP ツール、監督付き実行、人間同士の協調、そして AI プロバイダー横断の監査。**
 
 <!-- TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认 -->
 > 三人寄れば文殊の知恵。<br>
 > されど三人の孔明、談笑のうちに天下を定む。<br>
 > — IM.codes
 
-IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
+IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。対応先は Claude Code、Codex、Gemini CLI、GitHub Copilot、Cursor、OpenCode、OpenClaw、Qwen などで、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。セッション共有も live agent session を中心に pair / multi-person 協調プログラミングを支えます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションを内蔵——複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
@@ -69,9 +69,24 @@ iPhone、iPad、Apple Watch に対応しています。[Web App](https://app.im.
 
 それは問題の半分にすぎません。複雑な coding-agent 作業には、より安定した判断も必要です。単一モデルは慣れた型に寄り、問題を見落としたり、難しいタスクで出力が不安定になったりします。provider を切り替えると新しい視点は得られますが、共有コンテキストがなければ流れやプロジェクト記憶も失われます。
 
-[IM.codes](https://im.codes) はその両方のために作られています。そうした session をモバイルや Web から手の届く場所に保ち、ターミナルを開き、ファイルや Git 変更を確認し、別デバイスで localhost をプレビューし、作業完了時に通知を受け取り、複数の agent を並行して動かせます。さらに、下の「Shared Agent Context とメモリ」と「クロスモデル監査と Team ディスカッション」を組み合わせます。永続的なリコールは完了作業の要約メモリから来て、Team ディスカッションはコードが入る前の構造化されたクロスモデルレビューです。出力を完璧にはしませんが、単一モデルの盲点を減らし、複雑な作業をより多くのレビューで収束しやすくします。
+[IM.codes](https://im.codes) はその両方のために作られています。そうした session をモバイルや Web から手の届く場所に保ち、ターミナルを開き、ファイルや Git 変更を確認し、別デバイスで localhost をプレビューし、作業完了時に通知を受け取り、別の人を同じ session や server に招待し、複数の agent を並行して動かせます。さらに、下の「Shared Agent Context とメモリ」と「クロスモデル監査と Team ディスカッション」を組み合わせます。永続的なリコールは完了作業の要約メモリから来て、Team ディスカッションはコードが入る前の構造化されたクロスモデルレビューです。出力を完璧にはしませんが、単一モデルの盲点を減らし、複雑な作業をより多くのレビューで収束しやすくします。
 
 これは別の AI IDE ではなく、単なる遠隔ターミナルでもありません。端末ベースの coding agents を取り巻くメッセージング、メモリ、レビューのレイヤーです。
+
+## OpenSpec Auto Deliver
+
+OpenSpec ベースの変更では、Auto Deliver が change folder を end-to-end の監督付き delivery run に変えます: proposal/spec review、実装、検証、Team audit、自動モジュール採点、rework gate、見える最終 handoff まで扱います。
+
+- **ワンクリックの change pipeline。** transport-backed coding session から起動します。IM.codes は owner session を解決し、衝突を避けるため Team lane をロックし、`tasks.md` を読み、UI に live run projection を表示します。
+- **実装前の spec audit。** 任意の proposal/spec audit-repair は通常の Team flow（既定 `audit>review>plan`）を使い、chat summary ではなく authoritative JSON を読みます。
+- **タスク駆動の実装ループ。** daemon は同じ session に focused implementation prompt を送り、その OpenSpec change だけを扱い、checked/unchecked tasks を追跡し、project manifests から見つけた安全な validation command 候補を表示します。
+- **自動モジュール採点。** 各 audit は `spec`、`tasks`、`implementation`、`tests`、`risk` の structured scores を出し、evidence と summary は run details に表示されます。
+- **実装 audit と rework gate。** 採点付き final verdict — `PASS`、`REWORK`、`BLOCKED` — により、pass するか、limit 内で repair するか、人間判断に戻すかを決めます。
+- **Fail-closed と人間の最終制御。** audit output 不正、limit 到達、manual interference、Team state 不整合、tasks unreadable では human input を求めます。code の stage、commit、push は行いません。
+
+## 協調プログラミング
+
+現在のタブ、サブセッション、または source server 全体を他のユーザーに共有できます。`viewer` は read-only review、`participant` は対象 session への prompt 送信に使います。Shared message には actor label が付き、access は UI で降格または取り消しできます。
 
 ## Shared Agent Context とメモリ
 
@@ -119,6 +134,12 @@ SSH、VPN、ポート開放なしで、任意のブラウザから agent session
 
 ### モバイル、Watch、通知
 生体認証、push 通知、shell session の入力、Apple Watch での素早い確認と返信に対応します。
+
+### OpenSpec Auto Deliver
+spec-driven change を structured pipeline で進めます: proposal/spec audit、implementation prompts、manifest-aware validation hints、Team audit/rework、spec/tasks/implementation/tests/risk の自動採点、fail-closed handoff。
+
+### 協調プログラミング
+live session を他の人に共有して pair programming したり、viewer/participant roles で scoped server workspace に複数人を招待できます。
 
 ### クロスモデル監査と Team ディスカッション
 単一モデルの出力を盲信すべきではありません。Team ディスカッションでは、異なるプロバイダーや思考スタイルを持つ複数の agent が、コードを書く前に同じコードベースで協調分析を行います。各ラウンドはカスタマイズ可能なマルチフェーズパイプラインに従い、各 agent は前の貢献をすべて読んだ上で出力します。異なるモデルは異なる種類の問題を発見します。このクロスプロバイダー相互審査により、実装前に単一モデルが見落としがちな問題を発見し、手戻りを減らせます。
@@ -316,6 +337,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Node.js >= 22
 - Linux / macOS では tmux
 - Claude Code、Codex、Gemini CLI、OpenClaw、Qwen のいずれか
+
+## このプロジェクトについて
+
+個人プロジェクトです。私はほとんどコードを書いていません。ほぼ全てを [Claude Code](https://github.com/anthropics/claude-code) が構築し、[Codex](https://github.com/openai/codex) と [Gemini CLI](https://github.com/google-gemini/gemini-cli) も重要な貢献をしています。
 
 ## 免責事項
 

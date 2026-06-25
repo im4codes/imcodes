@@ -20,6 +20,7 @@ import { MEMORY_WS } from '../../shared/memory-ws.js';
 // ── Hoisted auth mock ────────────────────────────────────────────────────
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>();
+const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -28,6 +29,10 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
 vi.mock('../src/security/crypto.js', () => ({
@@ -151,6 +156,7 @@ describe('GET /api/memory/projection-owner', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
   });
   afterEach(() => WsBridge.getAll().clear());
 
@@ -204,6 +210,7 @@ describe('GET /api/memory/sources', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     serverId = `test-mem-${Math.random().toString(36).slice(2)}`;
   });
   afterEach(() => WsBridge.getAll().clear());
@@ -226,9 +233,30 @@ describe('GET /api/memory/sources', () => {
 
   it('403s when the caller does not own the serverId', async () => {
     mockResolveServerRole.mockResolvedValue('none');
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'not_authorized_for_server' });
     const app = await buildTestApp(makeDb());
     const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1&projectId=repo-1`);
     expect(res.status).toBe(403);
+  });
+
+  it('403s with share-direct-surface-denied for share-only callers before daemon/projection lookup', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    const queryOne = vi.fn();
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb());
+    daemon.sent.length = 0;
+    const app = await buildTestApp(makeDb({ queryOne }));
+
+    const res = await app.request(`/api/memory/sources?serverId=${serverId}&projectionId=proj-1&projectId=repo-1`);
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+    expect(queryOne).not.toHaveBeenCalled();
+    expect(daemon.sent.some((message) => message.includes(MEMORY_WS.GET_SOURCES_REQUEST))).toBe(false);
   });
 
   it('409s when no daemon is connected for the target serverId', async () => {

@@ -110,6 +110,47 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   else
     nohup bash -c 'systemctl --user daemon-reload && systemctl --user restart imcodes' </dev/null >>"$LOG" 2>&1 &
   fi
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  # Do not call the nested CLI service-restart path from here. When this
+  # helper is launched by the daemon itself, that nested CLI path can report
+  # success without launchd actually replacing the old daemon PID. Drive
+  # launchd directly, and keep a PID-file kill fallback for stuck processes.
+  nohup bash -c '
+    set -u
+    echo "=== detached macOS restart at $(date)"
+    plist="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
+    label="gui/$(id -u)/imcodes.daemon"
+    pid_file="$HOME/.imcodes/daemon.pid"
+    old_pid=""
+    if [[ -f "$pid_file" ]]; then
+      old_pid="$(tr -dc "0-9" <"$pid_file" 2>/dev/null || true)"
+    fi
+    if [[ -z "$old_pid" ]]; then
+      old_pid="$(launchctl list 2>/dev/null | awk "/[[:space:]]imcodes[.]daemon$/ { print \$1; exit }")"
+    fi
+    if ! [[ "$old_pid" =~ ^[0-9]+$ ]]; then
+      old_pid=""
+    fi
+
+    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || launchctl unload "$plist" 2>/dev/null || true
+
+    if [[ -n "$old_pid" && "$old_pid" != "$$" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill -TERM "$old_pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        sleep 1
+        if ! kill -0 "$old_pid" 2>/dev/null; then
+          break
+        fi
+      done
+      if kill -0 "$old_pid" 2>/dev/null; then
+        kill -KILL "$old_pid" 2>/dev/null || true
+      fi
+    fi
+
+    launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
+    launchctl kickstart -k "$label" 2>/dev/null || true
+    echo "=== detached macOS restart done at $(date)"
+  ' </dev/null >>"$LOG" 2>&1 &
 elif command -v setsid >/dev/null 2>&1; then
   setsid bash -c 'imcodes service restart --no-build' </dev/null >>"$LOG" 2>&1 &
 else

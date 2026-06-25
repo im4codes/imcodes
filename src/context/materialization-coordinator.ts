@@ -4,6 +4,7 @@ import type {
   ContextJobTrigger,
   ContextModelConfig,
   ContextNamespace,
+  ContextReplicationState,
   ContextTargetRef,
   LocalContextEvent,
   ProcessedContextProjection,
@@ -12,28 +13,16 @@ import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
 import { CompressionAdmissionClosedError, compressWithSdk, computeTargetTokens, type CompressionResult } from './summary-compressor.js';
 import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
-import {
-  archiveEventsForMaterialization,
-  clearDirtyTarget,
-  countConsecutiveFailedJobs,
-  deleteTentativeProjections,
-  enqueueContextJob,
-  getReplicationState,
-  deleteStagedEventsByIds,
-  listContextEvents,
-  listDirtyTargets,
-  listArchivedEventsForTarget,
-  listPinnedNotes,
-  listProcessedProjections,
-  pruneArchiveIfDue,
-  queryProcessedProjections,
-  recordCompressionRun,
-  recordContextEvent,
-  countStagedTokens,
-  setReplicationState,
-  updateContextJob,
-  writeProcessedProjection,
+import type {
+  IngestContextEventResult,
+  LatestRecentSummarySession,
+  MaterializationCommitInput,
+  MaterializationCommitResult,
+  PinnedNote,
+  WriteProcessedProjectionInput,
 } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import { serializeContextNamespace, serializeContextTarget } from './context-keys.js';
 import { countTokens } from './tokenizer.js';
 import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
@@ -42,6 +31,7 @@ import { computeFingerprint } from '../../shared/memory-fingerprint.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
+import { ensureProjectionEmbeddingForProjection } from './projection-embedding-maintenance.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import {
   decideSkillReviewSchedule,
@@ -59,6 +49,14 @@ import {
   getPersistedMemoryFeatureFlagValues,
   getRuntimeMemoryFeatureFlagValues,
 } from '../store/memory-feature-config-store.js';
+
+/** Archive-write override hook. The injected test form is synchronous; the
+ *  default coordinator implementation routes through the async client and may
+ *  return a Promise — callers `await` the result so both shapes are safe. */
+type ArchiveEventsForMaterializationFn = (events: LocalContextEvent[], archivedAt?: number) => void | Promise<void>;
+/** Atomic materialization commit override hook (sync injected form, async
+ *  client-routed default). */
+type CommitMaterializationFn = (input: MaterializationCommitInput) => MaterializationCommitResult | Promise<MaterializationCommitResult>;
 
 export interface MaterializationThresholds {
   autoTriggerTokens: number;
@@ -83,7 +81,9 @@ export interface MaterializationCoordinatorOptions {
   /** Override the SDK compressor (for testing or environments without SDK access). */
   compressor?: (input: import('./summary-compressor.js').CompressionInput) => Promise<import('./summary-compressor.js').CompressionResult>;
   /** Override archive writes for failure-injection tests. */
-  archiveEventsForMaterialization?: typeof archiveEventsForMaterialization;
+  archiveEventsForMaterialization?: ArchiveEventsForMaterializationFn;
+  /** Override the atomic materialization commit (for failure/crash-injection tests). */
+  commitMaterialization?: CommitMaterializationFn;
   /**
    * Optional post-response skill review scheduler. The coordinator invokes it
    * only after SDK-backed materialization has completed, so auto-creation stays
@@ -156,14 +156,28 @@ export class MaterializationCoordinator {
   private readonly resolveMemoryConfig: MemoryConfigResolver;
   private readonly thresholdOverrides: Partial<MaterializationThresholds>;
   private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
-  private readonly _archiveEventsForMaterialization: typeof archiveEventsForMaterialization;
+  private readonly _archiveEventsForMaterialization: ArchiveEventsForMaterializationFn;
+  private readonly _commitMaterialization: CommitMaterializationFn;
+  /** True when a test injected `commitMaterialization` — then we always use the
+   *  injected fn and never route to the worker. */
+  private readonly _commitMaterializationIsOverride: boolean;
   private readonly _skillReviewScheduler?: MaterializationSkillReviewScheduler;
   private readonly _selfLearningEnabled?: boolean | (() => boolean);
   private readonly skillReviewEvidenceByTarget = new Map<string, SkillReviewTriggerEvidence>();
 
   constructor(options?: MaterializationCoordinatorOptions) {
     this._compressor = options?.compressor;
-    this._archiveEventsForMaterialization = options?.archiveEventsForMaterialization ?? archiveEventsForMaterialization;
+    // Default archive/commit paths route through the centralized async client
+    // (worker when warm, in-process cold fallback otherwise) — no direct
+    // context-store import. Injected test overrides bypass the client entirely.
+    this._archiveEventsForMaterialization = options?.archiveEventsForMaterialization
+      ?? ((events, archivedAt) => getContextStoreClient().run<void>('archiveEventsForMaterialization', [events, archivedAt ?? Date.now()]));
+    // The default commit routes through the async client (worker when warm via
+    // runMaterializationCommit; in-process cold fallback here). An injected
+    // override bypasses the client entirely.
+    this._commitMaterialization = options?.commitMaterialization
+      ?? ((input) => getContextStoreClient().run<MaterializationCommitResult>('commitMaterialization', [input], { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background }));
+    this._commitMaterializationIsOverride = options?.commitMaterialization !== undefined;
     this._skillReviewScheduler = options?.skillReviewScheduler;
     this._selfLearningEnabled = options?.selfLearningEnabled;
     this.resolveMemoryConfig = options?.memoryConfigResolver ?? createMemoryConfigResolver({
@@ -180,33 +194,53 @@ export class MaterializationCoordinator {
     // explicit constructor overrides.
     this.thresholdOverrides = options?.thresholds ?? {};
     this.thresholds = this.buildThresholds(this.memoryConfig);
-    pruneArchiveIfDue(this.memoryConfig.archiveRetentionDays);
+    // No store touch in the constructor: the daemon main thread must never open
+    // the DB, and routing a prune through the worker here would either spawn it
+    // mid-flow (warm-partway WAL race) or no-op when cold. The archive prune is
+    // covered by the periodic `scheduleDueTargets` path (worker-routed) and the
+    // worker's own archive-backfill timer (task 3.4).
   }
 
-  ingestEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): {
+  async ingestEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): Promise<{
     event: LocalContextEvent;
     queuedJob?: ContextJobRecord;
     trigger?: ContextJobTrigger;
     filtered?: boolean;
-  } {
-    // Always record to local staging (visible in Raw Events tab)
-    const event = recordContextEvent(input);
-    // Only memory-eligible events (assistant.text) count toward materialization triggers.
-    // Streaming deltas, tool calls/results, and system events are excluded.
-    if (!isMemoryEligibleEvent(input.eventType)) {
-      return { event, filtered: true };
-    }
-    const dirtyTarget = this.findDirtyTarget(input.target);
-    if (!dirtyTarget) return { event };
-    const trigger = this.selectTrigger(dirtyTarget, event.createdAt);
+  }> {
+    // Only memory-eligible events (assistant.text) count toward materialization
+    // triggers; streaming deltas / tool calls / system events are excluded.
+    const eligible = isMemoryEligibleEvent(input.eventType);
+    const client = getContextStoreClient();
+    // ONE aggregate RPC: always record to staging, and (for eligible events) read
+    // the dirty target + staged-token upper bound + latest recent-summary
+    // timestamp — so per-event ingestion makes a single worker round trip off the
+    // daemon main thread instead of 2–3 separate calls. In-process fallback when
+    // the worker is not warm.
+    const agg = await client.run<IngestContextEventResult>(
+      'ingestContextEvent', [input, eligible],
+    );
+    const event = agg.event;
+    if (!eligible) return { event, filtered: true };
+    if (!agg.dirtyTarget) return { event };
+    // The trigger DECISION uses in-memory threshold/rate-limit state, so it stays
+    // here, fed by the data the aggregate already read.
+    const trigger = this.decideTrigger(
+      agg.dirtyTarget,
+      event.createdAt,
+      this.thresholdsForTarget(agg.dirtyTarget.target),
+      agg.stagedTokenUpperBound,
+      agg.latestSummaryUpdatedAt,
+    );
     if (!trigger) return { event };
     const jobType = input.target.kind === 'project' ? 'materialize_project' : 'materialize_session';
-    const queuedJob = enqueueContextJob(input.target, jobType, trigger, event.createdAt);
+    const queuedJob = await client.run<ContextJobRecord>(
+      'enqueueContextJob', [input.target, jobType, trigger, event.createdAt],
+    );
     return { event, queuedJob, trigger };
   }
 
-  listDirtyTargets(namespace?: ContextNamespace): ContextDirtyTarget[] {
-    return listDirtyTargets(namespace);
+  async listDirtyTargets(namespace?: ContextNamespace): Promise<ContextDirtyTarget[]> {
+    return getContextStoreClient().run<ContextDirtyTarget[]>('listDirtyTargets', [namespace]);
   }
 
   recordSkillReviewToolIteration(target: ContextTargetRef, count = 1): void {
@@ -230,12 +264,46 @@ export class MaterializationCoordinator {
     incrementCounter('mem.skill.evidence_filtered', { reason });
   }
 
+  /** Run the atomic materialization commit — in the context-store worker when it
+   *  is warm (so the heavy transaction stays off the daemon main thread), else
+   *  via the async client's in-process cold fallback (no direct store import). A
+   *  test-injected `commitMaterialization` always runs locally. */
+  private async runMaterializationCommit(input: MaterializationCommitInput): Promise<MaterializationCommitResult> {
+    if (!this._commitMaterializationIsOverride) {
+      const client = getContextStoreClient();
+      if (client.isReady) {
+        try {
+          return await client.call<MaterializationCommitResult>(
+            'commitMaterialization',
+            [input],
+            { timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background },
+          );
+        } catch {
+          // Worker failed/timeout — fall back to the in-process cold path below.
+        }
+      }
+    }
+    return this._commitMaterialization(input);
+  }
+
   async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
     const memoryConfig = this.configForTarget(target);
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
-    const job = enqueueContextJob(target, jobType, trigger, now);
-    updateContextJob(job.id, 'running', { attemptIncrement: true, now });
-    const allEvents = listContextEvents(target);
+    // Run the whole job lifecycle (create → running → … → completed) on the
+    // worker when warm, so the materialization job row is owned by one
+    // connection; in-process fallback when not ready.
+    const client = getContextStoreClient();
+    const job = await client.run<ContextJobRecord>(
+      'enqueueContextJob', [target, jobType, trigger, now],
+    );
+    await client.run<void>(
+      'updateContextJob', [job.id, 'running', { attemptIncrement: true, now }],
+    );
+    // Heavy reads run in the worker when warm (staged events can be large), off
+    // the daemon main thread; in-process fallback when not ready.
+    const allEvents = await client.run<LocalContextEvent[]>(
+      'listContextEvents', [target],
+    );
     // Only memory-eligible events are used for summary generation.
     // Streaming deltas, tool calls/results, and system events are excluded.
     const events = allEvents.filter((e) => {
@@ -250,10 +318,10 @@ export class MaterializationCoordinator {
     const hasUsableAssistantTurn = events.some((event) => event.eventType === 'assistant.text' || event.eventType === 'assistant.turn');
 
     if (hadNoiseAssistantTurn && !hasUsableAssistantTurn) {
-      this._archiveEventsForMaterialization(allEvents, now);
-      deleteStagedEventsByIds(sourceEventIds);
-      updateContextJob(job.id, 'completed', { now });
-      clearDirtyTarget(target);
+      await this._archiveEventsForMaterialization(allEvents, now);
+      await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
+      await client.run<void>('updateContextJob', [job.id, 'completed', { now }]);
+      await client.run<void>('clearDirtyTarget', [target]);
       return {
         replicationQueued: false,
         filteredOut: true,
@@ -263,8 +331,9 @@ export class MaterializationCoordinator {
     // Recent summaries are delta-only. Do not feed the previous recent summary
     // back into the compressor, or every small batch snowballs into another
     // full handoff and burns tokens when synced into sub-sessions.
-    const previousProjections = listProcessedProjections(target.namespace, 'recent_summary')
-      .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
+    const previousProjections = (await client.run<ProcessedContextProjection[]>(
+      'listProcessedProjections', [target.namespace, 'recent_summary'],
+    )).filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
     const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -276,7 +345,7 @@ export class MaterializationCoordinator {
     const compressFn = this._compressor ?? compressWithSdk;
     let compression: CompressionResult;
     try {
-      const pinnedNotes = collectPinnedNotesForNamespace(target.namespace);
+      const pinnedNotes = await collectPinnedNotesForNamespace(target.namespace);
       compression = await compressFn({
         events,
         previousSummary: undefined,
@@ -292,9 +361,9 @@ export class MaterializationCoordinator {
       });
     } catch (error) {
       if (error instanceof CompressionAdmissionClosedError) {
-        updateContextJob(job.id, 'materialization_failed', { now,
+        await client.run<void>('updateContextJob', [job.id, 'materialization_failed', { now,
           error: `compression_admission_closed: ${error.reason} — kept raw events for retry`,
-        });
+        }]);
         incrementCounter('mem.materialization.compression_admission_closed', { reason: error.reason });
         // Round-2 audit (0699ea64-3e6 finding A2/Commit B): admission_closed
         // path used to early-return WITHOUT recording in
@@ -305,7 +374,7 @@ export class MaterializationCoordinator {
         // — but we explicitly do NOT emit a timeline event (would be chat
         // noise: "nothing happened, but here's an event saying so").
         try {
-          recordCompressionRun({
+          await client.run<void>('recordCompressionRun', [{
             backend: 'none',
             model: '',
             usedBackup: false,
@@ -323,7 +392,7 @@ export class MaterializationCoordinator {
             outcome: 'admission_closed',
             errorCode: error.reason,
             errorMessage: null,
-          });
+          }]);
         } catch { /* never escape */ }
         return {
           replicationQueued: false,
@@ -363,7 +432,7 @@ export class MaterializationCoordinator {
       : (compression.errorCode || compression.errorMessage ? 'error' : 'fallback');
     if (events.length > 0) {
       try {
-        recordCompressionRun({
+        await client.run<void>('recordCompressionRun', [{
           backend: compression.backend,
           model: compression.model,
           usedBackup: compression.usedBackup,
@@ -381,7 +450,7 @@ export class MaterializationCoordinator {
           outcome,
           errorCode: compression.errorCode ?? null,
           errorMessage: compression.errorMessage ?? null,
-        });
+        }]);
       } catch {
         // Telemetry must never escape — recordCompressionRun already swallows
         // its own errors, but defense-in-depth.
@@ -425,11 +494,11 @@ export class MaterializationCoordinator {
     // A fromSdk: false result means "no real summary was produced" — the
     // fallback branch below owns that case; we don't treat it as noise.
     if (compression.fromSdk && isMemoryNoiseSummary(compression.summary)) {
-      deleteTentativeProjections(target.namespace, 'recent_summary');
-      this._archiveEventsForMaterialization(allEvents, now);
-      deleteStagedEventsByIds(sourceEventIds);
-      updateContextJob(job.id, 'completed', { now });
-      clearDirtyTarget(target);
+      await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
+      await this._archiveEventsForMaterialization(allEvents, now);
+      await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
+      await client.run<void>('updateContextJob', [job.id, 'completed', { now }]);
+      await client.run<void>('clearDirtyTarget', [target]);
       return {
         replicationQueued: false,
         compression,
@@ -459,7 +528,7 @@ export class MaterializationCoordinator {
     // nested error banners. Choosing to store nothing on failure matches
     // the user intent: "a period of backend downtime means a gap in memory,
     // not a scar."
-    const priorFailures = countConsecutiveFailedJobs(target);
+    const priorFailures = await client.run<number>('countConsecutiveFailedJobs', [target]);
     const sdkFailed = !compression.fromSdk;
 
     if (sdkFailed) {
@@ -475,20 +544,20 @@ export class MaterializationCoordinator {
       // Any legacy tentative rows from earlier versions of this code get
       // scrubbed here — the new design never writes tentatives, so the only
       // tentative rows that can exist are pre-migration leftovers.
-      deleteTentativeProjections(target.namespace, 'recent_summary');
+      await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
 
       if (retryBudgetExhausted) {
         // Abandon batch: delete staged events, clear dirty target so we
         // don't keep re-triggering for the same data. Job status is
         // 'completed' (not 'materialization_failed') so the next fresh
         // batch starts with a clean failure counter.
-        this._archiveEventsForMaterialization(allEvents, now);
+        await this._archiveEventsForMaterialization(allEvents, now);
         incrementCounter('mem.materialization.retry_exhausted_archived', { source: 'materializeTarget' });
-        deleteStagedEventsByIds(sourceEventIds);
-        updateContextJob(job.id, 'completed', { now,
+        await client.run<void>('deleteStagedEventsByIds', [sourceEventIds]);
+        await client.run<void>('updateContextJob', [job.id, 'completed', { now,
           error: `SDK compression abandoned after ${totalFailuresIncludingCurrent} consecutive failures — events discarded, no summary written`,
-        });
-        clearDirtyTarget(target);
+        }]);
+        await client.run<void>('clearDirtyTarget', [target]);
         return {
           replicationQueued: false,
           compression,
@@ -498,9 +567,9 @@ export class MaterializationCoordinator {
 
       // Retry path: keep staged events, leave dirty target in place, mark
       // job materialization_failed so the next trigger retries SDK.
-      updateContextJob(job.id, 'materialization_failed', { now,
+      await client.run<void>('updateContextJob', [job.id, 'materialization_failed', { now,
         error: `SDK compression unavailable (attempt ${totalFailuresIncludingCurrent}/${MAX_SDK_RETRY_ATTEMPTS}) — kept raw events for retry`,
-      });
+      }]);
       return {
         replicationQueued: false,
         compression,
@@ -510,24 +579,11 @@ export class MaterializationCoordinator {
     // SDK succeeded — commit the real summary. Also scrub any legacy
     // tentative rows that might have been left behind by prior code.
     if (priorFailures > 0) {
-      deleteTentativeProjections(target.namespace, 'recent_summary');
+      await client.run<number>('deleteTentativeProjections', [target.namespace, 'recent_summary']);
     }
 
-    try {
-      this._archiveEventsForMaterialization(allEvents, now);
-    } catch (error) {
-      updateContextJob(job.id, 'materialization_failed', { now,
-        error: `archive_failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
-      incrementCounter('mem.materialization.archive_failed', { source: 'materializeTarget' });
-      warnOncePerHour('mem.materialization.archive_failed', { error: error instanceof Error ? error.message : String(error) });
-      return {
-        replicationQueued: false,
-        compression,
-      };
-    }
-
-    const summaryProjection = writeProcessedProjection({
+    // Build the summary projection input (written atomically below).
+    const summaryInput: WriteProcessedProjectionInput = {
       namespace: target.namespace,
       class: 'recent_summary',
       origin: 'chat_compacted',
@@ -550,37 +606,68 @@ export class MaterializationCoordinator {
       },
       createdAt: now,
       updatedAt: now,
-    });
-    let durableProjection: ProcessedContextProjection | undefined;
+    };
+
+    // Optional durable candidate input (best-effort: a build/extraction failure
+    // yields no durable input and never blocks the summary commit).
+    let durableInput: WriteProcessedProjectionInput | undefined;
     if (this.isSelfLearningEnabled()) {
       try {
-        durableProjection = buildDurableProjection(
-          target.namespace,
-          events,
-          compression.summary,
-          sourceEventIds,
-          now,
-        );
+        durableInput = buildDurableProjectionInput(target.namespace, events, compression.summary, sourceEventIds, now);
       } catch (error) {
         incrementCounter('mem.materialization.durable_projection_failed', { source: 'materializeTarget' });
         warnOncePerHour('mem.materialization.durable_projection_failed', { error: error instanceof Error ? error.message : String(error) });
       }
     }
 
-    const replicationState = getReplicationState(target.namespace);
-    const pendingProjectionIds = [
-      ...(replicationState?.pendingProjectionIds ?? []),
-      summaryProjection.id,
-      ...(durableProjection ? [durableProjection.id] : []),
-    ];
-    setReplicationState(target.namespace, {
-      pendingProjectionIds: Array.from(new Set(pendingProjectionIds)),
-      lastReplicatedAt: replicationState?.lastReplicatedAt,
-      lastError: replicationState?.lastError,
-    });
-    deleteStagedEventsByIds(sourceEventIds);
-    updateContextJob(job.id, 'completed', { now });
-    clearDirtyTarget(target);
+    const replicationState = await client.run<ContextReplicationState | undefined>(
+      'getReplicationState', [target.namespace],
+    );
+
+    // Atomic commit bundle: archive events + write summary (+ durable) + set
+    // replication + delete staged + complete job + clear dirty in ONE SQLite
+    // transaction. A crash mid-bundle leaves NO half-committed state (no
+    // duplicate projection, no lost/orphaned staged events). compressWithSdk
+    // already ran above, OUTSIDE any transaction.
+    let commit: MaterializationCommitResult;
+    try {
+      commit = await this.runMaterializationCommit({
+        archiveEvents: allEvents,
+        archivedAt: now,
+        summaryProjection: summaryInput,
+        durableProjection: durableInput,
+        replication: {
+          namespace: target.namespace,
+          priorPendingProjectionIds: replicationState?.pendingProjectionIds ?? [],
+          lastReplicatedAt: replicationState?.lastReplicatedAt,
+          lastError: replicationState?.lastError,
+        },
+        deleteStagedEventIds: sourceEventIds,
+        completeJobId: job.id,
+        completedAt: now,
+        clearDirty: target,
+      });
+    } catch (error) {
+      // The whole bundle rolled back atomically — staged events remain, so the
+      // target re-materializes cleanly on retry (no duplicate).
+      await client.run<void>('updateContextJob', [job.id, 'materialization_failed', { now,
+        error: `commit_failed: ${error instanceof Error ? error.message : String(error)}`,
+      }]);
+      incrementCounter('mem.materialization.commit_failed', { source: 'materializeTarget' });
+      warnOncePerHour('mem.materialization.commit_failed', { error: error instanceof Error ? error.message : String(error) });
+      return {
+        replicationQueued: false,
+        compression,
+      };
+    }
+
+    const summaryProjection = commit.summaryProjection;
+    const durableProjection = commit.durableProjection;
+    // Best-effort write-time embeddings (OUTSIDE the transaction) so the next
+    // semantic recall reads a precomputed BLOB. Never awaited — must not add
+    // latency to materialization.
+    void ensureProjectionEmbeddingForProjection(summaryProjection);
+    if (durableProjection) void ensureProjectionEmbeddingForProjection(durableProjection);
     this.schedulePostResponseSkillReview({
       target,
       projectionId: summaryProjection.id,
@@ -596,40 +683,39 @@ export class MaterializationCoordinator {
     };
   }
 
-  scheduleDueTargets(now = Date.now()): ContextJobRecord[] {
-    pruneArchiveIfDue(this.memoryConfig.archiveRetentionDays, now);
+  async scheduleDueTargets(now = Date.now()): Promise<ContextJobRecord[]> {
+    const client = getContextStoreClient();
+    // Best-effort archive prune (a prune failure must never block scheduling).
+    // Route via `run` (not `fireAndForget`) so we don't eagerly spawn/warm a
+    // cold worker mid-flow — `run` reuses the warm worker when present and falls
+    // back in-process otherwise, keeping this scheduling pass on one path.
+    try {
+      await client.run<{ deleted: number; skipped: boolean }>('pruneArchiveIfDue', [this.memoryConfig.archiveRetentionDays, now]);
+    } catch {
+      // ignore — best-effort
+    }
     const queued: ContextJobRecord[] = [];
-    for (const target of listDirtyTargets()) {
-      const trigger = this.selectTrigger(target, now);
+    for (const target of await client.run<ContextDirtyTarget[]>('listDirtyTargets', [undefined])) {
+      const trigger = await this.selectTrigger(target, now);
       if (!trigger) continue;
       const jobType = target.target.kind === 'project' ? 'materialize_project' : 'materialize_session';
-      queued.push(enqueueContextJob(target.target, jobType, trigger, now));
+      queued.push(await client.run<ContextJobRecord>('enqueueContextJob', [target.target, jobType, trigger, now]));
     }
     return queued;
   }
 
-  listProcessed(namespace: ContextNamespace): ProcessedContextProjection[] {
-    return listProcessedProjections(namespace);
+  async listProcessed(namespace: ContextNamespace): Promise<ProcessedContextProjection[]> {
+    return getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace]);
   }
 
   async materializeDueMasterSummaries(now = Date.now()): Promise<ProcessedContextProjection[]> {
-    const latestBySession = new Map<string, { sessionName: string; namespace: ContextNamespace; updatedAt: number }>();
-    for (const projection of queryProcessedProjections({ projectionClass: 'recent_summary', includeArchived: true, limit: 1000 })) {
-      const sessionName = typeof projection.content.sessionName === 'string' ? projection.content.sessionName : undefined;
-      if (!sessionName) continue;
-      const key = `${serializeContextNamespace(projection.namespace)}::${sessionName}`;
-      const existing = latestBySession.get(key);
-      if (!existing || projection.updatedAt > existing.updatedAt) {
-        latestBySession.set(key, { sessionName, namespace: projection.namespace, updatedAt: projection.updatedAt });
-      }
-    }
-
+    const client = getContextStoreClient();
     const due: ProcessedContextProjection[] = [];
-    for (const item of latestBySession.values()) {
+    for (const item of await client.run<LatestRecentSummarySession[]>('listLatestRecentSummarySessions', [1000])) {
       const itemMemoryConfig = this.resolveMemoryConfig(item.namespace);
       const idleMs = Math.max(0, itemMemoryConfig.masterIdleHours) * 60 * 60 * 1000;
-      const lastMaster = findLatestMasterSummary(item.sessionName, item.namespace);
-      if (lastMaster && lastMaster.updatedAt >= item.updatedAt) continue;
+      const lastMasterUpdatedAt = await client.run<number | undefined>('getLatestMasterSummaryUpdatedAt', [item.sessionName, item.namespace]);
+      if (lastMasterUpdatedAt !== undefined && lastMasterUpdatedAt >= item.updatedAt) continue;
       if (idleMs > 0 && now - item.updatedAt < idleMs) continue;
       const projection = await materializeMasterSummary(item.sessionName, item.namespace, now, itemMemoryConfig);
       if (projection) due.push(projection);
@@ -637,11 +723,6 @@ export class MaterializationCoordinator {
     return due;
   }
 
-  private findDirtyTarget(target: ContextTargetRef): ContextDirtyTarget | undefined {
-    return listDirtyTargets(target.namespace).find((entry) =>
-      entry.target.kind === target.kind && entry.target.sessionName === target.sessionName,
-    );
-  }
 
   private schedulePostResponseSkillReview(input: {
     target: ContextTargetRef;
@@ -713,10 +794,19 @@ export class MaterializationCoordinator {
     }
   }
 
-  private selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): ContextJobTrigger | undefined {
-    const thresholds = this.thresholdsForTarget(dirtyTarget.target);
-    if (this.isRateLimited(dirtyTarget.target, now)) return undefined;
-    const tokenSum = countStagedTokens(dirtyTarget.target);
+  /** PURE trigger decision from already-read store data + in-memory thresholds.
+   *  Shared by the per-event aggregate path (`ingestEvent`, which passes data
+   *  from the `ingestContextEvent` RPC) and the periodic `selectTrigger`. */
+  private decideTrigger(
+    dirtyTarget: ContextDirtyTarget,
+    now: number,
+    thresholds: MaterializationThresholds,
+    stagedTokenUpperBound: number,
+    latestSummaryUpdatedAt: number | undefined,
+  ): ContextJobTrigger | undefined {
+    // Rate limit: a fresh recent summary suppresses re-fire within minIntervalMs.
+    if (latestSummaryUpdatedAt !== undefined && now - latestSummaryUpdatedAt < thresholds.minIntervalMs) return undefined;
+    const tokenSum = stagedTokenUpperBound;
     // Force-fire bypasses the event-count floor: this is a memory-safety valve
     // for runaway single/few-event batches with very large tool outputs.
     if (tokenSum >= thresholds.maxBatchTokens) return 'threshold';
@@ -729,36 +819,36 @@ export class MaterializationCoordinator {
     if (tokenSum >= thresholds.autoTriggerTokens) return 'threshold';
     if (now - dirtyTarget.newestEventAt >= thresholds.idleMs) return 'idle';
     if (now - dirtyTarget.oldestEventAt >= thresholds.scheduleMs) return 'schedule';
-    if (this.hasProcessedSummary(dirtyTarget.target)) return 'schedule';
+    // hasProcessedSummary === (latestSummaryUpdatedAt !== undefined)
+    if (latestSummaryUpdatedAt !== undefined) return 'schedule';
     return undefined;
   }
 
-  canMaterializeTarget(target: ContextTargetRef, now = Date.now()): boolean {
-    return !this.isRateLimited(target, now);
+  private async selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): Promise<ContextJobTrigger | undefined> {
+    const client = getContextStoreClient();
+    return this.decideTrigger(
+      dirtyTarget,
+      now,
+      this.thresholdsForTarget(dirtyTarget.target),
+      await client.run<number>('estimateStagedTokenUpperBound', [dirtyTarget.target]),
+      await client.run<number | undefined>('getLatestRecentSummaryUpdatedAtForTarget', [dirtyTarget.target]),
+    );
   }
 
-  private isRateLimited(target: ContextTargetRef, now: number): boolean {
+  async canMaterializeTarget(target: ContextTargetRef, now = Date.now()): Promise<boolean> {
+    return !(await this.isRateLimited(target, now));
+  }
+
+  private async isRateLimited(target: ContextTargetRef, now: number): Promise<boolean> {
     const thresholds = this.thresholdsForTarget(target);
-    const latestSummaryAt = this.getLatestSummaryUpdatedAt(target);
+    const latestSummaryAt = await this.getLatestSummaryUpdatedAt(target);
     return latestSummaryAt !== undefined && now - latestSummaryAt < thresholds.minIntervalMs;
   }
 
-  private hasProcessedSummary(target: ContextTargetRef): boolean {
-    return this.getLatestSummaryUpdatedAt(target) !== undefined;
-  }
-
-  private getLatestSummaryUpdatedAt(target: ContextTargetRef): number | undefined {
-    const projections = listProcessedProjections(target.namespace, 'recent_summary');
-    for (const projection of projections) {
-      const targetKind = typeof projection.content.targetKind === 'string' ? projection.content.targetKind : undefined;
-      const sessionName = typeof projection.content.sessionName === 'string' ? projection.content.sessionName : undefined;
-      if (target.kind === 'project') {
-        if (targetKind === 'project') return projection.updatedAt;
-        continue;
-      }
-      if (targetKind === 'session' && sessionName === target.sessionName) return projection.updatedAt;
-    }
-    return undefined;
+  /** Routed through the worker when warm (in-process cold fallback otherwise) —
+   *  the daemon main thread never opens the DB for this admission read. */
+  private async getLatestSummaryUpdatedAt(target: ContextTargetRef): Promise<number | undefined> {
+    return getContextStoreClient().run<number | undefined>('getLatestRecentSummaryUpdatedAtForTarget', [target]);
   }
 
   private configForTarget(target: ContextTargetRef): MemoryConfig {
@@ -802,11 +892,11 @@ export class MaterializationCoordinator {
 }
 
 
-function collectPinnedNotesForNamespace(namespace: ContextNamespace): string[] {
+async function collectPinnedNotesForNamespace(namespace: ContextNamespace): Promise<string[]> {
   const namespaceKey = serializeContextNamespace(namespace);
   const notes: string[] = [];
   let tokenTotal = 0;
-  for (const note of listPinnedNotes(namespaceKey)) {
+  for (const note of await getContextStoreClient().run<PinnedNote[]>('listPinnedNotes', [namespaceKey])) {
     const noteTokens = countTokens(note.content);
     if (tokenTotal + noteTokens > 1000) {
       incrementCounter('mem.pinned_notes_overflow', { namespace: namespaceKey });
@@ -820,15 +910,16 @@ function collectPinnedNotesForNamespace(namespace: ContextNamespace): string[] {
 }
 
 export async function materializeMasterSummary(sessionName: string, namespace?: ContextNamespace, now = Date.now(), memoryConfig?: MemoryConfig): Promise<ProcessedContextProjection | undefined> {
-  const resolvedNamespace = namespace ?? findNamespaceForSessionSummaries(sessionName);
+  const client = getContextStoreClient();
+  const resolvedNamespace = namespace ?? await findNamespaceForSessionSummaries(sessionName);
   if (!resolvedNamespace) return undefined;
   const effectiveMemoryConfig = memoryConfig ?? resolveMemoryConfigForNamespace(resolvedNamespace);
 
-  const previousMaster = findLatestMasterSummary(sessionName, resolvedNamespace);
+  const previousMaster = await findLatestMasterSummary(sessionName, resolvedNamespace);
   const since = previousMaster?.updatedAt ?? 0;
-  const batchSummaries = queryBatchSummariesForMaster(sessionName, resolvedNamespace, since);
+  const batchSummaries = await queryBatchSummariesForMaster(sessionName, resolvedNamespace, since);
   const target: ContextTargetRef = { namespace: resolvedNamespace, kind: 'session', sessionName };
-  const archiveEvents = listArchivedEventsForTarget(target, since, 200).filter(isHighSignalMasterEvent);
+  const archiveEvents = (await client.run<LocalContextEvent[]>('listArchivedEventsForTarget', [target, since, 200])).filter(isHighSignalMasterEvent);
   if (batchSummaries.length === 0 && archiveEvents.length === 0) return previousMaster;
 
   const sourceEventIds = mergeMasterSourceIds(previousMaster?.sourceEventIds ?? [], [
@@ -852,7 +943,7 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
       : ['- (none)']),
   ].join('\n');
   const summary = redactSummaryPreservingPinned(rawSummary, effectiveMemoryConfig.extraRedactPatterns);
-  return writeProcessedProjection({
+  const masterProjection = await client.run<ProcessedContextProjection>('writeProcessedProjection', [{
     id: `master:${computeFingerprint(`${namespaceKey}:${sessionName}`)}`,
     namespace: resolvedNamespace,
     class: 'master_summary',
@@ -870,7 +961,10 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
     },
     createdAt: previousMaster?.createdAt ?? now,
     updatedAt: now,
-  });
+  }]);
+  // Best-effort, fire-and-forget write-time embedding (see materializeTarget).
+  void ensureProjectionEmbeddingForProjection(masterProjection);
+  return masterProjection;
 }
 
 function mergeMasterSourceIds(prior: string[], incoming: string[]): string[] {
@@ -880,19 +974,19 @@ function mergeMasterSourceIds(prior: string[], incoming: string[]): string[] {
   return out;
 }
 
-function findNamespaceForSessionSummaries(sessionName: string): ContextNamespace | undefined {
-  return queryProcessedProjections({ projectionClass: 'recent_summary', includeArchived: true, limit: 1000 })
-    .find((projection) => projection.content.sessionName === sessionName)?.namespace;
+async function findNamespaceForSessionSummaries(sessionName: string): Promise<ContextNamespace | undefined> {
+  return (await getContextStoreClient().run<LatestRecentSummarySession[]>('listLatestRecentSummarySessions', [1000]))
+    .find((item) => item.sessionName === sessionName)?.namespace;
 }
 
-function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): ProcessedContextProjection | undefined {
-  return listProcessedProjections(namespace, 'master_summary')
+async function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): Promise<ProcessedContextProjection | undefined> {
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary']))
     .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
     .find((projection) => projection.content.sessionName === sessionName);
 }
 
-function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNamespace, since = 0): ProcessedContextProjection[] {
-  return listProcessedProjections(namespace, 'recent_summary')
+async function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNamespace, since = 0): Promise<ProcessedContextProjection[]> {
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary']))
     .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
     .filter((projection) => projection.content.sessionName === sessionName && projection.updatedAt > since)
     .sort((a, b) => a.updatedAt - b.updatedAt);
@@ -910,13 +1004,13 @@ function isHighSignalMasterEvent(event: LocalContextEvent): boolean {
   return false;
 }
 
-function buildDurableProjection(
+function buildDurableProjectionInput(
   namespace: ContextNamespace,
   events: LocalContextEvent[],
   summary: string,
   sourceEventIds: string[],
   now: number,
-): ProcessedContextProjection | undefined {
+): WriteProcessedProjectionInput | undefined {
   const extracted = extractDurableSignalsFromSummary(summary);
   const fallback = extractDurableSignalsFromEvents(events);
   const signals = {
@@ -926,7 +1020,7 @@ function buildDurableProjection(
   };
   const candidateCount = signals.decisions.length + signals.constraints.length + signals.preferences.length;
   if (candidateCount === 0) return undefined;
-  return writeProcessedProjection({
+  return {
     namespace,
     class: 'durable_memory_candidate',
     origin: 'agent_learned',
@@ -946,7 +1040,7 @@ function buildDurableProjection(
     },
     createdAt: now,
     updatedAt: now,
-  });
+  };
 }
 
 function extractDurableSignalsFromEvents(events: LocalContextEvent[]): DurableSignals {

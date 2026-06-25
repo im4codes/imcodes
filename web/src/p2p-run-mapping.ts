@@ -3,6 +3,7 @@ import {
   normalizeP2pProgressNodeStatus,
   type P2pActivePhase,
 } from '@shared/p2p-status.js';
+import type { EffectiveActorRole, SharedActorEnvelope } from '@shared/tab-sharing.js';
 import {
   P2P_WORKFLOW_DIAGNOSTIC_CODES,
   P2P_WORKFLOW_DIAGNOSTIC_PHASES,
@@ -92,6 +93,44 @@ function parseSnapshot(rawSnapshot: unknown): Record<string, any> {
   return (rawSnapshot ?? {}) as Record<string, any>;
 }
 
+function parseSharedActor(rawActor: unknown): SharedActorEnvelope | undefined {
+  if (!rawActor || typeof rawActor !== 'object' || Array.isArray(rawActor)) return undefined;
+  const actor = rawActor as Partial<SharedActorEnvelope>;
+  if (
+    typeof actor.actorUserId !== 'string' ||
+    typeof actor.actorDisplayName !== 'string' ||
+    typeof actor.actionId !== 'string' ||
+    typeof actor.authorizedAt !== 'number' ||
+    !actor.snapshot ||
+    typeof actor.snapshot !== 'object'
+  ) {
+    return undefined;
+  }
+  const role = actor.effectiveActorRole;
+  if (
+    role !== 'viewer' &&
+    role !== 'participant' &&
+    role !== 'server-member' &&
+    role !== 'server-manager' &&
+    role !== 'system'
+  ) {
+    return undefined;
+  }
+  const origin = actor.origin;
+  if (origin !== 'shared-server' && origin !== 'shared-tab' && origin !== 'server-member') return undefined;
+  return {
+    ...actor,
+    actorUserId: actor.actorUserId,
+    actorDisplayName: actor.actorDisplayName,
+    snapshot: actor.snapshot as SharedActorEnvelope['snapshot'],
+    primaryShareId: typeof actor.primaryShareId === 'string' ? actor.primaryShareId : null,
+    effectiveActorRole: role as EffectiveActorRole,
+    actionId: actor.actionId,
+    origin,
+    authorizedAt: actor.authorizedAt,
+  };
+}
+
 function mapLegacyNodes(source: Record<string, any>) {
   return Array.isArray(source.all_nodes) ? source.all_nodes.map((n: any) => ({
     session: typeof n.session === 'string' ? n.session : undefined,
@@ -122,6 +161,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
   const snapshot = parseSnapshot(r.progress_snapshot);
   const source = { ...snapshot, ...r } as Record<string, any>;
   const diagnostics = extractDiagnostics(source);
+  const sharedActor = parseSharedActor(source.sharedActor ?? source.shared_actor);
   const receivedAt = Date.now();
   const updatedAt = parseTimestamp(source.updated_at ?? source.updatedAt);
   const completedAt = parseTimestamp(source.completed_at ?? source.completedAt);
@@ -242,6 +282,7 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
       source.updated_at ?? source.updatedAt,
       receivedAt,
     ),
+    sharedActor,
     diagnostics,
   };
 }
@@ -292,17 +333,8 @@ export function mergeP2pStatusResponseDiscussions<T extends {
   const explicitMissingRunId = options.runId && options.runFound === false
     ? `p2p_${options.runId}`
     : null;
-  const incomingIds = new Set(incoming.map((entry) => entry.id));
   const merged = existing.filter((d) => {
     if (explicitMissingRunId && d.id === explicitMissingRunId) return false;
-    if (
-      options.fullList === true
-      && d.id.startsWith('p2p_')
-      && !incomingIds.has(d.id)
-      && !isTerminalDiscussionState(d.state)
-    ) {
-      return false;
-    }
     return true;
   });
 

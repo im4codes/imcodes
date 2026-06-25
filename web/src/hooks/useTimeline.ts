@@ -1211,6 +1211,20 @@ function hasStructuredOlderPage(msg: TimelineEventsServerMessage): boolean {
   return msg.hasMore === true && getOlderTimelineCursor(msg) !== null;
 }
 
+function buildFallbackOlderCursor(events: readonly TimelineEvent[], epoch: number): TimelineCursor | null {
+  let earliest: TimelineEvent | null = null;
+  for (const event of events) {
+    if (typeof event.ts !== 'number' || !Number.isFinite(event.ts)) continue;
+    if (!earliest || event.ts < earliest.ts) earliest = event;
+  }
+  if (!earliest) return null;
+  return {
+    epoch: epoch > 0 ? epoch : earliest.epoch,
+    beforeTs: earliest.ts,
+    direction: TIMELINE_CURSOR_DIRECTIONS.OLDER,
+  };
+}
+
 function supportsTimelineProtocol(ws: WsClient): boolean {
   const method = (ws as { supportsTimelineProtocolRevision?: (minRevision?: number) => boolean }).supportsTimelineProtocolRevision;
   return typeof method === 'function' && method.call(ws, TIMELINE_PROTOCOL_REVISION);
@@ -2020,7 +2034,7 @@ export function useTimeline(
     });
   }, [clearOptimisticTimer, rememberSettledCommandId, sessionId]);
 
-  const markOptimisticAccepted = useCallback((commandId: string) => {
+  const markOptimisticAccepted = useCallback((commandId: string, options?: { clearPending?: boolean }) => {
     if (!commandId) return;
     // N-R2 fix (audit 0419d1ac-1f4 / O2 选项 D) — `accepted` is a daemon-
     // receipt ack ("I got your command"), NOT a terminal outcome. Two
@@ -2054,7 +2068,7 @@ export function useTimeline(
       const existing = base[idx]!;
       const payload: Record<string, unknown> = {
         ...existing.payload,
-        pending: false,
+        pending: options?.clearPending === true ? false : true,
         failed: false,
         acked: true,
       };
@@ -2182,7 +2196,7 @@ export function useTimeline(
           continue;
         }
       }
-      markOptimisticAccepted(commandId);
+      markOptimisticAccepted(commandId, { clearPending: true });
     }
   }, [clearOptimisticTimer, markOptimisticAccepted, rememberSettledCommandId]);
 
@@ -2236,6 +2250,16 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
+    if (commandId) {
+      // A browser may miss the immediate command.ack/user.message while the
+      // socket is resubscribing (most visible on sub-session windows). The
+      // message may already be running, so do one cheap tail catch-up instead
+      // of letting the local bubble spin until the 90s safety timeout.
+      fireHttpBackfillRef.current(1200, {
+        phase: 'refresh',
+        cooldownMs: 1500,
+      });
+    }
   }, [sessionId, clearOptimisticTimer, markOptimisticFailed]);
 
   const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2254,8 +2278,9 @@ export function useTimeline(
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
     if (!cached || cached.length === 0) return;
-    const cursor = olderCursorRef.current;
+    const cursor = olderCursorRef.current ?? buildFallbackOlderCursor(cached, epochRef.current);
     if (!cursor) return;
+    olderCursorRef.current = cursor;
     loadingOlderRef.current = true;
     setHistoryStatus({
       phase: 'older',

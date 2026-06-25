@@ -58,6 +58,7 @@ vi.mock('../../src/util/logger.js', () => ({
   },
 }));
 
+import { getTransportRuntime } from '../../src/agent/session-manager.js';
 import {
   startP2pRun,
   cancelP2pRun,
@@ -65,19 +66,75 @@ import {
   listP2pRuns,
   notifySessionIdle,
   serializeP2pRun,
+  extractOpenSpecAutoDeliverStrictSegment,
   _setFileSettleCycles,
   _setGracePeriodMs,
   _setIdlePollMs,
   _setMarkerPromptRetryAfterMs,
   _setMinProcessingMs,
-  _setPostSummaryConfirmationDelayMs,
+  _setQueueStuckStopAfterMs,
+  _setQueuedPromptStopAfterMs,
   _setRoundHopCleanupDelayMs,
   type P2pRun,
   type P2pRunStatus,
 } from '../../src/daemon/p2p-orchestrator.js';
+import {
+  clearAutoDeliverP2pLocksForTests,
+  registerAutoDeliverP2pLock,
+  releaseAutoDeliverP2pLock,
+} from '../../src/daemon/p2p-launch-admission.js';
 
 let tempProjectDir: string;
 let autoWriteExecutionMarkers = true;
+const TEST_CLEANUP_SETTLE_MS = 50;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+let trackedTestTimers = new Set<ReturnType<typeof setTimeout>>();
+let pendingTestTasks = new Set<Promise<unknown>>();
+
+function installTestTimerTracking(): void {
+  trackedTestTimers = new Set();
+  pendingTestTasks = new Set();
+  globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+    let handle: ReturnType<typeof setTimeout>;
+    const wrapped = (...callbackArgs: unknown[]) => {
+      trackedTestTimers.delete(handle);
+      if (typeof handler === 'function') {
+        return (handler as (...innerArgs: unknown[]) => unknown)(...callbackArgs);
+      }
+      return undefined;
+    };
+    handle = realSetTimeout(wrapped, timeout, ...args);
+    trackedTestTimers.add(handle);
+    return handle;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((handle?: ReturnType<typeof setTimeout>) => {
+    if (handle) trackedTestTimers.delete(handle);
+    return realClearTimeout(handle);
+  }) as typeof clearTimeout;
+}
+
+function trackTestTask(task: Promise<unknown>): void {
+  const tracked = task.finally(() => {
+    pendingTestTasks.delete(tracked);
+  });
+  pendingTestTasks.add(tracked);
+}
+
+async function settleAndClearTestBackgroundWork(): Promise<void> {
+  await new Promise((r) => realSetTimeout(r, TEST_CLEANUP_SETTLE_MS));
+  if (pendingTestTasks.size > 0) {
+    const results = await Promise.allSettled([...pendingTestTasks]);
+    const rejected = results.find((result) => result.status === 'rejected');
+    if (rejected?.status === 'rejected') throw rejected.reason;
+  }
+  for (const timer of trackedTestTimers) {
+    realClearTimeout(timer);
+  }
+  trackedTestTimers.clear();
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
+}
 
 function pathFromPrompt(prompt: string): string {
   const match = prompt.match(/\/\S+?\.md/);
@@ -112,6 +169,38 @@ async function writeFailedExecutionMarkerFromPrompt(prompt: string, error = 'age
   return true;
 }
 
+function makeFakeTransportRuntime(sessionName: string): Record<string, unknown> {
+  return {
+    providerSessionId: `${sessionName}:provider`,
+    pendingCount: 0,
+    pendingVersion: 0,
+    pendingMessages: [],
+    pendingEntries: [],
+    drainPendingIfIdle: vi.fn().mockReturnValue(false),
+    getDiagnosticSnapshot: vi.fn().mockReturnValue({
+      status: 'idle',
+      sending: false,
+      pendingCount: 0,
+      pendingVersion: 0,
+      activeDispatchCount: 0,
+      stalePendingRecoveryActive: false,
+      providerSessionBound: true,
+      lastActivityAt: Date.now(),
+      lastActivityAgeMs: 0,
+    }),
+    cancelStaleActiveTurnWithPending: vi.fn().mockReturnValue(false),
+    cancel: vi.fn().mockResolvedValue(undefined),
+    send: vi.fn((prompt: string) => {
+      const filePath = [...prompt.matchAll(/\/\S+?\.md/g)].at(-1)?.[0] ?? pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      trackTestTask(appendFile(filePath, `\n## ${heading}\n\nTransport output from ${sessionName}.\n`, 'utf8')
+        .then(() => writeExecutionMarkerFromPrompt(prompt))
+        .then(() => setTimeout(() => notifySessionIdle(sessionName), 20)));
+      return 'sent';
+    }),
+  };
+}
+
 async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10000): Promise<P2pRun> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
@@ -121,7 +210,7 @@ async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10
   }
   const run = getP2pRun(runId);
   if (!run) throw new Error(`Run ${runId} disappeared before reaching ${expected.join(', ')}`);
-  throw new Error(`Run ${runId} ended in ${run.status}, expected ${expected.join(', ')}`);
+  throw new Error(`Run ${runId} ended in ${run.status}, expected ${expected.join(', ')}${run.error ? `; error=${run.error}` : ''}`);
 }
 
 async function waitForNoRoundHopArtifacts(projectDir: string, runId: string, maxMs = 1000): Promise<void> {
@@ -139,14 +228,19 @@ async function waitForNoRoundHopArtifacts(projectDir: string, runId: string, max
 }
 
 beforeEach(async () => {
+  installTestTimerTracking();
   vi.clearAllMocks();
+  clearAutoDeliverP2pLocksForTests();
   _setIdlePollMs(20);
   _setGracePeriodMs(80);
   _setMarkerPromptRetryAfterMs(0);
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
-  _setPostSummaryConfirmationDelayMs(0);
+  _setQueueStuckStopAfterMs(40);
+  _setQueuedPromptStopAfterMs(40);
   _setRoundHopCleanupDelayMs(0);
+  vi.mocked(getTransportRuntime).mockReset();
+  vi.mocked(getTransportRuntime).mockReturnValue(undefined);
   autoWriteExecutionMarkers = true;
 
   tempProjectDir = join(tmpdir(), `p2p-par-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -156,6 +250,7 @@ beforeEach(async () => {
     if (name === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'brain' };
     if (name === 'deck_proj_w1') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'w1' };
     if (name === 'deck_proj_w2') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'w2' };
+    if (name === 'deck_sub_worker') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: 'deck_proj_brain', label: 'sub' };
     if (name === 'deck_other_w2') return { agentType: 'claude-code', projectDir: join(tempProjectDir, 'other'), parentSession: undefined, label: 'w2x' };
     return null;
   });
@@ -183,20 +278,69 @@ afterEach(async () => {
   // Cancel all active runs BEFORE deleting the temp dir to prevent background
   // async ops (file reads, idle polls) from throwing ENOENT on deleted files.
   await Promise.allSettled(listP2pRuns().map((r) => cancelP2pRun(r.id, serverLinkMock as any)));
-  // Brief settle so in-flight promises flush before filesystem cleanup.
-  await new Promise((r) => setTimeout(r, 50));
+  await settleAndClearTestBackgroundWork();
 
-  _setIdlePollMs(3000);
-  _setGracePeriodMs(180000);
-  _setMarkerPromptRetryAfterMs(60000);
-  _setMinProcessingMs(30000);
-  _setFileSettleCycles(3);
-  _setPostSummaryConfirmationDelayMs(10000);
+  _setIdlePollMs(1000);
+  _setGracePeriodMs(45000);
+  _setMarkerPromptRetryAfterMs(30000);
+  _setMinProcessingMs(8000);
+  _setFileSettleCycles(2);
+  _setQueueStuckStopAfterMs(120000);
+  _setQueuedPromptStopAfterMs(20000);
   _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
+  clearAutoDeliverP2pLocksForTests();
 });
 
 describe('P2P orchestrator — parallel rounds', () => {
+
+  it('extracts the generic strict JSON segment from the final summary instead of prior transcript fences', () => {
+    const finalJson = {
+      auto_deliver: { runId: 'auto-1' },
+      verdict: 'PASS',
+      module_scores: [],
+      unchecked_tasks: [],
+      required_changes: [],
+      repairs_applied: [],
+      evidence: [],
+    };
+    const discussion = [
+      '## Earlier Spec Section',
+      '```json',
+      '{"example":true}',
+      '```',
+      '```ts',
+      'const example = 1;',
+      '```',
+      '## brain:codex-sdk:implementation_audit — Final Summary',
+      '```json',
+      JSON.stringify(finalJson, null, 2),
+      '```',
+      '## P2P Original Request Execution Confirmed',
+      'Marker file: .imc/discussions/run.cycle1.execution-marker.json',
+    ].join('\n');
+
+    const segment = extractOpenSpecAutoDeliverStrictSegment(discussion);
+    expect(segment).toContain('"runId": "auto-1"');
+    expect(segment).not.toContain('"example":true');
+  });
+
+  it('fails closed when the final summary contains multiple strict JSON candidates', () => {
+    const discussion = [
+      '```json',
+      '{"earlier":true}',
+      '```',
+      '## brain:codex-sdk:implementation_audit — Final Summary',
+      '```json',
+      '{"verdict":"PASS"}',
+      '```',
+      '```json',
+      '{"verdict":"REWORK"}',
+      '```',
+    ].join('\n');
+
+    expect(extractOpenSpecAutoDeliverStrictSegment(discussion)).toBeNull();
+  });
 
   it('creates round-scoped hop artifact names with run id, round, and hop index', async () => {
     const run = await startP2pRun(
@@ -210,6 +354,445 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['completed']);
     expect(done.hopStates).toHaveLength(1);
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
+  });
+
+  it('restores transport initiator runtime instead of falling back to tmux dispatch', async () => {
+    const runtimeBySession = new Map<string, any>();
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_sdk_brain') {
+        return {
+          name,
+          projectName: 'demo',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          providerId: 'codex-sdk',
+          providerSessionId: 'provider-old',
+          codexSessionId: 'codex-resume-id',
+          projectDir: tempProjectDir,
+          parentSession: undefined,
+          label: 'brain',
+        };
+      }
+      if (name === 'deck_sub_peer') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: 'deck_sdk_brain', label: 'peer' };
+      return null;
+    });
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimeBySession.get(session));
+    launchTransportSessionMock.mockImplementation(async (opts: { name: string }) => {
+      runtimeBySession.set(opts.name, makeFakeTransportRuntime(opts.name));
+    });
+
+    const run = await startP2pRun(
+      'deck_sdk_brain',
+      [{ session: 'deck_sub_peer', mode: 'audit' }],
+      'transport restore p2p prompt',
+      [],
+      serverLinkMock as any,
+    );
+
+    await waitForStatus(run.id, ['completed'], 5_000);
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sdk_brain',
+      agentType: 'codex-sdk',
+      codexSessionId: 'codex-resume-id',
+    }));
+    expect(sendKeysDelayedEnterMock.mock.calls.some((call) => call[0] === 'deck_sdk_brain')).toBe(false);
+    expect(runtimeBySession.get('deck_sdk_brain')?.send).toHaveBeenCalled();
+  });
+
+  it('nudges stale active transport work when a P2P prompt is queued behind it', async () => {
+    const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(true);
+    const fakeRuntime = {
+      send: vi.fn().mockReturnValue('queued'),
+      pendingCount: 1,
+      pendingVersion: 7,
+      pendingMessages: ['queued p2p prompt'],
+      pendingEntries: [{ clientMessageId: 'queued-p2p-1', text: 'queued p2p prompt' }],
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'thinking',
+        sending: true,
+        pendingCount: 1,
+        pendingVersion: 7,
+        activeDispatchCount: 1,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now() - 1_000,
+        lastActivityAgeMs: 1_000,
+      }),
+      cancelStaleActiveTurnWithPending,
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'queued transport p2p prompt',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    expect(fakeRuntime.send).toHaveBeenCalled();
+    expect(fakeRuntime.drainPendingIfIdle).toHaveBeenCalledWith('p2p-discussion_section_prompt-post-send');
+    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'p2p-discussion_section_missing',
+      staleMs: 40,
+    }));
+    expect(fakeRuntime.cancel).not.toHaveBeenCalled();
+  });
+
+  it('removes its queued transport prompt when a P2P hop times out before drain', async () => {
+    const pending: Array<{ clientMessageId: string; text: string }> = [];
+    const removePendingMessage = vi.fn((clientMessageId: string) => {
+      const index = pending.findIndex((entry) => entry.clientMessageId === clientMessageId);
+      if (index < 0) return null;
+      const [removed] = pending.splice(index, 1);
+      return removed;
+    });
+    const fakeRuntime = {
+      send: vi.fn((prompt: string, commandId?: string) => {
+        pending.push({ clientMessageId: commandId ?? 'missing-command-id', text: prompt });
+        return 'queued';
+      }),
+      get pendingCount() { return pending.length; },
+      pendingVersion: 1,
+      get pendingMessages() { return pending.map((entry) => entry.text); },
+      get pendingEntries() { return pending.map((entry) => ({ ...entry })); },
+      removePendingMessage,
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'thinking',
+        sending: true,
+        pendingCount: 1,
+        pendingVersion: 1,
+        activeDispatchCount: 1,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now() - 1_000,
+        lastActivityAgeMs: 1_000,
+      }),
+      cancelStaleActiveTurnWithPending: vi.fn().mockReturnValue(false),
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'queued transport p2p prompt should not survive timeout',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    const commandId = fakeRuntime.send.mock.calls[0]?.[1];
+    expect(commandId).toMatch(new RegExp(`^p2p:${run.id}:`));
+    expect(removePendingMessage).toHaveBeenCalledWith(commandId);
+    expect(pending).toEqual([]);
+  });
+
+  it('does not cancel an active P2P transport turn just because discussion output has not appeared yet', async () => {
+    const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(false);
+    const fakeRuntime = {
+      send: vi.fn().mockReturnValue('sent'),
+      pendingCount: 0,
+      pendingVersion: 3,
+      pendingMessages: [],
+      pendingEntries: [],
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'thinking',
+        sending: true,
+        pendingCount: 0,
+        pendingVersion: 3,
+        activeDispatchCount: 1,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now() - 1_000,
+        lastActivityAgeMs: 1_000,
+      }),
+      cancelStaleActiveTurnWithPending,
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'slow active transport p2p prompt',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    expect(fakeRuntime.send).toHaveBeenCalled();
+    expect(fakeRuntime.drainPendingIfIdle).toHaveBeenCalled();
+    expect(cancelStaleActiveTurnWithPending).not.toHaveBeenCalled();
+    expect(fakeRuntime.cancel).not.toHaveBeenCalled();
+  });
+
+  it('drains a queued P2P prompt immediately when the transport runtime is already idle', async () => {
+    const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(false);
+    const fakeRuntime = {
+      send: vi.fn().mockReturnValue('queued'),
+      pendingCount: 1,
+      pendingVersion: 11,
+      pendingMessages: ['queued p2p prompt'],
+      pendingEntries: [{ clientMessageId: 'queued-p2p-2', text: 'queued p2p prompt' }],
+      drainPendingIfIdle: vi.fn()
+        .mockReturnValueOnce(true)
+        .mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({
+        status: 'idle',
+        sending: false,
+        pendingCount: 0,
+        pendingVersion: 12,
+        activeDispatchCount: 0,
+        stalePendingRecoveryActive: false,
+        providerSessionBound: true,
+        lastActivityAt: Date.now(),
+        lastActivityAgeMs: 0,
+      }),
+      cancelStaleActiveTurnWithPending,
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'idle queued transport p2p prompt',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      180,
+    );
+
+    await waitForStatus(run.id, ['completed', 'timed_out'], 3_000);
+
+    expect(fakeRuntime.send).toHaveBeenCalled();
+    expect(fakeRuntime.drainPendingIfIdle).toHaveBeenCalledWith('p2p-discussion_section_prompt-post-send');
+    expect(cancelStaleActiveTurnWithPending).not.toHaveBeenCalled();
+    expect(fakeRuntime.cancel).not.toHaveBeenCalled();
+  });
+
+  it('serializes shared actor and share scope metadata for shared P2P runs', async () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-p2p-serialize',
+      primaryShareId: 'share-1',
+      authorizedAt: 1_000,
+      queuedAt: 1_001,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 900,
+        authorizedAt: 1_000,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        nextCoverageRecheckAt: null,
+      },
+    };
+    const shareScope = {
+      target: { kind: 'main', serverId: 'srv-main', sessionName: 'deck_proj_brain' },
+      historyCutoffAt: 900,
+      primaryShareId: 'share-1',
+      coveringShareIds: ['share-1'],
+    };
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'shared projection',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: sharedActor as any,
+      shareScope: shareScope as any,
+    });
+
+    expect(serializeP2pRun(run)).toMatchObject({
+      sharedActor,
+      shareScope,
+    });
+  });
+
+  it('blocks manual P2P launch while the owning main session has an Auto Deliver lock', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-1',
+      owningMainSessionName: 'deck_proj',
+      generation: 3,
+      selectedTeamComboId: 'audit>review>plan',
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-1' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-1');
+  });
+
+  it('blocks force-like manual and OpenSpec preset launches while Auto Deliver owns the Team lane', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-force',
+      owningMainSessionName: 'deck_proj',
+      generation: 3,
+      selectedTeamComboId: 'audit>review>plan',
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual force while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-force-command' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-force');
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual openspec preset while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      advancedPresetKey: 'openspec',
+      launchOrigin: { kind: 'manual', commandId: 'manual-openspec-preset' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-force');
+  });
+
+  it('blocks manual P2P launched from a sub-session when the owning main session is locked', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-sub',
+      owningMainSessionName: 'deck_proj',
+      generation: 5,
+      selectedTeamComboId: 'audit>review>plan',
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_sub_worker',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual sub-session launch while auto deliver is active',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-sub-1' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-sub');
+  });
+
+  it('restores normal manual Team launch behavior after the Auto Deliver lock is released', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-release',
+      owningMainSessionName: 'deck_proj',
+      generation: 1,
+      selectedTeamComboId: 'audit>review>plan',
+    });
+
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual launch before release',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-before-release' },
+    })).rejects.toThrow('p2p_launch_blocked:auto_deliver_active:auto-run-release');
+
+    expect(releaseAutoDeliverP2pLock('deck_proj', 'auto-run-release')).toBe(true);
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual launch after release',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: { kind: 'manual', commandId: 'manual-after-release' },
+    });
+
+    expect(run.launchOrigin).toEqual({ kind: 'manual', commandId: 'manual-after-release' });
+    expect(run.mainSession).toBe('deck_proj');
+  });
+
+  it('allows Auto Deliver-owned P2P launch when metadata matches the active lock', async () => {
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-2',
+      owningMainSessionName: 'deck_proj',
+      generation: 7,
+      stage: 'spec_audit_repair',
+      roundIndex: 1,
+      selectedTeamComboId: 'audit>review>plan',
+      activeOpenSpecPromptId: 'proposal_audit',
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'auto deliver audit-repair',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      launchOrigin: {
+        kind: 'openspec_auto_deliver',
+        commandId: 'auto-command-1',
+        autoDeliver: {
+          runId: 'auto-run-2',
+          changeName: 'openspec-auto-delivery',
+          owningMainSessionName: 'deck_proj',
+          generation: 7,
+          stage: 'spec_audit_repair',
+          roundIndex: 1,
+          attemptId: 'attempt-1',
+          selectedTeamComboId: 'audit>review>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
+        },
+      },
+    });
+
+    expect(serializeP2pRun(run)).toMatchObject({
+      launch_origin: {
+        kind: 'openspec_auto_deliver',
+        commandId: 'auto-command-1',
+        autoDeliver: {
+          runId: 'auto-run-2',
+          changeName: 'openspec-auto-delivery',
+          owningMainSessionName: 'deck_proj',
+          generation: 7,
+          stage: 'spec_audit_repair',
+          roundIndex: 1,
+          attemptId: 'attempt-1',
+          selectedTeamComboId: 'audit>review>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
+        },
+      },
+    });
   });
 
   it('removes legacy round hop artifacts after merging them into the main discussion file', async () => {
@@ -277,7 +860,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.flow_step_current).toBe(2);
     expect(payload.flow_step_total).toBe(2);
     const content = await readFile(done.contextFilePath, 'utf8');
-    expect(content.match(/Initial Analysis/g)?.length).toBe(1);
+    expect(content.match(/Initial Analysis/g)?.length).toBe(4);
   });
 
   it('inlines original-request execution into each complete legacy combo-cycle summary and follows up to confirm', async () => {
@@ -372,14 +955,17 @@ describe('P2P orchestrator — parallel rounds', () => {
     );
 
     await waitForStatus(run.id, ['completed'], 5000);
-    expect(initialPrompts).toHaveLength(1);
+    expect(initialPrompts).toHaveLength(2);
     expect(initialPrompts[0]).not.toContain('Previous cycle audit scope');
+    expect(initialPrompts[1]).toContain('Previous cycle audit scope');
+    expect(initialPrompts[1]).toContain('review all previous round outputs and any implementation/execution evidence');
     expect(nextCycleHopPrompts).toHaveLength(1);
     expect(nextCycleHopPrompts[0]).toContain('Previous cycle audit scope');
     expect(nextCycleHopPrompts[0]).toContain('Treat cycle 1/2 outputs as the primary audit scope');
     expect(nextCycleHopPrompts[0]).toContain('P2P Original Request Execution Confirmed (cycle 1/2)');
     expect(nextCycleHopPrompts[0]).toContain('Summary: Cycle 1 execution result');
-    expect(nextCycleHopPrompts[0]).toContain('Changed files: src/cycle-1.ts');
+    expect(nextCycleHopPrompts[0]).toContain('File changes were reported by the execution marker; inspect the workspace for details.');
+    expect(nextCycleHopPrompts[0]).not.toContain('Changed files: src/cycle-1.ts');
     expect(nextCycleHopPrompts[0]).toContain('Tests: vitest cycle 1');
   });
 
@@ -418,6 +1004,42 @@ describe('P2P orchestrator — parallel rounds', () => {
 
     const done = await waitForStatus(run.id, ['timed_out'], 3000);
     expect(done.error).toContain('post_summary_execution_timeout');
+  });
+
+  it('advances post-summary execution from matching markers without waiting for idle', async () => {
+    autoWriteExecutionMarkers = false;
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        if (prompt.includes('Execution proof required')) {
+          await writeExecutionMarkerFromPrompt(prompt, true);
+          return;
+        }
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (prompt.includes('Execution proof required')) {
+        await writeExecutionMarkerFromPrompt(prompt, true);
+        return;
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'marker completes without idle',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      1_000,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 3000);
+    expect(done.status).toBe('completed');
   });
 
   it('retries the post-summary execution prompt after idle until the marker appears', async () => {
@@ -635,6 +1257,159 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(confirmationPrompts[0].prompt).toContain('Do not just say it is done');
   });
 
+  it('skips the post-summary execution gate for Auto Deliver-launched audit discussions', async () => {
+    // Auto Deliver audit discussions are analysis-only: the repair turn (with
+    // the must-fix checklist) and the acceptance scoring are dispatched by the
+    // auto-deliver orchestrator AFTER this run completes. The generic
+    // "execute the original request" gate would burn an extra execution turn
+    // plus a follow-up confirmation turn on an audit-only request.
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    registerAutoDeliverP2pLock({
+      runId: 'auto-run-gate-skip',
+      owningMainSessionName: 'deck_proj',
+      generation: 1,
+      stage: 'spec_audit_repair',
+      roundIndex: 1,
+      selectedTeamComboId: 'audit',
+      activeOpenSpecPromptId: 'proposal_audit',
+    });
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'auto deliver audit discussion — analysis only',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      // With the gate gone there is no full request restatement on the final
+      // summary turn — output contracts (e.g. the repair scorecard section)
+      // must be restated here and MUST land in the final summary prompt.
+      finalSummaryExtraInstruction: 'include the exact heading "repair scorecard" with per-module baselines',
+      launchOrigin: {
+        kind: 'openspec_auto_deliver',
+        commandId: 'auto-command-gate-skip',
+        autoDeliver: {
+          runId: 'auto-run-gate-skip',
+          changeName: 'demo-change',
+          owningMainSessionName: 'deck_proj',
+          generation: 1,
+          stage: 'spec_audit_repair',
+          roundIndex: 1,
+          attemptId: 'attempt-gate-skip',
+          selectedTeamComboId: 'audit',
+          activeOpenSpecPromptId: 'proposal_audit',
+        },
+      },
+    });
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt).toBeDefined();
+    // No inline execution block in the final summary…
+    expect(finalSummaryPrompt?.prompt).not.toContain('Execution proof required');
+    expect(finalSummaryPrompt?.prompt).not.toContain('directly execute the user');
+    // …and no follow-up verification turn at all.
+    expect(prompts.some((entry) => entry.prompt.includes('Team execution follow-up verification'))).toBe(false);
+    // The caller-supplied output contract IS restated on the final summary.
+    expect(finalSummaryPrompt?.prompt).toContain('include the exact heading "repair scorecard" with per-module baselines');
+  });
+
+  it('appends finalSummaryExtraInstruction to the legacy final summary alongside the inline execution block', async () => {
+    // Manual runs keep the execution gate; the extra instruction must coexist
+    // with (not replace) the inline execution block.
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'manual run with a final summary output contract',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      finalSummaryExtraInstruction: 'final summary MUST include the section "output contract lock"',
+    });
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt?.prompt).toContain('final summary MUST include the section "output contract lock"');
+    expect(finalSummaryPrompt?.prompt).toContain('Execution proof required');
+  });
+
+  it('appends finalSummaryExtraInstruction to the workflow-path final summary', async () => {
+    // The advanced/workflow flow builds its final summary through a different
+    // code path than the legacy combo loop — lock the restatement there too.
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { agentType: 'claude-code-sdk', projectDir: tempProjectDir, parentSession: undefined, label: 'brain' };
+      return null;
+    });
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+      await writeExecutionMarkerFromPrompt(prompt);
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [],
+      userText: 'workflow run with a final summary output contract',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      finalSummaryExtraInstruction: 'final summary MUST include the section "output contract lock"',
+      advancedRounds: [
+        {
+          id: 'implementation',
+          title: 'Implementation',
+          preset: 'implementation',
+          executionMode: 'single_main',
+          permissionScope: 'implementation',
+        },
+      ],
+    });
+
+    const done = await waitForStatus(run.id, ['completed'], 15_000);
+    expect(done.status).toBe('completed');
+
+    const finalSummaryPrompt = prompts.find((entry) => entry.session === 'deck_proj_brain' && entry.prompt.includes('Final Summary'));
+    expect(finalSummaryPrompt?.prompt).toContain('final summary MUST include the section "output contract lock"');
+  });
+
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       const filePath = pathFromPrompt(prompt);
@@ -697,10 +1472,10 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('still enters summary when zero hops complete in a round', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
-    if (await writeExecutionMarkerFromPrompt(prompt)) {
-      setTimeout(() => notifySessionIdle(session), 20);
-      return;
-    }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
       const filePath = pathFromPrompt(prompt);
       const heading = headingFromPrompt(prompt);
       if (session === 'deck_proj_brain') {
@@ -846,6 +1621,44 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.hopStates.some((hop) => hop.session === 'deck_proj_w1' && hop.status === 'completed')).toBe(true);
     const content = await readFile(done.contextFilePath, 'utf8');
     expect(content).toContain('SUCCESS-deck_proj_w1');
+  });
+
+  it('does not double the configured timeout for required initiator hops', async () => {
+    _setIdlePollMs(10);
+    _setGracePeriodMs(20);
+    _setMinProcessingMs(0);
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 5);
+        return;
+      }
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      if (session === 'deck_proj_brain' && heading.includes('Initial Analysis')) {
+        setTimeout(() => notifySessionIdle(session), 5);
+        return;
+      }
+      await appendFile(filePath, `\n## ${heading}\n\nSUCCESS-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 5);
+    });
+
+    const startedAt = Date.now();
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'initiator timeout should not be multiplied',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      220,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 3000);
+    const elapsedMs = Date.now() - startedAt;
+    expect(done.skippedHops).toContain('deck_proj_brain');
+    expect(elapsedMs).toBeLessThan(420);
   });
 
   it('uses isolated cross-project hop copies and copies completed artifacts back to the main project hop file', async () => {
@@ -999,6 +1812,71 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.hop_counts?.completed).toBeGreaterThanOrEqual(1);
   });
 
+  it('waits for final idle content instead of completing on the first streamed heading', async () => {
+    let pendingFinalWrites = 0;
+    detectStatusAsyncMock.mockImplementation(async () => (pendingFinalWrites === 0 ? 'idle' : 'thinking'));
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        pendingFinalWrites += 1;
+        await appendFile(filePath, `\n## ${heading}\n\npartial streaming text\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => {
+          void appendFile(filePath, 'FINAL ANSWER TEXT\n', 'utf8').then(() => {
+            pendingFinalWrites -= 1;
+            notifySessionIdle(session);
+          });
+        }, 2400);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'wait for final text',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      5000,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 10_000);
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content).toContain('FINAL ANSWER TEXT');
+  }, 12_000);
+
+  it('uses SDK transport runtime state instead of tmux detection when completing P2P hops', async () => {
+    detectStatusAsyncMock.mockResolvedValue('thinking');
+    const runtimes = new Map<string, Record<string, unknown>>([
+      ['deck_proj_brain', makeFakeTransportRuntime('deck_proj_brain')],
+      ['deck_proj_w1', makeFakeTransportRuntime('deck_proj_w1')],
+    ]);
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimes.get(session) as any);
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'transport runtime idle should settle p2p',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      500,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 3000);
+    expect(done.status).toBe('completed');
+    expect(detectStatusAsyncMock).not.toHaveBeenCalled();
+  });
+
   it('preserves the active run phase when an advanced whole-run timeout fires', async () => {
     let runId = '';
     sendKeysDelayedEnterMock.mockImplementationOnce(async (session: string, prompt: string) => {
@@ -1064,6 +1942,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'helper diagnostics payload',
       timeoutMs: 120000,
       resultSummary: null,
+      strictAuthoritativeResult: null,
       completedHops: [],
       skippedHops: [],
       error: null,
@@ -1144,6 +2023,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'latest step serialization',
       timeoutMs: 120000,
       resultSummary: null,
+      strictAuthoritativeResult: null,
       completedHops: [],
       skippedHops: [],
       error: null,
@@ -1263,6 +2143,7 @@ describe('P2P orchestrator — parallel rounds', () => {
       userText: 'parallel progress',
       timeoutMs: 120000,
       resultSummary: null,
+      strictAuthoritativeResult: null,
       completedHops: [],
       skippedHops: [],
       error: null,
@@ -1386,8 +2267,13 @@ describe('P2P orchestrator — parallel rounds', () => {
 
   it('cleans up clone-mode temporary sdk helper sessions after reducer use', async () => {
     let helperName: string | null = null;
+    const runtimeBySession = new Map<string, any>([
+      ['deck_proj_brain', makeFakeTransportRuntime('deck_proj_brain')],
+    ]);
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimeBySession.get(session));
     launchTransportSessionMock.mockImplementation(async (opts: any) => {
       helperName = opts.name;
+      runtimeBySession.set(opts.name, makeFakeTransportRuntime(opts.name));
     });
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_proj_brain') {
@@ -1583,6 +2469,13 @@ describe('P2P orchestrator — parallel rounds', () => {
   });
 
   it('launches and tears down clone-mode helper sessions', async () => {
+    const runtimeBySession = new Map<string, any>([
+      ['deck_proj_brain', makeFakeTransportRuntime('deck_proj_brain')],
+    ]);
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) => runtimeBySession.get(session));
+    launchTransportSessionMock.mockImplementation(async (opts: any) => {
+      runtimeBySession.set(opts.name, makeFakeTransportRuntime(opts.name));
+    });
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_proj_brain') return {
         agentType: 'claude-code-sdk',
@@ -2075,6 +2968,48 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['failed'], 15_000);
     expect(done.error).toContain('Expected artifact not observably updated');
     expect(done.error).toContain('docs/plan.md');
+  }, 20_000);
+
+  it('accepts openspec_convention artifact rounds that modify files inside an existing change', async () => {
+    const changeDir = join(tempProjectDir, 'openspec', 'changes', 'existing-change');
+    await mkdir(join(changeDir, 'specs', 'demo'), { recursive: true });
+    await writeFile(join(changeDir, 'proposal.md'), '# Proposal\n\nBefore\n', 'utf8');
+    await writeFile(join(changeDir, 'tasks.md'), '- [ ] update\n', 'utf8');
+    await writeFile(join(changeDir, 'specs', 'demo', 'spec.md'), '# Spec\n', 'utf8');
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+    if (await writeExecutionMarkerFromPrompt(prompt)) {
+      setTimeout(() => notifySessionIdle(session), 20);
+      return;
+    }
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await writeFile(join(changeDir, 'proposal.md'), '# Proposal\n\nAfter\n', 'utf8');
+      await appendFile(filePath, `\n## ${heading}\n\nUpdated existing OpenSpec artifacts from ${session}.\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [],
+      userText: 'artifact round updates an existing openspec change',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      advancedRounds: [
+        {
+          id: 'openspec_artifact',
+          title: 'OpenSpec Artifact',
+          preset: 'custom',
+          executionMode: 'single_main',
+          permissionScope: 'artifact_generation',
+          artifactConvention: 'openspec_convention',
+        },
+      ],
+    });
+
+    const done = await waitForStatus(run.id, ['completed'], 15_000);
+    expect(done.error).toBeNull();
+    await expect(readFile(join(changeDir, 'proposal.md'), 'utf8')).resolves.toContain('After');
   }, 20_000);
 
   it('completes the openspec preset after proposal artifacts are created and audit eventually passes', async () => {

@@ -19,6 +19,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.title') return 'OpenSpec';
       if (key === 'openspec.changes') return 'changes';
       if (key === 'openspec.empty') return 'empty';
+      if (key === 'openspec.no_tasks') return 'No tasks';
+      if (key === 'openspec.task_status_title') return `${opts?.checked ?? 0}/${opts?.total ?? 0} tasks complete`;
       if (key === 'openspec.load_timeout') return 'openspec_timeout';
       if (key === 'openspec.load_unavailable') return 'openspec_unavailable';
       if (key === 'openspec.load_error') return 'openspec_error';
@@ -28,6 +30,40 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.implement_action') return 'implement_action';
       if (key === 'openspec.achieve_action') return 'achieve_action';
       if (key === 'openspec.propose_action') return 'propose_action';
+      if (key === 'openspec.auto.action') return 'Auto';
+      if (key === 'openspec.auto.launcher_title') return 'Auto Deliver';
+      if (key === 'openspec.auto.details_title') return 'Auto Deliver details';
+      if (key === 'openspec.auto.current_run') return 'Current Auto Deliver';
+      if (key === 'openspec.auto.kicker') return 'Auto Deliver';
+      if (key === 'openspec.auto.start') return 'Start Auto Deliver';
+      if (key === 'openspec.auto.auto_commit_push') return 'Commit and push automatically after audit passes';
+      if (key === 'openspec.auto.auto_commit_push_help') return 'Saved as your preference. After the audit passes, the agent receives commit&push.';
+      if (key === 'openspec.auto.view') return 'View';
+      if (key === 'openspec.auto.stop') return 'Stop Auto Deliver';
+      if (key === 'openspec.auto.lock_manual_actions') return 'Auto Deliver owns Team lane';
+      if (key === 'openspec.auto.conflict_summary') return 'Details are visible only in participating sessions.';
+      if (key === 'openspec.auto.error.missing_change') return 'Select a change first';
+      if (key === 'openspec.auto.error.active_run') return 'Auto Deliver already running';
+      if (key === 'openspec.auto.error.manual_team_busy') return 'Manual Team is busy';
+      if (key === 'openspec.auto.error.unsupported_runtime') return 'Unsupported runtime';
+      if (key === 'openspec.auto.error.daemon_offline') return 'Daemon offline';
+      if (key === 'openspec.auto.error.launch_timeout') return 'Launch timed out';
+      if (key === 'openspec.auto.error.invalid_rounds') return 'Invalid rounds';
+      if (key === 'openspec.auto.error.custom_combo_unsupported') return 'Custom Team combos are not supported for Auto Deliver yet';
+      if (key === 'openspec.auto.error.launch_failed') return 'Launch failed';
+      if (key === 'openspec.auto.custom') return 'Custom';
+      if (key === 'openspec.auto.preset.fast') return 'Fast';
+      if (key === 'openspec.auto.preset.standard') return 'Standard';
+      if (key === 'openspec.auto.preset.strict') return 'Strict';
+      if (key === 'openspec.auto.preset.deep') return 'Deep';
+      if (key === 'openspec.auto.preset_limits') return `Spec ${opts?.spec ?? ''} · Impl ${opts?.impl ?? ''}`;
+      if (key === 'openspec.auto.materialized_limits') return `Spec audit-repair ${opts?.spec ?? ''} · Implementation audit-repair ${opts?.impl ?? ''}`;
+      if (key === 'openspec.auto.tasks_progress') return `${opts?.checked ?? 0}/${opts?.total ?? 0} tasks`;
+      if (key === 'openspec.auto.prompt_count') return `${opts?.count ?? 0} prompts`;
+      if (key === 'openspec.auto.conflict_active') return `${opts?.change ?? ''} already running`;
+      if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
+      if (key.startsWith('openspec.auto.status.')) return key.split('.').pop() ?? key;
+      if (key.startsWith('openspec.auto.stage.')) return key.split('.').pop() ?? key;
       if (key === 'openspec.propose_from_discussion_action') return 'propose_from_discussion_action';
       if (key === 'openspec.propose_from_description_action') return 'propose_from_description_action';
       if (key === 'openspec.audit_implementation_prompt') {
@@ -54,6 +90,14 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.transport_send_queued_count') {
         return `${opts?.count ?? 0} queued`;
       }
+      if (key === 'share.actorLabel') {
+        return `${String(opts?.name ?? '')} · ${String(opts?.role ?? '')}`;
+      }
+      if (key === 'share.role.viewer') return 'Viewer';
+      if (key === 'share.role.participant') return 'Participant';
+      if (key === 'share.role.serverMember') return 'Server member';
+      if (key === 'share.role.serverManager') return 'Server manager';
+      if (key === 'share.role.system') return 'System';
       if (key === 'session.send_placeholder') {
         return `Send to ${String(opts?.name ?? 'session')}…`;
       }
@@ -219,7 +263,9 @@ vi.mock('../../src/api.js', () => ({
   onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
+import { OpenSpecAutoDeliverLauncher } from '../../src/components/OpenSpecAutoDeliver.js';
 import { OPENSPEC_LIST_REQUEST_TIMEOUT_MS, SessionControls } from '../../src/components/SessionControls.js';
+import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
 import type { SessionInfo } from '../../src/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
@@ -270,6 +316,7 @@ const makeWs = (overrides: { capabilitySnapshot?: { daemonId: string; capabiliti
   return {
     send: vi.fn(),
     sendSessionCommand: vi.fn(),
+    sendSessionMessage: vi.fn(),
     // Urgent variant for stop / cancel — bypasses the probe-state gate.
     // Stop must reach the server even during a brief WS probe (`_connected
     // = false` for ~50-200ms after focus/visibility ticks).
@@ -401,6 +448,7 @@ const subSession = (name: string, label: string): SessionInfo =>
 describe('SessionControls', () => {
 afterEach(() => {
   cleanup();
+  __resetPrefCacheForTests();
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
 });
 
@@ -424,10 +472,9 @@ afterEach(() => {
     patchSubSessionMock.mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.split(':').pop() ?? key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
-            [sessionKey]: { enabled: true, mode: 'audit' },
+            deck_sub_abc: { enabled: true, mode: 'audit' },
           },
           rounds: 3,
         });
@@ -809,10 +856,8 @@ afterEach(() => {
     const ws = makeWs();
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
-        const sessionKey = key.slice('p2p_session_config:'.length);
         return JSON.stringify({
           sessions: {
-            [sessionKey]: { enabled: true, mode: 'audit' },
             'deck_sub_abc': { enabled: true, mode: 'review' },
           },
           rounds: 3,
@@ -821,7 +866,7 @@ afterEach(() => {
           advancedRunTimeoutMinutes: 45,
           contextReducer: {
             mode: 'clone_sdk_session',
-            templateSession: sessionKey,
+            templateSession: 'deck_sub_abc',
           },
         });
       }
@@ -853,7 +898,6 @@ afterEach(() => {
         { session: '__all__', mode: 'config' },
       ],
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
         'deck_sub_abc': { enabled: true, mode: 'review' },
       },
       p2pRounds: 3,
@@ -930,7 +974,7 @@ afterEach(() => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         return JSON.stringify({
           sessions: {
-            'my-session': { enabled: false, mode: 'audit' },
+            'deck_sub_abc': { enabled: false, mode: 'audit' },
           },
           rounds: 3,
         });
@@ -952,7 +996,7 @@ afterEach(() => {
   it('applies P2P config preference events without refetching', async () => {
     let prefValue = JSON.stringify({
       sessions: {
-        'my-session': { enabled: false, mode: 'audit' },
+        'deck_sub_abc': { enabled: false, mode: 'audit' },
       },
       rounds: 3,
     });
@@ -969,7 +1013,6 @@ afterEach(() => {
 
     prefValue = JSON.stringify({
       sessions: {
-        'my-session': { enabled: true, mode: 'audit' },
         'deck_sub_abc': { enabled: true, mode: 'review' },
       },
       rounds: 3,
@@ -1010,7 +1053,7 @@ afterEach(() => {
         scopeSession: 'my-session',
         config: {
           sessions: {
-            'my-session': { enabled: true, mode: 'audit' },
+            deck_sub_abc: { enabled: true, mode: 'audit' },
           },
           rounds: 3,
         },
@@ -1026,16 +1069,15 @@ afterEach(() => {
     await waitFor(() => expect(ws.send).toHaveBeenCalledTimes(1));
 
     ws.emit({ type: DAEMON_MSG.RECONNECTED });
-    await flushAsync();
 
-    expect(ws.send).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(ws.send).toHaveBeenCalledTimes(2));
     expect(ws.send).toHaveBeenLastCalledWith({
       type: P2P_CONFIG_MSG.SAVE,
       requestId: expect.any(String),
       scopeSession: 'my-session',
       config: {
         sessions: {
-          'my-session': { enabled: true, mode: 'audit' },
+          deck_sub_abc: { enabled: true, mode: 'audit' },
         },
         rounds: 3,
       },
@@ -1131,7 +1173,7 @@ afterEach(() => {
       ],
       p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
+        deck_sub_abc: { enabled: true, mode: 'audit' },
       },
       p2pRounds: 3,
       p2pLocale: 'en',
@@ -1152,7 +1194,7 @@ afterEach(() => {
       ],
       p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
+        deck_sub_abc: { enabled: true, mode: 'audit' },
       },
       p2pRounds: 3,
       p2pLocale: 'en',
@@ -1182,7 +1224,7 @@ afterEach(() => {
       ],
       p2pMode: 'audit>review>plan',
       p2pSessionConfig: {
-        'my-session': { enabled: true, mode: 'audit' },
+        deck_sub_abc: { enabled: true, mode: 'audit' },
       },
       p2pRounds: 3,
       p2pLocale: 'en',
@@ -1214,7 +1256,7 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
 
-    expect(ws.fsListDir).toHaveBeenCalledWith('/repo/openspec/changes', false, false);
+    expect(ws.fsListDir).toHaveBeenNthCalledWith(1, '/repo/openspec/changes', false, false);
 
     ws.emit({
       type: 'fs.ls_response',
@@ -1224,6 +1266,7 @@ afterEach(() => {
       entries: [
         { name: 'archive', path: '/repo/openspec/changes/archive', isDir: true, hidden: false },
         { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
+        { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false },
         { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
         { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
       ],
@@ -1232,11 +1275,648 @@ afterEach(() => {
 
     const changeButton = screen.getByRole('button', { name: 'change-a' });
     expect(changeButton.textContent).toContain('@');
+    expect(changeButton.textContent).not.toContain('1/2');
+    expect(ws.fsListDir).toHaveBeenNthCalledWith(2, '/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false, openSpecTaskStats: { total: 3, checked: 3, unchecked: 0 } },
+        { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false, openSpecTaskStats: { total: 0, checked: 0, unchecked: 0 } },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false, openSpecTaskStats: { total: 2, checked: 1, unchecked: 1 } },
+      ],
+    });
+    await flushAsync();
+
+    expect(changeButton.textContent).toContain('1/2');
+    expect(screen.getByText('3/3')).toBeDefined();
+    expect(screen.getByText('No tasks')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'archive' })).toBeNull();
 
     fireEvent.click(changeButton);
 
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('renders cached OpenSpec task stats immediately while refreshing task stats in the background', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false, openSpecTaskStats: { total: 2, checked: 1, unchecked: 1 } },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'change-a' }).textContent).toContain('1/2');
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'change-a' }).textContent).toContain('1/2');
+    expect(screen.getByText('loading')).toBeDefined();
+    expect(ws.fsListDir).toHaveBeenLastCalledWith('/repo/openspec/changes', false, false);
+
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'change-a' }).textContent).toContain('1/2');
+    expect(ws.fsListDir).toHaveBeenLastCalledWith('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+  });
+
+  it('opens Auto Deliver launcher from each openspec change row without inserting a prompt', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+
+    expect(screen.getByTestId('openspec-auto-launcher')).toBeDefined();
+    expect(screen.getByText('Standard')).toBeDefined();
+    expect(screen.getByRole('textbox').textContent).toBe('');
+
+    fireEvent.click(screen.getByTestId('openspec-auto-preset-strict'));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.launch',
+      serverId: 'srv-1',
+      sessionName: 'my-session',
+      changeName: 'change-a',
+      presetId: 'strict',
+      requestId: expect.any(String),
+    }));
+    expect(screen.getByRole('textbox').textContent).toBe('');
+  });
+
+  it('keeps Auto Deliver launch bound to OpenSpec changes while sending combo id and materialized limits', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    input.textContent = 'raw requirement text should stay in chat and must not become an Auto Deliver launch source';
+    fireEvent.input(input);
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    const launcher = screen.getByTestId('openspec-auto-launcher');
+    expect(within(launcher).getByTestId('openspec-auto-preset-fast')).toBeDefined();
+    expect(within(launcher).getByTestId('openspec-auto-preset-standard')).toBeDefined();
+    expect(within(launcher).getByTestId('openspec-auto-preset-strict')).toBeDefined();
+    expect(within(launcher).getByTestId('openspec-auto-preset-deep')).toBeDefined();
+    expect(within(launcher).queryByRole('textbox')).toBeNull();
+    expect(within(launcher).getAllByRole('spinbutton')).toHaveLength(2);
+    expect(within(launcher).getByRole('combobox')).toBeDefined();
+    expect(within(launcher).queryByDisplayValue(/openspec_auto_deliver/i)).toBeNull();
+
+    fireEvent.click(within(launcher).getByRole('button', { name: 'Start Auto Deliver' }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.launch',
+      serverId: 'srv-1',
+      sessionName: 'my-session',
+      changeName: 'change-a',
+      presetId: 'standard',
+      selectedTeamComboId: 'audit>review>plan',
+      materializedLimits: {
+        specAuditRepairRounds: 1,
+        implementationAuditRepairRounds: 2,
+        maxImplementationPrompts: 12,
+        maxElapsedMinutes: 480,
+      },
+      requestId: expect.any(String),
+    }));
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('raw requirement text'),
+    }));
+    expect(input.textContent).toBe('raw requirement text should stay in chat and must not become an Auto Deliver launch source');
+  });
+
+  it('defaults the Auto Deliver Team combo to the audit-review-plan machine id', () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    const comboSelect = screen.getByRole('combobox') as HTMLSelectElement;
+    expect(comboSelect.value).toBe('audit>review>plan');
+    expect(within(comboSelect).getByRole('option', { name: 'mode_audit→mode_review→mode_plan' })).toBeDefined();
+    expect(within(comboSelect).getByRole('option', { name: 'mode_brainstorm→mode_discuss→mode_plan' })).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', {
+      selectedTeamComboId: 'audit>review>plan',
+      autoCommitPush: false,
+      materializedLimits: {
+        specAuditRepairRounds: 1,
+        implementationAuditRepairRounds: 2,
+        maxImplementationPrompts: 12,
+        maxElapsedMinutes: 480,
+      },
+    });
+  });
+
+  it('sends the persisted auto commit/push preference when the launcher checkbox is enabled', () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Commit and push automatically after audit passes' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', expect.objectContaining({
+      selectedTeamComboId: 'audit>review>plan',
+      autoCommitPush: true,
+    }));
+  });
+
+  it('keeps numeric controls editable after preset quick setters and launches custom exact limits', () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('openspec-auto-preset-fast'));
+    expect(screen.getByText('Spec audit-repair 0 · Implementation audit-repair 1')).toBeDefined();
+
+    const [specRounds, implementationRounds] = screen.getAllByRole('spinbutton') as HTMLInputElement[];
+    fireEvent.input(specRounds!, { target: { value: '3' } });
+    fireEvent.input(implementationRounds!, { target: { value: '5' } });
+
+    expect((specRounds as HTMLInputElement).value).toBe('3');
+    expect((implementationRounds as HTMLInputElement).value).toBe('5');
+    expect(screen.getByText('Spec audit-repair 3 · Implementation audit-repair 5')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'custom', {
+      selectedTeamComboId: 'audit>review>plan',
+      autoCommitPush: false,
+      materializedLimits: {
+        specAuditRepairRounds: 3,
+        implementationAuditRepairRounds: 5,
+        maxImplementationPrompts: 12,
+        maxElapsedMinutes: 480,
+      },
+    });
+  });
+
+  it('lists saved custom Team combos in the Auto Deliver launcher and blocks them with a compatibility reason before launch', async () => {
+    const onLaunch = vi.fn();
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName="change-a"
+        onClose={vi.fn()}
+        onLaunch={onLaunch}
+      />,
+    );
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
+        detail: { key: 'p2p_custom_combos', value: JSON.stringify(['audit>plan']) },
+      }));
+    });
+
+    const comboSelect = screen.getByRole('combobox') as HTMLSelectElement;
+    await waitFor(() => expect(within(comboSelect).getByRole('option', { name: 'mode_audit→mode_plan (Custom)' })).toBeDefined());
+    expect(within(comboSelect).queryByRole('option', { name: 'audit>plan (Custom)' })).toBeNull();
+    fireEvent.change(comboSelect, { target: { value: 'audit>plan' } });
+
+    expect(screen.getByTestId('openspec-auto-combo-warning').textContent).toBe('Custom Team combos are not supported for Auto Deliver yet');
+    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    expect(onLaunch).not.toHaveBeenCalled();
+  });
+
+  it('shows local Auto Deliver launch validation when no change is selected', () => {
+    render(
+      <OpenSpecAutoDeliverLauncher
+        open
+        changeName={null}
+        onClose={vi.fn()}
+        onLaunch={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId('openspec-auto-error').textContent).toBe('Select a change first');
+    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('keeps the Auto Deliver launcher open and renders Team-busy launch errors', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    ws.emit({
+      type: 'openspec_auto_deliver.launch_error',
+      error: 'team_lane_busy',
+    });
+    await flushAsync();
+
+    expect(screen.getByTestId('openspec-auto-launcher')).toBeDefined();
+    expect(screen.getByText('Manual Team is busy')).toBeDefined();
+    expect(screen.queryByTestId('openspec-auto-details')).toBeNull();
+  });
+
+  it('keeps the Auto Deliver launcher open and renders unsupported-runtime launch errors', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'my-session',
+          projectDir: '/repo',
+          agentType: 'codex',
+          runtimeType: 'process',
+        })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    ws.emit({
+      type: 'openspec_auto_deliver.launch_error',
+      error: 'transport_runtime_required',
+    });
+    await flushAsync();
+
+    expect(screen.getByTestId('openspec-auto-launcher')).toBeDefined();
+    expect(screen.getByText('Unsupported runtime')).toBeDefined();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.launch',
+      changeName: 'change-a',
+      presetId: 'standard',
+    }));
+  });
+
+  it('opens Auto Deliver details after a matching launch ack projection', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
+    ws.emit({
+      type: 'openspec_auto_deliver.launch_ack',
+      projection: {
+        runId: 'auto-ack',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-a',
+        status: 'spec_audit_repair',
+        stage: 'spec_audit_repair',
+        taskStats: { total: 2, checked: 1, unchecked: 1 },
+      },
+    });
+    await flushAsync();
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('openspec-auto-launcher')).toBeNull();
+      expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
+    });
+  });
+
+  it('renders Auto Deliver projections, ignores stale updates, and locks manual Team/OpenSpec actions', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-1',
+        projectionVersion: 2,
+        visibility: 'full',
+        changeName: 'change-a',
+        launchedFromSessionName: 'my-session',
+        targetImplementationSessionName: 'my-session',
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        selectedTeamComboId: 'audit>review>plan',
+        startedAt: Date.now() - 1000,
+        taskStats: { total: 4, checked: 2, unchecked: 2 },
+        implementationPromptCount: 3,
+        canStop: true,
+        recentFinding: 'fresh finding',
+      },
+    });
+    await flushAsync();
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-1',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'old-change',
+        status: 'spec_audit_repair',
+        stage: 'spec_audit_repair',
+        taskStats: { total: 1, checked: 0, unchecked: 1 },
+        recentFinding: 'stale finding',
+      },
+    });
+    await flushAsync();
+
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
+    expect(screen.queryByText('old-change')).toBeNull();
+
+    const teamButton = screen.getByRole('button', { name: /^team$/i });
+    expect((teamButton as HTMLButtonElement).disabled).toBe(true);
+    expect(teamButton.getAttribute('title')).toBe('Auto Deliver owns Team lane');
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    expect(screen.getByText('Current Auto Deliver')).toBeDefined();
+    const auditButton = screen.getByRole('button', { name: 'audit_action' }) as HTMLButtonElement;
+    const achieveButton = screen.getByRole('button', { name: 'achieve_action' }) as HTMLButtonElement;
+    expect(auditButton.disabled).toBe(true);
+    expect(auditButton.getAttribute('title')).toBe('Auto Deliver owns Team lane');
+    expect((screen.getByRole('button', { name: 'implement_action' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(achieveButton.disabled).toBe(true);
+    expect(achieveButton.getAttribute('title')).toBe('Auto Deliver owns Team lane');
+    expect((screen.getByRole('button', { name: 'propose_action' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(auditButton);
+    fireEvent.click(achieveButton);
+    expect(screen.queryByRole('button', { name: 'audit_implementation_action' })).toBeNull();
+    expect(gatherSendCalls(ws)).toEqual([]);
+    expect(screen.getByRole('textbox').textContent).toBe('');
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'View' })[0]);
+    const details = screen.getByTestId('openspec-auto-details');
+    expect(details).toBeDefined();
+    expect(within(details).getByText('change-a')).toBeDefined();
+    expect(within(details).getByText('mode_audit→mode_review→mode_plan')).toBeDefined();
+    expect(within(details).queryByText('audit>review>plan')).toBeNull();
+    expect(within(details).getByText('fresh finding')).toBeDefined();
+  });
+
+  it('renders redacted Auto Deliver conflict entries without details actions', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'sibling-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-conflict',
+        projectionVersion: 1,
+        visibility: 'conflict',
+        changeName: 'change-a',
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        owningMainSessionName: 'deck_main',
+        conflictReason: 'Owned by another visible session',
+      },
+    });
+    await flushAsync();
+
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+
+    const entry = screen.getByTestId('openspec-auto-conflict-entry');
+    expect(within(entry).getByText('Owned by another visible session')).toBeDefined();
+    expect(within(entry).getByText('Details are visible only in participating sessions.')).toBeDefined();
+    expect(within(entry).queryByRole('button', { name: 'View' })).toBeNull();
+  });
+
+  it('renders Auto Deliver run state in a participating sub-session', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'deck_sub_worker-alpha',
+          projectDir: '/repo',
+          agentType: 'codex',
+        })}
+        subSessions={[
+          { sessionName: 'deck_sub_worker-alpha', type: 'codex', label: 'Worker Alpha', state: 'idle', parentSession: 'deck_main' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-sub',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-sub',
+        status: 'implementation_task_loop',
+        stage: 'implementation_task_loop',
+        owningMainSessionName: 'deck_main',
+        targetImplementationSessionName: 'deck_sub_worker-alpha',
+        taskStats: { total: 3, checked: 2, unchecked: 1 },
+        canStop: true,
+      },
+    });
+    await flushAsync();
+
+    expect(screen.queryByTestId('openspec-auto-runbar')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+
+    const entry = screen.getByTestId('openspec-auto-current-entry');
+    expect(within(entry).getByText('change-sub')).toBeDefined();
+    expect(within(entry).getByText('deck_main → deck_sub_worker-alpha')).toBeDefined();
+  });
+
+  it('translates Auto Deliver terminal reasons and evidence codes in details', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    ws.emit({
+      type: 'openspec_auto_deliver.projection',
+      projection: {
+        runId: 'auto-i18n',
+        projectionVersion: 1,
+        visibility: 'full',
+        changeName: 'change-i18n',
+        launchedFromSessionName: 'my-session',
+        targetImplementationSessionName: 'my-session',
+        status: 'needs_human',
+        stage: 'needs_human',
+        terminalReason: 'missing_authoritative_json',
+        recentFinding: 'missing_authoritative_json',
+        evidence: [{ label: 'strict result', summary: 'missing_authoritative_json' }],
+        taskStats: { total: 84, checked: 84, unchecked: 0 },
+      },
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    await flushAsync();
+    fireEvent.click(within(screen.getByTestId('openspec-auto-current-entry')).getByRole('button', { name: 'View' }));
+    expect(screen.getByTestId('openspec-auto-details')).toBeDefined();
+    const translated = screen.getAllByText('The audit did not produce a final authoritative JSON result.');
+    expect(translated.length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText('missing_authoritative_json')).toBeNull();
   });
 
   it('opens an openspec change folder in the file browser and can insert files from it', async () => {
@@ -1476,6 +2156,148 @@ afterEach(() => {
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
+  it('OpenSpec Execute dropdown pins the saved template, lists eligible sessions, sets/clears the preference, and dispatches the OpenSpec prompt to the chosen session', async () => {
+    const ws = makeWs();
+    // Saved per-project execution template for serverId "srv-exec" → the worker
+    // sub-session "deck_sub_pinned". The dropdown must PIN it first.
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (key === 'exec_routing.template:srv-exec') return 'deck_sub_pinned';
+      return null;
+    });
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        serverId="srv-exec"
+        sessions={[
+          makeSession({ name: 'my-session', role: 'w1', agentType: 'codex' }),
+          // Main/brain session is excluded from the Execute selector.
+          mainSession,
+        ]}
+        subSessions={[
+          { sessionName: 'deck_sub_pinned', type: 'codex', label: 'pinned', state: 'idle', parentSession: 'my-session', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_other', type: 'codex', label: 'other', state: 'idle', parentSession: 'my-session', executionTemplateEligible: true },
+          // Ineligible sub-session — must NOT appear.
+          { sessionName: 'deck_sub_blocked', type: 'codex', label: 'blocked', state: 'idle', parentSession: 'my-session', executionTemplateEligible: false },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+
+    // Open the OpenSpec panel with a single change. Execute is now a per-change
+    // row action, so the trigger lives inside that change's row.
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    // Open the change row's Execute dropdown (per-change trigger + menu).
+    const row = screen.getByTestId('openspec-change-row-change-a');
+    fireEvent.click(within(row).getByTestId('openspec-execute-trigger-change-a'));
+    const menu = screen.getByTestId('openspec-execute-menu-change-a');
+
+    // Pinned saved template appears FIRST as a dispatch item.
+    const pinned = within(menu).getByTestId('openspec-execute-pinned');
+    expect(pinned).toBeDefined();
+    const dispatchButtons = menu.querySelectorAll('[data-testid^="openspec-execute-session-"], [data-testid="openspec-execute-pinned"]');
+    expect(dispatchButtons[0]).toBe(pinned);
+
+    // Eligible non-current/non-main sessions are listed; the pinned one is not
+    // duplicated below, and the ineligible/main sessions are excluded.
+    expect(within(menu).getByTestId('openspec-execute-session-deck_sub_other')).toBeDefined();
+    expect(within(menu).queryByTestId('openspec-execute-session-deck_sub_pinned')).toBeNull();
+    expect(within(menu).queryByTestId('openspec-execute-session-deck_sub_blocked')).toBeNull();
+    expect(within(menu).queryByTestId('openspec-execute-session-deck_my-project_brain')).toBeNull();
+
+    // Choosing the pinned session dispatches THIS change's OpenSpec implement
+    // prompt to it (and closes the panel). Cross-session routing must NOT inject
+    // into the composer.
+    fireEvent.click(pinned);
+    expect(ws.sendSessionMessage).toHaveBeenCalledWith(
+      'deck_sub_pinned',
+      'implement @openspec/changes/change-a, keep openspec artifacts aligned while coding',
+    );
+    expect(screen.getByRole('textbox').textContent).toBe('');
+
+    // Re-open the OpenSpec panel, then the row's Execute submenu, and set a
+    // DIFFERENT session as the shared default → persists the SAME per-project
+    // execution-template preference (no OpenSpec-only key).
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+    fireEvent.click(within(screen.getByTestId('openspec-change-row-change-a')).getByTestId('openspec-execute-trigger-change-a'));
+    fireEvent.click(screen.getByTestId('openspec-execute-set-deck_sub_other'));
+    await flushAsync();
+    expect(saveUserPrefMock).toHaveBeenCalledWith('exec_routing.template:srv-exec', 'deck_sub_other');
+
+    // Re-open the Execute submenu and CLEAR the default (allowed HERE, unlike
+    // the generic dropdown) → writes the empty sentinel to the SAME key.
+    fireEvent.click(within(screen.getByTestId('openspec-change-row-change-a')).getByTestId('openspec-execute-trigger-change-a'));
+    fireEvent.click(screen.getByTestId('openspec-execute-clear'));
+    await flushAsync();
+    expect(saveUserPrefMock).toHaveBeenCalledWith('exec_routing.template:srv-exec', '');
+  });
+
+  it('OpenSpec Execute dropdown dispatches to a non-default eligible session for the current change', async () => {
+    const ws = makeWs();
+    getUserPrefMock.mockResolvedValue(null); // no saved default
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        serverId="srv-exec"
+        sessions={[makeSession({ name: 'my-session', role: 'w1', agentType: 'codex' })]}
+        subSessions={[
+          { sessionName: 'deck_sub_worker', type: 'codex', label: 'worker', state: 'idle', parentSession: 'my-session', executionTemplateEligible: true },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-z', path: '/repo/openspec/changes/change-z', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    const row = screen.getByTestId('openspec-change-row-change-z');
+    fireEvent.click(within(row).getByTestId('openspec-execute-trigger-change-z'));
+    const menu = screen.getByTestId('openspec-execute-menu-change-z');
+    // No saved default → no pinned item.
+    expect(within(menu).queryByTestId('openspec-execute-pinned')).toBeNull();
+
+    fireEvent.click(within(menu).getByTestId('openspec-execute-session-deck_sub_worker'));
+    expect(ws.sendSessionMessage).toHaveBeenCalledWith(
+      'deck_sub_worker',
+      'implement @openspec/changes/change-z, keep openspec artifacts aligned while coding',
+    );
+  });
+
   it('shows openspec propose even when there are no existing changes', async () => {
     const ws = makeWs();
     render(
@@ -1644,6 +2466,50 @@ afterEach(() => {
 
       expect(screen.getByRole('button', { name: 'implement_action' })).toBeDefined();
       expect(screen.getByRole('button', { name: 'collapse change-a' })).toBeDefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+    }
+  });
+
+  it('keeps the OpenSpec Auto Deliver launcher outside the mobile change-list scroller', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+          { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
+          { name: 'change-c', path: '/repo/openspec/changes/change-c', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      fireEvent.click(screen.getByRole('button', { name: 'expand change-a' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+
+      const launcher = screen.getByTestId('openspec-auto-launcher');
+      const mobileSheet = document.querySelector('.menu-dropdown-openspec-inline') as HTMLElement;
+      const scrollArea = document.querySelector('.openspec-dropdown-scroll') as HTMLElement;
+      expect(launcher).toBeDefined();
+      expect(mobileSheet).toBeTruthy();
+      expect(scrollArea).toBeTruthy();
+      expect(scrollArea.contains(launcher)).toBe(false);
+      expect(launcher.parentElement).toBe(mobileSheet);
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
     }
@@ -1958,7 +2824,64 @@ afterEach(() => {
     expect(screen.getByText('queued second')).toBeDefined();
   });
 
-  it('renders all queued transport messages when pending entries are partial', () => {
+  it('does not resurrect stale pendingMessages when a versioned empty entries snapshot is present', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          runtimeType: 'transport',
+          transportPendingMessages: ['stale queued'],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 12,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+    expect(screen.queryByText('stale queued')).toBeNull();
+  });
+
+  it('clears a legacy queued card by unique text when the delivered timeline message has the real id', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['legacy stale send'],
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('legacy stale send')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:real-command-id',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: { text: 'legacy stale send', commandId: 'real-command-id' },
+        },
+      });
+    });
+
+    expect(screen.queryByText('legacy stale send')).toBeNull();
+  });
+
+  it('treats partial queued transport entries as authoritative', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -1977,7 +2900,94 @@ afterEach(() => {
     );
 
     expect(screen.getByText('queued first')).toBeDefined();
-    expect(screen.getByText('queued second')).toBeDefined();
+    expect(screen.queryByText('queued second')).toBeNull();
+  });
+
+  it('renders shared actor labels on queued transport messages', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['shared queued'],
+          transportPendingMessageEntries: [
+            {
+              clientMessageId: 'msg-shared',
+              text: 'shared queued',
+              sharedActor: {
+                actorUserId: 'user-shared',
+                actorDisplayName: 'Ada Shared',
+                effectiveActorRole: 'participant',
+                origin: 'shared-tab',
+                actionId: 'action-shared',
+                primaryShareId: 'share-1',
+                authorizedAt: 1,
+                snapshot: {
+                  target: { kind: 'main', serverId: 'srv-1', sessionName: 'qwen-session' },
+                  effectiveRole: 'participant',
+                  historyCutoffAt: 1,
+                  authorizedAt: 1,
+                  primaryShareId: 'share-1',
+                  coveringShareIds: ['share-1'],
+                  expiresAt: null,
+                  nextCoverageRecheckAt: null,
+                },
+              },
+            },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('shared queued')).toBeDefined();
+    expect(screen.getByText('Ada Shared · Participant')).toBeDefined();
+  });
+
+  it('renders server-member actor labels on queued transport messages', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['member queued'],
+          transportPendingMessageEntries: [
+            {
+              clientMessageId: 'msg-member',
+              text: 'member queued',
+              sharedActor: {
+                actorUserId: 'user-member',
+                actorDisplayName: 'Mira Member',
+                effectiveActorRole: 'server-member',
+                origin: 'server-member',
+                actionId: 'action-member',
+                primaryShareId: null,
+                authorizedAt: 1,
+                snapshot: {
+                  target: { kind: 'main', serverId: 'srv-1', sessionName: 'qwen-session' },
+                  effectiveRole: 'participant',
+                  historyCutoffAt: 0,
+                  authorizedAt: 1,
+                  primaryShareId: null,
+                  coveringShareIds: [],
+                  nextCoverageRecheckAt: null,
+                },
+              },
+            },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('member queued')).toBeDefined();
+    expect(screen.getByText('Mira Member · Server member')).toBeDefined();
   });
 
   it('does not offer edit or delete actions for legacy queued fallback entries', () => {
@@ -2141,6 +3151,36 @@ afterEach(() => {
     });
     expect(onSend).not.toHaveBeenCalled();
     expect(screen.getByText('queue from thinking')).toBeDefined();
+  });
+
+  it('uses active timeline turn as a busy signal for transport sends after assistant text starts', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'idle',
+        })}
+        activeTransportTurn={true}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queue after assistant text';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expectSendPayload(ws, {
+      sessionName: 'qwen-session',
+      text: 'queue after assistant text',
+    });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.getByText('queue after assistant text')).toBeDefined();
   });
 
   it('surfaces a normal send as locally failed when the socket write throws', () => {
@@ -2392,6 +3432,89 @@ afterEach(() => {
     });
 
     expect(screen.queryByText('queued then drained')).toBeNull();
+  });
+
+  it('drops an incoming queued entry once its message reaches the timeline even if the snapshot still lists it', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          // Daemon snapshot still lists the message as pending — the stale
+          // snapshot the resend / auto-deliver "queued" emit leaves until idle.
+          transportPendingMessages: ['stuck message'],
+          transportPendingMessageEntries: [{ clientMessageId: 'stuck-1', text: 'stuck message' }],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('stuck message')).toBeDefined();
+
+    // The message reaches the timeline → delivered, no longer queued.
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'um-stuck-1',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: { text: 'stuck message', commandId: 'stuck-1' },
+        },
+      });
+    });
+
+    // The daemon pending snapshot (prop) STILL lists it, but the timeline is
+    // authoritative — the zombie queued entry is gone.
+    expect(screen.queryByText('stuck message')).toBeNull();
+  });
+
+  it('clears a local queued entry when reconnect snapshot advances to an empty queue', () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 0,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'sent while browser was offline';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('sent while browser was offline')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 2,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByText('sent while browser was offline')).toBeNull();
   });
 
   it('clears an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
@@ -2793,7 +3916,7 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
-  it('pressing Escape in a running transport input sends direct cancel', () => {
+  it('pressing Escape in a focused running transport input sends direct cancel', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2809,6 +3932,7 @@ afterEach(() => {
     );
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
     fireEvent.keyDown(input, { key: 'Escape' });
 
     // Transport sessions cancel the SDK turn directly instead of sending
@@ -2822,7 +3946,173 @@ afterEach(() => {
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
-  it('pressing Escape in a running transport sub-session uses the same Stop feedback', () => {
+  it('pressing Escape with window focus sends direct cancel for the active transport surface', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expectUrgentCancelPayload(ws, { sessionName: 'qwen-session' });
+    expect(screen.getByRole('button', { name: /^stop$/i }).classList.contains('shortcut-btn-stop-pending')).toBe(true);
+    expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('does not send window-level Escape cancel when the surface is not keyboard-active', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_inactive',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        subSessionId="inactive"
+        keyboardActive={false}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('does not send direct cancel on Escape while the @ picker is open', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    try {
+      input.textContent = '@';
+      fireEvent.input(input);
+      expect(screen.getByText('files')).toBeDefined();
+
+      input.focus();
+      fireEvent.keyDown(input, { key: 'Escape' });
+
+      expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(ws.sendInput).not.toHaveBeenCalled();
+    } finally {
+      getSelectionSpy.mockRestore();
+    }
+  });
+
+  it('does not send direct cancel on Escape while a modal preview owns the keyboard', () => {
+    const ws = makeWs();
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    document.body.appendChild(dialog);
+    try {
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({
+            name: 'qwen-session',
+            agentType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.focus();
+      fireEvent.keyDown(input, { key: 'Escape' });
+
+      expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(ws.sendInput).not.toHaveBeenCalled();
+    } finally {
+      dialog.remove();
+    }
+  });
+
+  it('does not send direct cancel on Escape while an image lightbox owns the keyboard', () => {
+    const ws = makeWs();
+    const lightbox = document.createElement('div');
+    lightbox.className = 'fb-lightbox';
+    document.body.appendChild(lightbox);
+    try {
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({
+            name: 'qwen-session',
+            agentType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.focus();
+      fireEvent.keyDown(input, { key: 'Escape' });
+
+      expect(gatherCancelCalls(ws)).toEqual([]);
+      expect(ws.sendInput).not.toHaveBeenCalled();
+    } finally {
+      lightbox.remove();
+    }
+  });
+
+  it('does not send direct cancel on Escape during IME composition', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: 'Escape', isComposing: true });
+
+    expect(gatherCancelCalls(ws)).toEqual([]);
+    expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('pressing Escape in a focused running transport sub-session uses the same Stop feedback', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2839,6 +4129,7 @@ afterEach(() => {
     );
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
     fireEvent.keyDown(input, { key: 'Escape' });
 
     expectUrgentCancelPayload(ws, { sessionName: 'deck_sub_worker' });
@@ -3777,6 +5068,121 @@ afterEach(() => {
     });
   });
 
+  it('renders independent progress rows for a concurrent multi-file upload batch', async () => {
+    type UploadResolver = (value: { attachment: { daemonPath: string } }) => void;
+    const pendingUploads: Array<{
+      file: File;
+      onProgress?: (pct: number) => void;
+      resolve: UploadResolver;
+    }> = [];
+    uploadFileMock.mockImplementation((_serverId: string, file: File, onProgress?: (pct: number) => void) => (
+      new Promise<{ attachment: { daemonPath: string } }>((resolve) => {
+        pendingUploads.push({ file, onProgress, resolve });
+      })
+    ));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const alpha = new File(['aaa'], 'alpha.txt', { type: 'text/plain' });
+    const beta = new File(['bbb'], 'beta.txt', { type: 'text/plain' });
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [alpha, beta],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
+    expect(pendingUploads.map((entry) => entry.file.name)).toEqual(['alpha.txt', 'beta.txt']);
+
+    await act(async () => {
+      pendingUploads[0].onProgress?.(24);
+      pendingUploads[1].onProgress?.(68);
+    });
+
+    const rows = screen.getAllByTestId('composer-upload-row');
+    expect(rows).toHaveLength(2);
+    expect(within(rows[0]).getByText('alpha.txt')).toBeDefined();
+    expect(within(rows[1]).getByText('beta.txt')).toBeDefined();
+    const progressBars = screen.getAllByRole('progressbar');
+    expect(progressBars.map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
+    expect(progressBars.every((bar) => (bar as HTMLElement).style.gridColumn === '1 / -1')).toBe(true);
+
+    await act(async () => {
+      pendingUploads[1].resolve({ attachment: { daemonPath: '/tmp/beta.txt' } });
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '100']);
+    });
+
+    await act(async () => {
+      pendingUploads[0].resolve({ attachment: { daemonPath: '/tmp/alpha.txt' } });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(screen.queryAllByTestId('composer-upload-row')).toHaveLength(0);
+      expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1');
+      expect(screen.getByTestId('attachment-tag-2').textContent).toBe('#2');
+    });
+    const badges = document.querySelectorAll('.attachment-badge');
+    expect(badges[0].querySelector('.attachment-badge-name')?.textContent).toBe('alpha.txt');
+    expect(badges[1].querySelector('.attachment-badge-name')?.textContent).toBe('beta.txt');
+  });
+
+  it('disables sending while an attachment upload is still in flight', async () => {
+    let resolveUpload: ((value: { attachment: { daemonPath: string } }) => void) | null = null;
+    uploadFileMock.mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'send after upload';
+    fireEvent.input(input);
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['aaa'], 'pending.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+    const sendBtn = screen.getByRole('button', { name: /send/i }) as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(true);
+    fireEvent.click(sendBtn);
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveUpload?.({ attachment: { daemonPath: '/tmp/pending.txt' } });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(sendBtn.disabled).toBe(false));
+    fireEvent.click(sendBtn);
+    expectSendPayload(ws, {
+      sessionName: 'my-session',
+      text: '#1:(/tmp/pending.txt) send after upload',
+    });
+  });
+
   it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {
     let nextDaemonPath = '/tmp/x1.png';
     uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
@@ -4637,6 +6043,26 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'kimi-sdk-session',
       text: '/model moonshot-v1-auto,thinking',
+    });
+  });
+
+  // ── dedicated-execution-clone-sessions: generic launcher moved to footer ─────
+  describe('generic execution-clone launcher placement', () => {
+    it('does not render the old input-side 🤖 execution dropdown', async () => {
+      getUserPrefMock.mockResolvedValue(null);
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession({ name: 'deck_proj_brain', role: 'brain' })}
+          quickData={makeQuickData() as any}
+          serverId="srv-exec"
+          subSessions={[] as any}
+        />,
+      );
+      await flushAsync();
+      expect(screen.queryByLabelText('execution_session')).toBeNull();
+      expect(screen.queryByTestId('exec-menu-use-configured')).toBeNull();
+      expect(screen.queryByTestId('exec-menu-set-session')).toBeNull();
     });
   });
 });

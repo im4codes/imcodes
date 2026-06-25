@@ -1,9 +1,10 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
-import { requireAuth, resolveAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveAuth } from '../security/authorization.js';
 import { LocalWebPreviewRegistry, normalizeLocalPreviewPath } from '../preview/registry.js';
 import { commitAuthorizedAccess, resolveLocalPreviewAccess } from '../preview/access.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { rewritePreviewHtmlDocument, shouldRewritePreviewHtml } from '../preview/policy.js';
 import {
   appendPreviewAccessTokenIfMissing,
@@ -85,8 +86,8 @@ function setPreviewAccessCookie(c: Parameters<typeof setCookie>[0], serverId: st
 localWebPreviewRoutes.post('/:id/local-web-preview', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: PREVIEW_ERROR.FORBIDDEN, reason: access.reason }, 403);
 
   const body = await c.req.json().catch(() => null);
   const parsed = createSchema.safeParse(body satisfies CreatePreviewRequest | null);
@@ -118,8 +119,8 @@ localWebPreviewRoutes.post('/:id/local-web-preview', requireAuth(), async (c) =>
 localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: PREVIEW_ERROR.FORBIDDEN, reason: access.reason }, 403);
 
   const previewIdParam = c.req.param('previewId')!;
   const ok = LocalWebPreviewRegistry.get(serverId).close(previewIdParam, userId);
@@ -153,21 +154,33 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
   }
   const { preview } = access;
 
-  // Authorization passed (owner + current role + token/session) → commit the
-  // side effects: slide the TTL (commit, NOT peek) and — HTTP only — re-set the
+  // Authorization passed (owner + current role + token/session) → re-set the
   // preview scoped cookie so post-initial-load same-origin requests carry it
-  // (SameSite=Strict default defense). Committed here, BEFORE the daemon /
-  // in-flight gates, so a transient daemon outage doesn't strip a legitimately
-  // authorized session's credential.
-  commitAuthorizedAccess(serverId, previewId);
+  // (SameSite=Strict default defense). The cookie is (re)set HERE, BEFORE the
+  // daemon / in-flight gates, so a transient daemon outage doesn't strip a
+  // legitimately authorized session's credential (it stays cached for retry).
+  // The TTL slide (`commitAuthorizedAccess`) is deliberately NOT done here — it
+  // is deferred past the daemon-online gate below so a long-offline daemon can
+  // no longer keep a preview alive (occupying a per-user slot) just because the
+  // owner keeps polling/refreshing it (S1/N3, audit run 394c114e-11f).
   if (previewAccessToken) {
     setPreviewAccessCookie(c, serverId, previewId, previewAccessToken);
   }
 
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {
+    // Daemon offline → 503, with NO TTL touch (commit not yet called). This is
+    // an availability outcome, not an authorization failure; the cached cookie
+    // above keeps the credential warm for when the daemon returns.
     return c.json({ error: PREVIEW_ERROR.DAEMON_OFFLINE }, 503);
   }
+
+  // Daemon is online → commit the authorization side effect: slide the TTL
+  // (commit, NOT peek). Mirrors the WS upgrade in index.ts, which likewise
+  // commits only AFTER its daemon-online gate. The in-flight floor below is
+  // transient load shedding, so a legitimately-forwarded request still slides
+  // the TTL even when it is subsequently rejected for in-flight pressure.
+  commitAuthorizedAccess(serverId, previewId);
 
   // In-flight HTTP concurrency floor (run 8a975732-23a P0.4) — replaces the
   // removed per-request count rate limiter (which misfired on a real SPA first

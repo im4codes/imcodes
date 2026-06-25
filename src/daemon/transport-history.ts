@@ -41,7 +41,7 @@ const MAX_TAIL_BYTES = 16 * 1024 * 1024; // 16 MiB cap
 const NEWLINE_BYTE = 0x0a;
 export const TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES = 1024;
 const TRANSPORT_HISTORY_TRUNCATED_MARKER = '\n[transport result truncated]';
-const RENDERABLE_TRANSPORT_HISTORY_TYPES = new Set(['user.message', 'assistant.text', 'tool.result']);
+const RENDERABLE_TRANSPORT_HISTORY_TYPES = new Set(['user.message', 'assistant.text', 'tool.call', 'tool.result']);
 
 let dirEnsured = false;
 
@@ -60,7 +60,16 @@ function sessionFile(sessionId: string): string {
 function shouldKeepTransportHistoryEvent(event: Record<string, unknown>): boolean {
   if (event.hidden === true) return false;
   const type = typeof event.type === 'string' ? event.type : '';
+  if (type === 'tool.call') return readToolCallId(event) !== null;
   return RENDERABLE_TRANSPORT_HISTORY_TYPES.has(type);
+}
+
+function readToolCallId(event: Record<string, unknown>): string | null {
+  for (const key of ['toolCallId', 'toolUseId', 'callId', 'id']) {
+    const value = event[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
 }
 
 function truncateStringByUtf8Bytes(value: string, maxBytes: number): { value: string; truncated: boolean } {
@@ -131,12 +140,21 @@ function preserveTruncationMetadata(source: Record<string, unknown>, out: Record
 }
 
 export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): Record<string, unknown> {
+  if (event.type === 'tool.call') {
+    const out: Record<string, unknown> = { type: 'tool.call' };
+    for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', '_ts']) {
+      if (event[key] !== undefined) out[key] = event[key];
+    }
+    if (event.activityGeneration !== undefined) out.activityGeneration = event.activityGeneration;
+    return out;
+  }
+
   if (event.type !== 'tool.result') return event;
 
   const truncatedFields: string[] = [];
   const out: Record<string, unknown> = { type: 'tool.result' };
 
-  for (const key of ['sessionId', '_ts']) {
+  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', '_ts']) {
     if (event[key] !== undefined) out[key] = event[key];
   }
   previewField(out, 'output', pickToolResultOutput(event), truncatedFields);

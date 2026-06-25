@@ -5,6 +5,7 @@ import type { Env } from '../src/env.js';
 const mockGetServersByUserId = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockRequestDaemonUpgrade = vi.fn();
+const mockDeleteServer = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -18,7 +19,7 @@ vi.mock('../src/db/queries.js', () => ({
   getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
   updateServerHeartbeat: vi.fn(),
   updateServerName: vi.fn(),
-  deleteServer: vi.fn(),
+  deleteServer: (...args: unknown[]) => mockDeleteServer(...args),
   upsertChannelBinding: vi.fn(),
 }));
 
@@ -70,6 +71,7 @@ describe('server routes', () => {
       targetVersion: 'latest',
       deliveryStatus: 'sent',
     });
+    mockDeleteServer.mockResolvedValue(true);
     delete process.env.APP_VERSION;
   });
 
@@ -178,5 +180,29 @@ describe('server routes', () => {
       nextAttemptAt: '2026-05-06T12:00:15.000Z',
       reason: 'target_version_not_published',
     });
+  });
+
+  it('does not notify daemon when server delete authorization fails', async () => {
+    mockDeleteServer.mockResolvedValueOnce(false);
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1', { method: 'DELETE' });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('notifies daemon only after an authorized server delete succeeds', async () => {
+    mockDeleteServer.mockResolvedValueOnce(true);
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1', { method: 'DELETE' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
+    expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({ type: 'server.delete' }));
   });
 });

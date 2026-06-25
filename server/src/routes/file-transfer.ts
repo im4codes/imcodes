@@ -1,15 +1,22 @@
 /**
  * File transfer routes: upload and download via HTTP, relayed to daemon over WS.
  */
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth } from '../security/authorization.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
-import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../../shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
+} from '../../../shared/transport/file-transfer.js';
 import type {
   AttachmentRef,
   FileDownloadRequest,
+  FileDownloadStreamRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
 } from '../../../shared/transport/file-transfer.js';
@@ -18,7 +25,7 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -33,6 +40,7 @@ const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
 const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
 const UPLOAD_PROGRESS_STREAM_MIME = 'application/x-ndjson';
+const STAGED_DOWNLOAD_TTL_MS = FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS;
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
@@ -51,6 +59,66 @@ const stagedUploads = new Map<string, {
   timer: ReturnType<typeof setTimeout>;
   deleteAfterFetchTimer?: ReturnType<typeof setTimeout>;
 }>();
+const stagedDownloads = new Map<string, {
+  serverId: string;
+  token: string;
+  stream: PassThrough;
+  ready: Promise<Record<string, unknown>>;
+  resolveReady: (msg: Record<string, unknown>) => void;
+  rejectReady: (err: Error) => void;
+  readySettled: boolean;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+  started: boolean;
+}>();
+
+function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry || entry.readySettled) return;
+  entry.readySettled = true;
+  settle(entry);
+}
+
+function resolveStagedDownloadReady(downloadId: string, msg: Record<string, unknown>): void {
+  settleStagedDownloadReady(downloadId, (entry) => entry.resolveReady(msg));
+}
+
+function rejectStagedDownloadReady(downloadId: string, err: Error): void {
+  settleStagedDownloadReady(downloadId, (entry) => entry.rejectReady(err));
+}
+
+function waitForStagedDownloadReady(entry: { ready: Promise<Record<string, unknown>> }): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('download_stream_not_ready')), FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_READY_TIMEOUT_MS);
+    timer.unref?.();
+    entry.ready.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
+function decodeRelayFilename(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function deleteStagedDownload(downloadId: string, err?: Error): void {
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry) return;
+  stagedDownloads.delete(downloadId);
+  clearTimeout(entry.timer);
+  if (!entry.readySettled) {
+    entry.readySettled = true;
+    entry.rejectReady(err ?? new Error('download_stream_closed'));
+  }
+  if (err) {
+    entry.stream.destroy(err);
+  } else if (!entry.stream.destroyed) {
+    entry.stream.end();
+  }
+}
 
 function deleteStagedUpload(uploadId: string): void {
   const entry = stagedUploads.get(uploadId);
@@ -87,6 +155,144 @@ function buildStagedUploadUrl(requestUrl: string, serverId: string, uploadId: st
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/upload-staged/${encodeURIComponent(uploadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
+}
+
+function buildStagedDownloadUrl(requestUrl: string, serverId: string, downloadId: string, token: string): string {
+  const url = new URL(requestUrl);
+  url.pathname = `/api/server/${encodeURIComponent(serverId)}/download-staged/${encodeURIComponent(downloadId)}`;
+  url.search = `token=${encodeURIComponent(token)}`;
+  return url.toString();
+}
+
+/**
+ * Send a `file.download_done` (base64 inline) daemon result to the browser as a
+ * binary attachment response. Shared by the inline small-file fast path, the
+ * legacy (no-stream-capability) path, and the relay-failure fallback — repo
+ * rule: never copy code.
+ */
+function respondBase64Download(c: Context, result: Record<string, unknown>, attachmentId: string): Response {
+  const content = Buffer.from(result.content as string, 'base64');
+  const mime = (result.mime as string) || 'application/octet-stream';
+  const filename = (result.filename as string) || attachmentId;
+  c.header('Content-Type', mime);
+  c.header('Content-Length', String(content.length));
+  // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding. Include
+  // both for maximum client compatibility.
+  const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+  const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+  c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+  return c.body(content);
+}
+
+/**
+ * One streaming-relay download attempt. Stages a sink, asks the daemon to stream
+ * to it, and waits up to DOWNLOAD_STREAM_READY_TIMEOUT_MS for bytes to START
+ * flowing. Returns a terminal `{ kind: 'done', response }` for a delivered
+ * stream, an inline small-file reply, or a genuine missing/expired handle
+ * (404/410). Returns `{ kind: 'retry' }` when the relay errored or did not begin
+ * delivering in time — the caller retries (a fresh attempt can recover a wedged
+ * PUT) and ultimately falls back to base64. A ready relay still returns as soon
+ * as the first byte lands, so this never waits longer than necessary.
+ */
+async function attemptStreamedDownload(
+  c: Context,
+  bridge: ReturnType<typeof WsBridge.get>,
+  serverId: string,
+  attachmentId: string,
+): Promise<{ kind: 'done'; response: Response } | { kind: 'retry' }> {
+  const downloadId = randomHex(16);
+  const token = randomHex(32);
+  const stream = new PassThrough();
+  // Guard against an uncaught 'error' if the sink is destroyed while still
+  // unconsumed (relay failure / timeout before we hand it to the Response).
+  stream.on('error', () => {});
+  const timer = setTimeout(() => {
+    deleteStagedDownload(downloadId, new Error('download_timeout'));
+  }, STAGED_DOWNLOAD_TTL_MS);
+  timer.unref?.();
+  let resolveReady!: (msg: Record<string, unknown>) => void;
+  let rejectReady!: (err: Error) => void;
+  const ready = new Promise<Record<string, unknown>>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  stagedDownloads.set(downloadId, {
+    serverId,
+    token,
+    stream,
+    ready,
+    resolveReady,
+    rejectReady,
+    readySettled: false,
+    expiresAt: Date.now() + STAGED_DOWNLOAD_TTL_MS,
+    timer,
+    started: false,
+  });
+
+  const streamMsg: FileDownloadStreamRequest = {
+    type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+    downloadId,
+    attachmentId,
+    uploadUrl: buildStagedDownloadUrl(c.req.url, serverId, downloadId, token),
+  };
+  void bridge.sendFileTransferRequest(
+    downloadId,
+    streamMsg as unknown as Record<string, unknown>,
+    FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+  ).then((result) => {
+    // Settle readiness from the WS ack only for an explicit error or an inline
+    // reply. A success/READY ack is premature (bytes aren't flowing yet) — the
+    // download-staged PUT handler settles the streaming success case.
+    const resultType = result && (result as { type?: string }).type;
+    if (resultType === 'file.download_error' || resultType === 'file.download_done') {
+      resolveStagedDownloadReady(downloadId, result as Record<string, unknown>);
+    }
+  }).catch((err) => {
+    const error = err instanceof Error ? err : new Error(String(err));
+    rejectStagedDownloadReady(downloadId, error);
+    deleteStagedDownload(downloadId, error);
+  });
+
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry) return { kind: 'retry' };
+  try {
+    const result = await waitForStagedDownloadReady(entry);
+
+    if (result.type === 'file.download_error') {
+      const errMsg = result.message as string;
+      deleteStagedDownload(downloadId, new Error(String(errMsg ?? 'download_failed')));
+      // Genuine missing/expired handle is terminal (base64 would fail too).
+      if (errMsg === 'not_found') return { kind: 'done', response: c.json({ error: 'not_found' }, 404) };
+      if (errMsg === 'expired') return { kind: 'done', response: c.json({ error: 'handle_expired' }, 410) };
+      return { kind: 'retry' }; // relay/transport error → retry, then base64
+    }
+
+    if (result.type === 'file.download_done') {
+      // Small file returned inline — no relay/PassThrough involved.
+      deleteStagedDownload(downloadId);
+      return { kind: 'done', response: respondBase64Download(c, result, attachmentId) };
+    }
+
+    const mime = (result.mime as string) || 'application/octet-stream';
+    const filename = (result.filename as string) || attachmentId;
+    const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
+      ? Math.trunc(result.size)
+      : undefined;
+    c.header('Content-Type', mime);
+    if (size !== undefined) c.header('Content-Length', String(size));
+    const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+    const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+    c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+    c.header('Cache-Control', 'no-store');
+    return {
+      kind: 'done',
+      response: new Response(Readable.toWeb(stream) as ReadableStream, { status: 200, headers: c.res.headers }),
+    };
+  } catch {
+    // Did not start delivering in time — retry / fall back.
+    deleteStagedDownload(downloadId, new Error('download_stream_not_ready'));
+    return { kind: 'retry' };
+  }
 }
 
 function wantsUploadProgressStream(accept: string | undefined): boolean {
@@ -161,6 +367,57 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
   });
 });
 
+// ── PUT /api/server/:id/download-staged/:downloadId ─────────────────────────
+// Token-authenticated, relay-local sink for daemon → browser streaming
+// downloads. The daemon uploads raw bytes here; the browser GET response reads
+// the paired PassThrough, so large files never cross the daemon WS as base64.
+
+fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
+  const serverId = c.req.param('id')!;
+  const downloadId = c.req.param('downloadId')!;
+  const token = c.req.query('token') ?? '';
+  const entry = stagedDownloads.get(downloadId);
+  if (!entry || entry.serverId !== serverId) return c.json({ error: 'not_found' }, 404);
+  if (Date.now() > entry.expiresAt) {
+    deleteStagedDownload(downloadId, new Error('expired'));
+    return c.json({ error: 'expired' }, 410);
+  }
+  if (!token || token !== entry.token) return c.json({ error: 'forbidden' }, 403);
+  if (entry.started) return c.json({ error: 'already_started' }, 409);
+
+  const contentLengthHeader = c.req.header('content-length');
+  const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
+  if (Number.isFinite(contentLength) && contentLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+    deleteStagedDownload(downloadId, new Error('file_too_large'));
+    return c.json({ error: 'file_too_large', maxBytes: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }, 413);
+  }
+  if (!c.req.raw.body) {
+    deleteStagedDownload(downloadId, new Error('empty_body'));
+    return c.json({ error: 'empty_body' }, 400);
+  }
+
+  entry.started = true;
+  resolveStagedDownloadReady(downloadId, {
+    type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
+    downloadId,
+    mime: c.req.header('content-type') || 'application/octet-stream',
+    filename: decodeRelayFilename(c.req.header('x-imcodes-filename')),
+    size: Number.isFinite(contentLength) && contentLength >= 0 ? Math.trunc(contentLength) : undefined,
+  });
+  try {
+    await pipeline(
+      Readable.fromWeb(c.req.raw.body as never),
+      entry.stream,
+    );
+    deleteStagedDownload(downloadId);
+    return c.json({ ok: true });
+  } catch (err) {
+    deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
+    logger.warn({ serverId, downloadId, err }, 'Staged download stream failed');
+    return c.json({ error: 'download_stream_failed' }, 500);
+  }
+});
+
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
 
 fileTransferRoutes.post('/:id/upload', async (c) => {
@@ -168,8 +425,8 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const serverId = c.req.param('id')!;
 
   // Permission check
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const contentLengthHeader = c.req.header('content-length');
   const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
@@ -380,8 +637,8 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
 
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
@@ -423,8 +680,8 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   // Permission check
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   // Validate attachment ID format (hex + optional extension)
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
@@ -438,15 +695,40 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   const downloadId = randomHex(16);
-  const downloadMsg: FileDownloadRequest = {
-    type: 'file.download',
-    downloadId,
-    attachmentId,
-  };
+  const supportsStreamDownload = bridge.hasDaemonCapability?.(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY) === true;
 
   try {
+    if (supportsStreamDownload) {
+      // Give the streaming relay several chances to START delivering before
+      // falling back to base64. Each attempt waits DOWNLOAD_STREAM_READY_TIMEOUT_MS
+      // (long enough to catch a relay that's ready a few seconds in), and a fresh
+      // attempt can recover a wedged PUT — while a ready relay returns as soon as
+      // the first byte lands. Only a delivered stream / inline reply / genuine
+      // missing-or-expired handle is terminal; everything else retries, then
+      // falls through to base64.
+      for (let attempt = 0; attempt < FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS; attempt++) {
+        const outcome = await attemptStreamedDownload(c, bridge, serverId, attachmentId);
+        if (outcome.kind === 'done') return outcome.response;
+      }
+      logger.warn(
+        { serverId, attachmentId, attempts: FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS },
+        'Streamed download relay did not deliver after retries — falling back to base64 download',
+      );
+      // fall through to the legacy base64 path below (relay-failure fallback)
+    }
+
+    // Legacy base64 download: the path for daemons without stream capability AND
+    // the fallback when the stream relay above failed to deliver. Use a fresh id
+    // because the stream attempt (if any) already consumed `downloadId` for its
+    // WS request, whose RPC may still be pending.
+    const legacyDownloadId = supportsStreamDownload ? randomHex(16) : downloadId;
+    const downloadMsg: FileDownloadRequest = {
+      type: 'file.download',
+      downloadId: legacyDownloadId,
+      attachmentId,
+    };
     const result = await bridge.sendFileTransferRequest(
-      downloadId,
+      legacyDownloadId,
       downloadMsg as unknown as Record<string, unknown>,
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
     );
@@ -458,24 +740,13 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       return c.json({ error: 'download_failed', message: errMsg }, 500);
     }
 
-    // Decode base64 content and return as binary response
-    const content = Buffer.from(result.content as string, 'base64');
-    const mime = (result.mime as string) || 'application/octet-stream';
-    const filename = (result.filename as string) || attachmentId;
-
-    c.header('Content-Type', mime);
-    c.header('Content-Length', String(content.length));
-    // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding.
-    // Always include both for maximum client compatibility.
-    const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
-    const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-    c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
-
-    return c.body(content);
+    return respondBase64Download(c, result, attachmentId);
   } catch (err) {
+    deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') return c.json({ error: 'daemon_offline' }, 503);
     if (msg === 'timeout') return c.json({ error: 'download_timeout' }, 504);
+    if (msg === 'download_stream_not_ready') return c.json({ error: 'download_stream_not_ready' }, 504);
     logger.error({ serverId, downloadId, err }, 'Download relay failed');
     return c.json({ error: 'download_failed' }, 500);
   }

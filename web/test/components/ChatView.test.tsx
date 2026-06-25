@@ -65,7 +65,7 @@ function selectText(node: Text, start: number, end: number) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => {
+    t: (key: string, options?: Record<string, unknown>) => {
       const translations: Record<string, string> = {
         'session.state_idle': 'Agent idle — waiting for input',
         'session.state_running': 'Agent working...',
@@ -75,8 +75,16 @@ vi.mock('react-i18next', () => ({
         'session.state_stop_requested': 'Stop requested',
         'session.state_stopping': 'Stopping...',
         'session.state_compacting': 'Compacting context...',
+        'session.state_error_detail': 'Error: {{error}}',
+        'share.actorLabel': '{{name}} · {{role}}',
+        'share.role.viewer': 'Viewer',
+        'share.role.participant': 'Participant',
+        'share.role.serverMember': 'Server member',
+        'share.role.serverManager': 'Server manager',
+        'share.role.system': 'System',
       };
-      return translations[key] ?? key;
+      const template = translations[key] ?? key;
+      return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
     },
   }),
 }));
@@ -181,6 +189,50 @@ describe('ChatView', () => {
     fireEvent.click(screen.getByText('chat.load_older'));
 
     expect(screen.getByText('message-0')).toBeTruthy();
+  });
+
+  it('reveals locally cached older messages at the top without preserving the previous anchor', async () => {
+    const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `message-${index}` },
+    }));
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_large_anchor_brain"
+      />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', {
+      configurable: true,
+      get: () => (container.textContent?.includes('message-0') ? 1800 : 1200),
+    });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    scrollTopValue = 0;
+    fireEvent.wheel(scrollEl, { deltaY: -20 });
+    fireEvent.scroll(scrollEl);
+
+    expect(screen.getByText('chat.loading_older')).toBeTruthy();
+    await waitFor(() => {
+      expect(screen.getByText('message-0')).toBeTruthy();
+    });
+    expect(scrollTopValue).toBe(0);
   });
 
   it('collapses sent user messages longer than ten hard lines by default', () => {
@@ -408,7 +460,40 @@ describe('ChatView', () => {
     expect(container.querySelector('.chat-html-preview-btn')).toBeNull();
   });
 
-  it('opens the fullscreen HTML preview in a new window and closes the overlay', () => {
+  it('keeps ChatView mounted when HTML preview dispatch fails because the websocket is disconnected', () => {
+    const ws = {
+      fsReadFile: vi.fn(() => {
+        throw new Error('WebSocket not connected');
+      }),
+      onMessage: vi.fn(() => () => undefined),
+    };
+    const events = [{
+      eventId: 'user-html-path-offline',
+      type: 'user.message',
+      ts: Date.now(),
+      payload: { text: 'Open ./dist/offline.HTML' },
+    }];
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        ws={ws as any}
+        workdir="/repo"
+      />,
+    );
+
+    const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
+    expect(htmlButton).not.toBeNull();
+    expect(() => fireEvent.click(htmlButton!)).not.toThrow();
+    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/offline.HTML');
+    expect(container.textContent).toContain('Open ./dist/offline.HTML');
+    expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
+    expect(document.body.textContent).toContain('upload.daemon_offline');
+  });
+
+  it('opens HTML previews in a new window by default', () => {
     vi.useFakeTimers();
     const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
     const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
@@ -416,7 +501,7 @@ describe('ChatView', () => {
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window);
 
     try {
       const wsListeners = new Set<(msg: any) => void>();
@@ -456,11 +541,6 @@ describe('ChatView', () => {
           });
         }
       });
-
-      const openButton = document.body.querySelector('.html-fullscreen-preview-open-window') as HTMLButtonElement | null;
-      expect(openButton).not.toBeNull();
-      expect(openButton?.disabled).toBe(false);
-      fireEvent.click(openButton!);
 
       expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
       expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
@@ -678,6 +758,28 @@ describe('ChatView', () => {
 
     expect(container.querySelector('.chat-refreshing-spinner')).not.toBeNull();
     expect(container.querySelector('.chat-history-overlay')).not.toBeNull();
+  });
+
+  it('shows a top loading indicator while fetching older messages', () => {
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'evt-1',
+          type: 'assistant.text',
+          ts: 1000,
+          payload: { text: 'hello world' },
+        }] as any}
+        loading={false}
+        loadingOlder
+        hasOlderHistory
+        onLoadOlder={vi.fn()}
+        sessionId="deck_loading_older_brain"
+      />,
+    );
+
+    expect(screen.getByRole('status').textContent).toContain('chat.loading_older');
+    expect(container.querySelector('.chat-load-older-status .chat-refreshing-spinner')).not.toBeNull();
+    expect(screen.queryByText('chat.load_older')).toBeNull();
   });
 
   it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {
@@ -1587,6 +1689,51 @@ describe('ChatView', () => {
     expect(container.textContent).toContain('Session stopped');
   });
 
+  it('renders session error state with the concrete backend error message', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-error',
+            type: 'session.state',
+            ts: 1000,
+            payload: { state: 'error', error: 'Codex compact cancelled' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('Error: Codex compact cancelled');
+  });
+
+  it('renders idle transport cancel details as visible Stop confirmation', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-cancelled-idle',
+            type: 'session.state',
+            ts: 1000,
+            payload: { state: 'idle', error: 'Turn cancelled by user stop' },
+          },
+          {
+            eventId: 'evt-normal-idle',
+            type: 'session.state',
+            ts: 1001,
+            payload: { state: 'idle' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('Error: Turn cancelled by user stop');
+    expect(container.textContent).not.toContain('Agent idle');
+  });
+
   it('renders transport Stop cancel feedback as a visible system row', () => {
     const { container } = render(
       <ChatView
@@ -1929,6 +2076,139 @@ describe('ChatView', () => {
     } finally {
       if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
     }
+  });
+
+  it('shows date and time in the pinned last-sent banner', async () => {
+    const originalIntersectionObserver = globalThis.IntersectionObserver;
+    let observerCallback: IntersectionObserverCallback | null = null;
+    class IntersectionObserverMock {
+      root: Element | Document | null = null;
+      rootMargin = '';
+      thresholds = [];
+      constructor(callback: IntersectionObserverCallback) {
+        observerCallback = callback;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+      takeRecords = vi.fn(() => []);
+    }
+    globalThis.IntersectionObserver = IntersectionObserverMock as unknown as typeof IntersectionObserver;
+
+    try {
+      const ts = new Date('2026-04-17T12:34:00Z').getTime();
+      const { container } = render(
+        <ChatView
+          events={[
+            {
+              eventId: 'evt-pinned-user',
+              type: 'user.message',
+              ts,
+              payload: {
+                text: 'Pull latest code',
+                sharedActor: {
+                  actorDisplayName: 'Ada Shared',
+                  effectiveActorRole: 'participant',
+                },
+              },
+            },
+            {
+              eventId: 'evt-assistant',
+              type: 'assistant.text',
+              ts: ts + 1,
+              payload: { text: 'Done', streaming: false },
+            },
+          ] as any}
+          loading={false}
+          sessionId="deck_main_brain"
+        />,
+      );
+
+      const target = container.querySelector('[data-event-id="evt-pinned-user"]') as Element;
+      await act(async () => {
+        observerCallback?.([
+          {
+            target,
+            isIntersecting: false,
+            rootBounds: { top: 100 } as DOMRectReadOnly,
+            boundingClientRect: { bottom: 50 } as DOMRectReadOnly,
+          } as IntersectionObserverEntry,
+        ], {} as IntersectionObserver);
+      });
+
+      expect(container.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('chat.pinned_last_sent_label');
+      expect(container.querySelector('.chat-pinned-last-sent-actor')?.textContent).toBe('Ada Shared · Participant');
+      const timeText = container.querySelector('.chat-pinned-last-sent-time')?.textContent ?? '';
+      expect(timeText).toBe(new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+      expect(container.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('Pull latest code');
+    } finally {
+      globalThis.IntersectionObserver = originalIntersectionObserver;
+    }
+  });
+
+  it('renders shared actor labels for share-originated user messages', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-shared-user',
+            type: 'user.message',
+            ts: Date.now(),
+            payload: {
+              text: 'Shared prompt',
+              sharedActor: {
+                actorDisplayName: 'Ada Shared',
+                effectiveActorRole: 'participant',
+              },
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-shared-actor-label')?.textContent).toBe('Ada Shared · Participant');
+    expect(screen.getByText('Shared prompt')).toBeTruthy();
+  });
+
+  it('renders member and system actor roles for user-originated timeline actions', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-member-user',
+            type: 'user.message',
+            ts: Date.now(),
+            payload: {
+              text: 'Manager prompt',
+              sharedActor: {
+                actorDisplayName: 'Mina Manager',
+                effectiveActorRole: 'server-manager',
+              },
+            },
+          },
+          {
+            eventId: 'evt-system-user',
+            type: 'user.message',
+            ts: Date.now() + 1,
+            payload: {
+              text: 'System replay',
+              sharedActor: {
+                actorDisplayName: 'System',
+                effectiveActorRole: 'system',
+              },
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const labels = [...container.querySelectorAll('.chat-shared-actor-label')].map((node) => node.textContent);
+    expect(labels).toContain('Mina Manager · Server manager');
+    expect(labels).toContain('System · System');
   });
 
   it('shows the selected-text Copy and Quote popup in narrow desktop windows', async () => {

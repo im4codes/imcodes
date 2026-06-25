@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { ASK_QUESTION_WAIT_MS, ASK_QUESTION_RETENTION_MS } from '@shared/ask-question-timing.js';
 
 export interface AskOption {
@@ -27,8 +28,57 @@ interface Props {
   onDismiss: () => void;
 }
 
+const AUTO_DELIVER_HEADER = 'OpenSpec Auto Deliver';
+const AUTO_DELIVER_REASON_RE = /Auto Deliver stopped with reason "([^"]+)"/;
+
+function humanizeMachineReason(reason: string): string {
+  return reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function localizeAskQuestionItem(q: AskQuestionItem, t: (key: string, options?: Record<string, unknown>) => string): AskQuestionItem {
+  const match = q.question.match(AUTO_DELIVER_REASON_RE);
+  const isAutoDeliverQuestion = q.header === AUTO_DELIVER_HEADER || match !== null;
+  if (!isAutoDeliverQuestion) return q;
+
+  const reasonCode = match?.[1] ?? '';
+  const reason = reasonCode
+    ? t(`openspec.auto.reason.${reasonCode}`, { defaultValue: humanizeMachineReason(reasonCode) })
+    : q.question;
+
+  return {
+    ...q,
+    header: t('openspec.auto.ask.header', { defaultValue: AUTO_DELIVER_HEADER }),
+    question: reasonCode
+      ? t('openspec.auto.ask.needs_human_question', {
+        reason,
+        defaultValue: `Auto Deliver needs human input: ${reason}`,
+      })
+      : q.question,
+    options: q.options?.map((opt) => {
+      if (opt.label === 'Review the failure and continue manually') {
+        return {
+          label: t('openspec.auto.ask.review_continue', { defaultValue: opt.label }),
+          description: t('openspec.auto.ask.review_continue_desc', { defaultValue: opt.description ?? '' }),
+        };
+      }
+      if (opt.label === 'Stop here and summarize the current state') {
+        return {
+          label: t('openspec.auto.ask.stop_summarize', { defaultValue: opt.label }),
+          description: t('openspec.auto.ask.stop_summarize_desc', { defaultValue: opt.description ?? '' }),
+        };
+      }
+      return opt;
+    }),
+  };
+}
+
 export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
+  const { t } = useTranslation();
   const { questions } = pending;
+  const displayQuestions = useMemo(
+    () => questions.map((q) => localizeAskQuestionItem(q, t)),
+    [questions, t]
+  );
 
   // ── Countdown / retention phases ──────────────────────────────────────────
   // Phase 1 (≤ waitMs): the model is PAUSED waiting — answering steers it in the
@@ -58,9 +108,14 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
 
   // State: for each question, either selected indices (multiSelect) or text value
   const [selections, setSelections] = useState<Array<Set<number>>>(() =>
-    questions.map(() => new Set<number>())
+    displayQuestions.map(() => new Set<number>())
   );
-  const [texts, setTexts] = useState<string[]>(() => questions.map(() => ''));
+  const [texts, setTexts] = useState<string[]>(() => displayQuestions.map(() => ''));
+
+  useEffect(() => {
+    setSelections(displayQuestions.map(() => new Set<number>()));
+    setTexts(displayQuestions.map(() => ''));
+  }, [pending.toolUseId, displayQuestions.length]);
 
   function toggleOption(qi: number, oi: number) {
     setSelections((prev) => {
@@ -72,7 +127,7 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
   }
 
   function buildAnswer(): string {
-    return questions.map((q, qi) => {
+    return displayQuestions.map((q, qi) => {
       const parts: string[] = [];
       if (q.options && q.options.length > 0) {
         const selected = [...selections[qi]].sort().map((i) => q.options![i].label);
@@ -89,10 +144,16 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
       <div class="ask-dialog">
         <div class={`ask-status ${inWaitPhase ? 'ask-status-waiting' : 'ask-status-retained'}`}>
           {inWaitPhase
-            ? `⏳ Waiting for your answer — the model continues on its own in ${waitRemainSec}s`
-            : `▶ The model already continued — you can still interrupt it (${retentionRemainSec}s)`}
+            ? t('askQuestion.waiting', {
+              seconds: waitRemainSec,
+              defaultValue: `Waiting for your answer — the model continues on its own in ${waitRemainSec}s`,
+            })
+            : t('askQuestion.retained', {
+              seconds: retentionRemainSec,
+              defaultValue: `The model already continued — you can still interrupt it (${retentionRemainSec}s)`,
+            })}
         </div>
-        {questions.map((q, qi) => (
+        {displayQuestions.map((q, qi) => (
           <div key={qi} class="ask-question-block">
             {q.header && <div class="ask-header">{q.header}</div>}
             <div class="ask-question">{q.question}</div>
@@ -124,7 +185,9 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
             <input
               class="ask-custom-input"
               type="text"
-              placeholder={q.options && q.options.length > 0 ? 'Custom / extra (optional)' : 'Your answer'}
+              placeholder={q.options && q.options.length > 0
+                ? t('askQuestion.customPlaceholder', { defaultValue: 'Custom / extra (optional)' })
+                : t('askQuestion.answerPlaceholder', { defaultValue: 'Your answer' })}
               value={texts[qi]}
               onInput={(e) => {
                 const v = (e.target as HTMLInputElement).value;
@@ -135,9 +198,13 @@ export function AskQuestionDialog({ pending, onSubmit, onDismiss }: Props) {
           </div>
         ))}
         <div class="ask-actions">
-          <button class="ask-btn-cancel" onClick={onDismiss}>Dismiss</button>
+          <button class="ask-btn-cancel" onClick={onDismiss}>
+            {t('askQuestion.dismiss', { defaultValue: 'Dismiss' })}
+          </button>
           <button class="ask-btn-submit" onClick={() => onSubmit(buildAnswer())}>
-            {inWaitPhase ? 'Answer' : 'Interrupt with this'}
+            {inWaitPhase
+              ? t('askQuestion.answer', { defaultValue: 'Answer' })
+              : t('askQuestion.interrupt', { defaultValue: 'Interrupt with this' })}
           </button>
         </div>
       </div>

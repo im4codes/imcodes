@@ -47,7 +47,7 @@ describe('memory MCP write tools', () => {
     sourceServerId: 'srv-1',
   });
 
-  it('saves observations with fixed identity fields and computed fingerprint', () => {
+  it('saves observations with fixed identity fields and computed fingerprint', async () => {
     const ensureContextNamespace = vi.fn(() => namespaceRow());
     const writeContextObservation = vi.fn((input) => observationRow({
       id: 'obs-1',
@@ -56,7 +56,7 @@ describe('memory MCP write tools', () => {
       sourceEventIds: input.sourceEventIds ?? [],
     }));
 
-    const result = saveObservation({
+    const result = await saveObservation({
       content: 'Use the MCP caller boundary',
       tags: ['mcp'],
       turnId: 'turn-1',
@@ -100,37 +100,37 @@ describe('memory MCP write tools', () => {
     expect(JSON.stringify(writeContextObservation.mock.calls[0][0])).not.toContain('/tmp/secret');
   });
 
-  it('rejects observation caps before persistence', () => {
+  it('rejects observation caps before persistence', async () => {
     const writeContextObservation = vi.fn();
     const oversized = 'a'.repeat(MEMORY_MCP_CAPS.OBSERVATION_CONTENT_MAX_BYTES + 1);
-    expect(saveObservation({ content: oversized }, caller, { writeContextObservation })).toMatchObject({
+    expect(await saveObservation({ content: oversized }, caller, { writeContextObservation })).toMatchObject({
       status: 'error',
       reason: 'write_quota_exceeded',
     });
-    expect(saveObservation({ content: 'ok', tags: Array.from({ length: 9 }, (_, index) => `t${index}`) }, caller, { writeContextObservation })).toMatchObject({
+    expect(await saveObservation({ content: 'ok', tags: Array.from({ length: 9 }, (_, index) => `t${index}`) }, caller, { writeContextObservation })).toMatchObject({
       reason: 'write_quota_exceeded',
     });
-    expect(saveObservation({ content: 'ok', tags: ['x'.repeat(65)] }, caller, { writeContextObservation })).toMatchObject({
+    expect(await saveObservation({ content: 'ok', tags: ['x'.repeat(65)] }, caller, { writeContextObservation })).toMatchObject({
       reason: 'write_quota_exceeded',
     });
     expect(writeContextObservation).not.toHaveBeenCalled();
   });
 
-  it('rejects agent observations when the caller has no project scope', () => {
+  it('rejects agent observations when the caller has no project scope', async () => {
     const scopedOutCaller = createMemoryToolCaller({
       userId: 'user-1',
       namespace: { scope: 'personal', userId: 'user-1' },
     });
     const writeContextObservation = vi.fn();
 
-    expect(saveObservation({ content: 'projectless observation' }, scopedOutCaller, { writeContextObservation })).toMatchObject({
+    expect(await saveObservation({ content: 'projectless observation' }, scopedOutCaller, { writeContextObservation })).toMatchObject({
       status: 'error',
       reason: 'scope_forbidden',
     });
     expect(writeContextObservation).not.toHaveBeenCalled();
   });
 
-  it('saves preferences through explicit observation writes without @pref parsing authority', () => {
+  it('saves preferences through explicit observation writes without @pref parsing authority', async () => {
     const ensureContextNamespace = vi.fn(() => namespaceRow());
     const writeContextObservation = vi.fn((input) => observationRow({
       id: 'pref-1',
@@ -141,7 +141,7 @@ describe('memory MCP write tools', () => {
       content: input.content,
     }));
 
-    const result = savePreference({
+    const result = await savePreference({
       text: '@pref: Keep tests focused',
       idempotencyKey: 'pref-key',
       origin: 'agent_learned',
@@ -170,9 +170,9 @@ describe('memory MCP write tools', () => {
     }));
   });
 
-  it('caps preference text by shared preference max bytes', () => {
+  it('caps preference text by shared preference max bytes', async () => {
     const writeContextObservation = vi.fn();
-    expect(savePreference({ text: 'a'.repeat(PREFERENCE_MAX_BYTES + 1) }, caller, { writeContextObservation })).toMatchObject({
+    expect(await savePreference({ text: 'a'.repeat(PREFERENCE_MAX_BYTES + 1) }, caller, { writeContextObservation })).toMatchObject({
       status: 'error',
       reason: 'write_quota_exceeded',
     });

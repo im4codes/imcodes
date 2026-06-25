@@ -2,13 +2,13 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**IM для агентов. Общая память, управляемые MCP-инструменты, контролируемое выполнение и кросс-модельный аудит поверх AI-провайдеров.**
+**IM для агентов. Общая память, OpenSpec Auto Deliver, управляемые MCP-инструменты, контролируемое выполнение, совместная работа людей и кросс-модельный аудит поверх AI-провайдеров.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes даёт coding agents единый слой памяти и управляемую MCP-поверхность поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или вспоминает нужную историю в будущие session. Поддерживаются Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw и Qwen, а также терминал, файлы, Git, localhost preview, уведомления, multi-agent workflows и нативный стриминг для transport-агентов. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Встроенное Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.
+IM.codes даёт coding agents единый слой памяти и управляемую MCP-поверхность поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или вспоминает нужную историю в будущие session. Поддерживаются Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, OpenCode, OpenClaw и Qwen, а также терминал, файлы, Git, localhost preview, уведомления, multi-agent workflows и нативный стриминг для transport-агентов. OpenSpec Auto Deliver может провести change от proposal/spec audit через implementation, validation hints, Team audit/rework, автоматическую оценку модулей и финальные quality gates. Совместный доступ также поддерживает pair или multi-person collaborative coding вокруг live agent sessions. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Встроенное Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.
 
 > Это перевод. **Каноническая версия — английский README (`../README.md`).** Если есть расхождения, ориентируйтесь на английский вариант.
 
@@ -68,9 +68,24 @@ IM.codes даёт coding agents единый слой памяти и управ
 
 Эта проблема доступа — только половина истории. Сложная работа с coding agents также требует более устойчивого суждения: одна модель может застрять в привычных шаблонах, пропустить проблемы или дать нестабильный ответ на трудной задаче. Смена provider даёт новую перспективу, но без общего контекста легко потерять нить.
 
-[IM.codes](https://im.codes) закрывает обе потребности. Он удерживает эти сессии доступными с телефона или из веба: открыть терминал, проверить файлы и Git, посмотреть localhost с другого устройства, получить уведомление о завершении работы и координировать несколько агентов на собственной инфраструктуре. Он также связывает "Shared Agent Context и память" с "Кросс-модельный аудит и Team обсуждения": долговременный recall приходит из сводок завершённой работы, а Team обсуждение — это структурированный кросс-модельный review до попадания кода. Это не делает вывод идеальным, но уменьшает слепые зоны одной модели и помогает сложной работе сходиться под большим числом проверок.
+[IM.codes](https://im.codes) закрывает обе потребности. Он удерживает эти сессии доступными с телефона или из веба: открыть терминал, проверить файлы и Git, посмотреть localhost с другого устройства, получить уведомление о завершении работы, пригласить другого человека в ту же session или server и координировать несколько агентов на собственной инфраструктуре. Он также связывает "Shared Agent Context и память" с "Кросс-модельный аудит и Team обсуждения": долговременный recall приходит из сводок завершённой работы, а Team обсуждение — это структурированный кросс-модельный review до попадания кода. Это не делает вывод идеальным, но уменьшает слепые зоны одной модели и помогает сложной работе сходиться под большим числом проверок.
 
 Это не ещё один AI IDE и не просто удалённый терминал. Это слой сообщений, памяти и review вокруг терминальных coding agents.
+
+## OpenSpec Auto Deliver
+
+Для OpenSpec-based changes Auto Deliver превращает change folder в end-to-end supervised delivery run: proposal/spec review, implementation, validation, Team audit, автоматическая оценка модулей, rework gates и видимый final handoff.
+
+- **One-click change pipeline.** Запускается из transport-backed coding session. IM.codes определяет owning session, блокирует Team lane от конфликтующих runs, читает `tasks.md` и показывает live run projection в UI.
+- **Spec audit до implementation.** Опциональный proposal/spec audit-repair использует обычный Team flow (по умолчанию `audit>review>plan`) и читает authoritative JSON вместо доверия chat summaries.
+- **Task-driven implementation loop.** Daemon отправляет focused implementation prompts в ту же session, работает только с этим OpenSpec change, отслеживает checked/unchecked tasks и показывает безопасные validation command candidates из project manifests.
+- **Автоматическая оценка модулей.** Каждый audit выдаёт structured scores для `spec`, `tasks`, `implementation`, `tests` и `risk`; evidence и summaries видны в run details, а не спрятаны в chat text.
+- **Implementation audit и rework gates.** Финальный scored verdict — `PASS`, `REWORK` или `BLOCKED` — решает, пройдет ли run, будет ли repair в пределах лимитов или нужна human decision.
+- **Fail-closed и контроль человека.** Auto Deliver просит human input при invalid audit output, исчерпанных time/prompt limits, manual interference, несовместимом Team state или unreadable tasks. Он не делает stage, commit или push кода.
+
+## Совместное программирование
+
+Поделитесь текущей вкладкой, sub-session или всем source server с другим пользователем. `viewer` подходит для read-only review, `participant` — когда teammate должен отправлять prompts в покрытые sessions. Shared messages несут actor labels, а доступ можно понизить или отозвать из UI.
 
 ## Shared Agent Context и память
 
@@ -118,6 +133,12 @@ IM.codes может вести поддерживаемые agent session ход
 
 ### Мобильные устройства, часы и уведомления
 Есть биометрическая аутентификация, push‑уведомления, ввод для shell‑сессий и быстрые ответы на Apple Watch.
+
+### OpenSpec Auto Deliver
+Проведите spec-driven change через structured pipeline: proposal/spec audit, implementation prompts, manifest-aware validation hints, Team audit/rework, автоматическая оценка spec/tasks/implementation/tests/risk и fail-closed handoff.
+
+### Совместное программирование
+Поделитесь live session для pair programming или пригласите нескольких людей в scoped server workspace с ролями viewer/participant.
 
 ### Кросс-модельный аудит и Team обсуждения
 Выходу одной модели нельзя доверять слепо. Team обсуждения позволяют нескольким агентам — от разных провайдеров и с разными стилями мышления — совместно анализировать одну кодовую базу ещё до написания кода. Каждый раунд следует настраиваемому многоэтапному пайплайну, где каждый агент читает все предыдущие вклады. Разные модели находят разные типы проблем. Такая перекрёстная проверка ещё до реализации выявляет проблемы, которые одна модель часто пропускает, и сокращает переделки.
@@ -315,6 +336,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Node.js >= 22
 - tmux на Linux/macOS
 - как минимум один AI coding agent: Claude Code, Codex, Gemini CLI, OpenClaw или Qwen
+
+## О проекте
+
+Это личный проект. Я почти не писал код сам: он почти полностью создан [Claude Code](https://github.com/anthropics/claude-code), со значительным вкладом [Codex](https://github.com/openai/codex) и [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
 ## Дисклеймер
 

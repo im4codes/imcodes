@@ -23,6 +23,87 @@
     "hide": "Ocultar",
     "this_feature": "Esta función"
   },
+  "share": {
+    "menu": {
+      "shareTab": "Compartir"
+    },
+    "dialogTitle": "Compartir acceso",
+    "dialogSubtitle": "Concede acceso limitado a {{target}}.",
+    "target": {
+      "label": "Destino",
+      "currentTab": "Pestaña actual",
+      "server": "Servidor de origen completo",
+      "serverFallback": "Este servidor"
+    },
+    "role": {
+      "label": "Rol",
+      "viewer": "Visualizador",
+      "participant": "Participante",
+      "serverMember": "Miembro del servidor",
+      "serverManager": "Administrador del servidor",
+      "system": "Sistema"
+    },
+    "roleHelp": {
+      "viewer": "Puede ver el estado del alcance y participar en debates del alcance sin dirigir al agente.",
+      "participant": "Puede ver el estado del alcance y enviar indicaciones a pestañas concretas cubiertas."
+    },
+    "trust": {
+      "title": "Aviso de confianza para participantes",
+      "body": "Los agentes no están en una zona aislada. Los límites de UI/API reducen controles directos, pero una indicación de participante puede influir en un agente que actúa en su entorno accesible."
+    },
+    "recipient": {
+      "label": "Destinatario",
+      "placeholder": "ID de usuario o correo"
+    },
+    "list": {
+      "label": "Usuarios compartidos",
+      "title": "Usuarios compartidos",
+      "empty": "Aún no hay usuarios compartidos"
+    },
+    "manage": {
+      "roleFor": "Rol para {{user}}",
+      "revoke": "Revocar",
+      "revokeConfirm": "¿Revocar el acceso de {{user}}?"
+    },
+    "sharedWithMe": {
+      "title": "Compartido conmigo",
+      "empty": "No hay pestañas ni servidores compartidos",
+      "refresh": "Actualizar acceso compartido",
+      "kind": {
+        "server": "Servidor",
+        "tab": "Pestaña",
+        "subsession": "Subsesión"
+      }
+    },
+    "create": "Crear recurso compartido",
+    "creating": "Creando...",
+    "scope": {
+      "current": "Alcance compartido"
+    },
+    "indicator": "{{scope}} compartido como {{role}} · {{status}}",
+    "indicatorCompact": "Compartido como {{role}} · {{status}}",
+    "indicatorSharedOut": "Compartido con otros",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "Activo",
+      "revoked": "Revocado",
+      "expired": "Caducado",
+      "target-unavailable": "Destino no disponible"
+    },
+    "reason": {
+      "share-role-denied": "Este rol no puede usar esa acción.",
+      "share-direct-surface-denied": "Esta superficie no está disponible con acceso compartido.",
+      "share-rate-limited": "Demasiadas acciones compartidas. Inténtalo de nuevo pronto.",
+      "share-revoked": "Este recurso compartido fue revocado.",
+      "share-expired": "Este recurso compartido caducó.",
+      "share-target-unavailable": "El destino compartido no está disponible.",
+      "share-role-changed": "El rol compartido cambió.",
+      "share-ticket-invalid": "El ticket de acceso compartido no es válido.",
+      "share-cancel-unsupported": "Cancelar no es compatible con esta pestaña compartida.",
+      "share-audit-duplicate": "Esta acción ya fue registrada.",
+      "share-comment-invalid": "No se pudo publicar el comentario."
+    }
+  },
   "window": {
     "maximize": "Maximizar",
     "restore": "Restaurar",
@@ -45,7 +126,18 @@
     "reload": "Recargar",
     "retry": "Reintentar"
   },
+  "askQuestion": {
+    "waiting": "Esperando tu respuesta. El modelo continuará por sí solo en {{seconds}}s.",
+    "retained": "El modelo ya continuó. Aún puedes interrumpirlo durante {{seconds}}s.",
+    "customPlaceholder": "Personalizado / extra (opcional)",
+    "answerPlaceholder": "Tu respuesta",
+    "dismiss": "Cerrar",
+    "answer": "Responder",
+    "interrupt": "Interrumpir con esto"
+  },
   "chat": {
+    "delete_message": "Eliminar mensaje",
+    "delete_message_confirm": "¿Eliminar este mensaje para todos? Esta acción no se puede deshacer.",
     "dpad": {
       "title": "Teclas de flecha: arrastra para mover"
     },
@@ -170,6 +262,13 @@
     "zoom_title": "Mensaje",
     "zoom_copy_all": "Copiar todo",
     "zoom_hint": "Mantén presionado para seleccionar texto. Ajusta los tiradores y luego copia.",
+    "image_download": "Descargar imagen",
+    "image_downloading": "Descargando...",
+    "image_downloaded": "Descargada",
+    "image_download_failed": "Error al descargar",
+    "image_copy": "Copiar imagen",
+    "image_copied": "Imagen copiada",
+    "image_copy_failed": "Error al copiar",
     "tool_detail_toggle": "detalles",
     "tool_detail_input": "entrada",
     "tool_detail_output": "salida",
@@ -250,7 +349,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "Ejecutar la tarea actual con clones de ejecución",
+    "execution_clone_run_with_template": "Ejecutar la tarea actual con {{count}} clon(es) de {{name}}",
+    "execution_clone_run_no_template": "Activa y elige una sesión de ejecución en la configuración del equipo",
+    "execution_clone_run_empty": "Escribe una tarea primero",
+    "execution_clone_run_offline": "Vuelve a conectar antes de ejecutar clones"
   },
   "session": {
     "restart": "↺ Reiniciar",
@@ -292,6 +396,9 @@
     "type": "Tipo",
     "label": "Etiqueta",
     "workingDir": "Directorio de trabajo",
+    "subsessionWorkingDirectory": "Directorio de trabajo",
+    "subsessionWorkingDirectoryPlaceholder": "Directorio de la sesión actual",
+    "subsessionWorkingDirectoryLocked": "Las subsesiones usan el directorio actual y no pueden cambiarlo al iniciarse.",
     "parentSession": "Sesión principal",
     "rename": "✎ Renombrar",
     "rename_plain": "Renombrar",
@@ -316,6 +423,10 @@
       "overrideDirectories": "Usar un nuevo directorio de trabajo para las sesiones clonadas",
       "cwdOverride": "Directorio de trabajo de reemplazo",
       "cwdOverridePlaceholder": "/work/new-checkout",
+      "gitRemoteUrl": "URL remote de Git (opcional)",
+      "gitRemoteUrlPlaceholder": "https://github.com/org/repo.git",
+      "gitRemoteUrlHelp": "Si se completa, el daemon clona este remote en el directorio de trabajo de reemplazo antes de copiar el grupo.",
+      "gitRemoteCapabilityMissing": "El daemon conectado aún no admite clonar remotes de Git para grupos copiados. Actualiza o reconecta el daemon e inténtalo de nuevo.",
       "browseCwd": "Explorar directorio de trabajo",
       "daemonHostValidation": "Los directorios de trabajo se validan en el host del daemon antes de crear recursos.",
       "runningWarning": "El grupo copiado empieza desde cero. No se copian mensajes pendientes, historial de terminal ni trabajo en ejecución del origen.",
@@ -363,6 +474,8 @@
         "blank_target_project": "El nombre del proyecto destino es obligatorio.",
         "name_taken": "Ese nombre de sesión destino ya está en uso.",
         "invalid_cwd": "El directorio de trabajo no se pudo usar en el host del daemon.",
+        "invalid_git_remote": "La URL remote de Git no es compatible.",
+        "git_clone_failed": "El daemon no pudo clonar el remote de Git en el directorio de trabajo.",
         "incomplete_clone_spec": "A una sesión hija en ejecución le faltan ajustes de inicio copiables.",
         "unsupported_session_type": "Una de las sesiones aún no se puede copiar.",
         "p2p_config_invalid": "La configuración Team no se pudo copiar.",
@@ -541,7 +654,17 @@
       "deny": "Denegar",
       "tool": "{{tool}} requiere aprobación"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "Realiza el trabajo de implementación/ejecución solicitado en esta sesión.",
+      "useConfigured": "usar {{name}}",
+      "useConfiguredNone": "usar sesión de ejecución",
+      "setSession": "configurar sesión de ejecución…"
+    },
+    "executionGroup": {
+      "title": "Trabajadores de ejecución (ejecución {{run}})",
+      "unknownRun": "pendiente"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",
@@ -604,12 +727,18 @@
     "tab_files": "Archivos",
     "tab_changes": "Cambios",
     "changes_title": "Cambios ({{count}})",
-    "no_changes": "Sin cambios"
+    "no_changes": "Sin cambios",
+    "rename_prompt": "Renombrar {{name}}",
+    "rename_failed": "No se pudo renombrar el elemento",
+    "delete_confirm": "¿Eliminar {{name}}? Esta acción no se puede deshacer.",
+    "delete_failed": "No se pudo eliminar el elemento",
+    "invalid_name": "El nombre no puede contener separadores de ruta"
   },
   "toast": {
     "finished": "terminó",
     "upgrade_blocked_title": "Actualización bloqueada",
     "upgrade_blocked_p2p_active": "Team sigue en ejecución. Deténlo antes de actualizar el daemon.",
+    "upgrade_blocked_auto_deliver_active": "Auto Deliver sigue en ejecución. Deténlo antes de actualizar el daemon.",
     "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces."
   },
   "discussion": {
@@ -649,6 +778,10 @@
     "title": "Iniciar nueva sesión",
     "project_name": "Nombre del proyecto",
     "working_directory": "Directorio de trabajo",
+    "git_remote_url": "URL remote de Git (opcional)",
+    "git_remote_url_placeholder": "https://github.com/org/repo.git",
+    "git_remote_url_help": "Si se completa, el daemon clona este remote en el directorio de trabajo antes de iniciar la sesión.",
+    "git_remote_capability_missing": "El daemon conectado aún no admite clonar remotes de Git. Actualiza o reconecta el daemon e inténtalo de nuevo.",
     "browse": "Examinar",
     "agent_type": "Tipo de agente",
     "agent_flavor_cli": "CLI: interfaz nativa para quienes prefieren la UI original. El modo chat no admite streaming.",
@@ -1060,6 +1193,8 @@
     "title": "OpenSpec",
     "changes": "Cambios",
     "empty": "No se encontraron cambios de OpenSpec",
+    "no_tasks": "Sin tareas",
+    "task_status_title": "{{checked}}/{{total}} tareas completadas",
     "load_timeout": "Los cambios de OpenSpec tardaron demasiado en cargar. Inténtalo de nuevo cuando el daemon se reconecte.",
     "load_unavailable": "Los cambios de OpenSpec no están disponibles hasta que la conexión con el daemon esté lista.",
     "load_error": "No se pudieron escanear los cambios de OpenSpec",
@@ -1069,6 +1204,214 @@
     "implement_action": "Implementar",
     "achieve_action": "Completar",
     "propose_action": "Proponer",
+    "execute": {
+      "action": "Ejecutar",
+      "dispatch_heading": "Ejecutar el cambio actual en",
+      "dispatch_to": "{{name}}",
+      "default_heading": "Sesión de ejecución predeterminada",
+      "set_default": "Establecer {{name}} como predeterminada",
+      "clear_default": "Borrar la sesión de ejecución predeterminada",
+      "no_change": "Abre un cambio para elegir su destino de ejecución.",
+      "no_sessions": "Aún no hay sesiones de ejecución aptas en este proyecto."
+    },
+    "auto": {
+      "action": "Auto",
+      "kicker": "Entrega automática",
+      "custom": "Personalizado",
+      "launcher_title": "Entrega automática",
+      "details_title": "Detalles de Auto Deliver",
+      "current_run": "Entrega automática actual",
+      "list_title": "Entrega automática",
+      "list_empty": "Aún no se ha observado ninguna entrega automática.",
+      "list_select": "Selecciona una entrega automática.",
+      "no_change": "Ningún cambio seleccionado",
+      "start": "Iniciar entrega automática",
+      "stop": "Detener",
+      "confirm_stop": "¿Detener esta entrega automática? El trabajo activo de Team/auditoría se cancelará.",
+      "stopping": "Deteniendo...",
+      "view": "Ver",
+      "compact": "Compactar",
+      "expand": "Expandir",
+      "tasks": "Tasks",
+      "tasks_unknown": "Tareas desconocidas",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "overall_progress": "Progreso general",
+      "current_stage_progress": "Etapa actual",
+      "progress_count": "{{current}}/{{total}}",
+      "progress_percent": "{{percent}}%",
+      "prompt_count": "{{count}} prompts",
+      "prompt_progress": "{{count}}/{{total}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "latest_message": "Último mensaje",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "Otra sesión del grupo está ejecutando Auto Deliver.",
+      "conflict_summary": "Los detalles solo son visibles en sesiones participantes.",
+      "lock_manual_actions": "Auto Deliver está ejecutándose para este grupo de sesión.",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "Tiempo",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Combo de Team",
+      "active_prompt": "OpenSpec prompt",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "final_scores": "Final acceptance scores",
+      "pre_repair_scores": "Pre-repair audit scores",
+      "score_snapshot_meta": "Round {{round}} · {{reason}}",
+      "scores_empty": "Sin puntuaciones todavía",
+      "scores_pending_repair_rescore": "These scores are from the previous implementation audit. Auto Deliver is repairing those findings now and will rescore after implementation finishes.",
+      "audit_results": "Resultados de rondas de auditoría",
+      "audit_results_empty": "Aún no hay rondas de auditoría completadas",
+      "round_index": "Ronda {{count}}",
+      "required_changes": "Cambios requeridos",
+      "evidence": "Evidencia",
+      "evidence_stale": "Obsoleta",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "Auto Deliver ya se está ejecutando para este grupo de sesión.",
+        "manual_team_busy": "Una ejecución manual de Team ya está usando este grupo de sesión.",
+        "unsupported_runtime": "Auto Deliver requiere una sesión de codificación basada en transport.",
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "El número de rondas está fuera del rango permitido.",
+        "daemon_offline": "El daemon está desconectado. Inténtalo de nuevo cuando se reconecte.",
+        "launch_timeout": "La entrega automática agotó el tiempo de inicio. Inténtalo de nuevo.",
+        "stop_timeout": "La detención de la entrega automática agotó el tiempo. Inténtalo de nuevo.",
+        "custom_combo_unsupported": "La entrega automática todavía no admite combos personalizados de Team.",
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "La continuación de Auto Deliver agotó el tiempo. Inténtalo de nuevo."
+      },
+      "preset": {
+        "fast": "Rápido",
+        "standard": "Estándar",
+        "strict": "Estricto",
+        "deep": "Profundo"
+      },
+      "status": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementing",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Confirmar y enviar",
+        "stopping": "Stopping",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Confirmar y enviar",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      },
+      "ask": {
+        "header": "Auto Deliver de OpenSpec",
+        "needs_human_question": "Auto Deliver necesita intervención humana: {{reason}} ¿Qué debe pasar ahora en esta sesión?",
+        "review_continue": "Revisar el fallo y continuar manualmente",
+        "review_continue_desc": "Envía una instrucción para inspeccionar la ejecución detenida, corregir el problema e informar el resultado.",
+        "stop_summarize": "Detener aquí y resumir el estado actual",
+        "stop_summarize_desc": "Pide al agente que detenga el trabajo activo y entregue un resumen breve."
+      },
+      "reason": {
+        "auto_deliver_active": "Auto Deliver ya se está ejecutando para esta sesión.",
+        "audit_p2p_failed": "La auditoría Team/P2P falló antes de producir un resultado.",
+        "missing_authoritative_json": "La auditoría no produjo un resultado JSON autoritativo final.",
+        "invalid_authoritative_json": "El resultado JSON autoritativo final no es válido.",
+        "audit_metadata_mismatch": "Los metadatos del resultado de auditoría no coinciden con esta ejecución de Auto Deliver.",
+        "invalid_authoritative_result_path": "La ruta del archivo de resultado autoritativo está fuera del directorio de discusión permitido.",
+        "invalid_audit_verdict": "La carga del veredicto de auditoría no es válida.",
+        "audit_blocked": "La auditoría informó un resultado bloqueado. Revisa las puntuaciones y decide si vuelves a ejecutar Auto Deliver.",
+        "tasks_unreadable": "No se pudo leer tasks.md.",
+        "tasks_missing_checkboxes": "tasks.md no tiene casillas de tareas para verificar.",
+        "implementation_audit_required": "Se requiere auditoría de implementación antes de completar.",
+        "implementation_prompt_limit_reached": "Se alcanzó el límite de prompts de implementación.",
+        "max_elapsed_time_reached": "Se alcanzó el límite de tiempo de Auto Deliver.",
+        "out_of_band_target_session_input": "Se envió entrada manual a la sesión de implementación durante Auto Deliver.",
+        "spec_audit_rework_reported": "La auditoría de especificación informó trabajo pendiente. Revisa las puntuaciones y decide si vuelves a ejecutar Auto Deliver.",
+        "implementation_audit_rework_reported": "La auditoría de implementación informó trabajo pendiente. Revisa las puntuaciones y decide si vuelves a ejecutar Auto Deliver.",
+        "spec_audit_rework_rounds_exhausted": "Se agotaron las rondas de auditoría-reparación de especificación.",
+        "implementation_audit_rework_rounds_exhausted": "Se agotaron las rondas de auditoría-reparación de implementación.",
+        "audit_pass_with_unchecked_tasks": "La auditoría pasó aunque tasks.md aún tiene tareas sin marcar.",
+        "audit_pass_with_required_changes": "La auditoría pasó aunque quedan cambios requeridos.",
+        "audit_pass_without_scores": "La auditoría pasó sin puntuaciones completas por módulo.",
+        "audit_pass_with_changed_files_without_repairs": "La auditoría pasó después de cambios de archivos sin resúmenes de reparación.",
+        "audit_pass_with_uncovered_changes": "El resumen de reparación de auditoría no cubre todos los archivos modificados.",
+        "quality_gate_low_score": "A quality gate paused for low module score: {{modules}}. Auto Deliver will run an implementation repair prompt, then audit and score again.",
+        "final_audit_passed": "La auditoría final pasó.",
+        "final_audit_rework_scored": "La auditoría final terminó con trabajo pendiente puntuado. Revisa las puntuaciones por módulo para decidir si ejecutas Auto Deliver otra vez.",
+        "final_audit_blocked_scored": "La auditoría final terminó con un veredicto bloqueado puntuado. Revisa las puntuaciones por módulo para decidir si ejecutas Auto Deliver otra vez.",
+        "auto_commit_push_failed": "La confirmación/envío automático falló: {{detail}}",
+        "auto_commit_push_git_status_failed": "No se pudo leer el estado de git para confirmar/enviar automáticamente: {{detail}}",
+        "auto_commit_push_preexisting_changes": "Se omitió la confirmación/envío automático porque ya había archivos de producto modificados antes del inicio: {{files}}",
+        "auto_commit_push_incomplete": "La confirmación/envío automático necesita revisión humana porque aún hay archivos de producto modificados tras el paso de commit/push: {{files}}",
+        "auto_commit_push_no_upstream": "La confirmación/envío automático necesita revisión humana porque esta rama no tiene upstream.",
+        "auto_commit_push_not_pushed": "La confirmación/envío automático necesita revisión humana porque {{count}} commit(s) siguen por delante del upstream.",
+        "auto_commit_push_no_commit": "La confirmación/envío automático necesita revisión humana porque no se creó ningún commit nuevo.",
+        "auto_commit_push_forbidden_paths": "La confirmación/envío automático necesita revisión humana porque se confirmaron archivos locales de planificación: {{files}}",
+        "auto_commit_push_unexpected_files": "La confirmación/envío automático necesita revisión humana porque el commit incluyó archivos fuera de este cambio de Auto Deliver: {{files}}",
+        "spec_audit_blocked": "La auditoría de especificación está bloqueada. Revisa el resultado, corrige el problema y continúa.",
+        "implementation_audit_blocked": "La auditoría de implementación está bloqueada. Revisa el resultado, corrige el problema y continúa.",
+        "spec_audit_rework_requires_repair": "La auditoría de especificación informó reparaciones pendientes. Auto Deliver continuará con el siguiente ciclo de auditoría-reparación.",
+        "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
+        "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
+        "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."
+      },
+      "lifecycle": {
+        "spec_audit_repair_started": "La auditoría-reparación de especificación empezó.",
+        "spec_audit_repair_p2p_started": "La ejecución Team de auditoría de especificación empezó.",
+        "implementation_prompt_dispatched": "Se envió el prompt de implementación.",
+        "spec_repair_prompt_dispatched": "Spec repair prompt sent from audit findings: {{reason}}",
+        "implementation_repair_prompt_dispatched": "Implementation repair prompt sent from audit findings: {{reason}}",
+        "implementation_idle_incomplete": "La implementación sigue procesando tareas.",
+        "implementation_idle_all_checked": "Todas las tareas de implementación están marcadas.",
+        "implementation_audit_repair_started": "La auditoría-reparación de implementación empezó.",
+        "implementation_audit_repair_p2p_started": "La ejecución Team de auditoría de implementación empezó.",
+        "auto_commit_push_prompt_dispatched": "Se envió el prompt de commit/push.",
+        "post_repair_acceptance_audit_dispatched": "Final acceptance audit sent.",
+        "post_repair_result_file_repair_prompt_dispatched": "Se envió el prompt de reparación del resultado final de aceptación.",
+        "authoritative_result_file_repair_prompt_dispatched": "Se envió el prompt de reparación del archivo de resultado.",
+        "spec_audit_passed": "La auditoría de especificación pasó.",
+        "spec_audit_rework_scored": "La auditoría de especificación terminó con trabajo pendiente puntuado.",
+        "spec_audit_blocked_scored": "La auditoría de especificación terminó con un veredicto bloqueado puntuado.",
+        "continue_requested": "Continuación solicitada."
+      },
+      "spec_rounds": "Rondas de auditoría de especificación",
+      "impl_rounds": "Rondas de auditoría de implementación",
+      "team_combo": "Combo de Team",
+      "auto_commit_push": "Confirmar y enviar automáticamente tras aprobar la auditoría",
+      "auto_commit_push_help": "Se guarda como tu preferencia. Tras aprobar la auditoría, el agente recibe commit&push.",
+      "continue": "Continuar",
+      "continuing": "Continuando..."
+    },
     "propose_from_discussion_action": "Desde la discusión reciente",
     "propose_from_description_action": "Desde la descripción de abajo",
     "audit_implementation_prompt": "Realiza una auditoría estricta de la implementación de {{reference}} contra sus artefactos de OpenSpec. Identifica cada discrepancia, omisión, riesgo de regresión, hueco en casos límite y prueba faltante; después corrige el código, las pruebas y cualquier cambio de soporte necesario. Si la implementación exige mover también la especificación, actualiza en la misma tarea los archivos de OpenSpec bajo {{reference}}. No te detengas en un informe: deja la implementación totalmente alineada con la especificación.",
@@ -1141,7 +1484,27 @@
     "passkey_verify_wrong_account": "Esa passkey pertenece a otra cuenta. Verifica con la passkey registrada en esta cuenta.",
     "passkey_verify_no_passkeys": "No hay passkeys registradas para esta cuenta.",
     "native_status_verifying_passkey": "Verificando passkey…",
-    "native_status_saving_password": "Guardando acceso con contraseña…"
+    "native_status_saving_password": "Guardando acceso con contraseña…",
+    "executionRouting": {
+      "title": "Enrutamiento de ejecución",
+      "enableLabel": "Usar una sesión de ejecución dedicada",
+      "enableHint": "Cuando está activado, el trabajo de implementación/ejecución se envía a trabajadores clon de corta duración copiados de la sesión plantilla de abajo, en lugar de ejecutarse en el orquestador. Guardar esto solo almacena la preferencia; no inicia ninguna ejecución.",
+      "templateLabel": "Sesión plantilla de ejecución",
+      "templateNone": "Ninguna seleccionada",
+      "templateHint": "Los clones heredan el proveedor, el modelo y las herramientas de esta sesión, pero nunca su identidad ni su historial. Solo se listan las sesiones no principales elegibles de este proyecto.",
+      "noCandidates": "Aún no hay sesiones plantilla elegibles en este proyecto. Inicia un trabajador o subsesión para usarlo como plantilla.",
+      "reselectRequired": "El enrutamiento está activado pero no hay una plantilla válida seleccionada para este proyecto. Elige una sesión plantilla de ejecución abajo.",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "sin capacidad",
+        "template_ineligible": "no es una plantilla válida",
+        "clone_of_clone_forbidden": "ya es un clon de ejecución",
+        "worker_clone_forbidden": "los trabajadores no pueden ser plantillas",
+        "cron_clone_forbidden": "una sesión programada no puede ser plantilla",
+        "target_not_found": "sesión no encontrada",
+        "destroy_forbidden": "no permitido"
+      }
+    }
   },
   "admin": {
     "title": "Panel de administración",
@@ -1293,6 +1656,7 @@
     "restore_quick_closed": "Restaurar las ventanas de sub-sesión recién cerradas",
     "quick_close_unavailable": "Abre primero una ventana de sub-sesión",
     "p2p_discussions": "Discusiones Team",
+    "auto_deliver": "Auto Deliver",
     "p2p_compact_show": "Mostrar barra Team compacta",
     "p2p_compact_hide": "Compactar barra Team",
     "p2p_compact_expand": "Mostrar barra Team detallada",

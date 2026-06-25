@@ -179,6 +179,26 @@ describe('timeline history worker', () => {
     expect(result.detailCandidates.every((candidate) => Buffer.byteLength(candidate.value, 'utf8') <= candidate.valueMaxBytes)).toBe(true);
   });
 
+  it('uses one extra content row as an older-history sentinel without returning it', async () => {
+    const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
+      insertSession(db, 'deck_hist');
+      insertEvent(db, 1, makeEvent('deck_hist', 1, 'user.message', { text: 'oldest' }, 100));
+      insertEvent(db, 2, makeEvent('deck_hist', 2, 'user.message', { text: 'middle' }, 101));
+      insertEvent(db, 3, makeEvent('deck_hist', 3, 'assistant.text', { text: 'latest', streaming: false }, 102));
+    });
+
+    const result = await handleTimelineHistoryWorkerRequest(request({ limit: 2 }));
+
+    expect(result.kind).toBe('success');
+    if (result.kind !== 'success') throw new Error(result.reason);
+    expect(result.hasMore).toBe(true);
+    expect(result.eventsRead).toBe(3);
+    expect(result.events.map((event) => event.eventId)).toEqual([
+      'deck_hist-2-user.message',
+      'deck_hist-3-assistant.text',
+    ]);
+  });
+
   it('does not send multi-MB raw detail candidates back to the main thread', async () => {
     const huge = 'x'.repeat(2 * 1024 * 1024);
     const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {

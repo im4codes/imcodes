@@ -5,6 +5,7 @@ import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-m
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -238,7 +239,7 @@ describe('WsClient', () => {
     client.connect();
     expect(client.connecting).toBe(true);
 
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(client.connected).toBe(false);
     // The first hung ticket attempt has yielded to a reconnect timer.
@@ -381,7 +382,9 @@ describe('WsClient', () => {
       state: 'disconnected',
       reason: 'socket_closed',
     });
-    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).toThrow('WebSocket not connected');
+    // Stale-socket window: send() drops the message (no delivery) but must NOT
+    // throw — an uncaught throw here crashes the ChatView via the ErrorBoundary.
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).not.toThrow();
     await vi.advanceTimersByTimeAsync(0);
 
     const secondWs = lastWs!;
@@ -424,7 +427,11 @@ describe('WsClient', () => {
     });
     expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
     expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
-    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).toThrow('WebSocket not connected');
+    // During the probe window send() must NOT deliver (no extra socket.send)
+    // and must NOT throw (an uncaught throw here crashes the ChatView).
+    const callsBeforeGuarded = socket.send.mock.calls.length;
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).not.toThrow();
+    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded);
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     expect(client.connected).toBe(true);
@@ -637,9 +644,16 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
-  it('send() throws when not connected', () => {
+  it('send() is a safe no-op when not connected (does not throw)', () => {
+    // Fire-and-forget transport must never throw to React effects/listeners —
+    // an uncaught throw crashes the ChatView via the ErrorBoundary.
     const client = new WsClient('http://localhost:8787', 'srv-1');
-    expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
+    expect(() => client.send({ type: 'ping' })).not.toThrow();
+  });
+
+  it('skips Claude weekly quota opt-in without throwing while disconnected', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(() => client.setClaudeWeeklyQuotaOptIn(true)).not.toThrow();
   });
 
   describe('dead-socket detection (pong timeout)', () => {
@@ -741,19 +755,19 @@ describe('WsClient', () => {
       client.subscribeTerminal('chat-session', false);
       client.subscribeTerminal('terminal-session', true);
 
-      expect(lastWs!.send).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(200);
-
-      expect(lastWs!.send).toHaveBeenCalledTimes(2);
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
       expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
-        type: 'terminal.subscribe',
-        session: 'chat-session',
-        raw: false,
-      });
-      expect(JSON.parse(lastWs!.send.mock.calls[1][0] as string)).toEqual({
         type: 'terminal.subscribe',
         session: 'terminal-session',
         raw: true,
+      });
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(lastWs!.send).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(lastWs!.send.mock.calls[1][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'chat-session',
+        raw: false,
       });
       client.disconnect();
       vi.useRealTimers();
@@ -800,7 +814,7 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
-    it('debounces rapid terminal subscribe/unsubscribe churn to the final state', async () => {
+    it('debounces rapid passive terminal subscribe/unsubscribe churn to the final state', async () => {
       vi.useFakeTimers();
       const client = new WsClient('http://localhost:8787', 'srv-1');
       client.connect();
@@ -810,7 +824,7 @@ describe('WsClient', () => {
 
       client.subscribeTerminal('storm-session', false);
       client.unsubscribeTerminal('storm-session');
-      client.subscribeTerminal('storm-session', true);
+      client.subscribeTerminal('storm-session', false);
       client.unsubscribeTerminal('empty-session');
 
       expect(lastWs!.send).not.toHaveBeenCalled();
@@ -818,7 +832,7 @@ describe('WsClient', () => {
 
       const messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
       expect(messages).toEqual([
-        { type: 'terminal.subscribe', session: 'storm-session', raw: true },
+        { type: 'terminal.subscribe', session: 'storm-session', raw: false },
       ]);
 
       lastWs!.send.mockClear();
@@ -826,9 +840,33 @@ describe('WsClient', () => {
       client.subscribeTerminal('storm-session', false);
       await vi.advanceTimersByTimeAsync(120);
 
-      expect(lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string))).toEqual([
-        { type: 'terminal.subscribe', session: 'storm-session', raw: false },
-      ]);
+      expect(lastWs!.send).not.toHaveBeenCalled();
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('sends raw terminal subscriptions immediately even behind a passive backlog', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      for (let i = 0; i < 25; i++) {
+        client.subscribeTerminal(`passive-${i}`, false);
+      }
+      expect(lastWs!.send).not.toHaveBeenCalled();
+
+      client.subscribeTerminal('deck_sub_shell', true);
+
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'deck_sub_shell',
+        raw: true,
+      });
 
       client.disconnect();
       vi.useRealTimers();
@@ -1108,6 +1146,7 @@ describe('WsClient', () => {
 
     let messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
     expect(messages).toEqual([
+      { type: 'terminal.subscribe', session: 'deck_storm_brain', raw: true },
       {
         type: TIMELINE_MESSAGES.HISTORY_REQUEST,
         sessionName: 'deck_storm_brain',
@@ -1400,6 +1439,27 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
+    it('can request OpenSpec task stats for directory listings', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+      client.fsListDir('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+      await vi.advanceTimersByTimeAsync(300);
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: 'fs.ls',
+        path: '/repo/openspec/changes',
+        includeFiles: false,
+        includeMetadata: false,
+        includeOpenSpecTaskStats: true,
+      });
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('returns a unique UUID as requestId', async () => {
       const client = await connectClient();
       const id1 = client.fsListDir('/home/user/a');
@@ -1428,12 +1488,44 @@ describe('WsClient', () => {
     });
   });
 
+  describe('fs rename/delete', () => {
+    it('includes the owning session when renaming', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const requestId = client.fsRename('/home/user/project/a.txt', '/home/user/project/b.txt', 'deck_proj_brain');
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: FS_TRANSPORT_MSG.RENAME,
+        requestId,
+        path: '/home/user/project/a.txt',
+        newPath: '/home/user/project/b.txt',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+
+    it('includes the owning session when deleting', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const requestId = client.fsDelete('/home/user/project/a.txt', 'deck_proj_brain');
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: FS_TRANSPORT_MSG.DELETE,
+        requestId,
+        path: '/home/user/project/a.txt',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+  });
+
   describe('urgent send (stop / cancel high-priority path)', () => {
     // Pins the user-reported "stop button stopped working again" regression.
     // probeConnection() flips `_connected = false` for ~50-200 ms on every
-    // visibility/focus tick while it pings the server. During that window
-    // the regular `send()` rejects, and the stop-button code path silently
-    // swallowed the throw — so a stop tap landing in that window vanished.
+    // visibility/focus tick while it pings the server. During that window the
+    // regular `send()` is gated and drops the message (it no-ops rather than
+    // throwing — throwing crashed the ChatView), so a stop tap landing in that
+    // window would otherwise vanish.
     // sendUrgent / sendSessionCommandUrgent bypass the probe gate (still
     // checking the OS-level readyState). Caller HTTP-fallback handles the
     // genuinely-dead-socket case.
@@ -1453,8 +1545,10 @@ describe('WsClient', () => {
       // OPEN at the OS level (the exact regression window).
       (client as unknown as { _connected: boolean })._connected = false;
 
-      // Regular send() rejects — sanity check that the gate IS in place.
-      expect(() => client.send({ type: 'session.send', text: 'normal' })).toThrow('WebSocket not connected');
+      // Regular send() is gated during the probe window — no delivery — but
+      // must NOT throw (an uncaught throw crashes the ChatView).
+      expect(() => client.send({ type: 'session.send', text: 'normal' })).not.toThrow();
+      expect(sentMessages).toHaveLength(0);
 
       // sendUrgent goes through.
       expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).not.toThrow();
@@ -1572,6 +1666,43 @@ describe('WsClient', () => {
       const client = new WsClient('http://localhost:8787', 'srv-1');
       expect(() => client.subscribeTerminal('s', false)).not.toThrow();
       expect(lastWs).toBeNull();
+    });
+  });
+
+  describe('send() never throws on a disconnected socket (ChatView crash guard)', () => {
+    // Regression: send() is called from React effects / document listeners
+    // (focus/visibility → requestSessionList, discussionList). When the socket
+    // is momentarily down, an uncaught "WebSocket not connected" throw bubbled
+    // to the ErrorBoundary and crashed the whole ChatView.
+    it('does not throw when never connected', () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(client.connected).toBe(false);
+      expect(() => client.send({ type: 'get_sessions' })).not.toThrow();
+      expect(() => client.requestSessionList()).not.toThrow();
+      expect(() => client.discussionList()).not.toThrow();
+    });
+
+    it('does not throw after the socket closes', async () => {
+      const client = await connectClient();
+      expect(client.connected).toBe(true);
+      lastWs!.emit('close', { code: 1006 });
+      expect(client.connected).toBe(false);
+      expect(() => client.send({ type: 'get_sessions' })).not.toThrow();
+      expect(() => client.requestSessionList()).not.toThrow();
+      expect(() => client.discussionList()).not.toThrow();
+    });
+
+    it('still forwards to the socket while connected', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.send({ type: 'get_sessions' });
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toMatchObject({ type: 'get_sessions' });
+    });
+
+    it('sendUrgent() STILL throws when disconnected (preserves HTTP fallback)', () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(() => client.sendUrgent({ type: 'session.stop', sessionName: 's' })).toThrow(/not connected/i);
     });
   });
 });

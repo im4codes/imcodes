@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import * as childProcess from 'node:child_process';
+import * as fsp from 'node:fs/promises';
 
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -19,13 +20,23 @@ vi.mock('node:child_process', async () => {
   };
 });
 
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  return {
+    ...actual,
+    readdir: vi.fn(),
+  };
+});
+
 import { scanFsGitStatusSnapshot } from '../../src/daemon/fs-git-status-worker.js';
 
 const mockExecFile = vi.mocked(childProcess.execFile);
+const mockReaddir = vi.mocked(fsp.readdir);
 
 describe('fs git status worker', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockReaddir.mockReset();
   });
 
   it('runs git status and optional numstat off the daemon hot path', async () => {
@@ -60,11 +71,16 @@ describe('fs git status worker', () => {
     ]);
   });
 
-  it('skips numstat work for lightweight tree status', async () => {
+  it('skips numstat work and checks only direct children for lightweight ignored status', async () => {
+    mockReaddir.mockResolvedValue([{ name: 'dist' }, { name: 'src' }] as any);
     mockExecFile.mockImplementation((file: any, args: any, options: any, callback: any) => {
       if (typeof options === 'function') callback = options;
       if (file === 'git' && args.join(' ') === 'status --porcelain=v1 -z -u') {
         callback(null, 'M  src/a.ts\0', '');
+        return {} as any;
+      }
+      if (file === 'git' && args.join(' ') === 'check-ignore -z -- dist src') {
+        callback(null, 'dist\0', '');
         return {} as any;
       }
       callback(new Error(`unexpected command: ${file} ${args.join(' ')}`), '', '');
@@ -78,8 +94,14 @@ describe('fs git status worker', () => {
       includeStats: false,
     });
 
-    expect(result.files).toEqual([{ path: '/home/k/project/src/a.ts', code: 'M' }]);
-    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    expect(result.files).toEqual([
+      { path: '/home/k/project/src/a.ts', code: 'M' },
+      { path: '/home/k/project/dist', code: '!!' },
+    ]);
+    expect(mockExecFile.mock.calls.map((call) => call[1])).toEqual([
+      ['status', '--porcelain=v1', '-z', '-u'],
+      ['check-ignore', '-z', '--', 'dist', 'src'],
+    ]);
   });
 
   it('normalizes renamed and escaped paths consistently across status and numstat', async () => {

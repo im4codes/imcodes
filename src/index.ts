@@ -66,9 +66,9 @@ import { Command } from 'commander';
 // Use dynamic import() at point of use instead of top-level imports.
 import { bindFlow } from './bind/bind-flow.js';
 import logger from './util/logger.js';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { cpus, freemem, homedir, loadavg, totalmem } from 'os';
-import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
@@ -94,6 +94,49 @@ import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.j
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
+
+function shellDoubleQuotedLiteral(value: string): string {
+  return `"${value.replace(/["\\$`]/g, '\\$&')}"`;
+}
+
+function buildImcodesCliWrapper(nodeBin: string, entryScript: string): string {
+  return `#!/bin/sh\nexec ${shellDoubleQuotedLiteral(nodeBin)} ${shellDoubleQuotedLiteral(entryScript)} "$@"\n`;
+}
+
+function writeExecutableShim(path: string, body: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  try {
+    if (lstatSync(path).isSymbolicLink()) unlinkSync(path);
+  } catch {
+    // Missing path is fine; writeFileSync below will create it.
+  }
+  writeFileSync(path, body, { mode: 0o755 });
+  chmodSync(path, 0o755);
+}
+
+function repairImcodesCliWrappers(nodeBin: string, entryScript: string): { userShim?: string; systemShim?: string; systemSkippedReason?: string } {
+  if (process.platform === 'win32') return {};
+  if (!existsSync(entryScript)) {
+    return { systemSkippedReason: `entry script not found: ${entryScript}` };
+  }
+
+  const body = buildImcodesCliWrapper(nodeBin, entryScript);
+  const userShim = join(homedir(), '.local', 'bin', 'imcodes');
+  writeExecutableShim(userShim, body);
+
+  const systemShim = '/usr/local/bin/imcodes';
+  try {
+    writeExecutableShim(systemShim, body);
+    return { userShim, systemShim };
+  } catch {
+    try {
+      execFileSync('sudo', ['-n', 'install', '-m', '755', userShim, systemShim], { stdio: 'ignore' });
+      return { userShim, systemShim };
+    } catch {
+      return { userShim, systemSkippedReason: '/usr/local/bin is not writable and passwordless sudo is unavailable' };
+    }
+  }
+}
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
@@ -878,6 +921,7 @@ program
 
     // Step 1: Install new version (do NOT kill daemon — upgrade may be running from
     // a daemon-managed session, so killing it would kill ourselves).
+    let installedEntryScript: string | null = null;
     if (isGlobal) {
       const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
       const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
@@ -887,6 +931,20 @@ program
       } catch {
         console.error('npm install failed.');
         process.exit(1);
+      }
+      try {
+        const globalRoot = execSync(`"${npmCmd}" root -g`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        installedEntryScript = join(globalRoot, 'imcodes', 'dist', 'src', 'index.js');
+        const repair = repairImcodesCliWrappers(process.execPath, installedEntryScript);
+        if (repair.userShim) console.log(`CLI wrapper refreshed: ${repair.userShim}`);
+        if (repair.systemShim) {
+          console.log(`CLI wrapper refreshed: ${repair.systemShim}`);
+        } else if (repair.systemSkippedReason) {
+          console.warn(`CLI wrapper global refresh skipped: ${repair.systemSkippedReason}`);
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`CLI wrapper refresh failed (non-fatal): ${reason}`);
       }
     } else {
       const projectRoot = PROJECT_ROOT;
@@ -905,7 +963,10 @@ program
 
     // Show new version
     try {
-      if (platform === 'win32') {
+      if (installedEntryScript && existsSync(installedEntryScript)) {
+        const newVer = execFileSync(process.execPath, [installedEntryScript, '--version'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+        console.log(`Upgraded to v${newVer}`);
+      } else if (platform === 'win32') {
         const newVer = execSync(`"${selfPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
         console.log(`Upgraded to v${newVer}`);
       } else {

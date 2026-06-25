@@ -3,6 +3,7 @@
  * Commands arrive as JSON objects with a `type` field.
  */
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
+import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -31,6 +32,8 @@ import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type Memo
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
+import { buildTransportPendingQueueSnapshot } from './transport-pending-snapshot.js';
+import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import {
   startSubSession,
   stopSubSession,
@@ -40,10 +43,12 @@ import {
   subSessionName,
   type SubSessionRecord,
 } from './subsession-manager.js';
-import { sendSubSessionSync } from './subsession-sync.js';
+import { sendSubSessionSync, type SubSessionSyncOptions } from './subsession-sync.js';
 import logger from '../util/logger.js';
+import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
@@ -57,18 +62,31 @@ import {
   type TimelineResponseStatus,
 } from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
-import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
+import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
+import {
+  expandP2pTargets as expandP2pTargetsShared,
+  resolveP2pConfigScopeSession as resolveP2pConfigScopeSessionShared,
+  resolveStructuredP2pSessionConfig as resolveStructuredP2pSessionConfigShared,
+} from './p2p-target-selection.js';
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { supervisionAutomation } from './supervision-automation.js';
-import { parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import {
+  getEnabledP2pMemberNames,
+  isP2pMemberEligibleSession,
+  parseModePipeline,
+  P2P_CONFIG_MODE,
+  isP2pSavedConfig,
+  sanitizeP2pSavedConfig,
+  type P2pSessionConfig,
+} from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig, P2pRoundPreset } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { getLoadedConfig } from '../config.js';
@@ -101,7 +119,7 @@ import {
   recordRecentInjection,
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
-import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
@@ -120,6 +138,7 @@ import {
   type MemoryMcpToolFamilyGateView,
 } from '../../shared/memory-ws.js';
 import { buildMemoryProjectionFallbackSource } from '../../shared/memory-projection-source-fallback.js';
+import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
 import { FS_WRITE_ERROR } from '../shared/transport/fs.js';
 import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG, MAX_P2P_PARTICIPANTS } from '../../shared/p2p-config-events.js';
 import { P2P_PRESET_DEFAULT_SUMMARY_PROMPT, P2P_WORKFLOW_SCHEMA_VERSION } from '../../shared/p2p-workflow-constants.js';
@@ -127,7 +146,19 @@ import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../sha
 import { compileP2pWorkflowDraft } from '../../shared/p2p-workflow-compiler.js';
 import { materializeOldAdvancedConfigToWorkflowDraft } from '../../shared/p2p-workflow-materialize.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
+import {
+  getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade,
+  handleOpenSpecAutoDeliverCommand,
+} from './openspec-auto-deliver-orchestrator.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import {
+  EXECUTION_CLONE_KIND,
+  EXECUTION_CLONE_PARENT_STAGES,
+  parseDedicatedExecutionRoutingPreference,
+  type DedicatedExecutionRoutingGlobalPreference,
+} from '../../shared/execution-clone.js';
+import { dispatchSendMessage } from './send-tool.js';
 import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
 import {
@@ -158,25 +189,18 @@ import {
   isTransportEffortLevel,
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
-import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
-import {
-  deleteContextObservation,
-  ensureContextNamespace,
-  getProcessedProjectionStats,
-  getProcessedProjectionById,
-  listMemoryProjectSummaries,
-  listContextNamespaces,
-  listContextObservations,
-  queryPendingContextEvents,
-  promoteContextObservation,
-  queryProcessedProjections,
-  recordMemoryHits,
-  updateProcessedProjectionSummary,
-  upsertPinnedNote,
-  updateContextObservationText,
-  writeContextObservation,
-  writeProcessedProjection,
+import { upsertSavedP2pConfig } from '../store/p2p-config-store.js';
+import type {
+  ContextNamespaceRow,
+  ContextObservationRow,
+  ObservationPromotionAuditRow,
+  PinnedNote,
+  ProcessedProjectionQuery,
+  ProcessedProjectionStats,
+  ProjectionSourceRow,
+  WriteProcessedProjectionInput,
 } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import {
   isKnownTestProjectName,
@@ -188,6 +212,11 @@ import {
   SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
 } from '../../shared/shared-context-runtime-config.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import {
+  searchLocalMemoryAuthorizedForManagement,
+  searchLocalMemorySemanticForManagement,
+  searchLocalMemorySemanticFrontOfTurn,
+} from '../context/memory-recall-client.js';
 import { getCompressionQueueState, resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
 import { closeLiveContextMaterializationAdmission, reopenLiveContextMaterializationAdmission } from '../context/live-context-ingestion.js';
 import { getInflightMasterCompactionCount, resumeAcceptingMasterCompactions, stopAcceptingMasterCompactions } from './master-compaction-registry.js';
@@ -231,6 +260,7 @@ import { incrementCounter } from '../util/metrics.js';
 import { computeMemoryFingerprint } from '../../shared/memory-fingerprint.js';
 import { isMemoryScope, isOwnerPrivateMemoryScope, isSharedProjectionScope, type MemoryScope } from '../../shared/memory-scope.js';
 import { isObservationClass } from '../../shared/memory-observation.js';
+import type { ContextObservationInput } from '../../shared/memory-observation.js';
 import { SKILL_MAX_BYTES } from '../../shared/skill-envelope.js';
 import { MD_INGEST_FEATURE_FLAG } from '../../shared/md-ingest.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES, type MemoryManagementErrorCode } from '../../shared/memory-management.js';
@@ -248,7 +278,13 @@ import {
   shouldHideTimelineUserMessageForSessionControl,
   shouldResetProcessPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
-import type { ContextMemoryStatsView, ContextNamespace } from '../../shared/context-types.js';
+import type {
+  ContextMemoryProjectView,
+  ContextMemoryStatsView,
+  ContextNamespace,
+  ContextPendingEventView,
+  ProcessedContextProjection,
+} from '../../shared/context-types.js';
 import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
 import { assertManagedSkillPathSync, ManagedSkillPathError } from '../context/managed-skill-path.js';
 import {
@@ -364,11 +400,63 @@ function prepareProcessPreferenceProviderText(input: {
   return prependPreferenceProviderContext(input.providerText, context);
 }
 
-function loadPreferenceProviderContext(input: {
+/**
+ * Tolerant normalizer for the launch-payload `dedicatedExecutionRouting` field
+ * (task 2.7 daemon receive-end). Returns the run-level routing object
+ * `{ enabled, templateSessionName, limits, recentSummary? }` ONLY when the
+ * payload is a well-formed object; otherwise returns `undefined` so the run
+ * keeps its default (disabled → byte-identical final-execution prompt, no
+ * clones).
+ *
+ * `enabled` is true only when the raw value is strictly the boolean `true`.
+ * `templateSessionName` is a non-empty trimmed string or null. `recentSummary`
+ * is carried only when it is a non-empty string (an already-stored summary; the
+ * hand-off builder re-bounds it). The bounded clone limits the web sends
+ * (`maxParallelClones`, `maxQueuedClones`, `cloneHardTimeoutMs`,
+ * `cloneRetentionMs`) are resolved+clamped via
+ * {@link parseDedicatedExecutionRoutingPreference} so a forged/out-of-range
+ * limit can never widen the cap — absent/invalid fields fall back to the
+ * canonical defaults. Routing is meaningful only when enabled with a valid
+ * template, but the object is still threaded when present so the orchestrator's
+ * own enable/template guards remain the single source of truth.
+ */
+function normalizeDedicatedExecutionRoutingPayload(
+  raw: unknown,
+): {
+  enabled: boolean;
+  templateSessionName: string | null;
+  limits: DedicatedExecutionRoutingGlobalPreference;
+  recentSummary?: string | null;
+} | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  const enabled = record.enabled === true;
+  const rawTemplate = record.templateSessionName;
+  const templateSessionName = typeof rawTemplate === 'string' && rawTemplate.trim().length > 0
+    ? rawTemplate
+    : null;
+  // When neither enabled nor a template is present, there is nothing to thread —
+  // return undefined so the run stays default-disabled (byte-identical).
+  if (!enabled && templateSessionName === null) return undefined;
+  const rawSummary = record.recentSummary;
+  const recentSummary = typeof rawSummary === 'string' && rawSummary.length > 0 ? rawSummary : null;
+  // Resolve the bounded limits from the same payload. The shared parser clamps
+  // every numeric field into its [MIN,MAX] bound and ignores any retired/legacy
+  // keys, so the daemon never trusts a raw client-supplied cap.
+  const limits = parseDedicatedExecutionRoutingPreference(record);
+  return {
+    enabled,
+    templateSessionName,
+    limits,
+    ...(recentSummary !== null ? { recentSummary } : {}),
+  };
+}
+
+async function loadPreferenceProviderContext(input: {
   enabled: boolean;
   userId: string;
   currentRecords: readonly PreferenceIngestRecord[];
-}): string {
+}): Promise<string> {
   if (!input.enabled) return '';
   const records: PreferenceProviderContextRecord[] = input.currentRecords.map((record) => ({
     text: record.text,
@@ -382,10 +470,11 @@ function loadPreferenceProviderContext(input: {
     '',
   ].join('\u0000');
   try {
-    for (const observation of listContextObservations({
-      scope: PREFERENCE_INGEST_SCOPE,
-      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-    })) {
+    const observations = await getContextStoreClient().run<ContextObservationRow[]>(
+      'listContextObservations',
+      [{ scope: PREFERENCE_INGEST_SCOPE, class: PREFERENCE_INGEST_OBSERVATION_CLASS }],
+    );
+    for (const observation of observations) {
       if (observation.state !== PREFERENCE_INGEST_OBSERVATION_STATE) continue;
       const preferenceText = typeof observation.content.text === 'string'
         ? observation.content.text
@@ -414,22 +503,23 @@ function schedulePreferencePersistence(input: {
   sendOrigin: SendOrigin;
 }): void {
   if (input.records.length === 0) return;
-  setTimeout(() => {
+  setTimeout(async () => {
+    const client = getContextStoreClient();
     try {
-      const namespace = ensureContextNamespace({
-        scope: PREFERENCE_INGEST_SCOPE,
-        userId: input.userId,
-        name: 'preferences',
-      });
+      const namespace = await client.run<ContextNamespaceRow>(
+        'ensureContextNamespace',
+        [{ scope: PREFERENCE_INGEST_SCOPE, userId: input.userId, name: 'preferences' }],
+      );
       for (const record of input.records) {
-        const alreadyPersisted = listContextObservations({
-          namespaceId: namespace.id,
-          class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-        }).some((observation) => (
+        const existing = await client.run<ContextObservationRow[]>(
+          'listContextObservations',
+          [{ namespaceId: namespace.id, class: PREFERENCE_INGEST_OBSERVATION_CLASS }],
+        );
+        const alreadyPersisted = existing.some((observation) => (
           observation.fingerprint === record.fingerprint
           && observation.content.idempotencyKey === record.idempotencyKey
         ));
-        writeContextObservation({
+        const observationInput: ContextObservationInput = {
           namespaceId: namespace.id,
           scope: PREFERENCE_INGEST_SCOPE,
           class: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -445,7 +535,8 @@ function schedulePreferencePersistence(input: {
           text: record.text,
           sourceEventIds: [input.commandId],
           state: PREFERENCE_INGEST_OBSERVATION_STATE,
-        });
+        };
+        await client.run<ContextObservationRow>('writeContextObservation', [observationInput]);
         incrementCounter(alreadyPersisted ? 'mem.preferences.duplicate_ignored' : 'mem.preferences.persisted', {
           sendOrigin: input.sendOrigin,
         });
@@ -610,7 +701,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   invalidateTransportListModelsCache('subsession_transport_config_update');
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
-    await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig });
+    await sendSubSessionSync(serverLink, id, { transportConfig: nextTransportConfig }, getSubSessionSyncOptions(sessionName));
   } catch {
     // not connected
   }
@@ -692,28 +783,9 @@ async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<v
     }
   }
   await stopTransportRuntimeSession(record.name).catch(() => {});
-  await launchTransportSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
-    projectDir: record.projectDir,
-    label: record.label,
-    description: record.description,
-    requestedModel: record.requestedModel,
-    effort: record.effort,
-    transportConfig: record.transportConfig,
-    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
-    // Thread resume ids back so the provider reuses the same conversation.
-    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
-    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId } : {}),
-    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-  });
+  // Resume opts (provider resume ids threaded back) are built by the shared
+  // session-manager helper — also used by ensureTransportRuntimeForPendingResend.
+  await launchTransportSession(buildTransportResumeLaunchOpts(record));
 }
 
 function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {
@@ -737,7 +809,20 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
 async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
   if (!sessionName.startsWith('deck_sub_')) return;
   const subId = sessionName.slice('deck_sub_'.length);
-  try { await sendSubSessionSync(serverLink, subId); } catch { /* ignore */ }
+  try { await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(sessionName)); } catch { /* ignore */ }
+}
+
+function getSubSessionSyncOptions(sessionName: string): SubSessionSyncOptions | undefined {
+  const runtime = getTransportRuntime(sessionName);
+  const pendingQueue = buildTransportPendingQueueSnapshot(sessionName, runtime);
+  if (pendingQueue.source === 'empty') return undefined;
+  return {
+    transportQueue: {
+      pendingMessages: pendingQueue.pendingMessages,
+      pendingEntries: pendingQueue.pendingEntries,
+      ...(typeof pendingQueue.pendingVersion === 'number' ? { pendingVersion: pendingQueue.pendingVersion } : {}),
+    },
+  };
 }
 
 /**
@@ -803,6 +888,7 @@ import {
   handleFileUpload,
   handleFileUploadFetch,
   handleFileDownload,
+  handleFileDownloadStream,
   tryCreateProjectFileHandle,
   lookupAttachment,
 } from './file-transfer-handler.js';
@@ -810,6 +896,8 @@ import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests
 import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -872,7 +960,7 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     // Re-sync sub-sessions so their quota usage labels update in the browser
     if (session.name.startsWith('deck_sub_')) {
       const subId = session.name.replace(/^deck_sub_/, '');
-      if (serverLink) void sendSubSessionSync(serverLink, subId).catch(() => { /* not connected */ });
+      if (serverLink) void sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name)).catch(() => { /* not connected */ });
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
@@ -894,7 +982,34 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
     if (!session.name.startsWith('deck_sub_')) continue;
     const subId = session.name.replace(/^deck_sub_/, '');
     try {
-      await sendSubSessionSync(serverLink, subId);
+      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
+    } catch {
+      // not connected
+    }
+  }
+}
+
+/**
+ * Periodic Option-B (5h + weekly) quota refresh for claude-code-sdk SUB-sessions.
+ *
+ * Why this is needed separately from main sessions: buildSessionList carries the
+ * proactive /api/oauth/usage override (the 5h+7d picture) for MAIN sessions but
+ * EXPLICITLY EXCLUDES sub-sessions (session-list.ts), and the real-time
+ * rate_limit_event only refreshes sub-sessions that are actively taking turns. So
+ * an idle claude-code-sdk sub keeps a stale 5h-only quota and its footer never
+ * shows the 7d line. Pushing a periodic subsession.sync — which prefers the
+ * Option-B snapshot (see subsession-sync.ts) — keeps the 7d line current, exactly
+ * mirroring refreshCodexQuotaMetadata's sub-session handling above.
+ */
+export async function refreshClaudeSdkSubQuotaMetadata(serverLink?: ServerLink): Promise<void> {
+  if (!serverLink) return;
+  for (const session of listSessions()) {
+    if (session.agentType !== 'claude-code-sdk') continue;
+    if (!session.name.startsWith('deck_sub_')) continue;
+    if (session.state === 'stopped' || session.state === 'error') continue;
+    const subId = session.name.replace(/^deck_sub_/, '');
+    try {
+      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
     } catch {
       // not connected
     }
@@ -914,61 +1029,11 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
  * - Always skip: initiator itself, stopped sessions
  */
 function expandAllTargets(initiatorName: string, mode: string, excludeSameType = false, sessionConfig?: P2pSessionConfig): P2pTarget[] {
-  const initiator = getSession(initiatorName);
-  const all = listSessions();
-  const targets: P2pTarget[] = [];
-
-  const NON_DISCUSSABLE = new Set(['shell', 'script']);
-
-  for (const s of all) {
-    if (s.name === initiatorName) continue;
-    if (s.state === 'stopped') continue;
-    if (NON_DISCUSSABLE.has(s.agentType ?? '')) continue;
-    if (excludeSameType && initiator?.agentType && s.agentType === initiator.agentType) continue;
-
-    let inDomain = false;
-    if (initiatorName.startsWith('deck_sub_')) {
-      const isSibling = s.parentSession && s.parentSession === initiator?.parentSession;
-      const isParent = s.name === initiator?.parentSession;
-      inDomain = !!(isSibling || isParent);
-    } else {
-      const isChild = s.parentSession === initiatorName;
-      const isSameProject = !s.name.startsWith('deck_sub_') && initiator?.projectName && s.projectName === initiator.projectName;
-      inDomain = !!(isChild || isSameProject);
-    }
-
-    if (!inDomain) continue;
-
-    if (sessionConfig) {
-      // Strict allowlist semantics: a saved P2P config is an INCLUSION list.
-      // ONLY sessions with `enabled: true` and a non-`skip` mode are eligible.
-      // Missing entries are EXCLUDED.
-      //
-      // Earlier "missing = include" semantics caused every new sub-session
-      // (created after the user's last save) to silently join the run, so
-      // selecting 3 members produced "all members" once any new sub-session
-      // was spawned. The Gate 1 / Gate 2 / cap=5 checks at command-handler
-      // entry now reject the empty-config case explicitly with a clear error
-      // (`NO_SAVED_CONFIG` / `NO_ENABLED_PARTICIPANTS`), so the strict
-      // allowlist never silently fails — it always either runs the picked
-      // set or surfaces a visible error.
-      const entry = sessionConfig[s.name];
-      if (!entry || entry.enabled !== true || entry.mode === 'skip') continue;
-      const effectiveMode = (mode === P2P_CONFIG_MODE) ? entry.mode : mode;
-      targets.push({ session: s.name, mode: effectiveMode });
-    } else {
-      targets.push({ session: s.name, mode });
-    }
-  }
-  // Sort deterministically by session name for predictable ordering
-  targets.sort((a, b) => a.session.localeCompare(b.session));
-  return targets;
+  return expandP2pTargetsShared(initiatorName, mode, excludeSameType, sessionConfig);
 }
 
 function resolveP2pConfigScopeSession(sessionName: string): string {
-  if (!sessionName.startsWith('deck_sub_')) return sessionName;
-  const record = getSession(sessionName);
-  return record?.parentSession ?? sessionName;
+  return resolveP2pConfigScopeSessionShared(sessionName);
 }
 
 async function resolveStructuredP2pSessionConfig(
@@ -976,15 +1041,7 @@ async function resolveStructuredP2pSessionConfig(
   serverLink: ServerLink,
   clientConfig?: P2pSessionConfig,
 ): Promise<P2pSessionConfig | undefined> {
-  const scopeSession = resolveP2pConfigScopeSession(sessionName);
-  const storeScope = getP2pConfigStoreScope(serverLink, scopeSession);
-  const saved = await getSavedP2pConfig(storeScope);
-  if (saved?.sessions && typeof saved.sessions === 'object') return saved.sessions;
-  if (storeScope !== scopeSession) {
-    const legacySaved = await getSavedP2pConfig(scopeSession);
-    if (legacySaved?.sessions && typeof legacySaved.sessions === 'object') return legacySaved.sessions;
-  }
-  return clientConfig;
+  return resolveStructuredP2pSessionConfigShared(sessionName, serverLink, clientConfig);
 }
 
 function sendP2pTargetError(
@@ -1300,6 +1357,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
       void handleSessionCancel(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES:
+      void handleSessionExecutionClones(cmd, serverLink);
+      break;
     case SESSION_GROUP_CLONE_MSG.START:
       void handleSessionGroupCloneCommand(cmd, serverLink);
       break;
@@ -1317,6 +1377,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'session.undo_queued_message':
       void handleUndoQueuedTransportMessage(cmd, serverLink);
+      break;
+    case TIMELINE_MESSAGES.DELETE:
+      void handleDeleteTimelineMessage(cmd, serverLink);
       break;
     case 'session.input':
       void handleInput(cmd);
@@ -1402,7 +1465,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
           upsertSession({ ...record, label: nextLabel, updatedAt: Date.now() });
           logger.info({ sessionName: sName, label }, 'subsession.rename: label updated');
           const id = sName.replace(/^deck_sub_/, '');
-          void sendSubSessionSync(serverLink, id, { label: nextLabel }).catch(() => {
+          void sendSubSessionSync(serverLink, id, { label: nextLabel }, getSubSessionSyncOptions(sName)).catch(() => {
             // not connected
           });
         }
@@ -1532,11 +1595,23 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'fs.write':
       void handleFsWrite(cmd, serverLink);
       break;
+    case FS_TRANSPORT_MSG.RENAME:
+      void handleFsRename(cmd, serverLink);
+      break;
+    case FS_TRANSPORT_MSG.DELETE:
+      void handleFsDelete(cmd, serverLink);
+      break;
     case P2P_WORKFLOW_MSG.CANCEL:
       void handleP2pCancel(cmd, serverLink);
       break;
     case P2P_WORKFLOW_MSG.STATUS:
       void traceCommandAsync(cmd, 'web_command.p2p_status', () => handleP2pStatus(cmd, serverLink));
+      break;
+    case OPENSPEC_AUTO_DELIVER_MSG.LAUNCH:
+    case OPENSPEC_AUTO_DELIVER_MSG.CONTINUE:
+    case OPENSPEC_AUTO_DELIVER_MSG.STOP:
+    case OPENSPEC_AUTO_DELIVER_MSG.STATUS_REQUEST:
+      void traceCommandAsync(cmd, 'web_command.openspec_auto_deliver', () => handleOpenSpecAutoDeliverCommand(cmd, serverLink));
       break;
     case CC_PRESET_MSG.LIST:
       void handleCcPresetsList(serverLink);
@@ -1618,6 +1693,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'file.download':
       void handleFileDownload(cmd, serverLink);
       break;
+    case FILE_TRANSFER_MSG.DOWNLOAD_STREAM:
+      void handleFileDownloadStream(cmd, serverLink);
+      break;
     case TRANSPORT_MSG.LIST_SESSIONS:
       void handleListProviderSessions(cmd, serverLink);
       break;
@@ -1692,7 +1770,8 @@ async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: Ser
     return;
   }
   try {
-    await upsertSavedP2pConfig(getP2pConfigStoreScope(serverLink, scopeSession), config);
+    const sanitizedConfig = sanitizeP2pSavedConfig(config, { scopeSession });
+    await upsertSavedP2pConfig(getP2pConfigStoreScope(serverLink, scopeSession), sanitizedConfig);
     if (requestId) {
       serverLink?.send({
         type: P2P_CONFIG_MSG.SAVE_RESPONSE,
@@ -1737,7 +1816,7 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawProject = cmd.project as string | undefined;
   const agentType = (cmd.agentType as string) || 'claude-code';
-  const dir = expandTilde((cmd.dir as string) || '~');
+  const requestedDir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
   const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
@@ -1756,7 +1835,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
   if (isKnownTestSessionName(sessionName) || isKnownTestProjectName(rawProject)) {
     const message = `Refusing to start known test session pattern: ${sessionName}`;
-    logger.warn({ rawProject, project, dir, agentType }, 'session.start rejected by test-session guard');
+    logger.warn({ rawProject, project, dir: requestedDir, agentType }, 'session.start rejected by test-session guard');
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
     return;
   }
@@ -1773,10 +1852,16 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     const existingByProject = listSessions(project).filter((s) => s.role === 'brain' && s.state !== 'stopped');
     if (existingByProject.length > 0) {
       const message = `Session already exists for project ${project}. Stop or restart it instead of starting a duplicate.`;
-      logger.warn({ project, dir, agentType, existing: existingByProject.map((s) => s.name) }, 'session.start rejected because project already has an active main session');
+      logger.warn({ project, dir: requestedDir, agentType, existing: existingByProject.map((s) => s.name) }, 'session.start rejected because project already has an active main session');
       try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
       return;
     }
+
+    const dir = await maybeCloneGitRemoteToDirectory({
+      gitRemoteUrl: cmd.gitRemoteUrl,
+      targetDir: requestedDir,
+    });
+
     if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
@@ -2013,7 +2098,9 @@ function markTransportCancelIdle(sessionName: string, error?: string): void {
     pendingCount: runtime?.pendingCount ?? 0,
     pendingMessages: runtime?.pendingMessages ?? [],
     pendingMessageEntries: runtime?.pendingEntries ?? [],
-    pendingMessageVersion: runtime?.pendingVersion ?? 0,
+    pendingMessageVersion: runtime
+      ? observeTransportQueueRevision(sessionName, runtime.pendingVersion)
+      : (getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined)),
     ...(error ? { error } : {}),
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -2042,6 +2129,11 @@ function cancelTransportTurnNow(
   clearResend(sessionName);
   if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
   emitSessionControlTimelineFeedback(sessionName, 'stop');
+  // Reflect idle PROMPTLY so the "working" spinner clears on STOP even when the
+  // provider's CANCELLED settle is slow or lost (notably Codex). Deferring this
+  // until after `await cancel()` left Codex sessions showing "working" until a
+  // slow interrupt settled — an idle-misjudgment / stuck-turn regression. The
+  // real cancel below still finalizes provider state.
   markTransportCancelIdle(sessionName);
 
   if (!stopRuntime) return true;
@@ -2548,12 +2640,116 @@ function summarizeP2pWorkflowDiagnostics(diagnostics: P2pWorkflowDiagnostic[]): 
   return diagnostics.map((diagnostic) => diagnostic.code).join(', ') || 'invalid_launch_envelope';
 }
 
+function buildGenericExecutionCloneWorkerPrompt(userTask: string, workerIndex: number, workerTotal: number): string {
+  return [
+    `You are execution clone worker ${workerIndex}/${workerTotal} for a generic execution request.`,
+    '',
+    'Execute the current user task independently in this cloned execution session.',
+    'Do not wait for other workers. If safe, make the needed changes directly; if the task is not safely splittable or you hit a blocker, report that clearly instead of inventing progress.',
+    'When finished, reply to the creator with a concise summary, files changed, tests run, and any blockers.',
+    '',
+    'Current user task:',
+    userTask,
+  ].join('\n');
+}
+
+async function handleSessionExecutionClones(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
+  const text = typeof cmd.text === 'string' ? cmd.text.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : randomUUID();
+
+  const fail = (error: string) => {
+    if (!sessionName) return;
+    emitCommandAck(sessionName, commandId, 'error', error, serverLink);
+  };
+
+  if (!sessionName || !text) {
+    logger.warn('session.execution_clones: missing sessionName or text');
+    return;
+  }
+
+  const callerRecord = getSession(sessionName);
+  if (!callerRecord) {
+    fail('caller session not found');
+    return;
+  }
+
+  const routing = normalizeDedicatedExecutionRoutingPayload((cmd as any).dedicatedExecutionRouting);
+  if (!routing?.enabled || !routing.templateSessionName) {
+    fail('execution template is not configured');
+    return;
+  }
+  const templateSessionName = routing.templateSessionName;
+
+  const pref = {
+    ...routing.limits,
+    enabled: true,
+  };
+  const workerTotal = Math.max(1, pref.maxParallelClones);
+  const parentRunId = `generic-execution-${commandId}`;
+  const parentStage = EXECUTION_CLONE_PARENT_STAGES[0];
+  const owningMainSessionName = callerRecord.parentSession ?? callerRecord.name;
+  const projectName = callerRecord.projectName ?? getSession(owningMainSessionName)?.projectName ?? null;
+
+  const results = await Promise.allSettled(
+    Array.from({ length: workerTotal }, async (_, index) => dispatchSendMessage(
+      {
+        userId: 'web',
+        sessionName,
+        projectName,
+        projectRoot: callerRecord.projectDir ?? null,
+      },
+      {
+        target: templateSessionName,
+        message: buildGenericExecutionCloneWorkerPrompt(text, index + 1, workerTotal),
+        reply: true,
+        idempotencyKey: `${commandId}:${index + 1}`,
+        clone: {
+          kind: EXECUTION_CLONE_KIND,
+          ephemeral: true,
+          parentRunId,
+          parentStage,
+        },
+      },
+      {
+        resolveExecutionCloneLimits: () => pref,
+      },
+    )),
+  );
+
+  const accepted = results.filter((result) => (
+    result.status === 'fulfilled' && result.value.status === 'accepted'
+  )).length;
+  if (accepted > 0) {
+    emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
+    return;
+  }
+
+  const firstError = results.find((result) => result.status === 'fulfilled' && result.value.status === 'error');
+  if (firstError?.status === 'fulfilled' && firstError.value.status === 'error') {
+    fail(firstError.value.error);
+    return;
+  }
+  const rejected = results.find((result) => result.status === 'rejected');
+  fail(rejected?.status === 'rejected'
+    ? (rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason))
+    : 'execution clone dispatch failed');
+}
+
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
   const directTargetSession = (cmd as any).directTargetSession as string | undefined;
   const directTargetMode = ((cmd as any).directTargetMode as string | undefined) ?? 'discuss';
+  const sharedActor = cmd.sharedActor && typeof cmd.sharedActor === 'object'
+    ? cmd.sharedActor as SharedActorEnvelope
+    : undefined;
+  const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
+    ? cmd.shareScope as SharedP2pRunScope
+    : undefined;
 
   if (!sessionName || !text) {
     logger.warn('session.send: missing sessionName or text');
@@ -2572,12 +2768,64 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn({ sessionName, effectiveId }, 'session.send: missing commandId — using server-generated fallback');
   }
 
+// ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
+  const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  const p2pScopeSession = resolveP2pConfigScopeSession(sessionName);
+  let receiptAcked = false;
+  const emitAcceptedReceiptAck = (): void => {
+    if (receiptAcked) return;
+    const status = isLegacy ? 'accepted_legacy' : 'accepted';
+    emitCommandAck(sessionName, effectiveId, status, undefined, serverLink);
+    receiptAcked = true;
+  };
+  const trimmedText = text.trim();
+  const wantsStructuredP2pRouting = Boolean(
+    clientP2pSessionConfig ||
+    (cmd as any).p2pMode ||
+    directTargetSession ||
+    (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
+  );
+  const wantsLegacyP2pRouting = text.includes('@@discuss(')
+    || text.includes('@@all(')
+    || text.includes('@@p2p-config(');
+  const isDaemonHandledControlSend = trimmedText === '/stop'
+    || isDaemonHandledSessionControlSend(trimmedText)
+    || /^\/model\s+\S+/.test(trimmedText)
+    || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
+
+  // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
+  // once the daemon owns the commandId, the browser should stop waiting on the
+  // websocket round trip. This intentionally happens before the first async
+  // boundary in handleSend: no P2P preference reads, no pending relaunch wait,
+  // no per-session send lock, no live context bootstrap, no semantic recall, no
+  // embedding, and no provider send-start may delay it. Follow-up delivery,
+  // reconnect/restart, memory, and SDK failures surface through later timeline
+  // or session-state events. `/compact` is intentionally NOT a daemon-handled
+  // control and is acked here before being forwarded unchanged to the SDK.
+
   // Dedup: reject duplicate commandIds explicitly so the browser/server does
   // not wait for an ack timeout after the daemon has already seen this send.
   const dedup = getDedup(sessionName);
   if (dedup.has(effectiveId)) {
     if ((cmd as any).__bridgeRetry === true) {
-      logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for commandId already owned by daemon, ignored');
+      // The bridge only retries session.send when it never saw our ack — so the
+      // original receipt ack was lost in transit. RE-EMIT it (reliably) plus the
+      // current queue snapshot instead of silently ignoring; otherwise the web's
+      // optimistic "sending" bubble spins forever even though the daemon already
+      // owns and queued the message. (Idempotent: the ack just flips the bubble's
+      // status, and session.state is a snapshot.)
+      logger.debug({ sessionName, effectiveId }, 'session.send: bridge retry for owned commandId — re-acking + re-syncing state');
+      emitAcceptedReceiptAck();
+      const retryRuntime = getTransportRuntime(sessionName);
+      if (retryRuntime && retryRuntime.pendingCount > 0) {
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'queued',
+          pendingCount: retryRuntime.pendingCount,
+          pendingMessages: retryRuntime.pendingMessages,
+          pendingMessageEntries: retryRuntime.pendingEntries,
+          pendingMessageVersion: observeTransportQueueRevision(sessionName, retryRuntime.pendingVersion),
+        }, { source: 'daemon', confidence: 'high' });
+      }
       return;
     }
     logger.debug({ sessionName, effectiveId }, 'session.send: duplicate commandId, rejected');
@@ -2596,15 +2844,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   dedup.add(effectiveId);
 
-// ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
-  const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
-  let receiptAcked = false;
-  const emitAcceptedReceiptAck = (): void => {
-    if (receiptAcked) return;
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    emitCommandAck(sessionName, effectiveId, status, undefined, serverLink);
-    receiptAcked = true;
-  };
   const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
     // Always thread the client commandId through so the web UI can reconcile
     // its optimistic "sending" bubble deterministically. Callers that set
@@ -2613,6 +2852,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       text: payloadText,
       allowDuplicate: true,
       commandId: effectiveId,
+      ...(sharedActor ? { sharedActor } : {}),
     };
     timelineEmitter.emit(
       sessionName,
@@ -2621,29 +2861,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
   };
-  const trimmedText = text.trim();
-  const wantsStructuredP2pRouting = Boolean(
-    clientP2pSessionConfig ||
-    (cmd as any).p2pMode ||
-    directTargetSession ||
-    (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
-  );
-  const wantsLegacyP2pRouting = text.includes('@@discuss(')
-    || text.includes('@@all(')
-    || text.includes('@@p2p-config(');
-  const isDaemonHandledControlSend = trimmedText === '/stop'
-    || isDaemonHandledSessionControlSend(trimmedText)
-    || /^\/model\s+\S+/.test(trimmedText)
-    || /^\/(?:thinking|effort)\s+\S+/.test(trimmedText);
-  // For ordinary user turns, command.ack is a daemon-receipt acknowledgement:
-  // once the daemon owns the commandId, the browser should stop waiting on the
-  // websocket round trip. This intentionally happens before the first async
-  // boundary in handleSend: no P2P preference reads, no pending relaunch wait,
-  // no per-session send lock, no live context bootstrap, no semantic recall, no
-  // embedding, and no provider send-start may delay it. Follow-up delivery,
-  // reconnect/restart, memory, and SDK failures surface through later timeline
-  // or session-state events. `/compact` is intentionally NOT a daemon-handled
-  // control and is acked here before being forwarded unchanged to the SDK.
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
   }
@@ -2708,9 +2925,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         );
         return;
       }
-      const enabledNames = Object.entries(p2pSessionConfig)
-        .filter(([, entry]) => entry && entry.enabled === true && entry.mode !== 'skip')
-        .map(([name]) => name);
+      const enabledNames = getEnabledP2pMemberNames(p2pSessionConfig, {
+        scopeSession: p2pScopeSession,
+      });
       if (enabledNames.length === 0) {
         logger.warn({ sessionName }, 'P2P start blocked: saved config has no enabled members');
         sendP2pTargetError(
@@ -2744,6 +2961,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const p2pAdvancedRunTimeoutMinutes = (cmd as any).p2pAdvancedRunTimeoutMinutes as number | undefined;
   const p2pContextReducer = (cmd as any).p2pContextReducer as P2pContextReducerConfig | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
+  // Dedicated-execution routing (OFF by default). Read from the launch payload
+  // and normalized; `undefined`/absent keeps the run's final-execution prompt
+  // byte-identical (no clones). This is the daemon receive-end of task 2.7 — the
+  // web populates the payload; here it is validated and threaded into the run.
+  const dedicatedExecutionRouting = normalizeDedicatedExecutionRoutingPayload(
+    (cmd as any).dedicatedExecutionRouting,
+  );
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
   const explicitTargets = directTargetSession
     ? [{ session: directTargetSession, mode: resolveSingleTargetMode(directTargetSession, directTargetMode, p2pSessionConfig) }]
@@ -2758,8 +2982,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     for (const t of explicitTargets) {
       if (t.session === '__all__') {
         agents.push(...expandAllTargets(sessionName, t.mode, false, p2pSessionConfig));
-      } else if (getSession(t.session)) {
-        agents.push({ session: t.session, mode: t.mode });
+      } else {
+        const targetRecord = getSession(t.session);
+        if (targetRecord && isP2pMemberEligibleSession(t.session, {
+          scopeSession: p2pScopeSession,
+          role: targetRecord.role,
+        })) {
+          agents.push({ session: t.session, mode: t.mode });
+        }
       }
     }
     // Extract @file references from text
@@ -2863,7 +3093,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (existingRun && forceNew) {
         // Force: cancel existing run first, then start new
         logger.info({ sessionName, existingRunId: existingRun.id }, 'P2P force: cancelling existing run');
-        cancelP2pRun(existingRun.id, serverLink);
+        cancelP2pRun(existingRun.id, serverLink, {
+          source: 'force_new_p2p',
+          reason: 'existing_run_conflict_force',
+          requestedBySession: sessionName,
+        });
       }
 
       const record = getSession(sessionName);
@@ -2938,6 +3172,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         extraPrompt: p2pExtraPrompt,
         modeOverride: resolvedMode || undefined,
         hopTimeoutMs: p2pHopTimeoutMs,
+        sharedActor,
+        shareScope,
+        launchOrigin: {
+          kind: 'manual',
+          commandId: effectiveId,
+        },
+        ...(dedicatedExecutionRouting ? { dedicatedExecutionRouting } : {}),
         ...(compiledFromEnvelope
           ? {
               advanced: {
@@ -3055,7 +3296,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     incrementCounter(event.counter, { sendOrigin: event.sendOrigin });
   }
   const displayText = preferenceIngest.providerText;
-  const preferenceMessagePreamble = loadPreferenceProviderContext({
+  const preferenceMessagePreamble = await loadPreferenceProviderContext({
     enabled: preferenceFeatureEnabled,
     userId: preferenceUserId,
     currentRecords: preferenceIngest.records,
@@ -3097,6 +3338,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
@@ -3123,7 +3365,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
-    const infoMsg = `⏳ Provider ${providerLabel} not connected yet — will resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once reconnected.`;
+    const infoMsg = `⏳ Agent ${providerLabel} is restoring — ${queued.length} queued message${queued.length === 1 ? '' : 's'} will send automatically once ready.`;
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
@@ -3137,11 +3379,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         state: 'queued',
         pendingCount: queued.length,
         pendingMessages: queued.map((e) => e.text),
-        pendingMessageEntries: queued.map((e) => ({ clientMessageId: e.commandId, text: e.text })),
+        pendingMessageEntries: queued.map((e) => ({
+          clientMessageId: e.commandId,
+          text: e.text,
+          ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
+        })),
+        pendingMessageVersion: enqueueResult.pendingVersion,
       },
       { source: 'daemon', confidence: 'high' },
     );
     emitAcceptedReceiptAck();
+    void syncSubSessionIfNeeded(sessionName, serverLink);
     // Best-effort resume for sessions that failed to launch or whose runtime
     // vanished outside the provider reconnect path. The resend queue drains on
     // successful relaunch, so the queued user message still delivers.
@@ -3180,6 +3428,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
       queuedAt: Date.now(),
     });
@@ -3201,7 +3450,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
-    const infoMsg = `⏳ Provider ${providerLabel} is restarting — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once the runtime is back.`;
+    const infoMsg = `⏳ Provider ${providerLabel} runtime is recovering — will auto-resend ${queued.length} queued message${queued.length === 1 ? '' : 's'} once it is back.`;
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
@@ -3215,11 +3464,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         state: 'queued',
         pendingCount: queued.length,
         pendingMessages: queued.map((e) => e.text),
-        pendingMessageEntries: queued.map((e) => ({ clientMessageId: e.commandId, text: e.text })),
+        pendingMessageEntries: queued.map((e) => ({
+          clientMessageId: e.commandId,
+          text: e.text,
+          ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
+        })),
+        pendingMessageVersion: enqueueResultMissingSid.pendingVersion,
       },
       { source: 'daemon', confidence: 'high' },
     );
     emitAcceptedReceiptAck();
+    void syncSubSessionIfNeeded(sessionName, serverLink);
     // Best-effort resume. Failure is logged but doesn't change the ack —
     // the next user send will re-enter this branch and try again, or a
     // manual /restart path can recover.
@@ -3497,16 +3752,29 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
+      const sharedMetadata = sharedActor ? { sharedActor } : undefined;
       const result = preferenceMessagePreamble
-        ? transportRuntime.send(
-          displayText,
-          effectiveId,
-          attachments.length > 0 ? attachments : undefined,
-          preferenceMessagePreamble,
-        )
+        ? (sharedMetadata
+            ? transportRuntime.send(
+              displayText,
+              effectiveId,
+              attachments.length > 0 ? attachments : undefined,
+              preferenceMessagePreamble,
+              sharedMetadata,
+            )
+            : transportRuntime.send(
+              displayText,
+              effectiveId,
+              attachments.length > 0 ? attachments : undefined,
+              preferenceMessagePreamble,
+            ))
         : (attachments.length > 0
-            ? transportRuntime.send(displayText, effectiveId, attachments)
-            : transportRuntime.send(displayText, effectiveId));
+            ? (sharedMetadata
+                ? transportRuntime.send(displayText, effectiveId, attachments, undefined, sharedMetadata)
+                : transportRuntime.send(displayText, effectiveId, attachments))
+            : (sharedMetadata
+                ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sharedMetadata)
+                : transportRuntime.send(displayText, effectiveId)));
       if (shouldTrackSupervisionTaskRun) {
         if (result === 'queued') {
           supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
@@ -3532,7 +3800,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           pendingCount: transportRuntime.pendingCount,
           pendingMessages: transportRuntime.pendingMessages,
           pendingMessageEntries: transportRuntime.pendingEntries,
-          pendingMessageVersion: transportRuntime.pendingVersion,
+          pendingMessageVersion: observeTransportQueueRevision(sessionName, transportRuntime.pendingVersion),
         }, { source: 'daemon', confidence: 'high' });
       }
       // Clear fresh-start flag — the new conversation is now active
@@ -3737,7 +4005,7 @@ async function sendProcessSessionMessage(
       relatedToEventId: userEvent.eventId,
     });
     if (memoryContext.hitIds && memoryContext.hitIds.length > 0) {
-      try { recordMemoryHits(memoryContext.hitIds); } catch { /* non-fatal */ }
+      getContextStoreClient().fireAndForget('recordMemoryHits', [memoryContext.hitIds]);
     }
   }
 
@@ -3819,7 +4087,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: runtime.pendingVersion,
+      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -3856,13 +4124,79 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: runtime.pendingVersion,
+      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   } finally {
     release();
   }
+}
+
+/**
+ * Globally delete (hide) one timeline message. Initiated by a right-click in the
+ * web UI; the deletion is durable and propagates to every viewer.
+ *
+ * Mechanism: re-emit the exact target event with `hidden: true`. The stable-eventId
+ * path in `timelineEmitter.emit` replaces it in the ring buffer and re-broadcasts to
+ * all viewers; the re-emit's fresh (higher) `seq` wins the same-eventId merge
+ * (`preferTimelineEvent`) on BOTH the daemon and every web client; the renderer drops
+ * `hidden` events (ChatView filters them); and the JSONL append + SQLite `hidden`
+ * column make it durable across refresh/restart. The agent's already-processed
+ * conversation context is intentionally untouched — this removes the message from the
+ * timeline view, it does not rewrite history the model already saw.
+ *
+ * Double-insurance write path: the server pod-routes the command by serverId, and the
+ * daemon independently re-checks that it actually owns `sessionName` before mutating.
+ */
+async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
+  const eventId = typeof cmd.eventId === 'string' ? cmd.eventId.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : `delete-msg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (!sessionName || !eventId) return;
+
+  const ackError = (error: string): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  };
+  const ackAccepted = (): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+  };
+
+  // Authorize: this daemon must actually own the session before touching its timeline.
+  if (!getSession(sessionName)) {
+    ackError('Session not found');
+    return;
+  }
+
+  // Locate the target event: in-memory ring buffer first (covers recently-visible
+  // messages), then a bounded tail read of the persisted JSONL for older ones.
+  let target = timelineEmitter.getBufferedEvents(sessionName).find((e) => e.eventId === eventId);
+  if (!target) {
+    try {
+      target = timelineStore.read(sessionName, { limit: 5000 }).find((e) => e.eventId === eventId);
+    } catch { /* fall through to not-found */ }
+  }
+  if (!target) {
+    ackError('Message not found');
+    return;
+  }
+  if (target.hidden) {
+    ackAccepted(); // Idempotent — already deleted.
+    return;
+  }
+
+  // Re-emit verbatim with hidden:true (see function doc for why this is the delete).
+  timelineEmitter.emit(sessionName, target.type, target.payload, {
+    eventId: target.eventId,
+    hidden: true,
+    source: target.source,
+    confidence: target.confidence,
+  });
+  ackAccepted();
 }
 
 async function handleInput(cmd: Record<string, unknown>): Promise<void> {
@@ -3948,13 +4282,39 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
       existing.unsubscribe();
       activeSubscriptions.delete(session);
     }
-    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for transport session');
+    const runtime = getTransportRuntime(session);
+    if (!runtime?.providerSessionId && record) {
+      // A browser subscription is the daemon's strongest signal that this
+      // transport session is active/visible after a daemon restart. Warm-restore
+      // it here so the user's next message does not have to be the thing that
+      // creates the SDK runtime. The per-session relaunch lock prevents repeated
+      // subscribe replays from causing a launch storm.
+      void runExclusiveSessionRelaunch(session, async () => {
+        try {
+          await resumeTransportRuntimeAfterLoss(record);
+        } catch (err) {
+          logger.warn({ err, session, agentType: record.agentType }, 'Transport warm restore from browser subscription failed');
+        }
+      });
+    }
+    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for transport session; warm restore requested if needed');
+    return;
+  }
+  const raw = cmd.raw === true;
+  const isShellLike = record?.agentType === 'shell' || record?.agentType === 'script';
+  if (isShellLike && !raw) {
+    const existing = activeSubscriptions.get(session);
+    if (existing) {
+      existing.unsubscribe();
+      activeSubscriptions.delete(session);
+    }
+    logger.debug({ session, agentType: record?.agentType }, 'Terminal subscribe skipped for passive shell/script session');
     return;
   }
 
-  // The bridge may include a `raw` flag on terminal.subscribe for its own forwarding-mode
-  // bookkeeping, but daemon-side terminal streaming remains transport-stable in this phase:
-  // once subscribed for a session, we continue emitting both text diffs and raw PTY bytes.
+  // Non-shell process sessions still keep a daemon-side stream for terminal
+  // state and legacy parser updates; shell/script sessions are live surfaces
+  // only, so raw:false is handled above as "no terminal subscription".
   // Per-session raw PTY batching: accumulate small chunks and flush on timer or size threshold.
   let rawBatch: Buffer[] = [];
   let rawBatchBytes = 0;
@@ -4518,6 +4878,7 @@ interface TimelineHistoryBuildResult {
   payloadBytes: number;
   droppedEvents: number;
   truncatedEvents: number;
+  hasMore: boolean;
   readMs: number;
   synthesizeMs: number;
   sanitizeMs: number;
@@ -4537,6 +4898,7 @@ function timelineHistoryErrorResult(source: string, errorReason: TimelineRequest
     payloadBytes: 2,
     droppedEvents: 0,
     truncatedEvents: 0,
+    hasMore: false,
     readMs: 0,
     synthesizeMs: 0,
     sanitizeMs: 0,
@@ -4599,7 +4961,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     substantive = await timelineStore.readByTypesPreferred(
       params.sessionName,
       [...TIMELINE_HISTORY_CONTENT_TYPES],
-      { limit: params.limit, afterTs: params.afterTs, beforeTs: params.beforeTs },
+      { limit: params.limit + 1, afterTs: params.afterTs, beforeTs: params.beforeTs },
     );
   } catch (err) {
     if (err instanceof TimelinePreferredReadError) {
@@ -4628,7 +4990,8 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
 
   // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
-  const trimmedSubstantive = substantive.length > params.limit ? substantive.slice(substantive.length - params.limit) : substantive;
+  let hasMoreHistory = substantive.length > params.limit;
+  const trimmedSubstantive = hasMoreHistory ? substantive.slice(substantive.length - params.limit) : substantive;
   let trimmed: TimelineEvent[];
   if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
     const cutoffTs = trimmedSubstantive[0]!.ts;
@@ -4655,12 +5018,14 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
         const synthesized = buildTimelineEventsFromOpenCodeExport(params.sessionName, exportData, timelineEmitter.epoch)
           .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
           .filter((event) => params.beforeTs === undefined || event.ts < params.beforeTs);
-        const synthesizedTrimmed = synthesized.length > params.limit ? synthesized.slice(synthesized.length - params.limit) : synthesized;
+        const synthesizedHasMore = synthesized.length > params.limit;
+        const synthesizedTrimmed = synthesizedHasMore ? synthesized.slice(synthesized.length - params.limit) : synthesized;
         if (
           !hasSubstantiveTimelineHistory(trimmed)
           || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
         ) {
           trimmed = synthesizedTrimmed;
+          hasMoreHistory = synthesizedHasMore;
         }
       } catch (err) {
         logger.debug({ err, sessionHash: hashSessionName(params.sessionName), opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
@@ -4683,6 +5048,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     payloadBytes: sanitized.payloadBytes,
     droppedEvents: sanitized.droppedEvents,
     truncatedEvents: sanitized.truncatedEvents,
+    hasMore: hasMoreHistory || sanitized.droppedEvents > 0,
     readMs,
     synthesizeMs,
     sanitizeMs: Date.now() - tSanitize,
@@ -4716,6 +5082,7 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     payloadBytes: result.payloadBytes,
     droppedEvents: result.droppedEvents,
     truncatedEvents: result.truncatedEvents,
+    hasMore: result.hasMore === true || result.droppedEvents > 0,
     readMs: result.readMs,
     synthesizeMs: 0,
     sanitizeMs: result.sanitizeMs,
@@ -4763,6 +5130,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const tStart = Date.now();
   try {
     const result = await getTimelineHistoryResult(params);
+    const hasMore = result.hasMore || result.droppedEvents > 0;
     const sent = sendTimelineMessage(serverLink, {
       type: timelineHistoryResponseTypeForRequest(cmd),
       sessionName,
@@ -4774,7 +5142,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       source: result.source,
       payloadBytes: result.payloadBytes,
       payloadTruncated: result.droppedEvents > 0 || result.truncatedEvents > 0,
-      hasMore: result.droppedEvents > 0,
+      hasMore,
       nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
       cursorReset: result.cursorReset,
       droppedEvents: result.droppedEvents,
@@ -4905,7 +5273,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
-        await sendSubSessionSync(serverLink, id);
+        await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -4969,7 +5337,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      await sendSubSessionSync(serverLink, id);
+      await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -5016,7 +5384,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
         });
         try {
-          await sendSubSessionSync(serverLink, id);
+          await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));
         } catch { /* not connected */ }
       } catch (e: unknown) {
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
@@ -5034,7 +5402,7 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
   for (const sub of subSessions) {
     try {
-      await sendSubSessionSync(serverLink, sub.id);
+      await sendSubSessionSync(serverLink, sub.id, undefined, getSubSessionSyncOptions(`deck_sub_${sub.id}`));
     } catch (e) {
       logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
     }
@@ -5072,7 +5440,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      await sendSubSessionSync(serverLink, id);
+      await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sessionName));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');
@@ -5119,9 +5487,31 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
       // (confirming the answer was received) and persists it across a refresh.
       emitTransportUserMessageEvent(sessionName, answer);
     } else {
-      // Timed out / already self-continued: deliver as an ordinary message,
-      // which echoes the answer through handleSend.
-      await handleSend({ sessionName, text: answer }, serverLink);
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime?.providerSessionId) {
+        // If the provider cannot resolve the question in place, this answer is
+        // still semantically tied to the currently visible dialog. Do not append
+        // it behind unrelated pending user messages: put it at the front of the
+        // transport queue so it is the next provider-visible turn. This fixes
+        // the askquestion failure mode where a queued backlog caused the chosen
+        // option to arrive too late and the dialog reported "no answer".
+        const result = runtime.send(answer, undefined, undefined, undefined, { queuePlacement: 'front' });
+        if (result === 'sent') {
+          emitTransportUserMessageEvent(sessionName, answer);
+        } else {
+          timelineEmitter.emit(sessionName, 'session.state', {
+            state: 'queued',
+            pendingCount: runtime.pendingCount,
+            pendingMessages: runtime.pendingMessages,
+            pendingMessageEntries: runtime.pendingEntries,
+            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+          }, { source: 'daemon', confidence: 'high' });
+        }
+      } else {
+        // Timed out / already self-continued and no live runtime snapshot is
+        // available: fall back to the ordinary transport-aware send path.
+        await handleSend({ sessionName, text: answer }, serverLink);
+      }
     }
     return;
   }
@@ -5510,10 +5900,14 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
   const cwd = cmd.cwd as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const rawParticipants = cmd.participants as Array<Record<string, unknown>> | undefined;
+  const shareEnvelope = {
+    ...(cmd.sharedActor ? { sharedActor: cmd.sharedActor } : {}),
+    ...(cmd.shareScope ? { shareScope: cmd.shareScope } : {}),
+  };
 
   if (!topic || !rawParticipants || rawParticipants.length < 2) {
     logger.warn('discussion.start: missing required fields');
-    try { serverLink.send({ type: 'discussion.error', requestId, error: 'missing_fields' }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'discussion.error', requestId, error: 'missing_fields', ...shareEnvelope }); } catch { /* ignore */ }
     return;
   }
 
@@ -5545,7 +5939,7 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
         verdictIdx: cmd.verdictIdx as number | undefined,
       },
       (msg) => {
-        try { serverLink.send(msg as Record<string, unknown>); } catch { /* not connected */ }
+        try { serverLink.send({ ...msg, ...shareEnvelope } as Record<string, unknown>); } catch { /* not connected */ }
       },
     );
 
@@ -5563,12 +5957,13 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
           agentType: p.agentType,
           model: p.model,
         })),
+        ...shareEnvelope,
       });
     } catch { /* not connected */ }
   } catch (err) {
     logger.error({ err }, 'discussion.start failed');
     const error = err instanceof Error ? err.message : String(err);
-    try { serverLink.send({ type: 'discussion.error', requestId, error }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'discussion.error', requestId, error, ...shareEnvelope }); } catch { /* ignore */ }
   }
 }
 
@@ -5719,7 +6114,14 @@ export function evaluateAutoUpgradeCooldown(
   let raw: string | null = null;
   try { raw = input.readSentinel(); } catch { /* sentinel unreadable */ }
   if (!raw) return { onCooldown: false, remainingMs: 0, lastAt: null };
-  const lastAt = parseInt(raw.trim(), 10);
+  const trimmed = raw.trim();
+  // Require a pure epoch-ms integer. `parseInt` silently accepts trailing
+  // garbage — e.g. the corrupt "17813679103N" that BSD/macOS `date +%s%3N`
+  // writes (no %N support) — and would misread it as a 1970-era timestamp,
+  // making the cooldown look long-expired and driving an auto-upgrade thrash
+  // loop. Anything that isn't all digits is treated as "no usable sentinel".
+  if (!/^\d+$/.test(trimmed)) return { onCooldown: false, remainingMs: 0, lastAt: null };
+  const lastAt = parseInt(trimmed, 10);
   if (!Number.isFinite(lastAt)) return { onCooldown: false, remainingMs: 0, lastAt: null };
   const ageMs = now - lastAt;
   // Negative age (clock skew, sentinel from the future) → ignore the
@@ -5730,13 +6132,11 @@ export function evaluateAutoUpgradeCooldown(
   return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
 }
 
-/** How long the *session-busy* gate may keep deferring an upgrade before the
- *  daemon forces it through. The per-turn staleness guard
- *  (`TRANSPORT_STALE_TURN_MS`) catches wedged transport turns; this is the
- *  final backstop for everything else (a process-agent CLI stuck in
- *  'running'/'queued', a transport turn the staleness guard hasn't yet aged
- *  out, an unforeseen state) so ONE stuck session can never pin the daemon on
- *  an old version forever. Override for tests via IMCODES_MAX_UPGRADE_DEFER_MS. */
+/** How long the *session-busy* gate reports continuous deferral in logs before
+ *  it marks the wait as capped. It is intentionally advisory only: a daemon
+ *  self-upgrade must never force through an active turn, because restarting the
+ *  daemon would kill or abandon the user's in-flight work. Override for tests
+ *  via IMCODES_MAX_UPGRADE_DEFER_MS. */
 const MAX_UPGRADE_DEFER_MS = (() => {
   const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
@@ -5750,8 +6150,8 @@ let upgradeSessionBusyDeferredSince: number | null = null;
 
 /** Pure decision for the session-busy deferral backstop. Given whether the
  *  session gate is currently blocking and how long it has been blocking,
- *  decide whether to proceed anyway (forced) and what the next "blocked since"
- *  marker should be. Extracted for deterministic unit testing. */
+ *  decide whether to keep blocking and what the next "blocked since" marker
+ *  should be. Extracted for deterministic unit testing. */
 export function evaluateUpgradeDeferralBackstop(args: {
   blocked: boolean;
   deferredSince: number | null;
@@ -5764,10 +6164,9 @@ export function evaluateUpgradeDeferralBackstop(args: {
   }
   const since = deferredSince ?? now;
   const deferredMs = Math.max(0, now - since);
-  if (Number.isFinite(maxDeferMs) && maxDeferMs > 0 && deferredMs >= maxDeferMs) {
-    // Deferred long enough — force the upgrade through and reset the tracker.
-    return { proceed: true, forced: true, nextDeferredSince: null, deferredMs };
-  }
+  // The cap is diagnostic, not a bypass. Keep blocking active work forever
+  // until the turn finishes or the user explicitly stops it.
+  void maxDeferMs;
   return { proceed: false, forced: false, nextDeferredSince: since, deferredMs };
 }
 
@@ -5901,46 +6300,6 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
-  // ── Auto-upgrade cooldown ─────────────────────────────────────────────────
-  // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the
-  // npm registry. With CI publishing every ~5 min during active dev work,
-  // four daemons each restarting on every tag = ~7 s offline × 4 boxes
-  // every few minutes, which a human operator perceives as "always
-  // offline". Bypassed when the operator names a specific targetVersion.
-  // Sentinel: ~/.imcodes/last-upgrade-at, updated by upgrade.sh.
-  try {
-    const { homedir: _homedir } = await import('os');
-    const { join: _join } = await import('path');
-    const { readFileSync: _readFile } = await import('fs');
-    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
-    const verdict = evaluateAutoUpgradeCooldown({
-      targetVersion,
-      cooldownMs: parseInt(
-        process.env.IMCODES_UPGRADE_COOLDOWN_MS ?? String(10 * 60 * 1000),
-        10,
-      ),
-      readSentinel: () => {
-        try { return _readFile(sentinelPath, 'utf8'); } catch { return null; }
-      },
-    });
-    if (verdict.onCooldown) {
-      logger.info({
-        targetVersion,
-        lastUpgradeAt: verdict.lastAt,
-        cooldownRemainingMs: verdict.remainingMs,
-      }, 'daemon.upgrade: auto-upgrade declined (cooldown active)');
-      try {
-        serverLink?.send({
-          type: DAEMON_MSG.UPGRADE_BLOCKED,
-          reason: 'cooldown_active',
-          cooldownRemainingMs: verdict.remainingMs,
-          lastUpgradeAt: verdict.lastAt,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
-  } catch { /* defensive — never block the upgrade on a sentinel read error */ }
-
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -5953,6 +6312,25 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
         type: DAEMON_MSG.UPGRADE_BLOCKED,
         reason: 'p2p_active',
         activeRunIds: activeRuns.map((run) => run.id),
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
+  const activeOpenSpecAutoDeliverRuns = getActiveOpenSpecAutoDeliverRunsBlockingDaemonUpgrade();
+  if (activeOpenSpecAutoDeliverRuns.length > 0) {
+    logger.warn({
+      targetVersion,
+      activeRunIds: activeOpenSpecAutoDeliverRuns.map((run) => run.runId),
+      activeRunStatuses: activeOpenSpecAutoDeliverRuns.map((run) => run.status),
+      activeRunStages: activeOpenSpecAutoDeliverRuns.map((run) => run.stage),
+    }, 'daemon.upgrade: blocked because OpenSpec Auto Deliver is active');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'auto_deliver_active',
+        activeRunIds: activeOpenSpecAutoDeliverRuns.map((run) => run.runId),
+        activeOpenSpecAutoDeliverRuns,
       });
     } catch { /* ignore */ }
     return;
@@ -6015,18 +6393,48 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     } catch { /* ignore */ }
     return;
   }
-  if (activeSessions.length > 0 && deferralBackstop.forced) {
-    // Deferred past MAX_UPGRADE_DEFER_MS — the blocking session(s) are almost
-    // certainly wedged. Proceed anyway rather than stay pinned on an old
-    // version forever; a transport SDK session resumes after restart and a
-    // wedged process turn was already lost.
-    logger.warn({
+
+  // ── Auto-upgrade cooldown (LAST gate before upgrading) ────────────────────
+  // Server pushes `daemon.upgrade` whenever it sees a new dev tag on the npm
+  // registry. With CI publishing every ~5 min during active dev work, daemons
+  // restarting on every tag = repeated ~7 s offline windows, perceived as
+  // "always offline". Bypassed when the operator names a specific
+  // targetVersion. Sentinel: ~/.imcodes/last-upgrade-at, updated by upgrade.sh.
+  // Checked AFTER the active-work gates above: those are more important and
+  // must report their specific block reason rather than being preempted by a
+  // recent-upgrade cooldown.
+  try {
+    const { homedir: _homedir } = await import('os');
+    const { join: _join } = await import('path');
+    const { readFileSync: _readFile } = await import('fs');
+    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
+    const verdict = evaluateAutoUpgradeCooldown({
       targetVersion,
-      blockedSessions: activeSessions,
-      deferredMs: deferralBackstop.deferredMs,
-      maxDeferMs: MAX_UPGRADE_DEFER_MS,
-    }, 'daemon.upgrade: forcing upgrade despite active sessions after prolonged deferral (sessions likely wedged)');
-  }
+      cooldownMs: parseInt(
+        process.env.IMCODES_UPGRADE_COOLDOWN_MS ?? String(10 * 60 * 1000),
+        10,
+      ),
+      readSentinel: () => {
+        try { return _readFile(sentinelPath, 'utf8'); } catch { return null; }
+      },
+    });
+    if (verdict.onCooldown) {
+      logger.info({
+        targetVersion,
+        lastUpgradeAt: verdict.lastAt,
+        cooldownRemainingMs: verdict.remainingMs,
+      }, 'daemon.upgrade: auto-upgrade declined (cooldown active)');
+      try {
+        serverLink?.send({
+          type: DAEMON_MSG.UPGRADE_BLOCKED,
+          reason: 'cooldown_active',
+          cooldownRemainingMs: verdict.remainingMs,
+          lastUpgradeAt: verdict.lastAt,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+  } catch { /* defensive — never block the upgrade on a sentinel read error */ }
 
   const { spawn } = await import('child_process');
   const { writeFileSync, readFileSync, mkdtempSync, existsSync } = await import('fs');
@@ -6687,6 +7095,57 @@ if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; the
   exit 0
 fi
 
+NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
+NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
+
+repair_cli_wrappers() {
+  if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
+    log "[step 3.6] $NEW_IMCODES_SCRIPT not found — skipping CLI wrapper repair"
+    return 0
+  fi
+
+  WRAPPER_TMP="$SCRIPT_DIR/imcodes-cli-wrapper"
+  {
+    printf '%s\\n' '#!/bin/sh'
+    printf 'exec "%s" "%s" "$@"\\n' "$NODE" "$NEW_IMCODES_SCRIPT"
+  } > "$WRAPPER_TMP" || {
+    log "[step 3.6] failed to write temporary CLI wrapper (non-fatal)"
+    return 0
+  }
+  chmod 755 "$WRAPPER_TMP" 2>/dev/null || true
+
+  USER_BIN="$HOME/.local/bin"
+  USER_SHIM="$USER_BIN/imcodes"
+  if mkdir -p "$USER_BIN" 2>/dev/null; then
+    if rm -f "$USER_SHIM" 2>/dev/null && cp "$WRAPPER_TMP" "$USER_SHIM" 2>/dev/null && chmod 755 "$USER_SHIM" 2>/dev/null; then
+      log "[step 3.6] refreshed CLI wrapper: $USER_SHIM"
+    else
+      log "[step 3.6] failed to refresh $USER_SHIM (non-fatal)"
+    fi
+  else
+    log "[step 3.6] failed to create $USER_BIN (non-fatal)"
+  fi
+
+  case "$(uname)" in
+    Linux|Darwin)
+      GLOBAL_SHIM="/usr/local/bin/imcodes"
+      if [ ! -d "/usr/local/bin" ]; then
+        log "[step 3.6] /usr/local/bin absent — skipped global CLI wrapper"
+      elif rm -f "$GLOBAL_SHIM" 2>/dev/null && cp "$WRAPPER_TMP" "$GLOBAL_SHIM" 2>/dev/null && chmod 755 "$GLOBAL_SHIM" 2>/dev/null; then
+        log "[step 3.6] refreshed CLI wrapper: $GLOBAL_SHIM"
+      elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+        if sudo install -m 755 "$WRAPPER_TMP" "$GLOBAL_SHIM" >> "$LOG" 2>&1; then
+          log "[step 3.6] refreshed CLI wrapper with sudo: $GLOBAL_SHIM"
+        else
+          log "[step 3.6] sudo install failed for $GLOBAL_SHIM (non-fatal)"
+        fi
+      else
+        log "[step 3.6] skipped $GLOBAL_SHIM: not writable and passwordless sudo unavailable"
+      fi
+      ;;
+  esac
+}
+
 # Downgrade guard — refuse to restart if installed < current daemon.
 # Catches: server broadcasts \`latest\` but npm's "latest" dist-tag
 # resolves to an older release than the operator's local dev build.
@@ -6719,7 +7178,9 @@ if [ "$CMP" = "1" ]; then
   exit 0
 fi
 if [ "$CMP" = "0" ]; then
-  log "[step 3] installed $INSTALLED_VER matches current — no restart needed"
+  log "[step 3] installed $INSTALLED_VER matches current — repairing CLI wrappers without restart"
+  log "[step 3.6] repairing CLI wrappers"
+  repair_cli_wrappers
   log "=== upgrade complete (no-op) ==="
   schedule_self_cleanup
   exit 0
@@ -6760,8 +7221,6 @@ log "[step 3] version comparator: installed > current → restart"
 # directly or have a non-standard launcher, neither of which we should
 # clobber.
 log "[step 3.5] regenerating launch chain"
-NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
-NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
 
 # Prefer the self-healing launcher (bin/imcodes-launch.sh) when the
 # freshly-installed package ships it. Older installs (pre-launcher) fall
@@ -6828,6 +7287,9 @@ elif [ "$(uname)" = "Darwin" ]; then
   fi
 fi
 
+log "[step 3.6] repairing CLI wrappers"
+repair_cli_wrappers
+
 log "[step 4] running restart command"
 # Wrap restartCmd in a subshell so its multi-line content captures all
 # stdout/stderr to LOG. The previous template-literal interpolation
@@ -6888,9 +7350,13 @@ else
   # consults this on the new daemon's next auto-upgrade attempt to
   # rate-limit dev-tag-poll-driven restarts. Survives restart by
   # design (the very transition we are throttling against).
-  # date +%s%3N = epoch ms (matches Date.now in JS). Best-effort: a
-  # missing sentinel means no cooldown applies.
-  date +%s%3N > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
+  # Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
+  # has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
+  # the sentinel — which made the cooldown never apply and drove a macOS
+  # auto-upgrade thrash loop (stuck upgrade.sh + endless daemon restarts).
+  # seconds*1000 is ms-granular enough for a multi-minute cooldown and works on
+  # both GNU and BSD date. Best-effort: a missing sentinel means no cooldown.
+  printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
   log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 fi
 
@@ -6936,12 +7402,47 @@ function isPathAllowed(realPath: string): boolean {
   return isFilePreviewPathAllowed(realPath);
 }
 
+function isSameOrInsidePath(root: string, candidate: string): boolean {
+  const relative = nodePath.relative(root, candidate);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
+}
+
+async function resolveFsMutationSessionRoot(cmd: Record<string, unknown>): Promise<
+  | { ok: true; realRoot?: string }
+  | { ok: false; error: string }
+> {
+  const sessionName = typeof cmd.sessionName === 'string'
+    ? cmd.sessionName
+    : typeof cmd.session === 'string'
+      ? cmd.session
+      : '';
+  if (!sessionName) return { ok: true };
+  const record = getSession(sessionName);
+  if (!record?.projectDir) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+  try {
+    const realRoot = await fsRealpath(record.projectDir);
+    if (!isPathAllowed(realRoot)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    return { ok: true, realRoot };
+  } catch {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
+  }
+}
+
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 
 async function handleP2pCancel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const runId = cmd.runId as string | undefined;
   if (!runId) return;
-  const ok = await cancelP2pRun(runId, serverLink);
+  const requestedBySession = typeof cmd.sessionName === 'string'
+    ? cmd.sessionName
+    : typeof cmd.session === 'string'
+      ? cmd.session
+      : null;
+  const ok = await cancelP2pRun(runId, serverLink, {
+    source: 'manual_p2p_cancel',
+    reason: 'browser_cancel_request',
+    requestedBySession,
+  });
   try { serverLink.send({ type: P2P_WORKFLOW_MSG.CANCEL_RESPONSE, runId, ok }); } catch { /* ignore */ }
 }
 
@@ -7306,6 +7807,12 @@ interface FsLsSnapshot {
   entries: Array<Record<string, unknown>>;
 }
 
+interface OpenSpecTaskStatsSummary {
+  total: number;
+  checked: number;
+  unchecked: number;
+}
+
 interface FsListRequestContext {
   readonly terminal: boolean;
   markTerminal(): void;
@@ -7361,6 +7868,41 @@ function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetad
     ? (allowDownloadHandles ? 'meta' : 'meta-no-downloads')
     : 'plain';
   return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
+}
+
+function shouldAttachOpenSpecTaskStats(realPath: string, includeOpenSpecTaskStats: boolean): boolean {
+  if (!includeOpenSpecTaskStats) return false;
+  const normalized = nodePath.normalize(realPath);
+  return nodePath.basename(normalized) === 'changes'
+    && nodePath.basename(nodePath.dirname(normalized)) === 'openspec';
+}
+
+async function readOpenSpecTaskStats(changePath: string): Promise<OpenSpecTaskStatsSummary> {
+  try {
+    const markdown = await fsReadFileRaw(nodePath.join(changePath, 'tasks.md'), 'utf8');
+    const parsed = parseOpenSpecTasksMarkdown(markdown);
+    return {
+      total: parsed.total,
+      checked: parsed.checked,
+      unchecked: parsed.unchecked,
+    };
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+    if (code !== 'ENOENT') {
+      logger.debug({ changePath, error }, 'OpenSpec task stats read failed');
+    }
+    return { total: 0, checked: 0, unchecked: 0 };
+  }
+}
+
+async function attachOpenSpecTaskStats(entries: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
+  return await mapWithConcurrency(entries, 16, async (entry) => {
+    if (entry.isDir !== true || typeof entry.path !== 'string') return entry;
+    return {
+      ...entry,
+      openSpecTaskStats: await readOpenSpecTaskStats(entry.path),
+    };
+  });
 }
 
 function createFsListRequestContext(serverLink: ServerLink): FsListRequestContext {
@@ -7605,6 +8147,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const requestId = cmd.requestId as string | undefined;
   const includeFiles = cmd.includeFiles === true;
   const includeMetadata = cmd.includeMetadata === true;
+  const includeOpenSpecTaskStats = cmd.includeOpenSpecTaskStats === true;
   if (!rawPath || !requestId) return;
 
   // Special sentinel paths bypass normal path resolution
@@ -7622,7 +8165,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, requestContext), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext), deadline]);
   } catch (err) {
     const msg = fsListErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -7639,7 +8182,15 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   }
 }
 
-async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, requestContext: FsListRequestContext): Promise<void> {
+async function handleFsListInner(
+  resolved: string,
+  rawPath: string,
+  requestId: string,
+  includeFiles: boolean,
+  includeMetadata: boolean,
+  includeOpenSpecTaskStats: boolean,
+  requestContext: FsListRequestContext,
+): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
   if (process.platform === 'win32' && rawPath === WINDOWS_DRIVES_PATH) {
@@ -7673,8 +8224,11 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
   }
 
   const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
+  const entries = shouldAttachOpenSpecTaskStats(canonical.realPath, includeOpenSpecTaskStats)
+    ? await attachOpenSpecTaskStats(snapshot.entries)
+    : snapshot.entries;
 
-  requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries: snapshot.entries });
+  requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries });
 }
 
 const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
@@ -7900,6 +8454,10 @@ function normalizeRepoRelativePath(repoRoot: string, relativePath: string): stri
   return nodePath.join(repoRoot, decodeGitPath(relativePath));
 }
 
+function toGitPath(relativePath: string): string {
+  return relativePath.split(nodePath.sep).join('/');
+}
+
 async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
   const { stdout } = await execAsync('git status --porcelain=v1 -z -u', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
   const files: GitStatusFile[] = [];
@@ -7919,6 +8477,36 @@ async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string
     files.push({ path: normalizeRepoRelativePath(repoRoot, logicalPath), code });
   }
   return { repoRoot, repoSignature, files };
+}
+
+async function loadRepoDirectIgnoredChildren(repoRoot: string, requestedPath: string): Promise<GitStatusFile[]> {
+  if (!isPathInside(repoRoot, requestedPath)) return [];
+  let entries: Array<{ name: string }>;
+  try {
+    entries = await fsReaddir(requestedPath, { withFileTypes: true }) as Array<{ name: string }>;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(entries)) return [];
+  const relativeChildren = entries
+    .map((entry) => toGitPath(nodePath.relative(repoRoot, nodePath.join(requestedPath, entry.name))))
+    .filter((relativePath) => relativePath && !relativePath.startsWith('..') && !nodePath.isAbsolute(relativePath));
+  if (relativeChildren.length === 0) return [];
+  let stdout = '';
+  try {
+    ({ stdout } = await execFileAsync('git', ['check-ignore', '-z', '--', ...relativeChildren], {
+      cwd: repoRoot,
+      timeout: 5000,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+    }));
+  } catch {
+    return [];
+  }
+  return parseZRecords(stdout).map((relativePath) => ({
+    path: normalizeRepoRelativePath(repoRoot, relativePath),
+    code: '!!',
+  }));
 }
 
 async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSnapshot | null> {
@@ -8077,16 +8665,24 @@ async function loadRepoGitStatusResponseSnapshot(
     loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature),
     includeStats ? loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature) : Promise.resolve(null),
   ]);
-  const files = filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
+  const filesByPath = new Map<string, GitStatusFile>();
+  for (const file of filterRepoFilesForPath(snapshot.files, requestedPath).map((file) => {
     const stats = numstat?.stats.get(file.path);
     return stats ? { ...file, ...stats } : file;
-  });
+  })) {
+    filesByPath.set(file.path, file);
+  }
+  if (!includeStats) {
+    for (const file of await loadRepoDirectIgnoredChildren(context.repoRoot, requestedPath)) {
+      if (!filesByPath.has(file.path)) filesByPath.set(file.path, file);
+    }
+  }
   return {
     repoRoot: context.repoRoot,
     repoSignature: context.repoSignature,
     requestedPath,
     includeStats,
-    files,
+    files: [...filesByPath.values()],
   };
 }
 
@@ -8206,7 +8802,7 @@ async function getRepoGitStatusResponseSnapshot(startPath: string, includeStats:
 
 async function loadFileGitDiffSnapshot(logicalPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
   let diff = '';
-  const repoRelativePath = nodePath.relative(repoRoot, logicalPath).split(nodePath.sep).join('/');
+  const repoRelativePath = toGitPath(nodePath.relative(repoRoot, logicalPath));
   try {
     const { stdout } = await execFileAsync('git', ['diff', 'HEAD', '--', repoRelativePath], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
     diff = stdout;
@@ -8596,6 +9192,145 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 }
 
+async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?: string): Promise<
+  | { ok: true; resolved: string; real: string }
+  | { ok: false; error: string; resolved?: string }
+> {
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const resolved = nodePath.resolve(expanded);
+  try {
+    const linkStats = await fsLstat(resolved);
+    if (linkStats.isSymbolicLink()) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    }
+  } catch (err) {
+    const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+    return { ok: false, error: code === 'ENOENT' || code === 'ENOTDIR' ? FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND : FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, resolved };
+  }
+  try {
+    const real = await fsRealpath(resolved);
+    if (!isPathAllowed(real)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+    if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, real)) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+    }
+    return { ok: true, resolved, real };
+  } catch {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND, resolved };
+  }
+}
+
+async function resolveFsMutationDestination(rawPath: string, sessionRealRoot?: string): Promise<
+  | { ok: true; resolved: string; realParent: string }
+  | { ok: false; error: string; resolved?: string }
+> {
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const resolved = nodePath.resolve(expanded);
+  const parent = nodePath.dirname(resolved);
+  try {
+    const realParent = await fsRealpath(parent);
+    if (!isPathAllowed(realParent)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realParent)) {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    }
+    try {
+      await fsLstat(resolved);
+      return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
+    } catch (err) {
+      const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      if (code !== 'ENOENT') return { ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, resolved };
+    }
+    return { ok: true, resolved, realParent };
+  } catch {
+    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND, resolved };
+  }
+}
+
+async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const rawPath = cmd.path as string | undefined;
+  const rawNewPath = cmd.newPath as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  if (!rawPath || !rawNewPath || !requestId) {
+    if (requestId) {
+      try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath ?? '', newPath: rawNewPath, status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  const source = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+  if (!source.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: source.resolved, status: 'error', error: source.error }); } catch { /* ignore */ }
+    return;
+  }
+  const destination = await resolveFsMutationDestination(rawNewPath, sessionRoot.realRoot);
+  if (!destination.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: destination.resolved, status: 'error', error: destination.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  try {
+    await fsRename(source.resolved, destination.resolved);
+    invalidateFsListCachesForPath(source.real);
+    invalidateFsListCachesForPath(destination.resolved);
+    invalidateFileSearchCachesForPath(source.real);
+    invalidateFileSearchCachesForPath(destination.resolved);
+    invalidateGitCachesForPath(source.real);
+    invalidateGitCachesForPath(destination.resolved);
+    try {
+      serverLink.send({
+        type: FS_TRANSPORT_MSG.RENAME_RESPONSE,
+        requestId,
+        path: rawPath,
+        newPath: rawNewPath,
+        resolvedPath: source.real,
+        status: 'ok',
+      });
+    } catch { /* ignore */ }
+  } catch (err) {
+    logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.rename failed');
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
+  }
+}
+
+async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const rawPath = cmd.path as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  if (!rawPath || !requestId) {
+    if (requestId) {
+      try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath ?? '', status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  const sessionRoot = await resolveFsMutationSessionRoot(cmd);
+  if (!sessionRoot.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+  if (!target.ok) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.resolved, status: 'error', error: target.error }); } catch { /* ignore */ }
+    return;
+  }
+
+  try {
+    await fsRm(target.real, { recursive: true, force: false });
+    invalidateFsListCachesForPath(target.real);
+    invalidateFileSearchCachesForPath(target.real);
+    invalidateGitCachesForPath(target.real);
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.real, status: 'ok' }); } catch { /* ignore */ }
+  } catch (err) {
+    logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.delete failed');
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
+  }
+}
+
 /** server.delete — remove credentials + service, then exit */
 async function handleServerDelete(): Promise<void> {
   const { homedir } = await import('os');
@@ -8754,8 +9489,14 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   const { getProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
   let provider = getProvider(agentType);
 
-  // Auto-connect local providers if missing, so we can probe for models
-  if (!provider && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  // Passive list-models requests come from model pickers and page hydration.
+  // They must not start heavyweight provider runtimes; doing so on daemon
+  // startup/reconnect can spawn Codex app-server/Copilot/Cursor processes before
+  // the user has sent any message. Use a side-effect-free fallback unless the
+  // caller explicitly forces a live probe.
+  if (!provider && !force) return await loadPassiveTransportListModels(agentType);
+
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -8765,6 +9506,51 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
 
   if (provider && typeof provider.listModels === 'function') {
     return await provider.listModels(force);
+  }
+  return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
+}
+
+function modelIdsToTransportModels(ids: readonly string[]): TransportListModelsResult['models'] {
+  return ids.map((id) => ({ id }));
+}
+
+async function loadPassiveTransportListModels(agentType: string): Promise<TransportListModelsResult> {
+  if (agentType === 'codex-sdk') {
+    const cfg = await getCodexRuntimeConfig({ probe: false }).catch(() => undefined);
+    const models = cfg?.models?.length
+      ? cfg.models.map((model) => ({
+        id: model.id,
+        ...(model.name ? { name: model.name } : {}),
+        ...(model.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+      }))
+      : modelIdsToTransportModels(CODEX_MODEL_IDS);
+    return {
+      models,
+      defaultModel: cfg?.defaultModel ?? CODEX_MODEL_IDS[0],
+      ...(cfg?.planLabel ? { isAuthenticated: true } : {}),
+    };
+  }
+  if (agentType === 'claude-code-sdk') {
+    return {
+      models: modelIdsToTransportModels(CLAUDE_CODE_MODEL_IDS),
+      defaultModel: CLAUDE_CODE_MODEL_IDS[0],
+    };
+  }
+  if (agentType === 'qwen') {
+    return { models: modelIdsToTransportModels(QWEN_MODEL_IDS), defaultModel: QWEN_MODEL_IDS[0] };
+  }
+  if (agentType === 'gemini-sdk') {
+    return { models: modelIdsToTransportModels(GEMINI_MODEL_IDS), defaultModel: GEMINI_MODEL_IDS[0] };
+  }
+  if (agentType === 'copilot-sdk') {
+    const { COPILOT_FALLBACK_MODEL_IDS } = await import('../agent/copilot-runtime-config.js');
+    return {
+      models: modelIdsToTransportModels(COPILOT_FALLBACK_MODEL_IDS),
+      defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
+    };
+  }
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk') {
+    return { models: [] };
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
 }
@@ -9021,7 +9807,7 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
   // any that were previously "replicated" while sync was off get sent.
   if (normalized.enablePersonalMemorySync && !wasSyncEnabled) {
     const { requeueAllForReplication } = await import('../context/processed-context-replication.js');
-    requeueAllForReplication();
+    await requeueAllForReplication();
   }
 }
 
@@ -9060,14 +9846,14 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  const baseStats = getProcessedProjectionStats({
+  const baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
     scope: 'personal',
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
-  });
+  }]);
 
   let records: Array<{
     id: string;
@@ -9087,17 +9873,36 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   let matchedRecords: number;
 
   if (query) {
-    const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
-    const semantic = await searchLocalMemorySemantic({
+    const semanticQuery: Parameters<typeof searchLocalMemorySemanticForManagement>[0] = {
       query,
       scope: 'personal',
       userId: ownerUserId,
       includeLegacyPersonalOwner: true,
       repo: projectId || undefined,
-      projectionClass,
+      // `projectionClass` is already validated to the 3 classes at its declaration.
+      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
       limit,
       includeArchived,
-    });
+    };
+    // R5 management semantic read goes through the worker (bounded L3 RPC) too,
+    // off the daemon main thread. Unlike R1, unavailable/timeout errors are
+    // reported explicitly to the management surface instead of becoming a
+    // successful empty recall.
+    let semantic: Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
+    try {
+      semantic = await searchLocalMemorySemanticForManagement(semanticQuery);
+    } catch (error) {
+      logger.warn({ error }, 'personal memory semantic query unavailable');
+      serverLink.send({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId,
+        stats: { ...baseStats, matchedRecords: 0, localUnavailable: true },
+        records: [],
+        pendingRecords: [],
+        projects: [],
+      });
+      return;
+    }
     records = semantic.items
       .filter((item) => item.type === 'processed' && item.scope === 'personal' && personalOwnerMatchesManagementUser(item.userId, ownerUserId))
       .map((item) => ({
@@ -9115,7 +9920,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       }));
     matchedRecords = records.length;
   } else {
-    records = queryProcessedProjections({
+    const queryArgs: ProcessedProjectionQuery = {
       scope: 'personal',
       userId: ownerUserId,
       includeLegacyPersonalOwner: true,
@@ -9123,7 +9928,8 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       projectionClass,
       limit,
       includeArchived,
-    }).map((projection) => ({
+    };
+    records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
       id: projection.id,
       scope: projection.namespace.scope as 'personal',
       projectId: projection.namespace.projectId ?? '',
@@ -9148,22 +9954,24 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     ...baseStats,
     matchedRecords,
   };
-  const pendingRecords = queryPendingContextEvents({
-    scope: 'personal',
+  const pendingArgs = {
+    scope: 'personal' as const,
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     query: query || undefined,
     limit,
-  });
-  const projects = listMemoryProjectSummaries({
+  };
+  const pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
+  const summaryArgs: ProcessedProjectionQuery = {
     scope: 'personal',
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
-  });
+  };
+  const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
   serverLink.send({
     type: MEMORY_WS.PERSONAL_RESPONSE,
     requestId,
@@ -9287,8 +10095,9 @@ function preferenceOwnerFromObservation(observation: { content: Record<string, u
   return typeof parts[1] === 'string' && parts[1].trim() ? parts[1] : DAEMON_LOCAL_PREFERENCE_USER_ID;
 }
 
-function observationNamespace(namespaceId: string): ContextNamespace | undefined {
-  return listContextNamespaces().find((namespace) => namespace.id === namespaceId);
+async function observationNamespace(namespaceId: string): Promise<ContextNamespace | undefined> {
+  const namespaces = await getContextStoreClient().run<ContextNamespaceRow[]>('listContextNamespaces', []);
+  return namespaces.find((namespace) => namespace.id === namespaceId);
 }
 
 function personalOwnerMatchesManagementUser(namespaceUserId: string | undefined, ownerUserId: string): boolean {
@@ -9356,18 +10165,18 @@ async function validateProjectScopedManagementBinding(
   return { projectDir, canonicalRepoId, binding };
 }
 
-function observationVisibleToManagementContext(
+async function observationVisibleToManagementContext(
   observation: { scope: MemoryScope; namespaceId: string },
   ctx: AuthenticatedMemoryManagementContext,
-): boolean {
-  return managementContextCanAccessNamespace(observationNamespace(observation.namespaceId), ctx);
+): Promise<boolean> {
+  return managementContextCanAccessNamespace(await observationNamespace(observation.namespaceId), ctx);
 }
 
-function observationMutableByManagementContext(
+async function observationMutableByManagementContext(
   observation: { scope: MemoryScope; namespaceId: string; content: Record<string, unknown> },
   ctx: AuthenticatedMemoryManagementContext,
-): boolean {
-  const namespace = observationNamespace(observation.namespaceId);
+): Promise<boolean> {
+  const namespace = await observationNamespace(observation.namespaceId);
   if (!managementContextCanAccessNamespace(namespace, ctx)) return false;
   if (isOwnerPrivateMemoryScope(observation.scope)) return true;
   if (isSharedProjectionScope(observation.scope)) {
@@ -9579,6 +10388,8 @@ function sendMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
     tools: [
       MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
       MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+      MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+      MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
     ],
   };
 }
@@ -9813,10 +10624,10 @@ async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
     return;
   }
-  const records = listContextObservations({
+  const records = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  })
+  }]))
     .filter((observation) => observation.state === PREFERENCE_INGEST_OBSERVATION_STATE)
     .map((observation) => {
       const userId = preferenceOwnerFromObservation(observation);
@@ -9861,8 +10672,9 @@ async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, server
   try {
     const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${userId}`;
     const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
-    const namespace = ensureContextNamespace({ scope: PREFERENCE_INGEST_SCOPE, userId, name: 'preferences' });
-    const row = writeContextObservation({
+    const namespaceArgs = { scope: PREFERENCE_INGEST_SCOPE, userId, name: 'preferences' };
+    const namespace = await getContextStoreClient().run<ContextNamespaceRow>('ensureContextNamespace', [namespaceArgs]);
+    const observationArgs = {
       namespaceId: namespace.id,
       scope: PREFERENCE_INGEST_SCOPE,
       class: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -9878,7 +10690,8 @@ async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, server
       text,
       sourceEventIds: [`manual-pref:${requestId || fingerprint}`],
       state: PREFERENCE_INGEST_OBSERVATION_STATE,
-    });
+    };
+    const row = await getContextStoreClient().run<ContextObservationRow>('writeContextObservation', [observationArgs]);
     incrementCounter('mem.preferences.persisted', { sendOrigin: 'interactive_user' });
     publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId });
     serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: true, id: row.id });
@@ -9909,10 +10722,10 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PREFERENCE_TEXT) });
     return;
   }
-  const existingPreference = listContextObservations({
+  const existingPreference = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }).find((observation) => observation.id === id);
+  }])).find((observation) => observation.id === id);
   if (!existingPreference) {
     serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
     return;
@@ -9925,7 +10738,7 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
   try {
     const scopeKey = `${PREFERENCE_INGEST_SCOPE}:${ctx.userId}`;
     const fingerprint = computeMemoryFingerprint({ kind: 'preference', content: text, scopeKey });
-    const row = updateContextObservationText({
+    const updateArgs = {
       observationId: id,
       text,
       observationClass: PREFERENCE_INGEST_OBSERVATION_CLASS,
@@ -9933,7 +10746,8 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
       ownerUserId: ctx.userId,
       createdByUserId: trustedRecordCreatedByUserIdFromContent(existingPreference.content, ctx.userId),
       updatedByUserId: ctx.actorId,
-    });
+    };
+    const row = await getContextStoreClient().run<ContextObservationRow | null>('updateContextObservationText', [updateArgs]);
     if (!row) {
       serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
       return;
@@ -9962,10 +10776,10 @@ async function handleMemoryPreferenceDelete(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MISSING_ID) });
     return;
   }
-  const existingPreference = listContextObservations({
+  const existingPreference = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
     scope: PREFERENCE_INGEST_SCOPE,
     class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }).find((observation) => observation.id === id);
+  }])).find((observation) => observation.id === id);
   if (!existingPreference) {
     serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_NOT_FOUND) });
     return;
@@ -9975,7 +10789,7 @@ async function handleMemoryPreferenceDelete(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PREFERENCE_FORBIDDEN_OWNER) });
     return;
   }
-  const success = deleteContextObservation(id);
+  const success = await getContextStoreClient().run<boolean>('deleteContextObservation', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'preference', userId: ctx.userId });
   serverLink.send({ type: MEMORY_WS.PREF_DELETE_RESPONSE, requestId, success });
 }
@@ -10254,30 +11068,40 @@ async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serve
     return;
   }
   const limit = Math.max(1, Math.min(200, typeof cmd.limit === 'number' ? cmd.limit : 50));
-  const records = listContextObservations({
+  const observationsArgs = {
     scope,
     class: isObservationClass(observationClass) ? observationClass : undefined,
-  }).filter((observation) => observationVisibleToManagementContext(observation, ctx)).slice(0, limit).map((observation) => {
-    const namespace = observationNamespace(observation.namespaceId);
-    const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
-    const createdByUserId = recordCreatedByUserIdFromContent(observation.content, ownerUserId);
-    return {
-      id: observation.id,
-      scope: observation.scope,
-      class: observation.class,
-      origin: observation.origin,
-      state: observation.state,
-      ownerUserId,
-      createdByUserId,
-      updatedByUserId: recordUpdatedByUserIdFromContent(observation.content) ?? createdByUserId,
-      text: observationText(observation.content),
-      fingerprint: observation.fingerprint,
-      namespaceId: observation.namespaceId,
-      projectionId: observation.projectionId,
-      createdAt: observation.createdAt,
-      updatedAt: observation.updatedAt,
-    };
-  });
+  };
+  const client = getContextStoreClient();
+  const observations = await client.run<ContextObservationRow[]>('listContextObservations', [observationsArgs]);
+  const namespacesById = new Map<string, ContextNamespaceRow>();
+  for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
+    namespacesById.set(namespace.id, namespace);
+  }
+  const records = observations
+    .filter((observation) => managementContextCanAccessNamespace(namespacesById.get(observation.namespaceId), ctx))
+    .slice(0, limit)
+    .map((observation) => {
+      const namespace = namespacesById.get(observation.namespaceId);
+      const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
+      const createdByUserId = recordCreatedByUserIdFromContent(observation.content, ownerUserId);
+      return {
+        id: observation.id,
+        scope: observation.scope,
+        class: observation.class,
+        origin: observation.origin,
+        state: observation.state,
+        ownerUserId,
+        createdByUserId,
+        updatedByUserId: recordUpdatedByUserIdFromContent(observation.content) ?? createdByUserId,
+        text: observationText(observation.content),
+        fingerprint: observation.fingerprint,
+        namespaceId: observation.namespaceId,
+        projectionId: observation.projectionId,
+        createdAt: observation.createdAt,
+        updatedAt: observation.updatedAt,
+      };
+    });
   serverLink.send({ type: MEMORY_WS.OBSERVATION_RESPONSE, requestId, records, featureEnabled: observationStoreFeatureEnabled() });
 }
 
@@ -10308,7 +11132,7 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
     return;
   }
   try {
-    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    const observation = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [])).find((candidate) => candidate.id === observationId);
     if (!observation) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
@@ -10317,7 +11141,7 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
       return;
     }
-    if (!observationMutableByManagementContext(observation, ctx)) {
+    if (!(await observationMutableByManagementContext(observation, ctx))) {
       incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_MUTATION_FORBIDDEN) });
       return;
@@ -10327,9 +11151,9 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
       content: text,
       scopeKey: `${observation.scope}:${observation.namespaceId}`,
     });
-    const namespace = observationNamespace(observation.namespaceId);
+    const namespace = await observationNamespace(observation.namespaceId);
     const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
-    const row = updateContextObservationText({
+    const updateArgs = {
       observationId,
       text,
       observationClass: observation.class,
@@ -10337,7 +11161,8 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
       ownerUserId,
       createdByUserId: trustedRecordCreatedByUserIdFromContent(observation.content, ownerUserId),
       updatedByUserId: ctx.actorId,
-    });
+    };
+    const row = await getContextStoreClient().run<ContextObservationRow | null>('updateContextObservationText', [updateArgs]);
     if (!row) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
@@ -10375,7 +11200,7 @@ async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serve
     return;
   }
   try {
-    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    const observation = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [])).find((candidate) => candidate.id === observationId);
     if (!observation) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
@@ -10384,16 +11209,17 @@ async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serve
       serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
       return;
     }
-    if (!observationMutableByManagementContext(observation, ctx)) {
+    if (!(await observationMutableByManagementContext(observation, ctx))) {
       incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
       serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_MUTATION_FORBIDDEN) });
       return;
     }
-    const success = deleteContextObservation(observationId);
+    const success = await getContextStoreClient().run<boolean>('deleteContextObservation', [observationId]);
     if (success) {
-      publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId, namespace: observationNamespace(observation.namespaceId) });
+      const namespace = await observationNamespace(observation.namespaceId);
+      publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId, namespace });
       if (observation.projectionId) {
-        publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: observation.projectionId, namespace: observationNamespace(observation.namespaceId) });
+        publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: observation.projectionId, namespace });
       }
     }
     serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success });
@@ -10433,12 +11259,12 @@ async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serv
   }
   const toScope = toScopeRaw;
   try {
-    const observation = listContextObservations().find((candidate) => candidate.id === observationId);
+    const observation = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [])).find((candidate) => candidate.id === observationId);
     if (!observation) {
       serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_NOT_FOUND) });
       return;
     }
-    if (!observationVisibleToManagementContext(observation, ctx)) {
+    if (!(await observationVisibleToManagementContext(observation, ctx))) {
       incrementCounter('mem.observation.unauthorized_promotion_attempt', { source: 'memory_management' });
       serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.PROMOTION_REQUIRES_AUTHORIZATION) });
       return;
@@ -10457,7 +11283,8 @@ async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serv
       serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_FROM_SCOPE_MISMATCH) });
       return;
     }
-    const audit = promoteContextObservation({ observationId, actorId, toScope, reason, action: 'web_ui_promote', actorRole: ctx.role, expectedFromScope });
+    const promoteArgs = { observationId, actorId, toScope, reason, action: 'web_ui_promote' as const, actorRole: ctx.role, expectedFromScope };
+    const audit = await getContextStoreClient().run<ObservationPromotionAuditRow>('promoteContextObservation', [promoteArgs]);
     publishRuntimeMemoryCacheInvalidation({ kind: 'observation', observationId });
     serverLink.send({ type: MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE, requestId, success: true, audit });
   } catch (error) {
@@ -10473,7 +11300,6 @@ async function handleMemoryObservationPromote(cmd: Record<string, unknown>, serv
 }
 
 async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const { searchLocalMemoryAuthorized } = await import('../context/memory-search.js');
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!isMemoryFeatureEnabled(MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch)) {
     serverLink.send({
@@ -10515,22 +11341,32 @@ async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: Serv
   ];
   if (searchBinding.workspaceId) authorizedNamespaces.push({ scope: 'workspace_shared', workspaceId: searchBinding.workspaceId, enterpriseId: searchBinding.orgId });
   if (searchBinding.orgId) authorizedNamespaces.push({ scope: 'org_shared', enterpriseId: searchBinding.orgId });
-  const result = searchLocalMemoryAuthorized({
-    query: typeof cmd.query === 'string' ? cmd.query : undefined,
-    authorizedNamespaces,
-    projectionClass: typeof cmd.projectionClass === 'string'
-      ? cmd.projectionClass as 'recent_summary' | 'durable_memory_candidate'
-      : undefined,
-    eventType: typeof cmd.eventType === 'string' ? cmd.eventType : undefined,
-    limit: typeof cmd.limit === 'number' ? cmd.limit : 50,
-    offset: typeof cmd.offset === 'number' ? cmd.offset : 0,
-  });
-  serverLink.send({
-    type: MEMORY_WS.SEARCH_RESPONSE,
-    requestId,
-    items: result.items,
-    stats: result.stats,
-  });
+  try {
+    const result = await searchLocalMemoryAuthorizedForManagement({
+      query: typeof cmd.query === 'string' ? cmd.query : undefined,
+      authorizedNamespaces,
+      projectionClass: typeof cmd.projectionClass === 'string'
+        ? cmd.projectionClass as 'recent_summary' | 'durable_memory_candidate'
+        : undefined,
+      eventType: typeof cmd.eventType === 'string' ? cmd.eventType : undefined,
+      limit: typeof cmd.limit === 'number' ? cmd.limit : 50,
+      offset: typeof cmd.offset === 'number' ? cmd.offset : 0,
+    });
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: result.items,
+      stats: result.stats,
+    });
+  } catch (error) {
+    logger.warn({ error }, 'memory quick search unavailable');
+    serverLink.send({
+      type: MEMORY_WS.SEARCH_RESPONSE,
+      requestId,
+      items: [],
+      stats: { total: 0, disabled: false, localUnavailable: true },
+    });
+  }
 }
 
 async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -10549,13 +11385,12 @@ async function handleMemoryArchive(cmd: Record<string, unknown>, serverLink: Ser
     serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
     serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
-  const { archiveMemory } = await import('../store/context-store.js');
-  const success = archiveMemory(id);
+  const success = await getContextStoreClient().run<boolean>('archiveMemory', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.ARCHIVE_RESPONSE, requestId, success });
 }
@@ -10576,13 +11411,12 @@ async function handleMemoryRestore(cmd: Record<string, unknown>, serverLink: Ser
     serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
     serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
-  const { restoreArchivedMemory } = await import('../store/context-store.js');
-  const success = restoreArchivedMemory(id);
+  const success = await getContextStoreClient().run<boolean>('restoreArchivedMemory', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.RESTORE_RESPONSE, requestId, success });
 }
@@ -10626,7 +11460,7 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
   const namespace: ContextNamespace = { scope: 'personal', projectId: canonicalRepoId, userId: ctx.userId };
   try {
     const fingerprint = computeMemoryFingerprint({ kind: 'note', content: text, scopeKey: `personal:${ctx.userId}:${canonicalRepoId}` });
-    const projection = writeProcessedProjection({
+    const writeArgs: WriteProcessedProjectionInput = {
       namespace,
       class: projectionClass,
       sourceEventIds: [`manual-memory:${requestId || fingerprint}`],
@@ -10642,7 +11476,8 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
         updatedByUserId: ctx.actorId,
       },
       origin: 'user_note',
-    });
+    };
+    const projection = await getContextStoreClient().run<ProcessedContextProjection>('writeProcessedProjection', [writeArgs]);
     publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: projection.id, namespace });
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: true, id: projection.id });
   } catch (error) {
@@ -10672,7 +11507,7 @@ async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection) {
     serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
     return;
@@ -10683,13 +11518,14 @@ async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: Serv
   }
   try {
     const ownerUserId = trustedRecordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ctx.userId;
-    const updated = updateProcessedProjectionSummary({
+    const summaryArgs = {
       projectionId: id,
       summary: text,
       ownerUserId,
       createdByUserId: trustedRecordCreatedByUserIdFromContent(projection.content, ownerUserId),
       updatedByUserId: ctx.actorId,
-    });
+    };
+    const updated = await getContextStoreClient().run<ProcessedContextProjection | null>('updateProcessedProjectionSummary', [summaryArgs]);
     if (!updated) {
       serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
       return;
@@ -10718,7 +11554,7 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection) {
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.MEMORY_NOT_FOUND) });
     return;
@@ -10728,12 +11564,13 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
   try {
-    const pinned = upsertPinnedNote({
+    const pinnedArgs = {
       id: `projection:${projection.id}`,
       namespaceKey: serializeContextNamespace(projection.namespace),
       content: projection.summary,
-      origin: 'manual_pin',
-    });
+      origin: 'manual_pin' as const,
+    };
+    const pinned = await getContextStoreClient().run<PinnedNote>('upsertPinnedNote', [pinnedArgs]);
     publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: projection.id, namespace: projection.namespace });
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: true, id: pinned.id });
   } catch (error) {
@@ -10785,8 +11622,7 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
   }
 
   try {
-    const { getProcessedProjectionById, listProjectionSources } = await import('../store/context-store.js');
-    const projection = getProcessedProjectionById(projectionId);
+    const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [projectionId]);
     if (!projection || !expectedProjectId || projection.namespace.projectId !== expectedProjectId) {
       // Isomorphic with missing/cross-project rows. The cloud route already
       // authenticates the caller, but the daemon still enforces project scope
@@ -10804,7 +11640,8 @@ async function handleMemoryGetSourcesRequest(cmd: Record<string, unknown>, serve
     }
 
     const projectionNamespaceKey = serializeContextNamespace(projection.namespace);
-    const sources = listProjectionSources(projectionId).map((source) => {
+    const projectionSources = await getContextStoreClient().run<ProjectionSourceRow[]>('listProjectionSources', [projectionId]);
+    const sources = projectionSources.map((source) => {
       // Same defense memoryGetSources applies: only surface event content
       // when the underlying event's namespace matches the projection's.
       // The daemon's SQLite is single-user, but a corrupt row from a past
@@ -10872,13 +11709,12 @@ async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementContextError() });
     return;
   }
-  const projection = getProcessedProjectionById(id);
+  const projection = await getContextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]);
   if (!projection || !projectionMutableByManagementContext(projection, ctx)) {
     serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.OBSERVATION_QUERY_FORBIDDEN) });
     return;
   }
-  const { deleteMemory } = await import('../store/context-store.js');
-  const success = deleteMemory(id);
+  const success = await getContextStoreClient().run<boolean>('deleteMemory', [id]);
   if (success) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId: id, namespace: projection.namespace });
   serverLink.send({ type: MEMORY_WS.DELETE_RESPONSE, requestId, success });
 }
@@ -10925,17 +11761,21 @@ async function prependLocalMemory(
     };
   }
   try {
-    const { searchLocalMemorySemantic } = await import('../context/memory-search.js');
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
-    const searchResult = await searchLocalMemorySemantic({
+    const recallQuery = {
       query,
       namespace: recallContext.namespace,
       currentEnterpriseId: recallContext.currentEnterpriseId,
       repo: recallContext.repo,
       limit: 10,
-    });
+    };
+    // Front-of-turn recall for PROCESS sessions runs in the context-store worker
+    // (bounded L3 RPC), off the daemon main thread — same as the transport path
+    // (Req "Bounded front-of-turn L3 recall"). In-process fallback only when the
+    // worker is not warm / unavailable, so recall never blocks the turn.
+    const searchResult = await searchLocalMemorySemanticFrontOfTurn(recallQuery);
     if (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt) {
       return {
         text: prompt,

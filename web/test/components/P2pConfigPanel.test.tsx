@@ -153,14 +153,17 @@ describe('P2pConfigPanel', () => {
         { name: 'deck_proj_w1', agentType: 'shell', state: 'idle' },
         { name: 'deck_proj_w2', agentType: 'script', state: 'idle' },
       ],
-      subSessions: [],
+      subSessions: [
+        { sessionName: 'deck_sub_worker', type: 'qwen', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+      ],
     });
 
     // Wait for loading to complete
     await flush();
 
-    // claude-code session should appear by its short name
-    expect(screen.getByText('brain')).toBeDefined();
+    // Main/brain session is the Team host and must not be listed as a member.
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('worker')).toBeDefined();
 
     // shell and script sessions should not appear
     expect(screen.queryByText('w1')).toBeNull();
@@ -183,7 +186,8 @@ describe('P2pConfigPanel', () => {
       await primary.promise;
     });
     await flush();
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('worker')).toBeDefined();
   });
 
   it('excludes shell type from subSessions', async () => {
@@ -265,8 +269,8 @@ describe('P2pConfigPanel', () => {
     expect(onSave).toHaveBeenCalledOnce();
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
 
-    // Active session + eligible sub-sessions should be in config
-    expect(cfg.sessions['deck_proj_brain']).toBeDefined();
+    // Active/main session is the host, not a Team member.
+    expect(cfg.sessions['deck_proj_brain']).toBeUndefined();
     expect(cfg.sessions['deck_sub_abc']).toBeDefined();
     // shell sub-session should not be included
     expect(cfg.sessions['deck_sub_def']).toBeUndefined();
@@ -279,7 +283,7 @@ describe('P2pConfigPanel', () => {
 
     getUserPrefMock.mockImplementation(async (key: string) => {
       if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
-        return JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 3 });
+        return JSON.stringify({ sessions: { deck_sub_abc: { enabled: true, mode: 'audit' } }, rounds: 3 });
       }
       return null;
     });
@@ -296,7 +300,8 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
-    expect(cfg.sessions.deck_proj_brain).toMatchObject({ enabled: true, mode: 'audit' });
+    expect(cfg.sessions.deck_proj_brain).toBeUndefined();
+    expect(cfg.sessions.deck_sub_abc).toMatchObject({ enabled: true, mode: 'audit' });
   }, 15_000);
 
   it('calls onClose when the close button (✕) is clicked', async () => {
@@ -659,7 +664,14 @@ describe('P2pConfigPanel', () => {
       return null;
     });
 
-    renderPanel({ onSave });
+    renderPanel({
+      onSave,
+      subSessions: [
+        { sessionName: 'deck_sub_abc', type: 'qwen', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+        { sessionName: 'deck_sub_ghi', type: 'claude-code-sdk', label: 'analyst', state: 'running', parentSession: 'deck_proj_brain' },
+        { sessionName: 'deck_sub_cli', type: 'codex', label: 'reviewer', state: 'running', parentSession: 'deck_proj_brain' },
+      ],
+    });
     await flush();
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
@@ -681,8 +693,9 @@ describe('P2pConfigPanel', () => {
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     expect(Object.keys(cfg.sessions).some((key) => key.startsWith('deck_old_stale_'))).toBe(false);
-    expect(cfg.sessions.deck_proj_brain.enabled).toBe(true);
+    expect(cfg.sessions.deck_proj_brain).toBeUndefined();
     expect(cfg.sessions.deck_sub_abc.enabled).toBe(true);
+    expect(cfg.sessions.deck_sub_ghi.enabled).toBe(true);
   }, 15_000);
 
   it('changing rounds updates the config passed to onSave', async () => {
@@ -786,7 +799,7 @@ describe('P2pConfigPanel', () => {
   it('reloads panel state when the session P2P preference changes externally', async () => {
     let prefValue = JSON.stringify({
       sessions: {
-        'deck_proj_brain': { enabled: false, mode: 'audit' },
+        'deck_sub_abc': { enabled: false, mode: 'audit' },
       },
       rounds: 1,
     });
@@ -803,7 +816,7 @@ describe('P2pConfigPanel', () => {
 
     prefValue = JSON.stringify({
       sessions: {
-        'deck_proj_brain': { enabled: true, mode: 'audit' },
+        'deck_sub_abc': { enabled: true, mode: 'audit' },
       },
       rounds: 1,
     });
@@ -963,7 +976,7 @@ describe('P2pConfigPanel', () => {
     renderPanel();
     await flush();
 
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
     expect(screen.getByText('worker')).toBeDefined();
     expect(screen.queryByText('reviewer')).toBeNull();
 
@@ -988,11 +1001,11 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
-    expect(cfg.sessions['deck_proj_brain']).toBeDefined();
-    expect(cfg.sessions['deck_proj_brain'].enabled).toBe(true);
+    expect(cfg.sessions['deck_proj_brain']).toBeUndefined();
     expect(cfg.sessions['deck_sub_cli']).toBeDefined();
     expect(cfg.sessions['deck_sub_cli'].enabled).toBe(true);
     expect(cfg.sessions['deck_sub_abc']).toBeDefined();
+    expect(cfg.sessions['deck_sub_abc'].enabled).toBe(true);
   }, 15_000);
 
   it('manages shared custom combos from the combo tab', async () => {
@@ -1062,7 +1075,7 @@ describe('P2pConfigPanel', () => {
   it('applies primary P2P preference events without refetching', async () => {
     getUserPrefMock.mockImplementation(async (key: string) => {
       if (key === 'p2p_session_config:srv-main:deck_proj_brain') {
-        return JSON.stringify({ sessions: { deck_proj_brain: { enabled: false, mode: 'audit' } }, rounds: 1 });
+        return JSON.stringify({ sessions: { deck_sub_abc: { enabled: false, mode: 'audit' } }, rounds: 1 });
       }
       return null;
     });
@@ -1074,7 +1087,7 @@ describe('P2pConfigPanel', () => {
     window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
       detail: {
         key: 'p2p_session_config:srv-main:deck_proj_brain',
-        value: JSON.stringify({ sessions: { deck_proj_brain: { enabled: true, mode: 'audit' } }, rounds: 1 }),
+        value: JSON.stringify({ sessions: { deck_sub_abc: { enabled: true, mode: 'audit' } }, rounds: 1 }),
       },
     }));
     await flush();
@@ -1835,6 +1848,152 @@ describe('P2pConfigPanel', () => {
       // Add row should be hidden, remove buttons hidden too.
       expect(screen.queryByTestId('p2p-allowed-executables-input')).toBeNull();
       expect(screen.queryByTestId('p2p-allowed-executables-remove-/usr/bin/jq')).toBeNull();
+    });
+  });
+
+  // ── dedicated-execution-clone-sessions 2.6: daemon-authoritative template
+  //    eligibility in the execution-routing tab ─────────────────────────────
+  describe('execution routing daemon eligibility', () => {
+    function renderExecTab(extra: {
+      sessions?: any[];
+      subSessions?: any[];
+      activeSession?: string;
+    } = {}) {
+      // Enable routing globally so the template <select> is interactive.
+      getUserPrefMock.mockImplementation(async (key: string) => {
+        if (key === 'exec_routing.global.v1') return JSON.stringify({ enabled: true });
+        return null;
+      });
+      const props = {
+        sessions: extra.sessions ?? [
+          { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain' },
+        ],
+        subSessions: extra.subSessions ?? [],
+        activeSession: extra.activeSession ?? 'deck_proj_brain',
+        serverId: 'srv-main',
+        initialTab: 'execution' as const,
+        onClose: vi.fn(),
+        onSave: vi.fn(),
+        daemonCapabilitySource: freshCapabilitySource(),
+      };
+      return render(<P2pConfigPanel {...(props as any)} />);
+    }
+
+    it('lists a daemon-eligible sub-session as a selectable option and excludes the brain', async () => {
+      renderExecTab({
+        subSessions: [
+          { sessionName: 'deck_sub_ok', type: 'codex-sdk', label: 'okworker', state: 'idle', parentSession: 'deck_proj_brain', ccPresetId: 'fast', modelDisplay: 'gpt-5.4', executionTemplateEligible: true },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const options = Array.from(select.querySelectorAll('option'));
+      const ok = options.find((o) => o.value === 'deck_sub_ok');
+      expect(ok).toBeDefined();
+      expect(ok!.disabled).toBe(false);
+      expect(ok!.textContent).toBe('okworker · codex-sdk · fast · gpt-5.4');
+      // The orchestrator/brain session is never offered as a template.
+      expect(options.some((o) => o.value === 'deck_proj_brain')).toBe(false);
+    });
+
+    it('shows qwen preset and model metadata in execution template options', async () => {
+      renderExecTab({
+        subSessions: [
+          {
+            sessionName: 'deck_sub_qwen',
+            type: 'qwen',
+            label: 'Qw1',
+            state: 'idle',
+            parentSession: 'deck_proj_brain',
+            executionTemplateEligible: true,
+            ccPresetId: 'MiniMax',
+            qwenModel: 'MiniMax-M2.7',
+          },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const opt = Array.from(select.querySelectorAll('option')).find((o) => o.value === 'deck_sub_qwen');
+      expect(opt?.textContent).toBe('Qw1 · qwen · MiniMax · MiniMax-M2.7');
+    });
+
+    it('renders a daemon-ineligible sub-session as a DISABLED option (not hidden)', async () => {
+      renderExecTab({
+        subSessions: [
+          { sessionName: 'deck_sub_no', type: 'codex-sdk', label: 'badworker', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_ineligible' },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const opt = Array.from(select.querySelectorAll('option')).find((o) => o.value === 'deck_sub_no');
+      // The ineligible session is rendered (not silently hidden) but disabled,
+      // so the user can see it exists and is not selectable. (The reason code is
+      // localized into the option label at runtime; the test translator does not
+      // interpolate, so we assert the structural disabled state here.)
+      expect(opt).toBeDefined();
+      expect(opt!.disabled).toBe(true);
+    });
+
+    it('excludes the current calling session from the template options', async () => {
+      renderExecTab({
+        activeSession: 'deck_sub_self',
+        subSessions: [
+          { sessionName: 'deck_sub_self', type: 'codex-sdk', label: 'self', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'other', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const values = Array.from(select.querySelectorAll('option')).map((o) => o.value);
+      expect(values).not.toContain('deck_sub_self');
+      expect(values).toContain('deck_sub_other');
+    });
+
+    it('hides structural main-session ineligible rows instead of rendering multiple disabled brain options', async () => {
+      renderExecTab({
+        sessions: [
+          { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_main_forbidden' },
+          { name: 'deck_other_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_main_forbidden' },
+          { name: 'deck_third_brain', agentType: 'codex-sdk', state: 'running', role: 'brain', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_main_forbidden' },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const options = Array.from(select.querySelectorAll('option'));
+      expect(options.some((o) => o.value === 'deck_other_brain')).toBe(false);
+      expect(options.some((o) => o.value === 'deck_third_brain')).toBe(false);
+      expect(options.some((o) => o.textContent?.includes('brain'))).toBe(false);
+    });
+
+    it('hides main worker sessions even when daemon marks them eligible', async () => {
+      renderExecTab({
+        sessions: [
+          { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running', role: 'brain', project: 'proj-a' },
+          { name: 'deck_proj_worker', agentType: 'codex-sdk', state: 'running', role: 'worker', project: 'proj-a', executionTemplateEligible: true },
+          { name: 'deck_other_worker', agentType: 'codex-sdk', state: 'running', role: 'worker', project: 'proj-b', executionTemplateEligible: true },
+          { name: 'deck_proj_blocked', agentType: 'codex-sdk', state: 'running', role: 'worker', project: 'proj-a', executionTemplateEligible: false, executionTemplateIneligibleReason: 'template_ineligible' },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const options = Array.from(select.querySelectorAll('option'));
+      expect(options.some((o) => o.value === 'deck_proj_worker')).toBe(false);
+      expect(options.some((o) => o.value === 'deck_other_worker')).toBe(false);
+      expect(options.some((o) => o.value === 'deck_proj_blocked')).toBe(false);
+    });
+
+    it('excludes execution-clone sub-sessions from template options', async () => {
+      renderExecTab({
+        subSessions: [
+          { sessionName: 'deck_sub_clone', type: 'codex-sdk', label: 'clone', state: 'idle', parentSession: 'deck_proj_brain', executionCloneKind: 'execution_clone', parentRunId: 'run-abc', executionTemplateEligible: true },
+          { sessionName: 'deck_sub_worker', type: 'codex-sdk', label: 'worker', state: 'idle', parentSession: 'deck_proj_brain', executionTemplateEligible: true },
+        ],
+      });
+      await flush();
+      const select = screen.getByTestId('exec-routing-template') as HTMLSelectElement;
+      const values = Array.from(select.querySelectorAll('option')).map((o) => o.value);
+      expect(values).not.toContain('deck_sub_clone');
+      expect(values).toContain('deck_sub_worker');
     });
   });
 });

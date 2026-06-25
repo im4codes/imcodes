@@ -55,7 +55,7 @@ describe('memory redaction pipeline', () => {
       compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
-    coordinator.ingestEvent(event);
+    await coordinator.ingestEvent(event);
     const result = await coordinator.materializeTarget(target, 'manual', 200);
 
     expect(result.summaryProjection?.summary).toContain('[REDACTED:stripe]');

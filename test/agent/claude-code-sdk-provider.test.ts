@@ -29,19 +29,19 @@ const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
   let waitForClose = false;
   let interruptNeverResolves = false;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; resolveClose?: () => void }> = [];
+  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
   const query = vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-    const run = { prompt, options, closed: false, interrupted: false, resolveClose: undefined as (() => void) | undefined };
+    const run = { prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
     async function* gen() {
       for (const message of nextMessages) yield message;
-      if (waitForClose) {
+      if (waitForClose && !run.closed) {
         await new Promise<void>((resolve) => {
           run.resolveClose = resolve;
         });
       }
     }
-    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
+    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
     iterator.close = () => {
       run.closed = true;
       run.resolveClose?.();
@@ -51,6 +51,9 @@ const sdkMock = vi.hoisted(() => {
       if (interruptNeverResolves) {
         await new Promise<void>(() => {});
       }
+    };
+    iterator.stopTask = async (taskId: string) => {
+      run.stoppedTasks.push(taskId);
     };
     return iterator;
   });
@@ -185,6 +188,40 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  it('resets the streaming accumulator across messages so a second message is not prefixed with the first', async () => {
+    // A single turn with a tool round produces TWO assistant messages, each
+    // with its own message_start id. The second message's streaming deltas must
+    // start fresh — not carry the first message's full text as a prefix.
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-multi', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'message_start', message: { id: 'msg-1' } } },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check.' } } },
+      { type: 'assistant', session_id: 'session-multi', message: { content: [{ type: 'text', text: 'Let me check.' }] } },
+      // ── tool round happens here; the model then continues in a NEW message ──
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'message_start', message: { id: 'msg-2' } } },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'The answer' } } },
+      { type: 'stream_event', session_id: 'session-multi', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' is 42.' } } },
+      { type: 'assistant', session_id: 'session-multi', message: { content: [{ type: 'text', text: 'The answer is 42.' }] } },
+      { type: 'result', session_id: 'session-multi', subtype: 'success', is_error: false, result: 'The answer is 42.', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-multi', cwd: '/tmp/project', resumeId: 'session-multi' });
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    await provider.send('route-multi', 'hello');
+    await flush();
+
+    // Message 2's deltas must be its OWN text only, never prefixed with msg-1.
+    const msg2Deltas = deltas.filter((d) => d.id === 'msg-2').map((d) => d.text);
+    expect(msg2Deltas).toEqual(['The answer', 'The answer is 42.']);
+    // Guard: no delta should ever contain both messages concatenated.
+    expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+  });
+
   it('uses the last assistant usage for completion metadata instead of cumulative result usage', async () => {
     sdkMock.setNextMessages([
       {
@@ -239,6 +276,75 @@ describe('ClaudeCodeSdkProvider', () => {
         cache_read_input_tokens: 300,
         output_tokens: 50,
       },
+    });
+  });
+
+  it('falls back to completing from result when the SDK iterator never closes', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'result', session_id: 'session-result-stuck', subtype: 'success', is_error: false, result: 'Done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-result-stuck', cwd: '/tmp/project', resumeId: 'session-result-stuck' });
+
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+
+    await provider.send('route-result-stuck', 'hello');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(completed).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed.map((msg) => msg.content)).toEqual(['Done']);
+    expect(completed[0]?.metadata).toMatchObject({ completionFallback: 'result-timeout' });
+    expect(sdkMock.runs[0]?.closed).toBe(true);
+  });
+
+  it('does not close the SDK query after foreground result while a background Claude task is active', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-background-result', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-background-result',
+        uuid: 'uuid-background-result-start',
+        task_id: 'task-background-result',
+        tool_use_id: 'tool-use-background-result',
+        description: 'Run in background',
+      },
+      { type: 'result', session_id: 'session-background-result', subtype: 'success', is_error: false, result: 'Background task started', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-background-result',
+      sessionName: 'deck_project_claude_background_result',
+      cwd: '/tmp/project',
+      resumeId: 'session-background-result',
+    });
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+
+    await provider.send('route-background-result', 'hello');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(completed.map((msg) => msg.content)).toEqual(['Background task started']);
+    expect(completed[0]?.metadata).toMatchObject({ completionFallback: 'result-timeout' });
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+    expect(provider.getActiveWorkSnapshot('route-background-result')).toMatchObject({
+      activeWorkCount: 1,
+      busyReasons: ['background_monitor'],
     });
   });
 
@@ -496,6 +602,33 @@ describe('ClaudeCodeSdkProvider', () => {
     ]);
   });
 
+  it('surfaces claude-agent-sdk thinking_tokens as a live thinking status with the running estimate', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-think', model: 'claude-opus-4-8' },
+      { type: 'system', subtype: 'thinking_tokens', session_id: 'session-think', estimated_tokens: 1234, estimated_tokens_delta: 1234 },
+      { type: 'system', subtype: 'thinking_tokens', session_id: 'session-think', estimated_tokens: 2680, estimated_tokens_delta: 1446 },
+      { type: 'result', session_id: 'session-think', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-think', cwd: '/tmp/project', resumeId: 'session-think' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('route-think', 'hello');
+    await flush();
+
+    // Each distinct estimate yields one live thinking status (emitStatus dedups
+    // by label, so equal estimates collapse). Compact format: 1234 -> 1.2k.
+    const thinking = statuses.filter((s) => s.status === 'thinking');
+    expect(thinking).toEqual([
+      { status: 'thinking', label: 'Thinking (1.2k tokens)' },
+      { status: 'thinking', label: 'Thinking (2.7k tokens)' },
+    ]);
+  });
+
   it('maps normalized provider payloads without re-assembling prompt state in the caller', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },
@@ -740,6 +873,59 @@ describe('ClaudeCodeSdkProvider', () => {
     ]);
   });
 
+  it('normalizes Claude update_plan bare array input into a plan checklist tool call', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-tool-plan', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-tool-plan', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-plan', name: 'update_plan' } } },
+      {
+        type: 'stream_event',
+        session_id: 'session-tool-plan',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: '[{"content":"梳理重启恢复入口和活跃信号","status":"in_progress"},{"content":"实现优先/延迟恢复与提示语","status":"pending"}]',
+          },
+        },
+      },
+      { type: 'stream_event', session_id: 'session-tool-plan', event: { type: 'content_block_stop', index: 0 } },
+      { type: 'result', session_id: 'session-tool-plan', subtype: 'success', is_error: false, result: 'done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-tool-plan', cwd: '/tmp/project', resumeId: 'session-tool-plan' });
+
+    const tools: ToolEventSnapshot[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
+
+    await provider.send('route-tool-plan', 'hello');
+    await flush();
+
+    expect(tools[0]).toMatchObject({ name: 'update_plan', status: 'running', input: undefined });
+    expect(tools[1]).toMatchObject({
+      name: 'update_plan',
+      status: 'complete',
+      input: {
+        plan: [
+          { content: '梳理重启恢复入口和活跃信号', status: 'in_progress' },
+          { content: '实现优先/延迟恢复与提示语', status: 'pending' },
+        ],
+      },
+      detail: {
+        kind: 'plan',
+        summary: 'Plan',
+        input: {
+          plan: [
+            { content: '梳理重启恢复入口和活跃信号', status: 'in_progress' },
+            { content: '实现优先/延迟恢复与提示语', status: 'pending' },
+          ],
+        },
+      },
+    });
+  });
+
   it('emits tool events from assistant/user message content when stream events are absent', async () => {
     sdkMock.setNextMessages([
       {
@@ -801,6 +987,37 @@ describe('ClaudeCodeSdkProvider', () => {
     ]);
   });
 
+  it('reports active-work snapshots while Claude tool calls are open', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'stream_event',
+        session_id: 'session-active-work',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'tool_use', id: 'tool-active-1', name: 'Read', input: { file_path: 'a.ts' } },
+        },
+      },
+    ]);
+    sdkMock.setWaitForClose(true);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-active-work', cwd: '/tmp/project', resumeId: 'session-active-work' });
+    await provider.send('route-active-work', 'hello');
+    await flush();
+
+    expect(provider.getActiveWorkSnapshot('route-active-work')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 2,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item', 'background_monitor'],
+    });
+
+    sdkMock.runs.at(-1)?.resolveClose?.();
+    await flush();
+  });
+
   it('emits a running SDK subagent snapshot for Claude task_started', async () => {
     const sessionName = 'deck_project_claude_start';
     const taskId = 'task-start-1';
@@ -856,6 +1073,255 @@ describe('ClaudeCodeSdkProvider', () => {
     });
     expect(JSON.stringify(tool?.input ?? null)).not.toContain(prompt);
     expect(tool?.detail?.raw).toBeUndefined();
+  });
+
+  it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {
+    const previousStaleMs = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+    process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = '1000';
+    try {
+      sdkMock.setNextMessages([
+        { type: 'system', subtype: 'init', session_id: 'session-route-subagent-stale', model: 'claude-sonnet-4-6' },
+        {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: 'session-route-subagent-stale',
+          uuid: 'uuid-task-stale-start',
+          task_id: 'task-stale-1',
+          tool_use_id: 'tool-use-stale',
+          description: 'Run a background task that never reports terminal',
+        },
+        { type: 'result', session_id: 'session-route-subagent-stale', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ]);
+
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-subagent-stale',
+        sessionName: 'deck_project_claude_stale',
+        cwd: '/tmp/project',
+        resumeId: 'session-route-subagent-stale',
+      });
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+      await provider.send('route-subagent-stale', 'hello');
+      await flush();
+
+      expect(provider.getActiveWorkSnapshot('route-subagent-stale')).toMatchObject({
+        activeWorkCount: 1,
+        activeToolCount: 0,
+        busyReasons: ['background_monitor'],
+      });
+
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 1_001);
+      expect(provider.getActiveWorkSnapshot('route-subagent-stale')).toMatchObject({
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+      });
+      vi.useRealTimers();
+
+      const staleTerminal = sdkSubagentTools(tools).at(-1);
+      expect(staleTerminal).toMatchObject({
+        id: makeClaudeSubagentCanonicalKey('deck_project_claude_stale', 'task-stale-1'),
+        status: 'error',
+        detail: {
+          meta: {
+            rawStatus: 'stale',
+            normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+            diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+            active: false,
+            terminal: true,
+          },
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+      if (previousStaleMs === undefined) delete process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+      else process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = previousStaleMs;
+    }
+  });
+
+  it('stops active Claude tasks through SDK stopTask before local cancellation state', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-cancel-after-result', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-cancel-after-result',
+        uuid: 'uuid-task-cancel-after-result',
+        task_id: 'task-cancel-after-result',
+        tool_use_id: 'tool-use-cancel-after-result',
+        description: 'Run a background task that will be stopped later',
+      },
+      { type: 'result', session_id: 'session-route-subagent-cancel-after-result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-subagent-cancel-after-result',
+      sessionName: 'deck_project_claude_cancel_after_result',
+      cwd: '/tmp/project',
+      resumeId: 'session-route-subagent-cancel-after-result',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-subagent-cancel-after-result', 'hello');
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(provider.getActiveWorkSnapshot('route-subagent-cancel-after-result')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    await provider.cancel('route-subagent-cancel-after-result');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sdkMock.runs[0]?.stoppedTasks).toEqual(['task-cancel-after-result']);
+    expect(provider.getActiveWorkSnapshot('route-subagent-cancel-after-result')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    const cancelledTerminal = sdkSubagentTools(tools).at(-1);
+    expect(cancelledTerminal).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey('deck_project_claude_cancel_after_result', 'task-cancel-after-result'),
+      status: 'error',
+      detail: {
+        meta: {
+          rawStatus: 'interrupted',
+          normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
+  it('closes the retained background-task query after a stopped task notification settles active work', async () => {
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-stopped-notification', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-stopped-notification',
+        uuid: 'uuid-task-stopped-notification-start',
+        task_id: 'task-stopped-notification',
+        tool_use_id: 'tool-use-stopped-notification',
+        description: 'Run a background task that stops after the foreground result',
+      },
+      { type: 'result', session_id: 'session-route-subagent-stopped-notification', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-route-subagent-stopped-notification',
+        uuid: 'uuid-task-stopped-notification',
+        task_id: 'task-stopped-notification',
+        status: 'stopped',
+        summary: 'Background task stopped',
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-subagent-stopped-notification',
+      sessionName: 'deck_project_claude_stopped_notification',
+      cwd: '/tmp/project',
+      resumeId: 'session-route-subagent-stopped-notification',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-subagent-stopped-notification', 'hello');
+
+    await vi.waitFor(() => {
+      expect(sdkMock.runs[0]?.closed).toBe(true);
+      expect(completed.map((msg) => msg.content)).toEqual(['Foreground done']);
+    });
+    expect(provider.getActiveWorkSnapshot('route-subagent-stopped-notification')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey('deck_project_claude_stopped_notification', 'task-stopped-notification'),
+      status: 'error',
+      detail: {
+        meta: {
+          rawStatus: 'stopped',
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
+  it('ignores task-notification result messages as foreground completions', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-task-notification-result', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-task-notification-result',
+        uuid: 'uuid-task-notification-result-start',
+        task_id: 'task-notification-result',
+        tool_use_id: 'tool-use-task-notification-result',
+        description: 'Run verification',
+      },
+      { type: 'result', session_id: 'session-task-notification-result', subtype: 'success', is_error: false, result: 'Main turn complete', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-task-notification-result',
+        uuid: 'uuid-task-notification-result',
+        task_id: 'task-notification-result',
+        status: 'completed',
+        summary: 'Background task complete',
+      },
+      {
+        type: 'result',
+        session_id: 'session-task-notification-result',
+        subtype: 'success',
+        is_error: false,
+        result: 'Synthetic task notification follow-up',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 },
+        origin: { kind: 'task-notification' },
+      },
+    ]);
+
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-task-notification-result',
+      sessionName: 'deck_project_claude_task_notification_result',
+      cwd: '/tmp/project',
+      resumeId: 'session-task-notification-result',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-task-notification-result', 'hello');
+    await flush();
+
+    expect(completed.map((msg) => msg.content)).toEqual(['Main turn complete']);
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey('deck_project_claude_task_notification_result', 'task-notification-result'),
+      status: 'complete',
+      output: 'Background task complete',
+    });
   });
 
   it('emits SDK subagent snapshots for Claude runtime subagent notifications', async () => {

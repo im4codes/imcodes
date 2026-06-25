@@ -43,6 +43,13 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemory: searchLocalMemoryMock,
 }));
 
+// `startup-memory` sources `searchLocalMemory` from the worker-safe core, so
+// mock it there too (spread the real module to keep the other exports).
+vi.mock('../../src/context/memory-recall-core.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/context/memory-recall-core.js')>()),
+  searchLocalMemory: searchLocalMemoryMock,
+}));
+
 import { injectGeminiMemoryWithTimeline } from '../../src/daemon/memory-inject.js';
 
 describe('injectGeminiMemoryWithTimeline', () => {

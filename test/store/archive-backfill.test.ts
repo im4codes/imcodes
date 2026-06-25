@@ -6,6 +6,7 @@ import {
   listProjectionSources,
   resetContextStoreForTests,
   runArchiveBackfillBatch,
+  setArchiveBackfillSchedulingEnabled,
 } from '../../src/store/context-store.js';
 import { serializeContextNamespace } from '../../src/context/context-keys.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -66,5 +67,23 @@ describe('archive/source backfill', () => {
     expect(runArchiveBackfillBatch(2)).toEqual({ processed: 1, done: true });
     expect(getContextMeta('migration_archive_backfilled')).toBe('1');
     expect(listProjectionSources('legacy-unique').map((row) => row.eventId)).toEqual(['evt-unique-a', 'evt-unique-b']);
+  });
+
+  it('does not auto-schedule the backfill timer when scheduling is disabled (worker owns it)', async () => {
+    // The daemon main thread disables scheduling once the worker is the single
+    // long-lived owner, so only the worker runs the backfill timer.
+    resetContextStoreForTests();
+    setArchiveBackfillSchedulingEnabled(false);
+    insertLegacyProjection({ id: 'legacy-disabled', sourceIds: ['evt-x'], summary: 'unique disabled summary', updatedAt: 10 });
+    // Trigger ensureDb (which would normally schedule the backfill timer).
+    getContextMeta('noop');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Disabled → no timer scheduled → the backfill never auto-ran.
+    expect(getContextMeta('migration_archive_backfilled')).toBeUndefined();
+
+    // The direct batch API is unaffected by the scheduling flag.
+    setArchiveBackfillSchedulingEnabled(true);
+    expect(runArchiveBackfillBatch(10).done).toBe(true);
+    expect(getContextMeta('migration_archive_backfilled')).toBe('1');
   });
 });

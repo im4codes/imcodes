@@ -5,6 +5,7 @@ import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
+import { SharedStateIndicator } from './SharedStateIndicator.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -22,6 +23,7 @@ interface Props {
   onRestartProject: (project: string, fresh?: boolean) => void;
   onCloneSession?: (session: SessionInfo) => void;
   onOpenSessionSettings?: (session: SessionInfo) => void;
+  onShareSession?: (session: SessionInfo) => void;
   /** When set to a session name, triggers inline rename */
   renameRequest?: string | null;
   onRenameHandled?: () => void;
@@ -69,7 +71,7 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -194,6 +196,35 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     });
     return () => cancelAnimationFrame(frame);
   }, [activeSession, orderedSessions]);
+
+  // Mouse-wheel → horizontal scroll for the tab bar. On Windows/Linux a plain
+  // mouse wheel only emits vertical `deltaY`, and the browser will NOT translate
+  // that into horizontal scroll for an `overflow-x` container — so when tabs
+  // overflow the bar they're unreachable without a horizontal scroll device.
+  // Translate vertical wheel intent into `scrollLeft` here. Registered as a
+  // NON-passive listener so `preventDefault()` actually suppresses the page
+  // from scrolling vertically instead. Trackpads (which already emit `deltaX`)
+  // keep working — we pick whichever axis has the larger magnitude.
+  useEffect(() => {
+    const tabBar = tabBarRef.current;
+    if (!tabBar) return;
+    const onWheel = (event: WheelEvent) => {
+      // Respect an explicit horizontal gesture (trackpad / shift+wheel) by
+      // using whichever axis the user actually moved more.
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      if (delta === 0) return;
+      const maxScroll = tabBar.scrollWidth - tabBar.clientWidth;
+      if (maxScroll <= 0) return; // nothing overflowing — let the page scroll
+      const atStart = tabBar.scrollLeft <= 0;
+      const atEnd = tabBar.scrollLeft >= maxScroll - 0.5;
+      // Don't trap the wheel at the edges — let the page scroll past the bar.
+      if ((delta < 0 && atStart) || (delta > 0 && atEnd)) return;
+      event.preventDefault();
+      tabBar.scrollLeft += delta;
+    };
+    tabBar.addEventListener('wheel', onWheel, { passive: false });
+    return () => tabBar.removeEventListener('wheel', onWheel);
+  }, []);
 
   // External rename trigger (from ⋯ menu in SessionControls)
   useEffect(() => {
@@ -486,6 +517,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+                <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 {/* tool call indicator removed — too flashy */}
                 {isActive && (
                   <span class="tab-ws-dot" style={{ color: connected ? latencyColor : '#ef4444' }} title={connected ? (latencyMs != null ? `${latencyMs}ms` : 'Connected') : 'Disconnected'}>
@@ -537,6 +569,12 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
             <button class="menu-item session-action-menu-item" onClick={() => { onCloneSession(ctx.session); setCtx(null); }}>
               <SessionActionMenuIcon kind="clone" />
               <span class="session-action-menu-label">{t('session.clone.menu', 'Copy session')}</span>
+            </button>
+          )}
+          {onShareSession && (
+            <button class="menu-item session-action-menu-item" onClick={() => { onShareSession(ctx.session); setCtx(null); }}>
+              <SessionActionMenuIcon kind="share" />
+              <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
             </button>
           )}
           <div class="menu-divider" />

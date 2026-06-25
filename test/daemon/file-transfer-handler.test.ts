@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, unlink, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 
 async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
   vi.resetModules();
@@ -202,6 +202,87 @@ describe('file-transfer local handle hardening', () => {
       downloadId: 'download-expired',
       message: 'expired',
     });
+  });
+
+  it('returns small files inline (file.download_done) instead of using the relay', async () => {
+    const filePath = path.join(rootDir, 'project', 'small.txt');
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, 'hello inline');
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'small.txt', 'text/plain', 'hello inline'.length);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const inline = createServerLinkMock();
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-inline',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-inline?token=secret',
+      },
+      inline.serverLink as never,
+    );
+
+    // Small file → single inline reply over WS, NO relay PUT.
+    expect(inline.sent).toEqual([
+      expect.objectContaining({
+        type: 'file.download_done',
+        downloadId: 'download-inline',
+        content: Buffer.from('hello inline').toString('base64'),
+        mime: 'text/plain',
+        filename: 'small.txt',
+      }),
+    ]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('streams LARGE downloads to the relay upload URL without sending base64 content over WS', async () => {
+    const filePath = path.join(rootDir, 'project', 'large.bin');
+    // Must exceed the inline threshold so it takes the relay path, not inline.
+    const content = Buffer.alloc(FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES + 1024, 7);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'large.bin', 'application/octet-stream', content.length);
+    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const streamed = createServerLinkMock();
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-stream',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-stream?token=secret',
+      },
+      streamed.serverLink as never,
+    );
+
+    expect(streamed.sent).toEqual([
+      expect.objectContaining({
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
+        downloadId: 'download-stream',
+        filename: 'large.bin',
+        mime: 'application/octet-stream',
+        size: content.length,
+      }),
+    ]);
+    expect(JSON.stringify(streamed.sent)).not.toContain('content');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://relay.example/download-staged/download-stream?token=secret',
+      expect.objectContaining({
+        method: 'PUT',
+        headers: expect.objectContaining({
+          'content-type': 'application/octet-stream',
+          'content-length': String(content.length),
+          'x-imcodes-filename': encodeURIComponent('large.bin'),
+        }),
+        duplex: 'half',
+      }),
+    );
   });
 
   it('rejects legacy uploads over the active single-frame cap', async () => {

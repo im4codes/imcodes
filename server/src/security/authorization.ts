@@ -27,7 +27,7 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') {
+    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== 'share-ws-ticket') {
       return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
     }
   }
@@ -69,7 +69,7 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return null;
   if (typeof payload.sub !== 'string') return null;
-  if (payload.type === 'ws-ticket') return null; // reject single-use WebSocket tickets
+  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket') return null; // reject special-purpose WebSocket tickets
   return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
 }
 

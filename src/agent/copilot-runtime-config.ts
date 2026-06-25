@@ -49,6 +49,32 @@ const FALLBACK_COPILOT_MODEL_IDS = [
 let clientPromise: Promise<unknown> | null = null;
 let inFlightProbe: Promise<CopilotRuntimeConfig> | null = null;
 
+export type CopilotRuntimeConfigOptions = boolean | {
+  force?: boolean;
+  /**
+   * When false, never start/probe the Copilot SDK. This is used by passive
+   * session-list refreshes so a UI repaint cannot spawn a headless Copilot
+   * subprocess during daemon startup.
+   */
+  probe?: boolean;
+};
+
+function normalizeOptions(options: CopilotRuntimeConfigOptions): { force: boolean; probe: boolean } {
+  if (typeof options === 'boolean') return { force: options, probe: true };
+  return {
+    force: options.force === true,
+    probe: options.probe !== false,
+  };
+}
+
+function fallbackRuntimeConfig(): CopilotRuntimeConfig {
+  return {
+    availableModels: [...FALLBACK_COPILOT_MODEL_IDS],
+    models: FALLBACK_COPILOT_MODEL_IDS.map((id) => ({ id })),
+    isAuthenticated: false,
+  };
+}
+
 async function getCopilotClient(): Promise<unknown> {
   if (clientPromise) return clientPromise;
   clientPromise = (async () => {
@@ -125,9 +151,11 @@ async function probeCopilotSdk(): Promise<CopilotRuntimeConfig> {
  *  Cached for {@link CACHE_TTL_MS} unless `force` is true. Never throws.
  *  Concurrent callers share a single in-flight probe so we never spawn more
  *  than one CopilotClient (see `clientPromise` comment). */
-export async function getCopilotRuntimeConfig(force = false): Promise<CopilotRuntimeConfig> {
+export async function getCopilotRuntimeConfig(optionsArg: CopilotRuntimeConfigOptions = false): Promise<CopilotRuntimeConfig> {
+  const options = normalizeOptions(optionsArg);
   const now = Date.now();
-  if (!force && cached && cached.expiresAt > now) return cached.value;
+  if (!options.force && cached && cached.expiresAt > now) return cached.value;
+  if (!options.probe) return cached?.value ?? fallbackRuntimeConfig();
   if (inFlightProbe) return inFlightProbe;
   inFlightProbe = (async () => {
     try {

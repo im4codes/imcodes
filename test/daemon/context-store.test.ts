@@ -6,12 +6,19 @@ import {
   deleteMemory,
   clearDirtyTarget,
   enqueueContextJob,
+  ensureContextNamespace,
+  estimateStagedTokenUpperBound,
   getLocalProcessedFreshness,
   getProcessedProjectionStats,
   getReplicationState,
+  getLatestMasterSummaryUpdatedAt,
+  getLatestRecentSummaryUpdatedAtForTarget,
+  hasProcessedProjectionsInNamespace,
   listContextEvents,
   listDirtyTargets,
+  listLatestRecentSummarySessions,
   listProcessedProjections,
+  listStartupContextObservations,
   queryPendingContextEvents,
   queryProcessedProjections,
   removeMemoryNoiseProjections,
@@ -22,9 +29,11 @@ import {
   deleteStagedEventsByIds,
   setReplicationState,
   updateContextJob,
+  writeContextObservation,
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -35,6 +44,7 @@ describe('context-store', () => {
   let target: ContextTargetRef;
 
   beforeEach(async () => {
+    resetMetricsForTests();
     tempDir = await createIsolatedSharedContextDb('context-store');
     namespace = { scope: 'personal', projectId: 'repo', userId: 'user-1' };
     target = { namespace, kind: 'session', sessionName: 'deck_repo_brain' };
@@ -59,6 +69,153 @@ describe('context-store', () => {
     ]);
   });
 
+  it('treats duplicate staged event ids as idempotent without inflating dirty counts or token estimates', () => {
+    const stagedId = 'evt-idempotent-duplicate';
+    const originalContent = 'first';
+    const duplicateContent = 'duplicate content must not inflate the target';
+
+    const first = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: originalContent,
+      createdAt: 10,
+    });
+    const tokenEstimateBeforeDuplicate = estimateStagedTokenUpperBound(target);
+
+    const duplicate = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'assistant.turn',
+      content: duplicateContent,
+      createdAt: 20,
+    });
+
+    expect(duplicate.id).toBe(first.id);
+    expect(listContextEvents(target)).toEqual([first]);
+    expect(listDirtyTargets(namespace)).toEqual([
+      expect.objectContaining({
+        target,
+        eventCount: 1,
+        oldestEventAt: 10,
+        newestEventAt: 10,
+      }),
+    ]);
+    expect(estimateStagedTokenUpperBound(target)).toBe(tokenEstimateBeforeDuplicate);
+    expect(tokenEstimateBeforeDuplicate).toBe(originalContent.length);
+  });
+
+  it('does not flag a duplicate-id mismatch when the replayed event_type and content match', () => {
+    const stagedId = 'evt-duplicate-id-match';
+
+    const first = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: 'identical replay payload',
+      createdAt: 10,
+    });
+    const duplicate = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: 'identical replay payload',
+      createdAt: 20,
+    });
+
+    // Idempotent: first row kept, no double dirty/staged count.
+    expect(duplicate.id).toBe(first.id);
+    expect(listContextEvents(target)).toEqual([first]);
+    expect(listDirtyTargets(namespace)).toEqual([
+      expect.objectContaining({ target, eventCount: 1, oldestEventAt: 10, newestEventAt: 10 }),
+    ]);
+    // Matching replay is a normal idempotent no-op — the mismatch counter must stay at 0.
+    expect(getCounter('mem.ingest.duplicate_id_mismatch', { source: 'recordContextEvent' })).toBe(0);
+  });
+
+  it('flags a duplicate-id mismatch (metric) when a replayed stable id carries a different event_type or content but stays idempotent', () => {
+    const stagedId = 'evt-duplicate-id-mismatch';
+
+    const first = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'user.turn',
+      content: 'original payload',
+      createdAt: 10,
+    });
+    const duplicate = recordContextEvent({
+      id: stagedId,
+      target,
+      eventType: 'assistant.turn',
+      content: 'conflicting payload for the same stable id',
+      createdAt: 20,
+    });
+
+    // Still idempotent: first row kept, dirty count NOT double-incremented.
+    expect(duplicate.id).toBe(first.id);
+    expect(listContextEvents(target)).toEqual([first]);
+    expect(listDirtyTargets(namespace)).toEqual([
+      expect.objectContaining({ target, eventCount: 1, oldestEventAt: 10, newestEventAt: 10 }),
+    ]);
+    // Observability: the contract violation is counted exactly once.
+    expect(getCounter('mem.ingest.duplicate_id_mismatch', { source: 'recordContextEvent' })).toBe(1);
+  });
+
+  it('rolls back the staged insert when the dirty-target upsert fails', () => {
+    const seedContent = 'seed';
+    const seed = recordContextEvent({
+      id: 'evt-rollback-seed',
+      target,
+      eventType: 'user.turn',
+      content: seedContent,
+      createdAt: 10,
+    });
+    expect(listDirtyTargets(namespace)[0]).toEqual(expect.objectContaining({ eventCount: 1 }));
+
+    const dbPath = process.env.IMCODES_CONTEXT_DB_PATH;
+    expect(dbPath).toBeTruthy();
+    const sqlite = new DatabaseSync(dbPath!);
+    try {
+      sqlite.exec(`
+        CREATE TRIGGER context_dirty_targets_injected_update_failure
+        BEFORE UPDATE ON context_dirty_targets
+        BEGIN
+          SELECT RAISE(ABORT, 'injected dirty-target upsert failure');
+        END;
+      `);
+    } finally {
+      sqlite.close();
+    }
+
+    try {
+      expect(() => recordContextEvent({
+        id: 'evt-rollback-current',
+        target,
+        eventType: 'assistant.turn',
+        content: 'insert should be rolled back',
+        createdAt: 20,
+      })).toThrow(/injected dirty-target upsert failure/);
+
+      expect(listContextEvents(target)).toEqual([seed]);
+      expect(listDirtyTargets(namespace)).toEqual([
+        expect.objectContaining({
+          target,
+          eventCount: 1,
+          oldestEventAt: 10,
+          newestEventAt: 10,
+        }),
+      ]);
+      expect(estimateStagedTokenUpperBound(target)).toBe(seedContent.length);
+    } finally {
+      const cleanup = new DatabaseSync(dbPath!);
+      try {
+        cleanup.exec('DROP TRIGGER IF EXISTS context_dirty_targets_injected_update_failure');
+      } finally {
+        cleanup.close();
+      }
+    }
+  });
+
   it('dedupes pending jobs per target/job type and tracks triggers', () => {
     recordContextEvent({ target, eventType: 'user.turn', createdAt: 10 });
     const first = enqueueContextJob(target, 'materialize_session', 'threshold', 30);
@@ -70,6 +227,14 @@ describe('context-store', () => {
       pendingJobId: first.id,
       lastTrigger: 'idle',
     }));
+  });
+
+  it('estimates staged token upper bound without hydrating staged event rows', () => {
+    recordContextEvent({ target, eventType: 'user.turn', content: 'hello', createdAt: 10 });
+    recordContextEvent({ target, eventType: 'assistant.turn', content: 'world!', createdAt: 20 });
+
+    expect(estimateStagedTokenUpperBound(target)).toBe(11);
+    expect(estimateStagedTokenUpperBound({ namespace, kind: 'session', sessionName: 'deck_repo_other' })).toBe(0);
   });
 
   it('stores processed projections and replication state', () => {
@@ -101,6 +266,102 @@ describe('context-store', () => {
       lastError: undefined,
     });
     expect(getLocalProcessedFreshness(namespace)).toBe('stale');
+  });
+
+  it('checks namespace processed activity without hydrating projection rows', () => {
+    expect(hasProcessedProjectionsInNamespace(namespace)).toBe(false);
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-noise'],
+      summary: '[API Error: Connection error. (cause: fetch failed)]',
+      content: {},
+      createdAt: 5,
+      updatedAt: 5,
+    });
+    expect(hasProcessedProjectionsInNamespace(namespace)).toBe(false);
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'summary',
+      content: {},
+      createdAt: 10,
+      updatedAt: 10,
+    });
+    expect(hasProcessedProjectionsInNamespace(namespace)).toBe(true);
+    expect(hasProcessedProjectionsInNamespace({ scope: 'personal', projectId: 'other', userId: 'user-1' })).toBe(false);
+  });
+
+  it('lists startup observations with SQL-side namespace/state filters', () => {
+    const allowed = ensureContextNamespace({
+      scope: 'user_private',
+      projectId: namespace.projectId,
+      userId: namespace.userId,
+    }, 100);
+    const other = ensureContextNamespace({
+      scope: 'user_private',
+      projectId: 'other',
+      userId: namespace.userId,
+    }, 100);
+    const active = writeContextObservation({
+      namespaceId: allowed.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'active-startup',
+      content: { text: 'active startup observation' },
+      text: 'active startup observation',
+      state: 'active',
+      now: 300,
+    });
+    const promoted = writeContextObservation({
+      namespaceId: allowed.id,
+      scope: 'user_private',
+      class: 'decision',
+      origin: 'user_note',
+      fingerprint: 'promoted-startup',
+      content: { text: 'promoted startup observation' },
+      text: 'promoted startup observation',
+      state: 'promoted',
+      now: 250,
+    });
+    writeContextObservation({
+      namespaceId: allowed.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'candidate-startup',
+      content: { text: 'candidate startup observation' },
+      text: 'candidate startup observation',
+      state: 'candidate',
+      now: 400,
+    });
+    writeContextObservation({
+      namespaceId: allowed.id,
+      scope: 'user_private',
+      class: 'skill_candidate',
+      origin: 'agent_learned',
+      fingerprint: 'skill-startup',
+      content: { text: 'skill startup observation' },
+      text: 'skill startup observation',
+      state: 'active',
+      now: 350,
+    });
+    const otherObservation = writeContextObservation({
+      namespaceId: other.id,
+      scope: 'user_private',
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'other-startup',
+      content: { text: 'other namespace startup observation' },
+      text: 'other namespace startup observation',
+      state: 'active',
+      now: 500,
+    });
+
+    expect(listStartupContextObservations([allowed.id], 10).map((row) => row.id)).toEqual([active.id, promoted.id]);
+    expect(listStartupContextObservations([allowed.id, other.id], 1).map((row) => row.id)).toEqual([otherObservation.id]);
   });
 
   it('reports stale local processed freshness when the latest projection is older than the freshness cutoff', () => {
@@ -368,6 +629,110 @@ describe('context-store', () => {
       expect(results[0].hitCount).toBe(1);
       expect(results[0].lastUsedAt).toBeTypeOf('number');
       expect(results[0].lastUsedAt).toBeGreaterThanOrEqual(now);
+    });
+
+    it('finds the latest recent summary timestamp for a specific materialization target', () => {
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-other'],
+        summary: 'Other session summary',
+        content: { targetKind: 'session', sessionName: 'deck_repo_other' },
+        createdAt: 100,
+        updatedAt: 500,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-target-old'],
+        summary: 'Old target summary',
+        content: { targetKind: 'session', sessionName: 'deck_repo_brain' },
+        createdAt: 100,
+        updatedAt: 200,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-target-new'],
+        summary: 'New target summary',
+        content: { targetKind: 'session', sessionName: 'deck_repo_brain' },
+        createdAt: 100,
+        updatedAt: 300,
+      });
+
+      expect(getLatestRecentSummaryUpdatedAtForTarget(target)).toBe(300);
+      expect(getLatestRecentSummaryUpdatedAtForTarget({
+        namespace,
+        kind: 'project',
+      })).toBeUndefined();
+    });
+
+    it('lists latest recent-summary sessions without hydrating projection contents', () => {
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-old'],
+        summary: 'Old session summary',
+        content: { sessionName: 'deck_repo_brain' },
+        createdAt: 100,
+        updatedAt: 100,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-new'],
+        summary: 'New session summary',
+        content: { sessionName: 'deck_repo_brain' },
+        createdAt: 200,
+        updatedAt: 200,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-noise'],
+        summary: '[API Error: Connection error. (cause: fetch failed)]',
+        content: { sessionName: 'deck_repo_brain' },
+        createdAt: 250,
+        updatedAt: 250,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'recent_summary',
+        sourceEventIds: ['evt-other'],
+        summary: 'Other session summary',
+        content: { sessionName: 'deck_repo_other' },
+        createdAt: 300,
+        updatedAt: 300,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'master_summary',
+        sourceEventIds: ['evt-master'],
+        summary: 'Master summary',
+        content: { sessionName: 'deck_repo_brain' },
+        createdAt: 400,
+        updatedAt: 400,
+      });
+      writeProcessedProjection({
+        namespace,
+        class: 'master_summary',
+        sourceEventIds: ['evt-master-noise'],
+        summary: '[API Error: Connection error. (cause: fetch failed)]',
+        content: { sessionName: 'deck_repo_other' },
+        createdAt: 500,
+        updatedAt: 500,
+      });
+
+      expect(listLatestRecentSummarySessions(10).map((item) => ({
+        sessionName: item.sessionName,
+        updatedAt: item.updatedAt,
+      }))).toEqual([
+        { sessionName: 'deck_repo_other', updatedAt: 300 },
+        { sessionName: 'deck_repo_brain', updatedAt: 200 },
+      ]);
+      expect(getLatestMasterSummaryUpdatedAt('deck_repo_brain', namespace)).toBe(400);
+      expect(getLatestMasterSummaryUpdatedAt('deck_repo_other', namespace)).toBeUndefined();
+      expect(getLatestMasterSummaryUpdatedAt('deck_repo_missing', namespace)).toBeUndefined();
     });
 
     it('recordMemoryHits handles multiple IDs in one call', () => {

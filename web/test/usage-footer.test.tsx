@@ -16,8 +16,13 @@ vi.mock('react-i18next', () => ({
       const translations: Record<string, string> = {
         'session.state_idle': 'Agent idle — waiting for input',
         'session.state_running': 'Agent working...',
+        'session.state_running_detail': 'Agent working: {{detail}}',
+        'session.state_error': 'Session error',
+        'session.state_error_detail': 'Error: {{error}}',
       };
-      if (translations[key]) return translations[key];
+      if (translations[key]) {
+        return translations[key].replace(/\{\{(\w+)\}\}/g, (_, name) => String(opts?.[name] ?? ''));
+      }
       if (key === 'session.provider_plan_title') return `Plan: ${String(opts?.value ?? '')}`;
       if (key === 'session.provider_quota_title') return `Quota: ${String(opts?.value ?? '')}`;
       if (key === 'session.provider_quota_usage_title') return `Quota usage: ${String(opts?.value ?? '')}`;
@@ -69,6 +74,48 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
+  it('renders the execution-clone launcher before summary sync and calls its handler', () => {
+    const onRunExecutionClones = vi.fn();
+    const onSyncMemorySummaries = vi.fn();
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_test_brain"
+        onRunExecutionClones={onRunExecutionClones}
+        runExecutionClonesTitle="Run clones"
+        runExecutionClonesCount={3}
+        onSyncMemorySummaries={onSyncMemorySummaries}
+      />,
+    );
+
+    const cloneButton = screen.getByLabelText('Run clones');
+    const syncButton = screen.getByLabelText('chat.memory_summary_sync');
+    const buttons = Array.from(container.querySelectorAll('button'));
+    expect(buttons.indexOf(cloneButton as HTMLButtonElement)).toBeLessThan(buttons.indexOf(syncButton as HTMLButtonElement));
+    expect(cloneButton.textContent).toContain('🤖');
+    expect(cloneButton.textContent).toContain('×3');
+
+    fireEvent.click(cloneButton);
+    expect(onRunExecutionClones).toHaveBeenCalledTimes(1);
+    expect(onSyncMemorySummaries).not.toHaveBeenCalled();
+  });
+
+  it('disables the execution-clone launcher when requested', () => {
+    const onRunExecutionClones = vi.fn();
+    render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_test_brain"
+        onRunExecutionClones={onRunExecutionClones}
+        runExecutionClonesTitle="No task"
+        runExecutionClonesDisabled
+      />,
+    );
+
+    const cloneButton = screen.getByLabelText('No task') as HTMLButtonElement;
+    expect(cloneButton.disabled).toBe(true);
+  });
+
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
     const { container } = render(
       <UsageFooter
@@ -94,6 +141,35 @@ describe('UsageFooter', () => {
     expect(liveStatus?.textContent).toContain('Agent working...');
     expect(container.querySelector('.session-repo-branch-summary')).toBeNull();
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
+  });
+
+  it('shows transport activity detail when running is blocked by a specific reason', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        transportActivityDetail="provider_compaction"
+      />,
+    );
+
+    const liveStatus = container.querySelector('.session-live-status-inline.running');
+    expect(liveStatus?.textContent).toContain('Agent working: provider_compaction');
+  });
+
+  it('shows the concrete session error reason from the session summary', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_error_brain"
+        sessionState="error"
+        agentType="codex"
+        sessionError="Restart loop detected: more than 3 restarts within 5 minutes"
+      />,
+    );
+
+    const liveStatus = container.querySelector('.session-live-status-inline.error');
+    expect(liveStatus?.textContent).toContain('Error: Restart loop detected: more than 3 restarts within 5 minutes');
   });
 
   it('briefly shows a compact burning effect when ctx usage changes', async () => {
@@ -279,6 +355,47 @@ describe('UsageFooter', () => {
     expectRobotAvatar(plainRunningStatus);
     expect(plainRunningStatus?.textContent).toContain('⚙️');
     expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
+  });
+
+  it('keeps live transport turns running even when the session snapshot is stale idle', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        activeTimelineTurn={true}
+      />,
+    );
+
+    const runningStatus = container.querySelector('.session-live-status-inline.running') as HTMLSpanElement | null;
+    expectRobotAvatar(runningStatus);
+    expect(runningStatus?.textContent).toContain('⚙️');
+    expect(runningStatus?.textContent).toContain('Agent working...');
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+  });
+
+  it('does not show Agent working when timeline tail has settled but the session snapshot is stale running', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        activeTimelineTurn={false}
+      />,
+    );
+
+    expect(container.textContent ?? '').not.toContain('Agent working');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
   });
 
   it('shows tool-call icon when explicit running status text is present', () => {

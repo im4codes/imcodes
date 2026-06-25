@@ -259,7 +259,13 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
 
-vi.mock('../../src/store/context-store.js', () => ({
+// Spread the real module so the worker-client's in-process cold fallback
+// (`buildContextStoreOpHandlers`, reached via `getContextStoreClient().run(...)`
+// when no worker is spawned) can resolve every allowlisted L1 op export. The
+// asserted store functions remain mock spies; only they are dispatched by the
+// ops these tests exercise.
+vi.mock('../../src/store/context-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/store/context-store.js')>()),
   deleteContextObservation: deleteContextObservationMock,
   getProcessedProjectionStats: getProcessedProjectionStatsMock,
   queryPendingContextEvents: queryPendingContextEventsMock,
@@ -270,6 +276,32 @@ vi.mock('../../src/store/context-store.js', () => ({
   promoteContextObservation: promoteContextObservationMock,
   writeContextObservation: writeContextObservationMock,
 }));
+
+// Route the command handlers' context-store client through the in-process
+// op-handler map (the bounded cold fallback) instead of spawning a real
+// worker thread, so `run`/`fireAndForget` reach the mocked store spies these
+// tests assert on rather than a separate worker-thread module graph.
+vi.mock('../../src/store/context-store-worker-client.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/store/context-store-worker-client.js')>();
+  const { buildContextStoreOpHandlers } = await import('../../src/store/context-store-op-handlers.js');
+  let handlers: Map<string, (args: unknown[]) => unknown> | null = null;
+  const dispatch = (op: string, args: unknown[] = []): unknown => {
+    if (!handlers) handlers = buildContextStoreOpHandlers().handlers;
+    const handler = handlers.get(op);
+    if (!handler) throw new Error(`no in-process handler for op: ${op}`);
+    return handler(args);
+  };
+  const fakeClient = {
+    get isReady() { return false; },
+    async run(op: string, args: unknown[] = []) { return dispatch(op, args); },
+    fireAndForget(op: string, args: unknown[] = []) { dispatch(op, args); },
+    fireAndForgetCount: 0,
+  };
+  return {
+    ...actual,
+    getContextStoreClient: () => fakeClient,
+  };
+});
 
 vi.mock('../../src/util/logger.js', () => ({
   default: {
@@ -316,6 +348,14 @@ import { timelineStore } from '../../src/daemon/timeline-store.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function waitForAsync(predicate: () => boolean, attempts = 25): Promise<void> {
+  for (let i = 0; i < attempts; i += 1) {
+    if (predicate()) return;
+    await flushAsync();
+  }
+  if (!predicate()) throw new Error('Timed out waiting for async condition');
+}
 
 function timelineEvent(overrides: Record<string, unknown> = {}) {
   return {
@@ -586,32 +626,61 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'shared-action',
+      primaryShareId: 'share-1',
+      authorizedAt: 1_000,
+      queuedAt: 1_001,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_transport_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 900,
+        authorizedAt: 1_000,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        expiresAt: null,
+        nextCoverageRecheckAt: null,
+      },
+    };
+    const send = vi.fn(() => 'queued');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
-      send: vi.fn(() => 'queued'),
+      send,
       pendingCount: 2,
       pendingMessages: ['queued msg', 'queued msg 2'],
       pendingEntries: [
-        { clientMessageId: 'cmd-queued', text: 'queued msg' },
+        { clientMessageId: 'cmd-queued', text: 'queued msg', sharedActor },
         { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
       ],
     });
 
-    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'queued msg', commandId: 'cmd-queued' }, serverLink as any);
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'queued msg',
+      commandId: 'cmd-queued',
+      sharedActor,
+    }, serverLink as any);
     await flushAsync();
 
+    expect(send).toHaveBeenCalledWith('queued msg', 'cmd-queued', undefined, undefined, { sharedActor });
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      {
+      expect.objectContaining({
         state: 'queued',
         pendingCount: 2,
         pendingMessages: ['queued msg', 'queued msg 2'],
         pendingMessageEntries: [
-          { clientMessageId: 'cmd-queued', text: 'queued msg' },
+          { clientMessageId: 'cmd-queued', text: 'queued msg', sharedActor },
           { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
         ],
-      },
+        pendingMessageVersion: expect.any(Number),
+      }),
       expect.any(Object),
     );
     expect(emitMock).not.toHaveBeenCalledWith(
@@ -620,7 +689,106 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ clientMessageId: 'cmd-queued', pending: true }),
       expect.anything(),
     );
+    const queuedUserMessages = emitMock.mock.calls.filter(([session, type, payload]) => (
+      session === 'deck_transport_brain'
+      && type === 'user.message'
+      && (payload as { commandId?: string; clientMessageId?: string } | undefined)?.commandId === 'cmd-queued'
+    ));
+    expect(queuedUserMessages).toHaveLength(0);
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
+  });
+
+  it('re-acks a bridge-retried session.send for an already-owned commandId (recovers a lost ack, no stuck spinner)', async () => {
+    const send = vi.fn(() => 'queued');
+    getProviderMock.mockReturnValue({ id: 'mock-provider' });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 1,
+      pendingMessages: ['retry msg'],
+      pendingEntries: [{ clientMessageId: 'cmd-retry', text: 'retry msg' }],
+      pendingVersion: 3,
+    });
+
+    // First send → queued + accepted ack (registers the commandId in dedup).
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'retry msg', commandId: 'cmd-retry' }, serverLink as any);
+    await flushAsync();
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-retry', status: 'accepted' });
+
+    serverLink.send.mockClear();
+    emitMock.mockClear();
+
+    // The bridge retries the SAME commandId because it never saw the ack. The
+    // daemon must RE-ACK (accepted) + re-sync the queue snapshot, NOT silently
+    // ignore — otherwise the web's optimistic "sending" bubble spins forever.
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'retry msg', commandId: 'cmd-retry', __bridgeRetry: true } as any, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-retry',
+      status: 'accepted',
+    }));
+    // Must NOT be rejected as a duplicate error.
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-retry',
+      status: 'error',
+    }));
+    // Re-syncs the authoritative queue snapshot.
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'session.state', expect.objectContaining({
+      state: 'queued',
+      pendingMessageEntries: [{ clientMessageId: 'cmd-retry', text: 'retry msg' }],
+    }), expect.any(Object));
+    // The retry must NOT re-dispatch the message to the provider.
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues ask.answer at the front when no provider pending-question resolver accepts it', async () => {
+    const send = vi.fn(() => 'queued');
+    getProviderMock.mockReturnValue({ id: 'mock-provider' });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 3,
+      pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
+      pendingEntries: [
+        { clientMessageId: 'ask-answer-id', text: 'selected option' },
+        { clientMessageId: 'cmd-queued', text: 'queued msg' },
+        { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+      ],
+      pendingVersion: 7,
+    });
+
+    handleWebCommand({
+      type: 'ask.answer',
+      sessionName: 'deck_transport_brain',
+      answer: 'selected option',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith(
+      'selected option',
+      undefined,
+      undefined,
+      undefined,
+      { queuePlacement: 'front' },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        state: 'queued',
+        pendingCount: 3,
+        pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
+        pendingMessageEntries: [
+          { clientMessageId: 'ask-answer-id', text: 'selected option' },
+          { clientMessageId: 'cmd-queued', text: 'queued msg' },
+          { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+        ],
+        pendingMessageVersion: 7,
+      }),
+      expect.any(Object),
+    );
   });
 
   it('dispatches /clear as a fresh claude-code-sdk relaunch', async () => {
@@ -889,7 +1057,7 @@ describe('handleWebCommand transport queue behavior', () => {
         pendingCount: 3,
         pendingMessages: ['a', 'b', 'c'],
         pendingMessageEntries: [],
-        pendingMessageVersion: 0,
+        pendingMessageVersion: expect.any(Number),
       },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
@@ -2001,6 +2169,45 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(reasonByRequestId.get('detail-internal')).toBe(TIMELINE_DETAIL_ERROR_REASONS.INTERNAL_ERROR);
   });
 
+  it('serves passive transport.list_models without connecting a missing local provider', async () => {
+    getProviderMock.mockReturnValue(undefined);
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', requestId: 'passive-models' }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'passive-models'
+    )));
+
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: 'passive-models',
+      models: expect.arrayContaining([expect.objectContaining({ id: 'gpt-5.5' })]),
+    }));
+  });
+
+  it('allows forced transport.list_models to connect a missing local provider', async () => {
+    const listModels = vi.fn().mockResolvedValue({ models: [{ id: 'live-model' }] });
+    getProviderMock.mockReturnValue(undefined);
+    ensureProviderConnectedMock.mockResolvedValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'codex-sdk', requestId: 'forced-models', force: true }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'forced-models'
+    )));
+
+    expect(ensureProviderConnectedMock).toHaveBeenCalledWith('codex-sdk', {});
+    expect(listModels).toHaveBeenCalledWith(true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: 'forced-models',
+      models: [{ id: 'live-model' }],
+    }));
+  });
+
   it('coalesces concurrent transport.list_models requests for the same agent/provider and preserves request ids', async () => {
     let resolveModels!: (value: { models: Array<{ id: string }> }) => void;
     const listModels = vi.fn(() => new Promise((resolve) => {
@@ -2391,7 +2598,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'deck_transport_brain',
       'assistant.text',
       expect.objectContaining({
-        text: expect.stringContaining('will resend 1 queued message'),
+        text: expect.stringContaining('Agent claude-code-sdk is restoring'),
         streaming: false,
         memoryExcluded: true,
       }),
@@ -2994,12 +3201,13 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      {
+      expect.objectContaining({
         state: 'queued',
         pendingCount: 1,
         pendingMessages: ['edited queued'],
         pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'edited queued' }],
-      },
+        pendingMessageVersion: expect.any(Number),
+      }),
       expect.any(Object),
     );
   });
@@ -3028,7 +3236,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      { state: 'queued', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [] },
+      expect.objectContaining({ state: 'queued', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [], pendingMessageVersion: expect.any(Number) }),
       expect.any(Object),
     );
   });
@@ -3053,12 +3261,61 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('skips terminal subscribe and snapshot requests for transport sessions', async () => {
+    getTransportRuntimeMock.mockReturnValue(undefined);
     handleWebCommand({ type: 'terminal.subscribe', session: 'deck_transport_brain' }, serverLink as any);
     handleWebCommand({ type: 'terminal.snapshot_request', sessionName: 'deck_transport_brain' }, serverLink as any);
-    await flushAsync();
+    await waitForAsync(() => launchTransportSessionMock.mock.calls.length > 0);
 
     expect(terminalSubscribeMock).not.toHaveBeenCalled();
     expect(terminalRequestSnapshotMock).not.toHaveBeenCalled();
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'claude-code-sdk',
+    }));
+  });
+
+  it('skips passive shell/script terminal subscriptions and releases any live shell stream', async () => {
+    const unsubscribeShell = vi.fn();
+    terminalSubscribeMock.mockReturnValueOnce(unsubscribeShell);
+    getSessionMock.mockReturnValue({
+      name: 'deck_shell_brain',
+      projectName: 'transport',
+      role: 'worker',
+      agentType: 'shell',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_shell_brain', raw: false }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).not.toHaveBeenCalled();
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_shell_brain', raw: true }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).toHaveBeenCalledTimes(1);
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_shell_brain', raw: false }, serverLink as any);
+    await flushAsync();
+
+    expect(unsubscribeShell).toHaveBeenCalledTimes(1);
+    expect(terminalSubscribeMock).toHaveBeenCalledTimes(1);
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_script_brain',
+      projectName: 'transport',
+      role: 'worker',
+      agentType: 'script',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_script_brain', raw: false }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).toHaveBeenCalledTimes(1);
   });
 
   it('skips tmux resize for transport sessions', async () => {
@@ -3380,6 +3637,8 @@ describe('handleWebCommand transport queue behavior', () => {
         tools: [
           MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
           MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+          MEMORY_MCP_TOOL_NAMES.SEND_STOP,
+          MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
         ],
       }),
       expect.objectContaining({
@@ -3393,6 +3652,18 @@ describe('handleWebCommand transport queue behavior', () => {
         ],
       }),
     ]));
+  });
+
+  it('includes send_stop in the SEND tool-family gate (item 17)', async () => {
+    handleWebCommand({ type: MEMORY_WS.MCP_STATUS_QUERY, requestId: 'mcp-status-send-stop' }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((message) => message.type === MEMORY_WS.MCP_STATUS_RESPONSE);
+    const toolFamilies = response?.toolFamilies as Array<Record<string, unknown>>;
+    const sendFamily = toolFamilies.find((family) => family.family === MEMORY_MCP_TOOL_FAMILY.SEND);
+    expect(sendFamily?.tools).toContain(MEMORY_MCP_TOOL_NAMES.SEND_STOP);
   });
 
   it('reports disconnected managed providers as unknown instead of assuming MCP readiness', async () => {

@@ -405,3 +405,41 @@ describe('TimelineEmitter — forgetSession (frees per-session memory on teardow
     expect(emitter.replay('session-gone', 0).events).toHaveLength(1);
   });
 });
+
+describe('TimelineEmitter — global message delete (hidden re-emit)', () => {
+  let emitter: TimelineEmitter;
+
+  beforeEach(() => {
+    emitter = new TimelineEmitter();
+    vi.mocked(timelineStore.read).mockReturnValue([]);
+  });
+
+  it('re-emitting an event verbatim with hidden:true wins the same-eventId merge and hides it', () => {
+    const original = emitter.emit('session-x', 'assistant.text', { text: 'secret' });
+    expect(original).toBeTruthy();
+    // Sanity: visible (not hidden) before deletion.
+    const before = emitter.replay('session-x', 0).events.find((e) => e.eventId === original!.eventId);
+    expect(before?.hidden).toBeFalsy();
+
+    // Delete = re-emit the exact event with hidden:true. The fresh higher seq wins.
+    emitter.emit('session-x', original!.type, original!.payload, {
+      eventId: original!.eventId,
+      hidden: true,
+    });
+
+    // Still exactly one logical event for that eventId — now hidden (the renderer drops it).
+    const matches = emitter.replay('session-x', 0).events.filter((e) => e.eventId === original!.eventId);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.hidden).toBe(true);
+  });
+
+  it('the hidden re-emit is persisted (appended) so the deletion survives restart/refresh', () => {
+    vi.mocked(timelineStore.append).mockClear();
+    const original = emitter.emit('session-y', 'tool.call', { tool: 'Edit' });
+    emitter.emit('session-y', original!.type, original!.payload, { eventId: original!.eventId, hidden: true });
+    // The final append carries hidden:true (durable via JSONL + SQLite hidden column).
+    const appended = vi.mocked(timelineStore.append).mock.calls.map((c) => c[0]);
+    const lastForEvent = appended.reverse().find((e) => e.eventId === original!.eventId);
+    expect(lastForEvent?.hidden).toBe(true);
+  });
+});

@@ -36,6 +36,7 @@ import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
+import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
@@ -50,6 +51,12 @@ import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { memoryPruningCron } from './cron/memory-pruning.js';
 import { WsBridge } from './ws/bridge.js';
+import {
+  SHARE_REASONS,
+  SHARE_WS_TICKET_TYPE,
+  parseShareWsTicketClaims,
+  resolveShareCoverageFromDb,
+} from './ws/share-policy.js';
 import { MemoryRateLimiter } from './ws/rate-limiter.js';
 import { rateLimiter } from './security/lockout.js';
 import { csrfMiddleware } from './security/csrf.js';
@@ -164,6 +171,7 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  app.route('/api', tabSharingRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
   // string by the ingress for pod routing; the projection-owner resolver
   // ignores serverId entirely (cloud-only PG lookup).
@@ -384,6 +392,39 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
       if (!ticket) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
 
       const payload = verifyJwt(ticket, env.JWT_SIGNING_KEY);
+      const ua = (req.headers['user-agent'] ?? '').toLowerCase();
+      const isMobile = /iphone|ipad|android|mobile/.test(ua);
+      const shareTicket = parseShareWsTicketClaims(payload, serverId);
+      if (shareTicket) {
+        const now = Date.now();
+        if (shareTicket.expiresAt <= now) {
+          socket.write(`HTTP/1.1 401 Unauthorized\r\nX-IMCodes-Share-Denial: ${SHARE_REASONS.EXPIRED}\r\n\r\n`);
+          socket.destroy();
+          return;
+        }
+        const coverage = await resolveShareCoverageFromDb({
+          db: env.DB,
+          serverId,
+          userId: shareTicket.sub,
+          target: shareTicket.target,
+          now,
+        });
+        if (!coverage) {
+          socket.write(`HTTP/1.1 403 Forbidden\r\nX-IMCodes-Share-Denial: ${SHARE_REASONS.REVOKED}\r\n\r\n`);
+          socket.destroy();
+          return;
+        }
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          WsBridge.get(serverId).handleShareBrowserConnection(ws, shareTicket.sub, env.DB, {
+            ticketId: shareTicket.jti,
+            target: shareTicket.target,
+            snapshot: coverage,
+            isMobile,
+          });
+        });
+        return;
+      }
+
       if (!payload || payload.type !== 'ws-ticket' || payload.sid !== serverId) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
       }
@@ -401,8 +442,6 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
       }
 
       const userId = payload.sub as string;
-      const ua = (req.headers['user-agent'] ?? '').toLowerCase();
-      const isMobile = /iphone|ipad|android|mobile/.test(ua);
       wss.handleUpgrade(req, socket, head, (ws) => {
         WsBridge.get(serverId).handleBrowserConnection(ws, userId, env.DB, isMobile);
       });
@@ -453,7 +492,7 @@ async function handlePreviewWsUpgrade(
   const sessionCookieToken = parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_SESSION);
   if (sessionCookieToken && env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') {
+    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== SHARE_WS_TICKET_TYPE) {
       sessionUserId = payload.sub;
     }
   }

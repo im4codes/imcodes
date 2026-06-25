@@ -24,6 +24,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
 import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
 import { PendingQuestionRegistry, type InteractiveQuestionAnswerer } from '../pending-question-registry.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
@@ -34,6 +35,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -54,6 +56,8 @@ const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const FORCE_KILL_TIMEOUT_MS = 500;
+const RESULT_COMPLETION_FALLBACK_MS = 5_000;
+const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -67,6 +71,22 @@ const CLAUDE_TASK_SYSTEM_SUBTYPES = new Set([
   'task_updated',
   'task_notification',
 ]);
+
+function getClaudeMcpServers(config: SessionConfig): Record<string, unknown> {
+  const servers = getDefaultMcpServers(config);
+  const memoryServer = servers[IMCODES_MEMORY_MCP_SERVER_NAME];
+  if (!memoryServer) return servers;
+  return {
+    ...servers,
+    [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+      ...memoryServer,
+      // Claude Agent SDK >=0.3 starts MCP servers in the background by default.
+      // IM.codes' managed memory/send/cron MCP is part of the turn-1 contract,
+      // so require it to be connected and included in the initial tool set.
+      alwaysLoad: true,
+    },
+  };
+}
 const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
   'subagent_notification',
   'subagent_status',
@@ -76,6 +96,24 @@ const CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES = new Set([
   'runtime_subagent_notification',
   'runtime_subagent_status',
 ]);
+const CLAUDE_CHECKLIST_TOOL_NAMES = new Set([
+  'todowrite',
+  'todo_write',
+  'write_todos',
+  'writetodos',
+  'update_plan',
+  'updateplan',
+  'update_todo_list',
+  'updatetodolist',
+  'set_plan',
+  'setplan',
+]);
+const CLAUDE_CHECKLIST_LIST_KEYS = ['todos', 'plan', 'tasks', 'steps'] as const;
+const CLAUDE_CHECKLIST_TEXT_KEYS = ['content', 'step', 'text', 'title', 'task', 'description', 'name'] as const;
+
+type ClaudeChecklistInput = {
+  plan: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
+};
 
 interface ClaudeSdkSessionState {
   routeId: string;
@@ -107,6 +145,10 @@ interface ClaudeSdkSessionState {
   rateLimits?: Record<string, ClaudeRateLimitInfo>;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
+  turnGeneration: number;
+  runtimeActivityGeneration?: ActivityGeneration;
+  resultCompletionTimer: ReturnType<typeof setTimeout> | null;
+  resultCompletionGeneration?: number;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string }>;
   emittedToolStates: Map<string, string>;
@@ -147,6 +189,7 @@ interface ClaudeTaskState {
   diagnosticCode?: SdkSubagentDiagnosticCode;
   terminal: boolean;
   active: boolean;
+  lastUpdatedAt: number;
 }
 
 type ClaudeToolBlock = {
@@ -160,6 +203,12 @@ type ClaudeTaskLifecycleMessage = SDKMessage & {
   type: 'system';
   subtype: string;
   [key: string]: unknown;
+};
+
+type ClaudeThinkingTokensMessage = {
+  type: 'system';
+  subtype: 'thinking_tokens';
+  estimated_tokens?: number;
 };
 
 function collectAssistantText(message: SDKMessage): string {
@@ -179,6 +228,13 @@ function makeMessageId(state: ClaudeSdkSessionState): string {
 
 function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function getSubagentStaleWithoutTerminalMs(): number {
+  const raw = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+  if (!raw) return DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 1_000 ? parsed : DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS;
 }
 
 function parseRuntimeSubagentTag(line: string): Record<string, unknown> | null {
@@ -282,6 +338,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   async disconnect(): Promise<void> {
     this.questions.releaseAll();
     for (const state of this.sessions.values()) {
+      this.clearResultCompletionFallback(state);
       try { state.currentQuery?.close(); } catch {}
       this.terminateChild(state);
     }
@@ -319,6 +376,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       lastAssistantUsage: existing?.lastAssistantUsage,
       rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
+      turnGeneration: existing?.turnGeneration ?? 0,
+      resultCompletionTimer: null,
+      resultCompletionGeneration: undefined,
       toolCalls: new Map(),
       runtimeAgentToolCalls: new Map(),
       emittedToolStates: new Map(),
@@ -330,12 +390,75 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return routeId;
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const activeReason = state.currentQuery
+      ? 'query'
+      : state.currentChild
+        ? 'child'
+        : state.pendingComplete
+          ? 'pending-complete'
+          : state.resultCompletionTimer
+            ? 'completion-fallback'
+            : null;
+    return {
+      provider: this.id,
+      routeId: state.routeId,
+      active: activeReason !== null,
+      activeReason,
+      started: state.started,
+      resumeId: state.resumeId,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      currentQueryActive: Boolean(state.currentQuery),
+      currentChildActive: Boolean(state.currentChild && !state.currentChild.killed),
+      completed: state.completed,
+      cancelled: state.cancelled,
+      pendingComplete: Boolean(state.pendingComplete),
+      pendingError: Boolean(state.pendingError),
+      resultCompletionFallbackArmed: Boolean(state.resultCompletionTimer),
+      resultCompletionGeneration: state.resultCompletionGeneration ?? null,
+      turnGeneration: state.turnGeneration,
+      toolCallCount: state.toolCalls.size,
+      runtimeAgentToolCallCount: state.runtimeAgentToolCalls.size,
+      subagentTaskCount: state.subagentTasks.size,
+    };
+  }
+
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    this.expireStaleClaudeSubagentTasks(sessionId, state);
+    const activeToolCount = state.toolCalls.size + Array.from(state.runtimeAgentToolCalls.values()).length;
+    const activeSubagentCount = this.activeClaudeSubagentTasks(state).length;
+    const waitingForTaskNotification = state.completed && !state.pendingComplete && activeSubagentCount > 0;
+    const backgroundActive = Boolean(
+      state.resultCompletionTimer
+      || (state.currentQuery && !waitingForTaskNotification)
+      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification),
+    );
+    const busyReasons: SessionActivityBusyReason[] = [];
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (activeSubagentCount > 0 || backgroundActive) busyReasons.push('background_monitor');
+    return {
+      status: 'current',
+      activeWorkCount: activeToolCount + activeSubagentCount + (backgroundActive ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+      activityGeneration: state.runtimeActivityGeneration,
+      providerDiagnosticGeneration: state.turnGeneration,
+      updatedAt: Date.now(),
+    };
+  }
+
   async endSession(sessionId: string): Promise<void> {
     // Release any paused AskUserQuestion so a torn-down session never leaks a
     // pending timer / unresolved canUseTool promise. Keyed by sessionName.
     const state = this.sessions.get(sessionId);
     this.questions.release(state?.sessionName ?? sessionId);
     if (state) {
+      this.clearResultCompletionFallback(state);
       try { state.currentQuery?.close(); } catch {}
       this.terminateChild(state);
       this.sessions.delete(sessionId);
@@ -411,13 +534,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Claude SDK session is already busy', true);
     }
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+    state.runtimeActivityGeneration = payload.activityGeneration;
     await this.startQuery(sessionId, state, payload, true);
   }
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.currentQuery) return;
+    if (!state) return;
+    await this.cancelActiveClaudeSubagentTasks(sessionId, state);
+    if (!state.currentQuery) return;
     state.cancelled = true;
+    this.clearResultCompletionFallback(state);
     try {
       await Promise.race([
         state.currentQuery.interrupt(),
@@ -444,6 +571,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
+    this.clearResultCompletionFallback(state);
     state.toolCalls.clear();
     state.runtimeAgentToolCalls.clear();
     state.emittedToolStates.clear();
@@ -472,7 +600,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
-      mcpServers: getDefaultMcpServers({
+      mcpServers: getClaudeMcpServers({
         sessionKey: state.routeId,
         sessionName: state.sessionName,
         projectName: state.projectName,
@@ -525,8 +653,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     };
 
     const q = query({ prompt, options: options as any });
+    const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
-    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback);
+    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback, turnGeneration);
   }
 
   private async consumeQuery(
@@ -535,6 +664,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     q: ReturnType<typeof query>,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    turnGeneration: number,
   ): Promise<void> {
     let pendingError: ProviderError | null = null;
     try {
@@ -552,6 +682,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true, err)
         : this.normalizeError(err);
     } finally {
+      if (state.turnGeneration === turnGeneration) {
+        this.clearResultCompletionFallback(state);
+      }
       state.currentQuery = null;
       state.currentChild = null;
       const pendingComplete = state.pendingComplete;
@@ -622,6 +755,24 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       return;
     }
 
+    if (this.isClaudeThinkingTokensMessage(msg)) {
+      // Live thinking-token progress (claude-agent-sdk >= 0.3.x). During the
+      // redacted-thinking phase the model emits no visible output — only this
+      // running estimate — so surface it as a `thinking` status to drive the
+      // footer/pill spinner. Approximate (not the billed output_tokens);
+      // emitStatus dedups by label so only meaningful changes propagate.
+      const thinkingTokensMessage = msg as unknown as ClaudeThinkingTokensMessage;
+      const estimated = typeof thinkingTokensMessage.estimated_tokens === 'number' && thinkingTokensMessage.estimated_tokens > 0
+        ? thinkingTokensMessage.estimated_tokens
+        : 0;
+      const compact = estimated >= 1000 ? `${Math.round(estimated / 100) / 10}k` : `${estimated}`;
+      this.emitStatus(sessionId, state, {
+        status: 'thinking',
+        label: estimated > 0 ? `Thinking (${compact} tokens)` : 'Thinking…',
+      });
+      return;
+    }
+
     if (msg.type === 'rate_limit_event') {
       // claude.ai subscription rate-limit info (5h + weekly windows, with reset
       // times). Each event carries one `rateLimitType`; cache per type and push
@@ -641,8 +792,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (msg.type === 'stream_event') {
       const event = msg.event;
-      if (event.type === 'message_start' && event.message?.id) {
-        state.currentMessageId = String(event.message.id);
+      if (event.type === 'message_start') {
+        // New assistant message within the turn (the model's continuation after
+        // a tool result starts a fresh message_start with a new id). Reset the
+        // streaming accumulator so this message's deltas don't render prefixed
+        // with the previous message's full text. Without this, the new bubble
+        // briefly shows "<prev message text><new delta>" and only snaps to the
+        // correct text when the message completes — visible flicker/bleed.
+        state.currentText = '';
+        state.currentMessageId = event.message?.id ? String(event.message.id) : null;
         return;
       }
       if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {
@@ -791,6 +949,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
 
     if (msg.type === 'result') {
+      if ((msg as { origin?: { kind?: string } }).origin?.kind === 'task-notification') {
+        state.started = true;
+        this.closeSettledBackgroundQuery(sessionId, state, 'task-notification-result');
+        return;
+      }
       if (msg.is_error) {
         const details = Array.isArray((msg as any).errors) ? (msg as any).errors.join('; ') : 'Claude execution failed';
         state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, false, msg);
@@ -816,8 +979,56 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           resumeId: state.resumeId,
         },
       };
+      this.armResultCompletionFallback(sessionId, state);
       return;
     }
+  }
+
+  private armResultCompletionFallback(sessionId: string, state: ClaudeSdkSessionState): void {
+    if (!state.currentQuery || !state.pendingComplete) return;
+    this.clearResultCompletionFallback(state);
+    const turnGeneration = state.turnGeneration;
+    state.resultCompletionGeneration = turnGeneration;
+    state.resultCompletionTimer = setTimeout(() => {
+      state.resultCompletionTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      if (state.turnGeneration !== turnGeneration || state.resultCompletionGeneration !== turnGeneration) return;
+      if (!state.currentQuery || !state.pendingComplete) return;
+
+      const pendingComplete = state.pendingComplete;
+      const q = state.currentQuery;
+      state.pendingComplete = undefined;
+      state.pendingError = undefined;
+      state.resultCompletionGeneration = undefined;
+      state.currentMessageId = null;
+      state.currentText = '';
+      pendingComplete.metadata = {
+        ...(pendingComplete.metadata ?? {}),
+        completionFallback: 'result-timeout',
+      };
+      if (this.activeClaudeSubagentTasks(state).length > 0) {
+        // The Claude Code SDK keeps the Query open while background tasks can
+        // later inject task-notification follow-up messages. Do not close it
+        // here: deliver the foreground result to IM.codes, but keep listening
+        // so task_notification can terminalize the background row.
+        for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
+        return;
+      }
+      try { q.close(); } catch {}
+      this.terminateChild(state);
+      state.currentQuery = null;
+      state.currentChild = null;
+      for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
+    }, RESULT_COMPLETION_FALLBACK_MS);
+    state.resultCompletionTimer.unref?.();
+  }
+
+  private clearResultCompletionFallback(state: ClaudeSdkSessionState): void {
+    if (state.resultCompletionTimer) {
+      clearTimeout(state.resultCompletionTimer);
+      state.resultCompletionTimer = null;
+    }
+    state.resultCompletionGeneration = undefined;
   }
 
   private resolvePermissionMode(): PermissionMode {
@@ -875,6 +1086,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const existing = state.subagentTasks.get(taskId);
     const task = existing ?? this.createClaudeTaskState(sessionId, state, taskId);
     if (!existing) state.subagentTasks.set(taskId, task);
+    task.lastUpdatedAt = Date.now();
 
     const toolUseId = this.pickString(msg.tool_use_id);
     if (toolUseId) task.toolUseId = toolUseId;
@@ -907,6 +1119,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.applyClaudeTaskStatus(task, this.pickString(msg.status));
     }
 
+    if (task.terminal) {
+      this.closeSettledBackgroundQuery(sessionId, state, `task-${task.rawStatus ?? task.normalizedStatus}`);
+    }
     this.emitClaudeSubagentSnapshot(sessionId, state, task);
   }
 
@@ -1153,7 +1368,93 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
       terminal: false,
       active: true,
+      lastUpdatedAt: Date.now(),
     };
+  }
+
+  private expireStaleClaudeSubagentTasks(sessionId: string, state: ClaudeSdkSessionState, now = Date.now()): number {
+    const staleMs = getSubagentStaleWithoutTerminalMs();
+    let expired = 0;
+    for (const task of state.subagentTasks.values()) {
+      if (!task.active || task.terminal) continue;
+      if (now - task.lastUpdatedAt < staleMs) continue;
+      task.rawStatus = 'stale';
+      task.normalizedStatus = SDK_SUBAGENT_STATUS.STALE;
+      task.diagnosticCode = SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL;
+      task.summary = task.summary ?? 'Claude task did not report a terminal update';
+      task.error = `Claude task marked stale after ${Math.round((now - task.lastUpdatedAt) / 1000)}s without a terminal update`;
+      task.terminal = true;
+      task.active = false;
+      task.lastUpdatedAt = now;
+      this.emitClaudeSubagentSnapshot(sessionId, state, task);
+      expired += 1;
+    }
+    if (expired > 0) {
+      logger.warn({
+        provider: this.id,
+        sessionId,
+        expired,
+        staleMs,
+      }, 'Claude SDK subagent task(s) stale without terminal update; closing provider active-work evidence');
+    }
+    return expired;
+  }
+
+  private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
+    return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+  }
+
+  private closeSettledBackgroundQuery(sessionId: string, state: ClaudeSdkSessionState, reason: string): boolean {
+    if (!state.currentQuery) return false;
+    if (!state.completed) return false;
+    if (this.activeClaudeSubagentTasks(state).length > 0) return false;
+
+    this.clearResultCompletionFallback(state);
+    const q = state.currentQuery;
+    state.currentQuery = null;
+    try { q.close(); } catch {}
+    this.terminateChild(state);
+    state.currentChild = null;
+    logger.info({
+      provider: this.id,
+      sessionId,
+      reason,
+    }, 'Claude SDK background query settled; closing retained task-notification listener');
+    return true;
+  }
+
+  private async cancelActiveClaudeSubagentTasks(sessionId: string, state: ClaudeSdkSessionState, now = Date.now()): Promise<number> {
+    let cancelled = 0;
+    const queryWithTaskStop = state.currentQuery as (ReturnType<typeof query> & { stopTask?: (taskId: string) => Promise<void> }) | null;
+    for (const task of this.activeClaudeSubagentTasks(state)) {
+      if (typeof queryWithTaskStop?.stopTask === 'function') {
+        try {
+          await Promise.race([
+            queryWithTaskStop.stopTask(task.taskId),
+            new Promise<void>((resolve) => setTimeout(resolve, CANCEL_INTERRUPT_TIMEOUT_MS)),
+          ]);
+        } catch (err) {
+          logger.warn({ err, provider: this.id, sessionId, taskId: task.taskId }, 'Claude SDK stopTask failed; marking task cancelled locally');
+        }
+      }
+      task.rawStatus = 'interrupted';
+      task.normalizedStatus = SDK_SUBAGENT_STATUS.INTERRUPTED;
+      task.summary = task.summary ?? 'Claude task cancelled';
+      task.error = 'Claude task cancelled by user stop';
+      task.terminal = true;
+      task.active = false;
+      task.lastUpdatedAt = now;
+      this.emitClaudeSubagentSnapshot(sessionId, state, task);
+      cancelled += 1;
+    }
+    if (cancelled > 0) {
+      logger.info({
+        provider: this.id,
+        sessionId,
+        cancelled,
+      }, 'Claude SDK subagent task(s) cancelled by user stop');
+    }
+    return cancelled;
   }
 
   private emitClaudeRuntimeSubagentFromAgentTool(
@@ -1274,6 +1575,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return { normalizedStatus: SDK_SUBAGENT_STATUS.ERROR, terminal: true };
       case 'interrupted':
         return { normalizedStatus: SDK_SUBAGENT_STATUS.INTERRUPTED, terminal: true };
+      case 'stale':
+        return {
+          normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+          terminal: true,
+          diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+        };
       default:
         return {
           normalizedStatus: SDK_SUBAGENT_STATUS.UNKNOWN,
@@ -1397,15 +1704,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private emitToolCall(sessionId: string, state: ClaudeSdkSessionState, tool: ToolCallEvent): void {
+    const normalizedTool = this.normalizeChecklistToolCall(tool);
     const signature = JSON.stringify({
-      status: tool.status,
-      name: tool.name,
-      input: tool.input ?? null,
-      output: tool.output ?? null,
+      status: normalizedTool.status,
+      name: normalizedTool.name,
+      input: normalizedTool.input ?? null,
+      output: normalizedTool.output ?? null,
     });
-    if (state.emittedToolStates.get(tool.id) === signature) return;
-    state.emittedToolStates.set(tool.id, signature);
-    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    if (state.emittedToolStates.get(normalizedTool.id) === signature) return;
+    state.emittedToolStates.set(normalizedTool.id, signature);
+    for (const cb of this.toolCallCallbacks) cb(sessionId, normalizedTool);
   }
 
   private isClaudeTaskLifecycleMessage(msg: SDKMessage): msg is ClaudeTaskLifecycleMessage {
@@ -1418,6 +1726,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (msg.type !== 'system') return false;
     const subtype = (msg as { subtype?: unknown }).subtype;
     return typeof subtype === 'string' && CLAUDE_RUNTIME_SUBAGENT_SYSTEM_SUBTYPES.has(subtype);
+  }
+
+  private isClaudeThinkingTokensMessage(msg: SDKMessage): boolean {
+    return msg.type === 'system'
+      && (msg as { subtype?: unknown }).subtype === 'thinking_tokens';
   }
 
   private isToolBlock(block: unknown): block is ClaudeToolBlock {
@@ -1440,6 +1753,72 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         raw: block,
       },
     };
+  }
+
+  private normalizeChecklistToolCall(tool: ToolCallEvent): ToolCallEvent {
+    const normalizedName = normalizeStatusName(tool.name);
+    if (!CLAUDE_CHECKLIST_TOOL_NAMES.has(normalizedName)) return tool;
+    const input = this.normalizeClaudeChecklistInput(tool.input)
+      ?? this.normalizeClaudeChecklistInput(tool.detail?.input);
+    if (!input) return tool;
+    return {
+      ...tool,
+      input,
+      detail: {
+        ...(tool.detail ?? {}),
+        kind: 'plan',
+        summary: 'Plan',
+        input,
+        raw: tool.detail?.raw ?? tool.input,
+      },
+    };
+  }
+
+  private normalizeClaudeChecklistInput(value: unknown): ClaudeChecklistInput | null {
+    const rawItems = Array.isArray(value) ? value : this.rawChecklistItemsFromRecord(value);
+    if (!rawItems) return null;
+    const plan: ClaudeChecklistInput['plan'] = [];
+    for (const rawItem of rawItems) {
+      const content = this.claudeChecklistText(rawItem);
+      if (!content) continue;
+      const record = this.asRecord(rawItem);
+      const status = record
+        ? this.normalizeClaudeChecklistStatus(record.status)
+        : 'pending';
+      plan.push({ content, status });
+    }
+    return { plan };
+  }
+
+  private rawChecklistItemsFromRecord(value: unknown): unknown[] | null {
+    const record = this.asRecord(value);
+    if (!record) return null;
+    for (const key of CLAUDE_CHECKLIST_LIST_KEYS) {
+      if (Array.isArray(record[key])) return record[key] as unknown[];
+    }
+    return null;
+  }
+
+  private claudeChecklistText(value: unknown): string {
+    if (typeof value === 'string') return value.trim();
+    const record = this.asRecord(value);
+    if (!record) return '';
+    for (const key of CLAUDE_CHECKLIST_TEXT_KEYS) {
+      const text = record[key];
+      if (typeof text === 'string' && text.trim()) return text.trim();
+    }
+    return '';
+  }
+
+  private normalizeClaudeChecklistStatus(value: unknown): 'pending' | 'in_progress' | 'completed' {
+    const normalized = normalizeStatusName(typeof value === 'string' ? value : undefined);
+    if (normalized === 'completed' || normalized === 'complete' || normalized === 'done' || normalized === 'finished' || normalized === 'checked') {
+      return 'completed';
+    }
+    if (normalized === 'inprogress' || normalized === 'active' || normalized === 'doing' || normalized === 'running' || normalized === 'started') {
+      return 'in_progress';
+    }
+    return 'pending';
   }
 
   private tryParsePartialJson(value: string): unknown {

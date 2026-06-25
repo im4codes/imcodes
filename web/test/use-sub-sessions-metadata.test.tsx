@@ -129,6 +129,52 @@ describe('sub-session metadata via subsession.created', () => {
     expect(s.quotaUsageLabel).toBeNull();
     expect(s.qwenModel).toBeNull();
   });
+
+  it('stores execution-clone projection from subsession.created', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone1',
+      sessionName: 'deck_sub_clone1',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-parent-1',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-parent-1');
+  });
+
+  it('updates execution-clone projection on an existing subsession.created rebroadcast', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone2',
+      sessionName: 'deck_sub_clone2',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+    expect(captured[0].executionCloneKind).toBeNull();
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone2',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-parent-2',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-parent-2');
+  });
 });
 
 describe('sub-session metadata via subsession.sync', () => {
@@ -179,6 +225,30 @@ describe('sub-session metadata via subsession.sync', () => {
     const before = [...captured];
     act(() => send({ type: 'subsession.sync', id: 'unknown123', modelDisplay: 'nope' }));
     expect(captured).toEqual(before);
+  });
+
+  it('merges execution-clone projection from subsession.sync into existing sub-session', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sync-clone',
+      sessionName: 'deck_sub_sync_clone',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sync-clone',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-sync-clone',
+    }));
+
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-sync-clone');
   });
 
 
@@ -505,7 +575,7 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].transportPendingMessageEntries).toEqual([]);
   });
 
-  it('fills missing queued transport entries from pendingMessages when daemon sends a partial entry snapshot', async () => {
+  it('treats partial entry snapshots as authoritative and does not fill legacy tails', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
     await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
@@ -533,9 +603,9 @@ describe('sub-session metadata via subsession.sync', () => {
       },
     }));
 
+    expect(captured[0].transportPendingMessages).toEqual(['queued one']);
     expect(captured[0].transportPendingMessageEntries).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
-      { clientMessageId: 'deck_sub_q4:legacy:1:queued two', text: 'queued two' },
     ]);
   });
 });
@@ -844,7 +914,7 @@ describe('sub-session realtime state sync', () => {
         source: 'daemon',
         confidence: 'high',
         type: 'assistant.text',
-        payload: { text: 'working' },
+        payload: { text: 'working', streaming: true },
       },
     }));
     expect(captured[0]?.state).toBe('running');
@@ -1332,6 +1402,82 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
       },
     }));
     expectQueueCleared();
+  });
+
+  it('clears stale queue from reconnect subsession sync when runtime reports empty pending', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // Browser missed the live drain while offline; lifecycle reconnect sync
+    // must carry an explicit empty runtime snapshot so the old queue is cleared.
+    act(() => send({
+      type: 'subsession.created',
+      id: 'eq1',
+      sessionName: 'deck_sub_eq1',
+      sessionType: 'claude-code-sdk',
+      state: 'running',
+      transportPendingMessages: [],
+      transportPendingMessageEntries: [],
+      transportPendingMessageVersion: 2,
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+  });
+
+  it('ignores stale reconnect queue snapshots older than a drained user.message', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          state: 'queued',
+          pendingMessages: ['fix the bug', 'then add tests'],
+          pendingMessageEntries: [
+            { clientMessageId: 'q1', text: 'fix the bug' },
+            { clientMessageId: 'q2', text: 'then add tests' },
+          ],
+          pendingMessageVersion: 1,
+        },
+      },
+    }));
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'user.message',
+        sessionId: 'deck_sub_eq1',
+        payload: { clientMessageId: 'q1', text: 'fix the bug', pendingMessageVersion: 2 },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'eq1',
+      state: 'queued',
+      transportPendingMessages: ['fix the bug', 'then add tests'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'q1', text: 'fix the bug' },
+        { clientMessageId: 'q2', text: 'then add tests' },
+      ],
+      transportPendingMessageVersion: 1,
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
   });
 
   it('removes queued entries as authoritative user messages enter the timeline', async () => {

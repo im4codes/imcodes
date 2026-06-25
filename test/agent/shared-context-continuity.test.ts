@@ -84,8 +84,8 @@ describe('shared-agent-context continuity integration', () => {
       },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'Investigate rollout failure', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'Root cause is stale config replay', createdAt: 101 });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'Investigate rollout failure', createdAt: 100 });
+    await coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'Root cause is stale config replay', createdAt: 101 });
     const materialized = await coordinator.materializeTarget(target, 'manual', 200);
     setContextModelRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
@@ -160,8 +160,8 @@ describe('shared-agent-context continuity integration', () => {
       },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'decision', content: 'Repository migration stays incremental', createdAt: 10 });
-    coordinator.ingestEvent({ target, eventType: 'constraint', content: 'Do not bypass shared runtime assembly', createdAt: 20 });
+    await coordinator.ingestEvent({ target, eventType: 'decision', content: 'Repository migration stays incremental', createdAt: 10 });
+    await coordinator.ingestEvent({ target, eventType: 'constraint', content: 'Do not bypass shared runtime assembly', createdAt: 20 });
     await coordinator.materializeTarget(target, 'manual', 30);
 
     let replicationBody: ProcessedContextReplicationBody | null = null;
@@ -268,7 +268,7 @@ describe('shared-agent-context continuity integration', () => {
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'decision', content: 'Local summary exists but is not shared authority', createdAt: 1 });
+    await coordinator.ingestEvent({ target, eventType: 'decision', content: 'Local summary exists but is not shared authority', createdAt: 1 });
     await coordinator.materializeTarget(target, 'manual', 2);
 
     const { provider, send } = makeProvider();

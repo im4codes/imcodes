@@ -23,11 +23,13 @@ const mockPreviewCoordinator = vi.hoisted(() => ({
 // ── Mock fs/promises ───────────────────────────────────────────────────────
 vi.mock('node:fs/promises', () => ({
   lstat: vi.fn(),
+  readFile: vi.fn(),
   readdir: vi.fn(),
   realpath: vi.fn(),
   stat: vi.fn(),
 }));
 const mockReaddir = vi.mocked(fsp.readdir);
+const mockReadFile = vi.mocked(fsp.readFile);
 const mockRealpath = vi.mocked(fsp.realpath);
 const mockStat = vi.mocked(fsp.stat);
 
@@ -185,6 +187,58 @@ describe('fs.ls handler', () => {
     expect(resp.entries.map((e: any) => e.name)).toEqual(['src', '.git']);
     // README.md should not appear
     expect(resp.entries.every((e: any) => e.isDir)).toBe(true);
+  });
+
+  it('optionally attaches OpenSpec task stats while preserving plain fs.ls behavior', async () => {
+    const changesDir = path.join(homedir(), 'repo', 'openspec', 'changes');
+    mockRealpath.mockResolvedValue(changesDir as unknown as string);
+    mockReaddir.mockResolvedValue([
+      makeDirent('change-a', true),
+      makeDirent('change-b', true),
+      makeDirent('notes.md', false),
+    ] as unknown as fsp.Dirent<string>[]);
+    mockReadFile.mockImplementation(async (target) => {
+      const value = String(target);
+      if (value.endsWith(path.join('change-a', 'tasks.md'))) {
+        return [
+          '- [x] Completed task',
+          '- [ ] Remaining task',
+          '```md',
+          '- [ ] ignored fenced checkbox',
+          '```',
+        ].join('\n') as any;
+      }
+      const error = new Error('ENOENT') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      throw error;
+    });
+
+    handleWebCommand({ type: 'fs.ls', path: changesDir, requestId: 'req-openspec-plain', includeFiles: false }, mockServerLink as any);
+    await flushAsync();
+    expect((sent[0] as any).entries.every((entry: any) => entry.openSpecTaskStats === undefined)).toBe(true);
+    expect(mockReadFile).not.toHaveBeenCalled();
+
+    handleWebCommand({
+      type: 'fs.ls',
+      path: changesDir,
+      requestId: 'req-openspec-tasks',
+      includeFiles: false,
+      includeOpenSpecTaskStats: true,
+    }, mockServerLink as any);
+    await flushAsync();
+
+    const resp = sent[1] as any;
+    expect(resp.status).toBe('ok');
+    expect(resp.entries.find((entry: any) => entry.name === 'change-a').openSpecTaskStats).toEqual({
+      total: 2,
+      checked: 1,
+      unchecked: 1,
+    });
+    expect(resp.entries.find((entry: any) => entry.name === 'change-b').openSpecTaskStats).toEqual({
+      total: 0,
+      checked: 0,
+      unchecked: 0,
+    });
   });
 
   it('keeps non-preview fs.ls responsive while preview worker slots are blocked', async () => {

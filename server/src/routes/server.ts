@@ -382,18 +382,18 @@ serverRoutes.patch('/:id/name', requireAuth(), async (c) => {
   return c.json({ ok: true });
 });
 
-// DELETE /api/server/:id — delete a server (user must own it); notifies daemon to self-destruct first
+// DELETE /api/server/:id — delete a server (user must own it); notifies daemon to self-destruct after DB authorization
 serverRoutes.delete('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id') ?? '';
 
-  // Notify daemon to self-destruct (best-effort — daemon may be offline)
+  const deleted = await deleteServer(c.env.DB, serverId, userId);
+  if (!deleted) return c.json({ error: 'not_found' }, 404);
+
+  // Notify daemon to self-destruct after DB ownership has been proven (best-effort — daemon may be offline)
   try {
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: DAEMON_COMMAND_TYPES.SERVER_DELETE }));
   } catch { /* daemon may be offline, continue with DB deletion */ }
-
-  const deleted = await deleteServer(c.env.DB, serverId, userId);
-  if (!deleted) return c.json({ error: 'not_found' }, 404);
   return c.json({ ok: true });
 });
 

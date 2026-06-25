@@ -23,6 +23,87 @@
     "hide": "Скрыть",
     "this_feature": "Эта функция"
   },
+  "share": {
+    "menu": {
+      "shareTab": "Поделиться"
+    },
+    "dialogTitle": "Предоставить доступ",
+    "dialogSubtitle": "Предоставьте ограниченный доступ к {{target}}.",
+    "target": {
+      "label": "Цель",
+      "currentTab": "Текущая вкладка",
+      "server": "Весь исходный сервер",
+      "serverFallback": "Этот сервер"
+    },
+    "role": {
+      "label": "Роль",
+      "viewer": "Наблюдатель",
+      "participant": "Участник",
+      "serverMember": "Участник сервера",
+      "serverManager": "Администратор сервера",
+      "system": "Система"
+    },
+    "roleHelp": {
+      "viewer": "Может просматривать состояние в рамках области и участвовать в обсуждениях без управления агентом.",
+      "participant": "Может просматривать состояние в рамках области и отправлять запросы в покрытые конкретные вкладки."
+    },
+    "trust": {
+      "title": "Раскрытие доверия участника",
+      "body": "Агенты не изолированы песочницей. Ограничения UI/API уменьшают прямые элементы управления, но запрос участника всё равно может повлиять на агента в доступной ему среде."
+    },
+    "recipient": {
+      "label": "Получатель",
+      "placeholder": "ID пользователя или email"
+    },
+    "list": {
+      "label": "Пользователи с доступом",
+      "title": "Пользователи с доступом",
+      "empty": "Пользователей с доступом пока нет"
+    },
+    "manage": {
+      "roleFor": "Роль для {{user}}",
+      "revoke": "Отозвать",
+      "revokeConfirm": "Отозвать доступ для {{user}}?"
+    },
+    "sharedWithMe": {
+      "title": "Доступно мне",
+      "empty": "Нет общих вкладок или серверов",
+      "refresh": "Обновить общий доступ",
+      "kind": {
+        "server": "Сервер",
+        "tab": "Вкладка",
+        "subsession": "Подсессия"
+      }
+    },
+    "create": "Создать доступ",
+    "creating": "Создание...",
+    "scope": {
+      "current": "Область доступа"
+    },
+    "indicator": "{{scope}} предоставлена как {{role}} · {{status}}",
+    "indicatorCompact": "Доступ как {{role}} · {{status}}",
+    "indicatorSharedOut": "Доступ открыт другим",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "Активен",
+      "revoked": "Отозван",
+      "expired": "Истёк",
+      "target-unavailable": "Цель недоступна"
+    },
+    "reason": {
+      "share-role-denied": "Эта роль не может выполнить действие.",
+      "share-direct-surface-denied": "Эта поверхность недоступна при общем доступе.",
+      "share-rate-limited": "Слишком много действий общего доступа. Повторите позже.",
+      "share-revoked": "Этот доступ был отозван.",
+      "share-expired": "Срок этого доступа истёк.",
+      "share-target-unavailable": "Общая цель недоступна.",
+      "share-role-changed": "Роль общего доступа изменилась.",
+      "share-ticket-invalid": "Билет общего доступа недействителен.",
+      "share-cancel-unsupported": "Отмена не поддерживается для этой общей вкладки.",
+      "share-audit-duplicate": "Это действие уже записано.",
+      "share-comment-invalid": "Не удалось опубликовать комментарий."
+    }
+  },
   "window": {
     "maximize": "Развернуть",
     "restore": "Восстановить",
@@ -45,7 +126,18 @@
     "reload": "Перезагрузить",
     "retry": "Повторить"
   },
+  "askQuestion": {
+    "waiting": "Ожидается ваш ответ. Модель продолжит сама через {{seconds}} с.",
+    "retained": "Модель уже продолжила работу. Вы еще можете прервать ее в течение {{seconds}} с.",
+    "customPlaceholder": "Дополнение / свой ответ (необязательно)",
+    "answerPlaceholder": "Ваш ответ",
+    "dismiss": "Закрыть",
+    "answer": "Ответить",
+    "interrupt": "Прервать этим ответом"
+  },
   "chat": {
+    "delete_message": "Удалить сообщение",
+    "delete_message_confirm": "Удалить это сообщение для всех? Это действие нельзя отменить.",
     "dpad": {
       "title": "Клавиши-стрелки — тяните, чтобы двигать"
     },
@@ -170,6 +262,13 @@
     "zoom_title": "Сообщение",
     "zoom_copy_all": "Копировать всё",
     "zoom_hint": "Удерживайте, чтобы выделить текст. Передвиньте маркеры, затем скопируйте.",
+    "image_download": "Скачать изображение",
+    "image_downloading": "Скачивание...",
+    "image_downloaded": "Скачано",
+    "image_download_failed": "Не удалось скачать",
+    "image_copy": "Копировать изображение",
+    "image_copied": "Изображение скопировано",
+    "image_copy_failed": "Не удалось скопировать",
     "tool_detail_toggle": "подробно",
     "tool_detail_input": "ввод",
     "tool_detail_output": "вывод",
@@ -250,7 +349,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "Запустить текущую задачу через клоны выполнения",
+    "execution_clone_run_with_template": "Запустить текущую задачу через {{count}} клон(ов) {{name}}",
+    "execution_clone_run_no_template": "Сначала включите и выберите сессию выполнения в настройках Team",
+    "execution_clone_run_empty": "Сначала введите задачу",
+    "execution_clone_run_offline": "Переподключитесь перед запуском клонов"
   },
   "session": {
     "restart": "↺ Перезапустить",
@@ -292,6 +396,9 @@
     "type": "Тип",
     "label": "Метка",
     "workingDir": "Рабочий каталог",
+    "subsessionWorkingDirectory": "Рабочий каталог",
+    "subsessionWorkingDirectoryPlaceholder": "Каталог текущей сессии",
+    "subsessionWorkingDirectoryLocked": "Подсессии используют текущий каталог, и его нельзя изменить при запуске.",
     "parentSession": "Родительская сессия",
     "rename": "✎ Переименовать",
     "rename_plain": "Переименовать",
@@ -316,6 +423,10 @@
       "overrideDirectories": "Использовать новый рабочий каталог для клонированных сеансов",
       "cwdOverride": "Новый рабочий каталог",
       "cwdOverridePlaceholder": "/work/new-checkout",
+      "gitRemoteUrl": "Git remote URL (необязательно)",
+      "gitRemoteUrlPlaceholder": "https://github.com/org/repo.git",
+      "gitRemoteUrlHelp": "Если заполнено, daemon сначала clone этот remote в новый рабочий каталог, затем скопирует группу.",
+      "gitRemoteCapabilityMissing": "Подключенный daemon пока не поддерживает clone Git remotes для копируемых групп. Обновите или переподключите daemon и повторите попытку.",
       "browseCwd": "Выбрать рабочий каталог",
       "daemonHostValidation": "Рабочие каталоги проверяются на хосте daemon до создания ресурсов.",
       "runningWarning": "Скопированная группа начнется с чистого состояния. Ожидающие сообщения, история терминала и выполняемая работа из источника не копируются.",
@@ -363,6 +474,8 @@
         "blank_target_project": "Имя целевого проекта обязательно.",
         "name_taken": "Это имя целевой сессии уже используется.",
         "invalid_cwd": "Рабочий каталог нельзя использовать на хосте daemon.",
+        "invalid_git_remote": "Этот Git remote URL не поддерживается.",
+        "git_clone_failed": "daemon не смог clone Git remote в рабочий каталог.",
         "incomplete_clone_spec": "У выполняющейся дочерней сессии не хватает копируемых настроек запуска.",
         "unsupported_session_type": "Одну из сессий пока нельзя копировать.",
         "p2p_config_invalid": "Не удалось скопировать конфигурацию Team.",
@@ -541,7 +654,17 @@
       "deny": "Отклонить",
       "tool": "{{tool}} требует одобрения"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "Пожалуйста, выполните запрошенную работу по реализации/выполнению в этой сессии.",
+      "useConfigured": "использовать {{name}}",
+      "useConfiguredNone": "использовать сессию выполнения",
+      "setSession": "настроить сессию выполнения…"
+    },
+    "executionGroup": {
+      "title": "Рабочие выполнения (запуск {{run}})",
+      "unknownRun": "ожидание"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",
@@ -604,12 +727,18 @@
     "tab_files": "Файлы",
     "tab_changes": "Изменения",
     "changes_title": "Изменения ({{count}})",
-    "no_changes": "Нет изменений"
+    "no_changes": "Нет изменений",
+    "rename_prompt": "Переименовать {{name}}",
+    "rename_failed": "Не удалось переименовать элемент",
+    "delete_confirm": "Удалить {{name}}? Это действие нельзя отменить.",
+    "delete_failed": "Не удалось удалить элемент",
+    "invalid_name": "Имя не может содержать разделители пути"
   },
   "toast": {
     "finished": "завершено",
     "upgrade_blocked_title": "Обновление заблокировано",
     "upgrade_blocked_p2p_active": "Team всё ещё выполняется. Остановите его перед обновлением daemon.",
+    "upgrade_blocked_auto_deliver_active": "Auto Deliver всё ещё выполняется. Остановите его перед обновлением daemon.",
     "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого."
   },
   "discussion": {
@@ -649,6 +778,10 @@
     "title": "Новая сессия",
     "project_name": "Имя проекта",
     "working_directory": "Рабочая директория",
+    "git_remote_url": "Git remote URL (необязательно)",
+    "git_remote_url_placeholder": "https://github.com/org/repo.git",
+    "git_remote_url_help": "Если заполнено, daemon сначала clone этот remote в рабочий каталог, затем запустит сессию.",
+    "git_remote_capability_missing": "Подключенный daemon пока не поддерживает clone Git remotes. Обновите или переподключите daemon и повторите попытку.",
     "browse": "Обзор",
     "agent_type": "Тип агента",
     "agent_flavor_cli": "CLI: нативный интерфейс для тех, кто предпочитает оригинальный UI. В режиме чата нет стриминга.",
@@ -1060,6 +1193,8 @@
     "title": "OpenSpec",
     "changes": "Изменения",
     "empty": "Изменения OpenSpec не найдены",
+    "no_tasks": "Нет задач",
+    "task_status_title": "{{checked}}/{{total}} задач выполнено",
     "load_timeout": "Загрузка изменений OpenSpec заняла слишком много времени. Повторите попытку после переподключения daemon.",
     "load_unavailable": "Изменения OpenSpec недоступны, пока соединение с daemon не будет готово.",
     "load_error": "Не удалось просканировать изменения OpenSpec",
@@ -1069,6 +1204,213 @@
     "implement_action": "Реализация",
     "achieve_action": "Завершить",
     "propose_action": "Предложить",
+    "execute": {
+      "action": "Выполнить",
+      "dispatch_heading": "Выполнить текущее изменение в",
+      "dispatch_to": "{{name}}",
+      "default_heading": "Сессия выполнения по умолчанию",
+      "set_default": "Сделать {{name}} сессией по умолчанию",
+      "clear_default": "Очистить сессию выполнения по умолчанию",
+      "no_change": "Откройте изменение, чтобы выбрать цель выполнения.",
+      "no_sessions": "В этом проекте пока нет подходящих сессий выполнения."
+    },
+    "auto": {
+      "action": "Auto",
+      "kicker": "Автодоставка",
+      "custom": "Пользовательский",
+      "launcher_title": "Автодоставка",
+      "details_title": "Детали Auto Deliver",
+      "current_run": "Текущий Auto Deliver",
+      "list_title": "Автодоставка",
+      "list_empty": "Запуски автодоставки пока не обнаружены.",
+      "list_select": "Выберите запуск автодоставки.",
+      "no_change": "Изменение не выбрано",
+      "start": "Запустить Auto Deliver",
+      "stop": "Остановить",
+      "stopping": "Остановка...",
+      "view": "Открыть",
+      "compact": "Свернуть",
+      "expand": "Развернуть",
+      "tasks": "Tasks",
+      "tasks_unknown": "Задачи неизвестны",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "overall_progress": "Общий прогресс",
+      "current_stage_progress": "Текущий этап",
+      "progress_count": "{{current}}/{{total}}",
+      "progress_percent": "{{percent}}%",
+      "prompt_count": "{{count}} prompts",
+      "prompt_progress": "{{count}}/{{total}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "latest_message": "Последнее сообщение",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "В этой группе сеансов уже выполняется Auto Deliver.",
+      "conflict_summary": "Подробности видны только участвующим сеансам.",
+      "lock_manual_actions": "Auto Deliver выполняется для этой группы сеансов.",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "Время",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Комбо Team",
+      "active_prompt": "OpenSpec prompt",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "final_scores": "Final acceptance scores",
+      "pre_repair_scores": "Pre-repair audit scores",
+      "score_snapshot_meta": "Round {{round}} · {{reason}}",
+      "scores_empty": "Оценок пока нет",
+      "scores_pending_repair_rescore": "These scores are from the previous implementation audit. Auto Deliver is repairing those findings now and will rescore after implementation finishes.",
+      "audit_results": "Результаты раундов аудита",
+      "audit_results_empty": "Завершенных раундов аудита пока нет",
+      "round_index": "Раунд {{count}}",
+      "required_changes": "Обязательные изменения",
+      "evidence": "Доказательства",
+      "evidence_stale": "Устарело",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "Auto Deliver уже выполняется для этой группы сеансов.",
+        "manual_team_busy": "Ручной запуск Team уже использует эту группу сеансов.",
+        "unsupported_runtime": "Auto Deliver требуется сеанс кодирования на transport.",
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "Количество раундов вне допустимого диапазона.",
+        "daemon_offline": "Daemon не в сети. Повторите попытку после переподключения.",
+        "launch_timeout": "Истекло время запуска автодоставки. Повторите попытку.",
+        "stop_timeout": "Истекло время остановки автодоставки. Повторите попытку.",
+        "custom_combo_unsupported": "Автодоставка пока не поддерживает пользовательские комбо Team.",
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "Продолжение Auto Deliver истекло по времени. Попробуйте снова."
+      },
+      "preset": {
+        "fast": "Быстро",
+        "standard": "Стандарт",
+        "strict": "Строго",
+        "deep": "Глубоко"
+      },
+      "status": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementing",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
+        "stopping": "Stopping",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      },
+      "ask": {
+        "header": "OpenSpec Auto Deliver",
+        "needs_human_question": "Auto Deliver требует участия человека: {{reason}} Что сделать дальше в этой сессии?",
+        "review_continue": "Разобрать сбой и продолжить вручную",
+        "review_continue_desc": "Отправить инструкцию: проверить остановленный запуск, исправить проблему и отчитаться.",
+        "stop_summarize": "Остановиться здесь и кратко описать состояние",
+        "stop_summarize_desc": "Попросить агента остановить активную работу и дать краткий handoff."
+      },
+      "reason": {
+        "auto_deliver_active": "Auto Deliver уже выполняется для этой сессии.",
+        "audit_p2p_failed": "Аудит Team/P2P завершился ошибкой до создания результата.",
+        "missing_authoritative_json": "Аудит не выдал финальный авторитетный результат JSON.",
+        "invalid_authoritative_json": "Финальный авторитетный результат JSON недействителен.",
+        "audit_metadata_mismatch": "Метаданные результата аудита не соответствуют этому запуску Auto Deliver.",
+        "invalid_authoritative_result_path": "Путь к авторитетному файлу результата находится вне разрешенного каталога обсуждений.",
+        "invalid_audit_verdict": "Payload вердикта аудита недействителен.",
+        "audit_blocked": "Аудит сообщил о заблокированном результате. Проверьте оценки и решите, запускать ли Auto Deliver снова.",
+        "tasks_unreadable": "Не удалось прочитать tasks.md.",
+        "tasks_missing_checkboxes": "В tasks.md нет чекбоксов задач для проверки.",
+        "implementation_audit_required": "Перед завершением требуется аудит реализации.",
+        "implementation_prompt_limit_reached": "Достигнут лимит prompts для реализации.",
+        "max_elapsed_time_reached": "Достигнут лимит времени Auto Deliver.",
+        "out_of_band_target_session_input": "Во время Auto Deliver в сессию реализации был отправлен ручной ввод.",
+        "spec_audit_rework_reported": "Аудит спецификации сообщил о дальнейшей работе. Проверьте оценки и решите, запускать ли Auto Deliver снова.",
+        "implementation_audit_rework_reported": "Аудит реализации сообщил о дальнейшей работе. Проверьте оценки и решите, запускать ли Auto Deliver снова.",
+        "spec_audit_rework_rounds_exhausted": "Раунды аудита-исправления спецификации исчерпаны.",
+        "implementation_audit_rework_rounds_exhausted": "Раунды аудита-исправления реализации исчерпаны.",
+        "audit_pass_with_unchecked_tasks": "Аудит прошел, хотя в tasks.md остались неотмеченные задачи.",
+        "audit_pass_with_required_changes": "Аудит прошел, хотя остаются обязательные изменения.",
+        "audit_pass_without_scores": "Аудит прошел без полных оценок модулей.",
+        "audit_pass_with_changed_files_without_repairs": "Аудит прошел после изменений файлов без сводок исправлений.",
+        "audit_pass_with_uncovered_changes": "Сводка исправлений аудита не покрывает все измененные файлы.",
+        "quality_gate_low_score": "A quality gate paused for low module score: {{modules}}. Auto Deliver will run an implementation repair prompt, then audit and score again.",
+        "final_audit_passed": "Финальный аудит пройден.",
+        "final_audit_rework_scored": "Финальный аудит завершен с оценкой оставшейся работы. Проверьте оценки модулей и решите, запускать ли Auto Deliver снова.",
+        "final_audit_blocked_scored": "Финальный аудит завершен с оценкой блокирующего вердикта. Проверьте оценки модулей и решите, запускать ли Auto Deliver снова.",
+        "auto_commit_push_failed": "Автоматический commit/push не выполнен: {{detail}}",
+        "auto_commit_push_git_status_failed": "Не удалось прочитать статус git для автоматического commit/push: {{detail}}",
+        "auto_commit_push_preexisting_changes": "Автоматический commit/push пропущен: до запуска уже были изменены файлы продукта: {{files}}",
+        "auto_commit_push_incomplete": "Автоматический commit/push требует проверки человеком: после шага commit/push файлы продукта все еще изменены: {{files}}",
+        "auto_commit_push_no_upstream": "Автоматический commit/push требует проверки человеком: у этой ветки нет upstream.",
+        "auto_commit_push_not_pushed": "Автоматический commit/push требует проверки человеком: {{count}} commit(s) все еще впереди upstream.",
+        "auto_commit_push_no_commit": "Автоматический commit/push требует проверки человеком: новый commit не был создан.",
+        "auto_commit_push_forbidden_paths": "Автоматический commit/push требует проверки человеком: были закоммичены локальные planning-файлы: {{files}}",
+        "auto_commit_push_unexpected_files": "Автоматический commit/push требует проверки человеком: commit включил файлы вне текущего изменения Auto Deliver: {{files}}",
+        "spec_audit_blocked": "Аудит спецификации заблокирован. Проверьте результат, исправьте проблему и продолжите.",
+        "implementation_audit_blocked": "Аудит реализации заблокирован. Проверьте результат, исправьте проблему и продолжите.",
+        "spec_audit_rework_requires_repair": "Аудит спецификации сообщил о необходимых исправлениях. Auto Deliver продолжит следующий цикл audit-repair.",
+        "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
+        "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
+        "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."
+      },
+      "lifecycle": {
+        "spec_audit_repair_started": "Аудит-исправление спецификации начался.",
+        "spec_audit_repair_p2p_started": "Team-запуск аудита спецификации начался.",
+        "implementation_prompt_dispatched": "Prompt реализации отправлен.",
+        "spec_repair_prompt_dispatched": "Spec repair prompt sent from audit findings: {{reason}}",
+        "implementation_repair_prompt_dispatched": "Implementation repair prompt sent from audit findings: {{reason}}",
+        "implementation_idle_incomplete": "Реализация продолжает выполнять задачи.",
+        "implementation_idle_all_checked": "Все задачи реализации отмечены.",
+        "implementation_audit_repair_started": "Аудит-исправление реализации начался.",
+        "implementation_audit_repair_p2p_started": "Team-запуск аудита реализации начался.",
+        "auto_commit_push_prompt_dispatched": "Prompt commit/push отправлен.",
+        "post_repair_acceptance_audit_dispatched": "Final acceptance audit sent.",
+        "post_repair_result_file_repair_prompt_dispatched": "Prompt исправления файла финального результата приемки отправлен.",
+        "authoritative_result_file_repair_prompt_dispatched": "Prompt исправления файла результата отправлен.",
+        "spec_audit_passed": "Аудит спецификации пройден.",
+        "spec_audit_rework_scored": "Аудит спецификации завершен с оценкой оставшейся работы.",
+        "spec_audit_blocked_scored": "Аудит спецификации завершен с оценкой блокирующего вердикта.",
+        "continue_requested": "Запрошено продолжение."
+      },
+      "spec_rounds": "Раунды аудита спецификации",
+      "impl_rounds": "Раунды аудита реализации",
+      "team_combo": "Комбо Team",
+      "auto_commit_push": "Автоматически коммитить и отправлять после успешного аудита",
+      "auto_commit_push_help": "Сохраняется как ваша настройка. После успешного аудита agent получает commit&push.",
+      "continue": "Продолжить",
+      "continuing": "Продолжается..."
+    },
     "propose_from_discussion_action": "Из недавнего обсуждения",
     "propose_from_description_action": "Из описания ниже",
     "audit_implementation_prompt": "Проведи строгий аудит реализации {{reference}} по его артефактам OpenSpec. Выяви каждое расхождение, упущение, риск регрессии, пробел в пограничных сценариях и недостающий тест; затем исправь код, тесты и все необходимые сопутствующие изменения. Если по ходу нужно синхронизировать спецификацию, обнови в той же задаче соответствующие файлы OpenSpec внутри {{reference}}. Не останавливайся на отчете: доведи реализацию до полного соответствия спецификации.",
@@ -1141,7 +1483,27 @@
     "passkey_verify_wrong_account": "Этот passkey принадлежит другому аккаунту. Подтвердите passkey, зарегистрированный для текущего аккаунта.",
     "passkey_verify_no_passkeys": "Для этого аккаунта не зарегистрировано ни одного passkey.",
     "native_status_verifying_passkey": "Подтверждение passkey…",
-    "native_status_saving_password": "Сохранение входа по паролю…"
+    "native_status_saving_password": "Сохранение входа по паролю…",
+    "executionRouting": {
+      "title": "Маршрутизация выполнения",
+      "enableLabel": "Использовать выделенную сессию выполнения",
+      "enableHint": "При включении работа по реализации/выполнению отправляется короткоживущим клонам-воркерам, скопированным с шаблонной сессии ниже, а не выполняется в оркестраторе. Сохранение только записывает настройку и не запускает выполнение.",
+      "templateLabel": "Шаблонная сессия выполнения",
+      "templateNone": "Не выбрано",
+      "templateHint": "Клоны наследуют провайдера, модель и инструменты этой сессии, но никогда не её личность или историю. Перечислены только подходящие неосновные сессии этого проекта.",
+      "noCandidates": "В этом проекте пока нет подходящих шаблонных сессий. Запустите воркер или подсессию, чтобы использовать её как шаблон.",
+      "reselectRequired": "Маршрутизация включена, но для этого проекта не выбран допустимый шаблон. Выберите шаблонную сессию выполнения ниже.",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "достигнут предел",
+        "template_ineligible": "непригоден как шаблон",
+        "clone_of_clone_forbidden": "уже является клоном выполнения",
+        "worker_clone_forbidden": "рабочие сессии не могут быть шаблонами",
+        "cron_clone_forbidden": "запланированная сессия не может быть шаблоном",
+        "target_not_found": "сессия не найдена",
+        "destroy_forbidden": "не разрешено"
+      }
+    }
   },
   "admin": {
     "title": "Панель администратора",
@@ -1293,6 +1655,7 @@
     "restore_quick_closed": "Восстановить недавно закрытые окна подсессий",
     "quick_close_unavailable": "Сначала откройте окно подсессии",
     "p2p_discussions": "Team-обсуждения",
+    "auto_deliver": "Auto Deliver",
     "p2p_compact_show": "Показать компактную Team-панель",
     "p2p_compact_hide": "Свернуть Team-панель",
     "p2p_compact_expand": "Показать подробную Team-панель",

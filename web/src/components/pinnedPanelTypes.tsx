@@ -15,6 +15,7 @@ import { useTranslation } from 'react-i18next';
 import { UsageFooter } from './UsageFooter.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
@@ -49,6 +50,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
+  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const liveSessionState = useMemo(
     () => getTailSessionState(events) ?? liveSub?.state ?? null,
     [events, liveSub?.state],
@@ -87,7 +89,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           agentType={liveSub.type}
         />
       )}
-      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || activeToolCall || activeTimelineTurn || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
@@ -102,6 +104,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
           now={thinkingNow}
         />
       )}
@@ -144,6 +147,7 @@ registerPanelType('filebrowser', {
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
         serverId={ctx.serverId}
+        sessionName={activeSession}
         mode="file-multi"
         layout="panel"
         initialPath={projectDir}

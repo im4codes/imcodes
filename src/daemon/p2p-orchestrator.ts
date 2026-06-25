@@ -13,7 +13,9 @@ import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
+import type { SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
+import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
 import {
   P2P_BASELINE_PROMPT,
   getLegacyExecutionRoundCount,
@@ -34,6 +36,11 @@ import {
   type P2pResolvedPlan,
   type P2pResolvedRound,
 } from '../../shared/p2p-advanced.js';
+import type {
+  SharedActorEnvelope,
+  ShareTarget,
+  ShareAuthorizationSnapshot,
+} from '../../shared/tab-sharing.js';
 import type {
   P2pBindRuntimeContext,
   P2pBoundWorkflow,
@@ -63,6 +70,7 @@ import {
 import { makeP2pWorkflowDiagnostic, type P2pWorkflowDiagnostic } from '../../shared/p2p-workflow-diagnostics.js';
 import { evaluateP2pLogic } from '../../shared/p2p-workflow-logic-evaluator.js';
 import type { P2pWorkflowVariableValue } from '../../shared/p2p-workflow-types.js';
+import { OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES } from '../../shared/openspec-auto-deliver-constants.js';
 import {
   P2P_ROUTING_HISTORY_RETENTION_COUNT,
   P2P_SCRIPT_RETRIABLE_DIAGNOSTIC_CODES,
@@ -87,6 +95,8 @@ import {
 } from '../../shared/p2p-status.js';
 import {
   buildP2pExecutionMarker,
+  POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE,
+  POST_SUMMARY_EXECUTION_TIMEOUT_REASON,
   stringifyP2pExecutionMarker,
   validateP2pExecutionMarkerContent,
   type P2pExecutionMarker,
@@ -102,6 +112,25 @@ import ruLocale from '../../web/src/i18n/locales/ru.json' with { type: 'json' };
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { getFreshResendEntries, removeResendEntries } from './transport-resend-queue.js';
+import {
+  evaluateP2pLaunchAdmission,
+  sanitizeP2pLaunchOriginForProjection,
+  type P2pLaunchOrigin,
+} from './p2p-launch-admission.js';
+import { appendExecutionRoutingAppendix } from './execution-routing-appendix.js';
+import { buildExecutionRoutingRecentContextBlock } from './execution-routing-handoff.js';
+import { orchestrateCloneWorkers, WorkerTimeoutError } from './execution-clone-orchestration.js';
+import { defaultDedicatedExecutionRoutingPreference } from '../../shared/execution-clone.js';
+import type { ExecutionCloneParentStage, DedicatedExecutionRoutingGlobalPreference } from '../../shared/execution-clone.js';
+
+/**
+ * Parent stage owning the Team FINAL-EXECUTION prompt's task semantics. Typed
+ * against {@link ExecutionCloneParentStage} so it cannot drift from the shared
+ * tuple (compile error if the member is ever removed). This is a reference to
+ * the shared constant union, not a second definition of the string.
+ */
+const TEAM_FINAL_EXECUTION_STAGE: ExecutionCloneParentStage = 'team_final_execution';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +172,44 @@ export interface StartP2pRunOptions {
   advancedRunTimeoutMs?: number;
   /** @deprecated v1a passthrough — prefer `advanced` for new call sites. Removed in v1b. */
   contextReducer?: P2pContextReducerConfig;
+  sharedActor?: SharedActorEnvelope;
+  shareScope?: SharedP2pRunScope;
+  launchOrigin?: P2pLaunchOrigin;
+  /**
+   * Extra instruction appended verbatim to the FINAL summary hop instruction.
+   * Hop prompts never embed `userText`, so output requirements stated only in
+   * the original request (e.g. Auto Deliver's "repair scorecard" section that
+   * the acceptance audit hard-depends on) can get lost by the final round —
+   * previously they leaked in via the post-summary execution block's full
+   * request restatement; with that gate skipped for Auto Deliver runs the
+   * caller must restate them here explicitly.
+   */
+  finalSummaryExtraInstruction?: string;
+  /**
+   * Dedicated-execution routing config for this run. OFF by default
+   * (`undefined` → disabled). When enabled with a valid `templateSessionName`,
+   * the FINAL-EXECUTION prompt gets the routing appendix. Threaded through to
+   * `P2pRun.dedicatedExecutionRouting`.
+   */
+  dedicatedExecutionRouting?: {
+    enabled: boolean;
+    templateSessionName: string | null;
+    /**
+     * Resolved (clamped) per-run clone limits. When present, these are consumed
+     * by the orchestrator clone pool so a configured non-default cap (e.g.
+     * `maxParallelClones`) is actually enforced. Absent → canonical defaults.
+     */
+    limits?: DedicatedExecutionRoutingGlobalPreference;
+    /** Optional already-stored recent summary attached (bounded) to the worker hand-off. NEVER raw history. */
+    recentSummary?: string | null;
+  };
+}
+
+export interface SharedP2pRunScope {
+  target: ShareTarget;
+  historyCutoffAt: ShareAuthorizationSnapshot['historyCutoffAt'];
+  primaryShareId: ShareAuthorizationSnapshot['primaryShareId'];
+  coveringShareIds: ShareAuthorizationSnapshot['coveringShareIds'];
 }
 
 interface P2pHopRuntime extends P2pHopProgress {
@@ -176,6 +243,7 @@ export interface P2pRun {
   locale?: string;
   timeoutMs: number;
   resultSummary: string | null;
+  strictAuthoritativeResult: string | null;
   /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
   completedHops: P2pTarget[];
   /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
@@ -205,6 +273,8 @@ export interface P2pRun {
   advancedP2pEnabled: boolean;
   resolvedRounds?: P2pResolvedRound[];
   helperEligibleSnapshot: P2pParticipantSnapshotEntry[];
+  sharedActor?: SharedActorEnvelope;
+  shareScope?: SharedP2pRunScope;
   contextReducer?: P2pContextReducerConfig;
   advancedRunTimeoutMs?: number;
   /**
@@ -243,6 +313,14 @@ export interface P2pRun {
    * runs that obey the full v1 contract from legacy ones.
    */
   advancedSourceKind?: StartP2pRunAdvancedSource['kind'];
+  /**
+   * Admission/provenance metadata for the launch path that created this run.
+   * Kept daemon-local until the shared Auto Deliver contracts land; projection
+   * uses an allowlist sanitizer so raw prompts/provider internals never leak.
+   */
+  launchOrigin?: P2pLaunchOrigin;
+  /** See StartP2pRunOptions.finalSummaryExtraInstruction. */
+  finalSummaryExtraInstruction?: string;
   deadlineAt?: number | null;
   currentRoundId?: string | null;
   currentExecutionStep: number;
@@ -281,6 +359,34 @@ export interface P2pRun {
     timestamp: number;
   }>;
   helperDiagnostics: P2pHelperDiagnostic[];
+  /**
+   * Dedicated-execution routing config for this run (OFF by default). When
+   * `enabled` is true AND `templateSessionName` is a valid target, the Team
+   * FINAL-EXECUTION prompt gets the generic routing appendix telling the model
+   * to delegate execution to an ephemeral clone of the configured session
+   * instead of implementing in the orchestrator session. `undefined` →
+   * disabled → all existing prompts are byte-identical. NEVER carries OpenSpec
+   * task wording — that is owned only by the OpenSpec entry point.
+   */
+  dedicatedExecutionRouting?: {
+    enabled: boolean;
+    templateSessionName: string | null;
+    /**
+     * Resolved (clamped) per-run clone limits threaded from the launch payload.
+     * Consumed by {@link tryRunFinalExecutionViaClones} so a configured
+     * non-default cap is enforced by the clone pool. Absent → canonical
+     * defaults (the disabled/legacy path stays byte-identical).
+     */
+    limits?: DedicatedExecutionRoutingGlobalPreference;
+    /**
+     * Optional recent-memory summary for the run/session. When routing is
+     * enabled and this is present, a bounded slice (via
+     * {@link buildExecutionRoutingRecentContextBlock}) is attached to the
+     * worker hand-off prompt for continuity. MUST be an already-stored summary,
+     * NEVER raw provider history.
+     */
+    recentSummary?: string | null;
+  };
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -288,6 +394,27 @@ export interface P2pRun {
 // ── In-memory store ───────────────────────────────────────────────────────
 
 const activeRuns = new Map<string, P2pRun>();
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function extractFinalSummarySection(content: string): string {
+  let finalSummaryIndex = -1;
+  for (const match of content.matchAll(/^## .*Final Summary.*$/gmi)) {
+    finalSummaryIndex = match.index ?? finalSummaryIndex;
+  }
+  return finalSummaryIndex >= 0 ? content.slice(finalSummaryIndex) : content;
+}
+
+export function extractOpenSpecAutoDeliverStrictSegment(content: string): string | null {
+  const authoritativeSection = extractFinalSummarySection(content);
+  if (byteLength(authoritativeSection) > OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES) return null;
+  const matches = [...authoritativeSection.matchAll(/```json\s*([\s\S]*?)```/g)];
+  if (matches.length !== 1) return null;
+  const segment = matches[0]?.[0] ?? '';
+  return byteLength(segment) <= OPENSPEC_AUTO_DELIVER_VERDICT_JSON_MAX_BYTES ? segment : null;
+}
 
 /**
  * Audit fix (94b9b837-822 / N1) — module-level registry of "currently
@@ -328,11 +455,47 @@ export interface PostSummaryExecutionPromptSpec extends P2pExecutionMarkerSpec {
   markerPath: string;
 }
 
-function buildPostSummaryExecutionBasePrompt(run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>): string {
+function buildPostSummaryExecutionBasePrompt(
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale' | 'dedicatedExecutionRouting'>,
+): string {
   const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
-  return template
+  const base = template
     .replaceAll('{{discussionFile}}', run.contextFilePath)
     .replaceAll('{{request}}', run.userText);
+  return applyExecutionRoutingToFinalExecutionPrompt(base, run.dedicatedExecutionRouting);
+}
+
+/**
+ * Apply dedicated-execution routing to the Team FINAL-EXECUTION prompt.
+ *
+ * OFF by default: when `routing` is undefined or disabled (or has no valid
+ * template target) BOTH the recent-context block and the routing appendix are
+ * empty, so the returned prompt is BYTE-IDENTICAL to `base`. Only the
+ * final-execution prompt calls this — audit/summary/plan/spec-repair prompts
+ * never do, so they never receive the appendix (task 5.5).
+ *
+ * When enabled with a valid target:
+ *  - a bounded recent-context slice (already-stored summary only, never raw
+ *    history) is inserted as continuity content, then
+ *  - the GENERIC routing/delegation appendix is appended idempotently. The
+ *    appendix carries NO OpenSpec/task wording (task 5.4).
+ */
+function applyExecutionRoutingToFinalExecutionPrompt(
+  base: string,
+  routing: P2pRun['dedicatedExecutionRouting'],
+): string {
+  const enabled = routing?.enabled ?? false;
+  const templateTarget = routing?.templateSessionName ?? null;
+  let prompt = base;
+  if (enabled) {
+    const recentContext = buildExecutionRoutingRecentContextBlock(routing?.recentSummary ?? null);
+    if (recentContext.length > 0) prompt = `${prompt}\n\n${recentContext}`;
+  }
+  return appendExecutionRoutingAppendix(prompt, {
+    enabled,
+    parentStage: TEAM_FINAL_EXECUTION_STAGE,
+    templateTarget,
+  });
 }
 
 function buildPostSummaryExecutionProofBlock(
@@ -369,7 +532,7 @@ ${failureMarker}
 }
 
 function buildInlinePostSummaryExecutionInstruction(
-  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale' | 'dedicatedExecutionRouting'>,
   markerSpec: PostSummaryExecutionPromptSpec,
 ): string {
   return `After writing the required summary or plan, continue in the same turn and directly execute the user's original request. Do not wait for a separate follow-up prompt.
@@ -391,7 +554,7 @@ function buildPostSummaryExecutionConfirmationPrompt(
     `Execution marker file: ${executionSpec.markerPath}`,
     `Execution marker status: ${executionMarker.status}`,
     executionMarker.summary ? `Execution summary: ${executionMarker.summary}` : null,
-    executionMarker.changedFiles?.length ? `Changed files: ${executionMarker.changedFiles.join(', ')}` : null,
+    executionMarker.changedFiles?.length ? 'Execution marker reported file changes; inspect the workspace if file-level detail is needed.' : null,
     executionMarker.tests?.length ? `Tests: ${executionMarker.tests.join(', ')}` : null,
   ].filter((line): line is string => line !== null).join('\n');
 
@@ -412,7 +575,7 @@ ${buildPostSummaryExecutionProofBlock(markerSpec, options)}`;
 }
 
 export function buildPostSummaryExecutionPrompt(
-  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>,
+  run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale' | 'dedicatedExecutionRouting'>,
   markerSpec?: PostSummaryExecutionPromptSpec,
   options: { attempt?: number; deadlineAt?: number } = {},
 ): string {
@@ -485,7 +648,7 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     return acc;
   }, {});
 
-  return {
+  const payload: P2pRunUpdatePayload = {
     id: run.id,
     discussion_id: run.discussionId,
     server_id: '', // filled by bridge from auth context
@@ -569,6 +732,8 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     current_round_id: run.currentRoundId ?? null,
     current_execution_step: run.currentExecutionStep || null,
     current_round_attempt: run.currentRoundAttempt || null,
+    ...(run.sharedActor ? { sharedActor: run.sharedActor } : {}),
+    ...(run.shareScope ? { shareScope: run.shareScope } : {}),
     round_attempt_counts: run.advancedP2pEnabled ? { ...run.roundAttemptCounts } : undefined,
     round_jump_counts: run.advancedP2pEnabled ? { ...run.roundJumpCounts } : undefined,
     routing_history: run.advancedP2pEnabled ? [...routingHistory] : undefined,
@@ -675,17 +840,22 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
       return nodes;
     })(),
   };
+  const launchOrigin = sanitizeP2pLaunchOriginForProjection(run.launchOrigin);
+  if (launchOrigin) {
+    (payload as Record<string, unknown>).launch_origin = launchOrigin;
+  }
+  return payload;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-let IDLE_POLL_MS = 3_000;
-let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
-let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
-let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
-let MARKER_PROMPT_RETRY_AFTER_MS = 60_000; // Marker prompts may be retried, but only after queue-aware idle.
-let POST_SUMMARY_CONFIRMATION_DELAY_MS = 10_000; // Let the execution marker/status settle before the follow-up check.
-let QUEUE_STUCK_STOP_AFTER_MS = 300_000; // 5 min — stop only when transport queue/turn is stale
+let IDLE_POLL_MS = 1_000;
+let GRACE_PERIOD_DEFAULT_MS = 45_000; // Complex analysis can be slow, but blank/idle hops should not stall for minutes.
+let MIN_PROCESSING_MS = 8_000; // Give the agent a short startup window before trusting idle detection.
+let FILE_SETTLE_CYCLES = 2; // File must stop growing for 2 poll cycles (2s) to be "settled".
+let MARKER_PROMPT_RETRY_AFTER_MS = 30_000; // Marker prompts may be retried, but only after queue-aware idle.
+let QUEUE_STUCK_STOP_AFTER_MS = 120_000; // Generic stale queue recovery stays conservative.
+let QUEUED_PROMPT_STOP_AFTER_MS = 20_000; // P2P-owned queued prompt should be recovered quickly.
 let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */
@@ -698,10 +868,10 @@ export function _setMinProcessingMs(ms: number): void { MIN_PROCESSING_MS = ms; 
 export function _setFileSettleCycles(n: number): void { FILE_SETTLE_CYCLES = n; }
 /** Override marker retry delay for tests. */
 export function _setMarkerPromptRetryAfterMs(ms: number): void { MARKER_PROMPT_RETRY_AFTER_MS = ms; }
-/** Override follow-up confirmation delay for tests. */
-export function _setPostSummaryConfirmationDelayMs(ms: number): void { POST_SUMMARY_CONFIRMATION_DELAY_MS = ms; }
 /** Override stale queue watchdog threshold for tests. */
 export function _setQueueStuckStopAfterMs(ms: number): void { QUEUE_STUCK_STOP_AFTER_MS = ms; }
+/** Override queued P2P prompt watchdog threshold for tests. */
+export function _setQueuedPromptStopAfterMs(ms: number): void { QUEUED_PROMPT_STOP_AFTER_MS = ms; }
 /** Override round hop artifact cleanup delay for tests. */
 export function _setRoundHopCleanupDelayMs(ms: number): void { ROUND_HOP_CLEANUP_DELAY_MS = ms; }
 
@@ -711,44 +881,284 @@ async function maybeStopStaleP2pTransportQueue(args: {
   dispatchStartedAt: number;
   alreadyStopped: boolean;
   reason: string;
+  staleAfterMs?: number;
 }): Promise<boolean> {
   if (args.alreadyStopped) return true;
   const runtime = getTransportRuntime(args.session);
   if (!runtime) return false;
 
   const now = Date.now();
+  if (runtime.drainPendingIfIdle(`p2p-${args.reason}`)) {
+    logger.info(
+      { runId: args.run.id, session: args.session, reason: args.reason },
+      'P2P: drained queued transport prompt after observing idle runtime',
+    );
+    return false;
+  }
+
   const snapshot = runtime.getDiagnosticSnapshot(now);
   const blocked = snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0;
   if (!blocked) return false;
 
+  const staleAfterMs = args.staleAfterMs ?? QUEUE_STUCK_STOP_AFTER_MS;
   const dispatchAgeMs = Math.max(0, now - args.dispatchStartedAt);
-  if (dispatchAgeMs < QUEUE_STUCK_STOP_AFTER_MS || snapshot.lastActivityAgeMs < QUEUE_STUCK_STOP_AFTER_MS) {
+  if (dispatchAgeMs < staleAfterMs || snapshot.lastActivityAgeMs < staleAfterMs) {
     return false;
   }
 
-  logger.warn(
+  if (snapshot.pendingCount <= 0) {
+    logger.debug(
+      {
+        runId: args.run.id,
+        session: args.session,
+        reason: args.reason,
+        dispatchAgeMs,
+        queueStuckStopAfterMs: staleAfterMs,
+        status: snapshot.status,
+        sending: snapshot.sending,
+        pendingCount: snapshot.pendingCount,
+        activeDispatchCount: snapshot.activeDispatchCount,
+        lastActivityAgeMs: snapshot.lastActivityAgeMs,
+      },
+      'P2P: active transport turn has no queued prompt; leaving it to normal hop timeout',
+    );
+    return false;
+  }
+
+  const cancelStarted = runtime.cancelStaleActiveTurnWithPending({
+    reason: `p2p-${args.reason}`,
+    nowMs: now,
+    staleMs: staleAfterMs,
+  });
+  if (cancelStarted) {
+    logger.warn(
+      {
+        runId: args.run.id,
+        session: args.session,
+        reason: args.reason,
+        dispatchAgeMs,
+        queueStuckStopAfterMs: staleAfterMs,
+        status: snapshot.status,
+        sending: snapshot.sending,
+        pendingCount: snapshot.pendingCount,
+        activeDispatchCount: snapshot.activeDispatchCount,
+        lastActivityAgeMs: snapshot.lastActivityAgeMs,
+      },
+      'P2P: stale active transport turn has queued prompt — requested runtime recovery cancel',
+    );
+    return true;
+  }
+
+  logger.debug(
     {
       runId: args.run.id,
       session: args.session,
       reason: args.reason,
       dispatchAgeMs,
-      queueStuckStopAfterMs: QUEUE_STUCK_STOP_AFTER_MS,
+      queueStuckStopAfterMs: staleAfterMs,
       status: snapshot.status,
       sending: snapshot.sending,
       pendingCount: snapshot.pendingCount,
       activeDispatchCount: snapshot.activeDispatchCount,
       lastActivityAgeMs: snapshot.lastActivityAgeMs,
     },
-    'P2P: transport queue appears stale — stopping active turn once to allow queued work to drain',
+    'P2P: stale queue recovery skipped because runtime did not confirm queued pending work',
   );
+  return false;
+}
 
-  try {
-    await runtime.cancel();
-    return true;
-  } catch (err) {
-    logger.warn({ runId: args.run.id, session: args.session, err }, 'P2P: stale transport queue stop failed');
-    return true;
+async function dispatchP2pPromptToSession(args: {
+  run: P2pRun;
+  session: string;
+  prompt: string;
+  allowDuplicate?: boolean;
+  reason: string;
+}): Promise<P2pPromptDispatchResult> {
+  const transportRuntime = await getOrRestoreP2pTransportRuntime(args.session);
+  if (transportRuntime) {
+    const commandId = buildP2pPromptCommandId(args.run, args.session, args.reason);
+    const result = transportRuntime.send(args.prompt, commandId);
+    if (result === 'sent') {
+      timelineEmitter.emit(args.session, 'user.message', {
+        text: args.prompt,
+        commandId,
+        clientMessageId: commandId,
+        ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
+        memoryExcluded: true,
+        p2pRunId: args.run.id,
+        p2pDiscussionId: args.run.discussionId,
+        p2pPhase: args.run.activePhase,
+      }, { source: 'daemon', confidence: 'high', eventId: `p2p-user:${commandId}` });
+    }
+    if (result === 'queued') {
+      emitP2pTransportQueuedState(args.run, args.session, transportRuntime, args.reason);
+      transportRuntime.drainPendingIfIdle(`p2p-${args.reason}-post-send`);
+    }
+    return { mode: result, commandId };
   }
+  const record = getSession(args.session);
+  if (record?.runtimeType === 'transport') {
+    throw new Error(`missing_transport_runtime:${args.session}`);
+  }
+  await sendKeysDelayedEnter(args.session, args.prompt);
+  return { mode: 'tmux' };
+}
+
+interface P2pPromptDispatchResult {
+  mode: 'sent' | 'queued' | 'tmux';
+  commandId?: string;
+}
+
+function p2pCommandIdPrefix(run: P2pRun): string {
+  return `p2p:${run.id}:`;
+}
+
+function sanitizeP2pCommandSegment(value: string): string {
+  const sanitized = value.replace(/[^a-zA-Z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
+  return (sanitized || 'prompt').slice(0, 80);
+}
+
+function buildP2pPromptCommandId(run: P2pRun, session: string, reason: string): string {
+  return [
+    p2pCommandIdPrefix(run),
+    sanitizeP2pCommandSegment(reason),
+    sanitizeP2pCommandSegment(session),
+    `r${Math.max(1, run.currentRound)}`,
+    sanitizeP2pCommandSegment(run.activePhase ?? 'phase'),
+    randomUUID().slice(0, 8),
+  ].join(':');
+}
+
+function isP2pRunPromptEntry(run: P2pRun, entry: { clientMessageId?: string; commandId?: string; text?: string }): boolean {
+  const id = entry.clientMessageId ?? entry.commandId ?? '';
+  if (id.startsWith(p2pCommandIdPrefix(run))) return true;
+  return typeof entry.text === 'string' && entry.text.includes(`[P2P Discussion Task — run ${run.id}]`);
+}
+
+function emitP2pQueueSnapshot(session: string, runtime: ReturnType<typeof getTransportRuntime> | undefined): void {
+  const resendEntries = runtime ? [] : getFreshResendEntries(session);
+  timelineEmitter.emit(session, 'session.state', {
+    state: runtime?.pendingCount || resendEntries.length > 0 ? 'queued' : 'idle',
+    pendingCount: runtime?.pendingCount ?? resendEntries.length,
+    pendingMessages: runtime?.pendingMessages ?? resendEntries.map((entry) => entry.text),
+    pendingMessageEntries: runtime?.pendingEntries ?? resendEntries.map((entry) => ({
+      clientMessageId: entry.commandId,
+      text: entry.text,
+      ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+    })),
+    ...(runtime
+      ? { pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion) }
+      : (typeof getTransportQueueRevision(session) === 'number' ? { pendingMessageVersion: getTransportQueueRevision(session) } : {})),
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+function purgeQueuedP2pPromptByCommandId(run: P2pRun, session: string, commandId: string | undefined, reason: string): void {
+  if (!commandId) return;
+  const runtime = getTransportRuntime(session);
+  let runtimeRemoved = 0;
+  if (typeof runtime?.removePendingMessage === 'function' && runtime.removePendingMessage(commandId)) {
+    runtimeRemoved = 1;
+  }
+  const resendRemoved = removeResendEntries(session, (entry) => entry.commandId === commandId);
+  if (runtimeRemoved + resendRemoved === 0) return;
+  emitP2pQueueSnapshot(session, runtime);
+  logger.warn({ runId: run.id, session, commandId, reason, runtimeRemoved, resendRemoved }, 'P2P: dropped stale queued prompt');
+}
+
+function purgeQueuedP2pPrompts(run: P2pRun, reason: string): void {
+  const sessions = new Set<string>([
+    run.initiatorSession,
+    run.currentTargetSession ?? '',
+    ...run.activeTargetSessions,
+    ...run.allTargets.map((target) => target.session),
+  ].filter(Boolean));
+
+  for (const session of sessions) {
+    const runtime = getTransportRuntime(session);
+    let runtimeRemoved = 0;
+    const runtimeWithBulkPurge = runtime as (typeof runtime & {
+      removePendingMessagesByCommandIdPrefix?: (prefix: string) => unknown[];
+    });
+    if (typeof runtimeWithBulkPurge?.removePendingMessagesByCommandIdPrefix === 'function') {
+      runtimeRemoved += runtimeWithBulkPurge.removePendingMessagesByCommandIdPrefix(p2pCommandIdPrefix(run)).length;
+    }
+    if (Array.isArray(runtime?.pendingEntries) && typeof runtime?.removePendingMessage === 'function') {
+      for (const entry of runtime.pendingEntries) {
+        if (isP2pRunPromptEntry(run, entry) && runtime.removePendingMessage(entry.clientMessageId)) {
+          runtimeRemoved += 1;
+        }
+      }
+    }
+
+    const resendRemoved = removeResendEntries(session, (entry) => isP2pRunPromptEntry(run, {
+      commandId: entry.commandId,
+      text: entry.text,
+    }));
+    if (runtimeRemoved + resendRemoved === 0) continue;
+    emitP2pQueueSnapshot(session, runtime);
+    logger.warn({ runId: run.id, session, reason, runtimeRemoved, resendRemoved }, 'P2P: dropped stale queued prompts for terminal run');
+  }
+}
+
+async function getOrRestoreP2pTransportRuntime(sessionName: string): Promise<ReturnType<typeof getTransportRuntime>> {
+  const existing = getTransportRuntime(sessionName);
+  if (existing) return existing;
+  const record = getSession(sessionName);
+  if (record?.runtimeType !== 'transport') return undefined;
+
+  await restoreP2pTransportRuntime(record, 'missing_runtime');
+  return getTransportRuntime(sessionName);
+}
+
+async function restoreP2pTransportRuntime(record: SessionRecord, reason: 'missing_runtime'): Promise<void> {
+  logger.warn({ session: record.name, reason }, 'P2P: restoring transport runtime before prompt dispatch');
+  await stopTransportRuntimeSession(record.name).catch(() => undefined);
+  await launchTransportSession({
+    name: record.name,
+    projectName: record.projectName,
+    role: record.role,
+    agentType: record.agentType as any,
+    projectDir: record.projectDir,
+    label: record.label,
+    description: record.description,
+    requestedModel: record.requestedModel,
+    effort: record.effort,
+    transportConfig: record.transportConfig,
+    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
+    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
+    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
+      ? { providerResumeId: record.providerResumeId } : {}),
+    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    ...(record.userCreated ? { userCreated: true } : {}),
+  });
+}
+
+function emitP2pTransportQueuedState(
+  run: P2pRun,
+  session: string,
+  runtime: NonNullable<ReturnType<typeof getTransportRuntime>>,
+  reason: string,
+): void {
+  logger.warn(
+    {
+      runId: run.id,
+      session,
+      reason,
+      pendingCount: runtime.pendingCount,
+      pendingVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
+    },
+    'P2P: transport prompt queued behind active turn',
+  );
+  timelineEmitter.emit(session, 'session.state', {
+    state: 'queued',
+    pendingCount: runtime.pendingCount,
+    pendingMessages: runtime.pendingMessages,
+    pendingMessageEntries: runtime.pendingEntries,
+    pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
+  }, { source: 'daemon', confidence: 'high' });
 }
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
@@ -806,6 +1216,34 @@ function waitForIdleEvent(session: string, timeoutMs: number): IdleWaiterHandle 
     set.add(resolver);
   });
   return { promise, cancel: cancelFn };
+}
+
+async function isP2pCompletionIdle(
+  run: P2pRun,
+  session: string,
+  idleEventReceived: boolean,
+): Promise<boolean> {
+  const transportRuntime = getTransportRuntime(session);
+  if (transportRuntime) {
+    const snapshot = transportRuntime.getDiagnosticSnapshot(Date.now());
+    if (snapshot.sending || snapshot.pendingCount > 0 || snapshot.activeDispatchCount > 0) {
+      return false;
+    }
+    return snapshot.status === 'idle' || snapshot.status === 'error';
+  }
+
+  const record = getSession(session);
+  const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+  const useStoreState = agentType === 'gemini';
+
+  try {
+    return useStoreState
+      ? record?.state === 'idle'
+      : await detectStatusAsync(session, agentType) === 'idle';
+  } catch (err) {
+    logger.debug({ runId: run.id, session, err }, 'P2P: idle detection failed while completing hop');
+    return idleEventReceived;
+  }
 }
 
 // ── Start a P2P run ───────────────────────────────────────────────────────
@@ -925,6 +1363,14 @@ export async function startP2pRun(...args:
   } = opts;
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
+  const admission = evaluateP2pLaunchAdmission({
+    mainSession,
+    origin: opts.launchOrigin,
+    activeRuns: listP2pRuns(),
+  });
+  if (!admission.ok) {
+    throw new Error(`p2p_launch_blocked:${admission.reason}:${admission.activeAutoDeliverRunId}`);
+  }
   for (const t of targets) {
     if (extractMainSession(t.session) !== mainSession) {
       throw new Error(`Cross-domain P2P not supported: ${t.session} is not in ${mainSession}`);
@@ -993,6 +1439,7 @@ export async function startP2pRun(...args:
     locale,
     timeoutMs: Math.min(hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000, 600_000),
     resultSummary: null,
+    strictAuthoritativeResult: null,
     completedHops: [],
     skippedHops: [],
     error: null,
@@ -1013,6 +1460,8 @@ export async function startP2pRun(...args:
     advancedP2pEnabled: resolvedPlan.advanced,
     resolvedRounds: resolvedPlan.advanced ? resolvedPlan.rounds : undefined,
     helperEligibleSnapshot: resolvedPlan.helperEligibleSnapshot ?? helperEligibleSnapshot,
+    sharedActor: opts.sharedActor,
+    shareScope: opts.shareScope,
     contextReducer: resolvedPlan.contextReducer,
     advancedRunTimeoutMs: resolvedPlan.advanced && resolvedPlan.overallRunTimeoutMinutes != null
       ? resolvedPlan.overallRunTimeoutMinutes * 60_000
@@ -1047,6 +1496,13 @@ export async function startP2pRun(...args:
     })(),
     routingHistory: [],
     helperDiagnostics: [],
+    // Dedicated-execution routing (OFF by default). Threaded from the launch
+    // options; `undefined` keeps the final-execution prompt byte-identical.
+    // The daemon command-handler reads + normalizes the launch-payload
+    // `dedicatedExecutionRouting` field (task 2.7) and passes it here via
+    // StartP2pRunOptions; other callers (Auto Deliver, supervision, cron,
+    // tests) pass it explicitly. Absent → disabled.
+    ...(opts.dedicatedExecutionRouting ? { dedicatedExecutionRouting: opts.dedicatedExecutionRouting } : {}),
     _cancelled: false,
     // Audit:V-1 / N-H1 / N2 / R3 PR-α — store the bound workflow ON THE RUN
     // so v1b dangerous-node executors can recheck against the live policy at
@@ -1067,6 +1523,8 @@ export async function startP2pRun(...args:
       ? advancedSource.bound
       : undefined,
     advancedSourceKind: advancedSource?.kind,
+    launchOrigin: opts.launchOrigin,
+    finalSummaryExtraInstruction: opts.finalSummaryExtraInstruction,
   };
 
   activeRuns.set(runId, run);
@@ -1083,9 +1541,34 @@ export async function startP2pRun(...args:
 
 // ── Cancel ────────────────────────────────────────────────────────────────
 
-export async function cancelP2pRun(runId: string, serverLink: ServerLink | null): Promise<boolean> {
+export interface P2pCancelOptions {
+  source?: string;
+  reason?: string;
+  requestedBySession?: string | null;
+}
+
+export async function cancelP2pRun(runId: string, serverLink: ServerLink | null, options: P2pCancelOptions = {}): Promise<boolean> {
   const run = activeRuns.get(runId);
-  if (!run) return false;
+  const source = options.source ?? 'unknown';
+  if (!run) {
+    logger.warn({
+      runId,
+      source,
+      reason: options.reason,
+      requestedBySession: options.requestedBySession ?? null,
+    }, 'P2P cancel requested for missing run');
+    return false;
+  }
+
+  logger.info({
+    runId,
+    source,
+    reason: options.reason,
+    requestedBySession: options.requestedBySession ?? null,
+    initiatorSession: run.initiatorSession,
+    currentStatus: run.status,
+    currentPhase: run.runPhase,
+  }, 'P2P cancel requested');
 
   run._cancelled = true;
   run.runPhase = 'cancelled';
@@ -1104,6 +1587,7 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
     run.activePhase = 'queued';
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
+    logger.info({ runId, source, reason: options.reason }, 'P2P queued run cancelled');
     return true;
   }
 
@@ -1119,10 +1603,17 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
     run.activeTargetSessions = [];
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
+    logger.info({
+      runId,
+      source,
+      reason: options.reason,
+      targetCount: targets.size,
+    }, 'P2P active run cancelled');
     return true;
   }
 
   activeRuns.delete(runId);
+  logger.info({ runId, source, reason: options.reason, currentStatus: run.status }, 'P2P terminal run removed after cancel request');
   return true;
 }
 
@@ -1344,7 +1835,7 @@ async function appendPostSummaryExecutionAudit(
     `Status: ${marker.status}`,
     `Attempts: ${attempts}`,
     marker.summary ? `Summary: ${marker.summary}` : null,
-    marker.changedFiles?.length ? `Changed files: ${marker.changedFiles.join(', ')}` : null,
+    marker.changedFiles?.length ? 'File changes were reported by the execution marker; inspect the workspace for details.' : null,
     marker.tests?.length ? `Tests: ${marker.tests.join(', ')}` : null,
     marker.completedAt ? `Completed at: ${marker.completedAt}` : null,
     '',
@@ -1438,17 +1929,24 @@ async function dispatchPostSummaryPrompt(
 ): Promise<boolean> {
   const session = run.initiatorSession;
   try {
-    const transportRuntime = getTransportRuntime(session);
-    if (transportRuntime) {
-      timelineEmitter.emit(session, 'user.message', { text: prompt, allowDuplicate: true });
-      transportRuntime.send(prompt);
-    } else {
-      await sendKeysDelayedEnter(session, prompt);
-    }
+    await dispatchP2pPromptToSession({
+      run,
+      session,
+      prompt,
+      allowDuplicate: true,
+      reason: 'post_summary_prompt',
+    });
     return true;
   } catch (err) {
     logger.warn({ runId: run.id, session, attempt, err }, failureLogMessage);
     return false;
+  }
+}
+
+function settlePostSummaryRuntimeFromMarker(run: P2pRun, reason: string): void {
+  const transportRuntime = getTransportRuntime(run.initiatorSession);
+  if (typeof transportRuntime?.settleActiveDispatchFromExternalCompletion === 'function') {
+    transportRuntime.settleActiveDispatchFromExternalCompletion(reason);
   }
 }
 
@@ -1600,15 +2098,7 @@ async function runPostSummaryExecutionGate(
 
     const markerState = await readPostSummaryExecutionMarker(spec);
     if (markerState?.ok) {
-      const confirmationDelayMs = Math.min(
-        POST_SUMMARY_CONFIRMATION_DELAY_MS,
-        Math.max(0, deadlineAt - Date.now() - 1),
-      );
-      if (confirmationDelayMs > 0) {
-        await sleep(confirmationDelayMs);
-        if (run._cancelled || isTerminal(run.status)) return false;
-        if (!ensureRunDeadline(run, serverLink)) return false;
-      }
+      settlePostSummaryRuntimeFromMarker(run, 'p2p-post-summary-execution-marker-completed');
       const confirmation = await runPostSummaryExecutionConfirmationGate(run, serverLink, spec, markerState.marker, timeoutMs);
       if (!confirmation) return false;
       await appendPostSummaryExecutionAudit(run, spec, markerState.marker, attempt);
@@ -1624,7 +2114,7 @@ async function runPostSummaryExecutionGate(
     }
     if (markerState && !markerState.ok) {
       if (markerState.failedByAgent) {
-        failRun(run, 'post_summary_execution_failed', markerState.reason, serverLink);
+        failRun(run, POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE, markerState.reason, serverLink);
         return false;
       }
     }
@@ -1647,8 +2137,189 @@ async function runPostSummaryExecutionGate(
   }
 
   logger.warn({ runId: run.id, session, timeoutMs, markerPath: spec.markerPath }, 'P2P: post-summary execution marker timed out');
-  failRun(run, 'timed_out', 'post_summary_execution_timeout', serverLink);
+  failRun(run, 'timed_out', POST_SUMMARY_EXECUTION_TIMEOUT_REASON, serverLink);
   return false;
+}
+
+/**
+ * True iff the run has dedicated execution routing enabled with a valid
+ * (non-empty) template target. Used to GATE the orchestrator-programmatic clone
+ * path: when this is false the existing in-session gate runs UNCHANGED, so the
+ * disabled path is byte-identical.
+ */
+function finalExecutionCloneRoutingActive(run: P2pRun): boolean {
+  const routing = run.dedicatedExecutionRouting;
+  return (routing?.enabled ?? false)
+    && typeof routing?.templateSessionName === 'string'
+    && routing.templateSessionName.trim().length > 0;
+}
+
+/**
+ * Build the worker hand-off prompt for a clone executing the Team final
+ * request. This is the SAME base execution prompt + marker proof the in-session
+ * gate uses, MINUS the routing/self-delegation appendix — the clone IS the
+ * worker, so it must do the work directly, not be told to delegate again. The
+ * optional recent-context block (bounded summary, never raw history) is
+ * attached for continuity.
+ */
+function buildFinalExecutionCloneWorkerPrompt(
+  run: P2pRun,
+  spec: PostSummaryExecutionRuntimeSpec,
+): string {
+  const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
+  let base = template
+    .replaceAll('{{discussionFile}}', run.contextFilePath)
+    .replaceAll('{{request}}', run.userText);
+  const recentContext = buildExecutionRoutingRecentContextBlock(run.dedicatedExecutionRouting?.recentSummary ?? null);
+  if (recentContext.length > 0) base = `${base}\n\n${recentContext}`;
+  const langLine = buildP2pLanguageInstruction(run.locale);
+  const proof = buildPostSummaryExecutionProofBlock(spec);
+  const body = `${base}\n\n${proof}`;
+  return langLine ? `${body}\n\n${langLine}` : body;
+}
+
+/**
+ * Orchestrator-programmatic Team final-execution path (tasks 6.1 / 6.2).
+ *
+ * Returns:
+ *  - `'disabled'` when dedicated routing is OFF / has no valid template — the
+ *    caller MUST fall through to the existing in-session execution gate
+ *    (`runPostSummaryExecutionGate`), keeping the disabled path byte-identical;
+ *  - `true`  when the clone worker completed the execution (marker confirmed);
+ *  - `false` when the clone worker failed/timed out (the run is failed here).
+ *
+ * When active, the final-execution work is routed to an ephemeral clone of the
+ * configured template via {@link orchestrateCloneWorkers}: the orchestrator
+ * dispatches the worker prompt to the clone, COLLECTS the execution marker
+ * before integration, then the clone is DESTROYED (on completion, failure, OR
+ * timeout) by the worker pool. Fail-closed: an invalid/missing template makes
+ * `createExecutionClone` throw, which fails the run (no fallback to running the
+ * work in the orchestrator session).
+ */
+async function tryRunFinalExecutionViaClones(
+  run: P2pRun,
+  serverLink: ServerLink | null,
+  spec: PostSummaryExecutionRuntimeSpec,
+  timeoutMs: number,
+): Promise<'disabled' | boolean> {
+  if (!finalExecutionCloneRoutingActive(run)) return 'disabled';
+  const templateSessionName = run.dedicatedExecutionRouting!.templateSessionName!.trim();
+  const deadlineAt = Date.now() + Math.max(1, timeoutMs);
+
+  run.runPhase = 'executing_original_request';
+  run.activePhase = 'execution';
+  run.hopStartedAt = Date.now();
+  run.executionAttempt = 1;
+  run.executionCycleCurrent = spec.cycleIndex;
+  run.executionCycleTotal = spec.cycleTotal;
+  run.executionMarkerPath = spec.markerPath;
+  pushState(run, serverLink);
+
+  const workerPrompt = buildFinalExecutionCloneWorkerPrompt(run, spec);
+
+  let orchestration;
+  try {
+    orchestration = await orchestrateCloneWorkers<P2pExecutionMarker>({
+      parentRunId: run.id,
+      parentStage: TEAM_FINAL_EXECUTION_STAGE,
+      templateSessionName,
+      ownerSessionName: run.initiatorSession,
+      owningMainSessionName: run.mainSession,
+      pref: {
+        // Consume the run's RESOLVED (clamped) clone limits when present so a
+        // configured non-default cap (e.g. maxParallelClones) is enforced by the
+        // pool; fall back to the canonical defaults only when absent. A single
+        // final-execution task needs only one slot, but the cap/queue bounds are
+        // passed so the pool enforces them uniformly.
+        ...(run.dedicatedExecutionRouting?.limits ?? defaultDedicatedExecutionRoutingPreference()),
+        enabled: true,
+      },
+      tasks: [{ id: `${run.id}.cycle${spec.cycleIndex}.final-execution`, prompt: workerPrompt }],
+      dispatch: async (cloneTarget, prompt) => {
+        await dispatchP2pPromptToSession({
+          run,
+          session: cloneTarget,
+          prompt,
+          allowDuplicate: true,
+          reason: 'final_execution_clone_dispatch',
+        });
+      },
+      collect: async (cloneTarget) => {
+        const marker = await collectFinalExecutionCloneMarker(run, cloneTarget, spec, deadlineAt);
+        if (marker === 'timeout') throw new WorkerTimeoutError('final_execution_clone_marker_timeout');
+        return marker;
+      },
+      outcomeOf: (marker) => (marker.status === 'completed' ? 'completed' : 'failed'),
+    });
+  } catch (err) {
+    // Fail-closed: invalid/missing template (or any non-capacity create
+    // failure). No fallback to the orchestrator session.
+    const reason = err instanceof Error ? err.message : String(err);
+    logger.warn({ runId: run.id, templateSessionName, err }, 'P2P: final-execution clone routing failed (fail-closed)');
+    failRun(run, POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE, `final_execution_clone_failed:${reason}`, serverLink);
+    return false;
+  }
+
+  if (run._cancelled || isTerminal(run.status)) return false;
+
+  const result = orchestration.results[0];
+  if (!result || result.outcome !== 'completed' || !result.collected) {
+    const reasonType = result?.outcome === 'timeout'
+      ? 'timed_out'
+      : POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE;
+    const reason = result?.outcome === 'timeout'
+      ? POST_SUMMARY_EXECUTION_TIMEOUT_REASON
+      : (result?.error ?? 'final_execution_clone_no_result');
+    failRun(run, reasonType, reason, serverLink);
+    return false;
+  }
+
+  // Collect-before-integration: append the worker's execution evidence into the
+  // discussion before continuing (the clone is already destroyed by the pool).
+  await appendPostSummaryExecutionAudit(
+    run,
+    spec,
+    result.collected,
+    1,
+    `P2P Original Request Execution (clone worker, cycle ${spec.cycleIndex}/${spec.cycleTotal})`,
+  );
+  logger.info(
+    { runId: run.id, cloneTarget: result.cloneTarget, cycleIndex: spec.cycleIndex },
+    'P2P: final-execution clone worker completed',
+  );
+  return true;
+}
+
+/**
+ * Poll a clone worker's execution marker until it appears or the deadline
+ * elapses. Returns the parsed marker, or `'timeout'` when the deadline passes
+ * with no terminal marker. An agent-written `failed` marker is returned (the
+ * caller maps it to a failed outcome). The marker spec's `markerPath` is shared
+ * with the worker prompt so the clone writes exactly where the orchestrator
+ * reads.
+ */
+async function collectFinalExecutionCloneMarker(
+  run: P2pRun,
+  cloneTarget: string,
+  spec: PostSummaryExecutionRuntimeSpec,
+  deadlineAt: number,
+): Promise<P2pExecutionMarker | 'timeout'> {
+  while (Date.now() < deadlineAt) {
+    if (run._cancelled || isTerminal(run.status)) return 'timeout';
+    const markerState = await readPostSummaryExecutionMarker(spec);
+    if (markerState?.ok) return markerState.marker;
+    if (markerState && !markerState.ok && markerState.failedByAgent) {
+      // Agent reported failure — surface a synthetic failed marker so the
+      // outcome classifier maps it to `failed` (clone still destroyed).
+      return { ...buildP2pExecutionMarker(spec, 'failed'), error: markerState.reason };
+    }
+    await sleep(Math.min(IDLE_POLL_MS, Math.max(1, deadlineAt - Date.now())));
+  }
+  logger.warn(
+    { runId: run.id, cloneTarget, markerPath: spec.markerPath },
+    'P2P: final-execution clone worker marker timed out',
+  );
+  return 'timeout';
 }
 
 function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
@@ -1708,24 +2379,28 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     const targets = [...run.remainingTargets];
 
-    // ── Phase 1: Initiator initial analysis (start of the whole discussion only) ──
-    if (run.currentRound === 1) {
-      if (run._cancelled) return;
-      run.activePhase = 'initial';
-      const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
-      const initialPrompt = buildHopPrompt(run, roundModeConfig, {
-        session: run.initiatorSession,
-        sectionHeader: initialHeader,
-        instruction: [
-          previousCycleAuditScope,
-          'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
-        ].filter(Boolean).join('\n\n'),
-        isInitial: true,
-      }, rp);
-      const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
-      if (!initialOk && (run._cancelled || isTerminal(run.status))) return;
-      if (run._cancelled || isTerminal(run.status)) return;
-    }
+    // ── Phase 1: Initiator kickoff analysis for this round ──
+    // Every round needs an explicit initiator pass. Later rounds are not a
+    // repeat of round 1: they audit prior findings plus any execution evidence
+    // before participant hops deepen the discussion.
+    if (run._cancelled) return;
+    run.activePhase = 'initial';
+    const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
+    const initialInstruction = run.currentRound === 1
+      ? 'Read the discussion file and provide your initial analysis. Append your output to the file.'
+      : 'Read the discussion file, review all previous round outputs and any implementation/execution evidence, then provide the initiator kickoff analysis for this round. Call out what prior findings were weak, incomplete, contradicted, or still need deeper investigation. Append your output to the file.';
+    const initialPrompt = buildHopPrompt(run, roundModeConfig, {
+      session: run.initiatorSession,
+      sectionHeader: initialHeader,
+      instruction: [
+        previousCycleAuditScope,
+        `${initialInstruction}\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+      ].filter(Boolean).join('\n\n'),
+      isInitial: true,
+    }, rp);
+    const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
+    if (!initialOk && (run._cancelled || isTerminal(run.status))) return;
+    if (run._cancelled || isTerminal(run.status)) return;
 
     // ── Phase 2: Sub-session hops ──
     run.activePhase = 'hop';
@@ -1778,7 +2453,16 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.activePhase = 'summary';
       const isLastRound = run.currentRound === run.rounds;
       const isFlowCycleEnd = (run.currentRound % pipelineLength) === 0;
-      const shouldRunExecutionGate = isFlowCycleEnd || isLastRound;
+      // OpenSpec Auto Deliver audit discussions are analysis-only by contract:
+      // the repair is a SEPARATE dedicated dispatch (with the must-fix
+      // checklist) and the score comes from the acceptance audit. Running the
+      // generic "execute the original request" gate here just burns an extra
+      // execution turn + a follow-up confirmation turn on an audit-only
+      // request — and its single-hop marker deadline routinely failed on large
+      // repairs (handleAuditPoll tolerates that failure for exactly this
+      // reason). Skip the gate entirely for these runs.
+      const skipExecutionGate = run.launchOrigin?.kind === 'openspec_auto_deliver';
+      const shouldRunExecutionGate = (isFlowCycleEnd || isLastRound) && !skipExecutionGate;
       const inlineExecutionSpec = shouldRunExecutionGate
         ? createPostSummaryExecutionSpec(run, {
           cycleIndex: Math.ceil(run.currentRound / pipelineLength),
@@ -1797,9 +2481,12 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       const nonFinalSummaryGuard = inlineExecutionSpec
         ? 'For the summary/kickoff portion, write analysis only into the discussion file first. After that section is written, follow the execution block below in the same turn.'
         : 'IMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.';
+      const finalSummaryExtra = isLastRound && run.finalSummaryExtraInstruction?.trim()
+        ? `\n${run.finalSummaryExtraInstruction.trim()}`
+        : '';
       const roundSummaryInstruction = isLastRound
-        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${inlineExecutionInstruction}`
-        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). This summary is also the next-round kickoff; the orchestrator will dispatch the next participant hops after this summary completes and will not send a separate initiator initial-analysis prompt for that next round. Append to the file.\n${nonFinalSummaryGuard}${inlineExecutionInstruction}`;
+        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${finalSummaryExtra}${inlineExecutionInstruction}`
+        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). This summary prepares the next round, but the orchestrator will still dispatch a separate next-round initiator initial-analysis prompt before participant hops. Append to the file.\n${nonFinalSummaryGuard}${inlineExecutionInstruction}`;
       const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
         session: run.initiatorSession,
         sectionHeader: roundSummaryHeader,
@@ -1817,13 +2504,23 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
       if (inlineExecutionSpec) {
-        const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-          cycleIndex: inlineExecutionSpec.cycleIndex,
-          cycleTotal: inlineExecutionSpec.cycleTotal,
-          timeoutMs: run.timeoutMs * 3,
-          spec: inlineExecutionSpec,
-          initialPromptAlreadyDispatched: true,
-        });
+        // Dedicated-execution routing (tasks 6.1/6.2): when enabled with a
+        // valid template, route the final-execution work to an ephemeral clone
+        // worker (collect-before-integration, destroy after). When DISABLED,
+        // `tryRunFinalExecutionViaClones` returns 'disabled' and the existing
+        // in-session gate below runs UNCHANGED — byte-identical.
+        const cloneOutcome = await tryRunFinalExecutionViaClones(
+          run, serverLink, inlineExecutionSpec, run.timeoutMs * 3,
+        );
+        const executionOk = cloneOutcome === 'disabled'
+          ? await runPostSummaryExecutionGate(run, serverLink, {
+            cycleIndex: inlineExecutionSpec.cycleIndex,
+            cycleTotal: inlineExecutionSpec.cycleTotal,
+            timeoutMs: run.timeoutMs * 3,
+            spec: inlineExecutionSpec,
+            initialPromptAlreadyDispatched: true,
+          })
+          : cloneOutcome;
         if (run._cancelled || isTerminal(run.status)) return;
         if (!executionOk) return;
       }
@@ -1852,7 +2549,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         await fh.read(buf, 0, length, size - length);
         // Drop the leading partial UTF-8 sequence if any; 2000 chars
         // downstream further trims to exactly the wanted window.
-        run.resultSummary = buf.toString('utf8').slice(-2000);
+        const summary = buf.toString('utf8').slice(-2000);
+        run.resultSummary = summary;
       }
     } finally {
       if (fh) { try { await fh.close(); } catch { /* best-effort */ } }
@@ -2148,10 +2846,14 @@ async function captureArtifactBaseline(run: P2pRun, round: P2pResolvedRound): Pr
       // PR-γ — no legacy baseline; the new helper is the only authority.
       return baseline;
     }
-    const target = join(projectDir, 'openspec', 'changes');
+    const target = 'openspec/changes';
     try {
-      const entries = await readdir(target);
-      baseline.set(target, entries.join('\n'));
+      const capture = await captureP2pArtifactBaseline({
+        rootPath: target,
+        phase: 'baseline',
+        repoRoot: projectDir,
+      });
+      baseline.set(target, JSON.stringify(capture.baseline.files));
     } catch {
       baseline.set(target, null);
     }
@@ -2180,8 +2882,15 @@ async function validateArtifactOutputsForRound(run: P2pRun, round: P2pResolvedRo
     const target = [...baseline.keys()][0];
     const before = baseline.get(target) ?? null;
     try {
-      const afterEntries = (await readdir(target)).join('\n');
-      if (afterEntries === before) throw new Error('openspec_convention artifacts were not observably updated');
+      const record = getSession(run.initiatorSession);
+      const projectDir = record?.projectDir ?? process.cwd();
+      const capture = await captureP2pArtifactBaseline({
+        rootPath: target,
+        phase: 'validate',
+        repoRoot: projectDir,
+      });
+      const after = JSON.stringify(capture.baseline.files);
+      if (after === before) throw new Error('openspec_convention artifacts were not observably updated');
       return;
     } catch (err) {
       throw new Error(err instanceof Error ? err.message : String(err));
@@ -3012,6 +3721,10 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
       }
     }
 
+    if (run.launchOrigin?.kind === 'openspec_auto_deliver' && authoritativeSegment.trim()) {
+      run.strictAuthoritativeResult = authoritativeSegment;
+    }
+
     await validateArtifactOutputsForRound(run, round, artifactBaseline).catch((err) => {
       failRun(run, 'failed', err instanceof Error ? err.message : String(err), serverLink);
     });
@@ -3338,16 +4051,27 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   const resolvedFinalSummaryPrompt = finalRoundSummaryPrompt
     ?? legacyModeSummaryPrompt
     ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.';
-  const inlineExecutionSpec = createPostSummaryExecutionSpec(run, {
-    cycleIndex: 1,
-    cycleTotal: 1,
-  });
+  // Same Auto Deliver exemption as the legacy combo path above: audit
+  // discussions are analysis-only; the repair + scoring turns are dispatched
+  // by the auto-deliver orchestrator after this run completes.
+  const inlineExecutionSpec = run.launchOrigin?.kind === 'openspec_auto_deliver'
+    ? null
+    : createPostSummaryExecutionSpec(run, {
+      cycleIndex: 1,
+      cycleTotal: 1,
+    });
+  const workflowFinalSummaryExtra = run.finalSummaryExtraInstruction?.trim()
+    ? `\n${run.finalSummaryExtraInstruction.trim()}`
+    : '';
+  const finalInstructionBase = `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.${workflowFinalSummaryExtra}`;
   const finalPrompt = buildHopPrompt(run, getP2pMode(finalRound?.modeKey ?? run.mode), {
     session: run.initiatorSession,
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
-    instruction: `${resolvedFinalSummaryPrompt}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.\n\n${buildInlinePostSummaryExecutionInstruction(run, inlineExecutionSpec)}`,
+    instruction: inlineExecutionSpec
+      ? `${finalInstructionBase}\n\n${buildInlinePostSummaryExecutionInstruction(run, inlineExecutionSpec)}`
+      : finalInstructionBase,
     isInitial: false,
-    allowsExecution: true,
+    allowsExecution: inlineExecutionSpec !== null,
   });
   const summaryOk = await dispatchHop(run, run.initiatorSession, finalPrompt, serverLink, {
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
@@ -3358,14 +4082,24 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   run.summaryPhase = summaryOk ? 'completed' : 'failed';
   if (run._cancelled || isTerminal(run.status)) return;
 
-  const executionOk = await runPostSummaryExecutionGate(run, serverLink, {
-    cycleIndex: inlineExecutionSpec.cycleIndex,
-    cycleTotal: inlineExecutionSpec.cycleTotal,
-    timeoutMs: run.timeoutMs * 3,
-    spec: inlineExecutionSpec,
-    initialPromptAlreadyDispatched: true,
-  });
-  if (!executionOk || run._cancelled || isTerminal(run.status)) return;
+  if (inlineExecutionSpec) {
+    // Dedicated-execution routing (tasks 6.1/6.2): clone-worker path when
+    // enabled with a valid template; otherwise 'disabled' → the existing
+    // in-session gate runs UNCHANGED (byte-identical disabled path).
+    const cloneOutcome = await tryRunFinalExecutionViaClones(
+      run, serverLink, inlineExecutionSpec, run.timeoutMs * 3,
+    );
+    const executionOk = cloneOutcome === 'disabled'
+      ? await runPostSummaryExecutionGate(run, serverLink, {
+        cycleIndex: inlineExecutionSpec.cycleIndex,
+        cycleTotal: inlineExecutionSpec.cycleTotal,
+        timeoutMs: run.timeoutMs * 3,
+        spec: inlineExecutionSpec,
+        initialPromptAlreadyDispatched: true,
+      })
+      : cloneOutcome;
+    if (!executionOk || run._cancelled || isTerminal(run.status)) return;
+  }
 
   // R3 v1b (W2) — flush the discussion write queue before reading so the
   // result summary captures every queued segment instead of an
@@ -3375,6 +4109,9 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   try {
     fullContent = await readFile(run.contextFilePath, 'utf8');
     run.resultSummary = fullContent.slice(-2000);
+    if (run.launchOrigin?.kind === 'openspec_auto_deliver') {
+      run.strictAuthoritativeResult = extractOpenSpecAutoDeliverStrictSegment(fullContent);
+    }
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
@@ -3447,16 +4184,10 @@ async function dispatchHop(
   const watchPath = localCopyPath ?? sourcePath;
   if (hop) hop.working_path = watchPath;
   const MAX_RETRIES = 0;
-  // Required legacy hops (initiator initial-analysis + round summaries) get a
-  // doubled wait window because they are more important than ordinary
-  // participant hops. If they still produce no output, mark that legacy hop
-  // skipped and continue with the evidence we have instead of re-sending the
-  // same prompt after a successful dispatch. Advanced workflow rounds keep
-  // their strict per-round timeout semantics.
-  const REQUIRED_HOP_TIMEOUT_MULTIPLIER = 2;
-  const effectiveTimeoutMs = required
-    ? run.timeoutMs * REQUIRED_HOP_TIMEOUT_MULTIPLIER
-    : run.timeoutMs;
+  // All hops respect the user-configured per-hop timeout. Required legacy hops
+  // still get special failure handling below, but they must not silently double
+  // the configured Team timeout and stall the next phase.
+  const effectiveTimeoutMs = run.timeoutMs;
 
   const finishHop = async (status: P2pHopStatus, error: string | null = null) => {
     if (localCopyPath && status === 'completed') {
@@ -3506,15 +4237,18 @@ async function dispatchHop(
 
     let sizeBefore = 0;
     try { sizeBefore = (await stat(watchPath)).size; } catch {}
+    let queuedDispatch = false;
+    let queuedCommandId: string | undefined;
 
     try {
-      const transportRuntime = getTransportRuntime(session);
-      if (transportRuntime) {
-        timelineEmitter.emit(session, 'user.message', { text: prompt });
-        transportRuntime.send(prompt);
-      } else {
-        await sendKeysDelayedEnter(session, prompt);
-      }
+      const dispatchResult = await dispatchP2pPromptToSession({
+        run,
+        session,
+        prompt,
+        reason: sectionHeader ? 'discussion_section_prompt' : 'discussion_prompt',
+      });
+      queuedDispatch = dispatchResult.mode === 'queued';
+      queuedCommandId = dispatchResult.commandId;
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         logger.warn({ runId: run.id, session, attempt }, 'P2P: dispatch failed, will retry');
@@ -3541,7 +4275,7 @@ async function dispatchHop(
     let lastSize = sizeBefore;
     let lastGrowthAt = 0;
     let headingFound = false;
-    let headingFoundAt = 0;
+    let executionMarkerFound = false;
     let queueStopSent = false;
 
     while (Date.now() < deadline) {
@@ -3591,7 +4325,6 @@ async function dispatchHop(
           const content = await readFile(watchPath, 'utf8');
           if (normalizeDiscussionSectionHeader(content).includes(normalizeDiscussionSectionHeader(`## ${sectionHeader}`))) {
             headingFound = true;
-            headingFoundAt = Date.now();
             if (!fileGrew) {
               fileGrew = true;
               if (run.status === 'dispatched') transition(run, 'running', serverLink);
@@ -3601,17 +4334,13 @@ async function dispatchHop(
         }
       } catch {}
 
-      if (headingFound && (Date.now() - headingFoundAt) >= 2_000) {
-        logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
-        idleWaiter.cancel();
-        await finishHop('completed');
-        pushState(run, serverLink);
-        return true;
-      }
-
       if (options.executionMarkerSpec) {
         const markerState = await readPostSummaryExecutionMarker(options.executionMarkerSpec);
         if (markerState?.ok || markerState?.failedByAgent) {
+          executionMarkerFound = true;
+          settlePostSummaryRuntimeFromMarker(run, markerState.ok
+            ? 'p2p-inline-execution-marker-completed'
+            : 'p2p-inline-execution-marker-failed');
           logger.info(
             {
               runId: run.id,
@@ -3619,7 +4348,7 @@ async function dispatchHop(
               markerPath: options.executionMarkerSpec.markerPath,
               markerStatus: markerState.marker?.status,
             },
-            'P2P: inline execution marker found while waiting for summary hop completion',
+            'P2P: inline execution marker found; completing summary hop from marker proof',
           );
           idleWaiter.cancel();
           await finishHop('completed');
@@ -3632,11 +4361,7 @@ async function dispatchHop(
       if (!headingFound && fileGrew && (lastSize - sizeBefore) > 500 &&
           lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleForGrowth &&
           (Date.now() - dispatchTime) > MIN_PROCESSING_MS) {
-        logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback — completing hop without heading');
-        idleWaiter.cancel();
-        await finishHop('completed');
-        pushState(run, serverLink);
-        return true;
+        logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback observed; waiting for final idle before completing hop');
       }
 
       const canCheckIdle = (Date.now() - dispatchTime) > MIN_PROCESSING_MS;
@@ -3653,24 +4378,12 @@ async function dispatchHop(
           dispatchStartedAt: dispatchTime,
           alreadyStopped: queueStopSent,
           reason: 'discussion_section_missing',
+          staleAfterMs: queuedDispatch ? QUEUED_PROMPT_STOP_AFTER_MS : undefined,
         });
       }
 
-      if (fileSettled || (pastGrace && !fileGrew)) {
-        let idleConfirmed = false;
-        const record = getSession(session);
-        const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-        const useStoreState = agentType === 'gemini';
-
-        try {
-          if (useStoreState) {
-            idleConfirmed = record?.state === 'idle';
-          } else {
-            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
-          }
-        } catch {
-          idleConfirmed = idleEventReceived;
-        }
+      if (fileSettled || executionMarkerFound || (pastGrace && !fileGrew)) {
+        const idleConfirmed = await isP2pCompletionIdle(run, session, idleEventReceived);
 
         if (fileSettled && idleConfirmed) {
           try {
@@ -3682,6 +4395,13 @@ async function dispatchHop(
               continue;
             }
           } catch {}
+          idleWaiter.cancel();
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
+        }
+
+        if (executionMarkerFound && !fileGrew && idleConfirmed) {
           idleWaiter.cancel();
           await finishHop('completed');
           pushState(run, serverLink);
@@ -3785,6 +4505,9 @@ async function dispatchHop(
     }
 
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out');
+    if (queuedDispatch) {
+      purgeQueuedP2pPromptByCommandId(run, session, queuedCommandId, 'hop_timeout');
+    }
     await finishHop('timed_out', 'timed_out');
     if (required) failRun(run, 'timed_out', session, serverLink);
     else pushState(run, serverLink);
@@ -3957,6 +4680,7 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
   }
   if (P2P_TERMINAL_RUN_STATUSES.has(status)) {
     run.completedAt = run.completedAt ?? new Date().toISOString();
+    purgeQueuedP2pPrompts(run, `terminal_${status}`);
     if (run.advancedP2pEnabled) {
       void cleanupRoundHopArtifacts(run.hopStates);
     } else {
@@ -3981,6 +4705,7 @@ function failRun(run: P2pRun, errorType: string, message: string, serverLink: Se
   if (run.activePhase === 'summary') {
     run.summaryPhase = 'failed';
   }
+  purgeQueuedP2pPrompts(run, `${status}_${errorType}`);
   if (run.advancedP2pEnabled) {
     void cleanupRoundHopArtifacts(run.hopStates);
   } else {

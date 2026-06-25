@@ -9,7 +9,31 @@ import { DiscussionsPage } from '../../src/pages/DiscussionsPage.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (key === 'openspec.auto.reason.auto_deliver_active') return 'Auto Deliver is already running for this session.';
+      if (key === 'openspec.auto.reason.missing_authoritative_json') return 'The audit did not produce a final authoritative JSON result.';
+      if (key === 'openspec.auto.lifecycle.spec_audit_repair_p2p_started') return 'Spec audit Team run started.';
+      if (key === 'openspec.auto.latest_message') return 'Latest';
+      if (key === 'openspec.auto.owning_session') return 'Owner';
+      if (key === 'openspec.auto.execution_session') return 'Execution';
+      if (key === 'openspec.auto.combo_id') return 'Team flow';
+      if (key === 'openspec.auto.terminal_reason') return 'Terminal reason';
+      if (key === 'openspec.auto.conflict_summary') return 'Conflict';
+      if (key === 'openspec.auto.details_title') return 'Auto Deliver details';
+      if (key === 'openspec.auto.task_stats') return 'Task status';
+      if (key === 'openspec.auto.audit_results') return 'Audit results';
+      if (key === 'openspec.auto.final_scores') return 'Final acceptance scores';
+      if (key === 'openspec.auto.evidence') return 'Evidence';
+      if (key === 'openspec.auto.score_module.implementation') return 'Implementation score';
+      if (key === 'openspec.auto.status.implementation_task_loop') return 'Active';
+      if (key === 'openspec.auto.stage.implementation_task_loop') return 'Implementation';
+      if (key === 'openspec.auto.stage.implementation_audit_repair') return 'Implementation audit';
+      if (key === 'openspec.auto.tasks_progress') return `${opts?.checked}/${opts?.total} tasks`;
+      if (key === 'p2p.mode_audit') return 'Audit';
+      if (key === 'p2p.mode_review') return 'Review';
+      if (key === 'p2p.mode_plan') return 'Plan';
+      return typeof opts?.defaultValue === 'string' ? opts.defaultValue : key;
+    },
   }),
 }));
 
@@ -42,6 +66,7 @@ describe('DiscussionsPage', () => {
   beforeEach(() => {
     clipboardWriteText = vi.fn().mockResolvedValue(undefined);
     nextP2pRequestIndex = 0;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
     const nextP2pRequestId = () => `p2p-test-${++nextP2pRequestIndex}`;
     const send = vi.fn();
     let rafTime = 0;
@@ -447,6 +472,328 @@ describe('DiscussionsPage', () => {
       finalCalls - baselineCalls,
       `expected ≤1 list_discussions dispatch from 10 RUN_UPDATEs, got ${finalCalls - baselineCalls}`,
     ).toBeLessThanOrEqual(1);
+  });
+
+  it('loads Auto Deliver recovery rows into the dedicated list tab', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} />);
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.list_request',
+    }));
+    const autoListRequest = vi.mocked(ws.send).mock.calls
+      .map((call) => call[0] as { type?: string; sessionName?: string })
+      .find((msg) => msg.type === 'openspec_auto_deliver.list_request');
+    expect(autoListRequest).toBeDefined();
+    expect(autoListRequest).not.toHaveProperty('sessionName');
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-run-1',
+          projectionVersion: 2,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_sub_1',
+          selectedTeamComboId: 'audit>review>plan',
+          recentFinding: 'spec_audit_repair_p2p_started',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getByRole('button', { name: 'openspec.auto.list_title' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'p2p.discussions.title' })).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'openspec.auto.list_title' }));
+    expect(screen.getAllByText('openspec-auto-delivery').length).toBeGreaterThanOrEqual(1);
+    const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    expect(autoRow).toBeTruthy();
+    expect(autoRow.textContent).toContain('Implementation');
+    expect(autoRow.textContent).toContain('Active');
+    expect(autoRow.textContent).not.toContain('Owner: deck_proj_brain');
+    expect(autoRow.textContent).not.toContain('Execution: deck_sub_1');
+    expect(autoRow.textContent).not.toContain('Team flow: Audit→Review→Plan');
+    expect(autoRow.textContent).not.toContain('Latest: Spec audit Team run started.');
+    expect(autoRow.textContent).not.toContain('Spec audit Team run started.');
+    expect(autoRow.textContent).not.toContain('implementation_task_loop');
+    expect(autoRow.textContent).not.toContain('spec_audit_repair_p2p_started');
+
+    fireEvent.click(autoRow);
+    expect(autoRow.className).toContain('active');
+    await waitFor(() => {
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'openspec_auto_deliver.status_request',
+        sessionName: 'deck_sub_1',
+      }));
+    });
+    await act(async () => {
+      handler?.({
+        type: 'openspec_auto_deliver.status_projection',
+        projection: {
+          runId: 'auto-run-1',
+          projectionVersion: 3,
+          generation: 1,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_sub_1',
+          selectedTeamComboId: 'audit>review>plan',
+          recentFinding: 'spec_audit_repair_p2p_started',
+          taskStats: { total: 5, checked: 3, unchecked: 2 },
+          auditResults: [{
+            stage: 'implementation_audit_repair',
+            roundIndex: 1,
+            attemptId: 'attempt-1',
+            generation: 1,
+            verdict: 'REWORK',
+            moduleScores: [{ module: 'implementation', score: 6, max_score: 10, summary: 'Needs repair.' }],
+            requiredChanges: ['Fix missing UI detail parity.'],
+            evidence: [],
+          }],
+          finalAfterRepair: {
+            phase: 'final_after_repair',
+            stage: 'implementation_audit_repair',
+            roundIndex: 1,
+            attemptId: 'attempt-final',
+            generation: 1,
+            verdict: 'PASS',
+            moduleScores: [{ module: 'implementation', score: 10, max_score: 10, summary: 'Aligned.' }],
+            completedAt: 100,
+          },
+          evidence: [{ source: 'daemon', summary: 'Validation passed.' }],
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getByText('deck_proj_brain')).toBeDefined();
+    expect(screen.getByText('deck_sub_1')).toBeDefined();
+    expect(screen.getByText('Audit→Review→Plan')).toBeDefined();
+    expect(screen.getAllByText('Spec audit Team run started.').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Latest')).toBeDefined();
+    expect(screen.getByText('Task status')).toBeDefined();
+    expect(screen.getByText('3/5 tasks')).toBeDefined();
+    expect(screen.getByText('Audit results')).toBeDefined();
+    expect(screen.getByText('Final acceptance scores')).toBeDefined();
+    expect(screen.getByText('Validation passed.')).toBeDefined();
+    expect(screen.queryByText('audit>review>plan')).toBeNull();
+    expect(screen.queryByText('spec_audit_repair_p2p_started')).toBeNull();
+  });
+
+  it('can open directly on the Auto Deliver list tab', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [{ id: 'team-1', preview: 'Team row', fileName: 'team-1.md', mtime: 1 }] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-run-direct',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'direct-auto',
+          status: 'implementation_task_loop',
+          stage: 'spec_audit_repair',
+          owningMainSessionName: 'deck_proj_brain',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getAllByText('direct-auto').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('Team row')).toBeNull();
+  });
+
+  it('keeps the Auto Deliver list category available on mobile', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: 'team-1', preview: 'Team row', fileName: 'team-1.md', mtime: 1 }],
+      } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-run-mobile-visible',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'visible-auto',
+          status: 'implementation_task_loop',
+          stage: 'spec_audit_repair',
+          owningMainSessionName: 'deck_proj_brain',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getByRole('button', { name: 'openspec.auto.list_title' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'p2p.discussions.title' })).toBeDefined();
+    expect(screen.getAllByText('visible-auto').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('Team row')).toBeNull();
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.list_request',
+    }));
+    const autoListRequest = vi.mocked(ws.send).mock.calls
+      .map((call) => call[0] as { type?: string; sessionName?: string })
+      .find((msg) => msg.type === 'openspec_auto_deliver.list_request');
+    expect(autoListRequest).toBeDefined();
+    expect(autoListRequest).not.toHaveProperty('sessionName');
+  });
+
+  it('renders Auto Deliver conflict rows without change names and localizes conflict reasons', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-conflict-1',
+          projectionVersion: 3,
+          visibility: 'conflict',
+          status: 'implementation_task_loop',
+          stage: 'implementation_audit_repair',
+          owningMainSessionName: 'deck_proj_brain',
+          reason: 'auto_deliver_active',
+          changeName: 'private-change-name',
+          latestRepairSummary: 'private repair summary',
+          evidence: [{ summary: 'private evidence' }],
+          uncheckedTaskLabels: ['private unchecked task'],
+          changedFiles: ['/Users/k/private/file.ts'],
+          findings: ['private finding'],
+          validationOutput: 'private validation output',
+          rawPrompt: 'private prompt',
+          rawP2pInternals: { sessionName: 'deck_secret_worker' },
+          apiToken: 'secret-token',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.queryByText('private-change-name')).toBeNull();
+    expect(screen.queryByText('private repair summary')).toBeNull();
+    expect(screen.queryByText('private evidence')).toBeNull();
+    expect(screen.queryByText('private unchecked task')).toBeNull();
+    expect(screen.queryByText('/Users/k/private/file.ts')).toBeNull();
+    expect(screen.queryByText('private finding')).toBeNull();
+    expect(screen.queryByText('private validation output')).toBeNull();
+    expect(screen.queryByText('private prompt')).toBeNull();
+    expect(screen.queryByText('deck_secret_worker')).toBeNull();
+    expect(screen.queryByText('secret-token')).toBeNull();
+    const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    expect(autoRow.textContent).toContain('deck_proj_brain');
+    expect(autoRow.textContent).not.toContain('private-change-name');
+    expect(autoRow.textContent).not.toContain('Conflict: Auto Deliver is already running for this session.');
+    expect(autoRow.textContent).not.toContain('auto_deliver_active');
+
+    fireEvent.click(autoRow);
+    expect(screen.getByText('Auto Deliver is already running for this session.')).toBeDefined();
+    expect(screen.queryByText('auto_deliver_active')).toBeNull();
+  });
+
+  it('drops malformed Auto Deliver list rows before recovery state can render them', async () => {
+    render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [
+          {
+            runId: 'missing-visibility',
+            projectionVersion: 1,
+            changeName: 'leaked-missing-visibility',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'missing-stage',
+            projectionVersion: 2,
+            visibility: 'full',
+            changeName: 'leaked-missing-stage',
+            status: 'active',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'bad-version',
+            projectionVersion: Number.POSITIVE_INFINITY,
+            visibility: 'conflict',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+            reason: 'auto_deliver_active',
+          },
+          {
+            runId: 'bad-status-active',
+            projectionVersion: 3,
+            visibility: 'full',
+            changeName: 'leaked-bad-status-active',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'bad-status-running',
+            projectionVersion: 4,
+            visibility: 'full',
+            changeName: 'leaked-bad-status-running',
+            status: 'running',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+          {
+            runId: 'valid-row',
+            projectionVersion: 5,
+            visibility: 'full',
+            changeName: 'visible-valid-row',
+            status: 'implementation_task_loop',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_proj_brain',
+          },
+        ],
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.getAllByText('visible-valid-row').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('leaked-missing-visibility')).toBeNull();
+    expect(screen.queryByText('leaked-missing-stage')).toBeNull();
+    expect(screen.queryByText('leaked-bad-status-active')).toBeNull();
+    expect(screen.queryByText('leaked-bad-status-running')).toBeNull();
+    expect(screen.queryByText('bad-version')).toBeNull();
+  });
+
+  it('localizes Auto Deliver terminal reasons in recovery row details', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} requestScope={{ sessionName: 'deck_sub_1' }} initialTab="auto" />);
+
+    await act(async () => {
+      handler?.({ type: 'p2p.list_discussions_response', discussions: [] } as ServerMessage);
+      handler?.({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [{
+          runId: 'auto-terminal-1',
+          projectionVersion: 4,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'needs_human',
+          stage: 'needs_human',
+          viewMode: 'compactRecovery',
+          owningMainSessionName: 'deck_proj_brain',
+          targetImplementationSessionName: 'deck_sub_1',
+          terminalReason: 'missing_authoritative_json',
+        }],
+      } as unknown as ServerMessage);
+    });
+
+    const autoRow = container.querySelector('.discussions-list-item') as HTMLElement;
+    expect(autoRow.textContent).not.toContain('Terminal reason: The audit did not produce a final authoritative JSON result.');
+    expect(autoRow.textContent).not.toContain('missing_authoritative_json');
+    fireEvent.click(autoRow);
+    expect(screen.getByText('The audit did not produce a final authoritative JSON result.')).toBeDefined();
+    expect(screen.queryByText('missing_authoritative_json')).toBeNull();
   });
 
   it('clicking a live progress card with NO fileId is a no-op (orphan run mid-bind)', async () => {

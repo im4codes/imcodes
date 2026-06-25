@@ -80,6 +80,61 @@ export interface P2pConfigSelection {
   modeOverride: string;
 }
 
+export interface P2pMemberEligibilityOptions {
+  /** Main session that owns this Team config. It is the host, never a member. */
+  scopeSession?: string | null;
+  /** Optional persisted/UI role for callers that already have session metadata. */
+  role?: string | null;
+}
+
+export function isP2pBrainSessionName(sessionName: string): boolean {
+  return !sessionName.startsWith('deck_sub_') && /^deck_.+_brain$/.test(sessionName);
+}
+
+export function isP2pMemberEligibleSession(
+  sessionName: string,
+  options: P2pMemberEligibilityOptions = {},
+): boolean {
+  const trimmed = sessionName.trim();
+  if (!trimmed) return false;
+  if (options.scopeSession && trimmed === options.scopeSession) return false;
+  if (options.role === 'brain') return false;
+  if (isP2pBrainSessionName(trimmed)) return false;
+  return true;
+}
+
+export function sanitizeP2pSessionConfig(
+  config: P2pSessionConfig | undefined,
+  options: P2pMemberEligibilityOptions = {},
+): P2pSessionConfig {
+  if (!config) return {};
+  const sanitized: P2pSessionConfig = {};
+  for (const [sessionName, entry] of Object.entries(config)) {
+    if (!isP2pMemberEligibleSession(sessionName, options)) continue;
+    sanitized[sessionName] = entry;
+  }
+  return sanitized;
+}
+
+export function sanitizeP2pSavedConfig(
+  config: P2pSavedConfig,
+  options: P2pMemberEligibilityOptions = {},
+): P2pSavedConfig {
+  return {
+    ...config,
+    sessions: sanitizeP2pSessionConfig(config.sessions, options),
+  };
+}
+
+export function getEnabledP2pMemberNames(
+  config: P2pSessionConfig | undefined,
+  options: P2pMemberEligibilityOptions = {},
+): string[] {
+  return Object.entries(sanitizeP2pSessionConfig(config, options))
+    .filter(([, entry]) => entry && entry.enabled === true && entry.mode !== 'skip')
+    .map(([name]) => name);
+}
+
 export function isP2pSessionEntry(value: unknown): value is P2pSessionEntry {
   if (!value || typeof value !== 'object') return false;
   const record = value as { enabled?: unknown; mode?: unknown };
@@ -134,14 +189,15 @@ export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
 }
 
 export function buildEffectiveP2pConfig(config: P2pSavedConfig, modeOverride: string): P2pSavedConfig {
-  if (modeOverride === P2P_CONFIG_MODE) return config;
+  const sanitizedConfig = sanitizeP2pSavedConfig(config);
+  if (modeOverride === P2P_CONFIG_MODE) return sanitizedConfig;
   const overriddenSessions: P2pSavedConfig['sessions'] = {};
-  for (const [session, entry] of Object.entries(config.sessions)) {
+  for (const [session, entry] of Object.entries(sanitizedConfig.sessions)) {
     overriddenSessions[session] = entry.enabled && entry.mode !== 'skip'
       ? { ...entry, mode: modeOverride }
       : { ...entry };
   }
-  return { ...config, sessions: overriddenSessions };
+  return { ...sanitizedConfig, sessions: overriddenSessions };
 }
 
 export function buildP2pConfigSelection(
@@ -248,6 +304,7 @@ export const BUILT_IN_MODES: P2pMode[] = [
       '5. **Acceptance and Validation** — explicit acceptance criteria plus concrete verification steps and tests for each major behavior\n' +
       '6. **Risk Assessment** — identified risks with mitigation strategies\n' +
       '7. **Open Questions** — unresolved decisions that need stakeholder input\n' +
+      'End with the exact heading "repair task checklist" and an ordered, executable checklist that the follow-up execution stage can complete item by item. Each checklist item must name the file/component area, intended change, dependencies, and validation evidence. ' +
       'Be precise: name files, functions, types, data structures, and test coverage. The final plan must be detailed enough for direct implementation and QA handoff.',
   },
   {

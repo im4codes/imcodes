@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { memo } from 'preact/compat';
 import type { P2pWorkflowDiagnostic } from '@shared/p2p-workflow-diagnostics.js';
+import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
+import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 
 export interface P2pProgressNode {
   label: string;
@@ -58,6 +60,8 @@ export interface P2pProgressDiscussion {
   hopStartedAt?: number;
   /** Workflow diagnostics surfaced from sanitizer (parse/compile/bind/execute/sanitize phases) */
   diagnostics?: P2pWorkflowDiagnostic[];
+  /** Server-authored actor metadata for shared P2P runs/replies. */
+  sharedActor?: SharedActorEnvelope;
 }
 
 interface Props {
@@ -321,6 +325,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
   const hopKey = isRunning ? `${discussion.currentRound}:${discussion.activeHop}:${discussion.activePhase}` : null;
   const runKey = isRunning ? discussion.id : null;
   const renderUltraCompact = mobile || ultraCompact;
+  const sharedActorLabel = formatSharedActorLabel(t, discussion.sharedActor);
 
   // ── Ultra-compact: single-line summary ─────────────────────────────────
   if (renderUltraCompact) {
@@ -338,6 +343,11 @@ export const P2pProgressCard = memo(function P2pProgressCard({
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
           <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-compact" />
           {phaseLabel && <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>}
+          {sharedActorLabel && (
+            <span class="controls-queued-item-actor" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </span>
+          )}
           {!hidden && activeNode && (
             <span class={`discussions-progress-node ${progressStatusClassName(activeNode.status, isRunning)}`} style={{ margin: 0 }}>
               <span class="discussions-progress-node-dot" />
@@ -426,6 +436,11 @@ export const P2pProgressCard = memo(function P2pProgressCard({
       <div class="discussions-progress-head">
         <div class="discussions-progress-titlewrap">
           <div class="discussions-progress-kicker">Team</div>
+          {sharedActorLabel && (
+            <div class="controls-queued-item-actor" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </div>
+          )}
           <div class="discussions-progress-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
         </div>
         <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-total" />

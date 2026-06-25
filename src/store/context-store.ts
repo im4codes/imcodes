@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import type {
@@ -41,9 +41,14 @@ import {
 import {
   contextNamespaceToBinding,
   createContextNamespaceBinding,
+  LEGACY_DAEMON_LOCAL_USER_ID,
+  parseNamespaceKey,
   type CanonicalNamespaceInput,
   type ContextNamespaceBinding,
 } from '../../shared/memory-namespace.js';
+// Re-export relocated runtime values so existing importers keep resolving them
+// from `context-store.js`. Definitions now live in `shared/memory-namespace.ts`.
+export { LEGACY_DAEMON_LOCAL_USER_ID, parseNamespaceKey } from '../../shared/memory-namespace.js';
 import {
   assertValidObservationInput,
   isObservationClass,
@@ -64,7 +69,6 @@ export type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'shared-agent-context.sqlite');
 const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
-export const LEGACY_DAEMON_LOCAL_USER_ID = 'daemon-local';
 
 let db: DatabaseSyncInstance | null = null;
 let currentDbPath: string | null = null;
@@ -72,6 +76,20 @@ let stagedReconciledForPath: string | null = null;
 let materializationRepairRanForPath: string | null = null;
 let archiveBackfillTimer: ReturnType<typeof setTimeout> | null = null;
 let archiveBackfillScheduledForPath: string | null = null;
+// Whether THIS module instance may schedule the archive-backfill timer. Default
+// enabled so tests, the CLI, and the context-store worker run it. The daemon
+// MAIN thread disables it once it spawns the context-store worker, so the
+// backfill runs EXCLUSIVELY in the worker (the single long-lived owner) and the
+// main-thread connection never schedules it.
+// The scheduling flag now lives in a no-DB module (`archive-backfill-scheduling`)
+// so the daemon main thread can toggle it WITHOUT importing this synchronous
+// store (task 4.5 import guard). Imported here for the `ensureDb` check + reset,
+// and re-exported for back-compat with existing importers (tests).
+import {
+  isArchiveBackfillSchedulingEnabled,
+  resetArchiveBackfillSchedulingForTests,
+} from './archive-backfill-scheduling.js';
+export { setArchiveBackfillSchedulingEnabled } from './archive-backfill-scheduling.js';
 
 function getDbPath(): string {
   return process.env.IMCODES_CONTEXT_DB_PATH?.trim() || DEFAULT_DB_PATH;
@@ -281,6 +299,8 @@ function ensureDb(): DatabaseSyncInstance {
   currentDbPath = dbPath;
   db.exec(`
     PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA wal_autocheckpoint = 1000;
     CREATE TABLE IF NOT EXISTS context_staged_events (
       id TEXT PRIMARY KEY,
       namespace_key TEXT NOT NULL,
@@ -469,6 +489,8 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_observations(projection_id);
     CREATE INDEX IF NOT EXISTS idx_context_observations_scope_state
       ON context_observations(scope, state, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_context_observations_namespace_state
+      ON context_observations(namespace_id, state, updated_at DESC);
 
     CREATE TABLE IF NOT EXISTS observation_promotion_audit (
       id TEXT PRIMARY KEY,
@@ -931,6 +953,56 @@ export function setContextMeta(key: string, value: string): void {
   internalSetContextMeta(ensureDb(), key, value);
 }
 
+/** WAL byte size above which an idle checkpoint escalates from PASSIVE to
+ *  TRUNCATE. TRUNCATE only actually shrinks the WAL file once the context-store
+ *  worker is the single long-lived connection (see the design's WAL-scope
+ *  coupling); while other connections still hold locks it is best-effort. */
+export const WAL_TRUNCATE_THRESHOLD_BYTES = 64 * 1024 * 1024;
+
+/** Resolve the WAL TRUNCATE threshold, allowing a test/ops override via
+ *  `IMCODES_CONTEXT_WAL_TRUNCATE_BYTES` (default {@link WAL_TRUNCATE_THRESHOLD_BYTES}). */
+function walTruncateThresholdBytes(): number {
+  const raw = process.env.IMCODES_CONTEXT_WAL_TRUNCATE_BYTES?.trim();
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return WAL_TRUNCATE_THRESHOLD_BYTES;
+}
+
+export type WalCheckpointMode = 'PASSIVE' | 'TRUNCATE';
+
+export interface WalCheckpointResult {
+  mode: WalCheckpointMode;
+  /** WAL file size in bytes observed immediately before the checkpoint. */
+  walBytesBefore: number;
+  /** WAL file size in bytes observed immediately after the checkpoint. */
+  walBytesAfter: number;
+}
+
+/** Run a WAL checkpoint on the context store. Defaults to a steady-state
+ *  PASSIVE checkpoint and escalates to TRUNCATE only when the WAL has grown past
+ *  {@link WAL_TRUNCATE_THRESHOLD_BYTES}. This is intended to be called ONLY from
+ *  the context-store worker (the daemon main thread must never checkpoint). */
+export function checkpointWal(): WalCheckpointResult {
+  const database = ensureDb();
+  const walPath = `${currentDbPath ?? getDbPath()}-wal`;
+  const walBytes = (): number => {
+    try {
+      return statSync(walPath).size;
+    } catch {
+      return 0;
+    }
+  };
+  const walBytesBefore = walBytes();
+  const mode: WalCheckpointMode =
+    walBytesBefore > walTruncateThresholdBytes() ? 'TRUNCATE' : 'PASSIVE';
+  // node:sqlite has no parameter binding for PRAGMA; mode is a fixed literal
+  // from the union above, never user input.
+  database.exec(`PRAGMA wal_checkpoint(${mode});`);
+  return { mode, walBytesBefore, walBytesAfter: walBytes() };
+}
+
 function projectionFingerprint(summary: string): string {
   return computeFingerprint(normalizeSummaryForFingerprint(summary));
 }
@@ -963,6 +1035,9 @@ function parseArchiveBackfillCursor(raw: string | undefined): ArchiveBackfillCur
 }
 
 function scheduleArchiveBackfillIfNeeded(database: DatabaseSyncInstance, dbPath: string, delayMs = 0): void {
+  // Runs EXCLUSIVELY in the context-store worker once the daemon disables it on
+  // the main thread; tests/CLI (the sole connection) keep it enabled.
+  if (!isArchiveBackfillSchedulingEnabled()) return;
   if (internalGetContextMeta(database, 'migration_archive_backfilled') === '1') return;
   if (archiveBackfillScheduledForPath === dbPath) return;
   archiveBackfillScheduledForPath = dbPath;
@@ -1385,6 +1460,7 @@ export function resetContextStoreForTests(): void {
   }
   archiveBackfillTimer = null;
   archiveBackfillScheduledForPath = null;
+  resetArchiveBackfillSchedulingForTests();
   if (db) db.close();
   db = null;
   currentDbPath = null;
@@ -1393,9 +1469,13 @@ export function resetContextStoreForTests(): void {
 }
 
 
-export function archiveEventsForMaterialization(events: LocalContextEvent[], archivedAt = Date.now()): void {
+/**
+ * Transaction-free body of {@link archiveEventsForMaterialization}: archives
+ * `events` directly on `database` with NO BEGIN/COMMIT/ensureDb. The caller
+ * MUST run this inside a transaction.
+ */
+export function archiveEventsForMaterializationForDb(database: DatabaseSyncInstance, events: LocalContextEvent[], archivedAt: number): void {
   if (events.length === 0) return;
-  const database = ensureDb();
   // Content / metadata stay byte-identical to the first archive write per the
   // foundations spec ("archive content is byte-identical to original event
   // content"). `token_count` is the only field that may legitimately change
@@ -1408,22 +1488,28 @@ export function archiveEventsForMaterialization(events: LocalContextEvent[], arc
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET token_count = excluded.token_count
   `);
+  for (const event of events) {
+    const content = event.content ?? '';
+    stmt.run(
+      event.id,
+      serializeContextNamespace(event.target.namespace),
+      serializeContextTarget(event.target),
+      event.eventType,
+      content,
+      JSON.stringify(event.metadata ?? null),
+      event.createdAt,
+      archivedAt,
+      countTokens(content),
+    );
+  }
+}
+
+export function archiveEventsForMaterialization(events: LocalContextEvent[], archivedAt = Date.now()): void {
+  if (events.length === 0) return;
+  const database = ensureDb();
   database.exec('BEGIN IMMEDIATE');
   try {
-    for (const event of events) {
-      const content = event.content ?? '';
-      stmt.run(
-        event.id,
-        serializeContextNamespace(event.target.namespace),
-        serializeContextTarget(event.target),
-        event.eventType,
-        content,
-        JSON.stringify(event.metadata ?? null),
-        event.createdAt,
-        archivedAt,
-        countTokens(content),
-      );
-    }
+    archiveEventsForMaterializationForDb(database, events, archivedAt);
     database.exec('COMMIT');
   } catch (error) {
     try { database.exec('ROLLBACK'); } catch { /* ignore */ }
@@ -2209,6 +2295,18 @@ export function countStagedTokens(target: ContextTargetRef): number {
   return listContextEvents(target).reduce((sum, event) => sum + countTokens(event.content ?? ''), 0);
 }
 
+export function estimateStagedTokenUpperBound(target: ContextTargetRef): number {
+  const database = ensureDb();
+  const targetKey = serializeContextTarget(target);
+  const row = database.prepare(`
+    SELECT coalesce(sum(length(coalesce(content, ''))), 0) AS chars
+      FROM context_staged_events
+     WHERE target_key = ?
+  `).get(targetKey) as { chars?: number } | undefined;
+  const chars = Number(row?.chars ?? 0);
+  return Number.isFinite(chars) && chars > 0 ? Math.ceil(chars) : 0;
+}
+
 export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): LocalContextEvent {
   const database = ensureDb();
   const event: LocalContextEvent = {
@@ -2222,50 +2320,116 @@ export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'create
   const namespaceKey = serializeContextNamespace(event.target.namespace);
   const targetKey = serializeContextTarget(event.target);
   const namespaceColumns = namespaceFilterColumnValues(event.target.namespace);
-  database.prepare(`
-    INSERT INTO context_staged_events (
-      id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-      target_key, target_kind, session_name, event_type, content, metadata_json, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    event.id,
-    namespaceKey,
-    ...namespaceColumns,
-    targetKey,
-    event.target.kind,
-    event.target.sessionName ?? null,
-    event.eventType,
-    event.content ?? null,
-    JSON.stringify(event.metadata ?? null),
-    event.createdAt,
-  );
-  database.prepare(`
-    INSERT INTO context_dirty_targets (
-      target_key, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-      target_kind, session_name, event_count, oldest_event_at, newest_event_at, last_trigger, pending_job_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
-    ON CONFLICT(target_key) DO UPDATE SET
-      event_count = context_dirty_targets.event_count + 1,
-      oldest_event_at = MIN(context_dirty_targets.oldest_event_at, excluded.oldest_event_at),
-      newest_event_at = MAX(context_dirty_targets.newest_event_at, excluded.newest_event_at),
-      namespace_key = excluded.namespace_key,
-      scope = excluded.scope,
-      enterprise_id = excluded.enterprise_id,
-      workspace_id = excluded.workspace_id,
-      user_id = excluded.user_id,
-      project_id = excluded.project_id,
-      target_kind = excluded.target_kind,
-      session_name = excluded.session_name
-  `).run(
-    targetKey,
-    namespaceKey,
-    ...namespaceColumns,
-    event.target.kind,
-    event.target.sessionName ?? null,
-    event.createdAt,
-    event.createdAt,
-  );
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const insertResult = database.prepare(`
+      INSERT INTO context_staged_events (
+        id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
+        target_key, target_kind, session_name, event_type, content, metadata_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(
+      event.id,
+      namespaceKey,
+      ...namespaceColumns,
+      targetKey,
+      event.target.kind,
+      event.target.sessionName ?? null,
+      event.eventType,
+      event.content ?? null,
+      JSON.stringify(event.metadata ?? null),
+      event.createdAt,
+    );
+    if (insertResult.changes === 0) {
+      // Duplicate stable id = idempotent replay. The insert was a no-op and dirty/staged
+      // counts must NOT double-increment (the ON CONFLICT DO NOTHING idempotency stands).
+      // For observability only, detect a stable-id collision whose payload disagrees with
+      // the already-staged row — this would mean an upstream provider reused one eventId for
+      // two genuinely different logical events, silently dropping the second. Count a metric
+      // and emit a low-frequency warn so the contract violation is visible, WITHOUT logging
+      // any chat content.
+      const existingRow = database.prepare(
+        'SELECT event_type, content FROM context_staged_events WHERE id = ?',
+      ).get(event.id) as { event_type?: string; content?: string | null } | undefined;
+      if (existingRow) {
+        const existingEventType = existingRow.event_type ?? null;
+        const existingContent = existingRow.content ?? null;
+        const incomingContent = event.content ?? null;
+        if (existingEventType !== event.eventType || existingContent !== incomingContent) {
+          incrementCounter('mem.ingest.duplicate_id_mismatch', { source: 'recordContextEvent' });
+          warnOncePerHour('mem.ingest.duplicate_id_mismatch.recordContextEvent', {
+            id: event.id,
+            existingEventType,
+            incomingEventType: event.eventType,
+          });
+        }
+      }
+      database.exec('COMMIT');
+      return event;
+    }
+    database.prepare(`
+      INSERT INTO context_dirty_targets (
+        target_key, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
+        target_kind, session_name, event_count, oldest_event_at, newest_event_at, last_trigger, pending_job_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
+      ON CONFLICT(target_key) DO UPDATE SET
+        event_count = context_dirty_targets.event_count + 1,
+        oldest_event_at = MIN(context_dirty_targets.oldest_event_at, excluded.oldest_event_at),
+        newest_event_at = MAX(context_dirty_targets.newest_event_at, excluded.newest_event_at),
+        namespace_key = excluded.namespace_key,
+        scope = excluded.scope,
+        enterprise_id = excluded.enterprise_id,
+        workspace_id = excluded.workspace_id,
+        user_id = excluded.user_id,
+        project_id = excluded.project_id,
+        target_kind = excluded.target_kind,
+        session_name = excluded.session_name
+    `).run(
+      targetKey,
+      namespaceKey,
+      ...namespaceColumns,
+      event.target.kind,
+      event.target.sessionName ?? null,
+      event.createdAt,
+      event.createdAt,
+    );
+    database.exec('COMMIT');
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw error;
+  }
   return event;
+}
+
+export interface IngestContextEventResult {
+  event: LocalContextEvent;
+  dirtyTarget?: ContextDirtyTarget;
+  stagedTokenUpperBound: number;
+  latestSummaryUpdatedAt?: number;
+}
+
+/** Aggregate ingest RPC: record the event and, when `computeTriggerData` is set
+ *  (memory-eligible events), read everything the coordinator needs to decide a
+ *  materialization trigger — the dirty target, the staged-token upper bound, and
+ *  the latest recent-summary timestamp — in ONE round trip, so per-event
+ *  ingestion makes a single worker call instead of 2–3. The trigger DECISION
+ *  stays on the caller (it needs in-memory rate-limit/threshold state). */
+export function ingestContextEvent(
+  input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>,
+  computeTriggerData: boolean,
+): IngestContextEventResult {
+  const event = recordContextEvent(input);
+  if (!computeTriggerData) return { event, stagedTokenUpperBound: 0 };
+  const dirtyTarget = listDirtyTargets(input.target.namespace).find(
+    (entry) => entry.target.kind === input.target.kind && entry.target.sessionName === input.target.sessionName,
+  );
+  if (!dirtyTarget) return { event, stagedTokenUpperBound: 0 };
+  return {
+    event,
+    dirtyTarget,
+    stagedTokenUpperBound: estimateStagedTokenUpperBound(input.target),
+    latestSummaryUpdatedAt: getLatestRecentSummaryUpdatedAtForTarget(input.target),
+  };
 }
 
 export function listDirtyTargets(namespace?: ContextNamespace): ContextDirtyTarget[] {
@@ -2301,11 +2465,21 @@ export function listContextEvents(target: ContextTargetRef): LocalContextEvent[]
   }));
 }
 
+/**
+ * Transaction-free body of {@link deleteStagedEventsByIds}: deletes staged
+ * events by id directly on `database` with NO ensureDb. This function does not
+ * itself open a transaction (the public wrapper did not either).
+ */
+export function deleteStagedEventsByIdsForDb(database: DatabaseSyncInstance, eventIds: string[]): void {
+  if (eventIds.length === 0) return;
+  const placeholders = eventIds.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM context_staged_events WHERE id IN (${placeholders})`).run(...eventIds);
+}
+
 export function deleteStagedEventsByIds(eventIds: string[]): void {
   if (eventIds.length === 0) return;
   const database = ensureDb();
-  const placeholders = eventIds.map(() => '?').join(', ');
-  database.prepare(`DELETE FROM context_staged_events WHERE id IN (${placeholders})`).run(...eventIds);
+  deleteStagedEventsByIdsForDb(database, eventIds);
 }
 
 export function queryPendingContextEvents(filters: {
@@ -2407,14 +2581,23 @@ export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobT
   return job;
 }
 
-export function updateContextJob(jobId: string, status: ContextJobStatus, updates?: { error?: string; attemptIncrement?: boolean; now?: number }): void {
-  const database = ensureDb();
+/**
+ * Transaction-free body of {@link updateContextJob}: updates a context job row
+ * directly on `database` with NO ensureDb. This function does not itself open a
+ * transaction (the public wrapper did not either).
+ */
+export function updateContextJobForDb(database: DatabaseSyncInstance, jobId: string, status: ContextJobStatus, updates?: { error?: string; attemptIncrement?: boolean; now?: number }): void {
   const now = updates?.now ?? Date.now();
   database.prepare(`
     UPDATE context_jobs
     SET status = ?, updated_at = ?, error = ?, attempt_count = attempt_count + ?
     WHERE id = ?
   `).run(status, now, updates?.error ?? null, updates?.attemptIncrement ? 1 : 0, jobId);
+}
+
+export function updateContextJob(jobId: string, status: ContextJobStatus, updates?: { error?: string; attemptIncrement?: boolean; now?: number }): void {
+  const database = ensureDb();
+  updateContextJobForDb(database, jobId, status, updates);
 }
 
 /**
@@ -2464,8 +2647,16 @@ export function deleteTentativeProjections(namespace: ContextNamespace, projecti
   return deleted;
 }
 
-export function writeProcessedProjection(input: Omit<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'> & Partial<Pick<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'>>): ProcessedContextProjection {
-  const database = ensureDb();
+/**
+ * Transaction-free body of {@link writeProcessedProjection}. Performs the
+ * prior-read + INSERT…ON CONFLICT + source/observation sync (branching on
+ * `input.id`) directly on `database` with NO BEGIN/COMMIT/ROLLBACK, retry, or
+ * `ensureDb`. The caller MUST run this inside a `BEGIN IMMEDIATE` transaction.
+ */
+export function writeProcessedProjectionForDb(
+  database: DatabaseSyncInstance,
+  input: WriteProcessedProjectionInput,
+): ProcessedContextProjection {
   const now = Date.now();
   const canonicalNamespace = canonicalizeContextNamespace(input.namespace);
   const namespaceKey = serializeContextNamespace(canonicalNamespace);
@@ -2486,71 +2677,154 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
   // distinct from fingerprint-based local rows, so keep summary_fingerprint
   // NULL, but still upsert by id and merge provenance on repeated writes.
   if (input.id) {
+    const prior = database.prepare('SELECT source_event_ids_json, created_at FROM context_processed_local WHERE id = ?')
+      .get(input.id) as { source_event_ids_json: string; created_at: number } | undefined;
+    const sourceEventIds = mergeSourceIds(parseJson<string[]>(prior?.source_event_ids_json, []), input.sourceEventIds);
+    const projection: ProcessedContextProjection = {
+      id: input.id,
+      namespace: canonicalNamespace,
+      class: input.class,
+      sourceEventIds,
+      summary: summaryForDb,
+      content: parseJson<Record<string, unknown>>(contentJsonForDb, contentForDb),
+      contentHash: contentHashForDb,
+      origin: originForDb,
+      createdAt: prior?.created_at ?? input.createdAt ?? now,
+      updatedAt: input.updatedAt ?? now,
+    };
+    database.prepare(`
+      INSERT INTO context_processed_local (
+        id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
+        class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(id) DO UPDATE SET
+        namespace_key = excluded.namespace_key,
+        scope = excluded.scope,
+        enterprise_id = excluded.enterprise_id,
+        workspace_id = excluded.workspace_id,
+        user_id = excluded.user_id,
+        project_id = excluded.project_id,
+        class = excluded.class,
+        source_event_ids_json = excluded.source_event_ids_json,
+        summary = excluded.summary,
+        content_json = excluded.content_json,
+        content_hash = excluded.content_hash,
+        origin = excluded.origin,
+        updated_at = excluded.updated_at,
+        summary_fingerprint = NULL
+    `).run(
+      projection.id,
+      namespaceKey,
+      ...namespaceColumns,
+      projection.class,
+      JSON.stringify(projection.sourceEventIds),
+      projection.summary,
+      contentJsonForDb,
+      contentHashForDb,
+      originForDb,
+      projection.createdAt,
+      projection.updatedAt,
+    );
+    syncProjectionSourcesForDb(database, projection.id, projection.sourceEventIds);
+    upsertProjectionObservationForDb(database, {
+      namespace: projection.namespace,
+      projectionId: projection.id,
+      projectionClass: projection.class,
+      sourceEventIds: projection.sourceEventIds,
+      summary: projection.summary,
+      content: projection.content,
+      createdAt: projection.createdAt,
+      updatedAt: projection.updatedAt,
+      fingerprint: projectionFingerprint(projection.summary),
+      origin: projection.origin ?? originForDb,
+    });
+    return projection;
+  }
+
+  const fingerprint = projectionFingerprint(summaryForDb);
+  const prior = database.prepare(`
+    SELECT id, source_event_ids_json, created_at
+    FROM context_processed_local
+    WHERE namespace_key = ? AND class = ? AND summary_fingerprint = ?
+    LIMIT 1
+  `).get(namespaceKey, input.class, fingerprint) as { id: string; source_event_ids_json: string; created_at: number } | undefined;
+  const mergedIds = mergeSourceIds(parseJson<string[]>(prior?.source_event_ids_json, []), input.sourceEventIds);
+  const projectionId = prior?.id ?? randomUUID();
+  const createdAt = prior?.created_at ?? input.createdAt ?? now;
+  const updatedAt = input.updatedAt ?? now;
+  const row = database.prepare(`
+    INSERT INTO context_processed_local (
+      id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
+      class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL DO UPDATE SET
+      scope = excluded.scope,
+      enterprise_id = excluded.enterprise_id,
+      workspace_id = excluded.workspace_id,
+      user_id = excluded.user_id,
+      project_id = excluded.project_id,
+      source_event_ids_json = excluded.source_event_ids_json,
+      summary = excluded.summary,
+      content_json = excluded.content_json,
+      content_hash = excluded.content_hash,
+      origin = excluded.origin,
+      updated_at = excluded.updated_at
+    RETURNING id, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at
+  `).get(
+    projectionId,
+    namespaceKey,
+    ...namespaceColumns,
+    input.class,
+    JSON.stringify(mergedIds),
+    summaryForDb,
+    contentJsonForDb,
+    contentHashForDb,
+    originForDb,
+    createdAt,
+    updatedAt,
+    fingerprint,
+  ) as { id: string; source_event_ids_json: string; summary: string; content_json: string; content_hash: string | null; origin: string | null; created_at: number; updated_at: number };
+  const returnedIds = parseJson<string[]>(row.source_event_ids_json, mergedIds);
+  const returnedOrigin = isMemoryOrigin(row.origin) ? row.origin : originForDb;
+  syncProjectionSourcesForDb(database, row.id, returnedIds);
+  upsertProjectionObservationForDb(database, {
+    namespace: canonicalNamespace,
+    projectionId: row.id,
+    projectionClass: input.class,
+    sourceEventIds: returnedIds,
+    summary: row.summary,
+    content: parseJson<Record<string, unknown>>(row.content_json, contentForDb),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    fingerprint,
+    origin: returnedOrigin,
+  });
+  return {
+    id: row.id,
+    namespace: canonicalNamespace,
+    class: input.class,
+    origin: returnedOrigin,
+    sourceEventIds: returnedIds,
+    summary: row.summary,
+    content: parseJson<Record<string, unknown>>(row.content_json, contentForDb),
+    contentHash: typeof row.content_hash === 'string' && row.content_hash ? row.content_hash : contentHashForDb,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+export function writeProcessedProjection(input: WriteProcessedProjectionInput): ProcessedContextProjection {
+  const database = ensureDb();
+
+  // The explicit-id and fingerprint-upsert paths keep separate busy-retry
+  // counters/warnings so their telemetry sources stay distinct, but both run
+  // the same transaction-free body via writeProcessedProjectionForDb.
+  if (input.id) {
     let lastExplicitBusyError: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         database.exec('BEGIN IMMEDIATE');
-        const prior = database.prepare('SELECT source_event_ids_json, created_at FROM context_processed_local WHERE id = ?')
-          .get(input.id) as { source_event_ids_json: string; created_at: number } | undefined;
-        const sourceEventIds = mergeSourceIds(parseJson<string[]>(prior?.source_event_ids_json, []), input.sourceEventIds);
-        const projection: ProcessedContextProjection = {
-          id: input.id,
-          namespace: canonicalNamespace,
-          class: input.class,
-          sourceEventIds,
-          summary: summaryForDb,
-          content: parseJson<Record<string, unknown>>(contentJsonForDb, contentForDb),
-          contentHash: contentHashForDb,
-          origin: originForDb,
-          createdAt: prior?.created_at ?? input.createdAt ?? now,
-          updatedAt: input.updatedAt ?? now,
-        };
-        database.prepare(`
-          INSERT INTO context_processed_local (
-            id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-            class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-          ON CONFLICT(id) DO UPDATE SET
-            namespace_key = excluded.namespace_key,
-            scope = excluded.scope,
-            enterprise_id = excluded.enterprise_id,
-            workspace_id = excluded.workspace_id,
-            user_id = excluded.user_id,
-            project_id = excluded.project_id,
-            class = excluded.class,
-            source_event_ids_json = excluded.source_event_ids_json,
-            summary = excluded.summary,
-            content_json = excluded.content_json,
-            content_hash = excluded.content_hash,
-            origin = excluded.origin,
-            updated_at = excluded.updated_at,
-            summary_fingerprint = NULL
-        `).run(
-          projection.id,
-          namespaceKey,
-          ...namespaceColumns,
-          projection.class,
-          JSON.stringify(projection.sourceEventIds),
-          projection.summary,
-          contentJsonForDb,
-          contentHashForDb,
-          originForDb,
-          projection.createdAt,
-          projection.updatedAt,
-        );
-        syncProjectionSourcesForDb(database, projection.id, projection.sourceEventIds);
-        upsertProjectionObservationForDb(database, {
-          namespace: projection.namespace,
-          projectionId: projection.id,
-          projectionClass: projection.class,
-          sourceEventIds: projection.sourceEventIds,
-          summary: projection.summary,
-          content: projection.content,
-          createdAt: projection.createdAt,
-          updatedAt: projection.updatedAt,
-          fingerprint: projectionFingerprint(projection.summary),
-          origin: projection.origin ?? originForDb,
-        });
+        const projection = writeProcessedProjectionForDb(database, input);
         database.exec('COMMIT');
         return projection;
       } catch (error) {
@@ -2566,81 +2840,13 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
     throw lastExplicitBusyError instanceof Error ? lastExplicitBusyError : new Error(String(lastExplicitBusyError));
   }
 
-  const fingerprint = projectionFingerprint(summaryForDb);
   let lastBusyError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       database.exec('BEGIN IMMEDIATE');
-      const prior = database.prepare(`
-        SELECT id, source_event_ids_json, created_at
-        FROM context_processed_local
-        WHERE namespace_key = ? AND class = ? AND summary_fingerprint = ?
-        LIMIT 1
-      `).get(namespaceKey, input.class, fingerprint) as { id: string; source_event_ids_json: string; created_at: number } | undefined;
-      const mergedIds = mergeSourceIds(parseJson<string[]>(prior?.source_event_ids_json, []), input.sourceEventIds);
-      const projectionId = prior?.id ?? randomUUID();
-      const createdAt = prior?.created_at ?? input.createdAt ?? now;
-      const updatedAt = input.updatedAt ?? now;
-      const row = database.prepare(`
-        INSERT INTO context_processed_local (
-          id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-          class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL DO UPDATE SET
-          scope = excluded.scope,
-          enterprise_id = excluded.enterprise_id,
-          workspace_id = excluded.workspace_id,
-          user_id = excluded.user_id,
-          project_id = excluded.project_id,
-          source_event_ids_json = excluded.source_event_ids_json,
-          summary = excluded.summary,
-          content_json = excluded.content_json,
-          content_hash = excluded.content_hash,
-          origin = excluded.origin,
-          updated_at = excluded.updated_at
-        RETURNING id, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at
-      `).get(
-        projectionId,
-        namespaceKey,
-        ...namespaceColumns,
-        input.class,
-        JSON.stringify(mergedIds),
-        summaryForDb,
-        contentJsonForDb,
-        contentHashForDb,
-        originForDb,
-        createdAt,
-        updatedAt,
-        fingerprint,
-      ) as { id: string; source_event_ids_json: string; summary: string; content_json: string; content_hash: string | null; origin: string | null; created_at: number; updated_at: number };
-      const returnedIds = parseJson<string[]>(row.source_event_ids_json, mergedIds);
-      const returnedOrigin = isMemoryOrigin(row.origin) ? row.origin : originForDb;
-      syncProjectionSourcesForDb(database, row.id, returnedIds);
-      upsertProjectionObservationForDb(database, {
-        namespace: canonicalNamespace,
-        projectionId: row.id,
-        projectionClass: input.class,
-        sourceEventIds: returnedIds,
-        summary: row.summary,
-        content: parseJson<Record<string, unknown>>(row.content_json, contentForDb),
-        createdAt: Number(row.created_at),
-        updatedAt: Number(row.updated_at),
-        fingerprint,
-        origin: returnedOrigin,
-      });
+      const projection = writeProcessedProjectionForDb(database, input);
       database.exec('COMMIT');
-      return {
-        id: row.id,
-        namespace: canonicalNamespace,
-        class: input.class,
-        origin: returnedOrigin,
-        sourceEventIds: returnedIds,
-        summary: row.summary,
-        content: parseJson<Record<string, unknown>>(row.content_json, contentForDb),
-        contentHash: typeof row.content_hash === 'string' && row.content_hash ? row.content_hash : contentHashForDb,
-        createdAt: Number(row.created_at),
-        updatedAt: Number(row.updated_at),
-      };
+      return projection;
     } catch (error) {
       try { database.exec('ROLLBACK'); } catch { /* ignore */ }
       if (!isSqliteBusy(error)) throw error;
@@ -2651,6 +2857,76 @@ export function writeProcessedProjection(input: Omit<ProcessedContextProjection,
   }
   incrementCounter('mem.write.retry_exhausted', { source: 'writeProcessedProjection' });
   warnOncePerHour('writeProcessedProjection.sqlite_busy', { error: lastBusyError instanceof Error ? lastBusyError.message : String(lastBusyError) });
+  throw lastBusyError instanceof Error ? lastBusyError : new Error(String(lastBusyError));
+}
+
+export type WriteProcessedProjectionInput = Omit<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'> & Partial<Pick<ProcessedContextProjection, 'id' | 'createdAt' | 'updatedAt'>>;
+
+export interface MaterializationCommitInput {
+  archiveEvents: LocalContextEvent[];
+  archivedAt: number;
+  summaryProjection: WriteProcessedProjectionInput;
+  durableProjection?: WriteProcessedProjectionInput;
+  /** The freshly-written summary (and durable) projection ids are APPENDED to
+   *  `priorPendingProjectionIds` inside the transaction (their ids are generated
+   *  during the write, so the caller cannot know them up front). */
+  replication: {
+    namespace: ContextNamespace;
+    priorPendingProjectionIds: string[];
+    lastReplicatedAt?: number;
+    lastError?: string;
+  };
+  deleteStagedEventIds: string[];
+  completeJobId: string;
+  completedAt: number;
+  clearDirty: ContextTargetRef;
+}
+
+export interface MaterializationCommitResult {
+  summaryProjection: ProcessedContextProjection;
+  durableProjection?: ProcessedContextProjection;
+}
+
+/** Run the post-SDK materialization commit bundle as ONE atomic transaction:
+ *  archive events + write summary projection (+ optional durable) + set
+ *  replication state + delete staged events + complete job + clear dirty. A
+ *  crash mid-bundle leaves NO half-committed state (no duplicate projection,
+ *  no lost/orphaned staged events). `compressWithSdk` runs BEFORE this, outside
+ *  any transaction. */
+export function commitMaterialization(input: MaterializationCommitInput): MaterializationCommitResult {
+  const database = ensureDb();
+  let lastBusyError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      database.exec('BEGIN IMMEDIATE');
+      archiveEventsForMaterializationForDb(database, input.archiveEvents, input.archivedAt);
+      const summary = writeProcessedProjectionForDb(database, input.summaryProjection);
+      const durable = input.durableProjection ? writeProcessedProjectionForDb(database, input.durableProjection) : undefined;
+      const pendingProjectionIds = Array.from(new Set([
+        ...input.replication.priorPendingProjectionIds,
+        summary.id,
+        ...(durable ? [durable.id] : []),
+      ]));
+      setReplicationStateForDb(database, input.replication.namespace, {
+        pendingProjectionIds,
+        lastReplicatedAt: input.replication.lastReplicatedAt,
+        lastError: input.replication.lastError,
+      });
+      deleteStagedEventsByIdsForDb(database, input.deleteStagedEventIds);
+      updateContextJobForDb(database, input.completeJobId, 'completed', { now: input.completedAt });
+      clearDirtyTargetForDb(database, input.clearDirty);
+      database.exec('COMMIT');
+      return { summaryProjection: summary, durableProjection: durable };
+    } catch (error) {
+      try { database.exec('ROLLBACK'); } catch { /* ignore */ }
+      if (!isSqliteBusy(error)) throw error;
+      lastBusyError = error;
+      if (attempt === 2) break;
+      sleepSync(25 * (attempt + 1));
+    }
+  }
+  incrementCounter('mem.write.retry_exhausted', { source: 'commitMaterialization' });
+  warnOncePerHour('commitMaterialization.sqlite_busy', { error: lastBusyError instanceof Error ? lastBusyError.message : String(lastBusyError) });
   throw lastBusyError instanceof Error ? lastBusyError : new Error(String(lastBusyError));
 }
 
@@ -2708,6 +2984,33 @@ export function listContextObservations(filters: {
     .filter((row) => !filters.class || row.class === filters.class)
     .filter((row) => !filters.state || (states ? states.has(row.state) : row.state === state))
     .filter((row) => !filters.projectionId || row.projectionId === filters.projectionId);
+}
+
+export function listStartupContextObservations(namespaceIds: readonly string[], limit: number): ContextObservationRow[] {
+  const ids = [...new Set(namespaceIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  const safeLimit = Math.max(0, Math.min(100, Math.floor(limit)));
+  if (ids.length === 0 || safeLimit === 0) return [];
+  const database = ensureDb();
+  const rows: ContextObservationRow[] = [];
+  const chunkSize = 500;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(',');
+    const chunkRows = database.prepare(`
+      SELECT *
+        FROM context_observations
+       WHERE namespace_id IN (${placeholders})
+         AND state IN ('active', 'promoted')
+         AND projection_id IS NULL
+         AND class <> 'skill_candidate'
+       ORDER BY updated_at DESC, id ASC
+       LIMIT ?
+    `).all(...chunk, safeLimit) as Array<Record<string, unknown>>;
+    rows.push(...chunkRows.map(observationRowFromDb));
+  }
+  return rows
+    .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))
+    .slice(0, safeLimit);
 }
 
 export function getContextObservationById(id: string): ContextObservationRow | null {
@@ -3198,6 +3501,45 @@ export function getProjectionEmbeddings(projectionIds: string[]): Map<string, Pr
   return out;
 }
 
+/** A projection row that still needs an embedding computed, with just the
+ *  fields the backfill needs to derive the embed-source text. */
+export interface ProjectionMissingEmbeddingRow {
+  id: string;
+  namespace: ContextNamespace;
+  summary: string;
+  content: Record<string, unknown>;
+}
+
+/** List projections that have no persisted embedding yet, newest first.
+ *  Drives the one-time startup backfill so the recall hot path can rely on
+ *  pre-computed candidate vectors instead of recomputing during recall. */
+export function listProjectionsMissingEmbedding(limit: number): ProjectionMissingEmbeddingRow[] {
+  const database = ensureDb();
+  const rows = database.prepare(
+    `SELECT id, namespace_key, summary, content_json
+       FROM context_processed_local
+      WHERE embedding IS NULL
+      ORDER BY updated_at DESC
+      LIMIT ?`,
+  ).all(limit) as Array<{ id: string; namespace_key: string; summary: string; content_json: string | null }>;
+  return rows.map((row) => ({
+    id: row.id,
+    namespace: parseNamespaceKey(String(row.namespace_key)),
+    summary: row.summary,
+    content: parseJson<Record<string, unknown>>(row.content_json, {}),
+  }));
+}
+
+/** Count projections with no persisted embedding. Cheap aggregate (no row
+ *  materialization) — used by the backfill to report accurate `remaining`. */
+export function countProjectionsMissingEmbedding(): number {
+  const database = ensureDb();
+  const row = database.prepare(
+    'SELECT COUNT(*) AS n FROM context_processed_local WHERE embedding IS NULL',
+  ).get() as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 export function listProcessedProjections(namespace: ContextNamespace, projectionClass?: ProcessedContextClass): ProcessedContextProjection[] {
   const database = ensureDb();
   const namespaceKey = serializeContextNamespace(namespace);
@@ -3219,6 +3561,140 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
     lastUsedAt: typeof row.last_used_at === 'number' ? row.last_used_at : undefined,
     status: typeof row.status === 'string' ? row.status as ProcessedContextProjectionStatus : 'active',
   })).filter((projection) => !isMemoryNoiseSummary(projection.summary));
+}
+
+export function hasProcessedProjectionsInNamespace(namespace: ContextNamespace): boolean {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  const rows = database.prepare(`
+    SELECT summary
+      FROM context_processed_local
+     WHERE namespace_key = ?
+     ORDER BY updated_at DESC
+  `).all(namespaceKey) as Array<{ summary?: string }>;
+  return rows.some((row) => !isMemoryNoiseSummary(row.summary));
+}
+
+export function listProcessedProjectionsByIds(namespace: ContextNamespace, projectionIds: readonly string[]): ProcessedContextProjection[] {
+  if (projectionIds.length === 0) return [];
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  const orderedIds = [...new Set(projectionIds.filter((id) => typeof id === 'string' && id.length > 0))];
+  const byId = new Map<string, ProcessedContextProjection>();
+  const chunkSize = 500;
+  for (let i = 0; i < orderedIds.length; i += chunkSize) {
+    const chunk = orderedIds.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = database.prepare(
+      `SELECT * FROM context_processed_local WHERE namespace_key = ? AND id IN (${placeholders})`,
+    ).all(namespaceKey, ...chunk) as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const projection = processedProjectionFromRow(row, namespace);
+      if (!isMemoryNoiseSummary(projection.summary)) byId.set(projection.id, projection);
+    }
+  }
+  return orderedIds.flatMap((id) => {
+    const projection = byId.get(id);
+    return projection ? [projection] : [];
+  });
+}
+
+export function getLatestRecentSummaryUpdatedAtForTarget(target: ContextTargetRef): number | undefined {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(target.namespace);
+  let rows: Array<Record<string, unknown>>;
+  if (target.kind === 'project') {
+    rows = database.prepare(`
+        SELECT updated_at, summary
+          FROM context_processed_local
+         WHERE namespace_key = ?
+           AND class = 'recent_summary'
+           AND status NOT IN ('archived', 'archived_dedup')
+           AND json_extract(content_json, '$.targetKind') = 'project'
+         ORDER BY updated_at DESC
+      `).all(namespaceKey) as Array<Record<string, unknown>>;
+  } else {
+    const sessionName = target.sessionName;
+    if (!sessionName) return undefined;
+    rows = database.prepare(`
+        SELECT updated_at, summary
+          FROM context_processed_local
+         WHERE namespace_key = ?
+           AND class = 'recent_summary'
+           AND status NOT IN ('archived', 'archived_dedup')
+           AND json_extract(content_json, '$.targetKind') = 'session'
+           AND json_extract(content_json, '$.sessionName') = ?
+         ORDER BY updated_at DESC
+      `).all(namespaceKey, sessionName) as Array<Record<string, unknown>>;
+  }
+  for (const row of rows as Array<{ updated_at: unknown; summary: unknown }>) {
+    if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
+    const updatedAt = Number(row.updated_at);
+    if (Number.isFinite(updatedAt)) return updatedAt;
+  }
+  return undefined;
+}
+
+export interface LatestRecentSummarySession {
+  sessionName: string;
+  namespace: ContextNamespace;
+  updatedAt: number;
+}
+
+export function listLatestRecentSummarySessions(limit = 1000): LatestRecentSummarySession[] {
+  const safeLimit = Math.max(0, Math.min(5000, Math.floor(limit)));
+  if (safeLimit === 0) return [];
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT namespace_key,
+           summary,
+           json_extract(content_json, '$.sessionName') AS session_name,
+           updated_at
+      FROM context_processed_local
+     WHERE class = 'recent_summary'
+       AND status NOT IN ('archived', 'archived_dedup')
+       AND json_extract(content_json, '$.sessionName') IS NOT NULL
+     ORDER BY updated_at DESC
+  `).all() as Array<Record<string, unknown>>;
+  const result: LatestRecentSummarySession[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
+    const sessionName = typeof row.session_name === 'string' ? row.session_name : undefined;
+    const updatedAt = Number(row.updated_at);
+    if (!sessionName || !Number.isFinite(updatedAt)) continue;
+    const namespaceKey = String(row.namespace_key);
+    const key = `${namespaceKey}\0${sessionName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      sessionName,
+      namespace: parseNamespaceKey(namespaceKey),
+      updatedAt,
+    });
+    if (result.length >= safeLimit) break;
+  }
+  return result;
+}
+
+export function getLatestMasterSummaryUpdatedAt(sessionName: string, namespace: ContextNamespace): number | undefined {
+  const database = ensureDb();
+  const namespaceKey = serializeContextNamespace(namespace);
+  const rows = database.prepare(`
+    SELECT updated_at, summary
+      FROM context_processed_local
+     WHERE namespace_key = ?
+       AND class = 'master_summary'
+       AND status NOT IN ('archived', 'archived_dedup')
+       AND json_extract(content_json, '$.sessionName') = ?
+     ORDER BY updated_at DESC
+  `).all(namespaceKey, sessionName) as Array<{ updated_at?: number; summary?: string }>;
+  for (const row of rows) {
+    if (isMemoryNoiseSummary(row.summary)) continue;
+    const updatedAt = Number(row.updated_at);
+    if (Number.isFinite(updatedAt)) return updatedAt;
+  }
+  return undefined;
 }
 
 /** Returns a map of namespace_key → projection IDs for all local projections. */
@@ -3570,8 +4046,13 @@ export function getLocalProcessedFreshness(namespace: ContextNamespace, now = Da
   return baseFreshness;
 }
 
-export function setReplicationState(namespace: ContextNamespace, state: Omit<ContextReplicationState, 'namespace'>): ContextReplicationState {
-  const database = ensureDb();
+/**
+ * Transaction-free body of {@link setReplicationState}: upserts replication
+ * state directly on `database` with NO ensureDb. This function does not itself
+ * open a transaction (the public wrapper did not either). Returns the same
+ * constructed {@link ContextReplicationState} value as the public function.
+ */
+export function setReplicationStateForDb(database: DatabaseSyncInstance, namespace: ContextNamespace, state: Omit<ContextReplicationState, 'namespace'>): ContextReplicationState {
   const namespaceKey = serializeContextNamespace(namespace);
   const value: ContextReplicationState = {
     namespace,
@@ -3588,6 +4069,11 @@ export function setReplicationState(namespace: ContextNamespace, state: Omit<Con
       last_error = excluded.last_error
   `).run(namespaceKey, JSON.stringify(value.pendingProjectionIds), value.lastReplicatedAt ?? null, value.lastError ?? null);
   return value;
+}
+
+export function setReplicationState(namespace: ContextNamespace, state: Omit<ContextReplicationState, 'namespace'>): ContextReplicationState {
+  const database = ensureDb();
+  return setReplicationStateForDb(database, namespace, state);
 }
 
 export function getReplicationState(namespace: ContextNamespace): ContextReplicationState | undefined {
@@ -3616,9 +4102,18 @@ export function listReplicationStates(): ContextReplicationState[] {
   });
 }
 
+/**
+ * Transaction-free body of {@link clearDirtyTarget}: clears a dirty-target row
+ * directly on `database` with NO ensureDb. This function does not itself open a
+ * transaction (the public wrapper did not either).
+ */
+export function clearDirtyTargetForDb(database: DatabaseSyncInstance, target: ContextTargetRef): void {
+  database.prepare('DELETE FROM context_dirty_targets WHERE target_key = ?').run(serializeContextTarget(target));
+}
+
 export function clearDirtyTarget(target: ContextTargetRef): void {
   const database = ensureDb();
-  database.prepare('DELETE FROM context_dirty_targets WHERE target_key = ?').run(serializeContextTarget(target));
+  clearDirtyTargetForDb(database, target);
 }
 
 function mapJobRecord(row: Record<string, unknown>, namespace: ContextNamespace): ContextJobRecord {
@@ -3632,17 +4127,6 @@ function mapJobRecord(row: Record<string, unknown>, namespace: ContextNamespace)
     updatedAt: Number(row.updated_at),
     attemptCount: Number(row.attempt_count),
     error: typeof row.error === 'string' ? row.error : undefined,
-  };
-}
-
-export function parseNamespaceKey(namespaceKey: string): ContextNamespace {
-  const [scope, enterpriseId, workspaceId, userId, projectId] = namespaceKey.split('::');
-  return {
-    scope: scope as ContextNamespace['scope'],
-    enterpriseId: enterpriseId || undefined,
-    workspaceId: workspaceId || undefined,
-    userId: userId || undefined,
-    projectId,
   };
 }
 

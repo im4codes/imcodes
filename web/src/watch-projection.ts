@@ -3,6 +3,11 @@ import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { isRunningTimelineEvent } from './timeline-running.js';
+import {
+  isAuthoritativeCleanIdlePayload,
+  normalizeActivityGeneration,
+  type ActivityGenerationLike,
+} from '../../shared/session-activity-types.js';
 
 export type WatchSnapshotStatus = 'fresh' | 'stale' | 'switching';
 export type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
@@ -40,6 +45,7 @@ export interface WatchApplicationContext {
 export type WatchDurableEvent =
   | { type: 'session.idle'; session: string; serverId?: string | null; title?: string; message?: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; serverId?: string | null; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
+  | { type: 'ask.question'; session: string; serverId?: string | null; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.error'; project: string; message: string };
 
 export interface WatchProjectionStoreDeps {
@@ -134,6 +140,15 @@ function normalizeState(state: string): WatchSessionState {
   return 'stopped';
 }
 
+function readToolActivityKey(payload: Record<string, unknown> | null | undefined): string | null {
+  if (!payload) return null;
+  for (const key of ['toolCallId', 'toolUseId', 'callId', 'id']) {
+    const value = payload[key];
+    if (typeof value === 'string' && value.trim()) return `${key}:${value.trim()}`;
+  }
+  return null;
+}
+
 function badgeForType(agentType?: string | null): string {
   if (!agentType) return '??';
   const badge = BADGE_MAP[agentType];
@@ -218,6 +233,9 @@ export class WatchProjectionStore {
   private sessionsByName = new Map<string, WatchSessionRow>();
   private parentSessionByName = new Map<string, string | null>();
   private assistantTextBySession = new Map<string, string>();
+  private openToolCountBySession = new Map<string, number>();
+  private openToolKeysBySession = new Map<string, Set<string>>();
+  private activityGenerationBySession = new Map<string, string>();
   private previewBySession = new Map<string, { previewText: string; previewUpdatedAt: number }>();
   private apiKeyOverride: string | null | undefined = undefined;
 
@@ -274,6 +292,9 @@ export class WatchProjectionStore {
       this.sessionsByName.clear();
       this.parentSessionByName.clear();
       this.assistantTextBySession.clear();
+      this.openToolCountBySession.clear();
+      this.openToolKeysBySession.clear();
+      this.activityGenerationBySession.clear();
       this.previewBySession.clear();
       this.generatedAt = 0;
       this.maybePush(true);
@@ -356,6 +377,9 @@ export class WatchProjectionStore {
     if (!removed) return false;
     this.parentSessionByName.delete(sessionName);
     this.assistantTextBySession.delete(sessionName);
+    this.openToolCountBySession.delete(sessionName);
+    this.openToolKeysBySession.delete(sessionName);
+    this.activityGenerationBySession.delete(sessionName);
     this.previewBySession.delete(sessionName);
     this.maybePush();
     return true;
@@ -382,6 +406,15 @@ export class WatchProjectionStore {
   onSessionIdle(sessionName: string, timestamp = this.now()): boolean {
     const row = this.sessionsByName.get(sessionName);
     if (!row) return false;
+    this.openToolCountBySession.delete(sessionName);
+    if ((this.openToolKeysBySession.get(sessionName)?.size ?? 0) > 0) {
+      if (row.state !== 'working') {
+        this.sessionsByName.set(sessionName, { ...row, state: 'working' });
+        this.maybePush();
+        return true;
+      }
+      return false;
+    }
 
     const cachedText = this.assistantTextBySession.get(sessionName);
     const derivedPreview = cachedText ? extractPreviewText(cachedText) : null;
@@ -401,6 +434,40 @@ export class WatchProjectionStore {
 
   handleTimelineEvent(event: TimelineEvent): boolean {
     let changed = false;
+    if (event.type === 'tool.call') {
+      const key = readToolActivityKey(event.payload);
+      if (key) {
+        const keys = this.openToolKeysBySession.get(event.sessionId) ?? new Set<string>();
+        keys.add(key);
+        this.openToolKeysBySession.set(event.sessionId, keys);
+      } else {
+        this.openToolCountBySession.set(event.sessionId, (this.openToolCountBySession.get(event.sessionId) ?? 0) + 1);
+      }
+    } else if (event.type === 'tool.result') {
+      const key = readToolActivityKey(event.payload);
+      if (key) {
+        const keys = this.openToolKeysBySession.get(event.sessionId);
+        if (keys?.delete(key) && keys.size === 0) this.openToolKeysBySession.delete(event.sessionId);
+      } else {
+        const next = Math.max(0, (this.openToolCountBySession.get(event.sessionId) ?? 0) - 1);
+        if (next === 0) this.openToolCountBySession.delete(event.sessionId);
+        else this.openToolCountBySession.set(event.sessionId, next);
+      }
+    } else if (event.type === 'session.state') {
+      const eventGeneration = normalizeActivityGeneration(event.payload?.activityGeneration as ActivityGenerationLike);
+      const state = String(event.payload?.state ?? '');
+      if (state !== 'idle' && eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
+      if (state === 'idle') {
+        const expectedGeneration = this.activityGenerationBySession.get(event.sessionId);
+        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)) {
+          this.openToolCountBySession.delete(event.sessionId);
+          this.openToolKeysBySession.delete(event.sessionId);
+          if (eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
+        } else {
+          this.openToolCountBySession.delete(event.sessionId);
+        }
+      }
+    }
     if (isRunningTimelineEvent(event)) {
       changed = this.updateSessionState(event.sessionId, 'working') || changed;
     }

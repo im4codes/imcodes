@@ -222,6 +222,35 @@ export class CursorHeadlessProvider implements TransportProvider {
     logger.info({ provider: this.id, resolved: resolved.executable }, 'Cursor headless provider connected');
   }
 
+  getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
+    const resolved = this.findSessionByAnyId(sessionId);
+    if (!resolved) return null;
+    const [routeId, state] = resolved;
+    const childActive = Boolean(state.child && !state.child.killed);
+    const pendingFinal = typeof state.pendingFinalText === 'string';
+    const activeReason = childActive
+      ? 'child'
+      : pendingFinal
+        ? 'pending-final'
+        : null;
+    return {
+      provider: this.id,
+      routeId,
+      active: activeReason !== null,
+      activeReason,
+      resumeId: state.resumeId,
+      childActive,
+      currentMessageId: state.currentMessageId,
+      currentTextLength: state.currentText.length,
+      pendingFinalTextLength: state.pendingFinalText?.length ?? 0,
+      pendingFinalMetadata: Boolean(state.pendingFinalMetadata),
+      cancelled: state.cancelled,
+      completed: state.completed,
+      emittedToolSignatureCount: state.emittedToolSignatures.size,
+      sessionSystemTextInjected: Boolean(state.sessionSystemTextInjected),
+    };
+  }
+
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
     if (this.mcpRegistration?.degraded) {
       return {
@@ -428,12 +457,23 @@ export class CursorHeadlessProvider implements TransportProvider {
     let stderrBuf = '';
 
     const sessionKey = this.findSessionIdForState(state) ?? sessionId;
+    let statusCleared = false;
+    const clearStatus = (): void => {
+      if (statusCleared) return;
+      statusCleared = true;
+      this.emitStatus(sessionKey, null, null);
+    };
+    // cursor-agent spends several seconds connecting to its backend before any
+    // output. Show "Connecting…" immediately so the turn doesn't read as hung.
+    this.emitStatus(sessionKey, 'connecting', 'Connecting…');
     const emitError = (error: ProviderError): void => {
       if (sawError || completed) return;
       sawError = true;
+      clearStatus();
       for (const cb of this.errorCallbacks) cb(sessionKey, error);
     };
     const emitDelta = (text: string): void => {
+      clearStatus();
       const messageId = state.currentMessageId ??= randomUUID();
       state.currentText = text;
       const delta: MessageDelta = {
@@ -475,10 +515,22 @@ export class CursorHeadlessProvider implements TransportProvider {
           resumeId: state.resumeId,
           ...(state.model ? { model: state.model } : {}),
         });
+        // Connected — model is now working. Switch the label until tokens stream.
+        this.emitStatus(sessionKey, 'thinking', 'Thinking…');
         return;
       }
 
       if (event.kind === 'assistant.delta') {
+        // Adopt a new message id and reset the accumulator BEFORE accumulating,
+        // so a new message's deltas start clean and emit under the right id.
+        // Otherwise the first delta of message 2 fails the startsWith guard
+        // (it doesn't start with message 1's text), gets concatenated onto the
+        // previous message's full text, and is emitted under the stale id —
+        // visible cross-message bleed until the message completes.
+        if (event.messageId && event.messageId !== state.currentMessageId) {
+          state.currentMessageId = event.messageId;
+          state.currentText = '';
+        }
         const chunk = event.text;
         if (chunk) {
           const nextText = chunk.startsWith(state.currentText)
@@ -487,9 +539,6 @@ export class CursorHeadlessProvider implements TransportProvider {
           if (nextText !== state.currentText) {
             emitDelta(nextText);
           }
-        }
-        if (event.messageId) {
-          state.currentMessageId = event.messageId;
         }
         return;
       }
@@ -541,6 +590,7 @@ export class CursorHeadlessProvider implements TransportProvider {
         completed = true;
         state.completed = true;
         state.child = null;
+        clearStatus();
         if (includeSessionSystemText) state.sessionSystemTextInjected = sessionSystemText;
         state.currentMessageId ??= randomUUID();
         const message: AgentMessage = {
@@ -577,6 +627,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     child.once('close', (code, signal) => {
       rl.close();
       state.child = null;
+      clearStatus();
       if (completed || sawError) return;
       if (state.cancelled) {
         emitError(this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor turn cancelled', true, { code, signal }));
@@ -792,6 +843,18 @@ export class CursorHeadlessProvider implements TransportProvider {
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  /**
+   * Surface a transient execution status (footer "working" label). cursor-agent
+   * spawns a fresh process per turn and spends ~8-15s connecting/authenticating
+   * to its backend BEFORE emitting any output — dead silence that reads as a
+   * hang. We emit "Connecting…" the moment we spawn, switch to "Thinking…" once
+   * the session initializes, and clear it (status:null) as soon as the first
+   * assistant token streams. `status: null` clears any active label.
+   */
+  private emitStatus(sessionId: string, status: string | null, label: string | null): void {
+    for (const cb of this.statusCallbacks) cb(sessionId, { status, ...(label !== undefined ? { label } : {}) });
   }
 
   private async runExecFile(

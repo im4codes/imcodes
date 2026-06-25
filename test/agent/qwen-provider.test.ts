@@ -123,6 +123,7 @@ async function waitForSpawnCount(count: number): Promise<void> {
 
 describe('QwenProvider', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     childProcessMock.execFile.mockClear();
     childProcessMock.spawn.mockClear();
     childProcessMock.spawned.length = 0;
@@ -1023,7 +1024,7 @@ describe('QwenProvider', () => {
     expect(runtime.pendingCount).toBe(0);
   });
 
-  it('does not drain queued messages until the qwen process closes', async () => {
+  it('drains queued messages from a terminal qwen result even when the process close is missing', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
     const runtime = new TransportSessionRuntime(provider, 'sess-queue-close-gate');
@@ -1035,22 +1036,24 @@ describe('QwenProvider', () => {
     runtime.send('first');
     await waitForSpawnCount(1);
     const first = lastSpawn();
+    vi.useFakeTimers();
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-close-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'done' })}\n`);
-    await flushIO();
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(runtime.send('second')).toBe('queued');
     expect(runtime.pendingCount).toBe(1);
-    await flushIO();
-
-    // Result arrived, but the underlying CLI process is still alive.
-    // The important invariant is that this does not surface an "already busy"
-    // provider error while waiting for the underlying close.
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingCount).toBe(1);
     expect(errors).toEqual([]);
 
-    first.child.emit('close', 0, null);
-    await waitForSpawnCount(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
 
+    expect(first.child.kill).toHaveBeenCalledWith('SIGTERM');
+    vi.useRealTimers();
+    await waitForSpawnCount(2);
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
     expect(runtime.pendingCount).toBe(0);
     expect(errors).toEqual([]);
@@ -1289,6 +1292,33 @@ describe('QwenProvider', () => {
     expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
   });
 
+  it('suppresses buffered qwen output after cancel so stop cannot leak assistant text', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-cancel-buffered', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    const completions: string[] = [];
+    const errors: Array<{ code: string; message: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, message) => completions.push(message.content));
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+
+    await provider.send('sess-cancel-buffered', 'cancel me');
+    const run = lastSpawn();
+    await provider.cancel?.('sess-cancel-buffered');
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-after-cancel' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'should not leak' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'should not complete' })}\n`);
+    await flushIO();
+    await flushIO();
+
+    expect(run.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(deltas).toEqual([]);
+    expect(completions).toEqual([]);
+    expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
+  });
+
   it('emits tool.call and tool.result events for qwen tool blocks', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
@@ -1301,9 +1331,29 @@ describe('QwenProvider', () => {
     const run = lastSpawn();
     run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-1', name: 'list_directory' } } })}\n`);
     run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{\"path\":\"/tmp/project\"}' } } })}\n`);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+    });
     run.child.stdout.write(`${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false }] } })}\n`);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
     run.child.emit('close', 0, null);
     await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
 
     expect(tools).toEqual([
       {
@@ -1355,5 +1405,48 @@ describe('QwenProvider', () => {
       { status: 'thinking', label: 'Thinking...' },
       { status: null, label: null },
     ]);
+  });
+
+  describe('cross-message streaming accumulator', () => {
+    it('resets the streaming accumulator at each message_start so a second message is not prefixed with the first', async () => {
+      // REGRESSION LOCK: Qwen streams cumulative text in state.currentText and
+      // emits it as a MessageDelta { messageId, delta } that the relay renders by
+      // replacing the bubble for that messageId. When a NEW assistant message
+      // (new message.id) begins mid-turn, state.currentText MUST reset to '' on
+      // the message_start event — otherwise message 2's deltas render prefixed
+      // with message 1's full text (visible cross-message bleed).
+      const provider = new QwenProvider();
+      await provider.connect({});
+      await provider.createSession({ sessionKey: 'sess-bleed', cwd: '/tmp/project' });
+
+      const deltas: Array<{ id: string; text: string }> = [];
+      provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+      await provider.send('sess-bleed', 'hello');
+      const run = lastSpawn();
+
+      // ── Message 1 ──
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check.' } } })}\n`);
+      // ── A new assistant message begins mid-turn (e.g. after a tool round) ──
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm2' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'The answer' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' is 42.' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'The answer is 42.' })}\n`);
+      run.child.emit('close', 0, null);
+      await flushIO();
+
+      // Message 1 accumulated only its own text.
+      const m1Deltas = deltas.filter((d) => d.id === 'm1').map((d) => d.text);
+      expect(m1Deltas).toEqual(['Let me check.']);
+
+      // Message 2's deltas must be its OWN cumulative text only — never prefixed
+      // with message 1's text. This is the lock.
+      const m2Deltas = deltas.filter((d) => d.id === 'm2').map((d) => d.text);
+      expect(m2Deltas).toEqual(['The answer', 'The answer is 42.']);
+
+      // Guard: no emitted delta may ever concatenate the two messages.
+      expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+    });
   });
 });

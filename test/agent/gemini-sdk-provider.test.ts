@@ -115,3 +115,37 @@ describe('GeminiSdkProvider runtime subagent status', () => {
     });
   });
 });
+
+describe('GeminiSdkProvider cross-message streaming accumulator', () => {
+  it('resets the streaming accumulator at each new messageId so a second message is not prefixed with the first', () => {
+    // A turn with a tool round produces TWO assistant messages with different
+    // ACP messageIds. The second message's deltas must start fresh — not carry
+    // the first message's full text as a prefix (the cross-message bleed bug).
+    const provider = new GeminiSdkProvider();
+    attachRoute(provider, 'gemini-route-bleed');
+
+    const deltas: Array<{ id: string; text: string }> = [];
+    provider.onDelta((_sessionId, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+    const chunk = (messageId: string, text: string) =>
+      (provider as any).handleSessionUpdate({
+        sessionId: 'acp-gemini-session',
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          messageId,
+          content: { type: 'text', text },
+        },
+      });
+
+    chunk('m1', 'Let me check.');
+    // ── tool round happens here; the model continues in a NEW message ──
+    chunk('m2', 'The answer');
+    chunk('m2', ' is 42.');
+
+    const m1Deltas = deltas.filter((d) => d.id === 'm1').map((d) => d.text);
+    expect(m1Deltas).toEqual(['Let me check.']);
+    const m2Deltas = deltas.filter((d) => d.id === 'm2').map((d) => d.text);
+    expect(m2Deltas).toEqual(['The answer', 'The answer is 42.']);
+    expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+  });
+});

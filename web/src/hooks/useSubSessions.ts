@@ -13,19 +13,20 @@ import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
+  buildTransportPendingSyncPatch,
   extractTransportPendingMessages,
   extractTransportPendingVersion,
+  hasExplicitTransportPendingSnapshot,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
-  mergeTransportPendingMessagesForIdleState,
-  mergeTransportPendingMessagesForRunningState,
   nextTransportQueueVersion,
   normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
-  shouldApplyTransportQueueSnapshot,
+  shouldApplyTransportQueueSnapshotForPayload,
 } from '../transport-queue.js';
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -35,6 +36,19 @@ export interface SubSession extends SubSessionData {
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
   /** Newest pending-queue version applied. Drops stale snapshots. */
   transportPendingMessageVersion?: number | null;
+}
+
+/**
+ * True when a sub-session record is an ephemeral execution clone — identified by
+ * its projected `executionCloneKind` discriminant (the canonical
+ * {@link EXECUTION_CLONE_KIND} value) or, defensively, by carrying a
+ * `parentRunId`. Execution clones must never render as flat top-level peers;
+ * they are grouped under their parent run. See {@link SessionTree}.
+ */
+export function isExecutionCloneSubSession(
+  sub: Pick<SubSessionData, 'executionCloneKind' | 'parentRunId'>,
+): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
 }
 
 function isCodexFamily(agentType: string | null | undefined): boolean {
@@ -77,6 +91,7 @@ export function useSubSessions(
   ws: WsClient | null,
   connected: boolean,
   activeSession?: string | null,
+  disableHttpLoad = false,
 ) {
   const [subSessions, setSubSessions] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
@@ -110,6 +125,13 @@ export function useSubSessions(
   const loadedGenRef = useRef(0);
   useEffect(() => {
     if (!serverId) { setSubSessions([]); setLoadedServerId(null); return; }
+    if (disableHttpLoad) {
+      const gen = ++loadGenRef.current;
+      loadedGenRef.current = gen;
+      setLoadedServerId(serverId);
+      rebuiltRef.current = false;
+      return;
+    }
     if (!connected) {
       rebuiltRef.current = false;
       return;
@@ -144,10 +166,43 @@ export function useSubSessions(
     load();
 
     return () => { if (timer) clearTimeout(timer); };
-  }, [serverId, connected, reconnectTick]);
+  }, [serverId, connected, reconnectTick, disableHttpLoad]);
+
+  const hydrateShared = useCallback((serverIdForShare: string, list: Array<{
+    subSessionId: string;
+    title: string;
+    type: string;
+    parentSessionName: string | null;
+  }>) => {
+    const now = Date.now();
+    setSubSessions((prev) => {
+      const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
+      return list.map((item) => mergeLoadedSubSession({
+        id: item.subSessionId,
+        serverId: serverIdForShare,
+        type: item.type,
+        runtimeType: getSessionRuntimeType(item.type),
+        providerId: getSessionRuntimeType(item.type) === 'transport' ? item.type : null,
+        providerSessionId: null,
+        shellBin: null,
+        cwd: null,
+        label: item.title,
+        closedAt: null,
+        createdAt: now,
+        updatedAt: now,
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: item.parentSessionName,
+        description: null,
+        ccPresetId: null,
+      }, previousById.get(item.subSessionId)));
+    });
+    setLoadedServerId(serverIdForShare);
+  }, []);
 
   // Rebuild all when daemon connects (once per connection)
   useEffect(() => {
+    if (disableHttpLoad) return;
     if (!connected || !ws || subSessions.length === 0 || rebuiltRef.current) return;
     if (loadedServerId !== serverId) return;
     if (loadedGenRef.current !== loadGenRef.current) return;
@@ -170,7 +225,7 @@ export function useSubSessions(
       effort: s.effort,
       transportConfig: s.transportConfig,
     })));
-  }, [connected, ws, subSessions]);
+  }, [connected, ws, subSessions, disableHttpLoad, loadedServerId, serverId]);
 
   // Reset rebuild flag when disconnected
   useEffect(() => {
@@ -195,10 +250,16 @@ export function useSubSessions(
               const updated = [...prev];
               const existing = updated[existingIdx];
               const preserveQuota = isCodexFamily(existing.type);
+              const transportPendingPatch = buildTransportPendingSyncPatch(
+                existing,
+                m,
+                existing.sessionName,
+              );
               updated[existingIdx] = { ...updated[existingIdx],
                 ...(m.state != null && { state: m.state as SubSession['state'] }),
                 ...(m.cwd != null && { cwd: m.cwd }),
                 ...(m.label != null && { label: m.label }),
+                ...(m.ccPresetId !== undefined && { ccPresetId: m.ccPresetId }),
                 ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
                 ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
                 ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
@@ -209,24 +270,15 @@ export function useSubSessions(
                 ...(m.effort != null && { effort: m.effort }),
                 ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
                 ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
+                ...(m.executionCloneKind !== undefined && { executionCloneKind: m.executionCloneKind }),
+                ...(m.parentRunId !== undefined && { parentRunId: m.parentRunId }),
                 ...(m.transportConfig !== undefined && {
                   transportConfig: mergeTransportConfigPreservingSupervision(
                     m.transportConfig,
                     updated[existingIdx].transportConfig,
                   ),
                 }),
-                ...(m.transportPendingMessages !== undefined && { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) }),
-                ...((m.transportPendingMessages !== undefined || m.transportPendingMessageEntries !== undefined) && {
-                  transportPendingMessageEntries: normalizeTransportPendingEntries(
-                    m.transportPendingMessageEntries,
-                    extractTransportPendingMessages(m.transportPendingMessages),
-                    updated[existingIdx].sessionName,
-                  ),
-                  transportPendingMessageVersion: nextTransportQueueVersion(
-                    updated[existingIdx].transportPendingMessageVersion ?? undefined,
-                    extractTransportPendingVersion(m.transportPendingMessageVersion),
-                  ),
-                }),
+                ...transportPendingPatch,
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
@@ -246,6 +298,7 @@ export function useSubSessions(
               providerSessionId: m.providerSessionId ?? null,
               cwd: m.cwd || null,
               label: m.label || null,
+              ccPresetId: m.ccPresetId ?? null,
               parentSession: m.parentSession || null,
               createdAt: now,
               updatedAt: now,
@@ -264,12 +317,28 @@ export function useSubSessions(
               effort: m.effort ?? null,
               contextNamespace: m.contextNamespace ?? null,
               contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
+              executionCloneKind: m.executionCloneKind ?? null,
+              parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
-              transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages),
+              transportPendingMessages: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessageEntries')
+                ? normalizeTransportPendingEntries(
+                    m.transportPendingMessageEntries,
+                    extractTransportPendingMessages(m.transportPendingMessages),
+                    toSessionName(m.id),
+                    {
+                      hasEntriesField: true,
+                      hasMessagesField: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessages'),
+                    },
+                  ).map((entry) => entry.text)
+                : extractTransportPendingMessages(m.transportPendingMessages),
               transportPendingMessageEntries: normalizeTransportPendingEntries(
                 m.transportPendingMessageEntries,
                 extractTransportPendingMessages(m.transportPendingMessages),
                 toSessionName(m.id),
+                {
+                  hasEntriesField: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessageEntries'),
+                  hasMessagesField: Object.prototype.hasOwnProperty.call(m, 'transportPendingMessages'),
+                },
               ),
               transportPendingMessageVersion: extractTransportPendingVersion(m.transportPendingMessageVersion),
             }];
@@ -294,10 +363,12 @@ export function useSubSessions(
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
             const preserveQuota = isCodexFamily(s.type);
+            const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
               ...(m.label !== undefined ? { label: m.label } : {}),
+              ...(m.ccPresetId !== undefined ? { ccPresetId: m.ccPresetId } : {}),
               ...(m.qwenModel !== undefined ? { qwenModel: m.qwenModel } : {}),
               ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
               ...(m.requestedModel !== undefined ? { requestedModel: m.requestedModel } : {}),
@@ -310,24 +381,15 @@ export function useSubSessions(
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
               ...(m.contextNamespace !== undefined ? { contextNamespace: m.contextNamespace } : {}),
               ...(m.contextNamespaceDiagnostics !== undefined ? { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics } : {}),
+              ...(m.executionCloneKind !== undefined ? { executionCloneKind: m.executionCloneKind } : {}),
+              ...(m.parentRunId !== undefined ? { parentRunId: m.parentRunId } : {}),
               ...(m.transportConfig !== undefined ? {
                 transportConfig: mergeTransportConfigPreservingSupervision(
                   m.transportConfig,
                   s.transportConfig,
                 ),
               } : {}),
-              ...(m.transportPendingMessages !== undefined ? { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) } : {}),
-              ...((m.transportPendingMessages !== undefined || m.transportPendingMessageEntries !== undefined) ? {
-                transportPendingMessageEntries: normalizeTransportPendingEntries(
-                  m.transportPendingMessageEntries,
-                  extractTransportPendingMessages(m.transportPendingMessages),
-                  s.sessionName,
-                ),
-                transportPendingMessageVersion: nextTransportQueueVersion(
-                  s.transportPendingMessageVersion ?? undefined,
-                  extractTransportPendingVersion(m.transportPendingMessageVersion),
-                ),
-              } : {}),
+              ...transportPendingPatch,
             };
           }));
         }
@@ -389,9 +451,9 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
-      const hasPendingMessagesField = msg.type === 'timeline.event'
+      const hasPendingSnapshot = msg.type === 'timeline.event'
         && msg.event.type === 'session.state'
-        && Object.prototype.hasOwnProperty.call(msg.event.payload ?? {}, 'pendingMessages');
+        && hasExplicitTransportPendingSnapshot(msg.event.payload);
       const pendingEntriesPayload = msg.type === 'timeline.event' && msg.event.type === 'session.state'
         ? msg.event.payload.pendingMessageEntries
         : undefined;
@@ -402,21 +464,32 @@ export function useSubSessions(
         ? extractTransportPendingVersion(msg.event.payload.pendingMessageVersion)
         : undefined;
       if (state === 'queued') {
-        const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+        const hasPendingEntriesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessageEntries');
+        const hasPendingMessagesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessages');
+        const parsedPendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? extractTransportPendingMessages(pendingMessagesPayload)
           : [];
         const pendingEntries = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? normalizeTransportPendingEntries(
               pendingEntriesPayload,
-              pendingMessages,
+              parsedPendingMessages,
               sessionName,
+              { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
             )
           : [];
+        const pendingMessages = hasPendingEntriesField ? pendingEntries.map((entry) => entry.text) : parsedPendingMessages;
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
           // Drop a stale `queued` snapshot wholesale (mirror app.tsx).
-          if (!shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion)) return prev;
+          if (!shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
+            hasExplicitSnapshot: true,
+            isExplicitEmpty: pendingMessages.length === 0 && pendingEntries.length === 0,
+          })) return prev;
           const next = [...prev];
           next[idx] = {
             ...next[idx],
@@ -429,11 +502,22 @@ export function useSubSessions(
         });
         return;
       }
-      if (state === 'running' && hasPendingMessagesField) {
+      if (state === 'running' && hasPendingSnapshot) {
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
-          const applyPending = shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion);
+          const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessageEntries');
+          const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessages');
+          const parsedIncomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
+          const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, parsedIncomingMessages, sessionName, {
+            hasEntriesField: hasPendingEntriesField,
+            hasMessagesField: hasPendingMessagesField,
+          });
+          const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
+          const applyPending = shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
+            hasExplicitSnapshot: hasPendingSnapshot,
+            isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
+          });
           if (!applyPending) {
             if (prev[idx].state === 'running') return prev;
             const sameNext = [...prev];
@@ -444,17 +528,14 @@ export function useSubSessions(
           next[idx] = {
             ...next[idx],
             state: 'running',
-            transportPendingMessages: mergeTransportPendingMessagesForRunningState(
-              next[idx].transportPendingMessages,
-              msg.event.payload.pendingMessages,
-              true,
-            ),
+            transportPendingMessages: incomingMessages,
             transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
               next[idx].transportPendingMessageEntries,
               msg.event.payload.pendingMessageEntries,
               msg.event.payload.pendingMessages,
-              true,
+              hasPendingSnapshot,
               sessionName,
+              hasPendingEntriesField,
             ),
             transportPendingMessageVersion: nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion),
           };
@@ -467,22 +548,35 @@ export function useSubSessions(
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
         // For idle, only fold in the pending snapshot when it isn't stale.
+        const hasPendingEntriesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessageEntries');
+        const hasPendingMessagesField = msg.type === 'timeline.event'
+          && msg.event.type === 'session.state'
+          && Object.prototype.hasOwnProperty.call(msg.event.payload, 'pendingMessages');
+        const parsedIncomingMessages = extractTransportPendingMessages(pendingMessagesPayload);
+        const incomingEntries = normalizeTransportPendingEntries(pendingEntriesPayload, parsedIncomingMessages, sessionName, {
+          hasEntriesField: hasPendingEntriesField,
+          hasMessagesField: hasPendingMessagesField,
+        });
+        const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
         const applyIdlePending = state === 'idle'
-          && shouldApplyTransportQueueSnapshot(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion);
+          && hasPendingSnapshot
+          && shouldApplyTransportQueueSnapshotForPayload(prev[idx].transportPendingMessageVersion ?? undefined, incomingPendingVersion, {
+            hasExplicitSnapshot: hasPendingSnapshot,
+            isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
+          });
         const nextPendingMessages = applyIdlePending
-          ? mergeTransportPendingMessagesForIdleState(
-              prev[idx].transportPendingMessages,
-              pendingMessagesPayload,
-              hasPendingMessagesField,
-            )
+          ? incomingMessages
           : prev[idx].transportPendingMessages ?? [];
         const nextPendingEntries = applyIdlePending
           ? mergeTransportPendingEntriesForIdleState(
               prev[idx].transportPendingMessageEntries,
               pendingEntriesPayload,
               pendingMessagesPayload,
-              hasPendingMessagesField,
+              hasPendingSnapshot,
               sessionName,
+              hasPendingEntriesField,
             )
           : prev[idx].transportPendingMessageEntries ?? [];
         const nextVersion = applyIdlePending
@@ -661,5 +755,5 @@ export function useSubSessions(
     [subSessions, activeSession],
   );
 
-  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal };
+  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal, hydrateShared };
 }

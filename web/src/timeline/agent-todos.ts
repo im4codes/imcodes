@@ -11,7 +11,7 @@
  *   TodoWrite   { todos: [{ content, status, activeForm }] }
  *   todo_write  { todos: [{ id, content, status }] }
  *   write_todos { todos: [{ title, status }] }
- *   update_plan { plan:  [{ step, status }] }
+ *   update_plan { plan:  [{ step, status }] } or [{ content, status }]
  *
  * Pure + framework-free so it is trivially unit-testable.
  */
@@ -43,9 +43,13 @@ const TODO_TOOL_NAMES: ReadonlySet<string> = new Set([
   'todowrite',
   'todo_write',
   'write_todos',
+  'writetodos',
   'update_plan',
+  'updateplan',
   'update_todo_list',
+  'updatetodolist',
   'set_plan',
+  'setplan',
 ]);
 
 /** Array fields that, when present, identify a checklist payload. */
@@ -87,6 +91,7 @@ export function normalizeTodoStatus(raw: unknown): AgentTodoStatus {
 }
 
 function extractRawItems(input: unknown): unknown[] | null {
+  if (Array.isArray(input)) return input;
   const obj = asRecord(input);
   if (!obj) return null;
   for (const key of LIST_KEYS) {

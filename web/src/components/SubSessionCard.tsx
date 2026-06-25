@@ -26,6 +26,8 @@ import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
+import type { SharedStateSummary } from '../tab-sharing-ui.js';
+import { SharedStateIndicator } from './SharedStateIndicator.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -74,6 +76,7 @@ interface Props {
   onTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
   /** Whether this sub-session is participating in an active P2P discussion. */
   inP2p?: boolean;
+  sharedState?: SharedStateSummary | null;
   accentColor?: string;
   previewHydrateDelayMs?: number;
 }
@@ -111,10 +114,11 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
+    transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
@@ -135,12 +139,12 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // daemon echo).
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
-    : useTimeline(timelineHydrated ? sub.sessionName : null, ws, serverId, {
+    : useTimeline(sub.sessionName, ws, serverId, {
       isActiveSession: !!isFocused,
-      // Open card = visible; participate in resume broadcast (rate-limited by
-      // the 15s success-only cooldown). Hidden/unhydrated cards pass null
-      // sessionName above so the hook stays inert.
-      isVisible: true,
+      // Keep the live timeline hook attached even while preview hydration is
+      // delayed. Without this, sub-session cards miss the typewriter phase and
+      // only jump to cached/final text when the timer flips `timelineHydrated`.
+      isVisible: timelineHydrated || isOpen || !!isFocused,
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
@@ -159,10 +163,9 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
 
-  // Shell/script cards render a live xterm preview. Keep them in raw mode so
-  // command output is delivered immediately instead of waiting for passive
-  // terminal snapshots; cleanup downgrades back to passive because App owns the
-  // global sub-session subscription.
+  // Shell/script cards render a live xterm preview. Keep them in raw mode only
+  // while the card is mounted; cleanup releases the stream entirely because
+  // shell/script sessions have no passive terminal history to replay.
   useEffect(() => {
     if (!isShell || !ws || !connected) return;
     if (typeof ws.holdTerminalRaw === 'function') {
@@ -170,7 +173,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     }
     try { ws.subscribeTerminal(sub.sessionName, true); } catch { /* ignore */ }
     return () => {
-      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+      try { ws.unsubscribeTerminal(sub.sessionName); } catch { /* ignore */ }
     };
   }, [connected, isShell, sub.sessionName, ws]);
 
@@ -227,15 +230,18 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const handleCardSend = useCallback(() => {
     const text = cardInputRef.current?.value?.trim();
     if (!text || !ws || !connected) return;
+    const commandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text });
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
     } catch (err) {
       console.warn('sub-session send failed; preserving draft for retry', err);
       return;
     }
+    addOptimisticUserMessage?.(text, commandId);
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [ws, connected, sub.sessionName, forceFollowLatest]);
+  }, [addOptimisticUserMessage, ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in
@@ -355,6 +361,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
         <span class="subcard-icon">{icon}</span>
         <span class="subcard-label">{label}</span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+        <SharedStateIndicator state={sharedState} iconOnly />
         {badge && <span class="subcard-badge">{badge}</span>}
         {busy && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}

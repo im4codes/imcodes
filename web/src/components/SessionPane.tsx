@@ -14,18 +14,26 @@ import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
+import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+
+function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
+  return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
+}
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -44,7 +52,17 @@ export interface SessionPaneProps {
   serverId: string;
   session: SessionInfo;
   sessions: SessionInfo[];
-  subSessions: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  subSessions: Array<{
+    sessionName: string;
+    type: string;
+    label?: string | null;
+    state: string;
+    parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
+    executionTemplateEligible?: boolean;
+    executionTemplateIneligibleReason?: string;
+  }>;
   ws: WsClient | null;
   connected: boolean;
   /** Whether this pane is the currently active session (controls show/hide). */
@@ -53,6 +71,8 @@ export interface SessionPaneProps {
   viewMode: ViewMode;
   /** For future split-view focus highlighting. */
   focused?: boolean;
+  /** Whether this pane is the active target for window-level shortcuts. */
+  keyboardActive?: boolean;
   quickData: UseQuickDataResult;
   detectedModel?: string;
 
@@ -76,6 +96,7 @@ export interface SessionPaneProps {
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
   onSettings?: () => void;
+  onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   sessionPinned?: boolean;
   stopBlockedByPinned?: boolean;
   onToggleSessionPin?: (sessionName: string) => void;
@@ -105,6 +126,7 @@ export function SessionPane({
   ws,
   connected,
   isActive,
+  keyboardActive,
   viewMode,
   quickData,
   detectedModel,
@@ -118,6 +140,7 @@ export function SessionPane({
   onStopProject,
   onRenameSession,
   onSettings,
+  onShareSession,
   sessionPinned,
   stopBlockedByPinned,
   onToggleSessionPin,
@@ -135,6 +158,9 @@ export function SessionPane({
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
   const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
+  const [composerText, setComposerText] = useState('');
+  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
+  const executionRouting = useExecutionRouting(serverId ?? null);
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -222,6 +248,8 @@ export function SessionPane({
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
+  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
+  const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
   const liveSessionState = useMemo(
     () => getTailSessionState(timelineEvents) ?? session.state ?? null,
     [timelineEvents, session.state],
@@ -239,6 +267,10 @@ export function SessionPane({
   const effectiveRuntimeType = resolveSessionInfoRuntimeType(session);
   const isTransportSession = effectiveRuntimeType === 'transport';
   const effectiveViewMode: ViewMode = isTransportSession ? 'chat' : viewMode;
+  const controlsSession = useMemo<SessionInfo>(() => {
+    if (!isTransportSession || !liveSessionState || liveSessionState === session.state) return session;
+    return { ...session, state: liveSessionState as SessionInfo['state'] };
+  }, [isTransportSession, liveSessionState, session]);
 
   // ── Chat scroll + input ref ─────────────────────────────────────────────────
   const chatScrollFnRef = useRef<(() => void) | null>(null);
@@ -279,6 +311,55 @@ export function SessionPane({
       termScrollFnRef.current?.();
     }
   }, [effectiveViewMode]);
+
+  const executionTemplateDisplayName = useMemo(() => {
+    const template = executionRouting.templateSessionName;
+    if (!template) return null;
+    const sub = subSessions.find((item) => item.sessionName === template);
+    if (sub && !isExecutionCloneTemplateLike(sub)) return sub.label || sub.sessionName.split('_').pop() || sub.sessionName;
+    return null;
+  }, [executionRouting.templateSessionName, subSessions]);
+  const hasValidExecutionTemplate = Boolean(
+    executionRouting.enabled
+    && executionRouting.templateSessionName
+    && executionTemplateDisplayName
+    && executionRouting.templateSessionName !== sessionName,
+  );
+  const executionCloneCount = executionRouting.limits.maxParallelClones;
+  const runExecutionClonesTitle = !connected || !ws
+    ? t('chat.execution_clone_run_offline')
+    : !hasValidExecutionTemplate
+      ? t('chat.execution_clone_run_no_template')
+      : !(composerText.trim() || inputRef.current?.textContent?.trim())
+        ? t('chat.execution_clone_run_empty')
+        : t('chat.execution_clone_run_with_template', {
+            count: executionCloneCount,
+            name: executionTemplateDisplayName,
+          });
+  const handleRunExecutionClones = useCallback(() => {
+    const text = (inputRef.current?.textContent ?? composerText).trim();
+    if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
+    const commandId = globalThis.crypto?.randomUUID?.()
+      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setExecutionClonesBusy(true);
+    try {
+      ws.sendExecutionClones({
+        sessionName,
+        text,
+        commandId,
+        dedicatedExecutionRouting: {
+          enabled: true,
+          templateSessionName: executionRouting.templateSessionName,
+          maxParallelClones: executionRouting.limits.maxParallelClones,
+          maxQueuedClones: executionRouting.limits.maxQueuedClones,
+          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
+          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
+        },
+      });
+    } finally {
+      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
+    }
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sessionName, ws]);
 
   const handleSyncMemorySummaries = useCallback(async () => {
     if (!ws || !connected || syncingMemorySummaries) return;
@@ -354,7 +435,7 @@ export function SessionPane({
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
           sessionId={sessionName}
-          sessionState={session.state}
+          sessionState={liveSessionState ?? undefined}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
           onViewRepo={onViewRepo}
@@ -383,10 +464,24 @@ export function SessionPane({
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
           activeToolCall={activeToolCall}
+          activeTimelineTurn={activeTimelineTurn}
+          transportActivityDetail={transportActivityDetail}
+          sessionError={session.error}
           now={thinkingNow}
           onSyncMemorySummaries={handleSyncMemorySummaries}
           syncMemorySummariesBusy={syncingMemorySummaries}
           syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
+          onRunExecutionClones={handleRunExecutionClones}
+          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesDisabled={
+            executionClonesBusy
+            || !connected
+            || !ws
+            || !hasValidExecutionTemplate
+            || !(composerText.trim() || inputRef.current?.textContent?.trim())
+          }
+          runExecutionClonesTitle={runExecutionClonesTitle}
+          runExecutionClonesCount={executionCloneCount}
         />
       )}
 
@@ -394,7 +489,7 @@ export function SessionPane({
       {isActive && (
         <SessionControls
           ws={ws}
-          activeSession={session}
+          activeSession={controlsSession}
           inputRef={inputRef}
           onAfterAction={onAfterAction}
           onSend={(_name, text, meta) => {
@@ -431,6 +526,7 @@ export function SessionPane({
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}
+          onShareSession={onShareSession}
           sessionPinned={sessionPinned}
           stopBlockedByPinned={stopBlockedByPinned}
           onToggleSessionPin={onToggleSessionPin}
@@ -440,6 +536,8 @@ export function SessionPane({
           detectedModel={effectiveDetectedModel}
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
+          activeTransportTurn={activeTimelineTurn}
+          keyboardActive={keyboardActive ?? isActive}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
           sessions={sessions}
@@ -451,6 +549,7 @@ export function SessionPane({
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
           onVersionSensitiveAction={onVersionSensitiveAction}
+          onComposerTextChange={setComposerText}
         />
       )}
     </div>

@@ -13,6 +13,8 @@ import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
+import { buildTransportPendingQueueSnapshot, type TransportPendingMessageEntry } from './transport-pending-snapshot.js';
+import { validateExecutionTemplateCandidate } from './execution-clone.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -21,10 +23,12 @@ export interface SessionListItem extends SessionContextBootstrapState {
   agentType: string;
   agentVersion?: string;
   state: string;
+  error?: string;
   projectDir?: string;
   runtimeType?: string;
   providerId?: string;
   providerSessionId?: string;
+  ccPreset?: string;
   qwenModel?: string;
   requestedModel?: string;
   activeModel?: string;
@@ -46,10 +50,45 @@ export interface SessionListItem extends SessionContextBootstrapState {
   userCreated?: boolean;
   transportConfig?: Record<string, unknown>;
   transportPendingMessages?: string[];
-  transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
+  transportPendingMessageEntries?: TransportPendingMessageEntry[];
   /** Monotonic version of the pending-queue snapshot. Lets the UI ignore
    *  stale snapshots delivered out of order. See TransportSessionRuntime. */
   transportPendingMessageVersion?: number;
+  /** DAEMON-AUTHORITATIVE: whether this session may be used as an execution
+   *  template (clone source). The UI renders this rather than recomputing
+   *  eligibility client-side. Base eligibility is caller-independent — the
+   *  "clone yourself" exclusion is the calling session's concern in the UI. */
+  executionTemplateEligible: boolean;
+  /** Ineligibility reason code (an `EXECUTION_CLONE_ERROR_CODES` value) set ONLY
+   *  when `executionTemplateEligible` is false. Absent when eligible. */
+  executionTemplateIneligibleReason?: string;
+}
+
+/**
+ * DAEMON-AUTHORITATIVE static template eligibility for a session-list item.
+ *
+ * Pure projection helper (extracted so it can be unit-tested without the heavy
+ * `buildSessionList` runtime deps). A session is eligible as an execution
+ * template when it is NOT a main/brain session, in an allowed state (idle/
+ * running — not stopped/error), NOT itself an execution clone, and carries a
+ * cloneable launch configuration (a non-blank `projectDir` + a supported
+ * `agentType`, the minimum the clone launch-spec builder needs).
+ *
+ * Calls the SAME {@link validateExecutionTemplateCandidate} predicate the
+ * create path uses (via `validateExecutionCloneRequest`), passing NO caller
+ * name so the caller-specific "clone yourself" exclusion is intentionally NOT
+ * applied here — that is the calling session's concern in the UI, layered on
+ * top of this base eligibility. UI eligibility therefore equals create-time
+ * template validation.
+ */
+export function computeExecutionTemplateEligibility(
+  record: SessionRecord,
+): { eligible: true } | { eligible: false; reason: string } {
+  const validation = validateExecutionTemplateCandidate(record);
+  if (!validation.ok) {
+    return { eligible: false, reason: validation.code };
+  }
+  return { eligible: true };
 }
 
 function resolveTransportSessionListState(
@@ -58,8 +97,6 @@ function resolveTransportSessionListState(
 ): SessionListItem['state'] {
   if (!runtime) return record.state;
   runtime.drainPendingIfIdle?.('session-list');
-  runtime.settleInactiveInProgressStatus?.('session-list');
-  runtime.cancelStaleActiveTurnWithPending?.({ reason: 'session-list' });
   const status = runtime.getStatus();
   if (status === 'error') return 'error';
   if (status === 'streaming' || status === 'thinking' || status === 'tool_running' || status === 'permission') {
@@ -71,17 +108,33 @@ function resolveTransportSessionListState(
 
 function baseItem(s: SessionRecord): SessionListItem {
   const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
+  const runtimeState = resolveTransportSessionListState(s, runtime);
+  const pendingQueue = s.runtimeType === 'transport'
+    ? buildTransportPendingQueueSnapshot(s.name, runtime)
+    : { pendingMessages: [], pendingEntries: [], source: 'empty' as const };
+  const hasPendingQueue = pendingQueue.pendingMessages.length > 0 || pendingQueue.pendingEntries.length > 0;
+  const state = hasPendingQueue
+    ? runtime
+      ? (runtimeState === 'idle' ? 'queued' : runtimeState)
+      : 'queued'
+    : runtimeState;
+  // DAEMON-AUTHORITATIVE template eligibility. Computed from the persisted
+  // record (not the resolved transport `state` above) so it stays deterministic
+  // and matches the clone-create gate's view of the session.
+  const eligibility = computeExecutionTemplateEligibility(s);
   return {
     name: s.name,
     project: s.projectName,
     role: s.role,
     agentType: s.agentType,
     agentVersion: s.agentVersion,
-    state: resolveTransportSessionListState(s, runtime),
+    state,
+    error: state === 'error' ? s.error : undefined,
     projectDir: s.projectDir,
     runtimeType: s.runtimeType,
     providerId: s.providerId,
     providerSessionId: s.providerSessionId,
+    ccPreset: s.ccPreset,
     qwenModel: s.qwenModel,
     requestedModel: s.requestedModel,
     activeModel: s.activeModel,
@@ -108,9 +161,15 @@ function baseItem(s: SessionRecord): SessionListItem {
     label: s.label,
     userCreated: s.userCreated,
     transportConfig: s.transportConfig,
-    transportPendingMessages: runtime?.pendingMessages ?? [],
-    transportPendingMessageEntries: runtime?.pendingEntries ?? [],
-    transportPendingMessageVersion: runtime?.pendingVersion ?? 0,
+    transportPendingMessages: pendingQueue.pendingMessages,
+    transportPendingMessageEntries: pendingQueue.pendingEntries,
+    ...(typeof pendingQueue.pendingVersion === 'number'
+      ? { transportPendingMessageVersion: pendingQueue.pendingVersion }
+      : {}),
+    executionTemplateEligible: eligibility.eligible,
+    ...(eligibility.eligible
+      ? {}
+      : { executionTemplateIneligibleReason: eligibility.reason }),
   };
 }
 
@@ -156,9 +215,9 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
   // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
   const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
-  const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig().catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
-  const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig().catch(() => null) : null;
-  const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig().catch(() => null) : null;
+  const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
+  const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
+  const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
 
   // Collect preset-pinned models for all qwen sessions that have a ccPreset.
   // Doing this once (before the map) avoids per-session dynamic imports inside

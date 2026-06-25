@@ -3,13 +3,13 @@
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
 
-**El IM para agentes. Memoria compartida, herramientas MCP gestionadas, ejecución supervisada y auditoría cruzada entre proveedores de IA.**
+**El IM para agentes. Memoria compartida, OpenSpec Auto Deliver, herramientas MCP gestionadas, ejecución supervisada, colaboración humana y auditoría cruzada entre proveedores de IA.**
 
 > Two heads are better than one.<br>
 > But minds in concert don't answer fate, they author it.<br>
 > — IM.codes
 
-IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
+IM.codes ofrece a los coding agents una capa de memoria compartida entre proveedores y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent), además de terminal, archivos, vistas Git, localhost preview, notificaciones, flujos multiagente y streaming nativo para agentes transport. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. El uso compartido de sesión también permite programación colaborativa pair o multi-persona alrededor de sesiones agent en vivo. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
@@ -70,11 +70,24 @@ Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se 
 
 Ese problema de acceso es solo la mitad. El trabajo complejo con coding agents también necesita un criterio más estable: un solo modelo puede caer en patrones familiares, pasar por alto problemas o producir respuestas inestables en tareas difíciles. Cambiar de provider puede aportar otra perspectiva, pero sin contexto compartido también puede perder el hilo.
 
-[IM.codes](https://im.codes) está pensado para ambas necesidades. Mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina y mantener varios agentes en marcha sobre tu propia infraestructura. También combina "Shared Agent Context y memoria" con "Auditoría cross-modelo y discusiones Team": la recuperación duradera viene de resúmenes del trabajo completado, mientras que la discusión Team es revisión cross-modelo estructurada antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y ayuda a que el trabajo complejo converja con más revisión.
+[IM.codes](https://im.codes) está pensado para ambas necesidades. Mantiene esas sesiones al alcance desde móvil o web: abrir el terminal, inspeccionar archivos y cambios Git, previsualizar localhost desde otro dispositivo, recibir notificaciones cuando el trabajo termina, invitar a otra persona a la misma sesión o servidor y mantener varios agentes en marcha sobre tu propia infraestructura. También combina "Shared Agent Context y memoria" con "Auditoría cross-modelo y discusiones Team": la recuperación duradera viene de resúmenes del trabajo completado, mientras que la discusión Team es revisión cross-modelo estructurada antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y ayuda a que el trabajo complejo converja con más revisión.
 
 No es otro IDE de IA ni un cliente genérico de terminal remota. Es la capa de mensajería, memoria y revisión alrededor de coding agents basados en terminal.
 
-Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+## OpenSpec Auto Deliver
+
+Para cambios basados en OpenSpec, Auto Deliver convierte un change folder en una ejecución de entrega supervisada de extremo a extremo: revisión proposal/spec, implementación, validación, auditoría Team, scoring automático por módulo, gates de retrabajo y handoff final visible.
+
+- **Pipeline de cambio con un clic.** Se lanza desde una sesión de coding transport-backed. IM.codes resuelve la sesión propietaria, bloquea el carril Team para evitar ejecuciones en conflicto, lee `tasks.md` y mantiene una proyección viva en la UI.
+- **Auditoría spec antes de implementar.** El audit-repair opcional de propuesta/spec usa el flujo Team normal (por defecto `audit>review>plan`) y lee un JSON autoritativo en vez de confiar en resúmenes de chat.
+- **Bucle de implementación guiado por tareas.** El daemon envía prompts de implementación enfocados a la misma sesión, trabaja solo en ese cambio OpenSpec, sigue tareas checked/unchecked y muestra candidatos seguros de comandos de validación descubiertos en manifests del proyecto.
+- **Scoring automático por módulo.** Cada auditoría produce puntuaciones estructuradas para `spec`, `tasks`, `implementation`, `tests` y `risk`, con evidencia y resumen visibles en los detalles de ejecución.
+- **Auditoría de implementación y gates de retrabajo.** El veredicto final con puntuación — `PASS`, `REWORK` o `BLOCKED` — decide si la ejecución pasa, repara mientras haya límites o requiere decisión humana.
+- **Fail-closed y control humano.** Auto Deliver pide intervención humana ante salida de auditoría inválida, límites agotados, interferencia manual, estado Team incompatible o tareas ilegibles. No hace stage, commit ni push de código.
+
+## Programación colaborativa
+
+Comparte una pestaña, sub-sesión o source server completo con otro usuario. Usa `viewer` para review de solo lectura o `participant` cuando un teammate deba enviar prompts a las sesiones cubiertas. Los mensajes compartidos llevan actor label y el acceso puede degradarse o revocarse desde la UI.
 
 ## Shared Agent Context y memoria
 
@@ -122,6 +135,12 @@ Previsualiza tu servidor de desarrollo local desde cualquier dispositivo sin des
 
 ### Móvil, reloj y notificaciones
 Soporte completo para móvil, autenticación biométrica, notificaciones push, entrada interactiva para sesiones shell y respuestas rápidas desde Apple Watch.
+
+### OpenSpec Auto Deliver
+Ejecuta un cambio guiado por spec mediante un pipeline estructurado: auditoría proposal/spec, prompts de implementación, sugerencias de validación basadas en manifests, auditoría/retrabajo Team, scoring automático de spec/tasks/implementation/tests/risk y handoff fail-closed visible.
+
+### Programación colaborativa
+Comparte una sesión viva para pair programming, o invita a más personas a un workspace de servidor con alcance mediante roles viewer/participant.
 
 ### Auditoría cross-modelo y discusiones Team
 La salida de un solo modelo no debería confiarse ciegamente. Las discusiones Team permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra problemas que un solo modelo suele pasar por alto antes de la implementación, reduciendo el retrabajo.
@@ -324,6 +343,10 @@ setx PATH "<npm-prefix-path>;%PATH%"
 - Node.js >= 22
 - tmux en Linux/macOS
 - Al menos un coding agent: Claude Code, Codex, Gemini CLI, OpenClaw o Qwen
+
+## Acerca de
+
+Este es un proyecto personal. Yo prácticamente no escribí código: fue construido casi por completo por [Claude Code](https://github.com/anthropics/claude-code), con contribuciones importantes de [Codex](https://github.com/openai/codex) y [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
 ## Descargo de responsabilidad
 

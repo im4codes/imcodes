@@ -81,6 +81,7 @@ vi.mock('../src/api.js', () => {
     clearApiKey: vi.fn(),
     configure: vi.fn(),
     configureApiKey: vi.fn(),
+    discoverSharedEntries: vi.fn(async () => []),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
     listP2pRuns: (...args: unknown[]) => listP2pRunsMock(...args),
@@ -236,7 +237,14 @@ vi.mock('../src/pages/LoginPage.js', () => ({ LoginPage: textComponent('login-pa
 vi.mock('../src/pages/ServerSetupPage.js', () => ({ ServerSetupPage: textComponent('server-setup-page') }));
 vi.mock('../src/pages/NativeAuthBridge.js', () => ({ NativeAuthBridge: textComponent('native-auth-bridge') }));
 vi.mock('../src/pages/DashboardPage.js', () => ({ DashboardPage: textComponent('dashboard-page') }));
-vi.mock('../src/pages/DiscussionsPage.js', () => ({ DiscussionsPage: textComponent('discussions-page') }));
+vi.mock('../src/pages/DiscussionsPage.js', () => ({
+  DiscussionsPage: ({ initialTab }: any) => (
+    <div>
+      discussions-page
+      <span data-testid="discussions-initial-tab">{initialTab ?? 'team'}</span>
+    </div>
+  ),
+}));
 vi.mock('../src/pages/RepoPage.js', () => ({
   RepoPage: ({ onBack, onCiEvent }: any) => (
     <div>
@@ -361,9 +369,42 @@ vi.mock('../src/components/SessionPane.js', () => ({
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
-  SubSessionBar: ({ onCollapsedChange, onNew, onOpen, onOpenMaximized, onViewCron, onViewDiscussions, onViewDiscussion, onViewRepo, onStopDiscussion, subSessions, discussions = [], totalRunningDiscussions = 0 }: any) => (
+  SubSessionBar: ({
+    onCollapsedChange,
+    onNew,
+    onOpen,
+    onOpenMaximized,
+    onViewAutoDeliver,
+    onViewCron,
+    onViewDiscussions,
+    onViewDiscussion,
+    onViewRepo,
+    onStopDiscussion,
+    subSessions,
+    discussions = [],
+    totalRunningDiscussions = 0,
+    openSpecAutoProjection,
+    openSpecAutoCompact,
+    onOpenSpecAutoView,
+    onOpenSpecAutoStop,
+    onOpenSpecAutoToggleCompact,
+    onOpenSpecAutoHide,
+  }: any) => (
     <div data-testid="app-shell-subsession-bar" data-running-discussions={String(totalRunningDiscussions)}>
       sub-session-bar
+      {openSpecAutoProjection && (
+        <div
+          data-testid="app-shell-auto-deliver-runbar"
+          data-compact={String(openSpecAutoCompact)}
+          data-run-id={openSpecAutoProjection.runId}
+        >
+          {openSpecAutoProjection.changeName}
+          <button onClick={onOpenSpecAutoView}>subbar-auto-deliver-view</button>
+          <button onClick={onOpenSpecAutoStop}>subbar-auto-deliver-stop-run</button>
+          <button onClick={onOpenSpecAutoToggleCompact}>subbar-auto-deliver-compact-run</button>
+          <button onClick={onOpenSpecAutoHide}>subbar-auto-deliver-hide-run</button>
+        </div>
+      )}
       {discussions.map((discussion: any) => (
         <div
           key={discussion.id}
@@ -385,6 +426,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
         <button key={sub.id} onClick={() => onOpen?.(sub.id)}>subbar-open-{sub.id}</button>
       ))}
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
+      <button onClick={onViewAutoDeliver}>subbar-auto-deliver</button>
       <button onClick={onViewCron}>subbar-cron</button>
       <button onClick={onViewDiscussions}>subbar-discussions</button>
       <button onClick={() => onViewDiscussion?.('disc-1')}>subbar-discussion</button>
@@ -447,9 +489,18 @@ vi.mock('../src/components/CloneSessionGroupDialog.js', () => ({
 }));
 vi.mock('../src/components/StartDiscussionDialog.js', () => ({ StartDiscussionDialog: textComponent('start-discussion-dialog') }));
 vi.mock('../src/components/AskQuestionDialog.js', () => ({
-  AskQuestionDialog: ({ onDismiss, onSubmit }: any) => (
+  AskQuestionDialog: ({ pending, onDismiss, onSubmit }: any) => (
     <div>
       ask-question-dialog
+      {pending?.questions?.map((question: any, index: number) => (
+        <div key={index}>
+          <span>{question.header}</span>
+          <span>{question.question}</span>
+          {question.options?.map((option: any, optionIndex: number) => (
+            <span key={optionIndex}>{option.label}</span>
+          ))}
+        </div>
+      ))}
       <button onClick={() => onSubmit?.('answer')}>ask-submit</button>
       <button onClick={onDismiss}>ask-dismiss</button>
     </div>
@@ -660,7 +711,52 @@ describe('App shell', () => {
     expect(ws.connect).toHaveBeenCalled();
   }, 20_000);
 
-  it('clears stale P2P progress from the session bar when a full status response has no active runs', async () => {
+  it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-sdk',
+        sessionName: 'deck_sub_alpha_sdk',
+        parentSession: 'deck_alpha_brain',
+        label: 'SDK',
+        description: 'SDK session',
+        cwd: '/work/alpha',
+        type: 'claude-code-sdk',
+        runtimeType: undefined,
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+      {
+        id: 'sub-process',
+        sessionName: 'deck_sub_alpha_process',
+        parentSession: 'deck_alpha_brain',
+        label: 'Process',
+        description: 'Process session',
+        cwd: '/work/alpha',
+        type: 'claude-code',
+        runtimeType: undefined,
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    const ws = wsInstances[0];
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+
+    await waitFor(() => {
+      expect(ws.subscribeTransportSession).toHaveBeenCalledWith('deck_sub_alpha_sdk', { replayHistory: false });
+    });
+    expect(ws.subscribeTransportSession).not.toHaveBeenCalledWith('deck_sub_alpha_process', expect.anything());
+  }, 20_000);
+
+  it('keeps cached P2P progress until an explicit status lookup confirms the run is missing', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -701,6 +797,20 @@ describe('App shell', () => {
         type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
         requestId: 'p2p-status-empty',
         runs: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('app-shell-p2p-discussion-p2p_run-status-bar')).toBeTruthy();
+      expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-running-discussions')).toBe('1');
+    });
+
+    await act(async () => {
+      ws.emit({
+        type: P2P_WORKFLOW_MSG.STATUS_RESPONSE,
+        requestId: 'p2p-status-missing',
+        runId: 'run-status-bar',
+        run: null,
       });
     });
 
@@ -1068,6 +1178,402 @@ describe('App shell', () => {
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
+  }, 20_000);
+
+  it('opens the Auto Deliver list from the sub-session toolbar status button', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    fireEvent.click(screen.getByText('subbar-auto-deliver'));
+
+    expect(await screen.findByText('discussions-page')).toBeTruthy();
+    expect(screen.getByTestId('discussions-initial-tab').textContent).toBe('auto');
+  }, 20_000);
+
+  it('renders the Auto Deliver runbar in the global sub-session toolbar and persists compact presentation locally', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-global-1',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 84, checked: 80, unchecked: 4 },
+          canStop: true,
+        },
+      });
+    });
+
+    const runbar = await screen.findByTestId('app-shell-auto-deliver-runbar');
+    expect(runbar.textContent).toContain('openspec-auto-delivery');
+    expect(runbar.getAttribute('data-compact')).toBe('false');
+
+    await act(async () => {
+      ws.emit({ type: 'p2p.status_response', runs: [] });
+    });
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).toContain('openspec-auto-delivery');
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.status_projection',
+        projection: {
+          runId: 'auto-global-1',
+          projectionVersion: 0,
+          visibility: 'full',
+          changeName: 'stale-change',
+          status: 'stopped',
+          stage: 'stopped',
+          terminal: true,
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 1, checked: 1, unchecked: 0 },
+          canStop: false,
+        },
+      });
+      ws.emit({
+        type: 'openspec_auto_deliver.list_response',
+        rows: [
+          {
+            runId: 'bad-list-row',
+            projectionVersion: Number.POSITIVE_INFINITY,
+            visibility: 'full',
+            changeName: 'bad-list-row-change',
+            status: 'active',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_alpha_brain',
+          },
+        ],
+      });
+    });
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).toContain('openspec-auto-delivery');
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).not.toContain('stale-change');
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').textContent).not.toContain('bad-list-row-change');
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-compact-run'));
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').getAttribute('data-compact')).toBe('true');
+    expect(localStorage.getItem('rcc_openspec_auto_runbar_compact')).toBe('1');
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.status_projection',
+        projection: {
+          runId: 'auto-global-1',
+          projectionVersion: 4,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_audit_repair',
+          stage: 'implementation_audit_repair',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 84, checked: 82, unchecked: 2 },
+          canStop: true,
+        },
+      });
+    });
+    expect(screen.getByTestId('app-shell-auto-deliver-runbar').getAttribute('data-compact')).toBe('true');
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-view'));
+    expect(await screen.findByTestId('openspec-auto-details')).toBeTruthy();
+
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.stop',
+      runId: 'auto-global-1',
+      sessionName: 'deck_alpha_brain',
+    }));
+
+    fireEvent.click(screen.getByText('subbar-auto-deliver-hide-run'));
+    expect(screen.queryByTestId('app-shell-auto-deliver-runbar')).toBeNull();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-global-2',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'second-change',
+          status: 'spec_audit_repair',
+          stage: 'spec_audit_repair',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 4, checked: 1, unchecked: 3 },
+          canStop: true,
+        },
+      });
+    });
+
+    const resetRunbar = await screen.findByTestId('app-shell-auto-deliver-runbar');
+    expect(resetRunbar.textContent).toContain('second-change');
+    expect(resetRunbar.getAttribute('data-compact')).toBe('true');
+  }, 20_000);
+
+  it('hides the global Auto Deliver runbar after the run reaches a terminal status', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-terminal-hidden',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'finished-change',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 2, checked: 1, unchecked: 1 },
+          canStop: true,
+        },
+      });
+    });
+
+    expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-terminal-hidden',
+          projectionVersion: 2,
+          visibility: 'full',
+          changeName: 'finished-change',
+          status: 'passed',
+          stage: 'passed',
+          terminal: true,
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 2, checked: 2, unchecked: 0 },
+          canStop: false,
+        },
+      });
+    });
+
+    expect(screen.queryByTestId('app-shell-auto-deliver-runbar')).toBeNull();
+  }, 20_000);
+
+  it('keeps the Auto Deliver runbar scoped to the main session when a desktop sub-session window is focused', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_helper',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper',
+        description: 'Helper session',
+        cwd: '/work/alpha',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'idle',
+        serverId: 'srv-1',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    fireEvent.click(screen.getByText('subbar-open-sub-1'));
+    expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+    await waitFor(() => {
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'openspec_auto_deliver.status_request',
+        sessionName: 'deck_alpha_brain',
+      }));
+    });
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.status_request',
+      sessionName: 'deck_sub_alpha_helper',
+    }));
+
+    await act(async () => {
+      ws.emit({
+        type: 'openspec_auto_deliver.projection',
+        projection: {
+          runId: 'auto-main-while-sub-focused',
+          projectionVersion: 1,
+          visibility: 'full',
+          changeName: 'openspec-auto-delivery',
+          status: 'implementation_task_loop',
+          stage: 'implementation_task_loop',
+          owningMainSessionName: 'deck_alpha_brain',
+          launchedFromSessionName: 'deck_alpha_brain',
+          targetImplementationSessionName: 'deck_alpha_brain',
+          taskStats: { total: 4, checked: 2, unchecked: 2 },
+          canStop: true,
+        },
+      });
+    });
+
+    expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'openspec_auto_deliver.stop',
+      runId: 'auto-main-while-sub-focused',
+      sessionName: 'deck_alpha_brain',
+    }));
+  }, 20_000);
+
+  it('binds the global Auto Deliver runbar to the open sub-session UI scope on mobile', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        {
+          id: 'sub-1',
+          sessionName: 'deck_sub_alpha_helper',
+          parentSession: 'deck_alpha_brain',
+          label: 'Helper',
+          description: 'Helper session',
+          cwd: '/work/alpha',
+          type: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+          serverId: 'srv-1',
+        },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = await getActiveWsClient();
+
+      fireEvent.click(screen.getByText('subbar-open-sub-1'));
+      expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+
+      await waitFor(() => {
+        expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'openspec_auto_deliver.status_request',
+          sessionName: 'deck_sub_alpha_helper',
+        }));
+      });
+
+      await act(async () => {
+        ws.emit({
+          type: 'openspec_auto_deliver.projection',
+          projection: {
+            runId: 'auto-sub-mobile',
+            projectionVersion: 1,
+            visibility: 'full',
+            changeName: 'openspec-auto-delivery',
+            status: 'implementation_task_loop',
+            stage: 'implementation_task_loop',
+            owningMainSessionName: 'deck_alpha_brain',
+            launchedFromSessionName: 'deck_sub_alpha_helper',
+            targetImplementationSessionName: 'deck_sub_alpha_helper',
+            taskStats: { total: 4, checked: 2, unchecked: 2 },
+            canStop: true,
+          },
+        });
+      });
+
+      expect(await screen.findByTestId('app-shell-auto-deliver-runbar')).toBeTruthy();
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      fireEvent.click(screen.getByText('subbar-auto-deliver-stop-run'));
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'openspec_auto_deliver.stop',
+        runId: 'auto-sub-mobile',
+        sessionName: 'deck_sub_alpha_helper',
+      }));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('reuses the AskQuestion dialog UI for Auto Deliver needs_human handoff questions', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    const { watchProjectionStore } = await import('../src/watch-projection.js');
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          id: 'evt-auto-ask',
+          ts: Date.now(),
+          sessionId: 'deck_alpha_brain',
+          type: 'ask.question',
+          payload: {
+            toolUseId: 'auto-run-1:needs-human:2',
+            waitMs: 300_000,
+            questions: [{
+              header: 'OpenSpec Auto Deliver',
+              question: 'Auto Deliver stopped with reason "missing_authoritative_json". What should happen next in this session?',
+              options: [
+                { label: 'Review the failure and continue manually' },
+                { label: 'Stop here and summarize the current state' },
+              ],
+            }],
+          },
+        },
+      });
+    });
+
+    expect(await screen.findByText('ask-question-dialog')).toBeTruthy();
+    expect(screen.getByText('OpenSpec Auto Deliver')).toBeTruthy();
+    expect(screen.getByText(/missing_authoritative_json/)).toBeTruthy();
+    expect(screen.getByText('Review the failure and continue manually')).toBeTruthy();
+    await waitFor(() => {
+      expect(vi.mocked(watchProjectionStore.pushDurableEvent)).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'ask.question',
+        session: 'deck_alpha_brain',
+        serverId: 'srv-1',
+        message: 'Auto Deliver stopped with reason "missing_authoritative_json". What should happen next in this session?',
+      }));
+    });
+
+    fireEvent.click(screen.getByText('ask-submit'));
+    expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer');
+    expect(screen.queryByText('ask-question-dialog')).toBeNull();
   }, 20_000);
 
   it('closes all open sub-session windows when clicking the active main session tab', async () => {

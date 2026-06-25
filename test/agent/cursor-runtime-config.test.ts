@@ -101,6 +101,15 @@ describe('cursor-runtime-config parsers', () => {
   });
 
   describe('getCursorRuntimeConfig', () => {
+    it('returns a passive fallback without spawning cursor-agent when probing is disabled', async () => {
+      const config = await getCursorRuntimeConfig({ probe: false });
+      expect(config).toEqual({
+        availableModels: [],
+        isAuthenticated: false,
+      });
+      expect(childProcessMock.execFile).not.toHaveBeenCalled();
+    });
+
     it('combines probe outputs into a runtime config', async () => {
       childProcessMock.execFile.mockImplementation((...args: any[]) => {
         const cliArgs = args[1] as string[];

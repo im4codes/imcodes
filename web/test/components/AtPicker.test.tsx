@@ -102,7 +102,7 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
 
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
     expect(screen.getByText('worker1')).toBeDefined();
     expect(screen.getByText('worker2')).toBeDefined();
     expect(screen.queryByText('other9')).toBeNull();
@@ -112,13 +112,45 @@ describe('AtPicker', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
-    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
 
     fireEvent.keyDown(document, { key: 'Escape' });
 
     expect(screen.getByText('files')).toBeDefined();
     expect(screen.getByText('agents')).toBeDefined();
     expect(screen.queryByText('brain')).toBeNull();
+  });
+
+  it('consumes Escape before the chat input can handle it', () => {
+    const targetKeyDown = vi.fn();
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+
+    render(
+      <div>
+        <input aria-label="chat input" onKeyDown={targetKeyDown} />
+        <AtPicker
+          query=""
+          sessions={[
+            { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null },
+            { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          ]}
+          rootSession="deck_proj_brain"
+          wsClient={wsClient as any}
+          projectDir="/tmp/proj"
+          onSelectFile={vi.fn()}
+          onSelectAgent={vi.fn()}
+          onClose={vi.fn()}
+          visible
+        />
+      </div>,
+    );
+
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.keyDown(screen.getByLabelText('chat input'), { key: 'Escape' });
+
+    expect(targetKeyDown).not.toHaveBeenCalled();
+    expect(screen.getByText('files')).toBeDefined();
+    expect(screen.getByText('agents')).toBeDefined();
   });
 
   it('with p2pConfig, individual agents list shows ALL agents (config only affects @@all)', () => {

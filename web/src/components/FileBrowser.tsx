@@ -1,4 +1,5 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -22,7 +23,7 @@ import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
-import { HtmlFullscreenPreview, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
+import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { ImageLightbox } from './ImageLightbox.js';
 import { downloadAttachment, getApiBaseUrl } from '../api.js';
 import {
@@ -123,6 +124,8 @@ export interface FileBrowserProps {
   refreshTrigger?: number;
   /** Server ID for file transfer download API. If provided, enables download buttons. */
   serverId?: string;
+  /** Session whose project directory scopes rename/delete requests. */
+  sessionName?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
   /** Called after a new directory is successfully created. */
@@ -250,6 +253,8 @@ export type FileBrowserPreviewState =
 
 export interface FileBrowserPreviewRequest {
   path: string;
+  /** Session whose project directory should scope writes from the preview host. */
+  sessionName?: string;
   preferDiff?: boolean;
   previewViewMode?: HtmlPreviewViewMode;
   preview?: FileBrowserPreviewState;
@@ -354,6 +359,17 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
+function findNodePath(nodes: FsNode[], targetId: string): string[] | null {
+  for (const node of nodes) {
+    if (node.id === targetId) return [node.id];
+    if (node.children?.length) {
+      const childPath = findNodePath(node.children, targetId);
+      if (childPath) return [node.id, ...childPath];
+    }
+  }
+  return null;
+}
+
 type PendingPreviewReason = 'interactive' | 'refresh';
 type PendingPreviewRequest = { path: string; cycleId: number; reason?: PendingPreviewReason; startedAt?: number };
 type PendingPreviewDiff = PendingPreviewRequest & { diff: string; diffHtml: string };
@@ -390,12 +406,27 @@ export const __resetFileBrowserSharedChangesForTests = __resetSharedChangesForTe
 const DEFAULT_SHOW_HIDDEN_FILES = true;
 
 type NewEntryKind = 'file' | 'folder';
+type FileContextMenuState = { node: FsNode; x: number; y: number };
 
 function shortenPathSegment(segment: string, maxLength: number): string {
   if (segment.length <= maxLength) return segment;
   const head = Math.max(6, Math.floor((maxLength - 1) * 0.55));
   const tail = Math.max(4, maxLength - 1 - head);
   return `${segment.slice(0, head)}…${segment.slice(-tail)}`;
+}
+
+function gitStatusClass(code: string): 'ignored' | 'untracked' | 'deleted' | 'added' | 'modified' {
+  if (code === '!!') return 'ignored';
+  if (code === '??') return 'untracked';
+  if (code === 'D') return 'deleted';
+  if (code === 'A') return 'added';
+  return 'modified';
+}
+
+function gitStatusBadge(code: string): string {
+  if (code === '!!') return 'I';
+  if (code === '??') return 'U';
+  return code;
 }
 
 export function FileBrowser({
@@ -421,6 +452,7 @@ export function FileBrowser({
   onPreviewFile,
   defaultTab = 'files',
   onInsertPath,
+  sessionName,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -446,6 +478,8 @@ export function FileBrowser({
   const navigateToRef = useRef<(path: string) => void>(() => {});
   const currentLabelRef = useRef(currentLabel);
   useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
+  const dataRef = useRef(data);
+  useEffect(() => { dataRef.current = data; }, [data]);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
@@ -458,7 +492,7 @@ export function FileBrowser({
   const [previewViewMode, setPreviewViewMode] = useState<HtmlPreviewViewMode>(() => (
     initialPreviewViewMode ?? (autoPreviewPreferDiff ? 'diff' : 'source')
   ));
-  const [lightbox, setLightbox] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<{ src: string; fileName?: string; onDownload?: () => void | Promise<void> } | null>(null);
   const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<HtmlFullscreenPreviewState | null>(null);
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -488,6 +522,7 @@ export function FileBrowser({
 
   const [newEntry, setNewEntry] = useState<{ kind: NewEntryKind; parentPath: string } | null>(null);
   const [newEntryName, setNewEntryName] = useState('');
+  const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
@@ -525,6 +560,9 @@ export function FileBrowser({
   const pendingPreviewDiffRef = useRef(new Map<string, PendingPreviewDiff>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const pendingCreateFileRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
+  const pendingRenameRef = useRef(new Map<string, { parentPath: string; sourcePath: string; targetPath: string }>());
+  const pendingDeleteRef = useRef(new Map<string, { parentPath: string | null; targetPath: string }>());
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewScrollSnapshotRef = useRef<PreviewScrollSnapshot | null>(null);
   const mountedRef = useRef(true);
@@ -553,12 +591,40 @@ export function FileBrowser({
       pendingPreviewDiffRef.current.clear();
       pendingMkdirRef.current.clear();
       pendingCreateFileRef.current.clear();
+      pendingRenameRef.current.clear();
+      pendingDeleteRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const closeWhenOutsideMenu = (event: Event) => {
+      const menu = contextMenuRef.current;
+      const target = event.target instanceof Node ? event.target : null;
+      if (menu && target && menu.contains(target)) return;
+      close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    document.addEventListener('pointerdown', closeWhenOutsideMenu, true);
+    document.addEventListener('mousedown', closeWhenOutsideMenu, true);
+    document.addEventListener('contextmenu', closeWhenOutsideMenu, true);
+    window.addEventListener('blur', close);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', closeWhenOutsideMenu, true);
+      document.removeEventListener('mousedown', closeWhenOutsideMenu, true);
+      document.removeEventListener('contextmenu', closeWhenOutsideMenu, true);
+      window.removeEventListener('blur', close);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     const root = data[0];
@@ -637,7 +703,7 @@ export function FileBrowser({
       // Keep the initial directory list lightweight. The tree currently only
       // renders names/dir flags, so per-file metadata (size/mime/downloadId)
       // just adds avoidable stat work on first open, especially on mobile.
-      requestId = ws.fsListDir(nodePath, includeFiles, showHidden);
+      requestId = ws.fsListDir(nodePath, includeFiles, false);
     } catch {
       setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
       return;
@@ -674,6 +740,8 @@ export function FileBrowser({
         pendingRef.current.clear();
         clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
+        pendingRenameRef.current.clear();
+        pendingDeleteRef.current.clear();
         const loadingPath = previewRef.current.status === 'loading' ? previewRef.current.path : null;
         activePreviewCycleRef.current = null;
         if (loadingPath) {
@@ -868,6 +936,51 @@ export function FileBrowser({
         return;
       }
 
+      if (msg.type === FS_TRANSPORT_MSG.RENAME_RESPONSE) {
+        const pendingRename = pendingRenameRef.current.get(msg.requestId);
+        if (!pendingRename) return;
+        pendingRenameRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
+        if (msg.status === 'error') {
+          setError(msg.error === FS_WRITE_ERROR.FILE_EXISTS ? t('file_browser.file_exists') : (msg.error ?? t('file_browser.rename_failed')));
+          return;
+        }
+        loadedRef.current.delete(pendingRename.parentPath);
+        setError(null);
+        setSelectedPaths(new Set([pendingRename.targetPath]));
+        if (previewRef.current.status !== 'idle' && (previewRef.current as { path: string }).path === pendingRename.sourcePath) {
+          setPreview({ status: 'idle' });
+        }
+        fetchDir(pendingRename.parentPath);
+        return;
+      }
+
+      if (msg.type === FS_TRANSPORT_MSG.DELETE_RESPONSE) {
+        const pendingDelete = pendingDeleteRef.current.get(msg.requestId);
+        if (!pendingDelete) return;
+        pendingDeleteRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
+        if (msg.status === 'error') {
+          setError(msg.error ?? t('file_browser.delete_failed'));
+          return;
+        }
+        if (pendingDelete.parentPath) {
+          loadedRef.current.delete(pendingDelete.parentPath);
+          fetchDir(pendingDelete.parentPath);
+        }
+        setError(null);
+        setSelectedPaths((prev) => {
+          if (!prev.has(pendingDelete.targetPath)) return prev;
+          const next = new Set(prev);
+          next.delete(pendingDelete.targetPath);
+          return next;
+        });
+        if (previewRef.current.status !== 'idle' && (previewRef.current as { path: string }).path === pendingDelete.targetPath) {
+          setPreview({ status: 'idle' });
+        }
+        return;
+      }
+
       if (msg.type === 'fs.git_status_response') {
         // Shared-cache path (changesRootPath, badges, etc.) is routed
         // into `git-status-store` by its per-ws bridge, so we only handle
@@ -960,18 +1073,30 @@ export function FileBrowser({
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
-    // Keep the LEFT file list in sync with the previewed file's folder: re-root
-    // the tree to the file's parent directory (its siblings) when we aren't
-    // already showing it. Runs for both inline and external (onPreviewFile)
-    // preview modes since FileBrowser is the left list in both.
+    // Keep the left tree in sync with the previewed file without discarding the
+    // user's expanded tree. If the file's parent already exists in the current
+    // tree, reveal/select it in-place. Only re-root when the preview came from
+    // outside the current tree (for example an external chat path).
     const parentDir = getParentDir(filePath);
     if (parentDir && parentDir !== currentLabelRef.current) {
-      navigateToRef.current(parentDir);
+      const parentNodePath = findNodePath(dataRef.current, parentDir);
+      if (parentNodePath) {
+        setExpandedPaths((prev) => {
+          const next = new Set(prev);
+          for (const nodeId of parentNodePath) next.add(nodeId);
+          return next;
+        });
+        setCurrentLabel(parentDir);
+        fetchDir(parentDir);
+      } else {
+        navigateToRef.current(parentDir);
+      }
       setSelectedPaths(new Set([filePath]));
     }
     if (onPreviewFile) {
       onPreviewFile({
         path: filePath,
+        sessionName,
         preferDiff,
         previewViewMode: nextViewMode,
         preview: { status: 'loading', path: filePath },
@@ -1010,7 +1135,7 @@ export function FileBrowser({
       const diffId = ws.fsGitDiff(filePath);
       trackPendingPreviewRequest('diff', diffId, { path: filePath, cycleId, reason: 'interactive' });
     }
-  }, [autoPreviewPath, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
+  }, [autoPreviewPath, fetchDir, getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, onPreviewStateChange, t, trackPendingPreviewRequest, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -1038,6 +1163,32 @@ export function FileBrowser({
     setNewEntry(null);
     setNewEntryName('');
   }, [buildChildPath, ws]);
+
+  const requestRename = useCallback((node: FsNode) => {
+    const parentPath = getParentDir(node.id);
+    if (!parentPath) return;
+    const nextName = window.prompt(t('file_browser.rename_prompt', { name: node.name }), node.name);
+    const trimmed = nextName?.trim();
+    if (!trimmed || trimmed === node.name) return;
+    if (trimmed.includes('/') || trimmed.includes('\\')) {
+      setError(t('file_browser.invalid_name'));
+      return;
+    }
+    const targetPath = buildChildPath(parentPath, trimmed);
+    const requestId = sessionName
+      ? ws.fsRename(node.id, targetPath, sessionName)
+      : ws.fsRename(node.id, targetPath);
+    pendingRenameRef.current.set(requestId, { parentPath, sourcePath: node.id, targetPath });
+    setContextMenu(null);
+  }, [buildChildPath, sessionName, t, ws]);
+
+  const requestDelete = useCallback((node: FsNode) => {
+    const confirmed = window.confirm(t('file_browser.delete_confirm', { name: node.name }));
+    if (!confirmed) return;
+    const requestId = sessionName ? ws.fsDelete(node.id, sessionName) : ws.fsDelete(node.id);
+    pendingDeleteRef.current.set(requestId, { parentPath: getParentDir(node.id), targetPath: node.id });
+    setContextMenu(null);
+  }, [sessionName, t, ws]);
 
   const requestNewEntry = useCallback(() => {
     if (!newEntry) return;
@@ -1311,6 +1462,16 @@ export function FileBrowser({
     }
   }, [fetchPreview, preview]);
 
+  const handleNodeContextMenu = useCallback((node: FsNode, event: MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      node,
+      x: Math.min(event.clientX, Math.max(0, window.innerWidth - 176)),
+      y: Math.min(event.clientY, Math.max(0, window.innerHeight - 96)),
+    });
+  }, []);
+
   const handleConfirm = () => {
     if (selectedPaths.size === 0) {
       if (mode === 'dir-only') onConfirm([currentLabel]);
@@ -1333,6 +1494,22 @@ export function FileBrowser({
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
+  const contextMenuView = contextMenu ? (
+    <div
+      ref={contextMenuRef}
+      class="fb-context-menu"
+      style={{ left: contextMenu.x, top: contextMenu.y }}
+      onClick={(event) => event.stopPropagation()}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
+      <button type="button" onClick={() => requestRename(contextMenu.node)}>{t('common.rename')}</button>
+      <button type="button" class="danger" onClick={() => requestDelete(contextMenu.node)}>{t('common.delete')}</button>
+    </div>
+  ) : null;
+
   const tree = (
     <div class={`fb-tree${layout !== 'panel' && hasInlinePreview ? ' fb-tree-split' : ''}`}>
       {data.map((root) => (
@@ -1348,6 +1525,7 @@ export function FileBrowser({
           onToggleExpand={toggleExpand}
           onSelect={handleSelect}
           onPreview={handlePreview}
+          onContextMenu={handleNodeContextMenu}
           previewPath={previewPath}
         />
       ))}
@@ -1391,10 +1569,52 @@ export function FileBrowser({
 
   useEffect(() => {
     if (!canRenderHtml || !isHtmlRenderMode || isEditing) return;
-    setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+    const next = { status: 'ok' as const, path: preview.path, content: preview.content };
+    if (!openHtmlPreviewInNewWindow(next)) {
+      setHtmlFullscreenPreview(next);
+    }
     setPreviewViewMode('source');
     setShowDiff(false);
   }, [canRenderHtml, isEditing, isHtmlRenderMode, preview]);
+
+  const downloadCurrentPreview = useCallback(async () => {
+    if (!serverId || preview.status === 'idle' || !('downloadId' in preview) || !preview.downloadId) return;
+    setDownloadError(null);
+    try {
+      await downloadAttachment(serverId, preview.downloadId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+      // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry.
+      if (isStaleHandle && 'path' in preview) {
+        try {
+          const freshId = await new Promise<string>((resolve, reject) => {
+            const requestId = ws.fsReadFile(preview.path);
+            const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
+            const off = ws.onMessage((m) => {
+              if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
+              off();
+              clearTimeout(timer);
+              if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
+              else reject(new Error('no_handle'));
+            });
+          });
+          setPreview((prev) => {
+            if (prev.status === 'idle' || !('path' in prev)) return prev;
+            return { ...prev, downloadId: freshId } as typeof prev;
+          });
+          await downloadAttachment(serverId, freshId);
+          return;
+        } catch { /* retry failed — fall through to show error */ }
+      }
+      if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
+      else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
+      else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
+      else setDownloadError(t('upload.download_failed'));
+      setTimeout(() => setDownloadError(null), 5000);
+      throw err;
+    }
+  }, [preview, serverId, t, ws]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1442,7 +1662,10 @@ export function FileBrowser({
             class="fb-diff-toggle"
             onClick={() => {
               previewTabOverridePathRef.current = preview.path;
-              setHtmlFullscreenPreview({ status: 'ok', path: preview.path, content: preview.content });
+              const next = { status: 'ok' as const, path: preview.path, content: preview.content };
+              if (!openHtmlPreviewInNewWindow(next)) {
+                setHtmlFullscreenPreview(next);
+              }
               setPreviewViewMode('source');
               setShowDiff(false);
             }}
@@ -1471,38 +1694,7 @@ export function FileBrowser({
             title={downloadError || t('upload.download_file')}
             style={downloadError ? { color: '#ef4444' } : undefined}
             onClick={() => {
-              setDownloadError(null);
-              void downloadAttachment(serverId, preview.downloadId!).catch(async (err) => {
-                const msg = err instanceof Error ? err.message : String(err);
-                const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-                // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry
-                if (isStaleHandle && 'path' in preview) {
-                  try {
-                    const freshId = await new Promise<string>((resolve, reject) => {
-                      const requestId = ws.fsReadFile(preview.path);
-                      const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
-                      const off = ws.onMessage((m) => {
-                        if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
-                        off();
-                        clearTimeout(timer);
-                        if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
-                        else reject(new Error('no_handle'));
-                      });
-                    });
-                    setPreview((prev) => {
-                      if (prev.status === 'idle' || !('path' in prev)) return prev;
-                      return { ...prev, downloadId: freshId } as typeof prev;
-                    });
-                    await downloadAttachment(serverId, freshId);
-                    return; // success on retry
-                  } catch { /* retry failed — fall through to show error */ }
-                }
-                if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
-                else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
-                else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
-                else setDownloadError(t('upload.download_failed'));
-                setTimeout(() => setDownloadError(null), 5000);
-              });
+              void downloadCurrentPreview().catch(() => undefined);
             }}
           >
             {downloadError || t('upload.download_file')}
@@ -1566,7 +1758,16 @@ export function FileBrowser({
         )}
         {preview.status === 'image' && (
           <div class="fb-preview-image">
-            <img src={preview.dataUrl} alt={preview.path.split(/[/\\]/).pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
+            <img
+              src={preview.dataUrl}
+              alt={preview.path.split(/[/\\]/).pop() ?? ''}
+              onClick={() => setLightbox({
+                src: preview.dataUrl,
+                fileName: preview.path.split(/[/\\]/).pop() || undefined,
+                onDownload: serverId && preview.downloadId ? downloadCurrentPreview : undefined,
+              })}
+              style={{ cursor: 'zoom-in' }}
+            />
           </div>
         )}
         {preview.status === 'office' && (
@@ -1853,7 +2054,12 @@ export function FileBrowser({
   ) : null;
 
   const lightboxOverlay = lightbox ? (
-    <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} />
+    <ImageLightbox
+      src={lightbox.src}
+      fileName={lightbox.fileName}
+      onDownload={lightbox.onDownload}
+      onClose={() => setLightbox(null)}
+    />
   ) : null;
 
   if (layout === 'panel') {
@@ -1871,6 +2077,7 @@ export function FileBrowser({
       return (
         <>
           {lightboxOverlay}
+          {contextMenuView}
           <div class="fb-panel">
             {tabs}
             {previewPane ? (
@@ -1889,6 +2096,7 @@ export function FileBrowser({
     return (
       <>
         {lightboxOverlay}
+        {contextMenuView}
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
@@ -1922,6 +2130,7 @@ export function FileBrowser({
   return (
     <>
       {lightboxOverlay}
+      {contextMenuView}
       <div class="fb-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
         <div class={`fb-modal${hasPreview ? ' fb-modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
           <div class="fb-header">
@@ -1954,6 +2163,7 @@ function FsTreeNode({
   onToggleExpand,
   onSelect,
   onPreview,
+  onContextMenu,
   previewPath,
   depth = 0,
 }: {
@@ -1967,6 +2177,7 @@ function FsTreeNode({
   onToggleExpand: (id: string) => void;
   onSelect: (id: string, isDir: boolean) => void;
   onPreview: (id: string) => void;
+  onContextMenu: (node: FsNode, event: MouseEvent) => void;
   previewPath: string | null;
   depth?: number;
 }) {
@@ -1977,18 +2188,23 @@ function FsTreeNode({
   const isDisabled = mode === 'dir-only' && !node.isDir;
   const isPreviewing = previewPath === node.id;
   const gitCode = modifiedFiles.get(node.id);
+  const gitClass = gitCode ? gitStatusClass(gitCode) : null;
 
   if (!showHidden && node.hidden) return null;
 
   return (
     <div>
       <div
-        class={`fb-node${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${gitCode ? ` git-${gitCode === '??' ? 'untracked' : gitCode === 'D' ? 'deleted' : gitCode === 'A' ? 'added' : 'modified'}` : ''}`}
+        class={`fb-node${isSelected ? ' selected' : ''}${isAlready ? ' already' : ''}${isDisabled ? ' disabled' : ''}${isPreviewing ? ' previewing' : ''}${gitClass ? ` git-${gitClass}` : ''}`}
         style={{ paddingLeft: 8 + depth * 16 }}
         onClick={() => {
           if (!isMulti && !isDisabled) onSelect(node.id, node.isDir);
           if (node.isDir) onToggleExpand(node.id);
           if (!node.isDir && mode !== 'dir-only') onPreview(node.id);
+        }}
+        onContextMenu={(event) => {
+          if (depth === 0) return;
+          onContextMenu(node, event);
         }}
       >
         {isMulti && (
@@ -2010,7 +2226,7 @@ function FsTreeNode({
             : '📄'}
         </span>
         <span class="fb-node-name">{node.name}</span>
-        {gitCode && <span class={`fb-node-git-badge git-badge-${gitCode === '??' ? 'untracked' : gitCode === 'D' ? 'deleted' : gitCode === 'A' ? 'added' : 'modified'}`} title={`git: ${gitCode}`}>{gitCode === '??' ? 'U' : gitCode}</span>}
+        {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
         {isAlready && <span class="fb-node-badge">↑</span>}
       </div>
       {node.isDir && isExpanded && node.children && (
@@ -2031,6 +2247,7 @@ function FsTreeNode({
               onToggleExpand={onToggleExpand}
               onSelect={onSelect}
               onPreview={onPreview}
+              onContextMenu={onContextMenu}
               previewPath={previewPath}
               depth={depth + 1}
             />

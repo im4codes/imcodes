@@ -12,10 +12,12 @@ import {
   mainSessionNameForProjectSlug,
   resolveCloneTargetProject,
 } from '../../shared/session-group-clone.js';
+import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 
 describe('session group clone shared contract', () => {
   it('exposes the stable daemon capability string', () => {
     expect(SESSION_GROUP_CLONE_CAPABILITY_V1).toBe('session-group-clone:v1');
+    expect(GIT_REMOTE_CLONE_CAPABILITY_V1).toBe('git-remote-clone:v1');
   });
 
   it('derives role-compatible main names from sanitized project input', () => {

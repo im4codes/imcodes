@@ -8,11 +8,13 @@ function runtimeSnapshot(
     clientMessageId: string;
     text: string;
     messagePreamble?: string;
+    sharedActor?: Record<string, unknown>;
   }>,
   pendingEntries: Array<{
     clientMessageId: string;
     text: string;
     messagePreamble?: string;
+    sharedActor?: Record<string, unknown>;
   }>,
 ): TransportSessionRuntime {
   return {
@@ -27,8 +29,27 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
   });
 
   it('preserves active entries before pending entries without reordering', () => {
+    const sharedActor = {
+      actorUserId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'action-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 1,
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_preserve_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 1,
+        authorizedAt: 1,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        expiresAt: null,
+        nextCoverageRecheckAt: null,
+      },
+    };
     const runtime = runtimeSnapshot(
-      [{ clientMessageId: 'cmd-active', text: 'active turn', messagePreamble: 'active context' }],
+      [{ clientMessageId: 'cmd-active', text: 'active turn', messagePreamble: 'active context', sharedActor }],
       [
         { clientMessageId: 'cmd-pending-1', text: 'queued one' },
         { clientMessageId: 'cmd-pending-2', text: 'queued two', messagePreamble: 'queued context' },
@@ -45,7 +66,7 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
       pendingCount: 2,
     });
     expect(getResendEntries('deck_preserve_brain')).toEqual([
-      expect.objectContaining({ commandId: 'cmd-active', text: 'active turn', messagePreamble: 'active context' }),
+      expect.objectContaining({ commandId: 'cmd-active', text: 'active turn', messagePreamble: 'active context', sharedActor }),
       expect.objectContaining({ commandId: 'cmd-pending-1', text: 'queued one' }),
       expect.objectContaining({ commandId: 'cmd-pending-2', text: 'queued two', messagePreamble: 'queued context' }),
     ]);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
 
 describe('normalizeClaudeCodeModelId', () => {
   it('maps opus alias to opus[1M]', () => {
@@ -19,9 +19,23 @@ describe('normalizeClaudeCodeModelId', () => {
     expect(normalizeClaudeCodeModelId('claude-haiku-4')).toBe('haiku');
   });
 
+  it('maps Claude Fable 5 / Mythos 5 to the fable picker option', () => {
+    expect(normalizeClaudeCodeModelId('fable')).toBe('fable');
+    expect(normalizeClaudeCodeModelId('claude-fable-5')).toBe('fable');
+    expect(normalizeClaudeCodeModelId('claude-fable-5-20260609')).toBe('fable');
+    expect(normalizeClaudeCodeModelId('claude-mythos-5')).toBe('fable');
+  });
+
   it('rejects unknown values', () => {
     expect(normalizeClaudeCodeModelId('')).toBeUndefined();
     expect(normalizeClaudeCodeModelId('foo')).toBeUndefined();
+  });
+});
+
+describe('CLAUDE_CODE_MODEL_IDS', () => {
+  it('lists fable (Mythos-class) first as the top-tier option', () => {
+    expect(CLAUDE_CODE_MODEL_IDS[0]).toBe('fable');
+    expect(CLAUDE_CODE_MODEL_IDS).toContain('opus[1M]');
   });
 });
 

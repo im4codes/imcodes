@@ -1144,6 +1144,9 @@ describe('sdk transport flow e2e', () => {
     await flushAsync();
 
     const claudeCall = mocks.claudeCalls.at(-1);
+    const stableEventId = `transport:${sessionName}:msg-cc-e2e`;
+    const streaming = mocks.emitted.filter((e) => e.session === sessionName && e.type === 'assistant.text' && e.payload.streaming === true);
+    const final = mocks.emitted.find((e) => e.session === sessionName && e.type === 'assistant.text' && e.payload.streaming === false);
     expect(claudeCall?.options.env).toMatchObject({
       ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
       ANTHROPIC_API_KEY: expect.any(String),
@@ -1151,6 +1154,10 @@ describe('sdk transport flow e2e', () => {
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
     expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    expect(streaming.map((e) => e.payload.text)).toEqual(['Claude']);
+    expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
+    expect(final?.payload.text).toBe('Claude: hello');
+    expect(final?.opts?.eventId).toBe(stableEventId);
   });
 
   beforeEach(async () => {

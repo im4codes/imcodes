@@ -23,6 +23,87 @@
     "hide": "숨기기",
     "this_feature": "이 기능"
   },
+  "share": {
+    "menu": {
+      "shareTab": "공유"
+    },
+    "dialogTitle": "액세스 공유",
+    "dialogSubtitle": "{{target}}에 범위가 제한된 액세스를 부여합니다.",
+    "target": {
+      "label": "대상",
+      "currentTab": "현재 탭",
+      "server": "전체 원본 서버",
+      "serverFallback": "이 서버"
+    },
+    "role": {
+      "label": "역할",
+      "viewer": "뷰어",
+      "participant": "참가자",
+      "serverMember": "서버 멤버",
+      "serverManager": "서버 관리자",
+      "system": "시스템"
+    },
+    "roleHelp": {
+      "viewer": "범위 내 상태를 보고 에이전트를 조작하지 않는 범위 내 토론에 참여할 수 있습니다.",
+      "participant": "범위 내 상태를 보고 포함된 구체적인 탭에 프롬프트를 보낼 수 있습니다."
+    },
+    "trust": {
+      "title": "참가자 신뢰 고지",
+      "body": "에이전트는 샌드박스 처리되지 않습니다. UI/API 제한은 직접 제어를 줄이지만, 참가자 프롬프트는 접근 가능한 환경에서 동작하는 에이전트에 영향을 줄 수 있습니다."
+    },
+    "recipient": {
+      "label": "받는 사람",
+      "placeholder": "사용자 ID 또는 이메일"
+    },
+    "list": {
+      "label": "공유 사용자",
+      "title": "공유 사용자",
+      "empty": "아직 공유 사용자가 없습니다"
+    },
+    "manage": {
+      "roleFor": "{{user}}의 역할",
+      "revoke": "철회",
+      "revokeConfirm": "{{user}}의 액세스를 철회할까요?"
+    },
+    "sharedWithMe": {
+      "title": "나에게 공유됨",
+      "empty": "공유된 탭 또는 서버가 없습니다",
+      "refresh": "공유 액세스 새로고침",
+      "kind": {
+        "server": "서버",
+        "tab": "탭",
+        "subsession": "하위 세션"
+      }
+    },
+    "create": "공유 만들기",
+    "creating": "만드는 중...",
+    "scope": {
+      "current": "공유 범위"
+    },
+    "indicator": "{{scope}}이(가) {{role}}로 공유됨 · {{status}}",
+    "indicatorCompact": "{{role}}로 공유됨 · {{status}}",
+    "indicatorSharedOut": "다른 사용자와 공유됨",
+    "actorLabel": "{{name}} · {{role}}",
+    "status": {
+      "active": "활성",
+      "revoked": "철회됨",
+      "expired": "만료됨",
+      "target-unavailable": "대상을 사용할 수 없음"
+    },
+    "reason": {
+      "share-role-denied": "이 역할은 해당 작업을 사용할 수 없습니다.",
+      "share-direct-surface-denied": "이 화면은 공유 액세스에서 사용할 수 없습니다.",
+      "share-rate-limited": "공유 작업이 너무 많습니다. 잠시 후 다시 시도하세요.",
+      "share-revoked": "이 공유는 철회되었습니다.",
+      "share-expired": "이 공유는 만료되었습니다.",
+      "share-target-unavailable": "공유 대상을 사용할 수 없습니다.",
+      "share-role-changed": "공유 역할이 변경되었습니다.",
+      "share-ticket-invalid": "공유 액세스 티켓이 유효하지 않습니다.",
+      "share-cancel-unsupported": "이 공유 탭에서는 취소가 지원되지 않습니다.",
+      "share-audit-duplicate": "이 작업은 이미 기록되었습니다.",
+      "share-comment-invalid": "댓글을 게시할 수 없습니다."
+    }
+  },
   "window": {
     "maximize": "최대화",
     "restore": "복원",
@@ -45,7 +126,18 @@
     "reload": "다시 로드",
     "retry": "다시 시도"
   },
+  "askQuestion": {
+    "waiting": "답변을 기다리는 중입니다. 모델은 {{seconds}}초 후 자동으로 계속합니다.",
+    "retained": "모델은 이미 계속 진행했습니다. {{seconds}}초 동안 이 답변으로 중단시킬 수 있습니다.",
+    "customPlaceholder": "사용자 지정 / 추가 입력(선택 사항)",
+    "answerPlaceholder": "답변 입력",
+    "dismiss": "닫기",
+    "answer": "답변",
+    "interrupt": "이 답변으로 중단"
+  },
   "chat": {
+    "delete_message": "메시지 삭제",
+    "delete_message_confirm": "이 메시지를 모두에게서 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
     "dpad": {
       "title": "방향키 — 드래그하여 이동"
     },
@@ -170,6 +262,13 @@
     "zoom_title": "메시지",
     "zoom_copy_all": "모두 복사",
     "zoom_hint": "길게 눌러 텍스트를 선택한 뒤 핸들을 끌어 범위를 조정하고 복사하세요.",
+    "image_download": "이미지 다운로드",
+    "image_downloading": "다운로드 중...",
+    "image_downloaded": "다운로드됨",
+    "image_download_failed": "다운로드 실패",
+    "image_copy": "이미지 복사",
+    "image_copied": "이미지를 복사했습니다",
+    "image_copy_failed": "복사 실패",
     "tool_detail_toggle": "세부정보",
     "tool_detail_input": "입력",
     "tool_detail_output": "출력",
@@ -250,7 +349,12 @@
         "fangsong": "FangSong",
         "microsoft-jhenghei": "Microsoft JhengHei"
       }
-    }
+    },
+    "execution_clone_run": "실행 클론으로 현재 작업 실행",
+    "execution_clone_run_with_template": "{{name}} 클론 {{count}}개로 현재 작업 병렬 실행",
+    "execution_clone_run_no_template": "Team 설정에서 실행 세션을 먼저 켜고 선택하세요",
+    "execution_clone_run_empty": "먼저 작업을 입력하세요",
+    "execution_clone_run_offline": "다시 연결한 뒤 실행 클론을 시작하세요"
   },
   "session": {
     "restart": "↺ 재시작",
@@ -292,6 +396,9 @@
     "type": "유형",
     "label": "레이블",
     "workingDir": "작업 디렉토리",
+    "subsessionWorkingDirectory": "작업 디렉터리",
+    "subsessionWorkingDirectoryPlaceholder": "현재 세션 디렉터리",
+    "subsessionWorkingDirectoryLocked": "하위 세션은 현재 디렉터리를 사용하며 시작 중에는 변경할 수 없습니다.",
     "parentSession": "상위 세션",
     "rename": "✎ 이름 변경",
     "rename_plain": "이름 변경",
@@ -316,6 +423,10 @@
       "overrideDirectories": "복제된 세션에 새 작업 디렉터리 사용",
       "cwdOverride": "대체 작업 디렉터리",
       "cwdOverridePlaceholder": "/work/new-checkout",
+      "gitRemoteUrl": "Git remote URL(선택 사항)",
+      "gitRemoteUrlPlaceholder": "https://github.com/org/repo.git",
+      "gitRemoteUrlHelp": "입력하면 daemon이 그룹을 복사하기 전에 이 remote를 대체 작업 디렉터리에 clone합니다.",
+      "gitRemoteCapabilityMissing": "연결된 daemon은 아직 복사 그룹용 Git remote clone을 지원하지 않습니다. daemon을 업데이트하거나 다시 연결한 뒤 시도하세요.",
       "browseCwd": "작업 디렉터리 찾아보기",
       "daemonHostValidation": "작업 디렉터리는 리소스를 만들기 전에 daemon 호스트에서 검증됩니다.",
       "runningWarning": "복사된 그룹은 새 상태로 시작합니다. 원본의 대기 중인 메시지, 터미널 기록, 실행 중인 작업은 복사되지 않습니다.",
@@ -363,6 +474,8 @@
         "blank_target_project": "대상 프로젝트 이름은 필수입니다.",
         "name_taken": "해당 대상 세션 이름은 이미 사용 중입니다.",
         "invalid_cwd": "해당 작업 디렉터리를 daemon 호스트에서 사용할 수 없습니다.",
+        "invalid_git_remote": "지원되지 않는 Git remote URL입니다.",
+        "git_clone_failed": "daemon이 Git remote를 작업 디렉터리에 clone하지 못했습니다.",
         "incomplete_clone_spec": "실행 중인 자식 세션에 복사 가능한 시작 설정이 부족합니다.",
         "unsupported_session_type": "세션 중 하나는 아직 복사할 수 없습니다.",
         "p2p_config_invalid": "Team 구성을 복사할 수 없습니다.",
@@ -541,7 +654,17 @@
       "deny": "거부",
       "tool": "{{tool}} 승인 필요"
     },
-    "workingDirPlaceholder": "~/projects/myapp"
+    "workingDirPlaceholder": "~/projects/myapp",
+    "execution": {
+      "genericPrompt": "이 세션에서 요청한 구현/실행 작업을 수행해 주세요.",
+      "useConfigured": "{{name}} 사용",
+      "useConfiguredNone": "실행 세션 사용",
+      "setSession": "실행 세션 설정…"
+    },
+    "executionGroup": {
+      "title": "실행 워커 (실행 {{run}})",
+      "unknownRun": "대기 중"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
@@ -604,12 +727,18 @@
     "tab_files": "파일",
     "tab_changes": "변경",
     "changes_title": "변경 ({{count}})",
-    "no_changes": "변경 없음"
+    "no_changes": "변경 없음",
+    "rename_prompt": "{{name}} 이름 변경",
+    "rename_failed": "항목 이름을 변경하지 못했습니다",
+    "delete_confirm": "{{name}}을(를) 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
+    "delete_failed": "항목을 삭제하지 못했습니다",
+    "invalid_name": "이름에는 경로 구분자를 포함할 수 없습니다"
   },
   "toast": {
     "finished": "완료됨",
     "upgrade_blocked_title": "업그레이드 차단됨",
     "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
+    "upgrade_blocked_auto_deliver_active": "Auto Deliver가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
     "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다."
   },
   "discussion": {
@@ -649,6 +778,10 @@
     "title": "새 세션 시작",
     "project_name": "프로젝트 이름",
     "working_directory": "작업 디렉터리",
+    "git_remote_url": "Git remote URL(선택 사항)",
+    "git_remote_url_placeholder": "https://github.com/org/repo.git",
+    "git_remote_url_help": "입력하면 daemon이 세션을 시작하기 전에 이 remote를 작업 디렉터리에 clone합니다.",
+    "git_remote_capability_missing": "연결된 daemon은 아직 Git remote clone을 지원하지 않습니다. daemon을 업데이트하거나 다시 연결한 뒤 시도하세요.",
     "browse": "찾아보기",
     "agent_type": "에이전트 유형",
     "agent_flavor_cli": "CLI: 원래 UI를 선호하는 사용자를 위한 네이티브 인터페이스입니다. 채팅 모드는 스트리밍을 지원하지 않습니다.",
@@ -1060,6 +1193,8 @@
     "title": "OpenSpec",
     "changes": "변경",
     "empty": "OpenSpec 변경 사항이 없습니다",
+    "no_tasks": "작업 없음",
+    "task_status_title": "{{checked}}/{{total}} 작업 완료",
     "load_timeout": "OpenSpec 변경을 불러오는 데 시간이 너무 오래 걸렸습니다. daemon이 다시 연결된 뒤 다시 시도하세요.",
     "load_unavailable": "daemon 연결이 준비될 때까지 OpenSpec 변경을 불러올 수 없습니다.",
     "load_error": "OpenSpec 변경을 스캔할 수 없습니다",
@@ -1069,6 +1204,213 @@
     "implement_action": "구현",
     "achieve_action": "완료",
     "propose_action": "제안",
+    "execute": {
+      "action": "실행",
+      "dispatch_heading": "현재 변경을 실행할 세션",
+      "dispatch_to": "{{name}}",
+      "default_heading": "기본 실행 세션",
+      "set_default": "{{name}}을(를) 기본으로 설정",
+      "clear_default": "기본 실행 세션 지우기",
+      "no_change": "변경을 펼쳐 실행 대상을 선택하세요.",
+      "no_sessions": "이 프로젝트에는 사용할 수 있는 실행 세션이 아직 없습니다."
+    },
+    "auto": {
+      "action": "Auto",
+      "kicker": "자동 전달",
+      "custom": "사용자 지정",
+      "launcher_title": "자동 전달",
+      "details_title": "Auto Deliver 세부 정보",
+      "current_run": "현재 Auto Deliver",
+      "list_title": "자동 전달",
+      "list_empty": "아직 자동 전달 실행이 없습니다.",
+      "list_select": "자동 전달 실행을 선택하세요.",
+      "no_change": "선택된 변경 없음",
+      "start": "Auto Deliver 시작",
+      "stop": "중지",
+      "stopping": "중지 중...",
+      "view": "보기",
+      "compact": "축소",
+      "expand": "확장",
+      "tasks": "Tasks",
+      "tasks_unknown": "작업 알 수 없음",
+      "tasks_progress": "{{checked}}/{{total}} tasks",
+      "overall_progress": "전체 진행률",
+      "current_stage_progress": "현재 단계",
+      "progress_count": "{{current}}/{{total}}",
+      "progress_percent": "{{percent}}%",
+      "prompt_count": "{{count}} prompts",
+      "prompt_progress": "{{count}}/{{total}} prompts",
+      "prompt_count_label": "Implementation prompts",
+      "latest_message": "최신 메시지",
+      "materialized_limits": "Spec audit {{spec}} · implementation audit {{impl}}",
+      "preset_limits": "Spec {{spec}} · Impl {{impl}}",
+      "conflict_active": "Auto Deliver is already running for {{change}}.",
+      "redacted_conflict": "같은 그룹의 다른 세션에서 Auto Deliver가 실행 중입니다.",
+      "conflict_summary": "자세한 정보는 참여 세션에서만 표시됩니다.",
+      "lock_manual_actions": "이 세션 그룹에서 Auto Deliver가 실행 중입니다.",
+      "status_label": "Status",
+      "stage_label": "Stage",
+      "elapsed": "경과 시간",
+      "preset_label": "Preset",
+      "owning_session": "Owning session",
+      "launched_from": "Launched from",
+      "execution_session": "Execution session",
+      "spec_round": "Spec audit round",
+      "impl_round": "Implementation audit round",
+      "active_p2p": "Active Team run",
+      "combo_id": "Team 콤보",
+      "active_prompt": "OpenSpec prompt",
+      "verdict": "Verdict",
+      "terminal_reason": "Terminal reason",
+      "task_stats": "Task status",
+      "scores": "Scores",
+      "final_scores": "Final acceptance scores",
+      "pre_repair_scores": "Pre-repair audit scores",
+      "score_snapshot_meta": "Round {{round}} · {{reason}}",
+      "scores_empty": "아직 점수가 없습니다",
+      "scores_pending_repair_rescore": "These scores are from the previous implementation audit. Auto Deliver is repairing those findings now and will rescore after implementation finishes.",
+      "audit_results": "감사 라운드 결과",
+      "audit_results_empty": "완료된 감사 라운드가 아직 없습니다",
+      "round_index": "{{count}} 라운드",
+      "required_changes": "필수 변경",
+      "evidence": "증거",
+      "evidence_stale": "오래됨",
+      "error": {
+        "missing_change": "Select an OpenSpec change first.",
+        "active_run": "이 세션 그룹에서 Auto Deliver가 이미 실행 중입니다.",
+        "manual_team_busy": "수동 Team 실행이 이 세션 그룹을 사용 중입니다.",
+        "unsupported_runtime": "Auto Deliver에는 transport 기반 코딩 세션이 필요합니다.",
+        "launch_failed": "Failed to start Auto Deliver.",
+        "invalid_rounds": "라운드 수가 허용 범위를 벗어났습니다.",
+        "daemon_offline": "Daemon이 오프라인입니다. 다시 연결된 뒤 재시도하세요.",
+        "launch_timeout": "자동 전달 시작 시간이 초과되었습니다. 다시 시도하세요.",
+        "stop_timeout": "자동 전달 중지가 시간 초과되었습니다. 다시 시도하세요.",
+        "custom_combo_unsupported": "자동 전달은 아직 사용자 Team 콤보를 지원하지 않습니다.",
+        "strict_result_failed": "The audit did not return a valid strict result.",
+        "continue_timeout": "Auto Deliver 계속 진행 시간이 초과되었습니다. 다시 시도하세요."
+      },
+      "preset": {
+        "fast": "빠름",
+        "standard": "표준",
+        "strict": "엄격",
+        "deep": "심층"
+      },
+      "status": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementing",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
+        "stopping": "Stopping",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped"
+      },
+      "stage": {
+        "proposed": "Proposed",
+        "spec_audit_repair": "Spec audit",
+        "implementation_task_loop": "Implementation",
+        "implementation_audit_repair": "Implementation audit",
+        "commit_push": "Commit & push",
+        "passed": "Passed",
+        "needs_human": "Needs human",
+        "failed": "Failed",
+        "stopped": "Stopped",
+        "stopping": "Stopping"
+      },
+      "score_module": {
+        "spec": "Spec",
+        "tasks": "Tasks",
+        "implementation": "Implementation",
+        "tests": "Tests",
+        "risk": "Risk"
+      },
+      "provenance": {
+        "daemon": "Daemon",
+        "implementation_reported": "Implementation reported",
+        "audit_reported": "Audit reported",
+        "none": "None"
+      },
+      "ask": {
+        "header": "OpenSpec Auto Deliver",
+        "needs_human_question": "Auto Deliver에 사람의 처리가 필요합니다: {{reason}} 이 세션에서 다음에 무엇을 할까요?",
+        "review_continue": "실패를 검토하고 수동으로 계속",
+        "review_continue_desc": "중단된 실행을 점검하고 문제를 수정한 뒤 결과를 보고하도록 지시합니다.",
+        "stop_summarize": "여기서 멈추고 현재 상태 요약",
+        "stop_summarize_desc": "에이전트에게 진행 중인 작업을 멈추고 간단한 인계 요약을 제공하도록 요청합니다."
+      },
+      "reason": {
+        "auto_deliver_active": "이 세션에서 Auto Deliver가 이미 실행 중입니다.",
+        "audit_p2p_failed": "Team/P2P 감사 실행이 결과를 생성하기 전에 실패했습니다.",
+        "missing_authoritative_json": "감사가 최종 권위 JSON 결과를 생성하지 않았습니다.",
+        "invalid_authoritative_json": "최종 권위 JSON 결과가 올바르지 않습니다.",
+        "audit_metadata_mismatch": "감사 결과 메타데이터가 이 Auto Deliver 실행과 일치하지 않습니다.",
+        "invalid_authoritative_result_path": "권위 결과 파일 경로가 허용된 discussion 디렉터리 밖에 있습니다.",
+        "invalid_audit_verdict": "감사 판정 페이로드가 올바르지 않습니다.",
+        "audit_blocked": "감사가 차단 결과를 보고했습니다. 점수를 검토한 뒤 Auto Deliver를 다시 실행할지 결정하세요.",
+        "tasks_unreadable": "tasks.md를 읽을 수 없습니다.",
+        "tasks_missing_checkboxes": "tasks.md에 검증할 작업 체크박스가 없습니다.",
+        "implementation_audit_required": "완료 전에 구현 감사가 필요합니다.",
+        "implementation_prompt_limit_reached": "구현 프롬프트 한도에 도달했습니다.",
+        "max_elapsed_time_reached": "Auto Deliver 시간 제한에 도달했습니다.",
+        "out_of_band_target_session_input": "Auto Deliver 중 구현 세션에 수동 입력이 전송되었습니다.",
+        "spec_audit_rework_reported": "명세 감사가 후속 작업을 보고했습니다. 점수를 검토한 뒤 Auto Deliver를 다시 실행할지 결정하세요.",
+        "implementation_audit_rework_reported": "구현 감사가 후속 작업을 보고했습니다. 점수를 검토한 뒤 Auto Deliver를 다시 실행할지 결정하세요.",
+        "spec_audit_rework_rounds_exhausted": "명세 감사-수정 라운드를 모두 사용했습니다.",
+        "implementation_audit_rework_rounds_exhausted": "구현 감사-수정 라운드를 모두 사용했습니다.",
+        "audit_pass_with_unchecked_tasks": "tasks.md에 미완료 작업이 남은 상태로 감사가 PASS 되었습니다.",
+        "audit_pass_with_required_changes": "필수 변경이 남은 상태로 감사가 PASS 되었습니다.",
+        "audit_pass_without_scores": "완전한 모듈 점수 없이 감사가 PASS 되었습니다.",
+        "audit_pass_with_changed_files_without_repairs": "파일 변경 후 수정 요약 없이 감사가 PASS 되었습니다.",
+        "audit_pass_with_uncovered_changes": "감사 수정 요약이 모든 변경 파일을 포함하지 않습니다.",
+        "quality_gate_low_score": "A quality gate paused for low module score: {{modules}}. Auto Deliver will run an implementation repair prompt, then audit and score again.",
+        "final_audit_passed": "최종 감사가 통과되었습니다.",
+        "final_audit_rework_scored": "최종 감사가 완료되었고 후속 작업 점수가 기록되었습니다. 모듈 점수를 확인해 Auto Deliver를 다시 실행할지 결정하세요.",
+        "final_audit_blocked_scored": "최종 감사가 완료되었고 차단 판정 점수가 기록되었습니다. 모듈 점수를 확인해 Auto Deliver를 다시 실행할지 결정하세요.",
+        "auto_commit_push_failed": "자동 commit/push 실패: {{detail}}",
+        "auto_commit_push_git_status_failed": "자동 commit/push를 위해 git 상태를 읽을 수 없습니다: {{detail}}",
+        "auto_commit_push_preexisting_changes": "시작 전에 이미 제품 파일 변경이 있어 자동 commit/push를 건너뛰었습니다: {{files}}",
+        "auto_commit_push_incomplete": "commit/push 단계 이후에도 제품 파일이 dirty 상태라서 사람의 검토가 필요합니다: {{files}}",
+        "auto_commit_push_no_upstream": "이 브랜치에 upstream이 없어 사람의 검토가 필요합니다.",
+        "auto_commit_push_not_pushed": "{{count}}개의 commit이 아직 upstream보다 앞서 있어 사람의 검토가 필요합니다.",
+        "auto_commit_push_no_commit": "새 commit이 생성되지 않아 사람의 검토가 필요합니다.",
+        "auto_commit_push_forbidden_paths": "로컬 계획 파일이 commit되어 사람의 검토가 필요합니다: {{files}}",
+        "auto_commit_push_unexpected_files": "commit에 이번 Auto Deliver 변경 범위 밖의 파일이 포함되어 사람의 검토가 필요합니다: {{files}}",
+        "spec_audit_blocked": "스펙 감사가 차단되었습니다. 결과를 확인하고 문제를 수정한 뒤 계속하세요.",
+        "implementation_audit_blocked": "구현 감사가 차단되었습니다. 결과를 확인하고 문제를 수정한 뒤 계속하세요.",
+        "spec_audit_rework_requires_repair": "스펙 감사에서 추가 수정이 필요하다고 보고했습니다. Auto Deliver가 다음 감사-수정 사이클을 계속합니다.",
+        "implementation_audit_rework_requires_repair": "Implementation audit reported required repairs. Auto Deliver will run implementation repair, then audit and score again.",
+        "spec_audit_followup_repair": "Spec audit discussion completed. Auto Deliver will repair the artifacts before final acceptance scoring.",
+        "implementation_audit_followup_repair": "Implementation audit discussion completed. Auto Deliver will run a final repair pass before acceptance scoring."
+      },
+      "lifecycle": {
+        "spec_audit_repair_started": "명세 감사-수정을 시작했습니다.",
+        "spec_audit_repair_p2p_started": "명세 감사 Team 실행을 시작했습니다.",
+        "implementation_prompt_dispatched": "구현 프롬프트를 보냈습니다.",
+        "spec_repair_prompt_dispatched": "Spec repair prompt sent from audit findings: {{reason}}",
+        "implementation_repair_prompt_dispatched": "Implementation repair prompt sent from audit findings: {{reason}}",
+        "implementation_idle_incomplete": "구현이 아직 작업을 처리 중입니다.",
+        "implementation_idle_all_checked": "모든 구현 작업이 체크되었습니다.",
+        "implementation_audit_repair_started": "구현 감사-수정을 시작했습니다.",
+        "implementation_audit_repair_p2p_started": "구현 감사 Team 실행을 시작했습니다.",
+        "auto_commit_push_prompt_dispatched": "Commit/push 프롬프트를 보냈습니다.",
+        "post_repair_acceptance_audit_dispatched": "Final acceptance audit sent.",
+        "post_repair_result_file_repair_prompt_dispatched": "최종 승인 결과 파일 수정 프롬프트를 보냈습니다.",
+        "authoritative_result_file_repair_prompt_dispatched": "결과 파일 수정 프롬프트를 보냈습니다.",
+        "spec_audit_passed": "명세 감사가 통과되었습니다.",
+        "spec_audit_rework_scored": "명세 감사가 완료되었고 후속 작업 점수가 기록되었습니다.",
+        "spec_audit_blocked_scored": "명세 감사가 완료되었고 차단 판정 점수가 기록되었습니다.",
+        "continue_requested": "계속 진행이 요청되었습니다."
+      },
+      "spec_rounds": "명세 감사 라운드",
+      "impl_rounds": "구현 감사 라운드",
+      "team_combo": "Team 콤보",
+      "auto_commit_push": "감사 통과 후 자동 commit & push",
+      "auto_commit_push_help": "사용자 기본값으로 저장됩니다. 감사 통과 후 agent에게 commit&push를 실행하게 합니다.",
+      "continue": "계속",
+      "continuing": "계속하는 중..."
+    },
     "propose_from_discussion_action": "최근 논의에서 생성",
     "propose_from_description_action": "아래 설명에서 생성",
     "audit_implementation_prompt": "{{reference}}에 대해 OpenSpec 산출물을 기준으로 엄격한 구현 감사를 수행하세요. 모든 불일치, 누락, 회귀 위험, 경계 사례 공백, 누락된 테스트를 찾아낸 뒤 코드, 테스트, 필요한 보조 변경까지 직접 수정하세요. 구현에 맞춰 명세 산출물도 움직여야 한다면 같은 작업 안에서 {{reference}} 아래 OpenSpec 파일까지 직접 갱신하세요. 보고서로 끝내지 말고 구현을 명세와 완전히 일치시키세요.",
@@ -1141,7 +1483,27 @@
     "passkey_verify_wrong_account": "이 패스키는 다른 계정에 속합니다. 현재 계정에 등록된 패스키로 확인하세요.",
     "passkey_verify_no_passkeys": "이 계정에는 등록된 패스키가 없습니다.",
     "native_status_verifying_passkey": "패스키 확인 중…",
-    "native_status_saving_password": "비밀번호 로그인 저장 중…"
+    "native_status_saving_password": "비밀번호 로그인 저장 중…",
+    "executionRouting": {
+      "title": "실행 라우팅",
+      "enableLabel": "전용 실행 세션 사용",
+      "enableHint": "활성화하면 구현/실행 작업이 오케스트레이터가 아니라 아래 템플릿 세션에서 복제된 수명이 짧은 클론 워커로 전달됩니다. 이를 저장해도 설정만 저장되며 실행을 시작하지 않습니다.",
+      "templateLabel": "실행 템플릿 세션",
+      "templateNone": "선택 안 함",
+      "templateHint": "클론은 이 세션의 제공자, 모델, 도구를 상속하지만 신원이나 기록은 절대 상속하지 않습니다. 이 프로젝트의 적격한 비메인 세션만 표시됩니다.",
+      "noCandidates": "이 프로젝트에 아직 적격한 템플릿 세션이 없습니다. 템플릿으로 사용할 워커나 서브 세션을 시작하세요.",
+      "reselectRequired": "라우팅이 활성화되었지만 이 프로젝트에 유효한 템플릿이 선택되지 않았습니다. 아래에서 실행 템플릿 세션을 선택하세요.",
+      "ineligibleOption": "{{name}} — {{reason}}",
+      "ineligibleReason": {
+        "capacity_full": "용량 한도 도달",
+        "template_ineligible": "템플릿으로 사용할 수 없음",
+        "clone_of_clone_forbidden": "이미 실행 클론임",
+        "worker_clone_forbidden": "워커는 템플릿이 될 수 없음",
+        "cron_clone_forbidden": "예약된 세션은 템플릿이 될 수 없음",
+        "target_not_found": "세션을 찾을 수 없음",
+        "destroy_forbidden": "허용되지 않음"
+      }
+    }
   },
   "admin": {
     "title": "관리자 패널",
@@ -1293,6 +1655,7 @@
     "restore_quick_closed": "방금 닫은 하위 세션 창 복원",
     "quick_close_unavailable": "먼저 하위 세션 창을 여세요",
     "p2p_discussions": "Team 토론",
+    "auto_deliver": "Auto Deliver",
     "p2p_compact_show": "컴팩트 Team 바 표시",
     "p2p_compact_hide": "Team 바 컴팩트로 접기",
     "p2p_compact_expand": "자세한 Team 바 표시",

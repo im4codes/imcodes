@@ -2,13 +2,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, mockResolveServerMemberAccessOrShareDeny } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
   hasDaemonCapabilityMock: vi.fn(),
+  mockResolveServerMemberAccessOrShareDeny: vi.fn(),
 }));
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -33,6 +36,10 @@ vi.mock('../src/ws/bridge.js', () => ({
       hasDaemonCapability: hasDaemonCapabilityMock,
     }),
   },
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
 vi.mock('../src/util/logger.js', () => ({
@@ -62,6 +69,7 @@ describe('file-transfer upload route', () => {
     hasDaemonCapabilityMock.mockReset();
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     sendFileTransferRequestMock.mockResolvedValue({
       type: 'file.upload_done',
       attachment: {
@@ -71,6 +79,25 @@ describe('file-transfer upload route', () => {
         downloadable: true,
       },
     });
+  });
+
+  it('rejects share-only uploads with the direct-surface reason before daemon relay', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+
+    const res = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
   it('rejects oversized legacy uploads from content-length before daemon relay', async () => {
@@ -263,5 +290,153 @@ describe('file-transfer upload route', () => {
         }),
       }),
     ]);
+  });
+});
+
+describe('file-transfer download route', () => {
+  beforeEach(() => {
+    sendFileTransferRequestMock.mockReset();
+    isDaemonConnectedMock.mockReset();
+    hasDaemonCapabilityMock.mockReset();
+    isDaemonConnectedMock.mockReturnValue(true);
+    hasDaemonCapabilityMock.mockReturnValue(true);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+  });
+
+  it('starts the browser download when the daemon PUT starts even if bridge ready never resolves', async () => {
+    const app = makeApp();
+    let stagedPut: Promise<Response> | undefined;
+
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId, message) => {
+      const downloadMessage = message as { type: string; uploadUrl: string };
+      expect(downloadMessage.type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+      const uploadUrl = new URL(downloadMessage.uploadUrl);
+      stagedPut = app.request(`${uploadUrl.pathname}${uploadUrl.search}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'text/plain',
+          'Content-Length': '5',
+          'x-imcodes-filename': encodeURIComponent('hello.txt'),
+        },
+        body: 'hello',
+      });
+      return new Promise(() => {});
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    expect(res.headers.get('content-length')).toBe('5');
+    expect(res.headers.get('content-disposition')).toContain('hello.txt');
+    await expect(res.text()).resolves.toBe('hello');
+    await expect(stagedPut).resolves.toMatchObject({ status: 200 });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        attachmentId: 'abc123',
+        uploadUrl: expect.stringContaining('/api/server/srv-1/download-staged/'),
+      }),
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+    );
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
+  });
+
+  it('falls back to the base64 download when the streamed relay fails to deliver bytes', async () => {
+    const app = makeApp();
+    // Every relay attempt rejects (relay wedged / never delivers); the base64
+    // file.download fallback then succeeds.
+    sendFileTransferRequestMock.mockImplementation((_requestId: string, message: unknown) => {
+      const type = (message as { type: string }).type;
+      if (type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) return Promise.reject(new Error('relay_upload_502'));
+      expect(type).toBe('file.download');
+      return Promise.resolve({
+        content: Buffer.from('hello world').toString('base64'),
+        mime: 'text/plain',
+        filename: 'hello.txt',
+      });
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    expect(res.headers.get('content-disposition')).toContain('hello.txt');
+    await expect(res.text()).resolves.toBe('hello world');
+    // All relay retries + the base64 fallback were issued.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS + 1);
+  });
+
+  it('surfaces a genuine not_found from the relay without a pointless base64 retry', async () => {
+    const app = makeApp();
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId: string, message: unknown) => {
+      expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+      return Promise.resolve({ type: 'file.download_error', message: 'not_found' });
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(404);
+    // A genuine missing-handle error must NOT trigger a base64 fallback.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to base64 when the relay reports a transport error (not a missing handle)', async () => {
+    const app = makeApp();
+    // Every relay attempt returns a transport error (NOT not_found); the base64
+    // file.download fallback then succeeds.
+    sendFileTransferRequestMock.mockImplementation((_requestId: string, message: unknown) => {
+      const type = (message as { type: string }).type;
+      if (type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) return Promise.resolve({ type: 'file.download_error', message: 'relay_upload_502' });
+      expect(type).toBe('file.download');
+      return Promise.resolve({
+        content: Buffer.from('recovered').toString('base64'),
+        mime: 'text/plain',
+        filename: 'r.txt',
+      });
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.text()).resolves.toBe('recovered');
+    // Relay errors → retries → base64 fallback, instead of a hard failure.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(FILE_TRANSFER_LIMITS.DOWNLOAD_STREAM_MAX_ATTEMPTS + 1);
+  });
+
+  it('returns a small file INLINE (file.download_done over WS) in one round-trip — no relay PUT, no fallback', async () => {
+    const app = makeApp();
+    // The daemon returns small files inline over the WS RPC instead of streaming
+    // through the relay. The server must return those bytes directly — the fast
+    // path that makes tiny files instant instead of waiting on the relay.
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId: string, message: unknown) => {
+      expect((message as { type: string }).type).toBe(FILE_TRANSFER_MSG.DOWNLOAD_STREAM);
+      return Promise.resolve({
+        type: 'file.download_done',
+        content: Buffer.from('hi there').toString('base64'),
+        mime: 'text/plain',
+        filename: 'note.txt',
+      });
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    expect(res.headers.get('content-disposition')).toContain('note.txt');
+    await expect(res.text()).resolves.toBe('hi there');
+    // Exactly one WS call: no relay PUT and no base64 fallback round-trip.
+    expect(sendFileTransferRequestMock).toHaveBeenCalledTimes(1);
   });
 });

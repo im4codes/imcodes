@@ -42,7 +42,7 @@ describe('skill registry and on-demand resolver', () => {
     buildUserSkillRegistry({ homeDir, context: { canonicalRepoId: 'github.com/acme/repo' } });
     await rm(skillPath);
 
-    const startup = buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
+    const startup = await buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
     expect(startup?.injectedText).toContain('testing/test-first');
     expect(startup?.injectedText).not.toContain('Run tests before final handoff.');
 
@@ -165,7 +165,7 @@ describe('skill registry and on-demand resolver', () => {
       updatedAt: Date.now(),
     }]);
 
-    const startup = buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
+    const startup = await buildTransportStartupMemory(namespace, { homeDir, skillsFeatureEnabled: true });
     expect(startup?.injectedText).toContain('skill://');
     expect(startup?.injectedText).not.toContain('/home/alice');
   });

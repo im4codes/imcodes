@@ -21,7 +21,7 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 }
 
 describe('memory MCP shared contracts', () => {
-  it('exposes exactly the twelve MVP tool names', () => {
+  it('exposes the registered MCP tool names including the execution-clone destroy tool', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
       'list_memory_summaries',
@@ -31,6 +31,7 @@ describe('memory MCP shared contracts', () => {
       'send_list_targets',
       'send_message',
       'send_stop',
+      'destroy_execution_clone',
       'cron_create',
       'cron_list',
       'cron_update',
@@ -62,8 +63,25 @@ describe('memory MCP shared contracts', () => {
     expect(sendList.description).toContain('current caller session');
     expect(sendList.description).toContain('stopped sessions are excluded');
     expect(sendList.description).toContain('if this returns no items');
+    expect(sendList.description).toContain('ask CC to audit');
+    expect(sendList.description).toContain('invite a reviewer to discuss');
+    expect(sendList.description).toContain('display label');
+    expect(sendList.description).toContain('no such running peer session is available');
     expect(sendMessage.description).toContain('caller session is not a valid target');
     expect(sendMessage.description).toContain('empty send_list_targets result');
+    expect(sendMessage.description).toContain('asking a CC session to audit');
+    expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
+
+    const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
+    const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;
+    const sendMessageReply = sendMessage.inputSchema.properties?.reply as { description?: string } | undefined;
+    const sendMessageBroadcast = sendMessage.inputSchema.properties?.broadcast as { description?: string } | undefined;
+    expect(sendListQuery?.description).toContain('cc');
+    expect(sendListQuery?.description).toContain('display labels');
+    expect(sendMessageText?.description).toContain('complete task/request text');
+    expect(sendMessageReply?.description).toContain('Set true');
+    expect(sendMessageReply?.description).toContain('discussion invites');
+    expect(sendMessageBroadcast?.description).toContain('every/all available sessions');
   });
 
   it('provides operational tool and parameter descriptions without secret/doc leakage', () => {

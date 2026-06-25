@@ -4,7 +4,8 @@ import { Cron } from 'croner';
 import { z } from 'zod';
 import type { Env } from '../env.js';
 import type { DbCronJob } from '../db/queries.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth } from '../security/authorization.js';
+import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { CRON_STATUS } from '../../../shared/cron-types.js';
@@ -173,8 +174,8 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
   const projectName = c.req.query('projectName') || null;
 
   if (serverId) {
-    const role = await resolveServerRole(c.env.DB, serverId, userId);
-    if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+    const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   }
 
   const jobs = await c.env.DB.query(
@@ -198,8 +199,8 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, timezone, expiresAt } = parsed.data;
   const persistedAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
 
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const validation = validateCronExpr(cronExpr, timezone);
   if ('error' in validation) {
@@ -238,8 +239,8 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
-  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId: job.server_id, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const updates = parsed.data;
   const now = Date.now();
@@ -308,8 +309,8 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
-  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId: job.server_id, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (newStatus === CRON_STATUS.ACTIVE && job.status !== CRON_STATUS.PAUSED) {
     return c.json({ error: 'cannot_resume', currentStatus: job.status }, 400);
@@ -338,8 +339,8 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
-  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId: job.server_id, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   await c.env.DB.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
 
@@ -361,8 +362,8 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
-  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId: job.server_id, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   try {
     await dispatchJobNow(c.env, job);
@@ -384,6 +385,10 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
   const serverId = routeServerId ?? c.req.query('serverId') ?? null;
   const limitParam = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(Math.max(1, limitParam), 200);
+  if (serverId) {
+    const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+    if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  }
 
   if (mode === 'latest') {
     // One row per job: most recent execution with job info
@@ -431,8 +436,8 @@ cronApiRoutes.get('/:id/executions', requireCronAuth(), async (c) => {
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
 
-  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
-  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId: job.server_id, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const executions = await c.env.DB.query(
     'SELECT id, status, detail, created_at FROM cron_executions WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2',

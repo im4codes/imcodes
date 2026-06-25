@@ -15,12 +15,12 @@ import type { MemorySearchResultItem } from '../context/memory-search.js';
 import {
   STARTUP_MEMORY_TOTAL_LIMIT,
   selectStartupMemoryByPolicy,
-  selectStartupMemoryItems,
   selectStartupObservationItems,
   type StartupMemoryCandidate,
 } from '../context/startup-memory.js';
 import { collectSkillStartupCandidates } from '../context/skill-startup-context.js';
-import { getLocalProcessedFreshness } from '../store/context-store.js';
+import { selectStartupMemoryForBootstrap } from '../context/memory-recall-client.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import {
   STARTUP_PROJECT_MEMORY_HEADER,
   STARTUP_SKILL_INDEX_HEADER,
@@ -124,10 +124,20 @@ async function buildBootstrapResult(
   projectDir?: string,
 ): Promise<TransportContextBootstrap> {
   const startupMemory = skipStartupMemory ? undefined : await buildTransportStartupMemoryForBootstrap(namespace, projectDir);
+  let localProcessedFreshness: ContextFreshness | undefined;
+  const diagnostics = [...(extras.diagnostics ?? [])];
+  try {
+    localProcessedFreshness = await getContextStoreClient().run<ContextFreshness>(
+      'getLocalProcessedFreshness', [namespace],
+    );
+  } catch {
+    diagnostics.push('local-processed-freshness:unavailable');
+  }
   return {
     namespace,
     ...extras,
-    localProcessedFreshness: getLocalProcessedFreshness(namespace),
+    diagnostics,
+    ...(localProcessedFreshness ? { localProcessedFreshness } : {}),
     startupMemory,
   };
 }
@@ -146,7 +156,7 @@ async function buildTransportStartupMemoryForBootstrap(
   });
 }
 
-export function buildTransportStartupMemory(
+export async function buildTransportStartupMemory(
   namespace: ContextNamespace,
   limitOrOptions: number | {
     limit?: number;
@@ -155,7 +165,7 @@ export function buildTransportStartupMemory(
     skillsFeatureEnabled?: boolean;
     remoteItems?: readonly MemorySearchResultItem[];
   } = STARTUP_MEMORY_TOTAL_LIMIT,
-): TransportMemoryRecallArtifact | undefined {
+): Promise<TransportMemoryRecallArtifact | undefined> {
   try {
     const options = typeof limitOrOptions === 'number'
       ? { limit: limitOrOptions }
@@ -163,11 +173,12 @@ export function buildTransportStartupMemory(
     const limit = options.limit ?? STARTUP_MEMORY_TOTAL_LIMIT;
     const remoteItems = options.remoteItems ?? [];
     const remoteIds = new Set(remoteItems.map((item) => item.id));
-    const processedItems = selectStartupMemoryItems(namespace, {
-      totalLimit: limit,
-      extraItems: remoteItems,
-    });
-    const observationItems = selectStartupObservationItems(namespace);
+    const selectionOptions = { totalLimit: limit, extraItems: remoteItems };
+    // Startup memory selection runs in the context-store worker (bounded L3
+    // RPC), off the daemon main thread; falls back to the in-process selection
+    // when the worker is not warm so startup never blocks the post-ack dispatch.
+    const processedItems = await selectStartupMemoryForBootstrap(namespace, selectionOptions).catch(() => remoteItems);
+    const observationItems = await selectStartupObservationItems(namespace).catch(() => []);
     const memoryById = new Map([...processedItems, ...observationItems].map((item) => [item.id, item]));
     const processedById = new Map(processedItems.map((item) => [item.id, item]));
     const skillCandidates = collectSkillStartupCandidates({

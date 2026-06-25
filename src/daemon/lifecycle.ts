@@ -4,12 +4,15 @@ import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
+import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
+import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { timelineStore } from './timeline-store.js';
@@ -35,13 +38,19 @@ import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersis
 import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
+import { observeTransportQueueRevision } from './transport-queue-revision.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
+import { backfillProjectionEmbeddings } from '../context/projection-embedding-maintenance.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
+import { getResendCount } from './transport-resend-queue.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
+import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { createWorkerSessionSyncRetrier, type WorkerSessionSyncRetrier, type WorkerSessionSyncRetryOutcome } from './worker-session-sync-retrier.js';
 import {
@@ -51,16 +60,24 @@ import {
 } from '../../shared/worker-session-snapshot.js';
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 
+function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event?.type !== 'assistant.text') continue;
+    const text = (event.payload as Record<string, unknown> | undefined)?.text;
+    if (typeof text === 'string' && text.trim()) return text.slice(0, 200);
+  }
+  return undefined;
+}
+
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 export async function getLastAssistantText(sessionName: string): Promise<string | undefined> {
+  const buffered = latestAssistantTextFromEvents(timelineEmitter.getBufferedEvents(sessionName));
+  if (buffered) return buffered;
+
   try {
     const events = await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 100 });
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].type === 'assistant.text') {
-        const text = (events[i].payload as Record<string, unknown>)?.text;
-        if (typeof text === 'string' && text.trim()) return text.slice(0, 200);
-      }
-    }
+    return latestAssistantTextFromEvents(events);
   } catch { /* ignore */ }
   return undefined;
 }
@@ -118,6 +135,34 @@ let ctx: DaemonContext | null = null;
 
 const WORKER_SESSION_SYNC_TIMEOUT_MS = 5_000;
 const STARTUP_WORKER_SESSION_SYNC_TIMEOUT_MS = 1_500;
+const SERVER_LINK_STARTUP_GRACE_MS = 12_000;
+const STARTUP_CONTEXT_REPLICATION_DELAY_MS = 90_000;
+const STARTUP_TIMELINE_RETENTION_DELAY_MS = 120_000;
+const STARTUP_MEMORY_PRUNING_DELAY_MS = 150_000;
+const STARTUP_CONTEXT_BACKFILL_DELAY_MS = 180_000;
+const STARTUP_SESSION_DB_PUSH_DELAY_MS = 210_000;
+// Lowest-priority startup task: backfill persisted projection embeddings so the
+// L3 semantic-recall rerank reads precomputed BLOBs instead of re-embedding on
+// the hot path. Runs after everything else has settled.
+const STARTUP_EMBEDDING_BACKFILL_DELAY_MS = 240_000;
+const STARTUP_TRANSPORT_RESTORE_DELAY_MS = 45_000;
+const STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS = 90_000;
+const TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS = 2_000;
+const TRANSPORT_SLOW_RESTORE_PROVIDER_PAUSE_MS = 5_000;
+const STARTUP_CONTEXT_BACKFILL_PAUSE_MS = 25;
+const STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY = 5;
+const LOCAL_STARTUP_TRANSPORT_PROVIDER_IDS = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
+
+function yieldToDaemonEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function pauseDaemonBackgroundWork(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
 
 async function persistSessionToWorker(
   workerUrl: string,
@@ -483,12 +528,10 @@ export async function startup(): Promise<DaemonContext> {
   //
   // Both calls walk every JSONL file in ~/.imcodes/timeline. With a backlog
   // of 50–100 oversized sessions (~5 MB each) the synchronous pre-R3 path
-  // blocked the daemon main thread for 5–20 s before `ready`. We now run
-  // them in the background, yielding the event loop between sessions, so
-  // the daemon comes up immediately and chip away at retention while WS /
-  // session restore proceeds in parallel. Both methods swallow internal
-  // errors; the surrounding handler logs anything that escapes.
-  void (async () => {
+  // blocked the daemon main thread for 5–20 s before `ready`. Keep this as
+  // delayed background retention so the ServerLink auth/proof window gets
+  // first claim on the event loop on session-heavy hosts.
+  const runTimelineStartupRetention = async (): Promise<void> => {
     try {
       const start = Date.now();
       await timelineStore.cleanup();
@@ -497,10 +540,25 @@ export async function startup(): Promise<DaemonContext> {
     } catch (err) {
       logger.warn({ err }, 'TimelineStore: startup cleanup/truncateAll background failed');
     }
-  })();
+  };
 
   // Archive stale local memory projections (recent_summary with no hits after 30 days)
-  pruneLocalMemory();
+  const runStartupMemoryPruning = async (): Promise<void> => {
+    await yieldToDaemonEventLoop();
+    // `pruneLocalMemory` already routes through the worker (in-process fallback
+    // when cold), so call it directly — no second client hop needed.
+    await pruneLocalMemory();
+  };
+
+  const runStartupEmbeddingBackfill = async (): Promise<void> => {
+    await yieldToDaemonEventLoop();
+    // One-time, low-priority, bounded backfill. Best-effort: the function never
+    // throws and quietly no-ops when the embedding model is unavailable.
+    const result = await backfillProjectionEmbeddings();
+    if (result.filled > 0 || result.remaining > 0) {
+      logger.info(result, 'projection embedding backfill completed (background)');
+    }
+  };
 
   const creds = await loadCredentials();
 
@@ -511,6 +569,16 @@ export async function startup(): Promise<DaemonContext> {
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
   configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
+  // Warm the context-store worker at boot so front-of-turn recall + store access
+  // run off the daemon main thread. Skipped under test (the in-process path is
+  // used there, matching the embedding engine's test behavior); recall callers
+  // fall back to in-process automatically until the worker reports ready.
+  if (!(process.env.VITEST || process.env.NODE_ENV === 'test')) {
+    getContextStoreClient().start();
+    // The worker is now the single long-lived DB owner — let it (not the
+    // main-thread connection) run the archive-backfill timer.
+    setArchiveBackfillSchedulingEnabled(false);
+  }
   if (creds) {
     try {
       const runtimeConfig = await fetchBackendSharedContextRuntimeConfig({ workerUrl: workerUrl!, serverId, token });
@@ -562,37 +630,42 @@ export async function startup(): Promise<DaemonContext> {
     logger.error({ err }, 'AckOutbox init failed — daemon continues (acks will be best-effort)');
   }
 
-  // Warm up the transformers.js embedding model in the background so the
-  // first user send after daemon start doesn't pay the ~16s cold-load latency
-  // inside prependLocalMemory(). Fire-and-forget — the recall path falls
-  // through safely if this is still in flight when the first message arrives.
-  void (async () => {
-    try {
-      const { generateEmbedding } = await import('../context/embedding.js');
-      const t0 = Date.now();
-      await generateEmbedding('warmup');
-      logger.info({ ms: Date.now() - t0 }, 'Embedding model warmed up');
-    } catch (err) {
-      // Non-fatal: semantic recall falls back to substring match if the
-      // model never loads.
-      logger.warn({ err }, 'Embedding model warmup failed — semantic recall will be lazy');
-    }
-  })();
+  // Do not warm the transformers.js embedding model during daemon startup.
+  // On session-heavy hosts the native model load can occupy the Node main
+  // thread long enough for ServerLink heartbeat/proof windows to go silent.
+  // Semantic recall already lazy-loads the model on first use and falls back
+  // safely if the model is unavailable.
 
   const skillReviewWorker = new LocalSkillReviewWorker();
   const liveContextIngestion = new LiveContextIngestion({
     sessionLookup: getSession,
     skillReviewScheduler: skillReviewWorker,
-    resolveBootstrap: (session) => resolveTransportContextBootstrap({
-      projectDir: session.projectDir,
-      transportConfig: getSession(session.name)?.transportConfig ?? session.transportConfig ?? {},
-    }),
+    shouldIngestTimelineEvent: (event, session) => !isP2pParticipantMemoryNoise(event, session, listP2pRuns()),
+    resolveBootstrap: (session) => {
+      const latest = getSession(session.name) ?? session;
+      if (latest.contextNamespace) {
+        return Promise.resolve({
+          namespace: latest.contextNamespace,
+          diagnostics: latest.contextNamespaceDiagnostics ?? ['namespace:persisted-session'],
+          ...(latest.contextRemoteProcessedFreshness ? { remoteProcessedFreshness: latest.contextRemoteProcessedFreshness } : {}),
+          ...(latest.contextLocalProcessedFreshness ? { localProcessedFreshness: latest.contextLocalProcessedFreshness } : {}),
+          ...(latest.contextRetryExhausted !== undefined ? { retryExhausted: latest.contextRetryExhausted } : {}),
+          ...(latest.contextSharedPolicyOverride ? { sharedPolicyOverride: latest.contextSharedPolicyOverride } : {}),
+        });
+      }
+      return resolveTransportContextBootstrap({
+        projectDir: latest.projectDir,
+        transportConfig: latest.transportConfig ?? {},
+        startupMemoryAlreadyInjected: true,
+      });
+    },
     onError: (err, event) => {
       logger.warn({ err, session: event.sessionId, type: event.type }, 'Live context ingestion failed');
     },
   });
 
   let serverLink: ServerLink | null = null;
+  let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
     serverLink.onMessage((msg) => {
@@ -601,7 +674,6 @@ export async function startup(): Promise<DaemonContext> {
     serverLink.onBinaryMessage((data) => {
       handlePreviewBinaryFrame(data, serverLink!);
     });
-    serverLink.connect();
 
     // Expose to the global error handlers in src/index.ts so uncaught
     // exceptions can be surfaced to browsers via daemon.error broadcasts.
@@ -611,74 +683,83 @@ export async function startup(): Promise<DaemonContext> {
 
     // Broadcast cached repo detections after connect so browsers that missed
     // the initial repo.detected push (e.g. connected late, reconnected) get the data.
-    setTimeout(() => {
-      if (!serverLink) return;
-      for (const session of listSessions()) {
-        const dir = session.projectDir;
-        if (!dir) continue;
-        const cacheKey = RepoCache.buildKey(dir, 'detect');
-        const cached = repoCache.get(cacheKey);
-        if (cached) {
-          try { serverLink.send({ type: 'repo.detected', projectDir: dir, context: cached }); } catch { /* ignore */ }
+    scheduleServerLinkRestoreBroadcast = () => {
+      const timer = setTimeout(() => {
+        if (!serverLink) return;
+        for (const session of listSessions()) {
+          const dir = session.projectDir;
+          if (!dir) continue;
+          const cacheKey = RepoCache.buildKey(dir, 'detect');
+          const cached = repoCache.get(cacheKey);
+          if (cached) {
+            try { serverLink.send({ type: 'repo.detected', projectDir: dir, context: cached }); } catch { /* ignore */ }
+          }
         }
-      }
-      // Re-broadcast active P2P runs so browsers get state after reconnect
-      for (const run of listP2pRuns()) {
-        if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
-        try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
-      }
-      // Re-sync all sub-sessions (including idle ones) so server DB and
-      // frontend stay in sync. The previous `state === 'running'` filter
-      // left idle sub-sessions with `state: 'unknown'` in the web sidebar
-      // after WS reconnect, which rendered as a stuck gray dot that only
-      // flipped to the correct color when the next live state transition
-      // happened — sometimes never, for genuinely-quiet sessions.
-      // Only skip terminal states that should have been cleaned up already.
-      for (const session of listSessions()) {
-        if (!session.name.startsWith('deck_sub_')) continue;
-        if (session.state === 'stopped') continue;
-        const sessionType = typeof session.agentType === 'string' && session.agentType ? session.agentType : null;
-        if (!sessionType) {
-          logger.warn({ sessionName: session.name }, 'Skipping subsession.sync during lifecycle restore without agentType');
-          continue;
+        // Re-broadcast active P2P runs so browsers get state after reconnect
+        for (const run of listP2pRuns()) {
+          if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
+          try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
         }
-        const id = session.name.slice('deck_sub_'.length);
-        try {
-          serverLink.send({
-            type: 'subsession.sync',
-            id,
-            // Including state here fixes "sidebar sub-session dot stuck
-            // gray after reconnect" — see buildSubSessionSync for the
-            // equivalent fix on the regular sync path.
-            state: session.state ?? null,
-            sessionType,
-            cwd: session.projectDir || null,
-            label: session.label ?? null,
-            ccSessionId: session.ccSessionId ?? null,
-            geminiSessionId: session.geminiSessionId ?? null,
-            parentSession: session.parentSession ?? null,
-            ccPresetId: session.ccPreset ?? null,
-            description: session.description ?? null,
-            runtimeType: session.runtimeType ?? null,
-            providerId: session.providerId ?? null,
-            providerSessionId: session.providerSessionId ?? null,
-            qwenModel: session.qwenModel ?? null,
-            qwenAuthType: session.qwenAuthType ?? null,
-            qwenAvailableModels: session.qwenAvailableModels ?? null,
-            codexAvailableModels: session.codexAvailableModels ?? null,
-            requestedModel: session.requestedModel ?? null,
-            activeModel: session.activeModel ?? session.modelDisplay ?? null,
-            modelDisplay: session.modelDisplay ?? null,
-            planLabel: session.planLabel ?? null,
-            quotaLabel: session.quotaLabel ?? null,
-            quotaUsageLabel: session.quotaUsageLabel ?? null,
-            quotaMeta: session.quotaMeta ?? null,
-            effort: session.effort ?? null,
-            transportConfig: session.transportConfig ?? null,
-          });
-        } catch { /* ignore */ }
-      }
-    }, 3_000); // delay to ensure WS auth handshake completes first
+        // Re-sync all sub-sessions (including idle ones) so server DB and
+        // frontend stay in sync. The previous `state === 'running'` filter
+        // left idle sub-sessions with `state: 'unknown'` in the web sidebar
+        // after WS reconnect, which rendered as a stuck gray dot that only
+        // flipped to the correct color when the next live state transition
+        // happened — sometimes never, for genuinely-quiet sessions.
+        // Only skip terminal states that should have been cleaned up already.
+        for (const session of listSessions()) {
+          if (!session.name.startsWith('deck_sub_')) continue;
+          if (session.state === 'stopped') continue;
+          const sessionType = typeof session.agentType === 'string' && session.agentType ? session.agentType : null;
+          if (!sessionType) {
+            logger.warn({ sessionName: session.name }, 'Skipping subsession.sync during lifecycle restore without agentType');
+            continue;
+          }
+          const id = session.name.slice('deck_sub_'.length);
+          const transportRuntime = getTransportRuntime(session.name);
+          try {
+            serverLink.send({
+              type: 'subsession.sync',
+              id,
+              // Including state here fixes "sidebar sub-session dot stuck
+              // gray after reconnect" — see buildSubSessionSync for the
+              // equivalent fix on the regular sync path.
+              state: session.state ?? null,
+              sessionType,
+              cwd: session.projectDir || null,
+              label: session.label ?? null,
+              ccSessionId: session.ccSessionId ?? null,
+              geminiSessionId: session.geminiSessionId ?? null,
+              parentSession: session.parentSession ?? null,
+              ccPresetId: session.ccPreset ?? null,
+              description: session.description ?? null,
+              runtimeType: session.runtimeType ?? null,
+              providerId: session.providerId ?? null,
+              providerSessionId: session.providerSessionId ?? null,
+              qwenModel: session.qwenModel ?? null,
+              qwenAuthType: session.qwenAuthType ?? null,
+              qwenAvailableModels: session.qwenAvailableModels ?? null,
+              codexAvailableModels: session.codexAvailableModels ?? null,
+              requestedModel: session.requestedModel ?? null,
+              activeModel: session.activeModel ?? session.modelDisplay ?? null,
+              modelDisplay: session.modelDisplay ?? null,
+              planLabel: session.planLabel ?? null,
+              quotaLabel: session.quotaLabel ?? null,
+              quotaUsageLabel: session.quotaUsageLabel ?? null,
+              quotaMeta: session.quotaMeta ?? null,
+              effort: session.effort ?? null,
+              transportConfig: session.transportConfig ?? null,
+              ...(transportRuntime ? {
+                transportPendingMessages: transportRuntime.pendingMessages,
+                transportPendingMessageEntries: transportRuntime.pendingEntries,
+                transportPendingMessageVersion: observeTransportQueueRevision(session.name, transportRuntime.pendingVersion),
+              } : {}),
+            });
+          } catch { /* ignore */ }
+        }
+      }, 3_000); // delay to ensure WS auth handshake completes first
+      timer.unref?.();
+    };
   }
 
   // Wire session events → ServerLink so the browser sees them
@@ -732,6 +813,7 @@ export async function startup(): Promise<DaemonContext> {
     let sessionsBackfilled = 0;
     for (const session of listSessions()) {
       sessionsSeen += 1;
+      if (sessionsSeen > 1) await yieldToDaemonEventLoop();
       // SQLite projection is the sole chat-history read source — no JSONL
       // `read()` fallback. That synchronous main-thread read was an event-loop
       // saturation amplifier under load (and JSONL is now write/backup-only).
@@ -747,9 +829,16 @@ export async function startup(): Promise<DaemonContext> {
       }
       if (history.length === 0) continue;
       sessionsBackfilled += 1;
-      void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
+      try {
+        await liveContextIngestion.backfillSessionFromEvents(session.name, history);
+      } catch (err) {
         logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
-      });
+      }
+      if (sessionsBackfilled % STARTUP_CONTEXT_BACKFILL_PAUSE_EVERY === 0) {
+        await pauseDaemonBackgroundWork(STARTUP_CONTEXT_BACKFILL_PAUSE_MS);
+      } else {
+        await yieldToDaemonEventLoop();
+      }
     }
     logger.info(
       { sessionsSeen, sessionsBackfilled, elapsedMs: Date.now() - startedAt },
@@ -803,7 +892,8 @@ export async function startup(): Promise<DaemonContext> {
       const pushableSessions = persistableSessions.filter((session) => allowedNames.has(session.name));
       const suppressedCount = persistableSessions.length - pushableSessions.length;
       let pushFailures = 0;
-      for (const s of pushableSessions) {
+      for (const [index, s] of pushableSessions.entries()) {
+        if (index > 0) await yieldToDaemonEventLoop();
         try {
           await persistSessionToWorker(workerUrl!, serverId, token, s.name, s);
         } catch (err) {
@@ -826,9 +916,13 @@ export async function startup(): Promise<DaemonContext> {
         );
       }
     };
-    void replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token }).catch((err) => {
-      logger.warn({ err }, 'Initial processed-context replication failed');
-    });
+    scheduleDaemonStartupBackgroundTask(
+      'initial processed-context replication',
+      async () => {
+        await replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token });
+      },
+      STARTUP_CONTEXT_REPLICATION_DELAY_MS,
+    );
   }
 
   async function persistBinding(platform: string, channelId: string, botId: string, bindingType: string, target: string): Promise<boolean> {
@@ -1020,7 +1114,32 @@ export async function startup(): Promise<DaemonContext> {
 
   logger.info('Daemon started');
 
-  void autoReconnectProviders();
+  if (serverLink) {
+    serverLink.connect();
+    scheduleServerLinkRestoreBroadcast?.();
+  }
+
+  const startupBackgroundBaseDelayMs = creds ? SERVER_LINK_STARTUP_GRACE_MS : 0;
+  scheduleDaemonStartupBackgroundTask(
+    'timeline retention startup cleanup',
+    runTimelineStartupRetention,
+    startupBackgroundBaseDelayMs + STARTUP_TIMELINE_RETENTION_DELAY_MS,
+  );
+  scheduleDaemonStartupBackgroundTask(
+    'startup local memory pruning',
+    runStartupMemoryPruning,
+    startupBackgroundBaseDelayMs + STARTUP_MEMORY_PRUNING_DELAY_MS,
+  );
+  scheduleDaemonStartupBackgroundTask(
+    'transport provider auto-reconnect',
+    autoReconnectProviders,
+    startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_RESTORE_DELAY_MS,
+  );
+  scheduleDaemonStartupBackgroundTask(
+    'transport runtime slow warm restore',
+    slowWarmRestoreTransportProviders,
+    startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS,
+  );
   if (creds && startupWorkerSessionSyncOutcome && startupWorkerSessionSyncOutcome.retryable) {
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = createWorkerSessionSyncRetrier({
@@ -1033,10 +1152,23 @@ export async function startup(): Promise<DaemonContext> {
     });
     workerSessionSyncRetrier.start(startupWorkerSessionSyncOutcome.reason ?? 'startup_sync_failed');
   }
-  scheduleDaemonStartupBackgroundTask('shared-context startup timeline backfill', backfillLiveContextFromTimeline, 2_000);
+  scheduleDaemonStartupBackgroundTask(
+    'shared-context startup timeline backfill',
+    backfillLiveContextFromTimeline,
+    startupBackgroundBaseDelayMs + STARTUP_CONTEXT_BACKFILL_DELAY_MS,
+  );
   if (pushLocalSessionsToWorkerOnStartup) {
-    scheduleDaemonStartupBackgroundTask('startup local main session DB push', pushLocalSessionsToWorkerOnStartup, 4_000);
+    scheduleDaemonStartupBackgroundTask(
+      'startup local main session DB push',
+      pushLocalSessionsToWorkerOnStartup,
+      startupBackgroundBaseDelayMs + STARTUP_SESSION_DB_PUSH_DELAY_MS,
+    );
   }
+  scheduleDaemonStartupBackgroundTask(
+    'startup projection embedding backfill',
+    runStartupEmbeddingBackfill,
+    startupBackgroundBaseDelayMs + STARTUP_EMBEDDING_BACKFILL_DELAY_MS,
+  );
 
   return ctx;
 }
@@ -1077,19 +1209,71 @@ async function reconcileRuntimesAfterWorkerSessionSync(
   }
 }
 
+function hasRestorableLocalTransportSessions(
+  providerId: string,
+  options: { onlyWithPendingResend?: boolean; onlyMissingRuntime?: boolean } = {},
+): boolean {
+  return listSessions().some((s) => {
+    const effectiveProviderId = s.providerId ?? s.agentType;
+    if (!(s.runtimeType === 'transport' || isTransportAgent(s.agentType))) return false;
+    if (effectiveProviderId !== providerId) return false;
+    if (!s.providerSessionId) return false;
+    if (options.onlyWithPendingResend && getResendCount(s.name) === 0) return false;
+    if (options.onlyMissingRuntime && getTransportRuntime(s.name)?.providerSessionId) return false;
+    return true;
+  });
+}
+
+let slowTransportWarmRestoreInFlight: Promise<void> | null = null;
+
+async function slowWarmRestoreTransportProviders(): Promise<void> {
+  if (slowTransportWarmRestoreInFlight) return slowTransportWarmRestoreInFlight;
+  const task = (async () => {
+    const { ensureProviderConnected } = await import('../agent/provider-registry.js');
+    const { restoreTransportSessions } = await import('../agent/session-manager.js');
+    let restoredProviderCount = 0;
+
+    for (const providerId of LOCAL_STARTUP_TRANSPORT_PROVIDER_IDS) {
+      if (!hasRestorableLocalTransportSessions(providerId, { onlyMissingRuntime: true })) continue;
+      if (restoredProviderCount > 0) {
+        await pauseDaemonBackgroundWork(TRANSPORT_SLOW_RESTORE_PROVIDER_PAUSE_MS);
+      }
+      try {
+        restoredProviderCount += 1;
+        logger.info({ providerId }, 'Starting delayed transport runtime warm restore');
+        await ensureProviderConnected(providerId, {});
+        await restoreTransportSessions(providerId, {
+          concurrency: 1,
+          interSessionDelayMs: TRANSPORT_SLOW_RESTORE_INTER_SESSION_DELAY_MS,
+        });
+      } catch (err) {
+        logger.warn({ err, providerId }, 'Delayed transport runtime warm restore failed');
+      }
+    }
+  })();
+  slowTransportWarmRestoreInFlight = task;
+  try {
+    await task;
+  } finally {
+    if (slowTransportWarmRestoreInFlight === task) slowTransportWarmRestoreInFlight = null;
+  }
+}
+
 async function autoReconnectProviders(): Promise<void> {
   try {
     // Dynamic import to avoid loading WS deps when not needed
-    const { listSessions } = await import('../store/session-store.js');
     const { loadConfig: loadOcConfig } = await import('../agent/openclaw-config.js');
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
-    for (const providerId of ['qwen', 'gemini-sdk', 'claude-code-sdk', 'codex-sdk', 'cursor-headless', 'copilot-sdk'] as const) {
-      if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
+    let restoredProviderCount = 0;
+    for (const providerId of LOCAL_STARTUP_TRANSPORT_PROVIDER_IDS) {
+      if (!hasRestorableLocalTransportSessions(providerId, { onlyWithPendingResend: true })) continue;
+      if (restoredProviderCount > 0) await yieldToDaemonEventLoop();
       try {
+        restoredProviderCount += 1;
         await ensureProviderConnected(providerId, {});
-        await restoreTransportSessions(providerId);
+        await restoreTransportSessions(providerId, { onlyWithPendingResend: true });
       } catch (err) {
         logger.warn({ err, providerId }, 'Local transport provider auto-connect failed');
       }
@@ -1111,7 +1295,7 @@ async function autoReconnectProviders(): Promise<void> {
           });
           logger.info('OpenClaw gateway reconnected');
           try {
-            await restoreTransportSessions('openclaw');
+            await restoreTransportSessions('openclaw', { onlyWithPendingResend: true });
           } catch (e) {
             logger.warn({ err: e }, 'Failed to restore transport sessions after provider connect');
           }
@@ -1145,6 +1329,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
         }
       }
     } catch { /* conpty not available */ }
+  }
+
+  try {
+    const { terminalStreamer } = await import('./terminal-streamer.js');
+    await terminalStreamer.destroyAsync();
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown terminal streamer drain failed');
   }
 
   try {
@@ -1256,6 +1447,13 @@ export async function shutdown(exitCode = 0): Promise<void> {
 }
 
 const HEALTH_POLL_MS = 30_000;
+// Last-resort recovery for a transport turn that has gone silent (no provider
+// output) long enough to look like a stuck PHANTOM. This must be conservative:
+// Codex/Claude can legitimately spend several minutes thinking or running a
+// quiet command with no deltas, and a 60s health-poll threshold falsely cancels
+// real turns. Queue-stuck flows have their own targeted recovery path; this
+// empty-queue spinner recovery should only fire after a very long silence.
+const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 30 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
 const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
@@ -1271,43 +1469,128 @@ let gcTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
+/** Mark an execution clone whose tmux pane has died as completed so the GC
+ *  retention reap can later remove it. Execution clones are NEVER respawned —
+ *  a dead clone pane means the worker ended. Retention is the configured
+ *  duration persisted at create (`resolveExecutionCloneRetentionMs`), falling
+ *  back to the parser default for old/rolling records. */
+function completeExecutionCloneOnPaneDeath(s: SessionRecord): void {
+  const meta = s.executionCloneMetadata;
+  if (!meta || meta.completedAt || meta.cleanupState === 'destroying' || meta.cleanupState === 'destroyed') return;
+  const now = Date.now();
+  upsertSession({
+    ...s,
+    state: 'stopped',
+    updatedAt: now,
+    executionCloneMetadata: {
+      ...meta,
+      completedAt: now,
+      retentionExpiresAt: now + resolveExecutionCloneRetentionMs(meta),
+      cleanupState: 'collecting',
+    },
+  });
+  timelineEmitter.emit(s.name, EXECUTION_CLONE_TIMELINE.TERMINAL, {
+    sessionName: s.name,
+    parentRunId: meta.parentRunId,
+    reason: 'pane_death',
+  });
+}
+
+/** Per-session health check. Exported so the execution-clone respawn-skip and
+ *  the sweep can be asserted deterministically without the 30s tick (task 3.9). */
+export async function checkSessionHealth(s: SessionRecord): Promise<void> {
+  if (s.state === 'stopped' || s.state === 'error') return;
+  // Execution clones are ephemeral: NEVER auto-respawn (this is the real
+  // destroy-safety mechanism — teardown is not atomic). On pane death, mark for
+  // the retention reap instead of resurrecting the worker.
+  if (isExecutionClone(s)) {
+    if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) return; // no pane; bounded by hard-timeout / orchestrator / restart sweep
+    try {
+      const exists = await sessionExists(s.name);
+      if (!exists || !(await isPaneAlive(s.name))) completeExecutionCloneOnPaneDeath(s);
+    } catch { /* ignore */ }
+    return;
+  }
+  // Transport sessions have no tmux pane — skip tmux health checks.
+  // Belt-and-suspenders: also check agentType so records persisted before
+  // the runtimeType field existed (or written by an older daemon) don't
+  // fall through and trigger a tmux restart loop on transport sessions.
+  if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) return;
+  // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
+  if (s.name.startsWith('deck_sub_')) {
+    try {
+      const exists = await sessionExists(s.name);
+      if (!exists) {
+        logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
+        upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
+      } else if (!(await isPaneAlive(s.name))) {
+        logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
+        await respawnSession(s);
+      }
+    } catch { /* ignore */ }
+    return;
+  }
+  try {
+    const exists = await sessionExists(s.name);
+    if (!exists) {
+      logger.warn({ session: s.name }, 'Session missing, attempting restart');
+      await restartSession(s);
+    } else if (!(await isPaneAlive(s.name))) {
+      logger.warn({ session: s.name }, 'Pane dead, respawning');
+      await respawnSession(s);
+    }
+  } catch (err) {
+    logger.warn({ session: s.name, err }, 'Health check error');
+  }
+}
+
+/** Sweep expired execution clones on each health tick (task 3.6). Three branches:
+ *  (1) creator-gone orphan sweep — the orchestrator session that created the clone
+ *  is gone/stopped/errored, so no owner remains to collect the worker's results;
+ *  (2) running clones past their hard timeout are stopped+destroyed; (3) completed
+ *  clones past their retention window are reaped. This is a creator-gone orphan
+ *  sweep + retention/hardTimeout backstop, NOT a full parent-run-terminal sweep:
+ *  registry absence is ambiguous (runs are DELETED on completion) so it can never
+ *  prove terminality and is never used here. Creator liveness is the only positive
+ *  terminal signal and covers all parent stages. Daemon restart sweeps ALL clones
+ *  (see initOnStartup). */
+export async function runExecutionCloneSweep(now: number): Promise<void> {
+  await sweepExecutionClones(now, {
+    // Positive terminal signal: the clone's creator session is provably gone.
+    // Unknown/alive creator → protect (fall back to retention/hardTimeout).
+    isCloneParentTerminal: (rec) => {
+      const creator = rec.executionCloneMetadata?.createdBySessionName;
+      if (!creator) return false; // no creator info → protect
+      const s = getSession(creator);
+      return !s || s.state === 'stopped' || s.state === 'error';
+    },
+    isRunning: (r) => !r.executionCloneMetadata?.completedAt && r.state !== 'stopped' && r.state !== 'error',
+    destroy: (target, reason) => destroyExecutionClone({ target, reason, bypassAuth: true }),
+  });
+}
+
 /** Periodically check all running sessions; restart any that have disappeared or died. */
 function startHealthPoller(): void {
   healthTimer = setInterval(async () => {
     const sessions = listSessions();
     for (const s of sessions) {
-      if (s.state === 'stopped' || s.state === 'error') continue;
-      // Transport sessions have no tmux pane — skip tmux health checks.
-      // Belt-and-suspenders: also check agentType so records persisted before
-      // the runtimeType field existed (or written by an older daemon) don't
-      // fall through and trigger a tmux restart loop on transport sessions.
-      if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) continue;
-      // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
-      if (s.name.startsWith('deck_sub_')) {
-        try {
-          const exists = await sessionExists(s.name);
-          if (!exists) {
-            logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
-            upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
-          } else if (!(await isPaneAlive(s.name))) {
-            logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
-            await respawnSession(s);
-          }
-        } catch { /* ignore */ }
-        continue;
-      }
+      await checkSessionHealth(s);
+      // Safety net: settle a phantom (silent-but-"active") transport turn to
+      // idle — and drain any queued work — so the session can't stay "working"
+      // forever. Fires whether or not anything is queued.
       try {
-        const exists = await sessionExists(s.name);
-        if (!exists) {
-          logger.warn({ session: s.name }, 'Session missing, attempting restart');
-          await restartSession(s);
-        } else if (!(await isPaneAlive(s.name))) {
-          logger.warn({ session: s.name }, 'Pane dead, respawning');
-          await respawnSession(s);
-        }
+        getTransportRuntime(s.name)?.recoverSilentActiveTurn({
+          reason: 'health-poll-stale-active-turn',
+          staleMs: TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS,
+        });
       } catch (err) {
-        logger.warn({ session: s.name, err }, 'Health check error');
+        logger.warn({ err, sessionName: s.name }, 'transport stale-active-turn recovery sweep error');
       }
+    }
+    try {
+      await runExecutionCloneSweep(Date.now());
+    } catch (err) {
+      logger.warn({ err }, 'Execution-clone sweep error');
     }
   }, HEALTH_POLL_MS);
 }
@@ -1317,6 +1600,12 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
   codexQuotaTimer = setInterval(() => {
     void refreshCodexQuotaMetadata(serverLink).catch((err) => {
       logger.warn({ err }, 'Codex quota refresh failed');
+    });
+    // claude-code-sdk sub-sessions are excluded from session_list (which carries
+    // the Option-B 5h+weekly override for main sessions), so push a periodic
+    // subsession.sync to keep their 7d quota line fresh — mirrors the codex subs.
+    void refreshClaudeSdkSubQuotaMetadata(serverLink).catch((err) => {
+      logger.warn({ err }, 'Claude SDK sub-session quota refresh failed');
     });
   }, CODEX_QUOTA_REFRESH_MS);
 }
@@ -1332,7 +1621,10 @@ function startContextReplicationPoller(workerUrl: string | undefined, serverId: 
 
 function startContextMaterializationPoller(liveContextIngestion: LiveContextIngestion): void {
   contextMaterializationTimer = setInterval(() => {
-    void liveContextIngestion.flushDueTargets().catch((err) => {
+    void (async () => {
+      await liveContextIngestion.flushAllRetryBuffers();
+      await liveContextIngestion.flushDueTargets();
+    })().catch((err) => {
       logger.warn({ err }, 'Context materialization poll failed');
     });
   }, CONTEXT_MATERIALIZATION_POLL_MS);

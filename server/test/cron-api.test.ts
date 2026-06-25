@@ -14,6 +14,7 @@ import { CRON_STATUS } from '../../shared/cron-types.js';
 // Mock requireAuth to inject a deterministic userId without real JWT/cookie logic.
 // Mock resolveServerRole to be controllable per-test.
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
+const mockResolveServerMemberAccessOrShareDeny = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (k: string, v: string) => void }, next: () => Promise<void>) => {
@@ -22,6 +23,10 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveServerMemberAccessOrShareDeny: (...args: unknown[]) => mockResolveServerMemberAccessOrShareDeny(...args),
 }));
 
 vi.mock('../src/security/audit.js', () => ({
@@ -190,6 +195,12 @@ describe('Cron API routes', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMemberAccessOrShareDeny.mockImplementation(async () => {
+      const role = await mockResolveServerRole();
+      return role === 'none'
+        ? { ok: false, reason: 'not_authorized_for_server' }
+        : { ok: true, role };
+    });
     mockDb = makeMockDb();
     const env = makeEnv(mockDb.db);
     app = await buildTestApp(env);
@@ -215,6 +226,19 @@ describe('Cron API routes', () => {
       expect(body.status).toBe(CRON_STATUS.ACTIVE);
       expect(body.nextRunAt).toBeTypeOf('number');
       expect(body.action).toEqual({ type: 'command', command: '/status' });
+    });
+
+    it('rejects share-only server-scoped cron creation with the direct-surface reason', async () => {
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+        ok: false,
+        reason: 'share-direct-surface-denied',
+      });
+
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', validCommandBody));
+
+      expect(res.status).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
+      expect(mockDb.cronJobs.size).toBe(0);
     });
 
     it('accepts a null targetSessionName for main-session cron jobs', async () => {

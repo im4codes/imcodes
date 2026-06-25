@@ -22,6 +22,7 @@ const {
   getClaudeSdkRuntimeConfigMock,
   getQwenDisplayMetadataMock,
   getQwenOAuthQuotaUsageLabelMock,
+  cloneGitRemoteToDirectoryMock,
 } = vi.hoisted(() => {
   const sessions = new Map<string, SessionRecord>();
   const p2pConfigs = new Map<string, import('../../shared/p2p-modes.js').P2pSavedConfig>();
@@ -48,6 +49,7 @@ const {
     getClaudeSdkRuntimeConfigMock: vi.fn(async () => ({})),
     getQwenDisplayMetadataMock: vi.fn(() => ({})),
     getQwenOAuthQuotaUsageLabelMock: vi.fn(() => undefined),
+    cloneGitRemoteToDirectoryMock: vi.fn(),
   };
 });
 
@@ -98,6 +100,18 @@ vi.mock('../../src/store/p2p-config-store.js', () => ({
   getSavedP2pConfig: getSavedP2pConfigMock,
   upsertSavedP2pConfig: upsertSavedP2pConfigMock,
   removeSavedP2pConfig: removeSavedP2pConfigMock,
+}));
+
+vi.mock('../../src/daemon/git-remote-clone.js', () => ({
+  GitRemoteCloneError: class GitRemoteCloneError extends Error {
+    readonly code: string;
+    constructor(code: string, message: string) {
+      super(message);
+      this.name = 'GitRemoteCloneError';
+      this.code = code;
+    }
+  },
+  cloneGitRemoteToDirectory: cloneGitRemoteToDirectoryMock,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -229,6 +243,7 @@ beforeEach(() => {
   });
   installDefaultLaunchMocks();
   getPaneCwdMock.mockRejectedValue(new Error('tmux unavailable'));
+  cloneGitRemoteToDirectoryMock.mockImplementation(async ({ targetDir }: { targetDir: string }) => targetDir);
   persistSessionRecordAwaitedMock.mockResolvedValue(undefined);
 });
 
@@ -307,7 +322,7 @@ describe('daemon session group clone', () => {
 
     const main = sessions.get('deck_cd_1_brain');
     expect(main).toMatchObject({
-      label: 'CD Brain',
+      label: 'cd_1',
       description: 'main persona',
       requestedModel: 'opus',
       activeModel: 'opus-active',
@@ -352,6 +367,81 @@ describe('daemon session group clone', () => {
     expect(eventText).not.toContain('SECRET_SUB_KEY');
     expect(eventText).not.toContain('authorization');
     expect(eventText).not.toContain('transportConfig');
+  });
+
+  it('copies daemon-local Team config saved under a source member scope', async () => {
+    const dir = await makeDir('member-p2p-config');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+    }));
+    sessions.set('deck_sub_active', makeSession({
+      name: 'deck_sub_active',
+      projectName: 'deck_sub_active',
+      role: 'w1',
+      projectDir: dir,
+      parentSession: 'deck_cd_brain',
+      label: 'Worker A',
+    }));
+    p2pConfigs.set('server-1:deck_sub_active', {
+      sessions: {
+        deck_sub_active: { enabled: true, mode: 'audit' },
+      },
+      rounds: 2,
+      contextReducer: {
+        mode: 'reuse_existing_session',
+        sessionName: 'deck_sub_active',
+      },
+    });
+    const { link, sent } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-member-p2p-${unique++}`,
+    }, link as never);
+
+    const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
+    expect(clonedSub?.name).toBeDefined();
+    expect(p2pConfigs.get('server-1:deck_cd_1_brain')).toMatchObject({
+      sessions: {
+        [clonedSub!.name]: { enabled: true, mode: 'audit' },
+      },
+      rounds: 2,
+      contextReducer: {
+        sessionName: clonedSub!.name,
+      },
+    });
+    expect(sent.at(-1)).toMatchObject({ state: 'succeeded' });
+  });
+
+  it('preserves a non-English target project name as the cloned main display label', async () => {
+    const dir = await makeDir('non-english-label');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+      label: 'Source Label',
+    }));
+    const { link } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      targetProjectName: '客户项目',
+      idempotencyKey: `idem-non-english-label-${unique++}`,
+    }, link as never);
+
+    const main = [...sessions.values()].find((record) => record.role === 'brain' && record.name !== 'deck_cd_brain');
+    expect(main).toMatchObject({
+      name: 'deck_u5ba2_u6237_u9879_u76ee_brain',
+      projectName: 'u5ba2_u6237_u9879_u76ee',
+      label: '客户项目',
+      userCreated: true,
+    });
   });
 
   it('syncs every cloned active direct child through the sub-session DB path', async () => {
@@ -729,6 +819,59 @@ describe('daemon session group clone', () => {
     ]);
   });
 
+  it('launches cloned sub-sessions concurrently instead of awaiting each one sequentially', async () => {
+    const dir = await makeDir('sub-parallel');
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: dir,
+    }));
+    for (const label of ['Reviewer', 'Implementer', 'Summarizer'] as const) {
+      const name = `deck_sub_${label.toLowerCase()}`;
+      sessions.set(name, makeSession({
+        name,
+        projectName: name,
+        role: 'w1',
+        projectDir: dir,
+        parentSession: 'deck_cd_brain',
+        label,
+      }));
+    }
+    const { link } = makeServerLink();
+
+    // Each launch parks on a manually released promise. If launches were
+    // sequential, the second startSubSession would never be invoked while the
+    // first is still pending and peak in-flight would stay at 1.
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const defaultImpl = startSubSessionMock.getMockImplementation()!;
+    const releases: Array<() => void> = [];
+    startSubSessionMock.mockImplementation(async (sub: Parameters<typeof defaultImpl>[0]) => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise<void>((resolve) => { releases.push(resolve); });
+      inFlight -= 1;
+      await defaultImpl(sub);
+    });
+
+    const clonePromise = handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-sub-parallel-${unique++}`,
+    }, link as never);
+
+    await vi.waitFor(() => {
+      expect(releases.length).toBe(3);
+    });
+    expect(peakInFlight).toBe(3);
+    for (const release of releases) release();
+    await clonePromise;
+
+    expect(startSubSessionMock).toHaveBeenCalledTimes(3);
+    expect([...sessions.values()].filter((record) => record.parentSession === 'deck_cd_1_brain')).toHaveLength(3);
+  });
+
   it('persists Qwen preset fields for main and sub-session clones and retargets cloned-root P2P config', async () => {
     const dir = await makeDir('qwen-preset-persist');
     sessions.set('deck_cd_brain', makeSession({
@@ -899,6 +1042,44 @@ describe('daemon session group clone', () => {
     expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(resolvedTargetDir);
     const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
     expect(clonedSub?.projectDir).toBe(resolvedTargetDir);
+  });
+
+  it('clones an optional git remote into the cwd override before copying the group', async () => {
+    const sourceDir = await makeDir('remote-source');
+    const requestedTargetDir = join(await makeDir('remote-parent'), 'checkout');
+    const clonedTargetDir = await makeDir('remote-cloned');
+    cloneGitRemoteToDirectoryMock.mockResolvedValueOnce(clonedTargetDir);
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      projectDir: sourceDir,
+    }));
+    sessions.set('deck_sub_active', makeSession({
+      name: 'deck_sub_active',
+      projectName: 'deck_sub_active',
+      role: 'w1',
+      projectDir: '',
+      parentSession: 'deck_cd_brain',
+    }));
+    const { link, sent } = makeServerLink();
+
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-remote-cwd-${unique++}`,
+      cwdOverride: requestedTargetDir,
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
+    }, link as never);
+
+    expect(cloneGitRemoteToDirectoryMock).toHaveBeenCalledWith({
+      gitRemoteUrl: 'https://github.com/acme/copied.git',
+      targetDir: requestedTargetDir,
+    });
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(sessions.get('deck_cd_1_brain')?.projectDir).toBe(clonedTargetDir);
+    const clonedSub = [...sessions.values()].find((record) => record.parentSession === 'deck_cd_1_brain');
+    expect(clonedSub?.projectDir).toBe(clonedTargetDir);
   });
 
   it('uses the live process pane cwd when an active sub-session has no persisted cwd', async () => {

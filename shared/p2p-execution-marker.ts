@@ -2,6 +2,27 @@ export const P2P_EXECUTION_MARKER_SCHEMA_VERSION = 1 as const;
 
 export type P2pExecutionMarkerStatus = 'completed' | 'failed';
 
+/**
+ * Error tokens emitted by the P2P post-summary execution gate when its final hop
+ * either writes a `failed` execution marker (`post_summary_execution_failed`) or
+ * times out (`post_summary_execution_timeout`). Consumers (e.g. OpenSpec Auto
+ * Deliver) treat these as recoverable "could not finish in this turn" outcomes,
+ * distinct from infrastructure failures such as `dispatch_failed`.
+ */
+export const POST_SUMMARY_EXECUTION_FAILURE_REASON_PREFIX = 'post_summary_execution';
+export const POST_SUMMARY_EXECUTION_FAILED_ERROR_TYPE = 'post_summary_execution_failed';
+export const POST_SUMMARY_EXECUTION_TIMEOUT_REASON = 'post_summary_execution_timeout';
+
+/**
+ * True when a terminated P2P run's error string indicates the post-summary
+ * execution gate could not complete (agent-authored `failed` marker or gate
+ * timeout), as opposed to an infrastructure/dispatch failure such as
+ * `dispatch_failed`.
+ */
+export function isPostSummaryExecutionGateFailure(p2pError: string | null | undefined): boolean {
+  return typeof p2pError === 'string' && p2pError.includes(POST_SUMMARY_EXECUTION_FAILURE_REASON_PREFIX);
+}
+
 export interface P2pExecutionMarkerSpec {
   runId: string;
   cycleIndex: number;

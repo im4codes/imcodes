@@ -3,9 +3,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const {
   startProjectMock,
   launchTransportSessionMock,
+  maybeCloneGitRemoteToDirectoryMock,
 } = vi.hoisted(() => ({
   startProjectMock: vi.fn(),
   launchTransportSessionMock: vi.fn(),
+  maybeCloneGitRemoteToDirectoryMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -52,6 +54,9 @@ vi.mock('../../src/util/logger.js', () => ({ default: { info: vi.fn(), warn: vi.
 vi.mock('../../src/util/imc-dir.js', () => ({ ensureImcDir: vi.fn().mockResolvedValue('/tmp/imc'), imcSubDir: vi.fn((dir: string, sub: string) => `${dir}/.imc/${sub}`) }));
 vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { decide: vi.fn() } }));
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
+vi.mock('../../src/daemon/git-remote-clone.js', () => ({
+  maybeCloneGitRemoteToDirectory: maybeCloneGitRemoteToDirectoryMock,
+}));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
@@ -67,6 +72,7 @@ describe('command-handler test-session guard', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    maybeCloneGitRemoteToDirectoryMock.mockImplementation(async ({ targetDir }: { targetDir: string }) => targetDir);
   });
 
   it('rejects known test main-session starts before launching a runtime', async () => {
@@ -83,6 +89,29 @@ describe('command-handler test-session guard', () => {
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.error',
       project: 'bootmainabc123',
+    }));
+  });
+
+  it('clones an optional git remote before starting a main session', async () => {
+    maybeCloneGitRemoteToDirectoryMock.mockResolvedValueOnce('/work/remote-app');
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'remote-app',
+      dir: '/work/remote-app',
+      agentType: 'claude-code',
+      gitRemoteUrl: 'https://github.com/acme/remote-app.git',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(maybeCloneGitRemoteToDirectoryMock).toHaveBeenCalledWith({
+      gitRemoteUrl: 'https://github.com/acme/remote-app.git',
+      targetDir: '/work/remote-app',
+    });
+    expect(startProjectMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'remote_app',
+      label: 'remote-app',
+      dir: '/work/remote-app',
     }));
   });
 });

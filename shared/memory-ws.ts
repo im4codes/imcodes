@@ -129,6 +129,8 @@ export const MEMORY_MCP_DEGRADED_REASON = {
   ...MEMORY_MCP_PROVIDER_STATUS_REASON,
   ENV_FORWARDING_UNVERIFIED: 'env_forwarding_unverified',
   FEATURE_DISABLED: MCP_ERROR_REASONS.FEATURE_DISABLED,
+  LOCAL_CONTEXT_STORE_UNAVAILABLE: 'local_context_store_unavailable',
+  SEMANTIC_EMBEDDING_UNAVAILABLE: 'embedding_unavailable',
   STATUS_NOT_REPORTED: 'status_not_reported',
 } as const;
 

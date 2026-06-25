@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
+  LOOPBACK_HOSTS,
   appendPreviewAccessTokenIfMissing,
+  defaultPortForProtocol,
   filterPreviewResponseHeaders,
   isWebSocketUpgrade,
   rewritePreviewRedirectLocation,
   rewriteSetCookieHeader,
   sanitizePreviewRequestHeaders,
+  shouldRewritePreviewRedirect,
   stripPreviewAccessTokenFromUpstreamPath,
 } from '../../shared/preview-policy.js';
 import { isStreamingResponse } from '../../shared/preview-stream-policy.js';
-import { rewritePreviewHtmlDocument } from '../src/preview/policy.js';
+import { buildPreviewRuntimePatch, rewritePreviewHtmlDocument } from '../src/preview/policy.js';
 import { COOKIE_CSRF, COOKIE_SESSION } from '../../shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '../../shared/preview-types.js';
 
@@ -150,6 +153,27 @@ describe('local web preview policy', () => {
     expect(rewritten).toContain(`href="${prefix}/docs?q=1"`);
     expect(rewritten).toContain(`src="${prefix}/logo.png"`);
     expect(rewritten).toContain(`var PREVIEW_PORT=3000`);
+  });
+
+  // T-R-CC1-1 regex-derivation coverage: the absolute-loopback HTML rewriter
+  // (`rewriteAbsoluteLocalhostValue`) builds its host alternation by REGEX-ESCAPING
+  // each LOOPBACK_HOST. The bracketed IPv6 host `[::1]` carries the regex
+  // metacharacters `[` and `]`, and `0.0.0.0` (the dev-server wildcard bind) carries
+  // `.` — if the escaping were wrong the alternation would be malformed / mismatch.
+  // This exercises those branches end-to-end through the HTML document rewrite.
+  it('rewrites absolute [::1] and 0.0.0.0 loopback urls in HTML (derived-regex metachar escaping)', () => {
+    const html = `
+      <html><head></head><body>
+        <img src="http://[::1]:3000/v6.png" />
+        <a href="http://0.0.0.0:3000/wild?x=1">Wild</a>
+      </body></html>
+    `;
+    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123', 3000);
+    const prefix = '/api/server/server123/local-web/preview123';
+    // The derived alternation correctly matches the bracketed-IPv6 and wildcard
+    // hosts for the current preview port (proves `[`/`]`/`.` were regex-escaped).
+    expect(rewritten).toContain(`src="${prefix}/v6.png"`);
+    expect(rewritten).toContain(`href="${prefix}/wild?x=1"`);
   });
 
   it('runtime patch script includes WebSocket constructor patch', () => {
@@ -389,5 +413,115 @@ describe('V-policy-parity: isStreamingResponse classification matrix', () => {
   it('never treats text/html (even chunked) as streaming', () => {
     expect(isStreamingResponse({ 'content-type': 'text/html', 'transfer-encoding': 'chunked' })).toBe(false);
     expect(isStreamingResponse({ 'content-type': 'application/xhtml+xml', 'transfer-encoding': 'chunked' })).toBe(false);
+  });
+});
+
+// ── T-R-CC1-1 (injection host single-source + anti-drift) ───────────────────────
+// The injected browser runtime patch cannot `import` at runtime, so it serializes
+// the exported `LOOPBACK_HOSTS` set into a `var LOOPBACK_HOSTS=[...]` literal at
+// inject time. This guards that the injected literal is DERIVED from the constant:
+// it MUST FAIL if a host is added to `LOOPBACK_HOSTS` without appearing in the
+// injected script (and vice-versa).
+describe('T-R-CC1-1: injected runtime patch loopback host set is derived from LOOPBACK_HOSTS', () => {
+  function extractInjectedLoopbackHosts(script: string): string[] {
+    // The serialized array itself contains a host with `]` (`[::1]`), so match up
+    // to the literal `];` that terminates the `var LOOPBACK_HOSTS=[...]` statement.
+    const match = script.match(/var LOOPBACK_HOSTS=(\[.*?\]);var TOKEN_PARAM=/);
+    if (!match) throw new Error('no var LOOPBACK_HOSTS=[...] literal found in injected runtime script');
+    return JSON.parse(match[1]) as string[];
+  }
+
+  it('serializes exactly [...LOOPBACK_HOSTS] into the injected script (deep-equal)', () => {
+    const script = buildPreviewRuntimePatch('/api/server/s1/local-web/p1', 3000);
+    expect(extractInjectedLoopbackHosts(script)).toEqual([...LOOPBACK_HOSTS]);
+  });
+
+  it('injects the same host set regardless of access token presence', () => {
+    const withToken = buildPreviewRuntimePatch('/api/server/s1/local-web/p1', 3000, 'tok123');
+    expect(extractInjectedLoopbackHosts(withToken)).toEqual([...LOOPBACK_HOSTS]);
+  });
+
+  it('drives the inline isLoopbackHost check off the injected LOOPBACK_HOSTS array (no hand-maintained literal)', () => {
+    const script = buildPreviewRuntimePatch('/api/server/s1/local-web/p1', 3000);
+    expect(script).toContain('function isLoopbackHost(host){return LOOPBACK_HOSTS.indexOf(host)!==-1;}');
+  });
+
+  it('also reaches the injected script via the full HTML rewrite path', () => {
+    const html = '<html><head></head><body></body></html>';
+    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123', 3000);
+    expect(extractInjectedLoopbackHosts(rewritten)).toEqual([...LOOPBACK_HOSTS]);
+  });
+});
+
+// ── T-R-CC1-CSP (regression: embed-block headers are stripped) ──────────────────
+// `filterPreviewResponseHeaders` strips the embed-block response headers via
+// `PREVIEW_EMBED_STRIP_RESPONSE_HEADERS`. This guards the PRECONDITION that the
+// injected runtime patches are not silently disabled by an upstream CSP / frame
+// policy: all three must be removed while ordinary headers pass through.
+describe('T-R-CC1-CSP: filterPreviewResponseHeaders strips embed-block headers', () => {
+  it('removes CSP, CSP-report-only and x-frame-options while keeping ordinary headers', () => {
+    const filtered = filterPreviewResponseHeaders(new Headers({
+      'content-security-policy': "frame-ancestors 'none'",
+      'content-security-policy-report-only': "frame-ancestors 'none'",
+      'x-frame-options': 'DENY',
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-cache',
+    }));
+
+    expect(filtered.get('content-security-policy')).toBeNull();
+    expect(filtered.get('content-security-policy-report-only')).toBeNull();
+    expect(filtered.get('x-frame-options')).toBeNull();
+    expect(filtered.get('content-type')).toBe('text/html; charset=utf-8');
+    expect(filtered.get('cache-control')).toBe('no-cache');
+  });
+});
+
+// ── T-R-CC1-3 (protocol-aware default port for redirect rewrite) ────────────────
+// `shouldRewritePreviewRedirect` must resolve a URL's default port BY PROTOCOL
+// (http/ws → 80, https/wss → 443) instead of the old `Number(url.port || '80')`,
+// which mis-defaulted an https/wss loopback URL without an explicit port to 80 and
+// thereby failed the preview-port comparison.
+describe('T-R-CC1-3: defaultPortForProtocol', () => {
+  it('maps http/ws → 80 and https/wss → 443 (with or without trailing colon, any case)', () => {
+    expect(defaultPortForProtocol('http:')).toBe(80);
+    expect(defaultPortForProtocol('ws:')).toBe(80);
+    expect(defaultPortForProtocol('https:')).toBe(443);
+    expect(defaultPortForProtocol('wss:')).toBe(443);
+    expect(defaultPortForProtocol('https')).toBe(443); // no trailing colon
+    expect(defaultPortForProtocol('HTTPS:')).toBe(443); // case-insensitive
+    expect(defaultPortForProtocol('ftp:')).toBe(80); // unknown → 80
+  });
+});
+
+describe('T-R-CC1-3: shouldRewritePreviewRedirect resolves default port by protocol', () => {
+  // The bug fix: an https loopback URL WITHOUT an explicit port must resolve to 443.
+  it('V-redirect-https-default-port: https loopback w/o explicit port matches preview port 443', () => {
+    expect(shouldRewritePreviewRedirect('https://127.0.0.1/events', 443)).toBe(true);
+    expect(shouldRewritePreviewRedirect('https://localhost/x', 443)).toBe(true);
+    // old behaviour (Number(''||'80')=80) would WRONGLY return false here.
+  });
+
+  it('http loopback w/o explicit port matches preview port 80', () => {
+    expect(shouldRewritePreviewRedirect('http://127.0.0.1/x', 80)).toBe(true);
+  });
+
+  it('https loopback w/o explicit port does NOT match a non-443 preview port', () => {
+    expect(shouldRewritePreviewRedirect('https://127.0.0.1/x', 3000)).toBe(false);
+  });
+
+  it('matches an explicit port and all loopback host spellings', () => {
+    expect(shouldRewritePreviewRedirect('http://127.0.0.1:3000/x', 3000)).toBe(true);
+    expect(shouldRewritePreviewRedirect('http://localhost:3000/x', 3000)).toBe(true);
+    expect(shouldRewritePreviewRedirect('http://0.0.0.0:3000/x', 3000)).toBe(true);
+    expect(shouldRewritePreviewRedirect('http://[::1]:3000/x', 3000)).toBe(true);
+  });
+
+  it('resolves a relative Location against the preview-port base (still a rewrite)', () => {
+    expect(shouldRewritePreviewRedirect('/dashboard', 3000)).toBe(true);
+  });
+
+  it('does NOT rewrite a non-loopback host or a different port', () => {
+    expect(shouldRewritePreviewRedirect('https://example.com/x', 443)).toBe(false);
+    expect(shouldRewritePreviewRedirect('http://127.0.0.1:9999/x', 3000)).toBe(false);
   });
 });

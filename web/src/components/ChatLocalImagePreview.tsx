@@ -7,10 +7,12 @@ export interface ChatLocalImagePreviewResult {
 }
 
 export type ChatLocalImagePreviewLoader = (path: string) => Promise<ChatLocalImagePreviewResult | string>;
+export type ChatLocalImagePreviewDownloadHandler = (path: string) => void | Promise<void>;
 
 interface Props {
   path: string;
   loadImagePreview: ChatLocalImagePreviewLoader;
+  onDownload?: ChatLocalImagePreviewDownloadHandler;
 }
 
 type PreviewState =
@@ -22,7 +24,7 @@ function basename(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
 
-export function ChatLocalImagePreview({ path, loadImagePreview }: Props) {
+export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Props) {
   const [preview, setPreview] = useState<PreviewState>({ status: 'loading' });
   const [lightboxOpen, setLightboxOpen] = useState(false);
 
@@ -75,7 +77,15 @@ export function ChatLocalImagePreview({ path, loadImagePreview }: Props) {
           }}
         />
       </span>
-      {lightboxOpen && <ImageLightbox src={preview.dataUrl} alt={preview.alt} onClose={() => setLightboxOpen(false)} />}
+      {lightboxOpen && (
+        <ImageLightbox
+          src={preview.dataUrl}
+          alt={preview.alt}
+          fileName={basename(preview.alt)}
+          onDownload={onDownload ? () => onDownload(path) : undefined}
+          onClose={() => setLightboxOpen(false)}
+        />
+      )}
     </>
   );
 }

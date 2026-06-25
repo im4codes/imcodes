@@ -280,6 +280,37 @@ describe('memory MCP recall search', () => {
     }
   });
 
+  it('falls back to exact local recall when semantic embedding is unavailable', async () => {
+    const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-embedding-unavailable');
+    try {
+      writeProcessedProjection({
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        class: 'recent_summary',
+        sourceEventIds: ['evt-local'],
+        summary: 'Only local recall memory',
+        content: {},
+        updatedAt: 100,
+      });
+      generateEmbeddingMock.mockResolvedValueOnce(null);
+
+      const result = await searchMcpMemoryRecall({
+        query: 'local recall',
+        namespace: { scope: 'personal', projectId: 'repo-1', userId: 'daemon-local' },
+        repo: 'repo-1',
+        includeLegacyPersonalOwner: true,
+        limit: 5,
+      }, {
+        credentials: null,
+      });
+
+      expect(result.localUnavailable).toBeUndefined();
+      expect(result.items.map((item) => item.summary)).toContain('Only local recall memory');
+      expect(result.items.every((item) => item.source === 'local')).toBe(true);
+    } finally {
+      await cleanupIsolatedSharedContextDb(tempDir);
+    }
+  });
+
   it('returns exact local observation hits with observationId before semantic projection hits', async () => {
     const tempDir = await createIsolatedSharedContextDb('memory-mcp-search-observation');
     try {
