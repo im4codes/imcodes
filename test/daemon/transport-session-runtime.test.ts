@@ -2068,7 +2068,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
-  it('uses a late provider CANCELLED callback to release pending work blocked by a stale provider snapshot', async () => {
+  it('does not let a locally stopped turn stale provider snapshot block queued work', async () => {
     let providerActive = false;
     (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
       status: 'current',
@@ -2086,19 +2086,48 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(1);
 
     await runtime.cancel();
-    await flushDispatch();
-
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
-    expect(runtime.pendingCount).toBe(1);
-
-    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop callback', recoverable: true });
     await waitForProviderSendCount(mock.provider, 2);
 
-    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
     expect(runtime.pendingCount).toBe(0);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       userMessage: 'queued after stop',
       assembledMessage: 'queued after stop',
+    }));
+
+    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop callback', recoverable: true });
+    await flushDispatch();
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a locally stopped turn stale provider snapshot block a later send', async () => {
+    let snapshotGeneration = 1;
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: snapshotGeneration },
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    snapshotGeneration = 0;
+    await runtime.cancel();
+
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('snapshot_stale');
+
+    runtime.send('later after stop', 'msg-later-after-stop');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'later after stop',
+      assembledMessage: 'later after stop',
     }));
   });
 

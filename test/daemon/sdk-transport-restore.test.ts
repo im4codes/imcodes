@@ -725,7 +725,7 @@ describe('sdk transport session restore', () => {
     });
   });
 
-  it('publishes idle after restoring a transport session from stale persisted running state', async () => {
+  it('starts a fresh codex thread after restoring a transport session from persisted running state', async () => {
     const persistedRecords: Array<Record<string, any> | null> = [];
     setSessionPersistCallback(async (record) => {
       persistedRecords.push(record);
@@ -746,6 +746,8 @@ describe('sdk transport session restore', () => {
       providerId: 'codex-sdk',
       providerSessionId: 'route-cx-stale-running',
       codexSessionId: 'codex-thread-stale-running',
+      startupMemoryInjected: true,
+      recentInjectionHistory: [['memory-old']],
       requestedModel: 'gpt-5.5',
       activeModel: 'gpt-5.5',
     });
@@ -753,11 +755,18 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    expect(getTransportRuntime('deck_sub_sdk_stale_running')?.getStatus()).toBe('idle');
+    const runtime = getTransportRuntime('deck_sub_sdk_stale_running');
+    expect(runtime?.getStatus()).toBe('idle');
+    expect(runtime?.providerSessionId).not.toBe('route-cx-stale-running');
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.state).toBe('idle');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBeUndefined();
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBeUndefined();
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toBeUndefined();
     expect(persistedRecords.at(-1)).toMatchObject({
       name: 'deck_sub_sdk_stale_running',
       state: 'idle',
+      codexSessionId: undefined,
+      startupMemoryInjected: undefined,
     });
     expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_sub_sdk_stale_running',
@@ -771,6 +780,16 @@ describe('sdk transport session restore', () => {
       }),
       { source: 'daemon', confidence: 'high' },
     );
+
+    runtime!.send('continue after daemon restart');
+    await settleCodexRun('deck_sub_sdk_stale_running', 'start');
+
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'resume')).toBeUndefined();
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'start')).toMatchObject({
+      mode: 'start',
+      input: 'continue after daemon restart',
+    });
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('thread-restored');
   });
 
   it('emits started idle when launching a new transport session', async () => {

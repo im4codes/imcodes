@@ -384,6 +384,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private _externalCompletionSettlementsToIgnore = 0;
   private _cancelledProviderErrorsToIgnore = 0;
+  private _locallyCancelledActivityGeneration: number | null = null;
   private _ignoreProviderSnapshotForNextLocalStopDrain = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
@@ -1106,8 +1107,25 @@ export class TransportSessionRuntime implements SessionRuntime {
     add('open_tool_call', openToolCount);
 
     const providerSnapshot = options?.ignoreProviderSnapshot ? null : this.getProviderActiveWorkSnapshot();
-    if (providerSnapshot) {
-      const expectedGeneration = this._activityGeneration > 0 ? this.currentActivityGeneration() : undefined;
+    const providerSnapshotIgnored = providerSnapshot
+      ? this.shouldIgnoreProviderSnapshotAfterLocalStop(providerSnapshot)
+      : false;
+    if (providerSnapshot && !providerSnapshotIgnored) {
+      // Only gate a *clean* provider snapshot on generation while a dispatch is
+      // actually in flight (211 deadlock: deck_cd_brain stuck "running" with a
+      // clean provider snapshot but a stale generation, busyReasons
+      // ['snapshot_stale'], never draining). getActiveWorkSnapshot() is a live
+      // synchronous read, so once the turn settles a zero-work read proves idle
+      // regardless of which generation the provider was last told about — an idle
+      // provider never re-advances its stamp. The turn-start race is still covered
+      // by runtime_dispatch / active_dispatch_entry. Active work or a non-current
+      // status still blocks below regardless of this gate.
+      const hasActiveDispatch = this._sending
+        || this._activeTurn
+        || this._activeDispatchEntries.length > 0;
+      const expectedGeneration = hasActiveDispatch && this._activityGeneration > 0
+        ? this.currentActivityGeneration()
+        : undefined;
       const evaluation = evaluateProviderSnapshot(providerSnapshot, expectedGeneration);
       if (evaluation.blocking) {
         const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
@@ -1120,10 +1138,34 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     return {
       blockingWorkCount,
-      activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
+      activeToolCount: Math.max(openToolCount, providerSnapshotIgnored ? 0 : Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
     };
+  }
+
+  private shouldIgnoreProviderSnapshotAfterLocalStop(snapshot: ProviderActiveWorkSnapshot): boolean {
+    if (this._locallyCancelledActivityGeneration === null) return false;
+    if (this.hasLocalActiveTurnWork()) return false;
+    if (snapshot.status === 'stale') return true;
+    const snapshotGeneration = this.snapshotGenerationNumber(snapshot);
+    return snapshotGeneration !== null && snapshotGeneration <= this._locallyCancelledActivityGeneration;
+  }
+
+  private snapshotGenerationNumber(snapshot: ProviderActiveWorkSnapshot): number | null {
+    const value = snapshot.activityGeneration ?? snapshot.generation;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string') {
+      const prefix = `session:${this.sessionKey}:`;
+      if (!value.startsWith(prefix)) return null;
+      const parsed = Number(value.slice(prefix.length));
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    if (typeof value === 'object' && value !== null) {
+      if (value.scope !== 'session' || value.sessionName !== this.sessionKey) return null;
+      return Number.isFinite(value.generation) ? value.generation : null;
+    }
+    return null;
   }
 
   private recordToolActivity(tool: { id: string; name: string; status: 'running' | 'complete' | 'error' }): void {
@@ -1625,6 +1667,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const dispatchId = ++this._nextDispatchId;
     this._activityGeneration++;
+    this._locallyCancelledActivityGeneration = null;
+    this._ignoreProviderSnapshotForNextLocalStopDrain = false;
     this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
     this._lastActivityAt = Date.now();
     this._sending = true;
@@ -2026,6 +2070,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._locallyCancelledDispatchIds.delete(dispatchId);
       return;
     }
+    this._locallyCancelledActivityGeneration = this._activityGeneration;
+    this._ignoreProviderSnapshotForNextLocalStopDrain = true;
     if (!this._activeTurn && !this._sending) {
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
@@ -2281,7 +2327,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         return { artifact: null };
       }
       // 1) Template-origin legacy summaries never surface through recall.
-      const processed = result.items
+      // Guard the worker/degrade path: a degraded/unavailable context-store
+      // worker can yield a nullish result — recall must never throw and abort the
+      // turn (211: "Cannot read properties of undefined (reading 'items')").
+      const processed = (result?.items ?? [])
         .filter((item): item is MemorySearchResultItem => item.type === 'processed')
         .filter((item) => !isTemplateOriginSummary(item.summary));
       // 2) Per-session dedup: skip items injected in this session's last

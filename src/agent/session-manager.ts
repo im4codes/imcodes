@@ -68,6 +68,15 @@ function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'a
     || isTransportAgent(record.agentType as AgentType);
 }
 
+function shouldStartFreshCodexThreadAfterInterruptedRestore(
+  record: Pick<SessionRecord, 'providerId' | 'agentType' | 'state' | 'codexSessionId'>,
+): boolean {
+  return (record.providerId ?? record.agentType) === 'codex-sdk'
+    && record.state === 'running'
+    && typeof record.codexSessionId === 'string'
+    && record.codexSessionId.trim().length > 0;
+}
+
 function shouldAutoRelaunchTransportRuntimeAfterError(
   providerError: TransportSessionRuntime['lastProviderError'],
 ): boolean {
@@ -1906,19 +1915,30 @@ export async function restoreTransportSessions(
       wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
+      const freshAfterInterruptedCodexRestore = shouldStartFreshCodexThreadAfterInterruptedRestore(s);
+      const freshOnRestore = freshAfterCancel || freshAfterInterruptedCodexRestore;
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
         || s.providerId === 'cursor-headless'
         || s.providerId === 'copilot-sdk'
         || s.providerId === 'kimi-sdk';
-      const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
+      const effectiveSessionKey = freshOnRestore || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
-          ? s.codexSessionId
+          ? (freshAfterInterruptedCodexRestore ? undefined : s.codexSessionId)
           : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk' || s.providerId === 'kimi-sdk')
             ? s.providerResumeId
             : undefined;
+      const preserveStartupMemoryOnRestore = s.startupMemoryInjected === true && !freshAfterInterruptedCodexRestore;
+      if (freshAfterInterruptedCodexRestore) {
+        logger.warn({
+          session: s.name,
+          providerId: s.providerId,
+          previousCodexSessionId: s.codexSessionId,
+          previousProviderSessionId: s.providerSessionId,
+        }, 'Codex SDK restore found interrupted running session; starting fresh thread');
+      }
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
@@ -1928,7 +1948,7 @@ export async function restoreTransportSessions(
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
-        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
+        startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
       const contextBootstrap = await resolveRuntimeContextBootstrap();
       runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
@@ -1967,8 +1987,9 @@ export async function restoreTransportSessions(
         sessionName: s.name,
         projectName: s.projectName,
         serverId: boundServerId,
-        bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
-        skipCreate: !freshAfterCancel && !!s.providerSessionId,
+        fresh: freshOnRestore,
+        bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
+        skipCreate: !freshOnRestore && !!s.providerSessionId,
         env: buildTransportSessionEnv(s.name, s.label, extraEnv),
         cwd: s.projectDir,
         label: s.label ?? s.name,
@@ -1993,7 +2014,7 @@ export async function restoreTransportSessions(
         // Restore path: only re-inject startup memory if the prior run hadn't
         // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
         // conversation already has its history preamble and we must not repeat it.
-        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
+        startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
@@ -2007,7 +2028,10 @@ export async function restoreTransportSessions(
         ...s,
         state: 'idle',
         updatedAt: Date.now(),
-        ...((freshAfterCancel || s.providerSessionId !== actualProviderSid)
+        ...(freshAfterInterruptedCodexRestore
+          ? { codexSessionId: undefined, startupMemoryInjected: undefined, recentInjectionHistory: undefined }
+          : {}),
+        ...((freshOnRestore || s.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
           : {}),
         contextNamespace: contextBootstrap.namespace,
@@ -2066,7 +2090,13 @@ export async function restoreTransportSessions(
         pendingVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
         pendingMessageVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
       }, { source: 'daemon', confidence: 'high' });
-      logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
+      logger.info({
+        session: s.name,
+        providerId: s.providerId,
+        providerSid: s.providerSessionId,
+        freshAfterCancel,
+        freshAfterInterruptedCodexRestore,
+      }, 'Restored transport session runtime');
 
       // Drain messages that arrived while the provider was offline. The
       // enqueue path deliberately did NOT emit a user.message event (the
