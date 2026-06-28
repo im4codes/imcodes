@@ -147,6 +147,96 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('auto-heals a truncated open: localStorage tail seed + empty IDB pulls the full window (no afterTs), not a tail backfill', async () => {
+    // Regression for "open the chat and only the latest few messages show;
+    // force-refresh fixes it". When the pane is seeded from the low-completeness
+    // localStorage TAIL snapshot but IndexedDB has no backing history, the mount
+    // bootstrap must pull the full newest window (no lower bound), NOT a tail
+    // backfill anchored at the seed's newest ts — otherwise the bulk history
+    // BELOW the tail is never fetched and the user is stranded until manual ↻.
+    const sessionName = `deck_truncated_open_heal_${Date.now()}`;
+    const serverId = `srv-truncated-open-${Date.now()}`;
+
+    // IDB empty + fast so path-3b (cold local read) is deterministic.
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 0, epoch: 0 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+
+    // Low-completeness seed: just the newest event (the "latest few" tail).
+    const tailSeed: TimelineEvent = {
+      eventId: `${sessionName}-tail`,
+      sessionId: sessionName,
+      ts: 100,
+      epoch: 1,
+      seq: 9,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'tail-seed' },
+    };
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${serverId}:${sessionName}`,
+      JSON.stringify([tailSeed]),
+    );
+
+    // The bulk history that lives BELOW the tail — only a no-lower-bound
+    // (manualLatestWindow) fetch can surface it.
+    const gapBelow: TimelineEvent = {
+      eventId: `${sessionName}-gap-below`,
+      sessionId: sessionName,
+      ts: 50,
+      epoch: 1,
+      seq: 4,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'gap-below-recovered' },
+    };
+    fetchSpy.mockResolvedValue({ events: [gapBelow, tailSeed], epoch: 1, hasMore: false, nextCursor: null });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-trunc'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-trunc'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe' },
+        events.map((e) => String(e.payload.text ?? '')).join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+
+    // Paint #1: the low-completeness tail seed.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('tail-seed');
+    });
+
+    // Let the mount bootstrap's backfill fire (~200ms) + merge.
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+
+    // The auto-heal must use the manualLatestWindow path: a full newest window
+    // with NO numeric afterTs. A tail backfill anchored at the seed (afterTs=100)
+    // is exactly the bug, so assert no fetch carried a numeric afterTs.
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ afterTs: expect.any(Number) }),
+    );
+
+    // End-to-end: the below-tail history is now visible without a manual ↻.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('gap-below-recovered');
+    });
+  });
+
   it('self-heals a settled blank pane through the force-refresh latest-window path', async () => {
     const sessionName = `deck_blank_self_heal_${Date.now()}`;
     const serverId = `srv-blank-self-heal-${Date.now()}`;

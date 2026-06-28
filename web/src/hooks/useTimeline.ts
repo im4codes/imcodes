@@ -1745,7 +1745,20 @@ export function useTimeline(
           setLoading(false);
         }
         if (isActiveSession) {
-          fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
+          // IDB came back EMPTY. If a low-completeness seed (localStorage tail
+          // snapshot / WS replay tail) is already painted, a tail-mode backfill
+          // would anchor afterTs at the seed's newest ts and never fetch the
+          // bulk history BELOW it — the "open the chat and only the latest few
+          // messages show; force-refresh fixes it" bug. With no IDB backing that
+          // seed is definitionally truncated, so pull the full newest window (no
+          // lower bound), exactly like forceRefresh's manualLatestWindow. A truly
+          // blank pane (no seed) keeps the tail path — afterTs=undefined there
+          // already fetches the full window — and is additionally covered by the
+          // blank-pane self-heal effect.
+          const truncatedSeedShowing = eventsRef.current.length > 0;
+          fireHttpBackfillRef.current(200, truncatedSeedShowing
+            ? { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' }
+            : { cooldownMs: 0, phase: 'bootstrap' });
         }
       }
     };
