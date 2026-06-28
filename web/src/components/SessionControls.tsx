@@ -40,7 +40,7 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
-import { isRunningSessionState } from '../thinking-utils.js';
+import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
@@ -874,7 +874,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
+  const activeSessionLiveStatus = deriveSessionLiveStatus({
+    sessionState: activeSession?.state,
+    activeThinking,
+    activeTransportTurn,
+    isAgentless: activeSession?.agentType === 'shell' || activeSession?.agentType === 'script',
+  });
+  const showRunningSweep = !compact && activeSessionLiveStatus.sweep;
   const openSpecAutoDeliver = useOpenSpecAutoDeliver({
     ws,
     serverId,
@@ -887,7 +893,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
-    && (isRunningSessionState(activeSession.state) || activeThinking || activeTransportTurn);
+    && activeSessionLiveStatus.busy;
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
@@ -3607,7 +3613,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               disabled={disabled || activeSession?.state === 'stopped'}
               onPointerDown={(e) => { e.preventDefault(); handleStopPress(); }}
               onClick={handleStopPress}
-              style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
+              style={activeSessionLiveStatus.sweep ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
             </button>

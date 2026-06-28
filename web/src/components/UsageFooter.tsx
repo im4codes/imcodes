@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { bestModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
+import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
@@ -88,10 +89,16 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // for a shell prompt and confusing for users running `top`, tailing logs,
   // etc. Skip the live-work UI entirely for these session types.
   const isAgentless = agentType === 'shell' || agentType === 'script';
-  const hasActiveLiveWork = !isAgentless && (!!activeToolCall || !!activeThinkingTs);
-  const hasLiveTransportTurn = !isAgentless && !!activeTimelineTurn;
-  const hasRunningSessionSnapshot = !isAgentless
-    && (sessionState === 'queued' || (sessionState === 'running' && activeTimelineTurn !== false));
+  const liveStatus = deriveSessionLiveStatus({
+    sessionState,
+    activeThinking: !!activeThinkingTs,
+    activeToolCall: !!activeToolCall,
+    activeTransportTurn: !!activeTimelineTurn,
+    statusText,
+    transportActivityDetail,
+    sessionError,
+    isAgentless,
+  });
   const showLiveStatus = !isAgentless;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
   const [ctxBurning, setCtxBurning] = useState(false);
@@ -185,36 +192,32 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const inlineQuotaText = displayQuotaLabel;
-  const errorDetail = sessionState === 'error'
-    ? ((transportActivityDetail && !/^error$/i.test(transportActivityDetail) ? transportActivityDetail : null) ?? sessionError ?? null)
-    : null;
-  const liveStatusMode = isAgentless
-    ? null
-    : sessionState === 'error'
-      ? 'error'
-      : hasActiveLiveWork
-      ? (activeToolCall ? 'tool' : 'thinking')
-      : hasLiveTransportTurn || hasRunningSessionSnapshot
-        ? 'running'
-        : statusText
-          ? (/^(?:supervised|auto):/i.test(statusText) ? 'result' : 'waiting')
-          : 'idle';
+  const liveStatusMode = liveStatus.mode;
   const liveStatusText = useMemo(() => {
-    if (isAgentless) return null;
-    if (sessionState === 'error') {
-      return errorDetail
+    if (isAgentless || !liveStatusMode) return null;
+    if (liveStatusMode === 'error') {
+      return liveStatus.errorDetail
         ? t('session.state_error_detail', {
-          error: errorDetail,
+          error: liveStatus.errorDetail,
           defaultValue: 'Error: {{error}}',
         })
         : t('session.state_error', { defaultValue: 'Session error' });
     }
-    if (hasActiveLiveWork || hasLiveTransportTurn || hasRunningSessionSnapshot) {
-      if (activeToolCall) return statusText || 'Tool running...';
+    if (liveStatusMode === 'stopping') return t('session.state_stop_requested');
+    if (liveStatusMode === 'cancelled') {
+      return liveStatus.errorDetail
+        ? t('session.state_error_detail', {
+          error: liveStatus.errorDetail,
+          defaultValue: 'Error: {{error}}',
+        })
+        : t('session.state_stop_requested');
+    }
+    if (liveStatus.busy) {
+      if (activeToolCall) return statusText || t('session.state_running');
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
-      if (transportActivityDetail) {
+      if (liveStatus.activityDetail) {
         return t('session.state_running_detail', {
-          detail: transportActivityDetail,
+          detail: liveStatus.activityDetail,
           defaultValue: 'Agent working: {{detail}}',
         });
       }
@@ -222,8 +225,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     }
     if (statusText) return statusText;
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, errorDetail, hasActiveLiveWork, hasLiveTransportTurn, hasRunningSessionSnapshot, isAgentless, now, sessionState, statusText, t, transportActivityDetail]);
-  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'result' || liveStatusMode === 'error';
+  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.busy, liveStatus.errorDetail, liveStatusMode, now, statusText, t]);
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'stopping' || liveStatusMode === 'cancelled' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK
   // rate_limit_event). Show an authorize affordance for claude-code-sdk until
@@ -282,6 +285,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
             {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
             {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
             {liveStatusMode === 'waiting' && <span class="session-live-status-emoji wait">⏳</span>}
+            {liveStatusMode === 'stopping' && <span class="session-live-status-emoji wait">■</span>}
+            {liveStatusMode === 'cancelled' && <span class="session-live-status-emoji error">⚠️</span>}
             {liveStatusMode === 'result' && <span class="session-live-status-emoji result">✅</span>}
             {liveStatusMode === 'error' && <span class="session-live-status-emoji error">⚠️</span>}
             {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}

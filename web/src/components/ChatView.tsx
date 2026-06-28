@@ -17,10 +17,6 @@ import type {
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
-  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
-  SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
-} from '@shared/session-control-commands.js';
-import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDERS,
@@ -53,6 +49,7 @@ import { domNodeToPlainText, selectionToPlainText } from '../util/dom-to-text.js
 import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
+import { deriveSessionLiveStatus } from '../session-live-status.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -3283,8 +3280,12 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'session.state': {
       const state = String(event.payload.state ?? '');
-      const isUserCancelFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
-      const isUserCompactFeedback = event.payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
+      const errorDetail = getSessionStateDetail(event);
+      const liveStatus = deriveSessionLiveStatus({
+        sessionState: state,
+        sessionStateReason: typeof event.payload.reason === 'string' ? event.payload.reason : null,
+        sessionStateError: errorDetail,
+      });
       const stateLabel: Record<string, string> = {
         idle: t('session.state_idle'),
         running: t('session.state_running'),
@@ -3294,15 +3295,14 @@ const ChatEvent = memo(function ChatEvent({
         stopping: t('session.state_stopping'),
         stopped: t('session.state_stopped'),
       };
-      const label = isUserCancelFeedback
+      const label = liveStatus.controlFeedback === 'stop_requested'
         ? t('session.state_stop_requested')
-        : isUserCompactFeedback
+        : liveStatus.controlFeedback === 'compact_requested'
           ? t('session.state_compacting')
           : (stateLabel[state] ?? state);
-      const errorDetail = getSessionStateDetail(event);
-      const displayLabel = errorDetail
+      const displayLabel = (liveStatus.mode === 'error' || liveStatus.mode === 'cancelled') && liveStatus.errorDetail
         ? t('session.state_error_detail', {
-            error: errorDetail,
+            error: liveStatus.errorDetail,
             defaultValue: 'Error: {{error}}',
           })
         : label;
