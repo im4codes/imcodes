@@ -108,6 +108,9 @@ const CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES = 512 * 1024;
 const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
 const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
 const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
+const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS = 2_000;
+const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS = 15 * 60_000;
+const CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS = 5_000;
 
 function readBoundedIntegerEnv(
   envName: string,
@@ -138,6 +141,21 @@ interface CodexTrackedSubagentThread {
   prompt?: string;
   model?: string;
   lastStatus?: unknown;
+  usageTotalTokens?: number;
+  rolloutPath?: string;
+}
+
+interface CodexChildSubagentRolloutSnapshot {
+  agentId: string;
+  parentThreadId: string;
+  rolloutPath: string;
+  cwd?: string;
+  imcodesSessionName?: string;
+  agentName?: string;
+  prompt?: string;
+  model?: string;
+  completed: boolean;
+  output?: string;
   usageTotalTokens?: number;
 }
 
@@ -192,6 +210,208 @@ async function findCodexRolloutPathByUuid(env: Record<string, string | undefined
     }
   }
   return latestPath;
+}
+
+function parseCodexRolloutJsonLine(line: string): Record<string, any> | null {
+  if (!line.trim()) return null;
+  try {
+    const parsed = JSON.parse(line);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function codexRolloutPayload(record: Record<string, any>): Record<string, any> {
+  return isRecord(record.payload) ? record.payload : record;
+}
+
+function readCodexChildSubagentSpawn(payload: Record<string, any>): {
+  parentThreadId: string;
+  agentId?: string;
+  agentName?: string;
+} | null {
+  const source = isRecord(payload.source) ? payload.source : undefined;
+  const subagent = isRecord(source?.subagent) ? source.subagent : undefined;
+  const spawn = isRecord(subagent?.thread_spawn) ? subagent.thread_spawn : undefined;
+  const parentThreadId = meaningfulString(spawn?.parent_thread_id)
+    ?? meaningfulString(spawn?.parentThreadId);
+  if (!parentThreadId) return null;
+  const agentId = meaningfulString(payload.id)
+    ?? meaningfulString(spawn?.agent_id)
+    ?? meaningfulString(spawn?.agentId)
+    ?? meaningfulString(spawn?.thread_id)
+    ?? meaningfulString(spawn?.threadId)
+    ?? meaningfulString(spawn?.agent_path)
+    ?? meaningfulString(spawn?.agentPath);
+  const agentName = meaningfulString(payload.agent_nickname)
+    ?? meaningfulString(spawn?.agent_nickname)
+    ?? meaningfulString(spawn?.agentNickname)
+    ?? meaningfulString(payload.agent_role)
+    ?? meaningfulString(spawn?.agent_role)
+    ?? meaningfulString(spawn?.agentRole);
+  return { parentThreadId, ...(agentId ? { agentId } : {}), ...(agentName ? { agentName } : {}) };
+}
+
+function readCodexRolloutUserMessage(payload: Record<string, any>): string | undefined {
+  if (payload.type === 'user_message') return meaningfulString(payload.message);
+  if (payload.type !== 'message' || payload.role !== 'user') return undefined;
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!isRecord(item)) continue;
+    const text = meaningfulString(item.text);
+    if (text) parts.push(text);
+  }
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+function readCodexRolloutUsageTotalTokens(payload: Record<string, any>): number | undefined {
+  if (payload.type !== 'token_count') return undefined;
+  const info = isRecord(payload.info) ? payload.info : undefined;
+  const total = isRecord(info?.total_token_usage) ? info.total_token_usage : undefined;
+  return finiteNumber(total?.total_tokens);
+}
+
+function readCodexRolloutBaseInstructionsText(payload: Record<string, any>): string | undefined {
+  const baseInstructions = payload.base_instructions;
+  if (typeof baseInstructions === 'string') return meaningfulString(baseInstructions);
+  if (isRecord(baseInstructions)) return meaningfulString(baseInstructions.text);
+  return meaningfulString(payload.instructions);
+}
+
+function readImcodesSessionNameFromBaseInstructions(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const match = /(?:^|\n)\s*-\s*Exact session name:\s*([^\n]+)/.exec(text)
+    ?? /(?:^|\n)\s*Exact session name:\s*([^\n]+)/.exec(text);
+  if (!match) return undefined;
+  return match[1]?.trim().replace(/^`|`$/g, '') || undefined;
+}
+
+function childSubagentIdFromRolloutPath(path: string): string | undefined {
+  const match = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
+  return match?.[1];
+}
+
+async function readCodexChildSubagentRolloutSnapshot(
+  rolloutPath: string,
+  parentThreadId?: string,
+): Promise<CodexChildSubagentRolloutSnapshot | null> {
+  let text: string;
+  try {
+    text = await readFile(rolloutPath, 'utf8');
+  } catch {
+    return null;
+  }
+  let spawn: ReturnType<typeof readCodexChildSubagentSpawn> = null;
+  let prompt: string | undefined;
+  let model: string | undefined;
+  let cwd: string | undefined;
+  let imcodesSessionName: string | undefined;
+  let completed = false;
+  let output: string | undefined;
+  let usageTotalTokens: number | undefined;
+  for (const line of text.split('\n')) {
+    const record = parseCodexRolloutJsonLine(line);
+    if (!record) continue;
+    const payload = codexRolloutPayload(record);
+    const nextSpawn = readCodexChildSubagentSpawn(payload);
+    if (nextSpawn) spawn = nextSpawn;
+    if (!cwd) cwd = meaningfulString(payload.cwd);
+    if (!imcodesSessionName) {
+      imcodesSessionName = readImcodesSessionNameFromBaseInstructions(
+        readCodexRolloutBaseInstructionsText(payload),
+      );
+    }
+    if (!prompt) prompt = readCodexRolloutUserMessage(payload);
+    if (!model) model = meaningfulString(payload.model);
+    const totalTokens = readCodexRolloutUsageTotalTokens(payload);
+    if (totalTokens !== undefined) usageTotalTokens = totalTokens;
+    if (payload.type === 'task_complete') {
+      completed = true;
+      output = meaningfulString(payload.last_agent_message)
+        ?? meaningfulString(payload.result)
+        ?? meaningfulString(payload.message)
+        ?? 'completed';
+    }
+  }
+  if (!spawn) return null;
+  if (parentThreadId && spawn.parentThreadId !== parentThreadId) return null;
+  const agentId = spawn.agentId ?? childSubagentIdFromRolloutPath(rolloutPath);
+  if (!agentId) return null;
+  return {
+    agentId,
+    parentThreadId: spawn.parentThreadId,
+    rolloutPath,
+    ...(cwd ? { cwd } : {}),
+    ...(imcodesSessionName ? { imcodesSessionName } : {}),
+    ...(spawn.agentName ? { agentName: spawn.agentName } : {}),
+    ...(prompt ? { prompt } : {}),
+    ...(model ? { model } : {}),
+    completed,
+    ...(output ? { output } : {}),
+    ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
+  };
+}
+
+async function discoverCodexChildSubagentRollouts(
+  env: Record<string, string | undefined>,
+  parentThreadId: string,
+  minMtimeMs: number,
+): Promise<CodexChildSubagentRolloutSnapshot[]> {
+  return discoverCodexChildSubagentRolloutsByPredicate(env, minMtimeMs, async (rolloutPath) => (
+    readCodexChildSubagentRolloutSnapshot(rolloutPath, parentThreadId)
+  ));
+}
+
+async function discoverCodexChildSubagentRolloutsBySession(
+  env: Record<string, string | undefined>,
+  sessionId: string,
+  cwd: string,
+  minMtimeMs: number,
+): Promise<CodexChildSubagentRolloutSnapshot[]> {
+  const normalizedCwd = normalizeTransportCwd(cwd) ?? cwd;
+  return discoverCodexChildSubagentRolloutsByPredicate(env, minMtimeMs, async (rolloutPath) => {
+    const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
+    if (!snapshot) return null;
+    if (snapshot.imcodesSessionName !== sessionId) return null;
+    if (snapshot.cwd) {
+      const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
+      if (snapshotCwd !== normalizedCwd) return null;
+    }
+    return snapshot;
+  });
+}
+
+async function discoverCodexChildSubagentRolloutsByPredicate(
+  env: Record<string, string | undefined>,
+  minMtimeMs: number,
+  readSnapshot: (rolloutPath: string) => Promise<CodexChildSubagentRolloutSnapshot | null>,
+): Promise<CodexChildSubagentRolloutSnapshot[]> {
+  const codexHome = getCodexHome(env);
+  const snapshots: CodexChildSubagentRolloutSnapshot[] = [];
+  const minMtimeWithSkew = minMtimeMs - CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS;
+  for (const dir of recentCodexSessionDirs(codexHome)) {
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
+      const rolloutPath = join(dir, name);
+      try {
+        const info = await stat(rolloutPath);
+        if (info.mtimeMs < minMtimeWithSkew) continue;
+      } catch {
+        continue;
+      }
+      const snapshot = await readSnapshot(rolloutPath);
+      if (snapshot) snapshots.push(snapshot);
+    }
+  }
+  return snapshots;
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -399,6 +619,7 @@ export interface CodexDiscoveredModel {
 
 interface CodexSdkSessionState {
   routeId: string;
+  imcodesSessionName?: string;
   cwd: string;
   env?: Record<string, string>;
   mcpConfig?: Record<string, unknown>;
@@ -415,6 +636,7 @@ interface CodexSdkSessionState {
   activeItemIds: Set<string>;
   activeToolItemIds: Set<string>;
   activeCompactionItemIds: Set<string>;
+  openProviderToolCalls: Map<string, ToolCallEvent>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
@@ -468,6 +690,12 @@ interface CodexSdkSessionState {
   rawChecklistScanPromise?: Promise<void>;
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
+  childSubagentRolloutStartedAt: number;
+  childSubagentRolloutSeenIds: Set<string>;
+  childSubagentRolloutCompletedIds: Set<string>;
+  childSubagentRolloutScanPromise?: Promise<void>;
+  childSubagentRolloutTimer: ReturnType<typeof setTimeout> | null;
+  childSubagentRolloutPollUntil: number;
   /** Set once a native codex>=0.139 `turn/plan/updated` event has rendered the
    *  plan, so the legacy rollout-file scan is suppressed (no double-render). */
   nativePlanEventSeen?: boolean;
@@ -1596,6 +1824,7 @@ export class CodexSdkProvider implements TransportProvider {
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
     this.sessions.set(routeId, {
       routeId,
+      ...(config.sessionName ? { imcodesSessionName: config.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
       mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
@@ -1611,6 +1840,7 @@ export class CodexSdkProvider implements TransportProvider {
       activeItemIds: new Set(),
       activeToolItemIds: new Set(),
       activeCompactionItemIds: new Set(),
+      openProviderToolCalls: new Map(),
       cancelled: false,
       cancelTimer: null,
       compactSettleTimer: null,
@@ -1636,6 +1866,12 @@ export class CodexSdkProvider implements TransportProvider {
       rawChecklistScanPromise: undefined,
       rawChecklistPollTimer: null,
       rawChecklistPollUntil: 0,
+      childSubagentRolloutStartedAt: Date.now(),
+      childSubagentRolloutSeenIds: existing?.childSubagentRolloutSeenIds ?? new Set(),
+      childSubagentRolloutCompletedIds: existing?.childSubagentRolloutCompletedIds ?? new Set(),
+      childSubagentRolloutScanPromise: undefined,
+      childSubagentRolloutTimer: null,
+      childSubagentRolloutPollUntil: 0,
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -1647,6 +1883,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
+    this.clearChildSubagentRolloutPollTimer(state);
     if (state.threadId && state.loaded) {
       await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
       this.threadToSession.delete(state.threadId);
@@ -1800,7 +2037,9 @@ export class CodexSdkProvider implements TransportProvider {
       this.rememberTerminatedTurn(state, turnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;      state.activeItemIds.clear();
+      this.closeOpenProviderToolCalls(sessionId, state, 'error');
       this.clearRawChecklistPollTimer(state);
+      this.clearChildSubagentRolloutPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
@@ -1817,7 +2056,9 @@ export class CodexSdkProvider implements TransportProvider {
     this.rl = null;
     for (const [sessionId, state] of this.sessions) {
       this.clearCancelTimer(state);
-      this.clearCompactTimers(state);      this.clearRawChecklistPollTimer(state);
+      this.clearCompactTimers(state);
+      this.clearRawChecklistPollTimer(state);
+      this.clearChildSubagentRolloutPollTimer(state);
       if (!options.clearSessions) {
         this.clearStatus(sessionId, state);
         this.rememberTerminatedActiveTurn(state);
@@ -1984,6 +2225,7 @@ export class CodexSdkProvider implements TransportProvider {
       const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
       if (startedTurnId) state.runningTurnId = startedTurnId;
       state.nativePlanEventSeen = false;
+      this.armChildSubagentRolloutPolling(sessionId, state);
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
         state.terminatedTurnIds.delete(state.runningTurnId);
@@ -2000,6 +2242,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.rememberTerminatedTurn(state, state.runningTurnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;      state.activeItemIds.clear();
+      this.closeOpenProviderToolCalls(sessionId, state, 'error');
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
@@ -2295,7 +2538,8 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async readRawChecklistHistoryChunk(state: CodexSdkSessionState): Promise<string | null> {
     if (!state.threadId) return null;
-    const env = { ...process.env, ...(state.env ?? {}) };
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
     const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
     if (!rolloutPath) return null;
     state.rawChecklistRolloutPath = rolloutPath;
@@ -2395,6 +2639,108 @@ export class CodexSdkProvider implements TransportProvider {
     };
     state.rawChecklistPollTimer = setTimeout(tick, CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS);
     state.rawChecklistPollTimer.unref?.();
+  }
+
+  private clearChildSubagentRolloutPollTimer(state: CodexSdkSessionState): void {
+    if (state.childSubagentRolloutTimer) clearTimeout(state.childSubagentRolloutTimer);
+    state.childSubagentRolloutTimer = null;
+    state.childSubagentRolloutPollUntil = 0;
+  }
+
+  private queueChildSubagentRolloutScan(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId || state.childSubagentRolloutScanPromise) return;
+    state.childSubagentRolloutScanPromise = this.scanChildSubagentRollouts(sessionId, state)
+      .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK child subagent rollout scan failed'))
+      .finally(() => {
+        state.childSubagentRolloutScanPromise = undefined;
+      });
+  }
+
+  private armChildSubagentRolloutPolling(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId) return;
+    state.childSubagentRolloutPollUntil = Date.now() + CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS;
+    this.queueChildSubagentRolloutScan(sessionId, state);
+    if (state.childSubagentRolloutTimer) return;
+    const tick = () => {
+      state.childSubagentRolloutTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      const hasOpenChild = [...this.trackedSubagentThreads.values()].some(
+        (tracked) => tracked.sessionId === sessionId && tracked.rolloutPath,
+      );
+      if (!state.threadId || (Date.now() > state.childSubagentRolloutPollUntil && !hasOpenChild)) {
+        this.clearChildSubagentRolloutPollTimer(state);
+        return;
+      }
+      this.queueChildSubagentRolloutScan(sessionId, state);
+      state.childSubagentRolloutTimer = setTimeout(tick, CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS);
+      state.childSubagentRolloutTimer.unref?.();
+    };
+    state.childSubagentRolloutTimer = setTimeout(tick, CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS);
+    state.childSubagentRolloutTimer.unref?.();
+  }
+
+  private async scanChildSubagentRollouts(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    if (!state.threadId) return;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const snapshots = await discoverCodexChildSubagentRollouts(
+      env,
+      state.threadId,
+      state.childSubagentRolloutStartedAt,
+    );
+    const seenRolloutPaths = new Set(snapshots.map((snapshot) => snapshot.rolloutPath));
+    const rememberSnapshot = (snapshot: CodexChildSubagentRolloutSnapshot | null | undefined): void => {
+      if (!snapshot || seenRolloutPaths.has(snapshot.rolloutPath)) return;
+      snapshots.push(snapshot);
+      seenRolloutPaths.add(snapshot.rolloutPath);
+    };
+    for (const tracked of this.trackedSubagentThreads.values()) {
+      if (tracked.sessionId !== sessionId) continue;
+      if (state.childSubagentRolloutCompletedIds.has(tracked.agentId)) continue;
+      const rolloutPath = tracked.rolloutPath ?? await findCodexRolloutPathByUuid(env, tracked.agentId);
+      if (!rolloutPath || seenRolloutPaths.has(rolloutPath)) continue;
+      const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
+      if (snapshot?.agentId === tracked.agentId) {
+        rememberSnapshot(snapshot);
+      }
+    }
+    const sessionSnapshots = await discoverCodexChildSubagentRolloutsBySession(
+      env,
+      state.imcodesSessionName ?? sessionId,
+      state.cwd,
+      state.childSubagentRolloutStartedAt,
+    );
+    for (const snapshot of sessionSnapshots) rememberSnapshot(snapshot);
+    for (const snapshot of snapshots) {
+      if (state.childSubagentRolloutCompletedIds.has(snapshot.agentId)) continue;
+      const existing = this.trackedSubagentThreads.get(snapshot.agentId);
+      const tracked: CodexTrackedSubagentThread = existing ?? {
+        sessionId,
+        callId: `rollout:${snapshot.agentId}`,
+        agentId: snapshot.agentId,
+      };
+      tracked.agentName = snapshot.agentName ?? tracked.agentName;
+      tracked.prompt = snapshot.prompt ?? tracked.prompt;
+      tracked.model = snapshot.model ?? tracked.model;
+      tracked.rolloutPath = snapshot.rolloutPath;
+      if (snapshot.usageTotalTokens !== undefined) tracked.usageTotalTokens = snapshot.usageTotalTokens;
+      this.trackedSubagentThreads.set(snapshot.agentId, tracked);
+
+      if (!state.childSubagentRolloutSeenIds.has(snapshot.agentId)) {
+        state.childSubagentRolloutSeenIds.add(snapshot.agentId);
+        this.emitTrackedSubagentSnapshot(tracked, 'running');
+      } else if (snapshot.usageTotalTokens !== undefined && !snapshot.completed) {
+        this.emitTrackedSubagentSnapshot(tracked, tracked.lastStatus ?? 'running');
+      }
+
+      if (snapshot.completed) {
+        const status = { completed: snapshot.output ?? 'completed' };
+        tracked.lastStatus = status;
+        this.emitTrackedSubagentSnapshot(tracked, status);
+        state.childSubagentRolloutCompletedIds.add(snapshot.agentId);
+        this.trackedSubagentThreads.delete(snapshot.agentId);
+      }
+    }
   }
 
   private handleRawResponseItem(params: Record<string, any>): boolean {
@@ -2511,6 +2857,7 @@ export class CodexSdkProvider implements TransportProvider {
         : rawStatus ?? 'completed';
     tracked.lastStatus = status;
     this.emitTrackedSubagentSnapshot(tracked, status);
+    this.sessions.get(tracked.sessionId)?.childSubagentRolloutCompletedIds.add(threadId);
     this.trackedSubagentThreads.delete(threadId);
     return true;
   }
@@ -2529,6 +2876,7 @@ export class CodexSdkProvider implements TransportProvider {
     tracked.lastStatus = status;
     const tool = this.emitTrackedSubagentSnapshot(tracked, status);
     if ((tool?.detail as SdkSubagentDetail | undefined)?.meta?.terminal) {
+      this.sessions.get(tracked.sessionId)?.childSubagentRolloutCompletedIds.add(threadId);
       this.trackedSubagentThreads.delete(threadId);
     }
     return true;
@@ -2642,7 +2990,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.nativePlanEventSeen = true;
       const tool = planToolFromTurnPlanEvent(sessionId, turnId ?? state.runningTurnId, params.plan);
       if (tool) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+        this.emitTrackedProviderToolCall(sessionId, state, tool);
       }
       return;
     }
@@ -2739,7 +3087,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+        this.emitTrackedProviderToolCall(sessionId, state, tool);
       }
 
       if (item.type === 'agentMessage') {
@@ -2791,6 +3139,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
+        this.closeOpenProviderToolCalls(sessionId, state, 'error');
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
         state.compactObserved = false;
@@ -2816,8 +3165,10 @@ export class CodexSdkProvider implements TransportProvider {
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
           state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
+          this.closeOpenProviderToolCalls(sessionId, state, 'error');
           return;
         }
+        this.closeOpenProviderToolCalls(sessionId, state, 'error');
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -2835,6 +3186,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearRawChecklistPollTimer(state);
+        this.closeOpenProviderToolCalls(sessionId, state, 'error');
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -2873,6 +3225,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRawChecklistPollTimer(state);
     this.commitPendingSessionSystemTextUpdate(state, turnId);
     this.rememberCompletedTurn(state, turnId);
+    this.closeOpenProviderToolCalls(sessionId, state, 'complete');
     const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
     const currentText = state.currentText;
     const usage = state.lastUsage;
@@ -3221,6 +3574,92 @@ export class CodexSdkProvider implements TransportProvider {
     state.pendingSessionSystemTextUpdateTurnId = undefined;
   }
 
+  private emitTrackedProviderToolCall(sessionId: string, state: CodexSdkSessionState, tool: ToolCallEvent): void {
+    if (tool.status === 'running') {
+      state.openProviderToolCalls.set(tool.id, tool);
+    } else {
+      state.openProviderToolCalls.delete(tool.id);
+    }
+    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+
+    if (tool.status !== 'running' && this.isCodexCollabSdkTool(tool)) {
+      this.closeOpenCodexCollabProviderToolCalls(
+        sessionId,
+        state,
+        tool.status === 'complete' ? 'complete' : 'error',
+        tool.id,
+      );
+    }
+  }
+
+  private isCodexCollabSdkTool(tool: ToolCallEvent): boolean {
+    const detail = isRecord(tool.detail) ? tool.detail : undefined;
+    const meta = isRecord(detail?.meta) ? detail.meta : undefined;
+    return detail?.kind === SDK_SUBAGENT_DETAIL_KIND
+      && meta?.provider === SDK_SUBAGENT_PROVIDERS.CODEX_SDK
+      && meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT;
+  }
+
+  private closeOpenCodexCollabProviderToolCalls(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    status: Exclude<ToolCallEvent['status'], 'running'>,
+    exceptToolId?: string,
+  ): void {
+    if (state.openProviderToolCalls.size === 0) return;
+    for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
+      if (toolId === exceptToolId) continue;
+      if (!this.isCodexCollabSdkTool(runningTool)) continue;
+      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status);
+    }
+  }
+
+  private closeOpenProviderToolCalls(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    status: Exclude<ToolCallEvent['status'], 'running'>,
+  ): void {
+    if (state.openProviderToolCalls.size === 0) return;
+    for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
+      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status);
+    }
+  }
+
+  private closeOneOpenProviderToolCall(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    toolId: string,
+    runningTool: ToolCallEvent,
+    status: Exclude<ToolCallEvent['status'], 'running'>,
+  ): void {
+    const output = runningTool.output !== undefined ? runningTool.output : status === 'complete' ? 'completed' : 'failed';
+    const detail = isRecord(runningTool.detail) && runningTool.detail.kind === SDK_SUBAGENT_DETAIL_KIND && isRecord(runningTool.detail.meta)
+      ? buildSdkSubagentSafeDetail({
+        ...(runningTool.detail as SdkSubagentDetail),
+        output,
+        meta: {
+          ...(runningTool.detail.meta as SdkSubagentDetail['meta']),
+          normalizedStatus: status === 'complete' ? SDK_SUBAGENT_STATUS.COMPLETE : SDK_SUBAGENT_STATUS.ERROR,
+          rawStatus: status === 'complete' ? 'completed' : 'error',
+          active: false,
+          terminal: true,
+          ...((runningTool.detail.meta as SdkSubagentDetail['meta']).providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT
+            ? { runningChildCount: 0 }
+            : {}),
+        },
+      } satisfies SdkSubagentDetail, { allowRaw: false })
+      : runningTool.detail;
+    const terminalTool: ToolCallEvent = {
+      ...runningTool,
+      id: toolId,
+      status,
+      output,
+      ...(detail ? { detail } : {}),
+    };
+    state.openProviderToolCalls.delete(toolId);
+    for (const cb of this.toolCallCallbacks) cb(sessionId, terminalTool);
+  }
+
   private commitPendingSessionSystemTextUpdate(state: CodexSdkSessionState, turnId?: string): void {
     if (!state.pendingSessionSystemTextUpdate) return;
     if (state.pendingSessionSystemTextUpdateTurnId && turnId && state.pendingSessionSystemTextUpdateTurnId !== turnId) {
@@ -3246,6 +3685,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.activeItemIds.clear();
     state.activeToolItemIds.clear();
     state.activeCompactionItemIds.clear();
+    this.closeOpenProviderToolCalls(sessionId, state, 'error');
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
 
@@ -3334,6 +3774,7 @@ export class CodexSdkProvider implements TransportProvider {
       state.currentMessageId = null;
       state.currentText = '';
       state.activeItemIds.clear();
+      this.closeOpenProviderToolCalls(sessionId, state, 'error');
       this.emitError(sessionId, this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         `Codex SDK compact did not complete within ${Math.round(COMPACT_HARD_TIMEOUT_MS)}ms`,

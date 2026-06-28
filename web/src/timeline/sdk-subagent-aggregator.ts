@@ -124,6 +124,11 @@ function getSessionFinishState(event: TimelineEvent, order: number): SessionFini
   return { eventId: event.eventId, ts: event.ts, order };
 }
 
+function getCodexCollabWrapperFinishState(event: TimelineEvent, order: number): SessionFinishState | null {
+  if (event.type === 'assistant.text') return { eventId: event.eventId, ts: event.ts, order };
+  return getSessionFinishState(event, order);
+}
+
 function isKnownStatus(value: string): value is SdkSubagentNormalizedStatus {
   return Object.values(SDK_SUBAGENT_STATUS).includes(value as SdkSubagentNormalizedStatus);
 }
@@ -275,6 +280,10 @@ function staleRowAfterFinish(row: RowState, finish: SessionFinishState): RowStat
   };
 }
 
+function isCodexCollabWrapperRow(row: Pick<SdkSubagentStatusRow, 'providerKind' | 'receiverThreadId'>): boolean {
+  return row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT && !row.receiverThreadId;
+}
+
 function getRunningContribution(row: SdkSubagentStatusRow): number {
   if (!row.active || row.terminal || !ACTIVE_STATUSES.has(row.normalizedStatus)) return 0;
   if (
@@ -312,10 +321,13 @@ export function deriveSdkSubagentStatusRows(
   const rowsByCanonicalKey = new Map<string, RowState>();
   const diagnosticsById = new Map<string, DiagnosticState>();
   const sessionFinishes: SessionFinishState[] = [];
+  const codexCollabWrapperFinishes: SessionFinishState[] = [];
 
   events.forEach((event, order) => {
     const finish = getSessionFinishState(event, order);
     if (finish) sessionFinishes.push(finish);
+    const codexCollabFinish = getCodexCollabWrapperFinishState(event, order);
+    if (codexCollabFinish) codexCollabWrapperFinishes.push(codexCollabFinish);
 
     const detail = getSdkSubagentDetail(event);
     if (!detail) return;
@@ -368,7 +380,10 @@ export function deriveSdkSubagentStatusRows(
   for (const [canonicalKey, row] of rowsByCanonicalKey.entries()) {
     if (!row.active || isTerminalish(row)) continue;
     if (row.backgrounded) continue;
-    const finish = findFinishAfter(row, sessionFinishes);
+    const finish = findFinishAfter(
+      row,
+      isCodexCollabWrapperRow(row) ? codexCollabWrapperFinishes : sessionFinishes,
+    );
     if (!finish) continue;
     rowsByCanonicalKey.set(canonicalKey, staleRowAfterFinish(row, finish));
   }

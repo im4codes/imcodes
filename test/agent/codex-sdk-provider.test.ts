@@ -516,6 +516,92 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('terminalizes open SDK sub-agent details when closing provider tool calls', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-close-open', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-close-open', 'spawn a helper that reports only wrapper running');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-open-wrapper',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'pendingInit' } },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-open-wrapper',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'pendingInit' } },
+    }));
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        turn: { id: 'turn-1', status: 'completed' },
+      },
+    });
+    await waitForCondition(() => tools.length === 3);
+
+    expect(tools[2]).toMatchObject({
+      id: 'collab-open-wrapper',
+      name: 'Codex Collaboration',
+      status: 'complete',
+      output: 'completed',
+    });
+    const detail = expectCodexSubagentDetail(tools[2]!);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-close-open', 'collab-open-wrapper'),
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      runningChildCount: 0,
+    });
+  });
+
+  it('closes prior Codex collaboration wrapper rows when terminal evidence uses a different call id', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-different-terminal-id', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-different-terminal-id', 'spawn then wait for a helper');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'spawn-call-id',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'pendingInit' } },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'wait-call-id',
+      status: 'completed',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'completed' } },
+    }));
+    await waitForCondition(() => tools.length === 3);
+
+    const closedSpawn = tools.find((tool) => tool.id === 'spawn-call-id' && tool.status === 'complete');
+    expect(closedSpawn).toBeTruthy();
+    const closedDetail = expectCodexSubagentDetail(closedSpawn!);
+    expect(closedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-different-terminal-id', 'spawn-call-id'),
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      rawStatus: 'completed',
+      active: false,
+      terminal: true,
+      runningChildCount: 0,
+    });
+  });
+
   it('handles empty Codex collaboration receiver lists without inventing child work', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
@@ -1336,6 +1422,302 @@ describe('CodexSdkProvider', () => {
     });
     await flush();
     expect(tools).toHaveLength(3);
+  });
+
+  it('emits backgrounded SDK sub-agent snapshots from Codex child rollout metadata', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-'));
+    const provider = new CodexSdkProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({ sessionKey: 'route-child-rollout-subagent', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      const rolloutPath = await writeCodexRolloutFile(codexHome, 'child-rollout-only', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f-child-rollout-only',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'thread-1',
+                  agent_nickname: 'Rawls',
+                  agent_role: 'default',
+                },
+              },
+            },
+            agent_nickname: 'Rawls',
+            agent_role: 'default',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'turn_context',
+          payload: { model: 'gpt-5.5' },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'Wait for 200 seconds',
+          },
+        },
+      ]);
+
+      await provider.send('route-child-rollout-subagent', 'spawn a child helper');
+      await waitForCondition(() => tools.length === 1);
+
+      const expectedKey = makeCodexSubagentCanonicalKey(
+        'route-child-rollout-subagent',
+        'runtime:019f-child-rollout-only',
+      );
+      expect(tools[0]).toMatchObject({
+        id: expectedKey,
+        name: 'Codex Sub-agent',
+        status: 'running',
+        input: { action: 'codex-runtime-subagent', description: 'Wait for 200 seconds' },
+      });
+      const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(runningDetail.meta).toMatchObject({
+        canonicalKey: expectedKey,
+        agentPath: '019f-child-rollout-only',
+        agentName: 'Rawls',
+        model: 'gpt-5.5',
+        rawStatus: 'running',
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      });
+
+      await appendFile(rolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          last_agent_message: '子代理 200 秒计时完成。',
+          duration_ms: 200_000,
+        },
+      })}\n`);
+
+      await waitForCondition(() => tools.length === 2, 5000);
+      expect(tools[1]).toMatchObject({
+        id: expectedKey,
+        name: 'Codex Sub-agent',
+        status: 'complete',
+        output: '子代理 200 秒计时完成。',
+      });
+      const completeDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(completeDetail.meta).toMatchObject({
+        canonicalKey: expectedKey,
+        rawStatus: 'completed',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        backgrounded: true,
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('completes raw spawn_agent sub-agents from child rollout even when rollout parent id differs', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-agent-id-'));
+    const provider = new CodexSdkProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({ sessionKey: 'route-child-rollout-agent-id', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-child-rollout-agent-id', 'spawn a helper');
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call',
+            name: 'spawn_agent',
+            call_id: 'call-spawn-rollout-agent-id',
+            arguments: JSON.stringify({ message: 'Wait for 60 seconds' }),
+          },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call_output',
+            call_id: 'call-spawn-rollout-agent-id',
+            output: JSON.stringify({
+              agent_id: '019f09e7-6e21-7493-a591-d55acec21e85',
+              nickname: 'Chandrasekhar',
+            }),
+          },
+        },
+      });
+      await waitForCondition(() => tools.length === 1);
+
+      await writeCodexRolloutFile(codexHome, '019f09e7-6e21-7493-a591-d55acec21e85', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f09e7-6e21-7493-a591-d55acec21e85',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'codex-cli-parent-rollout-id-not-thread-1',
+                  agent_nickname: 'Chandrasekhar',
+                },
+              },
+            },
+            agent_nickname: 'Chandrasekhar',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            last_agent_message: 'Codex 子代理状态测试完成。',
+          },
+        },
+      ]);
+
+      await waitForCondition(() => tools.some((tool) => tool.status === 'complete'), 10000);
+      const completedTool = tools.find((tool) => tool.status === 'complete')!;
+      expect(completedTool).toMatchObject({
+        id: makeCodexSubagentCanonicalKey(
+          'route-child-rollout-agent-id',
+          'runtime:019f09e7-6e21-7493-a591-d55acec21e85',
+        ),
+        name: 'Codex Sub-agent',
+        status: 'complete',
+        output: 'Codex 子代理状态测试完成。',
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers child rollout sub-agents by IM.codes session identity when Codex parent id differs', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-session-'));
+    const provider = new CodexSdkProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({
+        sessionKey: '89545d81-5ea0-4cf1-8eb3-8d0e9ff188a9',
+        sessionName: 'route-child-rollout-session',
+        cwd: '/tmp/project',
+      });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('89545d81-5ea0-4cf1-8eb3-8d0e9ff188a9', 'spawn a helper through the SDK wrapper');
+      const child = childProcessMock.children[0];
+      emitCodexItem(child, 'item/started', collabItem({
+        id: 'call-wrapper-spawn',
+        status: 'inProgress',
+        receiverThreadIds: ['unknown-pending-child'],
+        agentsStates: { 'unknown-pending-child': { status: 'pendingInit' } },
+        prompt: 'Wait for 45 seconds',
+      }));
+
+      await writeCodexRolloutFile(codexHome, '019f09f3-10d1-7832-91ae-666517d65455', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f09f3-10d1-7832-91ae-666517d65455',
+            cwd: '/tmp/project',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'codex-cli-parent-rollout-id-not-thread-1',
+                  agent_nickname: 'Linnaeus',
+                  agent_role: 'default',
+                },
+              },
+            },
+            agent_nickname: 'Linnaeus',
+            agent_role: 'default',
+            base_instructions: {
+              text: [
+                'You are Codex.',
+                '',
+                '# IM.codes runtime instructions',
+                '',
+                '- Exact session name: route-child-rollout-session',
+                '- Display label: route-child-rollout-session',
+              ].join('\n'),
+            },
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'Wait for 45 seconds',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            last_agent_message: 'Codex SDK 子代理 UI 状态测试完成。',
+          },
+        },
+      ]);
+
+      await waitForCondition(
+        () => tools.some((tool) => (
+          tool.name === 'Codex Sub-agent'
+          && tool.status === 'complete'
+        )),
+        10000,
+      );
+      const runtimeTool = tools.find((tool) => tool.name === 'Codex Sub-agent' && tool.status === 'complete')!;
+      const expectedKey = makeCodexSubagentCanonicalKey(
+        '89545d81-5ea0-4cf1-8eb3-8d0e9ff188a9',
+        'runtime:019f09f3-10d1-7832-91ae-666517d65455',
+      );
+      expect(runtimeTool).toMatchObject({
+        id: expectedKey,
+        name: 'Codex Sub-agent',
+        status: 'complete',
+        input: { action: 'codex-runtime-subagent', description: 'Wait for 45 seconds' },
+        output: 'Codex SDK 子代理 UI 状态测试完成。',
+      });
+      const detail = expectCodexSubagentDetail(runtimeTool, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(detail.meta).toMatchObject({
+        canonicalKey: expectedKey,
+        agentPath: '019f09f3-10d1-7832-91ae-666517d65455',
+        agentName: 'Linnaeus',
+        rawStatus: 'completed',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        backgrounded: true,
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('marks raw spawn_agent sub-agent rows complete from child turn completion', async () => {
@@ -3391,6 +3773,71 @@ describe('CodexSdkProvider', () => {
     const detail = tools[1].detail as { summary?: string; input?: Record<string, unknown> };
     expect(detail.summary).toBe('apple stock today');
     expect(detail.input).toEqual({ query: 'apple stock today', action: { type: 'search', query: 'apple stock today' } });
+  });
+
+  it('terminalizes a WebSearch started event when the turn completes without item/completed', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-start-only-turn-complete', cwd: '/tmp/project' });
+
+    const tools: Array<{ id: string; name: string; status: string; input: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ id: tool.id, name: tool.name, status: tool.status, input: tool.input }));
+
+    await provider.send('route-websearch-start-only-turn-complete', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-start-only-turn-complete')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-start-only', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.length === 1);
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+
+    await waitForCondition(() => tools.length === 2);
+    expect(tools).toEqual([
+      { id: 'ws-start-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } },
+      { id: 'ws-start-only', name: 'WebSearch', status: 'complete', input: { query: '(other)' } },
+    ]);
+  });
+
+  it('terminalizes a WebSearch started event when thread-idle settles a turn without turn/completed', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-start-only-idle-settle', cwd: '/tmp/project' });
+
+    const tools: Array<{ id: string; name: string; status: string; input: unknown }> = [];
+    const completed: string[] = [];
+    provider.onToolCall((_, tool) => tools.push({ id: tool.id, name: tool.name, status: tool.status, input: tool.input }));
+    provider.onComplete((_, message) => completed.push(message.content));
+
+    await provider.send('route-websearch-start-only-idle-settle', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-start-only-idle-settle')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-idle-only', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.length === 1);
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+
+    await waitForCondition(() => completed.length === 1 && tools.length === 2);
+    expect(completed).toEqual(['Done.']);
+    expect(tools).toEqual([
+      { id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } },
+      { id: 'ws-idle-only', name: 'WebSearch', status: 'complete', input: { query: '(other)' } },
+    ]);
   });
 
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
