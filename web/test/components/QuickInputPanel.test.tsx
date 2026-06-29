@@ -94,6 +94,36 @@ describe('QuickInputPanel history scope', () => {
     expect(screen.queryByRole('button', { name: 'LGTM, commit' })).toBeNull();
   });
 
+  it('renders multiline history previews with a visible return marker while selecting raw text', () => {
+    const onSelect = vi.fn();
+    const multiline = '测试\n换行';
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={onSelect}
+        onSend={vi.fn()}
+        agentType="codex-sdk"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: { 'session-a': [multiline] }, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const preview = screen.getByText('测试 ↵ 换行');
+    fireEvent.click(preview.closest('.qp-item')!);
+
+    expect(onSelect).toHaveBeenCalledWith(multiline);
+  });
+
   it('opens below the trigger when the quick-input trigger is high in the viewport', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
     Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });

@@ -423,6 +423,10 @@ function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
   return text.slice(0, half) + '...' + text.slice(-half);
 }
 
+function formatPreviewText(text: string, max = TRUNCATE_THRESHOLD): string {
+  return truncateMiddle(text.replace(/\r\n?/g, '\n').replace(/\n/g, ' ↵ '), max);
+}
+
 export function QuickInputPanel({
   open, onClose, onSelect, onSend, agentType, sessionName,
   data, loaded,
@@ -671,7 +675,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{truncateMiddle(cmd)}</span>
+                      <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</span>
                       <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemoveCommand(cmd); }}>✕</button>
                     </span>
@@ -703,7 +707,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{truncateMiddle(phrase)}</span>
+                      <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</span>
                       <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemovePhrase(phrase); }}>✕</button>
                     </span>
@@ -731,7 +735,7 @@ export function QuickInputPanel({
               </div>
               {historySlice.length > 0 ? historySlice.map((text, i) => (
                 <div key={historyPage * HISTORY_PAGE_SIZE + i} class="qp-item qp-item-history" onClick={() => handleSelect(text)} title={text.length > 60 ? text : undefined}>
-                  <span class="qp-item-text">{truncateMiddle(text, 60)}</span>
+                  <span class="qp-item-text">{formatPreviewText(text, 60)}</span>
                   <button class="qp-item-del" onClick={(e) => { e.stopPropagation(); handleRemoveItem(text); }}>✕</button>
                 </div>
               )) : (
