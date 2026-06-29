@@ -194,6 +194,35 @@ import {
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
 
+function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffix: string): void {
+  const parts: string[] = [];
+  const appendNewline = () => {
+    if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
+  };
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent ?? '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const child = node as HTMLElement;
+    const tag = child.tagName;
+    const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
+    if (tag === 'BR') {
+      appendNewline();
+      return;
+    }
+    if (isBlock && parts.length > 0) appendNewline();
+    child.childNodes.forEach(walk);
+    if (isBlock) appendNewline();
+  };
+  element.childNodes.forEach(walk);
+  const current = parts.join('').replace(/\n+$/g, '');
+  element.textContent = `${current}${suffix}`.replace(/\r\n?/g, '\n');
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.focus();
+}
+
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -4699,9 +4728,7 @@ export function App() {
                   const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                   if (inputEl) {
                     const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                    inputEl.textContent = (inputEl.textContent || '') + quote;
-                    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                    inputEl.focus();
+                    appendContentEditableTextPreservingNewlines(inputEl, quote);
                   }
                 },
                 t: trans,
@@ -5118,9 +5145,7 @@ export function App() {
                       : paths.map((p) => '@' + p + ' ');
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
-                      inputEl.textContent = (inputEl.textContent || '') + rel.join('');
-                      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                      inputEl.focus();
+                      appendContentEditableTextPreservingNewlines(inputEl, rel.join(''));
                     }
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
@@ -5393,8 +5418,7 @@ export function App() {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
                       const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                      inputEl.textContent = (inputEl.textContent || '') + quote;
-                      inputEl.focus();
+                      appendContentEditableTextPreservingNewlines(inputEl, quote);
                     }
                   },
                   t: trans,
