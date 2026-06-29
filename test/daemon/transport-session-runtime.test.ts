@@ -1994,7 +1994,7 @@ ${PREFERENCE_CONTEXT_END}`;
     // @openspec/changes/... references by themselves are now allowed —
     // they're common in user debugging prompts and must still trigger recall.
     r.send('Drive the implementation of @openspec/changes/shared-agent-context aggressively.', 'client-turn-template');
-    await flushDispatch();
+    await waitForProviderSendCount(localMock.provider, 1);
 
     expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
