@@ -27,6 +27,7 @@ import {
 import logger from '../util/logger.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { timelineStore } from '../daemon/timeline-store.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
@@ -47,6 +48,16 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { buildCodexLifecycleTerminalMetadata, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  parseSdkSubagentDetail,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -1783,8 +1794,20 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
 type RestoreOpenToolCall = {
   id: string;
   tool?: string;
-  activityGeneration?: unknown;
+  activityGeneration?: ActivityGenerationLike;
 };
+
+type RestoreOpenSdkSubagentCall = RestoreOpenToolCall & {
+  detail: SdkSubagentDetail;
+  key: string;
+  turnId?: string;
+};
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
 
 function readTransportToolCallId(event: Record<string, unknown>): string | null {
   for (const key of ['toolCallId', 'toolUseId', 'callId', 'id']) {
@@ -1813,7 +1836,7 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
       openTools.set(id, {
         id,
         ...(typeof event.tool === 'string' && event.tool.trim() ? { tool: event.tool.trim() } : {}),
-        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration } : {}),
+        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration as ActivityGenerationLike } : {}),
       });
     } else {
       openTools.delete(id);
@@ -1821,20 +1844,29 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
   }
   if (openTools.size === 0) return 0;
 
-  const activityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  const fallbackActivityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
   let closed = 0;
   for (const tool of openTools.values()) {
-    const payload: Record<string, unknown> = {
-      toolCallId: tool.id,
-      ...(tool.tool ? { tool: tool.tool } : {}),
+    const activityGeneration = tool.activityGeneration ?? fallbackActivityGeneration;
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: sessionName,
       terminalStatus: 'stale',
       terminalReason: 'daemon_restart_orphan',
       activityGeneration,
+      toolCallId: tool.id,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+    });
+    const payload: Record<string, unknown> = {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      ...metadata,
     };
     timelineEmitter.emit(sessionName, 'tool.result', payload, {
       source: 'daemon',
       confidence: 'high',
-      eventId: `transport-tool:${sessionName}:${tool.id}:daemon_restart_orphan`,
+      eventId: metadata.idempotencyKey,
     });
     await appendTransportEvent(sessionName, {
       type: 'tool.result',
@@ -1844,6 +1876,91 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
     closed++;
   }
   logger.info({ sessionName, closed }, 'transport restore reconciled orphan tool calls');
+  return closed;
+}
+
+async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, runtime: TransportSessionRuntime): Promise<number> {
+  let events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  try {
+    const timelineEvents = await timelineStore.readByTypesPreferred(sessionName, ['tool.call', 'tool.result'], { limit: 200 });
+    events = timelineEvents.map((event) => ({ type: event.type, payload: event.payload }));
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'transport restore sdk orphan reconcile could not read timeline history');
+    return 0;
+  }
+  if (events.length === 0) return 0;
+
+  const openSdk = new Map<string, RestoreOpenSdkSubagentCall>();
+  for (const event of events) {
+    const payload = record(event.payload);
+    if (!payload) continue;
+    const parsed = parseSdkSubagentDetail(payload.detail);
+    if (parsed.kind !== 'ok') continue;
+    const id = readTransportToolCallId(payload);
+    if (!id) continue;
+    const key = parsed.detail.meta.canonicalKey || id;
+    if (event.type === 'tool.call' && parsed.detail.meta.active && !parsed.detail.meta.terminal) {
+      openSdk.set(key, {
+        key,
+        id,
+        detail: parsed.detail,
+        ...(typeof payload.tool === 'string' && payload.tool.trim() ? { tool: payload.tool.trim() } : {}),
+        ...(payload.activityGeneration !== undefined ? { activityGeneration: payload.activityGeneration as ActivityGenerationLike } : {}),
+        ...(typeof payload.turnId === 'string' && payload.turnId.trim() ? { turnId: payload.turnId.trim() } : {}),
+      });
+    } else if (event.type === 'tool.result' || parsed.detail.meta.terminal) {
+      openSdk.delete(key);
+      openSdk.delete(id);
+    }
+  }
+  if (openSdk.size === 0) return 0;
+
+  const fallbackActivityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  let closed = 0;
+  for (const tool of openSdk.values()) {
+    const staleDetail = buildSdkSubagentSafeDetail({
+      ...tool.detail,
+      output: tool.detail.output ?? 'stale after daemon restart',
+      meta: {
+        ...tool.detail.meta,
+        normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+        rawStatus: 'daemon_restart_orphan',
+        active: false,
+        terminal: true,
+        diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+        ...(typeof tool.detail.meta.runningChildCount === 'number' ? { runningChildCount: 0 } : {}),
+      },
+    }, { allowRaw: false, sessionId: sessionName });
+    const itemKind = staleDetail.meta.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT
+      ? 'codex_collaboration'
+      : 'sdk_subagent';
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: sessionName,
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      activityGeneration: tool.activityGeneration ?? fallbackActivityGeneration,
+      toolCallId: tool.id,
+      ...(tool.turnId ? { turnId: tool.turnId } : {}),
+      itemKind,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+    });
+    timelineEmitter.emit(sessionName, 'tool.result', {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      ...metadata,
+      output: staleDetail.output,
+      detail: staleDetail,
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-tool:${sessionName}:${tool.id}:restore-orphan-result`,
+      hidden: true,
+    });
+    closed += 1;
+  }
+  logger.info({ sessionName, closed }, 'transport restore reconciled orphan sdk sub-agent rows');
   return closed;
 }
 
@@ -2074,6 +2191,7 @@ export async function restoreTransportSessions(
       upsertSession(restoredRecord);
       emitSessionPersist(restoredRecord, s.name);
       await reconcileTransportRestoreOrphanTools(s.name, runtime);
+      await reconcileTimelineRestoreOrphanSdkSubagents(s.name, runtime);
       const restoredActivity = runtime.getDiagnosticSnapshot();
       timelineEmitter.emit(s.name, 'session.state', {
         state: 'idle',

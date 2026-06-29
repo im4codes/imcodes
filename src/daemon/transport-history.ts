@@ -154,7 +154,7 @@ export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): R
   const truncatedFields: string[] = [];
   const out: Record<string, unknown> = { type: 'tool.result' };
 
-  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', '_ts']) {
+  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', 'synthetic', 'source', 'decisionReason', 'idempotencyKey', 'turnId', 'itemKind', '_ts']) {
     if (event[key] !== undefined) out[key] = event[key];
   }
   previewField(out, 'output', pickToolResultOutput(event), truncatedFields);

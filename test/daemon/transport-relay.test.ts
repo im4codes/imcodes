@@ -968,15 +968,65 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({
+      expect(call![2]).toMatchObject({
+        sessionId: 'sess-tool',
         toolCallId: 'tool-1',
         terminalStatus: 'succeeded',
         terminalReason: 'provider_result',
+        synthetic: false,
+        source: 'app_server_jsonrpc',
+        decisionReason: 'provider_result',
+        idempotencyKey: expect.stringContaining('tool-1:succeeded:provider_result'),
         output: 'done',
         detail: { kind: 'tool_result', output: 'done' },
       });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
       expect(call![3].hidden).not.toBe(true);
+    });
+
+    it('preserves canonical lifecycle terminal metadata from provider tool events', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-tool', {
+        id: 'tool-1',
+        name: 'WebSearch',
+        status: 'complete',
+        output: 'done',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        terminalSynthetic: true,
+        terminalSource: 'daemon_synthetic',
+        terminalDecisionReason: 'local_stop',
+        terminalIdempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+        activityGeneration: { scope: 'session', sessionName: 'sess-tool', generation: 1 },
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call?.[2]).toMatchObject({
+        sessionId: 'sess-tool',
+        toolCallId: 'tool-1',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'local_stop',
+        idempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+        activityGeneration: { scope: 'session', sessionName: 'sess-tool', generation: 1 },
+        turnId: 'turn-1',
+        itemKind: 'web_search',
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-tool', expect.objectContaining({
+        type: 'tool.result',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'local_stop',
+        idempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+      }));
     });
 
     it('emits a visible checklist tool.call for completed-only update_plan snapshots', () => {

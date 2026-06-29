@@ -1,5 +1,11 @@
 import type { ToolCallDetail } from './agent-message.js';
 import type { ToolCallEvent } from './agent-message.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+  type CodexLifecycleEvidenceSource,
+  type ToolTerminalReason,
+  type ToolTerminalStatus,
+} from './session-activity-types.js';
 
 export const SDK_SUBAGENT_DETAIL_KIND = 'sdkSubagent' as const;
 export const SDK_SUBAGENT_SCHEMA_VERSION = 1 as const;
@@ -121,6 +127,7 @@ export type SdkSubagentDetailParseResult =
 
 export interface SdkSubagentSafeDetailOptions {
   allowRaw?: boolean;
+  sessionId?: string;
 }
 
 const PROVIDER_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_PROVIDERS));
@@ -387,10 +394,36 @@ export function buildSdkSubagentTimelinePayload(
       },
     };
   }
+  const terminalStatus = (tool.terminalStatus ?? (tool.status === 'error' ? 'errored' : 'succeeded')) as ToolTerminalStatus;
+  const terminalReason = (tool.terminalReason ?? (tool.status === 'error' ? 'provider_error' : 'provider_result')) as ToolTerminalReason;
+  const lifecycleMetadata = options.sessionId
+    ? buildCodexLifecycleTerminalMetadata({
+      sessionId: options.sessionId,
+      terminalStatus,
+      terminalReason,
+      synthetic: tool.terminalSynthetic ?? false,
+      source: (tool.terminalSource ?? 'app_server_jsonrpc') as CodexLifecycleEvidenceSource,
+      decisionReason: tool.terminalDecisionReason ?? terminalReason,
+      ...(tool.terminalIdempotencyKey ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+      ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+      toolCallId: tool.id,
+      ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+      ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+    })
+    : {
+      terminalStatus,
+      terminalReason,
+      ...(tool.terminalSynthetic !== undefined ? { synthetic: tool.terminalSynthetic } : {}),
+      ...(tool.terminalSource !== undefined ? { source: tool.terminalSource } : {}),
+      ...(tool.terminalDecisionReason !== undefined ? { decisionReason: tool.terminalDecisionReason } : {}),
+      ...(tool.terminalIdempotencyKey !== undefined ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+      ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+      ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+      ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+    };
   const payload: Record<string, unknown> = {
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...lifecycleMetadata,
     detail,
   };
   if (tool.status === 'error') payload.error = detail.output ?? 'error';

@@ -26,7 +26,17 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
-import type { ActivityGeneration, ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../../../shared/session-activity-types.js';
+import type {
+  ActivityGeneration,
+  CodexLifecycleItemKind,
+  ProviderActiveWorkSnapshot,
+  SessionActivityBusyReason,
+  ToolTerminalReason,
+  ToolTerminalStatus,
+} from '../../../shared/session-activity-types.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+} from '../../../shared/session-activity-types.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   isSessionControlCommandText,
@@ -87,6 +97,13 @@ const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
 ]);
 
 const CODEX_TOOL_LIKE_ITEM_TYPES = new Set(['commandExecution', 'mcpToolCall']);
+type CodexAppServerDisconnectClass =
+  | 'intentional_shutdown'
+  | 'auth_refresh_restart'
+  | 'unexpected_eof'
+  | 'unexpected_crash'
+  | 'no_current_work_disconnect';
+
 const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'subagentnotification',
   'subagentstatus',
@@ -669,6 +686,7 @@ interface CodexSdkSessionState {
   pendingSessionSystemTextUpdate?: string;
   pendingSessionSystemTextUpdateTurnId?: string;
   completedTurnIds: Set<string>;
+  terminalDuringTurnStartIds: Set<string>;
   completedCompactTurnIds: Set<string>;
   terminatedTurnIds: Set<string>;
   terminatedCompactTurnIds: Set<string>;
@@ -1750,6 +1768,39 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
+  private getCurrentTurnWorkState(state: CodexSdkSessionState): {
+    activeWorkCount: number;
+    activeToolCount: number;
+    busyReasons: SessionActivityBusyReason[];
+  } {
+    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
+    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
+    const activeToolIds = new Set<string>(activeToolItemIds);
+    for (const toolId of state.openProviderToolCalls.keys()) activeToolIds.add(toolId);
+    const activeToolCount = activeToolIds.size;
+    const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
+    const providerTurnActive = Boolean(state.runningTurnId || state.turnStartInFlight);
+    const busyReasons: SessionActivityBusyReason[] = [];
+    const providerTurnOnlyCount = providerTurnActive && activeToolCount === 0 && !compactionActive ? 1 : 0;
+    if (providerTurnOnlyCount > 0) busyReasons.push('provider_wait');
+    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
+    if (compactionActive) busyReasons.push('provider_compaction');
+    return {
+      activeWorkCount: providerTurnOnlyCount + activeToolCount + (compactionActive ? 1 : 0),
+      activeToolCount,
+      busyReasons,
+    };
+  }
+
+  private getActiveWorkSessionIds(): string[] {
+    const active: string[] = [];
+    for (const [sessionId, state] of this.sessions) {
+      const work = this.getCurrentTurnWorkState(state);
+      if (work.activeWorkCount > 0 || Boolean(state.cancelTimer)) active.push(sessionId);
+    }
+    return active;
+  }
+
   getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
@@ -1798,17 +1849,11 @@ export class CodexSdkProvider implements TransportProvider {
   getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
-    const busyReasons: SessionActivityBusyReason[] = [];
-    const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
-    const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
-    const activeToolCount = activeToolItemIds.size;
-    const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
-    if (activeToolCount > 0) busyReasons.push('provider_tool_item');
-    if (compactionActive) busyReasons.push('provider_compaction');
+    const work = this.getCurrentTurnWorkState(state);
     return {
-      activeWorkCount: activeToolCount + (compactionActive ? 1 : 0),
-      activeToolCount,
-      busyReasons,
+      activeWorkCount: work.activeWorkCount,
+      activeToolCount: work.activeToolCount,
+      busyReasons: work.busyReasons,
       activityGeneration: state.runtimeActivityGeneration,
       providerDiagnosticGeneration: state.runningTurnId ?? state.deferredIdleSettleTurnId ?? state.deferredCompactSettleTurnId ?? null,
     };
@@ -1852,6 +1897,7 @@ export class CodexSdkProvider implements TransportProvider {
       pendingSessionSystemTextUpdate: undefined,
       pendingSessionSystemTextUpdateTurnId: undefined,
       completedTurnIds: existing?.completedTurnIds ?? new Set(),
+      terminalDuringTurnStartIds: existing?.terminalDuringTurnStartIds ?? new Set(),
       completedCompactTurnIds: existing?.completedCompactTurnIds ?? new Set(),
       terminatedTurnIds: existing?.terminatedTurnIds ?? new Set(),
       terminatedCompactTurnIds: existing?.terminatedCompactTurnIds ?? new Set(),
@@ -1964,7 +2010,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
-    if (state.runningTurnId || state.runningCompact) {
+    if (state.runningTurnId || state.runningCompact || state.turnStartInFlight) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
     await this.refreshAppServerForLatestAuth('send');
@@ -1972,8 +2018,15 @@ export class CodexSdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
 
+    if (state.openProviderToolCalls.size > 0 || state.activeToolItemIds.size > 0 || state.activeCompactionItemIds.size > 0) {
+      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'abandoned', 'generation_rollover');
+      state.activeToolItemIds.clear();
+      state.activeCompactionItemIds.clear();
+      state.activeItemIds.clear();
+    }
     state.currentText = '';
-    state.currentMessageId = null;    state.activeItemIds.clear();
+    state.currentMessageId = null;
+    state.activeItemIds.clear();
     state.cancelled = false;
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
@@ -2028,7 +2081,18 @@ export class CodexSdkProvider implements TransportProvider {
     void this.request('turn/interrupt', {
       threadId: state.threadId,
       turnId,
-    }, CANCEL_INTERRUPT_TIMEOUT_MS).catch(() => {});
+    }, CANCEL_INTERRUPT_TIMEOUT_MS).catch((err) => {
+      logger.warn(
+        {
+          err,
+          provider: this.id,
+          sessionId,
+          threadId: state.threadId,
+          turnId,
+        },
+        'Codex SDK turn interrupt request failed',
+      );
+    });
     this.clearCancelTimer(state);
     state.cancelTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
@@ -2037,7 +2101,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.rememberTerminatedTurn(state, turnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;      state.activeItemIds.clear();
-      this.closeOpenProviderToolCalls(sessionId, state, 'error');
+      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
       this.clearRawChecklistPollTimer(state);
       this.clearChildSubagentRolloutPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
@@ -2050,8 +2114,75 @@ export class CodexSdkProvider implements TransportProvider {
     return { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
   }
 
+  private clearSessionWorkAfterDisconnect(sessionId: string, state: CodexSdkSessionState): void {
+    this.clearCancelTimer(state);
+    this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
+    this.clearChildSubagentRolloutPollTimer(state);
+    this.clearStatus(sessionId, state);
+    this.rememberTerminatedActiveTurn(state);
+    state.loaded = false;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    state.runningCompact = false;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.activeItemIds.clear();
+    state.activeToolItemIds.clear();
+    state.activeCompactionItemIds.clear();
+    state.cancelled = false;
+    state.lastStatusSignature = null;
+    this.clearPendingSessionSystemTextUpdate(state);
+  }
+
+  private settleSessionAfterAppServerDisconnect(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    disconnectClass: CodexAppServerDisconnectClass,
+    message: string,
+  ): boolean {
+    const work = this.getCurrentTurnWorkState(state);
+    const hasCurrentWork = work.activeWorkCount > 0 || Boolean(state.cancelTimer);
+    if (!hasCurrentWork) {
+      this.clearSessionWorkAfterDisconnect(sessionId, state);
+      return false;
+    }
+
+    const terminalReason: ToolTerminalReason = disconnectClass === 'unexpected_eof'
+      ? 'unexpected_eof'
+      : disconnectClass === 'auth_refresh_restart'
+        ? 'auth_refresh_recovery_failed'
+        : 'app_server_disconnect';
+    this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', terminalReason);
+    this.clearSessionWorkAfterDisconnect(sessionId, state);
+    this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, message, false));
+    return true;
+  }
+
+  private handleAppServerDisconnect(
+    child: ChildProcessWithoutNullStreams,
+    disconnectClass: Exclude<CodexAppServerDisconnectClass, 'intentional_shutdown' | 'no_current_work_disconnect'>,
+    err: Error,
+  ): void {
+    if (this.child !== child) return;
+    this.rejectPending(err);
+    let emittedError = false;
+    for (const [sessionId, state] of this.sessions) {
+      emittedError = this.settleSessionAfterAppServerDisconnect(sessionId, state, disconnectClass, err.message) || emittedError;
+    }
+    if (!emittedError) {
+      logger.info({ provider: this.id, disconnectClass }, 'Codex app-server disconnected with no current work');
+    }
+    this.child = null;
+    this.rl = null;
+    this.appServerAuthFingerprint = null;
+  }
+
   private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
     this.rejectPending(new Error('Codex app-server disconnected'));
+    const child = this.child;
+    this.child = null;
     this.rl?.close();
     this.rl = null;
     for (const [sessionId, state] of this.sessions) {
@@ -2060,26 +2191,14 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearRawChecklistPollTimer(state);
       this.clearChildSubagentRolloutPollTimer(state);
       if (!options.clearSessions) {
-        this.clearStatus(sessionId, state);
-        this.rememberTerminatedActiveTurn(state);
-        state.loaded = false;
-        state.runningTurnId = undefined;
-        state.turnStartInFlight = false;
-        state.runningCompact = false;
-        state.compactObserved = false;
-        state.currentMessageId = null;
-        state.currentText = '';
-        state.activeItemIds.clear();
-        state.cancelled = false;
-        state.lastStatusSignature = null;
-        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearSessionWorkAfterDisconnect(sessionId, state);
+      } else {
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'provider_cancelled');
       }
     }
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead.
-    const child = this.child;
-    this.child = null;
     if (child && !child.killed) {
       void killProcessTree(child);
     }
@@ -2113,33 +2232,24 @@ export class CodexSdkProvider implements TransportProvider {
     this.child = child;
     this.rl = readline.createInterface({ input: child.stdout });
     this.rl.on('line', (line) => this.handleLine(line));
+    this.rl.on('close', () => {
+      if (this.child !== child) return;
+      this.handleAppServerDisconnect(child, 'unexpected_eof', new Error('Codex app-server stdout closed'));
+    });
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString();
       if (text.trim()) logger.debug({ provider: this.id, stderr: text.trim() }, 'Codex app-server stderr');
     });
     child.on('exit', (code) => {
       if (this.child !== child) return;
-      const err = new Error(`Codex app-server exited with code ${code ?? 'unknown'}`);
-      this.rejectPending(err);
-      const sessions = [...this.sessions.keys()];
-      for (const sid of sessions) {
-        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
-      }
-      this.child = null;
-      this.appServerAuthFingerprint = null;
+      this.handleAppServerDisconnect(child, 'unexpected_crash', new Error(`Codex app-server exited with code ${code ?? 'unknown'}`));
     });
     // CRITICAL: must listen for 'error' or spawn failures (e.g. ENOENT) become
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
       if (this.child !== child) return;
       logger.error({ provider: this.id, err }, 'Codex app-server spawn error');
-      this.rejectPending(err);
-      const sessions = [...this.sessions.keys()];
-      for (const sid of sessions) {
-        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
-      }
-      this.child = null;
-      this.appServerAuthFingerprint = null;
+      this.handleAppServerDisconnect(child, 'unexpected_crash', err);
     });
 
     try {
@@ -2174,6 +2284,25 @@ export class CodexSdkProvider implements TransportProvider {
     if (this.appServerRestart) return this.appServerRestart;
     const config = this.config;
     if (!config) return;
+    const activeSessionIds = this.getActiveWorkSessionIds();
+    if (activeSessionIds.length > 0) {
+      logger.warn({
+        provider: this.id,
+        reason,
+        activeSessionCount: activeSessionIds.length,
+        activeSessionIds: activeSessionIds.slice(0, 10),
+      }, 'Codex app-server restart deferred while current work is active');
+      throw this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        'Codex app-server restart deferred while current work is active',
+        true,
+        {
+          disconnectClass: 'auth_refresh_restart',
+          activeSessionCount: activeSessionIds.length,
+          activeSessionIds: activeSessionIds.slice(0, 10),
+        },
+      );
+    }
     const binaryPath = this.resolveBinaryPath(config);
     this.appServerRestart = (async () => {
       await this.startAppServer(binaryPath, config, { clearSessions: false });
@@ -2205,6 +2334,10 @@ export class CodexSdkProvider implements TransportProvider {
       await this.ensureThreadLoaded(sessionId, state, payload);
       await this.prepareGeneratedImageTracking(sessionId, state);
       const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
+      if (shouldInjectStableUpdate) {
+        state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
+        state.pendingSessionSystemTextUpdateTurnId = undefined;
+      }
       state.turnStartInFlight = true;
       const result = await this.request('turn/start', {
         threadId: state.threadId,
@@ -2223,15 +2356,21 @@ export class CodexSdkProvider implements TransportProvider {
       // clobber an id already learned from streamed items/deltas with undefined,
       // or the turn-id guards below would start dropping live assistant text.
       const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
-      if (startedTurnId) state.runningTurnId = startedTurnId;
+      const terminalArrivedDuringStart = Boolean(startedTurnId && state.terminalDuringTurnStartIds.delete(startedTurnId));
+      if (startedTurnId && !terminalArrivedDuringStart) {
+        state.completedTurnIds.delete(startedTurnId);
+        state.terminatedTurnIds.delete(startedTurnId);
+        state.completedCompactTurnIds.delete(startedTurnId);
+        state.terminatedCompactTurnIds.delete(startedTurnId);
+        state.runningTurnId = startedTurnId;
+      }
       state.nativePlanEventSeen = false;
       this.armChildSubagentRolloutPolling(sessionId, state);
       if (state.runningTurnId) {
         state.completedTurnIds.delete(state.runningTurnId);
         state.terminatedTurnIds.delete(state.runningTurnId);
       }
-      if (shouldInjectStableUpdate) {
-        state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
+      if (shouldInjectStableUpdate && state.pendingSessionSystemTextUpdate === desiredSessionSystemText) {
         state.pendingSessionSystemTextUpdateTurnId = state.runningTurnId;
       }
       if (state.cancelled && state.runningTurnId) {
@@ -2242,7 +2381,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.rememberTerminatedTurn(state, state.runningTurnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;      state.activeItemIds.clear();
-      this.closeOpenProviderToolCalls(sessionId, state, 'error');
+      this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
@@ -3127,10 +3266,12 @@ export class CodexSdkProvider implements TransportProvider {
       const turnId = readParamTurnId(params);
       this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
 
-      if (turnId && this.isClosedCompactTurn(state, turnId)) {
+      const terminalForTurnStartInFlight = Boolean(state.turnStartInFlight && turnId);
+      if (terminalForTurnStartInFlight && turnId) state.terminalDuringTurnStartIds.add(turnId);
+      if (turnId && this.isClosedCompactTurn(state, turnId) && !terminalForTurnStartInFlight && state.runningTurnId !== turnId) {
         return;
       }
-      if (turnId && this.isClosedTurn(state, turnId)) {
+      if (turnId && this.isClosedTurn(state, turnId) && !terminalForTurnStartInFlight && state.runningTurnId !== turnId) {
         return;
       }
 
@@ -3139,7 +3280,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
-        this.closeOpenProviderToolCalls(sessionId, state, 'error');
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
         state.compactObserved = false;
@@ -3165,10 +3306,10 @@ export class CodexSdkProvider implements TransportProvider {
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
           state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
-          this.closeOpenProviderToolCalls(sessionId, state, 'error');
+          this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
           return;
         }
-        this.closeOpenProviderToolCalls(sessionId, state, 'error');
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'provider_interrupted');
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -3186,7 +3327,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.rememberTerminatedActiveTurn(state, turnId);
         this.clearCancelTimer(state);
         this.clearRawChecklistPollTimer(state);
-        this.closeOpenProviderToolCalls(sessionId, state, 'error');
+        this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -3208,24 +3349,24 @@ export class CodexSdkProvider implements TransportProvider {
         }
       }
 
-      if (this.hasActiveToolItems(state)) {
-        state.deferredIdleSettleTurnId = turnId ?? state.runningTurnId ?? `${sessionId}:turn-completed`;
-        return;
-      }
-
-      await this.completeTurn(sessionId, state, turnId);
+      await this.completeTurn(sessionId, state, turnId, 'app_server_completed');
       return;
     }
   }
 
-  private async completeTurn(sessionId: string, state: CodexSdkSessionState, turnId?: string): Promise<void> {
+  private async completeTurn(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId?: string,
+    terminalReason: ToolTerminalReason = 'app_server_completed',
+  ): Promise<void> {
     this.clearIdleSettleTimer(state);
-    this.clearCancelTimer(state);    this.clearStatus(sessionId, state);
+    this.clearCancelTimer(state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
     this.commitPendingSessionSystemTextUpdate(state, turnId);
     this.rememberCompletedTurn(state, turnId);
-    this.closeOpenProviderToolCalls(sessionId, state, 'complete');
+    this.closeOpenProviderToolCalls(sessionId, state, 'complete', 'succeeded', terminalReason);
     const messageId = state.currentMessageId ?? `${sessionId}:agent-message`;
     const currentText = state.currentText;
     const usage = state.lastUsage;
@@ -3236,7 +3377,10 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.activeItemIds.clear();
+    state.activeToolItemIds.clear();
+    state.activeCompactionItemIds.clear();
     state.generatedImageTracking = null;
+    this.clearStatus(sessionId, state);
     const newlyDetectedImagePaths = generatedImageTracking
       ? await this.detectNewGeneratedImagePaths(generatedImageTracking)
       : [];
@@ -3311,7 +3455,7 @@ export class CodexSdkProvider implements TransportProvider {
           state.deferredIdleSettleTurnId = turnId;
           return;
         }
-        void this.completeTurn(sessionId, state, turnId);
+        void this.completeTurn(sessionId, state, turnId, 'thread_idle_settle');
       }
     }, CODEX_IDLE_SETTLE_DEBOUNCE_MS);
     state.idleSettleTimer.unref?.();
@@ -3587,6 +3731,8 @@ export class CodexSdkProvider implements TransportProvider {
         sessionId,
         state,
         tool.status === 'complete' ? 'complete' : 'error',
+        tool.terminalStatus ?? (tool.status === 'complete' ? 'succeeded' : 'errored'),
+        tool.terminalReason ?? (tool.status === 'complete' ? 'provider_result' : 'provider_error'),
         tool.id,
       );
     }
@@ -3600,17 +3746,26 @@ export class CodexSdkProvider implements TransportProvider {
       && meta?.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT;
   }
 
+  private codexLifecycleItemKindForTool(tool: ToolCallEvent): CodexLifecycleItemKind {
+    if (this.isCodexCollabSdkTool(tool)) return 'codex_collaboration';
+    if (tool.name === 'WebSearch' || String(tool.detail?.kind ?? '').toLowerCase() === 'websearch') return 'web_search';
+    if (String(tool.detail?.kind ?? '') === SDK_SUBAGENT_DETAIL_KIND) return 'sdk_subagent';
+    return 'provider_tool_like';
+  }
+
   private closeOpenCodexCollabProviderToolCalls(
     sessionId: string,
     state: CodexSdkSessionState,
     status: Exclude<ToolCallEvent['status'], 'running'>,
+    terminalStatus: ToolTerminalStatus = status === 'complete' ? 'succeeded' : 'errored',
+    terminalReason: ToolTerminalReason = status === 'complete' ? 'provider_result' : 'provider_error',
     exceptToolId?: string,
   ): void {
     if (state.openProviderToolCalls.size === 0) return;
     for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
       if (toolId === exceptToolId) continue;
       if (!this.isCodexCollabSdkTool(runningTool)) continue;
-      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status);
+      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status, terminalStatus, terminalReason);
     }
   }
 
@@ -3618,10 +3773,12 @@ export class CodexSdkProvider implements TransportProvider {
     sessionId: string,
     state: CodexSdkSessionState,
     status: Exclude<ToolCallEvent['status'], 'running'>,
+    terminalStatus: ToolTerminalStatus = status === 'complete' ? 'succeeded' : 'errored',
+    terminalReason: ToolTerminalReason = status === 'complete' ? 'provider_result' : 'provider_error',
   ): void {
     if (state.openProviderToolCalls.size === 0) return;
     for (const [toolId, runningTool] of [...state.openProviderToolCalls]) {
-      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status);
+      this.closeOneOpenProviderToolCall(sessionId, state, toolId, runningTool, status, terminalStatus, terminalReason);
     }
   }
 
@@ -3631,6 +3788,8 @@ export class CodexSdkProvider implements TransportProvider {
     toolId: string,
     runningTool: ToolCallEvent,
     status: Exclude<ToolCallEvent['status'], 'running'>,
+    terminalStatus: ToolTerminalStatus,
+    terminalReason: ToolTerminalReason,
   ): void {
     const output = runningTool.output !== undefined ? runningTool.output : status === 'complete' ? 'completed' : 'failed';
     const detail = isRecord(runningTool.detail) && runningTool.detail.kind === SDK_SUBAGENT_DETAIL_KIND && isRecord(runningTool.detail.meta)
@@ -3649,11 +3808,37 @@ export class CodexSdkProvider implements TransportProvider {
         },
       } satisfies SdkSubagentDetail, { allowRaw: false })
       : runningTool.detail;
+    const terminalSource = (
+      terminalReason === 'thread_idle_settle'
+      || terminalReason === 'generation_rollover'
+      || terminalReason === 'user_cancelled'
+    ) ? 'daemon_synthetic' : 'app_server_jsonrpc';
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId,
+      terminalStatus,
+      terminalReason,
+      synthetic: true,
+      source: terminalSource,
+      decisionReason: terminalReason,
+      ...(state.runtimeActivityGeneration ? { activityGeneration: state.runtimeActivityGeneration } : {}),
+      toolCallId: toolId,
+      ...(state.runningTurnId ? { turnId: state.runningTurnId } : {}),
+      itemKind: this.codexLifecycleItemKindForTool(runningTool),
+    });
     const terminalTool: ToolCallEvent = {
       ...runningTool,
       id: toolId,
       status,
       output,
+      terminalStatus: metadata.terminalStatus,
+      terminalReason: metadata.terminalReason,
+      terminalSynthetic: metadata.synthetic,
+      terminalSource: metadata.source,
+      terminalDecisionReason: metadata.decisionReason,
+      terminalIdempotencyKey: metadata.idempotencyKey,
+      ...(state.runtimeActivityGeneration ? { activityGeneration: state.runtimeActivityGeneration } : {}),
+      ...(state.runningTurnId ? { turnId: state.runningTurnId } : {}),
+      lifecycleItemKind: metadata.itemKind,
       ...(detail ? { detail } : {}),
     };
     state.openProviderToolCalls.delete(toolId);

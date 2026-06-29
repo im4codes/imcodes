@@ -26,6 +26,12 @@ import {
   normalizeSdkSubagentKeyComponent,
   parseSdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+  type CodexLifecycleEvidenceSource,
+  type ToolTerminalReason,
+  type ToolTerminalStatus,
+} from '../../shared/session-activity-types.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -106,11 +112,36 @@ function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
   });
 }
 
+function terminalStatusForTool(tool: ToolCallEvent): string {
+  return tool.terminalStatus ?? (tool.status === 'error' ? 'errored' : 'succeeded');
+}
+
+function terminalReasonForTool(tool: ToolCallEvent): string {
+  return tool.terminalReason ?? (tool.status === 'error' ? 'provider_error' : 'provider_result');
+}
+
+function terminalMetadataForTool(sessionName: string, tool: ToolCallEvent): Record<string, unknown> {
+  const terminalStatus = terminalStatusForTool(tool) as ToolTerminalStatus;
+  const terminalReason = terminalReasonForTool(tool) as ToolTerminalReason;
+  return { ...buildCodexLifecycleTerminalMetadata({
+    sessionId: sessionName,
+    terminalStatus,
+    terminalReason,
+    synthetic: tool.terminalSynthetic ?? false,
+    source: (tool.terminalSource ?? 'app_server_jsonrpc') as CodexLifecycleEvidenceSource,
+    decisionReason: tool.terminalDecisionReason ?? terminalReason,
+    ...(tool.terminalIdempotencyKey !== undefined ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+    ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+    toolCallId: tool.id,
+    ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+    ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+  }) };
+}
+
 function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   timelineEmitter.emit(sessionName, 'tool.result', {
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...terminalMetadataForTool(sessionName, tool),
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -126,8 +157,7 @@ function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
     type: 'tool.result',
     sessionId: sessionName,
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...terminalMetadataForTool(sessionName, tool),
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -460,6 +490,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         detail: sdkDetail.detail,
       }, {
         allowRaw: Boolean(sdkDetail.detail.meta.diagnosticCode),
+        sessionId: sessionName,
       });
       if (!sdkPayload) return;
       const eventToolId = normalizeSdkSubagentKeyComponent(tool.id || sdkDetail.detail.meta.canonicalKey);
@@ -566,8 +597,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       });
       timelineEmitter.emit(sessionName, 'tool.result', {
         toolCallId: effectiveTool.id,
-        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
-        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
+        ...terminalMetadataForTool(sessionName, effectiveTool),
         ...(effectiveTool.status === 'error'
           ? { error: effectiveTool.output ?? 'error' }
           : effectiveTool.output !== undefined
@@ -584,8 +614,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         type: 'tool.result',
         sessionId: sessionName,
         toolCallId: effectiveTool.id,
-        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
-        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
+        ...terminalMetadataForTool(sessionName, effectiveTool),
         tool: effectiveTool.name,
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
         ...(effectiveTool.status === 'error'

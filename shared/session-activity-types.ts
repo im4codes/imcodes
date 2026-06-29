@@ -22,12 +22,45 @@ export type ToolTerminalStatus = 'succeeded' | 'abandoned' | 'cancelled' | 'erro
 export type ToolTerminalReason =
   | 'provider_result'
   | 'provider_error'
+  | 'provider_cancelled'
+  | 'provider_interrupted'
   | 'user_cancelled'
   | 'generation_rollover'
   | 'daemon_restart_orphan'
   | 'provider_stale'
+  | 'thread_idle_settle'
+  | 'app_server_completed'
+  | 'app_server_failed'
+  | 'app_server_disconnect'
+  | 'auth_refresh_recovery_failed'
+  | 'app_server_restart_recovery_failed'
+  | 'unexpected_eof'
+  | 'no_current_work_disconnect'
   | 'unknown_tool'
   | 'duplicate_terminal';
+
+export type CodexLifecycleEvidenceSource =
+  | 'app_server_jsonrpc'
+  | 'exec_jsonl_compat'
+  | 'rollout_jsonl_diagnostic'
+  | 'provider_snapshot'
+  | 'projection_only'
+  | 'daemon_synthetic';
+
+export type CodexLifecycleItemKind =
+  | 'turn_start'
+  | 'command_execution'
+  | 'web_search'
+  | 'mcp_tool_call'
+  | 'provider_tool_like'
+  | 'sdk_subagent'
+  | 'codex_collaboration'
+  | 'context_compaction'
+  | 'agent_message'
+  | 'reasoning'
+  | 'usage_or_status'
+  | 'diagnostic'
+  | 'unknown';
 
 export interface ActivityGeneration {
   scope: 'session';
@@ -86,6 +119,21 @@ export interface ActivityDrainMetadata {
   entries: ActivityDrainEntryMetadata[];
 }
 
+export interface CodexLifecycleTerminalMetadata {
+  sessionId: string;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  synthetic: boolean;
+  source: CodexLifecycleEvidenceSource;
+  decisionReason: string;
+  idempotencyKey: string;
+  activityGeneration?: ActivityGenerationLike;
+  itemId?: string;
+  toolCallId?: string;
+  turnId?: string;
+  itemKind?: CodexLifecycleItemKind;
+}
+
 export interface TimelineActivityEvent {
   type: string;
   payload?: Record<string, unknown>;
@@ -108,6 +156,161 @@ export function normalizeActivityGeneration(value: ActivityGenerationLike): stri
   const sessionName = value.sessionName.trim();
   if (!sessionName || !Number.isFinite(value.generation)) return null;
   return `${value.scope}:${sessionName}:${value.generation}`;
+}
+
+const TOOL_TERMINAL_STATUSES = new Set<ToolTerminalStatus>([
+  'succeeded',
+  'abandoned',
+  'cancelled',
+  'errored',
+  'stale',
+]);
+
+const TOOL_TERMINAL_REASONS = new Set<ToolTerminalReason>([
+  'provider_result',
+  'provider_error',
+  'provider_cancelled',
+  'provider_interrupted',
+  'user_cancelled',
+  'generation_rollover',
+  'daemon_restart_orphan',
+  'provider_stale',
+  'thread_idle_settle',
+  'app_server_completed',
+  'app_server_failed',
+  'app_server_disconnect',
+  'auth_refresh_recovery_failed',
+  'app_server_restart_recovery_failed',
+  'unexpected_eof',
+  'no_current_work_disconnect',
+  'unknown_tool',
+  'duplicate_terminal',
+]);
+
+const CODEX_LIFECYCLE_SOURCES = new Set<CodexLifecycleEvidenceSource>([
+  'app_server_jsonrpc',
+  'exec_jsonl_compat',
+  'rollout_jsonl_diagnostic',
+  'provider_snapshot',
+  'projection_only',
+  'daemon_synthetic',
+]);
+
+const CODEX_LIFECYCLE_ITEM_KINDS = new Set<CodexLifecycleItemKind>([
+  'turn_start',
+  'command_execution',
+  'web_search',
+  'mcp_tool_call',
+  'provider_tool_like',
+  'sdk_subagent',
+  'codex_collaboration',
+  'context_compaction',
+  'agent_message',
+  'reasoning',
+  'usage_or_status',
+  'diagnostic',
+  'unknown',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function cleanMetadataString(value: unknown, maxLength = 256): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+export function buildCodexLifecycleIdempotencyKey(input: {
+  sessionId: string;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  activityGeneration?: ActivityGenerationLike;
+  itemId?: string;
+  toolCallId?: string;
+  turnId?: string;
+}): string {
+  const generation = normalizeActivityGeneration(input.activityGeneration) ?? 'generation:unknown';
+  const workId = input.itemId?.trim()
+    ? `item:${input.itemId.trim()}`
+    : input.toolCallId?.trim()
+      ? `tool:${input.toolCallId.trim()}`
+      : input.turnId?.trim()
+        ? `turn:${input.turnId.trim()}`
+        : 'work:unknown';
+  return [
+    'codex-terminal',
+    input.sessionId.trim() || 'session:unknown',
+    generation,
+    workId,
+    input.terminalStatus,
+    input.terminalReason,
+  ].join(':');
+}
+
+export function isCodexLifecycleTerminalMetadata(value: unknown): value is CodexLifecycleTerminalMetadata {
+  if (!isRecord(value)) return false;
+  if (typeof value.sessionId !== 'string' || !value.sessionId.trim()) return false;
+  if (!TOOL_TERMINAL_STATUSES.has(value.terminalStatus as ToolTerminalStatus)) return false;
+  if (!TOOL_TERMINAL_REASONS.has(value.terminalReason as ToolTerminalReason)) return false;
+  if (typeof value.synthetic !== 'boolean') return false;
+  if (!CODEX_LIFECYCLE_SOURCES.has(value.source as CodexLifecycleEvidenceSource)) return false;
+  if (typeof value.decisionReason !== 'string' || !value.decisionReason.trim()) return false;
+  if (typeof value.idempotencyKey !== 'string' || !value.idempotencyKey.trim()) return false;
+  if (value.activityGeneration !== undefined && normalizeActivityGeneration(value.activityGeneration as ActivityGenerationLike) === null) return false;
+  if (value.itemId !== undefined && (typeof value.itemId !== 'string' || !value.itemId.trim())) return false;
+  if (value.toolCallId !== undefined && (typeof value.toolCallId !== 'string' || !value.toolCallId.trim())) return false;
+  if (value.turnId !== undefined && (typeof value.turnId !== 'string' || !value.turnId.trim())) return false;
+  if (value.itemKind !== undefined && !CODEX_LIFECYCLE_ITEM_KINDS.has(value.itemKind as CodexLifecycleItemKind)) return false;
+  return true;
+}
+
+export function buildCodexLifecycleTerminalMetadata(input: Omit<CodexLifecycleTerminalMetadata, 'idempotencyKey'> & { idempotencyKey?: string }): CodexLifecycleTerminalMetadata {
+  const idempotencyKey = input.idempotencyKey ?? buildCodexLifecycleIdempotencyKey(input);
+  return {
+    sessionId: input.sessionId,
+    terminalStatus: input.terminalStatus,
+    terminalReason: input.terminalReason,
+    synthetic: input.synthetic,
+    source: input.source,
+    decisionReason: input.decisionReason,
+    idempotencyKey,
+    ...(input.activityGeneration !== undefined ? { activityGeneration: input.activityGeneration } : {}),
+    ...(input.itemId !== undefined ? { itemId: input.itemId } : {}),
+    ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
+    ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
+    ...(input.itemKind !== undefined ? { itemKind: input.itemKind } : {}),
+  };
+}
+
+export function toPrivacySafeLifecycleMetadata(input: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  const stringKeys = [
+    'sessionId',
+    'itemId',
+    'toolCallId',
+    'turnId',
+    'terminalStatus',
+    'terminalReason',
+    'source',
+    'decisionReason',
+    'idempotencyKey',
+    'itemKind',
+  ];
+  for (const key of stringKeys) {
+    const value = cleanMetadataString(input[key]);
+    if (value !== undefined) output[key] = value;
+  }
+  if (typeof input.synthetic === 'boolean') output.synthetic = input.synthetic;
+  if (typeof input.activeWorkCount === 'number' && Number.isFinite(input.activeWorkCount)) output.activeWorkCount = input.activeWorkCount;
+  if (typeof input.activeToolCount === 'number' && Number.isFinite(input.activeToolCount)) output.activeToolCount = input.activeToolCount;
+  if (typeof input.blockingWorkCount === 'number' && Number.isFinite(input.blockingWorkCount)) output.blockingWorkCount = input.blockingWorkCount;
+  if (input.activityGeneration !== undefined && normalizeActivityGeneration(input.activityGeneration as ActivityGenerationLike) !== null) {
+    output.activityGeneration = input.activityGeneration;
+  }
+  return output;
 }
 
 export function sameActivityGeneration(a: ActivityGenerationLike, b: ActivityGenerationLike): boolean {
@@ -198,13 +401,7 @@ function readTerminalStatus(payload: Record<string, unknown> | undefined): ToolT
     : typeof payload?.status === 'string'
       ? payload.status
       : undefined;
-  return status === 'succeeded'
-    || status === 'abandoned'
-    || status === 'cancelled'
-    || status === 'errored'
-    || status === 'stale'
-    ? status
-    : undefined;
+  return TOOL_TERMINAL_STATUSES.has(status as ToolTerminalStatus) ? status as ToolTerminalStatus : undefined;
 }
 
 function readToolKey(payload: Record<string, unknown> | undefined): string | null {

@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => {
 });
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
+const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -123,6 +124,9 @@ vi.mock('../../src/util/logger.js', () => ({
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
+vi.mock('../../src/daemon/timeline-store.js', () => ({
+  timelineStore: { readByTypesPreferred: timelineReadByTypesPreferredMock },
+}));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
@@ -158,6 +162,15 @@ import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transp
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -218,6 +231,28 @@ function forceRuntimeProviderError(
   internal.setStatus('error');
 }
 
+function makeRestoreSdkSubagentDetail(overrides: Partial<SdkSubagentDetail['meta']> = {}): SdkSubagentDetail {
+  return {
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: 'Child agent is running',
+    input: { action: 'start', receiverCount: 1 },
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: 'codex:restore:collab:child-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      rawStatus: 'running',
+      active: true,
+      terminal: false,
+      receiverCount: 1,
+      runningChildCount: 1,
+      ...overrides,
+    },
+  };
+}
+
 describe('sdk transport session restore', () => {
   let tempDir: string;
 
@@ -228,6 +263,8 @@ describe('sdk transport session restore', () => {
     mocks.claudeFailures.clear();
     clearAllResend();
     timelineEmitterEmitMock.mockClear();
+    timelineReadByTypesPreferredMock.mockReset();
+    timelineReadByTypesPreferredMock.mockResolvedValue([]);
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
   });
@@ -395,6 +432,7 @@ describe('sdk transport session restore', () => {
       sessionId: sessionName,
       toolCallId: 'restore-tool-1',
       tool: 'Bash',
+      activityGeneration: { scope: 'session', sessionName, generation: 7 },
       input: { command: 'SECRET_RESTORE_COMMAND' },
     });
     mocks.store.set(sessionName, {
@@ -441,9 +479,102 @@ describe('sdk transport session restore', () => {
         toolCallId: 'restore-tool-1',
         terminalStatus: 'stale',
         terminalReason: 'daemon_restart_orphan',
+        activityGeneration: { scope: 'session', sessionName, generation: 7 },
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'restore_reconnect_orphan_reconcile',
+        idempotencyKey: expect.stringContaining('restore-tool-1:stale:daemon_restart_orphan'),
       }),
     ]));
     expect(JSON.stringify(replayed)).not.toContain('SECRET_RESTORE_COMMAND');
+  });
+
+  it('reconciles hidden SDK sub-agent timeline rows as daemon restart orphans before restore idle observation', async () => {
+    const sessionName = `deck_sdk_hidden_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const activityGeneration = { scope: 'session', sessionName, generation: 11 };
+    const detail = makeRestoreSdkSubagentDetail();
+    timelineReadByTypesPreferredMock.mockResolvedValue([
+      {
+        eventId: 'hidden-sdk-call',
+        sessionId: sessionName,
+        ts: Date.now(),
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        hidden: true,
+        payload: {
+          toolCallId: 'sdk-hidden-1',
+          tool: 'Task',
+          activityGeneration,
+          turnId: 'turn-hidden-1',
+          input: { action: 'SECRET_CHILD_PROMPT' },
+          detail,
+        },
+      },
+    ]);
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkhidden',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-hidden',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-hidden-orphan',
+      codexSessionId: 'codex-thread-hidden-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 200 });
+    const terminalIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'tool.result'
+      && call[2]?.toolCallId === 'sdk-hidden-1'
+      && call[2]?.terminalStatus === 'stale'
+      && call[2]?.terminalReason === 'daemon_restart_orphan'
+    );
+    const restoreStateIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'session.state'
+      && call[2]?.decisionReason === 'restore_reconnect_observed'
+    );
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(restoreStateIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeLessThan(restoreStateIndex);
+    expect(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2]).toMatchObject({
+      activityGeneration,
+      turnId: 'turn-hidden-1',
+      itemKind: 'codex_collaboration',
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        meta: {
+          canonicalKey: 'codex:restore:collab:child-1',
+          normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+          active: false,
+          terminal: true,
+          diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+          runningChildCount: 0,
+        },
+      },
+    });
+    expect(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[3]).toMatchObject({
+      hidden: true,
+      eventId: `transport-tool:${sessionName}:sdk-hidden-1:restore-orphan-result`,
+    });
+    expect(JSON.stringify(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2])).not.toContain('SECRET_CHILD_PROMPT');
+    expect(timelineEmitterEmitMock.mock.calls[restoreStateIndex]?.[2]).not.toHaveProperty('authoritative');
   });
 
   it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {
@@ -652,6 +783,12 @@ describe('sdk transport session restore', () => {
 
     runtime!.send('What token did I ask you to remember?');
     await settleCodexRun('deck_sdk_cx_brain', 'resume');
+    {
+      const deadline = Date.now() + 5_000;
+      while (mocks.store.get('deck_sdk_cx_brain')?.state !== 'idle' && Date.now() < deadline) {
+        await flush();
+      }
+    }
 
     expect(codexRunForSession('deck_sdk_cx_brain', 'resume')).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');

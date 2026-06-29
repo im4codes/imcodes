@@ -207,7 +207,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
-import { PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type ProviderError, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -392,16 +392,23 @@ describe('CodexSdkProvider', () => {
   it('restarts the app-server when Codex reports a bearer auth failure', async () => {
     const provider = new CodexSdkProvider();
     const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
+    const tools: ToolCallEvent[] = [];
     provider.onError((_sid, error) => errors.push({
       code: error.code,
       recoverable: error.recoverable,
       message: error.message,
     }));
+    provider.onToolCall((_, tool) => tools.push(tool));
 
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
     await provider.send('route-1', 'hello');
     const firstChild = childProcessMock.children[0]!;
+    firstChild.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-auth', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-auth' && tool.status === 'running'));
 
     firstChild.emits({
       method: 'turn/completed',
@@ -422,9 +429,214 @@ describe('CodexSdkProvider', () => {
       code: PROVIDER_ERROR_CODES.AUTH_FAILED,
       recoverable: false,
     }]);
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-auth',
+      status: 'error',
+      terminalStatus: 'errored',
+      terminalReason: 'app_server_failed',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      lifecycleItemKind: 'web_search',
+    }));
     expect(childProcessMock.children).toHaveLength(2);
     expect(firstChild.child.killed).toBe(true);
     await provider.disconnect();
+  });
+
+  it('defers auth-change app-server restart while any session has active current work', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-active-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-auth-active', cwd: '/tmp/project' });
+      await provider.send('route-auth-active', 'search');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-auth-active')?.runningTurnId === 'turn-1',
+      );
+      const firstChild = childProcessMock.children[0]!;
+      firstChild.emits({
+        method: 'item/started',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-auth-active', type: 'webSearch', action: { type: 'other' } } },
+      });
+      await waitForCondition(
+        () => provider.getActiveWorkSnapshot('route-auth-active')?.activeToolCount === 1,
+      );
+
+      await writeCodexAuthFile(codexHome, 2);
+      await expect(provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' }))
+        .rejects.toMatchObject({
+          code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          recoverable: true,
+          details: {
+            disconnectClass: 'auth_refresh_restart',
+            activeSessionCount: 1,
+            activeSessionIds: ['route-auth-active'],
+          },
+        });
+      expect(childProcessMock.children).toHaveLength(1);
+      expect(firstChild.child.killed).toBe(false);
+      expect(provider.getActiveWorkSnapshot('route-auth-active')).toMatchObject({
+        activeWorkCount: 1,
+        activeToolCount: 1,
+      });
+
+      firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+      await waitForCondition(
+        () => provider.getActiveWorkSnapshot('route-auth-active')?.activeWorkCount === 0,
+      );
+
+      await provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' });
+      expect(childProcessMock.children).toHaveLength(2);
+      expect(firstChild.child.killed).toBe(true);
+      expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'initialize')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not emit a connection error when the app-server exits with no current work', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-no-work-disconnect', cwd: '/tmp/project' });
+    childProcessMock.children[0]!.child.emit('exit', 1);
+    await flush();
+
+    expect(errors).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-no-work-disconnect')).toMatchObject({
+      active: false,
+      runningTurnId: null,
+      turnStartInFlight: false,
+    });
+  });
+
+  it('terminalizes active current work before reporting app-server crash exit', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-active-crash', cwd: '/tmp/project' });
+    await provider.send('route-active-crash', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-active-crash')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-crash', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-crash' && tool.status === 'running'));
+
+    child.child.emit('exit', 2);
+
+    await waitForCondition(() => errors.length === 1 && tools.some((tool) => tool.id === 'ws-crash' && tool.status === 'error'));
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: false,
+    });
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-crash',
+      status: 'error',
+      terminalStatus: 'errored',
+      terminalReason: 'app_server_disconnect',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: 'app_server_disconnect',
+      lifecycleItemKind: 'web_search',
+    }));
+    expect(provider.getActiveWorkSnapshot('route-active-crash')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('terminalizes active current work before reporting app-server stdout EOF', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-active-eof', cwd: '/tmp/project' });
+    await provider.send('route-active-eof', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-active-eof')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-eof', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-eof' && tool.status === 'running'));
+
+    child.child.stdout.end();
+
+    await waitForCondition(() => errors.length === 1 && tools.some((tool) => tool.id === 'ws-eof' && tool.status === 'error'));
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: false,
+    });
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-eof',
+      status: 'error',
+      terminalStatus: 'errored',
+      terminalReason: 'unexpected_eof',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: 'unexpected_eof',
+      lifecycleItemKind: 'web_search',
+    }));
+    expect(provider.getActiveWorkSnapshot('route-active-eof')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('terminalizes open provider tools during intentional app-server shutdown without connection error', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-intentional-shutdown', cwd: '/tmp/project' });
+    await provider.send('route-intentional-shutdown', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-intentional-shutdown')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-shutdown', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-shutdown' && tool.status === 'running'));
+
+    await provider.disconnect();
+
+    expect(errors).toEqual([]);
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-shutdown',
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: 'provider_cancelled',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: 'provider_cancelled',
+      lifecycleItemKind: 'web_search',
+    }));
   });
 
   it('emits SDK sub-agent snapshots for Codex collaboration start, completion, and failure', async () => {
@@ -2314,7 +2526,7 @@ describe('CodexSdkProvider', () => {
     });
   });
 
-  it('defers turn/completed while a Codex commandExecution item is active', async () => {
+  it('terminalizes active Codex commandExecution items on turn/completed', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-turn-completed-active-command', cwd: '/tmp/project' });
@@ -2353,25 +2565,13 @@ describe('CodexSdkProvider', () => {
       },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(completed).toEqual([]);
-    expect(provider.getSessionDiagnostics('route-turn-completed-active-command')).toMatchObject({
-      runningTurnId: 'turn-1',
-      activeToolItemCount: 1,
-      deferredIdleSettleTurnId: 'turn-1',
-    });
-
-    child.emits({
-      method: 'item/completed',
-      params: {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        item: { id: 'cmd-1', type: 'commandExecution', status: 'completed', exitCode: 0 },
-      },
-    });
-
     await waitForCondition(() => completed.length === 1);
     expect(completed[0]).toContain('Done after command');
+    expect(provider.getSessionDiagnostics('route-turn-completed-active-command')).toMatchObject({
+      runningTurnId: null,
+      activeToolItemCount: 0,
+      deferredIdleSettleTurnId: null,
+    });
   });
 
   it('resumes with stored thread id on existing session', async () => {
@@ -3780,8 +3980,21 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-start-only-turn-complete', cwd: '/tmp/project' });
 
-    const tools: Array<{ id: string; name: string; status: string; input: unknown }> = [];
-    provider.onToolCall((_, tool) => tools.push({ id: tool.id, name: tool.name, status: tool.status, input: tool.input }));
+    const tools: Array<Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'input' | 'terminalStatus' | 'terminalReason' | 'terminalSynthetic' | 'terminalSource' | 'terminalDecisionReason' | 'terminalIdempotencyKey' | 'turnId' | 'lifecycleItemKind'>> = [];
+    provider.onToolCall((_, tool) => tools.push({
+      id: tool.id,
+      name: tool.name,
+      status: tool.status,
+      input: tool.input,
+      terminalStatus: tool.terminalStatus,
+      terminalReason: tool.terminalReason,
+      terminalSynthetic: tool.terminalSynthetic,
+      terminalSource: tool.terminalSource,
+      terminalDecisionReason: tool.terminalDecisionReason,
+      terminalIdempotencyKey: tool.terminalIdempotencyKey,
+      turnId: tool.turnId,
+      lifecycleItemKind: tool.lifecycleItemKind,
+    }));
 
     await provider.send('route-websearch-start-only-turn-complete', 'search');
     await waitForCondition(
@@ -3801,9 +4014,107 @@ describe('CodexSdkProvider', () => {
 
     await waitForCondition(() => tools.length === 2);
     expect(tools).toEqual([
-      { id: 'ws-start-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } },
-      { id: 'ws-start-only', name: 'WebSearch', status: 'complete', input: { query: '(other)' } },
+      expect.objectContaining({ id: 'ws-start-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
+      expect.objectContaining({
+        id: 'ws-start-only',
+        name: 'WebSearch',
+        status: 'complete',
+        input: { query: '(other)' },
+        terminalStatus: 'succeeded',
+        terminalReason: 'app_server_completed',
+        terminalSynthetic: true,
+        terminalSource: 'app_server_jsonrpc',
+        terminalDecisionReason: 'app_server_completed',
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      }),
     ]);
+    expect(tools[1]?.terminalIdempotencyKey).toContain('ws-start-only:succeeded:app_server_completed');
+  });
+
+  it('reports turn-start in-flight as provider active work until Codex returns a turn id', async () => {
+    childProcessMock.setHoldTurnStart(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-turn-start-snapshot', cwd: '/tmp/project' });
+
+    const sendPromise = provider.send('route-turn-start-snapshot', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-turn-start-snapshot')?.turnStartInFlight === true,
+    );
+
+    expect(provider.getActiveWorkSnapshot('route-turn-start-snapshot')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
+
+    childProcessMock.releaseHeldTurnStarts();
+    await sendPromise;
+  });
+
+  it('reports started-only WebSearch provider tools in the active-work snapshot', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-snapshot', cwd: '/tmp/project' });
+
+    await provider.send('route-websearch-snapshot', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-snapshot')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-snapshot', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(
+      () => provider.getActiveWorkSnapshot('route-websearch-snapshot')?.activeToolCount === 1,
+    );
+
+    expect(provider.getActiveWorkSnapshot('route-websearch-snapshot')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+    });
+  });
+
+  it('abandons stale open provider tools at the next send boundary before starting a new turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-rollover', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-websearch-rollover', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-rollover')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-rollover', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-rollover' && tool.status === 'running'));
+
+    const state = (provider as unknown as {
+      sessions: Map<string, { runningTurnId?: string; turnStartInFlight: boolean }>;
+    }).sessions.get('route-websearch-rollover')!;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+
+    await provider.send('route-websearch-rollover', 'next');
+
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-rollover',
+      status: 'error',
+      terminalStatus: 'abandoned',
+      terminalReason: 'generation_rollover',
+      terminalSynthetic: true,
+      terminalSource: 'daemon_synthetic',
+      terminalDecisionReason: 'generation_rollover',
+      lifecycleItemKind: 'web_search',
+    }));
   });
 
   it('terminalizes a WebSearch started event when thread-idle settles a turn without turn/completed', async () => {
@@ -3811,9 +4122,22 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-start-only-idle-settle', cwd: '/tmp/project' });
 
-    const tools: Array<{ id: string; name: string; status: string; input: unknown }> = [];
+    const tools: Array<Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'input' | 'terminalStatus' | 'terminalReason' | 'terminalSynthetic' | 'terminalSource' | 'terminalDecisionReason' | 'terminalIdempotencyKey' | 'turnId' | 'lifecycleItemKind'>> = [];
     const completed: string[] = [];
-    provider.onToolCall((_, tool) => tools.push({ id: tool.id, name: tool.name, status: tool.status, input: tool.input }));
+    provider.onToolCall((_, tool) => tools.push({
+      id: tool.id,
+      name: tool.name,
+      status: tool.status,
+      input: tool.input,
+      terminalStatus: tool.terminalStatus,
+      terminalReason: tool.terminalReason,
+      terminalSynthetic: tool.terminalSynthetic,
+      terminalSource: tool.terminalSource,
+      terminalDecisionReason: tool.terminalDecisionReason,
+      terminalIdempotencyKey: tool.terminalIdempotencyKey,
+      turnId: tool.turnId,
+      lifecycleItemKind: tool.lifecycleItemKind,
+    }));
     provider.onComplete((_, message) => completed.push(message.content));
 
     await provider.send('route-websearch-start-only-idle-settle', 'search');
@@ -3835,9 +4159,22 @@ describe('CodexSdkProvider', () => {
     await waitForCondition(() => completed.length === 1 && tools.length === 2);
     expect(completed).toEqual(['Done.']);
     expect(tools).toEqual([
-      { id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } },
-      { id: 'ws-idle-only', name: 'WebSearch', status: 'complete', input: { query: '(other)' } },
+      expect.objectContaining({ id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
+      expect.objectContaining({
+        id: 'ws-idle-only',
+        name: 'WebSearch',
+        status: 'complete',
+        input: { query: '(other)' },
+        terminalStatus: 'succeeded',
+        terminalReason: 'thread_idle_settle',
+        terminalSynthetic: true,
+        terminalSource: 'daemon_synthetic',
+        terminalDecisionReason: 'thread_idle_settle',
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      }),
     ]);
+    expect(tools[1]?.terminalIdempotencyKey).toContain('ws-idle-only:succeeded:thread_idle_settle');
   });
 
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {

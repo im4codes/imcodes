@@ -728,7 +728,7 @@ describe('TransportSessionRuntime', () => {
       expect.objectContaining({
         source: 'daemon',
         confidence: 'high',
-        eventId: 'transport-tool:deck_test_brain:tool-old:generation_rollover',
+        eventId: expect.stringContaining('tool-old:abandoned:generation_rollover'),
       }),
     );
   });
@@ -2202,6 +2202,7 @@ ${PREFERENCE_CONTEXT_END}`;
     runtime.send('queued after stop', 'msg-q-after-provider-cancel');
     expect(runtime.pendingCount).toBe(1);
 
+    providerActive = false;
     await runtime.cancel();
     await waitForProviderSendCount(mock.provider, 2);
 
