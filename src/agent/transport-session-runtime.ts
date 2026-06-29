@@ -17,6 +17,7 @@ import {
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
   evaluateProviderSnapshot,
+  type ProviderSnapshotEvaluation,
   type ActivityDrainMetadata,
   type ActivityGeneration,
   type ProviderActiveWorkSnapshot,
@@ -382,9 +383,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
   private readonly _locallyCancelledDispatchIds = new Set<number>();
+  private _currentActivityGenerationLocallyCancelled = false;
   private _externalCompletionSettlementsToIgnore = 0;
   private _cancelledProviderErrorsToIgnore = 0;
-  private _locallyCancelledActivityGeneration: number | null = null;
   private _ignoreProviderSnapshotForNextLocalStopDrain = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
@@ -1052,6 +1053,45 @@ export class TransportSessionRuntime implements SessionRuntime {
     };
   }
 
+  private markCurrentActivityGenerationLocallyCancelled(): void {
+    if (this._activityGeneration <= 0) return;
+    this._currentActivityGenerationLocallyCancelled = true;
+  }
+
+  private hasInFlightDispatchWork(): boolean {
+    return this._sending || !!this._activeTurn || this._activeDispatchEntries.length > 0;
+  }
+
+  private shouldIgnoreZeroWorkProviderSnapshot(
+    providerSnapshot: ProviderActiveWorkSnapshot,
+    evaluationState: ProviderSnapshotEvaluation['state'],
+  ): boolean {
+    if (providerSnapshot.activeWorkCount > 0 || providerSnapshot.activeToolCount > 0) return false;
+    const isCurrentOrImplicitStatus = (providerSnapshot.status ?? 'current') === 'current';
+    const isGenerationDriftClear = evaluationState === 'unattributed_clear'
+      || (evaluationState === 'stale' && isCurrentOrImplicitStatus);
+    if (!isGenerationDriftClear && evaluationState !== 'stale') return false;
+    const hasNonSnapshotBusyReasons = providerSnapshot.busyReasons.some((reason) => (
+      reason !== 'snapshot_stale' && reason !== 'snapshot_unavailable'
+    ));
+    if (hasNonSnapshotBusyReasons) return false;
+    // STOP is a local terminal decision for the current dispatch generation;
+    // after STOP, a zero-work stale/unattributed provider snapshot is stale
+    // information, not evidence that should keep queued user messages blocked.
+    if (this._currentActivityGenerationLocallyCancelled && (evaluationState === 'stale' || evaluationState === 'unattributed_clear')) {
+      return true;
+    }
+    // If the runtime has already settled the turn locally and has no in-flight
+    // dispatch records, a clear provider snapshot from an older generation must
+    // not resurrect "working" or prevent the next user message from dispatching.
+    if (!this.hasInFlightDispatchWork() && isGenerationDriftClear) {
+      return true;
+    }
+    // Explicit status:"stale" snapshots still fail closed unless the user
+    // already stopped the generation above.
+    return false;
+  }
+
   private emitSyntheticToolTerminal(
     toolId: string,
     tool: { generation: number; name: string },
@@ -1107,65 +1147,28 @@ export class TransportSessionRuntime implements SessionRuntime {
     add('open_tool_call', openToolCount);
 
     const providerSnapshot = options?.ignoreProviderSnapshot ? null : this.getProviderActiveWorkSnapshot();
-    const providerSnapshotIgnored = providerSnapshot
-      ? this.shouldIgnoreProviderSnapshotAfterLocalStop(providerSnapshot)
-      : false;
-    if (providerSnapshot && !providerSnapshotIgnored) {
-      // Only gate a *clean* provider snapshot on generation while a dispatch is
-      // actually in flight (211 deadlock: deck_cd_brain stuck "running" with a
-      // clean provider snapshot but a stale generation, busyReasons
-      // ['snapshot_stale'], never draining). getActiveWorkSnapshot() is a live
-      // synchronous read, so once the turn settles a zero-work read proves idle
-      // regardless of which generation the provider was last told about — an idle
-      // provider never re-advances its stamp. The turn-start race is still covered
-      // by runtime_dispatch / active_dispatch_entry. Active work or a non-current
-      // status still blocks below regardless of this gate.
-      const hasActiveDispatch = this._sending
-        || this._activeTurn
-        || this._activeDispatchEntries.length > 0;
-      const expectedGeneration = hasActiveDispatch && this._activityGeneration > 0
+    if (providerSnapshot) {
+      const expectedGeneration = this._activityGeneration > 0
         ? this.currentActivityGeneration()
         : undefined;
       const evaluation = evaluateProviderSnapshot(providerSnapshot, expectedGeneration);
       if (evaluation.blocking) {
-        const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
-        add(evaluation.reason, count);
-        for (const reason of providerSnapshot.busyReasons) {
-          if (!busyReasons.includes(reason)) busyReasons.push(reason);
+        if (!this.shouldIgnoreZeroWorkProviderSnapshot(providerSnapshot, evaluation.state)) {
+          const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
+          add(evaluation.reason, count);
+          for (const reason of providerSnapshot.busyReasons) {
+            if (!busyReasons.includes(reason)) busyReasons.push(reason);
+          }
         }
       }
     }
 
     return {
       blockingWorkCount,
-      activeToolCount: Math.max(openToolCount, providerSnapshotIgnored ? 0 : Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
+      activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
     };
-  }
-
-  private shouldIgnoreProviderSnapshotAfterLocalStop(snapshot: ProviderActiveWorkSnapshot): boolean {
-    if (this._locallyCancelledActivityGeneration === null) return false;
-    if (this.hasLocalActiveTurnWork()) return false;
-    if (snapshot.status === 'stale') return true;
-    const snapshotGeneration = this.snapshotGenerationNumber(snapshot);
-    return snapshotGeneration !== null && snapshotGeneration <= this._locallyCancelledActivityGeneration;
-  }
-
-  private snapshotGenerationNumber(snapshot: ProviderActiveWorkSnapshot): number | null {
-    const value = snapshot.activityGeneration ?? snapshot.generation;
-    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-    if (typeof value === 'string') {
-      const prefix = `session:${this.sessionKey}:`;
-      if (!value.startsWith(prefix)) return null;
-      const parsed = Number(value.slice(prefix.length));
-      return Number.isFinite(parsed) ? parsed : null;
-    }
-    if (typeof value === 'object' && value !== null) {
-      if (value.scope !== 'session' || value.sessionName !== this.sessionKey) return null;
-      return Number.isFinite(value.generation) ? value.generation : null;
-    }
-    return null;
   }
 
   private recordToolActivity(tool: { id: string; name: string; status: 'running' | 'complete' | 'error' }): void {
@@ -1400,6 +1403,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._pendingMessages.splice(0, retriedEntryCount);
         this._pendingVersion++;
       }
+      this.markCurrentActivityGenerationLocallyCancelled();
       this.closeOpenTools('cancelled', 'user_cancelled');
       // Remaining queued messages drain (deliver) after the cancelled turn;
       // settle idle when nothing is left.
@@ -1489,6 +1493,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
+    this._currentActivityGenerationLocallyCancelled = false;
     this._externalCompletionSettlementsToIgnore = 0;
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
@@ -1667,8 +1672,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const dispatchId = ++this._nextDispatchId;
     this._activityGeneration++;
-    this._locallyCancelledActivityGeneration = null;
     this._ignoreProviderSnapshotForNextLocalStopDrain = false;
+    this._currentActivityGenerationLocallyCancelled = false;
     this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
     this._lastActivityAt = Date.now();
     this._sending = true;
@@ -2070,8 +2075,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._locallyCancelledDispatchIds.delete(dispatchId);
       return;
     }
-    this._locallyCancelledActivityGeneration = this._activityGeneration;
     this._ignoreProviderSnapshotForNextLocalStopDrain = true;
+    this.markCurrentActivityGenerationLocallyCancelled();
     if (!this._activeTurn && !this._sending) {
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);

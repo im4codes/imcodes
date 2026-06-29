@@ -85,7 +85,6 @@ describe('watch projection store', () => {
     });
   });
 
-
   it('respects pinned and tab order from synced localStorage preferences', () => {
     localStorage.setItem('rcc_sync_tab_order', JSON.stringify({ v: ['deck_proj_two', 'deck_proj_one'], t: 1 }));
     localStorage.setItem('rcc_sync_tab_pinned', JSON.stringify({ v: ['deck_proj_two'], t: 1 }));
@@ -173,6 +172,46 @@ describe('watch projection store', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(pushes).toHaveLength(2);
     expect(pushes.at(-1)?.sessions[0]?.state).toBe('error');
+  });
+
+  it('does not keep watch session working for hidden SDK subagent wrapper calls after idle', () => {
+    const { store } = makeSnapshotStore(4_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [{ name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'running' }],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'sdk-wrapper-running',
+      sessionId: 'deck_proj_brain',
+      ts: 4_010,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: {
+        toolCallId: 'call-spawn',
+        tool: 'Codex Collaboration',
+        detail: {
+          kind: 'sdkSubagent',
+          summary: 'Codex collaboration agent (1 receiver)',
+          meta: {
+            isSdkSubagent: true,
+            schemaVersion: 1,
+            provider: 'codex-sdk',
+            providerKind: 'codexCollabAgent',
+            canonicalKey: 'codex:deck_proj_brain:call-spawn',
+            normalizedStatus: 'running',
+            active: true,
+            terminal: false,
+          },
+        },
+      },
+    } as any);
+    store.onSessionIdle('deck_proj_brain', 4_020);
+
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
   });
 
   it('tracks assistant text, derives preview text on idle, and keeps the previous preview when text is noisy or short', async () => {

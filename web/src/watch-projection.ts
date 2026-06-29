@@ -2,7 +2,7 @@ import { formatLabel } from './format-label.js';
 import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
-import { isRunningTimelineEvent } from './timeline-running.js';
+import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
 import {
   isAuthoritativeCleanIdlePayload,
   normalizeActivityGeneration,
@@ -435,6 +435,7 @@ export class WatchProjectionStore {
   handleTimelineEvent(event: TimelineEvent): boolean {
     let changed = false;
     if (event.type === 'tool.call') {
+      if (isSdkSubagentTimelineEvent(event)) return changed;
       const key = readToolActivityKey(event.payload);
       if (key) {
         const keys = this.openToolKeysBySession.get(event.sessionId) ?? new Set<string>();
@@ -444,6 +445,7 @@ export class WatchProjectionStore {
         this.openToolCountBySession.set(event.sessionId, (this.openToolCountBySession.get(event.sessionId) ?? 0) + 1);
       }
     } else if (event.type === 'tool.result') {
+      if (isSdkSubagentTimelineEvent(event)) return changed;
       const key = readToolActivityKey(event.payload);
       if (key) {
         const keys = this.openToolKeysBySession.get(event.sessionId);

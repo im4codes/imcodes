@@ -606,6 +606,34 @@ describe('TransportSessionRuntime', () => {
     expect(snapshot.busyReasons).toContain('snapshot_stale');
   });
 
+  it('does not let a zero-work old-generation snapshot block a settled runtime without Stop', async () => {
+    runtime.send('first generation turn', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    const settledSnapshot = runtime.getDiagnosticSnapshot();
+    expect(settledSnapshot.blockingWorkCount).toBe(0);
+    expect(settledSnapshot.busyReasons).not.toContain('snapshot_stale');
+
+    expect(runtime.send('second generation turn', 'cmd-second')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'second generation turn',
+      assembledMessage: 'second generation turn',
+    }));
+  });
+
   it('fails closed when provider clear snapshot lacks current runtime attribution', async () => {
     runtime.send('first generation turn', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
@@ -2051,6 +2079,95 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.getHistory().some((message) => message.content === 'queued completed')).toBe(true);
   });
 
+  it('cancel() drains queued messages when a zero-work stale provider snapshot lags behind the stopped generation', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after stale stop', 'msg-q-stale-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('runtime_dispatch');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stale stop',
+      assembledMessage: 'queued after stale stop',
+    }));
+  });
+
+  it('cancel() drains queued messages when provider explicitly reports a zero-work stale snapshot after Stop', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after explicit stale stop', 'msg-q-explicit-stale-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'stale',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: ['snapshot_stale'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now() - 60_000,
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after explicit stale stop',
+      assembledMessage: 'queued after explicit stale stop',
+    }));
+  });
+
+  it('repeated cancel() calls still drain later queued messages when old zero-work snapshots arrive across generations', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('second after first stop', 'msg-second-after-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'second after first stop',
+      assembledMessage: 'second after first stop',
+    }));
+
+    runtime.send('third after second stop', 'msg-third-after-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 3);
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.cancel).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(3, 'sess-1', expect.objectContaining({
+      userMessage: 'third after second stop',
+      assembledMessage: 'third after second stop',
+    }));
+  });
+
   it('ignores the late CANCELLED callback from the stopped dispatch after queued work drains', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);
@@ -2168,6 +2285,46 @@ ${PREFERENCE_CONTEXT_END}`;
     // 'running' on the next session_list pass — resurrecting the "working" UI
     // animation after the user stopped.
     expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('cancel() with no queued messages is not resurrected by a zero-work stale provider snapshot', async () => {
+    runtime.send('only');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(snapshot.blockingWorkCount).toBe(0);
+    expect(snapshot.busyReasons).not.toContain('snapshot_stale');
+  });
+
+  it('cancel() with no queued messages is not resurrected by an explicit zero-work stale provider snapshot', async () => {
+    runtime.send('only');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'stale',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: ['snapshot_stale'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now() - 60_000,
+    }));
+
+    await runtime.cancel();
+
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(snapshot.blockingWorkCount).toBe(0);
+    expect(snapshot.busyReasons).not.toContain('snapshot_stale');
   });
 
   it('cancel() stops a turn before provider.send starts when context bootstrap is still running', async () => {
