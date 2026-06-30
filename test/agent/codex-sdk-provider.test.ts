@@ -23,6 +23,7 @@ const childProcessMock = vi.hoisted(() => {
   const heldThreadStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldTurnStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldTurnInterrupts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const threadReadResults: Array<Record<string, any> | ((msg: Request) => Record<string, any> | undefined)> = [];
   let holdThreadStart = false;
   let holdTurnStart = false;
   let holdTurnInterrupt = false;
@@ -88,6 +89,13 @@ const childProcessMock = vi.hoisted(() => {
           }
           if (msg.method === 'thread/compact/start' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
+          }
+          if (msg.method === 'thread/read' && typeof msg.id === 'number') {
+            const next = threadReadResults.shift();
+            if (next) {
+              const result = typeof next === 'function' ? next(msg) : next;
+              if (result !== undefined) childRecord.emits({ id: msg.id, result });
+            }
           }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
             if (holdTurnInterrupt) {
@@ -160,6 +168,12 @@ const childProcessMock = vi.hoisted(() => {
     releaseHeldTurnInterrupts() {
       const held = heldTurnInterrupts.splice(0);
       for (const entry of held) emitTurnInterruptResult(entry.childRecord, entry.msg);
+    },
+    enqueueThreadReadResult(result: Record<string, any> | ((msg: Request) => Record<string, any> | undefined)) {
+      threadReadResults.push(result);
+    },
+    clearThreadReadResults() {
+      threadReadResults.length = 0;
     },
   };
 });
@@ -311,6 +325,7 @@ describe('CodexSdkProvider', () => {
     childProcessMock.setHoldThreadStart(false);
     childProcessMock.setHoldTurnStart(false);
     childProcessMock.setHoldTurnInterrupt(false);
+    childProcessMock.clearThreadReadResults();
     childProcessMock.releaseHeldThreadStarts();
     childProcessMock.releaseHeldTurnStarts();
     childProcessMock.releaseHeldTurnInterrupts();
@@ -318,6 +333,8 @@ describe('CodexSdkProvider', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.clearAllTimers();
+    vi.useRealTimers();
   });
 
   it('reports Memory MCP ready after app-server connect', async () => {
@@ -2330,6 +2347,13 @@ describe('CodexSdkProvider', () => {
       'currentTextLength',
       'deferredIdleSettleTurnId',
       'deferredCompactSettleTurnId',
+      'heartbeatFailureCount',
+      'heartbeatInFlight',
+      'heartbeatLeaseActive',
+      'heartbeatLeaseTurnId',
+      'lastAliveHeartbeatAtMs',
+      'lastHeartbeatAttemptAtMs',
+      'lastHeartbeatResponseAtMs',
       'loaded',
       'provider',
       'rawChecklistPollArmed',
@@ -2409,6 +2433,10 @@ describe('CodexSdkProvider', () => {
     // must not end the turn (no idle timers, no guessing when the turn ends).
     // Emit idle BEFORE the agent message: if idle wrongly completed the turn,
     // the later turn/completed would be de-duped and 'Done' would never surface.
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'active' },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
     child.emits({
       method: 'item/completed',
@@ -2451,6 +2479,10 @@ describe('CodexSdkProvider', () => {
     child.emits({
       method: 'item/completed',
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'turn-1', status: 'completed', current: false }],
     });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
@@ -4154,6 +4186,10 @@ describe('CodexSdkProvider', () => {
       method: 'item/completed',
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
     });
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'turn-1', status: 'completed', current: false }],
+    });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
     await waitForCondition(() => completed.length === 1 && tools.length === 2);
@@ -4358,5 +4394,327 @@ describe('CodexSdkProvider', () => {
       { status: 'thinking', label: 'Thinking...' },
       { status: null, label: null },
     ]);
+  });
+
+  it('heartbeats active turns with thread/read, classifies active/degraded without using turn/interrupt, and never polls idle sessions', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-active', cwd: '/tmp/project' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-idle', cwd: '/tmp/project' });
+
+    const errors: Array<{ code: string; details?: unknown }> = [];
+    provider.onError((_sid, error) => errors.push({ code: error.code, details: error.details }));
+
+    await provider.send('route-heartbeat-active', 'hello');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: { type: 'active' } },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
+
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(child.requests.filter((req) => req.method === 'thread/read')).toHaveLength(1);
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+    expect(errors).toEqual([]);
+    const activeDiagnostics = provider.getSessionDiagnostics('route-heartbeat-active')!;
+    expect(activeDiagnostics.lastHeartbeatAttemptAtMs).toEqual(expect.any(Number));
+    expect(activeDiagnostics.lastHeartbeatResponseAtMs).toEqual(expect.any(Number));
+    expect(activeDiagnostics.lastAliveHeartbeatAtMs).toBe(activeDiagnostics.lastHeartbeatResponseAtMs);
+
+    // Timeout-only/degraded evidence is never sdk_turn_lost and still does not
+    // use the destructive interrupt RPC as a liveness probe.
+    await vi.advanceTimersByTimeAsync(30_500);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(child.requests.filter((req) => req.method === 'thread/read').length).toBeGreaterThanOrEqual(2);
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+    expect(errors.some((entry) => (entry.details as any)?.reason === 'sdk_turn_lost')).toBe(false);
+    const timeoutDiagnostics = provider.getSessionDiagnostics('route-heartbeat-active')!;
+    expect(timeoutDiagnostics.lastHeartbeatAttemptAtMs as number).toBeGreaterThan(activeDiagnostics.lastHeartbeatAttemptAtMs as number);
+    expect(timeoutDiagnostics.lastHeartbeatResponseAtMs).toBe(activeDiagnostics.lastHeartbeatResponseAtMs);
+    expect(timeoutDiagnostics.lastAliveHeartbeatAtMs).toBe(activeDiagnostics.lastAliveHeartbeatAtMs);
+  }, 60_000);
+
+  it('enforces provider-wide heartbeat cap and releases capacity exactly once when an in-flight lease is cleared', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      for (const sessionKey of ['route-heartbeat-cap-1', 'route-heartbeat-cap-2', 'route-heartbeat-cap-3']) {
+        await provider.createSession({ sessionKey, cwd: '/tmp/project' });
+        await provider.send(sessionKey, `hello ${sessionKey}`);
+      }
+      const child = childProcessMock.children[0];
+
+      await vi.advanceTimersByTimeAsync(50_100);
+      await vi.advanceTimersByTimeAsync(0);
+
+      let reads = child.requests.filter((req) => req.method === 'thread/read');
+      expect(reads).toHaveLength(2);
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-1')).toMatchObject({ heartbeatInFlight: true });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: true });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: false });
+
+      await provider.cancel('route-heartbeat-cap-1');
+      child.emits({
+        id: reads[0]!.id,
+        result: {
+          thread: { id: 'thread-1', status: { type: 'active' } },
+          turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The capped third lease was rescheduled instead of spinning at 0ms.
+      // Once in-flight requests settle, exactly one new heartbeat can enter.
+      await vi.advanceTimersByTimeAsync(20_100);
+      await vi.advanceTimersByTimeAsync(0);
+      reads = child.requests.filter((req) => req.method === 'thread/read');
+      expect(reads).toHaveLength(3);
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: false });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: true });
+
+      child.emits({
+        id: reads[2]!.id,
+        result: {
+          thread: { id: 'thread-1', status: { type: 'active' } },
+          turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: false });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: false });
+    } finally {
+      randomSpy.mockRestore();
+    }
+  }, 60_000);
+
+  it('normalizes heartbeat status aliases and treats malformed/ambiguous/unknown summaries as inconclusive', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-aliases', cwd: '/tmp/project' });
+
+    const errors: Array<{ message: string; details?: unknown }> = [];
+    provider.onError((_sid, error) => errors.push({ message: error.message, details: error.details }));
+
+    await provider.send('route-heartbeat-aliases', 'hello');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread_status: { state: 'running' },
+      turns: [{ id: 'turn-1', status: 'in_progress', current: true }],
+    });
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const aliveAfterActive = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastAliveHeartbeatAtMs;
+    const responseAfterActive = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs;
+    expect(aliveAfterActive).toEqual(expect.any(Number));
+    expect(responseAfterActive).toBe(aliveAfterActive);
+
+    childProcessMock.enqueueThreadReadResult({ thread: { status: 'idle' } });
+    await vi.advanceTimersByTimeAsync(25_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const afterMalformed = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
+    expect(afterMalformed.lastHeartbeatResponseAtMs as number).toBeGreaterThan(responseAfterActive as number);
+    expect(afterMalformed.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
+
+    childProcessMock.enqueueThreadReadResult({
+      status: 'idle',
+      turns: [
+        { id: 'turn-a', status: 'inProgress', current: true },
+        { id: 'turn-b', status: 'inProgress', current: true },
+      ],
+    });
+    await vi.advanceTimersByTimeAsync(25_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const afterAmbiguous = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
+    expect(afterAmbiguous.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterMalformed.lastHeartbeatResponseAtMs as number);
+    expect(afterAmbiguous.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
+
+    childProcessMock.enqueueThreadReadResult({ status: 'mystery', turns: [{ id: 'turn-1', status: 'weird' }] });
+    await vi.advanceTimersByTimeAsync(25_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const afterUnknown = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
+    expect(afterUnknown.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterAmbiguous.lastHeartbeatResponseAtMs as number);
+    expect(afterUnknown.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
+
+    expect(child.requests.filter((req) => req.method === 'thread/read').length).toBeGreaterThanOrEqual(4);
+    expect(errors.some((entry) => (entry.details as any)?.reason === 'sdk_turn_lost')).toBe(false);
+  });
+
+  it('emits privacy-bounded sdk_turn_lost for deterministic idle-missing-turn and notLoaded summaries', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+
+    const errors: Array<{ sid: string; details?: any; message: string; recoverable: boolean }> = [];
+    provider.onError((sid, error) => errors.push({
+      sid,
+      details: error.details,
+      message: error.message,
+      recoverable: error.recoverable,
+    }));
+
+    await provider.createSession({ sessionKey: 'route-heartbeat-lost', sessionName: 'deck_repo_w1', cwd: '/tmp/project' });
+    await provider.send('route-heartbeat-lost', 'secret user prompt');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'other-turn', status: 'completed' }],
+      prompt: 'must-not-leak',
+    });
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ sid: 'route-heartbeat-lost', recoverable: true });
+    expect(errors[0]!.details).toMatchObject({
+      reason: 'sdk_turn_lost',
+      localSessionKey: 'route-heartbeat-lost',
+      sessionName: 'deck_repo_w1',
+      providerId: 'codex-sdk',
+      codexThreadId: 'thread-1',
+      codexTurnId: 'turn-1',
+      classifier: 'idle_missing_turn',
+      replayDecision: 'pending',
+    });
+    expect(JSON.stringify(errors[0]!.details)).not.toContain('secret user prompt');
+    expect(JSON.stringify(errors[0]!.details)).not.toContain('must-not-leak');
+    expect(provider.getSessionDiagnostics('route-heartbeat-lost')).toMatchObject({
+      heartbeatLeaseActive: false,
+      lastAliveHeartbeatAtMs: null,
+    });
+
+    await provider.createSession({ sessionKey: 'route-heartbeat-notloaded', cwd: '/tmp/project', fresh: true });
+    await provider.send('route-heartbeat-notloaded', 'hello again');
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'notLoaded' },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors.at(-1)?.details).toMatchObject({
+      reason: 'sdk_turn_lost',
+      classifier: 'not_loaded_with_active_lease',
+    });
+  });
+
+  it('makes completed/failed/interrupted local truth deactivate the lease and ignores late strong-looking events', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-terminal', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-heartbeat-terminal', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'late-msg', delta: 'late' } });
+    child.emits({ method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'late-reason', type: 'reasoning' } } });
+    child.emits({ method: 'turn/plan/updated', params: { threadId: 'thread-1', turnId: 'turn-1', plan: [{ step: 'late', status: 'pending' }] } });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'active' } });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(child.requests.some((req) => req.method === 'thread/read')).toBe(false);
+    expect(errors.some((message) => message.includes('lost'))).toBe(false);
+    expect(provider.getSessionDiagnostics('route-heartbeat-terminal')).toMatchObject({
+      runningTurnId: null,
+      heartbeatLeaseActive: false,
+      lastAliveHeartbeatAtMs: null,
+    });
+  });
+
+  it('does not let weak token-usage activity reset strong heartbeat grace indefinitely', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-weak', cwd: '/tmp/project' });
+
+    await provider.send('route-heartbeat-weak', 'hello');
+    const child = childProcessMock.children[0];
+    await vi.advanceTimersByTimeAsync(40_000);
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'thread-1',
+        tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 0 } },
+      },
+    });
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'active' },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
+
+    await vi.advanceTimersByTimeAsync(15_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(child.requests.some((req) => req.method === 'thread/read')).toBe(true);
+  });
+
+  it('uses heartbeat before idle-settle so idle missing-current-turn is not masked as normal completion', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-idle-lost', cwd: '/tmp/project' });
+
+    const completes: string[] = [];
+    const errors: any[] = [];
+    provider.onComplete((_sid, message) => completes.push(message.content));
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.send('route-heartbeat-idle-lost', 'hello');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'different-turn', status: 'completed' }],
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: 'idle' } });
+    await flush();
+
+    expect(completes).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].details).toMatchObject({
+      reason: 'sdk_turn_lost',
+      classifier: 'idle_missing_turn',
+    });
+  });
+
+  it('cleans heartbeat/tool/compact evidence on disconnect and keeps child/compact scopes isolated from ordinary lost-turn recovery', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-disconnect', cwd: '/tmp/project' });
+
+    const errors: any[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.send('route-heartbeat-disconnect', 'run a tool');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 10' } },
+    });
+    expect(provider.getActiveWorkSnapshot('route-heartbeat-disconnect')?.busyReasons).toContain('provider_tool_item');
+
+    await provider.disconnect();
+    expect(provider.getActiveWorkSnapshot('route-heartbeat-disconnect')).toBeNull();
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-compact', cwd: '/tmp/project' });
+    await provider.send('route-heartbeat-compact', '/compact');
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'unowned-child-thread', status: 'notLoaded' } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors.some((error) => error.details?.reason === 'sdk_turn_lost')).toBe(false);
   });
 });

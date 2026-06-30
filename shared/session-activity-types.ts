@@ -355,6 +355,17 @@ export function evaluateProviderSnapshot(
   return { state: 'clear', blocking: false, clear: true, reason: 'clear' };
 }
 
+export function isProviderSnapshotNonBlockingForStoppedGeneration(
+  snapshot: ProviderActiveWorkSnapshot | null | undefined,
+  stoppedGeneration: ActivityGenerationLike,
+): boolean {
+  if (!snapshot) return false;
+  if ((snapshot.status ?? 'current') !== 'current') return false;
+  if (snapshot.activeWorkCount <= 0 && snapshot.activeToolCount <= 0) return false;
+  const snapshotGeneration = snapshot.activityGeneration ?? snapshot.generation;
+  return sameActivityGeneration(snapshotGeneration, stoppedGeneration);
+}
+
 export function isProviderSnapshotBlocking(
   snapshot: ProviderActiveWorkSnapshot | null | undefined,
   currentGeneration?: ActivityGenerationLike,
@@ -364,6 +375,189 @@ export function isProviderSnapshotBlocking(
 
 export function hasProviderActiveWork(snapshot: ProviderActiveWorkSnapshot | null | undefined): boolean {
   return isProviderSnapshotBlocking(snapshot);
+}
+
+export const SDK_TURN_LOST_RECOVERY_REASON = 'sdk_turn_lost' as const;
+
+export type SdkTurnLostClassifier =
+  | 'idle_missing_turn'
+  | 'not_loaded_with_active_lease'
+  | 'start_grace_expired_no_current_turn';
+
+export type SdkTurnLostReplayDecision =
+  | 'pending'
+  | 'safe_replay'
+  | 'unsafe_side_effect'
+  | 'unsafe_ambiguous'
+  | 'unsafe_terminal'
+  | 'budget_exhausted'
+  | 'failed'
+  | 'not_applicable';
+
+export type SdkTurnLostRecoveryPhase = 'detected' | 'recovering' | 'recovered' | 'failed';
+
+export interface SdkTurnLostRecoveryMetadata {
+  reason: typeof SDK_TURN_LOST_RECOVERY_REASON;
+  localSessionKey: string;
+  sessionName?: string;
+  providerId?: string;
+  providerSessionId?: string;
+  codexThreadId?: string;
+  codexTurnId?: string;
+  activityGeneration: ActivityGenerationLike;
+  leaseStartedAt?: number;
+  lastStrongActivityAt?: number;
+  lastProviderEventAt?: number;
+  heartbeatStartedAt?: number;
+  heartbeatCompletedAt?: number;
+  heartbeatDurationMs?: number;
+  heartbeatFailureCount?: number;
+  silenceDurationMs?: number;
+  classifier: SdkTurnLostClassifier;
+  attempt?: number;
+  recoveryAttemptId?: string;
+  correlationId?: string;
+  replayDecision: SdkTurnLostReplayDecision;
+  phase?: SdkTurnLostRecoveryPhase;
+}
+
+export interface SdkTurnLostRecoveryEnvelope {
+  reason: typeof SDK_TURN_LOST_RECOVERY_REASON;
+  metadata: SdkTurnLostRecoveryMetadata;
+}
+
+const SDK_TURN_LOST_CLASSIFIERS = new Set<SdkTurnLostClassifier>([
+  'idle_missing_turn',
+  'not_loaded_with_active_lease',
+  'start_grace_expired_no_current_turn',
+]);
+
+const SDK_TURN_LOST_REPLAY_DECISIONS = new Set<SdkTurnLostReplayDecision>([
+  'pending',
+  'safe_replay',
+  'unsafe_side_effect',
+  'unsafe_ambiguous',
+  'unsafe_terminal',
+  'budget_exhausted',
+  'failed',
+  'not_applicable',
+]);
+
+const SDK_TURN_LOST_RECOVERY_PHASES = new Set<SdkTurnLostRecoveryPhase>([
+  'detected',
+  'recovering',
+  'recovered',
+  'failed',
+]);
+
+export interface SdkTurnLostRecoverySanitizeOptions {
+  expectedLocalSessionKey?: string;
+  expectedSessionName?: string;
+  expectedProviderSessionId?: string;
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+}
+
+function readString(value: unknown, maxLength = 512): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function readFiniteNumber(value: unknown, maxValue = Number.MAX_SAFE_INTEGER): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.min(Math.trunc(value), maxValue);
+}
+
+function isActivityGenerationLikeValue(value: unknown): value is ActivityGenerationLike {
+  return normalizeActivityGeneration(value as ActivityGenerationLike) !== null;
+}
+
+function sanitizeActivityGenerationValue(value: unknown): ActivityGenerationLike | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed.slice(0, 256) : null;
+  }
+  const object = readObject(value);
+  if (!object) return null;
+  if (object.scope !== 'session') return null;
+  const sessionName = readString(object.sessionName, 256);
+  const generation = readFiniteNumber(object.generation);
+  if (!sessionName || generation === undefined) return null;
+  return {
+    scope: 'session',
+    sessionName,
+    generation,
+  };
+}
+
+function expectedMatches(actual: string | undefined, expected: string | undefined): boolean {
+  return !actual || !expected || actual === expected;
+}
+
+export function isSdkTurnLostRecoveryPhase(value: unknown): value is SdkTurnLostRecoveryPhase {
+  return SDK_TURN_LOST_RECOVERY_PHASES.has(value as SdkTurnLostRecoveryPhase);
+}
+
+export function readSdkTurnLostRecoveryMetadata(
+  value: unknown,
+  options: SdkTurnLostRecoverySanitizeOptions = {},
+): SdkTurnLostRecoveryMetadata | null {
+  const source = readObject(value);
+  if (!source) return null;
+  const details = readObject(source.details);
+  const candidate = readObject(details?.metadata) ?? details ?? source;
+  if (candidate.reason !== SDK_TURN_LOST_RECOVERY_REASON) return null;
+  const localSessionKey = readString(candidate.localSessionKey);
+  if (!localSessionKey) return null;
+  const activityGeneration = sanitizeActivityGenerationValue(candidate.activityGeneration);
+  if (activityGeneration === null || !isActivityGenerationLikeValue(activityGeneration)) return null;
+  if (!SDK_TURN_LOST_CLASSIFIERS.has(candidate.classifier as SdkTurnLostClassifier)) return null;
+  if (!SDK_TURN_LOST_REPLAY_DECISIONS.has(candidate.replayDecision as SdkTurnLostReplayDecision)) return null;
+  const sessionName = readString(candidate.sessionName);
+  const providerSessionId = readString(candidate.providerSessionId);
+  if (!expectedMatches(localSessionKey, options.expectedLocalSessionKey)) return null;
+  if (!expectedMatches(sessionName, options.expectedSessionName)) return null;
+  if (!expectedMatches(providerSessionId, options.expectedProviderSessionId)) return null;
+
+  return {
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    localSessionKey,
+    ...(sessionName ? { sessionName } : {}),
+    ...(readString(candidate.providerId) ? { providerId: readString(candidate.providerId) } : {}),
+    ...(providerSessionId ? { providerSessionId } : {}),
+    ...(readString(candidate.codexThreadId) ? { codexThreadId: readString(candidate.codexThreadId) } : {}),
+    ...(readString(candidate.codexTurnId) ? { codexTurnId: readString(candidate.codexTurnId) } : {}),
+    activityGeneration,
+    ...(readFiniteNumber(candidate.leaseStartedAt) !== undefined ? { leaseStartedAt: readFiniteNumber(candidate.leaseStartedAt) } : {}),
+    ...(readFiniteNumber(candidate.lastStrongActivityAt) !== undefined ? { lastStrongActivityAt: readFiniteNumber(candidate.lastStrongActivityAt) } : {}),
+    ...(readFiniteNumber(candidate.lastProviderEventAt) !== undefined ? { lastProviderEventAt: readFiniteNumber(candidate.lastProviderEventAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatStartedAt) !== undefined ? { heartbeatStartedAt: readFiniteNumber(candidate.heartbeatStartedAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatCompletedAt) !== undefined ? { heartbeatCompletedAt: readFiniteNumber(candidate.heartbeatCompletedAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatDurationMs) !== undefined ? { heartbeatDurationMs: readFiniteNumber(candidate.heartbeatDurationMs) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatFailureCount) !== undefined ? { heartbeatFailureCount: readFiniteNumber(candidate.heartbeatFailureCount) } : {}),
+    ...(readFiniteNumber(candidate.silenceDurationMs) !== undefined ? { silenceDurationMs: readFiniteNumber(candidate.silenceDurationMs) } : {}),
+    classifier: candidate.classifier as SdkTurnLostClassifier,
+    ...(readFiniteNumber(candidate.attempt) !== undefined ? { attempt: readFiniteNumber(candidate.attempt) } : {}),
+    ...(readString(candidate.recoveryAttemptId) ? { recoveryAttemptId: readString(candidate.recoveryAttemptId) } : {}),
+    ...(readString(candidate.correlationId) ? { correlationId: readString(candidate.correlationId) } : {}),
+    replayDecision: candidate.replayDecision as SdkTurnLostReplayDecision,
+    ...(isSdkTurnLostRecoveryPhase(candidate.phase) ? { phase: candidate.phase } : {}),
+  };
+}
+
+export function sanitizeSdkTurnLostRecoveryMetadata(
+  value: unknown,
+  options: SdkTurnLostRecoverySanitizeOptions = {},
+): SdkTurnLostRecoveryMetadata | null {
+  return readSdkTurnLostRecoveryMetadata(value, options);
+}
+
+export function isSdkTurnLostRecovery(value: unknown): value is SdkTurnLostRecoveryEnvelope {
+  return readSdkTurnLostRecoveryMetadata(value) !== null;
 }
 
 export function isAuthoritativeIdlePayloadShape(payload: Record<string, unknown> | null | undefined): boolean {

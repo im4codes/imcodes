@@ -3,8 +3,8 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate } from './transport-provider.js';
-import { PROVIDER_ERROR_CODES } from './transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -18,10 +18,16 @@ import type { TransportAttachment } from '../../shared/transport-attachments.js'
 import {
   buildCodexLifecycleTerminalMetadata,
   evaluateProviderSnapshot,
+  isProviderSnapshotNonBlockingForStoppedGeneration,
+  normalizeActivityGeneration,
+  readSdkTurnLostRecoveryMetadata,
+  sameActivityGeneration,
+  SDK_TURN_LOST_RECOVERY_REASON,
   type ProviderSnapshotEvaluation,
   type ActivityDrainMetadata,
   type ActivityGeneration,
   type ProviderActiveWorkSnapshot,
+  type SdkTurnLostRecoveryMetadata,
   type SessionActivityBusyReason,
   type ToolTerminalReason,
   type ToolTerminalStatus,
@@ -41,6 +47,7 @@ import type {
 } from '../../shared/context-types.js';
 import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem } from '../shared/timeline/types.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
+import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { type MemorySearchResultItem } from '../context/memory-search.js';
 import { searchLocalMemorySemanticFrontOfTurn } from '../context/memory-recall-client.js';
@@ -76,8 +83,28 @@ export interface PendingTransportMessage {
   historyCommitted?: boolean;
 }
 
+type SdkTurnLostRecoveryAttemptStatus =
+  | 'detected'
+  | 'recovering'
+  | 'awaiting_replacement_activity'
+  | 'recovered'
+  | 'failed';
+
+interface SdkTurnLostRecoveryAttemptState {
+  metadata: SdkTurnLostRecoveryMetadata;
+  correlationId: string;
+  replayEntryIds: string[];
+  sourceGeneration: ActivityGeneration;
+  status: SdkTurnLostRecoveryAttemptStatus;
+  expectedReplacementDispatchId?: number;
+  expectedReplacementGeneration?: ActivityGeneration;
+  providerAccepted: boolean;
+}
+
 function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMessage {
-  const { timelineCommitted: _timelineCommitted, historyCommitted: _historyCommitted, ...publicEntry } = entry;
+  const publicEntry: PendingTransportMessage = { ...entry };
+  delete publicEntry.timelineCommitted;
+  delete publicEntry.historyCommitted;
   return publicEntry;
 }
 
@@ -149,6 +176,7 @@ const MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES = 3;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
+const MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS = 2;
 // A turn with a RUNNING TOOL can be legitimately silent for minutes — a command
 // that sleeps / polls / builds (e.g. a 180s `tcpdump` wait, a long test/build)
 // emits no provider events while it runs. The phantom-turn recovery must NOT
@@ -368,6 +396,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchId: number | null = null;
   private _activeDispatchStaleRecoveryStarted = false;
   private _stalePendingCancelFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private _ignoreProviderSnapshotForNextLocalStopDrain = false;
   // Consecutive recoverable dispatch-failure count for the current run of
   // retries; reset to 0 on any provider activity / successful send.
   private _recoverableDispatchRetries = 0;
@@ -385,6 +414,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private _currentActivityGenerationLocallyCancelled = false;
+  private _activeDispatchHasSideEffectEvidence = false;
+  private readonly _sdkTurnLostRecoveryAttempts = new Map<string, number>();
+  private readonly _sdkTurnLostRecoveryPhaseKeys = new Set<string>();
+  private _sdkTurnLostRecoveryAttempt: SdkTurnLostRecoveryAttemptState | null = null;
   private _externalCompletionSettlementsToIgnore = 0;
   private _cancelledProviderErrorsToIgnore = 0;
 
@@ -411,6 +444,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         this._lastProviderOutputAt = this._lastActivityAt;
+        this._activeDispatchHasSideEffectEvidence = true;
         if (this._activeDispatchCancelled) return;
         // A delta with no active turn is a late/stray callback from an
         // already-settled turn (provider callbacks are not dispatch-id scoped).
@@ -420,6 +454,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // (Reply delivery is governed by onComplete/onError below, which must
         // never silently drop a settlement.)
         if (!this.hasActiveTurnWork()) return;
+        this.markSdkTurnLostRecoveredOnProviderActivity();
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
@@ -469,6 +504,9 @@ export class TransportSessionRuntime implements SessionRuntime {
             this.setStatus('idle');
           }
           return;
+        }
+        if (!this._activeDispatchCancelled && this.hasActiveTurnWork()) {
+          this.markSdkTurnLostRecoveredOnProviderActivity();
         }
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
@@ -533,6 +571,9 @@ export class TransportSessionRuntime implements SessionRuntime {
             if (this._drainPending()) return;
             if (this.isInProgressStatus(this._status)) this.setStatus('idle');
           }
+          return;
+        }
+        if (this.handleSdkTurnLostRecovery(error)) {
           return;
         }
         if (!this.hasActiveTurnWork()) {
@@ -630,6 +671,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._lastActivityAt = Date.now();
       this._lastProviderOutputAt = this._lastActivityAt;
       this.recordToolActivity(tool);
+      this._activeDispatchHasSideEffectEvidence = true;
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -637,6 +679,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // SDKs can abort/rotate poisoned sessions instead of taking the purely
       // local pre-send skip path.
       this._activeDispatchProviderStarted = true;
+      this.markSdkTurnLostRecoveredOnProviderActivity();
     }) as unknown;
     if (typeof unsubscribeToolCall === 'function') {
       this._unsubscribes.push(unsubscribeToolCall as () => void);
@@ -645,6 +688,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        this._activeDispatchHasSideEffectEvidence = true;
         this._onApprovalRequest?.(req);
       });
     }
@@ -1063,6 +1107,10 @@ export class TransportSessionRuntime implements SessionRuntime {
     providerSnapshot: ProviderActiveWorkSnapshot,
     evaluationState: ProviderSnapshotEvaluation['state'],
   ): boolean {
+    if (this._currentActivityGenerationLocallyCancelled
+      && isProviderSnapshotNonBlockingForStoppedGeneration(providerSnapshot, this.currentActivityGeneration())) {
+      return true;
+    }
     if (providerSnapshot.activeWorkCount > 0 || providerSnapshot.activeToolCount > 0) return false;
     const isCurrentOrImplicitStatus = (providerSnapshot.status ?? 'current') === 'current';
     const isGenerationDriftClear = evaluationState === 'unattributed_clear'
@@ -1563,6 +1611,220 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._lastProviderErrorAt = Date.now();
   }
 
+  private sdkTurnLostRecoveryKey(metadata: SdkTurnLostRecoveryMetadata): string {
+    const generation = this._activeDispatchEntries.length > 0
+      ? this.currentActivityGeneration()
+      : metadata.activityGeneration;
+    return `${this.sessionKey}:${normalizeActivityGeneration(generation) ?? 'unknown'}:${metadata.reason}`;
+  }
+
+  private sdkTurnLostRecoveryBudgetUsed(metadata: SdkTurnLostRecoveryMetadata): number {
+    const key = this.sdkTurnLostRecoveryKey(metadata);
+    return this._sdkTurnLostRecoveryAttempts.get(key) ?? 0;
+  }
+
+  private consumeSdkTurnLostRecoveryBudget(metadata: SdkTurnLostRecoveryMetadata): boolean {
+    const key = this.sdkTurnLostRecoveryKey(metadata);
+    const used = this._sdkTurnLostRecoveryAttempts.get(key) ?? 0;
+    if (used >= MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS) return false;
+    this._sdkTurnLostRecoveryAttempts.set(key, used + 1);
+    return true;
+  }
+
+  private sdkTurnLostRecoveryCorrelationId(metadata: SdkTurnLostRecoveryMetadata): string {
+    return metadata.correlationId
+      ?? metadata.recoveryAttemptId
+      ?? `${this.sessionKey}:${normalizeActivityGeneration(metadata.activityGeneration) ?? 'unknown'}:${metadata.classifier}`;
+  }
+
+  private emitSdkTurnLostRecoveryPhase(
+    metadata: SdkTurnLostRecoveryMetadata,
+    phase: SdkTurnLostRecoveryPhase,
+    replayDecision?: SdkTurnLostReplayDecision | string,
+  ): void {
+    const correlationId = this.sdkTurnLostRecoveryCorrelationId(metadata);
+    const dedupKey = `${correlationId}:${phase}`;
+    if (this._sdkTurnLostRecoveryPhaseKeys.has(dedupKey)) return;
+    this._sdkTurnLostRecoveryPhaseKeys.add(dedupKey);
+    const recovery = {
+      ...metadata,
+      phase,
+      correlationId,
+      ...(replayDecision ? { replayDecision } : {}),
+    };
+    const payload = {
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      phase,
+      reason: SDK_TURN_LOST_RECOVERY_REASON,
+      correlationId,
+      recovery,
+    };
+    timelineEmitter.emit(this.sessionKey, 'agent.status', payload, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-runtime-recovery:${this.sessionKey}:${correlationId}:${phase}`,
+    });
+    void appendTransportEvent(this.sessionKey, {
+      type: 'agent.status',
+      sessionId: this.sessionKey,
+      ...payload,
+    });
+  }
+
+  private markSdkTurnLostRecoveredOnProviderActivity(): void {
+    const attempt = this._sdkTurnLostRecoveryAttempt;
+    if (!attempt || attempt.status === 'recovered' || attempt.status === 'failed') return;
+    if (attempt.expectedReplacementDispatchId === undefined || attempt.expectedReplacementGeneration === undefined) return;
+    if (this._activeDispatchId !== attempt.expectedReplacementDispatchId) return;
+    if (!sameActivityGeneration(this.currentActivityGeneration(), attempt.expectedReplacementGeneration)) return;
+    if (!this._activeDispatchProviderStarted || !attempt.providerAccepted) return;
+    attempt.status = 'recovered';
+    this.emitSdkTurnLostRecoveryPhase(attempt.metadata, SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED, 'safe_replay');
+    this._sdkTurnLostRecoveryAttempt = null;
+  }
+
+  private bindSdkTurnLostReplacementDispatch(dispatchId: number, entries: PendingTransportMessage[]): void {
+    const attempt = this._sdkTurnLostRecoveryAttempt;
+    if (!attempt || attempt.status !== 'recovering') return;
+    const dispatchedIds = new Set(entries.map((entry) => entry.clientMessageId));
+    if (!attempt.replayEntryIds.every((id) => dispatchedIds.has(id))) return;
+    attempt.expectedReplacementDispatchId = dispatchId;
+    attempt.expectedReplacementGeneration = this.currentActivityGeneration();
+    attempt.providerAccepted = false;
+    attempt.status = 'awaiting_replacement_activity';
+  }
+
+  private markSdkTurnLostReplacementProviderAccepted(dispatchId: number): void {
+    const attempt = this._sdkTurnLostRecoveryAttempt;
+    if (!attempt || attempt.status !== 'awaiting_replacement_activity') return;
+    if (attempt.expectedReplacementDispatchId !== dispatchId) return;
+    if (!sameActivityGeneration(this.currentActivityGeneration(), attempt.expectedReplacementGeneration)) return;
+    attempt.providerAccepted = true;
+  }
+
+  private makeSdkTurnLostFailure(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): ProviderError {
+    return {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK turn was lost and automatic replay was not safe. Please review the session and resend if appropriate.',
+      recoverable: false,
+      details: {
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        localSessionKey: this.sessionKey,
+        providerId: this.provider.id,
+        providerSessionId: this._providerSessionId ?? undefined,
+        activityGeneration: this.currentActivityGeneration(),
+        classifier: metadata.classifier,
+        replayDecision,
+        recoveryAttemptId: metadata.recoveryAttemptId,
+        correlationId: metadata.correlationId,
+      },
+    };
+  }
+
+  private failSdkTurnLostRecovery(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): void {
+    const existingAttempt = this._sdkTurnLostRecoveryAttempt;
+    if (existingAttempt) existingAttempt.status = 'failed';
+    this.emitSdkTurnLostRecoveryPhase(metadata, SDK_TURN_LOST_RECOVERY_PHASES.FAILED, replayDecision);
+    const failure = this.makeSdkTurnLostFailure(metadata, replayDecision);
+    this.recordProviderError(failure);
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: metadata.classifier,
+        replayDecision,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport runtime sdk turn lost recovery failed',
+    );
+    this._sending = false;
+    this._activeTurn?.reject(failure);
+    this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchHasSideEffectEvidence = false;
+    this._sdkTurnLostRecoveryAttempt = null;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+    this._activeDispatchEntries = [];
+    this.setStatus('error');
+  }
+
+  private handleSdkTurnLostRecovery(error: ProviderError): boolean {
+    const metadata = readSdkTurnLostRecoveryMetadata(error);
+    if (!metadata) return false;
+    if (metadata.localSessionKey !== this.sessionKey) return true;
+    if (this._currentActivityGenerationLocallyCancelled || this._activeDispatchCancelled) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_terminal');
+      return true;
+    }
+    if (!sameActivityGeneration(metadata.activityGeneration, this.currentActivityGeneration())) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
+      return true;
+    }
+    if (metadata.replayDecision !== 'pending' && metadata.replayDecision !== 'safe_replay') {
+      this.failSdkTurnLostRecovery(metadata, metadata.replayDecision);
+      return true;
+    }
+    if (this._activeDispatchEntries.length === 0 || !this._activeTurn) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
+      return true;
+    }
+    if (this._activeDispatchHasSideEffectEvidence || this._openTools.size > 0) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_side_effect');
+      return true;
+    }
+    if (!this.consumeSdkTurnLostRecoveryBudget(metadata)) {
+      this.failSdkTurnLostRecovery(metadata, 'budget_exhausted');
+      return true;
+    }
+
+    const replayEntries = this._activeDispatchEntries.map((entry) => ({ ...entry }));
+    const recoveryMetadata = { ...metadata, replayDecision: 'safe_replay' as const };
+    this._sdkTurnLostRecoveryAttempt = {
+      metadata: recoveryMetadata,
+      correlationId: this.sdkTurnLostRecoveryCorrelationId(recoveryMetadata),
+      replayEntryIds: replayEntries.map((entry) => entry.clientMessageId),
+      sourceGeneration: this.currentActivityGeneration(),
+      status: 'detected',
+      providerAccepted: false,
+    };
+    this.emitSdkTurnLostRecoveryPhase(recoveryMetadata, SDK_TURN_LOST_RECOVERY_PHASES.DETECTED, 'safe_replay');
+    this.emitSdkTurnLostRecoveryPhase(metadata, SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING, 'safe_replay');
+    this._sdkTurnLostRecoveryAttempt.status = 'recovering';
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: metadata.classifier,
+        attempt: this.sdkTurnLostRecoveryBudgetUsed(metadata),
+        maxAttempts: MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS,
+        activeDispatchCount: replayEntries.length,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
+    );
+    this._sending = false;
+    this._activeTurn.resolve();
+    this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
+    this._activeDispatchEntries = [];
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchHasSideEffectEvidence = false;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+    this._pendingMessages.unshift(...replayEntries);
+    this._pendingVersion++;
+    this._ignoreProviderSnapshotForNextLocalStopDrain = true;
+    if (!this._drainPending()) this.setStatus('thinking');
+    return true;
+  }
+
   private clearStalePendingCancelFallbackTimer(): void {
     if (!this._stalePendingCancelFallbackTimer) return;
     clearTimeout(this._stalePendingCancelFallbackTimer);
@@ -1685,6 +1947,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._lastProviderErrorAt = 0;
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
+    this._activeDispatchHasSideEffectEvidence = false;
     this._activeDispatchId = dispatchId;
     this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
@@ -1692,6 +1955,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       text: message,
       ...(attachments?.length ? { attachments } : {}),
     }]).map((entry) => ({ ...entry }));
+    this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     let resolve!: () => void;
     let reject!: (err: ProviderError) => void;
@@ -1824,6 +2088,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Provider accepted the send — the turn was delivered. Resolve any
       // recoverable-retry streak so a later failure starts with a full budget.
       this._recoverableDispatchRetries = 0;
+      this.markSdkTurnLostReplacementProviderAccepted(dispatchId);
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
         if (hitIds.length > 0) {
@@ -1887,6 +2152,9 @@ export class TransportSessionRuntime implements SessionRuntime {
                   message: err instanceof Error ? err.message : String(err),
                   recoverable: false,
                 });
+        if (this.handleSdkTurnLostRecovery(providerError)) {
+          return;
+        }
         this.recordProviderError(providerError);
         logger.warn(
           {

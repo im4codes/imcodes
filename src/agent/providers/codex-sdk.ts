@@ -17,12 +17,14 @@ import type {
   ProviderStatusUpdate,
   ProviderUsageUpdate,
   ToolCallEvent,
+  SdkTurnLostRecoveryMetadata,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
   normalizeProviderPayload,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
+  SDK_TURN_LOST_REASON,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
@@ -36,6 +38,11 @@ import type {
 } from '../../../shared/session-activity-types.js';
 import {
   buildCodexLifecycleTerminalMetadata,
+} from '../../../shared/session-activity-types.js';
+import {
+  normalizeActivityGeneration,
+  sameActivityGeneration,
+  type ActivityGenerationLike,
 } from '../../../shared/session-activity-types.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
@@ -78,6 +85,14 @@ const TERMINATED_TURN_CACHE_LIMIT = 200;
 // follows it; short enough that a genuinely finished turn is never stuck.
 const CODEX_IDLE_SETTLE_DEBOUNCE_MS = 1_500;
 const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
+const CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS = 50_000;
+const CODEX_TURN_HEARTBEAT_INTERVAL_MS = 20_000;
+const CODEX_TURN_HEARTBEAT_JITTER_MS = 5_000;
+const CODEX_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
+const CODEX_TURN_HEARTBEAT_FAILURE_THRESHOLD = 3;
+const CODEX_TURN_HEARTBEAT_START_GRACE_MS = 15_000;
+const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
+const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -128,21 +143,6 @@ const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS = 2_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS = 15 * 60_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS = 5_000;
-
-function readBoundedIntegerEnv(
-  envName: string,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  const raw = process.env[envName];
-  if (raw === undefined || raw.trim() === '') return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback;
-  if (parsed < min) return min;
-  if (parsed > max) return max;
-  return parsed;
-}
 
 interface CodexRawSpawnAgentCall {
   sessionId: string;
@@ -627,6 +627,74 @@ type GeneratedImageTrackingSnapshot = {
   knownPaths: Set<string>;
 };
 
+type HeartbeatThreadStatus = 'active' | 'idle' | 'notLoaded' | 'systemError' | 'unknown';
+type HeartbeatTurnStatus = 'active' | 'completed' | 'failed' | 'interrupted' | 'unknown';
+type HeartbeatClassifier =
+  | 'active'
+  | 'idle_completed'
+  | 'idle_failed'
+  | 'idle_interrupted'
+  | 'idle_missing_turn'
+  | 'not_loaded_with_active_lease'
+  | 'start_grace'
+  | 'start_grace_expired_no_current_turn'
+  | 'system_error'
+  | 'malformed'
+  | 'oversized'
+  | 'missing_turn_list'
+  | 'ambiguous_current_turn'
+  | 'unknown_status'
+  | 'timeout'
+  | 'stale'
+  | 'local_terminal';
+type HeartbeatClassification =
+  | { outcome: 'active'; classifier: HeartbeatClassifier }
+  | { outcome: 'terminal'; classifier: HeartbeatClassifier; status: 'completed' | 'failed' | 'interrupted'; turnId?: string }
+  | { outcome: 'lost'; classifier: 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn' }
+  | { outcome: 'provider_error'; classifier: 'system_error' }
+  | { outcome: 'inconclusive' | 'degraded' | 'stale'; classifier: HeartbeatClassifier };
+
+interface HeartbeatTurnSummary {
+  id?: string;
+  status: HeartbeatTurnStatus;
+  current: boolean;
+  startedAtMs?: number;
+  updatedAtMs?: number;
+  completedAtMs?: number;
+}
+
+interface HeartbeatThreadSummary {
+  valid: boolean;
+  malformedReason?: Extract<HeartbeatClassifier, 'malformed' | 'oversized' | 'missing_turn_list' | 'ambiguous_current_turn'>;
+  threadStatus: HeartbeatThreadStatus;
+  turns: HeartbeatTurnSummary[];
+  requestStartedAtMs: number;
+  requestEndedAtMs: number;
+  rawTurnCount: number;
+}
+
+interface CodexActiveTurnLease {
+  id: string;
+  attemptId: number;
+  localSessionKey: string;
+  sessionName?: string;
+  providerSessionId: string;
+  threadId: string;
+  turnId?: string;
+  activityGeneration?: ActivityGenerationLike;
+  startedAtMs: number;
+  turnStartInFlightAtMs?: number;
+  lastStrongActivityAtMs: number;
+  lastWeakActivityAtMs?: number;
+  lastHeartbeatAtMs?: number;
+  lastHeartbeatResponseAtMs?: number;
+  lastAliveHeartbeatAtMs?: number;
+  nextHeartbeatAtMs?: number;
+  heartbeatFailureCount: number;
+  heartbeatInFlight: boolean;
+  heartbeatTimer?: ReturnType<typeof setTimeout>;
+}
+
 export interface CodexDiscoveredModel {
   id: string;
   name?: string;
@@ -646,6 +714,7 @@ interface CodexSdkSessionState {
   loaded: boolean;
   runningTurnId?: string;
   runtimeActivityGeneration?: ActivityGeneration;
+  activeTurnLease?: CodexActiveTurnLease;
   turnStartInFlight: boolean;
   runningCompact: boolean;
   currentMessageId: string | null;
@@ -838,8 +907,61 @@ function isThreadIdleStatus(status: string | undefined): boolean {
   return normalized === 'idle'
     || normalized === 'ready'
     || normalized === 'complete'
+    || normalized === 'completed';
+}
+
+function normalizeHeartbeatThreadStatus(status: string | undefined): HeartbeatThreadStatus {
+  const normalized = normalizeStatusName(status);
+  if (normalized === 'systemerror' || normalized === 'error') return 'systemError';
+  if (normalized === 'notloaded' || normalized === 'notfound' || normalized === 'unloaded') return 'notLoaded';
+  if (
+    normalized === 'active'
+    || normalized === 'running'
+    || normalized === 'busy'
+    || normalized === 'compacting'
+    || normalized === 'inprogress'
+  ) return 'active';
+  if (
+    normalized === 'idle'
+    || normalized === 'ready'
+    || normalized === 'complete'
     || normalized === 'completed'
-    || normalized === 'notloaded';
+  ) return 'idle';
+  return 'unknown';
+}
+
+function normalizeHeartbeatTurnStatus(status: string | undefined): HeartbeatTurnStatus {
+  const normalized = normalizeStatusName(status);
+  if (
+    normalized === 'active'
+    || normalized === 'running'
+    || normalized === 'busy'
+    || normalized === 'inprogress'
+    || normalized === 'pending'
+  ) return 'active';
+  if (
+    normalized === 'completed'
+    || normalized === 'complete'
+    || normalized === 'succeeded'
+    || normalized === 'success'
+    || normalized === 'done'
+  ) return 'completed';
+  if (normalized === 'failed' || normalized === 'error' || normalized === 'errored') return 'failed';
+  if (
+    normalized === 'interrupted'
+    || normalized === 'cancelled'
+    || normalized === 'canceled'
+    || normalized === 'stopped'
+    || normalized === 'killed'
+  ) return 'interrupted';
+  return 'unknown';
+}
+
+function boundedTimestampMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.trunc(value);
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function meaningfulString(value: unknown): string | undefined {
@@ -1743,6 +1865,8 @@ export class CodexSdkProvider implements TransportProvider {
   private appServerRestart: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
+  private nextActiveTurnLeaseId = 1;
+  private heartbeatInFlightCount = 0;
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -1825,6 +1949,13 @@ export class CodexSdkProvider implements TransportProvider {
       activeReason,
       threadId: state.threadId ?? null,
       runningTurnId: state.runningTurnId ?? null,
+      heartbeatLeaseActive: state.activeTurnLease ? this.isHeartbeatLeaseActive(sessionId, state, state.activeTurnLease) : false,
+      heartbeatLeaseTurnId: state.activeTurnLease?.turnId ?? null,
+      heartbeatFailureCount: state.activeTurnLease?.heartbeatFailureCount ?? 0,
+      heartbeatInFlight: state.activeTurnLease?.heartbeatInFlight ?? false,
+      lastHeartbeatAttemptAtMs: state.activeTurnLease?.lastHeartbeatAtMs ?? null,
+      lastHeartbeatResponseAtMs: state.activeTurnLease?.lastHeartbeatResponseAtMs ?? null,
+      lastAliveHeartbeatAtMs: state.activeTurnLease?.lastAliveHeartbeatAtMs ?? null,
       turnStartInFlight: state.turnStartInFlight,
       runningCompact: state.runningCompact,
       loaded: state.loaded,
@@ -1878,6 +2009,7 @@ export class CodexSdkProvider implements TransportProvider {
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
+      activeTurnLease: undefined,
       turnStartInFlight: false,
       runningCompact: false,
       currentMessageId: null,
@@ -1926,6 +2058,7 @@ export class CodexSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
@@ -2026,7 +2159,8 @@ export class CodexSdkProvider implements TransportProvider {
     }
     state.currentText = '';
     state.currentMessageId = null;
-    state.activeItemIds.clear();
+    this.clearActiveItemEvidence(state);
+    this.clearActiveTurnLease(state);
     state.cancelled = false;
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
@@ -2042,6 +2176,12 @@ export class CodexSdkProvider implements TransportProvider {
     await this.startTurn(sessionId, state, payload);
   }
 
+  private clearActiveItemEvidence(state: CodexSdkSessionState): void {
+    state.activeItemIds.clear();
+    state.activeToolItemIds.clear();
+    state.activeCompactionItemIds.clear();
+  }
+
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -2051,6 +2191,7 @@ export class CodexSdkProvider implements TransportProvider {
     // carries the request across those async boundaries so startTurn() issues
     // turn/interrupt as soon as Codex exposes the id.
     state.cancelled = true;
+    this.clearActiveTurnLease(state);
     if (!state.threadId) return;
     if (state.runningCompact) {
       const turnId = state.runningTurnId;
@@ -2099,8 +2240,10 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.runningTurnId !== turnId) return;
       this.clearStatus(sessionId, state);
       this.rememberTerminatedTurn(state, turnId);
+      this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
-      state.turnStartInFlight = false;      state.activeItemIds.clear();
+      state.turnStartInFlight = false;
+      this.clearActiveItemEvidence(state);
       this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
       this.clearRawChecklistPollTimer(state);
       this.clearChildSubagentRolloutPollTimer(state);
@@ -2116,6 +2259,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private clearSessionWorkAfterDisconnect(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
     this.clearChildSubagentRolloutPollTimer(state);
@@ -2128,9 +2272,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.compactObserved = false;
     state.currentMessageId = null;
     state.currentText = '';
-    state.activeItemIds.clear();
-    state.activeToolItemIds.clear();
-    state.activeCompactionItemIds.clear();
+    this.clearActiveItemEvidence(state);
     state.cancelled = false;
     state.lastStatusSignature = null;
     this.clearPendingSessionSystemTextUpdate(state);
@@ -2187,6 +2329,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.rl = null;
     for (const [sessionId, state] of this.sessions) {
       this.clearCancelTimer(state);
+      this.clearActiveTurnLease(state);
       this.clearCompactTimers(state);
       this.clearRawChecklistPollTimer(state);
       this.clearChildSubagentRolloutPollTimer(state);
@@ -2194,6 +2337,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearSessionWorkAfterDisconnect(sessionId, state);
       } else {
         this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'provider_cancelled');
+        this.clearSessionWorkAfterDisconnect(sessionId, state);
       }
     }
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
@@ -2280,7 +2424,7 @@ export class CodexSdkProvider implements TransportProvider {
     await this.restartAppServerPreservingSessions(reason);
   }
 
-  private async restartAppServerPreservingSessions(reason: string): Promise<void> {
+  private async restartAppServerPreservingSessions(_reason: string): Promise<void> {
     if (this.appServerRestart) return this.appServerRestart;
     const config = this.config;
     if (!config) return;
@@ -2288,7 +2432,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (activeSessionIds.length > 0) {
       logger.warn({
         provider: this.id,
-        reason,
+        reason: _reason,
         activeSessionCount: activeSessionIds.length,
         activeSessionIds: activeSessionIds.slice(0, 10),
       }, 'Codex app-server restart deferred while current work is active');
@@ -2339,6 +2483,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.pendingSessionSystemTextUpdateTurnId = undefined;
       }
       state.turnStartInFlight = true;
+      this.refreshActiveTurnLease(sessionId, state, { strong: true, turnStartInFlight: true });
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
@@ -2357,12 +2502,15 @@ export class CodexSdkProvider implements TransportProvider {
       // or the turn-id guards below would start dropping live assistant text.
       const startedTurnId = readParamTurnId((result ?? {}) as Record<string, any>);
       const terminalArrivedDuringStart = Boolean(startedTurnId && state.terminalDuringTurnStartIds.delete(startedTurnId));
-      if (startedTurnId && !terminalArrivedDuringStart) {
-        state.completedTurnIds.delete(startedTurnId);
-        state.terminatedTurnIds.delete(startedTurnId);
-        state.completedCompactTurnIds.delete(startedTurnId);
-        state.terminatedCompactTurnIds.delete(startedTurnId);
-        state.runningTurnId = startedTurnId;
+      if (!terminalArrivedDuringStart) {
+        if (startedTurnId) {
+          state.completedTurnIds.delete(startedTurnId);
+          state.terminatedTurnIds.delete(startedTurnId);
+          state.completedCompactTurnIds.delete(startedTurnId);
+          state.terminatedCompactTurnIds.delete(startedTurnId);
+          state.runningTurnId = startedTurnId;
+        }
+        this.refreshActiveTurnLease(sessionId, state, { turnId: startedTurnId, strong: true });
       }
       state.nativePlanEventSeen = false;
       this.armChildSubagentRolloutPolling(sessionId, state);
@@ -2379,8 +2527,10 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
       this.rememberTerminatedTurn(state, state.runningTurnId);
+      this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
-      state.turnStartInFlight = false;      state.activeItemIds.clear();
+      state.turnStartInFlight = false;
+      this.clearActiveItemEvidence(state);
       this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
@@ -2409,6 +2559,7 @@ export class CodexSdkProvider implements TransportProvider {
     try {
       await this.ensureThreadLoaded(sessionId, state);
       this.clearPendingSessionSystemTextUpdate(state);
+      this.clearActiveTurnLease(state);
       state.runningCompact = true;
       state.compactObserved = false;
       state.currentText = '';
@@ -3043,6 +3194,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;      const normalizedUsage = normalizeCodexTokenUsage(params);
       if (!normalizedUsage) return;
       state.lastUsage = normalizedUsage;
+      this.recordWeakActivity(sessionId, state);
       for (const cb of this.usageCallbacks) cb(sessionId, {
         usage: normalizedUsage,
         ...(state.model ? { model: state.model } : {}),
@@ -3069,6 +3221,9 @@ export class CodexSdkProvider implements TransportProvider {
       const status = readThreadStatus(params);
       if (isThreadActiveStatus(status)) {
         this.clearIdleSettleTimer(state); // turn resumed → cancel any pending idle settle
+        const turnId = readParamTurnId(params);
+        if (turnId && state.runningTurnId === turnId) this.recordStrongActivity(sessionId, state, turnId);
+        else this.recordWeakActivity(sessionId, state);
         if (!state.runningCompact) return;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -3098,6 +3253,19 @@ export class CodexSdkProvider implements TransportProvider {
           && !state.turnStartInFlight
           && !this.isClosedCodexTurn(state, state.runningTurnId)
         ) {
+          if (this.hasActiveToolItems(state)) {
+            state.deferredIdleSettleTurnId = state.runningTurnId;
+            return;
+          }
+          const lease = state.activeTurnLease;
+          if (lease && this.isHeartbeatLeaseActive(sessionId, state, lease)) {
+            if (lease.heartbeatTimer) {
+              clearTimeout(lease.heartbeatTimer);
+              lease.heartbeatTimer = undefined;
+            }
+            void this.runHeartbeat(sessionId, lease.id, lease.attemptId);
+            return;
+          }
           this.armIdleSettleTimer(sessionId, state, state.runningTurnId);
           return;
         }
@@ -3107,6 +3275,17 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (isCodexRuntimeSubagentMethod(method, params)) {
       this.emitRuntimeSubagentNotification(params);
+      return;
+    }
+
+    if (method === 'turn/started') {
+      const threadId = readParamThreadId(params);
+      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state || state.cancelled || state.runningCompact) return;
+      const turnId = readParamTurnId(params);
+      if (turnId && !this.isClosedCodexTurn(state, turnId)) state.runningTurnId = state.runningTurnId ?? turnId;
+      this.recordStrongActivity(sessionId, state, turnId);
       return;
     }
 
@@ -3123,6 +3302,7 @@ export class CodexSdkProvider implements TransportProvider {
       const turnId = readParamTurnId(params);
       if (turnId && (state.cancelled || this.isClosedCodexTurn(state, turnId))) return;
       if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+      this.recordStrongActivity(sessionId, state, turnId);
       // Native plan event (codex >= 0.139). Render it AND suppress the legacy
       // rollout-file scan for this session so old (file-scrape) + new never
       // double-render the same plan.
@@ -3150,6 +3330,7 @@ export class CodexSdkProvider implements TransportProvider {
       // the UI. Closed/terminated turns may still render late text, but they
       // must never be adopted back into running state.
       if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.recordStrongActivity(sessionId, state, turnId);
       if (!closedTurn) this.clearStatus(sessionId, state);
       // Reset the streaming accumulator when a new agentMessage item starts so
       // its deltas don't render prefixed with the previous message's full text
@@ -3192,6 +3373,7 @@ export class CodexSdkProvider implements TransportProvider {
       // assistant text. Closed/terminated turns may still surface final
       // assistant text, but they must never be adopted back into running state.
       if (turnId && !closedTurn && !state.runningTurnId) state.runningTurnId = turnId;
+      if (!closedTurn) this.recordStrongActivity(sessionId, state, turnId);
       if (!closedTurn) this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
@@ -3277,6 +3459,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (status === 'failed') {
         this.rememberTerminatedActiveTurn(state, turnId);
+        this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
@@ -3285,7 +3468,8 @@ export class CodexSdkProvider implements TransportProvider {
         state.runningCompact = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
-        state.turnStartInFlight = false;        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();
+        state.turnStartInFlight = false;
+        this.clearActiveItemEvidence(state);
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
         if (this.isCodexAuthError(error)) {
@@ -3298,6 +3482,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (status === 'interrupted') {
         this.rememberTerminatedActiveTurn(state, turnId);
+        this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
@@ -3305,7 +3490,8 @@ export class CodexSdkProvider implements TransportProvider {
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
-          state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();          this.clearPendingSessionSystemTextUpdate(state);
+          this.clearActiveItemEvidence(state);
+          this.clearPendingSessionSystemTextUpdate(state);
           this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
           return;
         }
@@ -3313,7 +3499,8 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
-        state.activeItemIds.clear(); state.activeToolItemIds.clear(); state.activeCompactionItemIds.clear();        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearActiveItemEvidence(state);
+        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -3325,6 +3512,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       if (state.cancelled) {
         this.rememberTerminatedActiveTurn(state, turnId);
+        this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
         this.clearRawChecklistPollTimer(state);
         this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
@@ -3333,10 +3521,9 @@ export class CodexSdkProvider implements TransportProvider {
         state.turnStartInFlight = false;
         state.currentMessageId = null;
         state.currentText = '';
-        state.activeItemIds.clear();
-        state.activeToolItemIds.clear();
-        state.activeCompactionItemIds.clear();
-        state.cancelled = false;        this.clearPendingSessionSystemTextUpdate(state);
+        this.clearActiveItemEvidence(state);
+        state.cancelled = false;
+        this.clearPendingSessionSystemTextUpdate(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -3361,6 +3548,7 @@ export class CodexSdkProvider implements TransportProvider {
     terminalReason: ToolTerminalReason = 'app_server_completed',
   ): Promise<void> {
     this.clearIdleSettleTimer(state);
+    this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
     this.queueRawChecklistHistoryScan(sessionId, state);
     this.clearRawChecklistPollTimer(state);
@@ -3376,9 +3564,7 @@ export class CodexSdkProvider implements TransportProvider {
     const alreadyDetectedImagePaths = [...state.generatedImagePaths];
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
-    state.activeItemIds.clear();
-    state.activeToolItemIds.clear();
-    state.activeCompactionItemIds.clear();
+    this.clearActiveItemEvidence(state);
     state.generatedImageTracking = null;
     this.clearStatus(sessionId, state);
     const newlyDetectedImagePaths = generatedImageTracking
@@ -3420,6 +3606,354 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.completedTurnIds.size <= 50) return;
     const oldest = state.completedTurnIds.values().next().value;
     if (oldest) state.completedTurnIds.delete(oldest);
+  }
+
+  private sameHeartbeatGeneration(a: ActivityGenerationLike, b: ActivityGenerationLike): boolean {
+    const left = normalizeActivityGeneration(a);
+    const right = normalizeActivityGeneration(b);
+    if (left === null && right === null) return true;
+    return sameActivityGeneration(a, b);
+  }
+
+  private clearActiveTurnLease(state: CodexSdkSessionState): void {
+    const lease = state.activeTurnLease;
+    if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
+    state.activeTurnLease = undefined;
+  }
+
+  private refreshActiveTurnLease(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    options: { turnId?: string; strong: boolean; turnStartInFlight?: boolean },
+  ): void {
+    if (!state.threadId || state.runningCompact || state.cancelled) return;
+    const now = Date.now();
+    const current = state.activeTurnLease;
+    const canReuse = current
+      && current.localSessionKey === sessionId
+      && current.threadId === state.threadId
+      && this.sameHeartbeatGeneration(current.activityGeneration, state.runtimeActivityGeneration);
+    const lease = canReuse
+      ? current
+      : {
+          id: `${sessionId}:${state.threadId}:${this.nextActiveTurnLeaseId++}`,
+          attemptId: 0,
+          localSessionKey: sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          providerSessionId: state.routeId,
+          threadId: state.threadId,
+          activityGeneration: state.runtimeActivityGeneration,
+          startedAtMs: now,
+          lastStrongActivityAtMs: now,
+          heartbeatFailureCount: 0,
+          heartbeatInFlight: false,
+        } satisfies CodexActiveTurnLease;
+    if (!canReuse) state.activeTurnLease = lease;
+    if (options.turnId && !this.isClosedCodexTurn(state, options.turnId)) {
+      lease.turnId = options.turnId;
+    }
+    if (options.turnStartInFlight) {
+      lease.turnStartInFlightAtMs = lease.turnStartInFlightAtMs ?? now;
+    }
+    if (options.strong) {
+      lease.lastStrongActivityAtMs = now;
+      lease.heartbeatFailureCount = 0;
+    } else {
+      lease.lastWeakActivityAtMs = now;
+    }
+    this.scheduleHeartbeat(sessionId, state, lease);
+  }
+
+  private recordStrongActivity(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    if (state.cancelled || state.runningCompact) return;
+    if (turnId && this.isClosedCodexTurn(state, turnId)) return;
+    if (turnId && state.runningTurnId && turnId !== state.runningTurnId) return;
+    this.refreshActiveTurnLease(sessionId, state, { turnId, strong: true });
+  }
+
+  private recordWeakActivity(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.activeTurnLease) return;
+    this.refreshActiveTurnLease(sessionId, state, { strong: false });
+  }
+
+  private isHeartbeatLeaseActive(sessionId: string, state: CodexSdkSessionState, lease: CodexActiveTurnLease): boolean {
+    if (state.activeTurnLease !== lease) return false;
+    if (!this.sessions.has(sessionId)) return false;
+    if (lease.localSessionKey !== sessionId) return false;
+    if (!state.threadId || lease.threadId !== state.threadId) return false;
+    if (!this.sameHeartbeatGeneration(lease.activityGeneration, state.runtimeActivityGeneration)) return false;
+    if (state.cancelled || state.runningCompact) return false;
+    if (lease.turnId) {
+      if (this.isClosedCodexTurn(state, lease.turnId)) return false;
+      if (state.runningTurnId && state.runningTurnId !== lease.turnId) return false;
+      if (!state.runningTurnId && !state.turnStartInFlight) return false;
+    }
+    return true;
+  }
+
+  private scheduleHeartbeat(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    options: { minDelayMs?: number } = {},
+  ): void {
+    if (lease.heartbeatTimer) {
+      clearTimeout(lease.heartbeatTimer);
+      lease.heartbeatTimer = undefined;
+    }
+    if (!this.config || !this.child) return;
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    const now = Date.now();
+    const strongWait = Math.max(0, CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS - (now - lease.lastStrongActivityAtMs));
+    const intervalWait = lease.lastHeartbeatAtMs
+      ? Math.max(0, CODEX_TURN_HEARTBEAT_INTERVAL_MS - (now - lease.lastHeartbeatAtMs))
+      : 0;
+    const backoffWait = lease.heartbeatFailureCount > 0
+      ? Math.min(CODEX_TURN_HEARTBEAT_INTERVAL_MS * lease.heartbeatFailureCount, 60_000)
+      : 0;
+    const jitter = Math.floor(Math.random() * (CODEX_TURN_HEARTBEAT_JITTER_MS + 1));
+    const delay = Math.max(strongWait, intervalWait, backoffWait, options.minDelayMs ?? 0) + jitter;
+    lease.nextHeartbeatAtMs = now + delay;
+    lease.heartbeatTimer = setTimeout(() => {
+      lease.heartbeatTimer = undefined;
+      void this.runHeartbeat(sessionId, lease.id, lease.attemptId);
+    }, delay);
+    lease.heartbeatTimer.unref?.();
+  }
+
+  private normalizeHeartbeatThreadSummary(raw: unknown, requestStartedAtMs: number, requestEndedAtMs: number): HeartbeatThreadSummary {
+    if (!isRecord(raw)) {
+      return { valid: false, malformedReason: 'malformed', threadStatus: 'unknown', turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: 0 };
+    }
+    const thread = isRecord(raw.thread) ? raw.thread : raw;
+    const threadStatus = normalizeHeartbeatThreadStatus(readThreadStatus(thread));
+    const rawTurnsValue = Array.isArray(thread.turns)
+      ? thread.turns
+      : Array.isArray(raw.turns)
+        ? raw.turns
+        : undefined;
+    if (!rawTurnsValue) {
+      return { valid: false, malformedReason: 'missing_turn_list', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: 0 };
+    }
+    if (rawTurnsValue.length > CODEX_TURN_HEARTBEAT_MAX_TURNS) {
+      return { valid: false, malformedReason: 'oversized', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+    }
+    const currentTurnIds = new Set<string>();
+    const addCurrent = (value: unknown) => {
+      if (typeof value === 'string' && value.trim()) currentTurnIds.add(value.trim());
+    };
+    addCurrent(thread.currentTurnId);
+    addCurrent(thread.current_turn_id);
+    addCurrent(raw.currentTurnId);
+    addCurrent(raw.current_turn_id);
+    const turns: HeartbeatTurnSummary[] = [];
+    let explicitCurrentCount = 0;
+    for (const entry of rawTurnsValue) {
+      if (!isRecord(entry)) {
+        return { valid: false, malformedReason: 'malformed', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+      }
+      const id = readParamTurnId(entry) ?? meaningfulString(entry.id);
+      const status = normalizeHeartbeatTurnStatus(readTurnStatus(entry));
+      const current = Boolean(entry.current || entry.isCurrent || entry.active || (id && currentTurnIds.has(id)));
+      if (current) explicitCurrentCount += 1;
+      turns.push({
+        ...(id ? { id } : {}),
+        status,
+        current,
+        ...(boundedTimestampMs(entry.startedAt ?? entry.started_at ?? entry.createdAt ?? entry.created_at) !== undefined ? { startedAtMs: boundedTimestampMs(entry.startedAt ?? entry.started_at ?? entry.createdAt ?? entry.created_at)! } : {}),
+        ...(boundedTimestampMs(entry.updatedAt ?? entry.updated_at) !== undefined ? { updatedAtMs: boundedTimestampMs(entry.updatedAt ?? entry.updated_at)! } : {}),
+        ...(boundedTimestampMs(entry.completedAt ?? entry.completed_at) !== undefined ? { completedAtMs: boundedTimestampMs(entry.completedAt ?? entry.completed_at)! } : {}),
+      });
+    }
+    const activeTurnCount = turns.filter((turn) => turn.status === 'active').length;
+    if (explicitCurrentCount > 1 || (explicitCurrentCount === 0 && activeTurnCount > 1)) {
+      return { valid: false, malformedReason: 'ambiguous_current_turn', threadStatus, turns: [], requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+    }
+    return { valid: true, threadStatus, turns, requestStartedAtMs, requestEndedAtMs, rawTurnCount: rawTurnsValue.length };
+  }
+
+  private classifyHeartbeatSummary(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    summary: HeartbeatThreadSummary,
+  ): HeartbeatClassification {
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return { outcome: 'stale', classifier: 'stale' };
+    if (lease.turnId && this.isClosedCodexTurn(state, lease.turnId)) return { outcome: 'inconclusive', classifier: 'local_terminal' };
+    if (!summary.valid) return { outcome: 'inconclusive', classifier: summary.malformedReason ?? 'malformed' };
+    if (summary.threadStatus === 'systemError') return { outcome: 'provider_error', classifier: 'system_error' };
+    if (summary.threadStatus === 'notLoaded') return { outcome: 'lost', classifier: 'not_loaded_with_active_lease' };
+    if (summary.threadStatus === 'active') return { outcome: 'active', classifier: 'active' };
+    if (summary.threadStatus === 'unknown') return { outcome: 'inconclusive', classifier: 'unknown_status' };
+
+    const activeOrCurrentTurns = summary.turns.filter((turn) => turn.current || turn.status === 'active');
+    if (lease.turnId) {
+      const matching = summary.turns.find((turn) => turn.id === lease.turnId);
+      if (!matching) return { outcome: 'lost', classifier: 'idle_missing_turn' };
+      if (matching.status === 'active' || matching.current) return { outcome: 'active', classifier: 'active' };
+      if (matching.status === 'completed') return { outcome: 'terminal', classifier: 'idle_completed', status: 'completed', turnId: matching.id };
+      if (matching.status === 'failed') return { outcome: 'terminal', classifier: 'idle_failed', status: 'failed', turnId: matching.id };
+      if (matching.status === 'interrupted') return { outcome: 'terminal', classifier: 'idle_interrupted', status: 'interrupted', turnId: matching.id };
+      return { outcome: 'inconclusive', classifier: 'unknown_status' };
+    }
+
+    if (Date.now() - lease.startedAtMs < CODEX_TURN_HEARTBEAT_START_GRACE_MS) {
+      return { outcome: 'inconclusive', classifier: 'start_grace' };
+    }
+    if (activeOrCurrentTurns.length > 0) return { outcome: 'inconclusive', classifier: 'start_grace' };
+    return { outcome: 'lost', classifier: 'start_grace_expired_no_current_turn' };
+  }
+
+  private async runHeartbeat(sessionId: string, leaseId: string, attemptId: number): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const lease = state?.activeTurnLease;
+    if (!state || !lease || lease.id !== leaseId || lease.attemptId !== attemptId) return;
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    if (lease.heartbeatInFlight) return;
+    if (this.heartbeatInFlightCount >= CODEX_TURN_HEARTBEAT_PROVIDER_CAP) {
+      this.scheduleHeartbeat(sessionId, state, lease, { minDelayMs: CODEX_TURN_HEARTBEAT_INTERVAL_MS });
+      return;
+    }
+    lease.heartbeatInFlight = true;
+    this.heartbeatInFlightCount += 1;
+    const requestStartedAtMs = Date.now();
+    lease.lastHeartbeatAtMs = requestStartedAtMs;
+    try {
+      const raw = await this.request('thread/read', {
+        threadId: lease.threadId,
+        includeTurns: true,
+      }, CODEX_TURN_HEARTBEAT_TIMEOUT_MS);
+      const requestEndedAtMs = Date.now();
+      const latestState = this.sessions.get(sessionId);
+      const latestLease = latestState?.activeTurnLease;
+      if (!latestState || !latestLease || latestLease.id !== leaseId || latestLease.attemptId !== attemptId || !this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
+      latestLease.lastHeartbeatResponseAtMs = requestEndedAtMs;
+      const summary = this.normalizeHeartbeatThreadSummary(raw, requestStartedAtMs, requestEndedAtMs);
+      const classification = this.classifyHeartbeatSummary(sessionId, latestState, latestLease, summary);
+      this.applyHeartbeatClassification(sessionId, latestState, latestLease, summary, classification);
+    } catch {
+      const latestState = this.sessions.get(sessionId);
+      const latestLease = latestState?.activeTurnLease;
+      if (latestState && latestLease && latestLease.id === leaseId && latestLease.attemptId === attemptId && this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) {
+        latestLease.heartbeatFailureCount += 1;
+        const classification: HeartbeatClassification = latestLease.heartbeatFailureCount >= CODEX_TURN_HEARTBEAT_FAILURE_THRESHOLD
+          ? { outcome: 'degraded', classifier: 'timeout' }
+          : { outcome: 'inconclusive', classifier: 'timeout' };
+        this.applyHeartbeatClassification(sessionId, latestState, latestLease, {
+          valid: true,
+          threadStatus: 'unknown',
+          turns: [],
+          requestStartedAtMs,
+          requestEndedAtMs: Date.now(),
+          rawTurnCount: 0,
+        }, classification);
+      }
+    } finally {
+      const latestState = this.sessions.get(sessionId);
+      const latestLease = latestState?.activeTurnLease;
+      if (latestLease?.id === leaseId) latestLease.heartbeatInFlight = false;
+      if (this.heartbeatInFlightCount > 0) this.heartbeatInFlightCount -= 1;
+      if (latestState && latestLease?.id === leaseId && this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) {
+        this.scheduleHeartbeat(sessionId, latestState, latestLease);
+      }
+    }
+  }
+
+  private applyHeartbeatClassification(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    summary: HeartbeatThreadSummary,
+    classification: HeartbeatClassification,
+  ): void {
+    if (classification.outcome === 'active') {
+      lease.heartbeatFailureCount = 0;
+      lease.lastAliveHeartbeatAtMs = summary.requestEndedAtMs;
+      return;
+    }
+    if (classification.outcome === 'inconclusive' || classification.outcome === 'degraded' || classification.outcome === 'stale') return;
+    if (classification.outcome === 'provider_error') {
+      this.clearActiveTurnLease(state);
+      this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex thread heartbeat reported systemError', false, {
+        heartbeat: {
+          classifier: classification.classifier,
+          threadStatus: summary.threadStatus,
+          requestDurationMs: Math.max(0, summary.requestEndedAtMs - summary.requestStartedAtMs),
+        },
+      }));
+      return;
+    }
+    if (classification.outcome === 'terminal') {
+      this.clearActiveTurnLease(state);
+      if (classification.status === 'completed') {
+        void this.completeTurn(sessionId, state, classification.turnId);
+        return;
+      }
+      this.rememberTerminatedActiveTurn(state, classification.turnId);
+      state.runningTurnId = undefined;
+      state.turnStartInFlight = false;
+      this.clearActiveItemEvidence(state);
+      this.closeOpenProviderToolCalls(sessionId, state, 'error');
+      this.emitError(sessionId, this.makeError(
+        classification.status === 'interrupted' ? PROVIDER_ERROR_CODES.CANCELLED : PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        classification.status === 'interrupted' ? 'Codex turn cancelled' : 'Codex turn failed',
+        classification.status === 'interrupted',
+      ));
+      return;
+    }
+    if (classification.outcome === 'lost') {
+      this.emitSdkTurnLost(
+        sessionId,
+        state,
+        lease,
+        summary,
+        classification.classifier as 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn',
+      );
+    }
+  }
+
+  private emitSdkTurnLost(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    summary: HeartbeatThreadSummary,
+    classifier: 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn',
+  ): void {
+    const recoveryAttemptId = `${sessionId}:${normalizeActivityGeneration(lease.activityGeneration) ?? 'unknown'}:${lease.threadId}:${lease.turnId ?? 'no-turn'}:${lease.attemptId + 1}`;
+    const details: SdkTurnLostRecoveryMetadata = {
+      reason: SDK_TURN_LOST_REASON,
+      localSessionKey: sessionId,
+      ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+      providerId: this.id,
+      providerSessionId: state.routeId,
+      codexThreadId: lease.threadId,
+      ...(lease.turnId ? { codexTurnId: lease.turnId } : {}),
+      activityGeneration: lease.activityGeneration ?? state.runtimeActivityGeneration,
+      leaseStartedAt: lease.startedAtMs,
+      lastProviderEventAt: lease.lastStrongActivityAtMs,
+      heartbeatStartedAt: summary.requestStartedAtMs,
+      heartbeatCompletedAt: summary.requestEndedAtMs,
+      heartbeatDurationMs: Math.max(0, summary.requestEndedAtMs - summary.requestStartedAtMs),
+      silenceDurationMs: Math.max(0, summary.requestStartedAtMs - lease.lastStrongActivityAtMs),
+      heartbeatFailureCount: lease.heartbeatFailureCount,
+      classifier,
+      recoveryAttemptId,
+      correlationId: recoveryAttemptId,
+      replayDecision: 'pending',
+    };
+    this.clearActiveTurnLease(state);
+    this.rememberTerminatedActiveTurn(state, lease.turnId);
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    this.clearActiveItemEvidence(state);
+    this.closeOpenProviderToolCalls(sessionId, state, 'error');
+    this.clearStatus(sessionId, state);
+    this.emitError(sessionId, this.makeError(
+      PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+      'Codex SDK active turn was lost by the app-server',
+      true,
+      details,
+    ));
   }
 
   /** Cancel a pending debounced thread-idle settle (turn activity resumed). */
@@ -3537,11 +4071,12 @@ export class CodexSdkProvider implements TransportProvider {
 
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
     this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
     state.deferredCompactSettleTurnId = undefined;
-    state.activeCompactionItemIds.clear();
+    this.clearActiveItemEvidence(state);
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.compactObserved = false;
@@ -3857,6 +4392,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private cancelCompactLocally(sessionId: string, state: CodexSdkSessionState): void {
     this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);    this.clearStatus(sessionId, state);
     this.rememberTerminatedCompactTurn(state, state.runningTurnId);
@@ -3867,9 +4403,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
-    state.activeItemIds.clear();
-    state.activeToolItemIds.clear();
-    state.activeCompactionItemIds.clear();
+    this.clearActiveItemEvidence(state);
     this.closeOpenProviderToolCalls(sessionId, state, 'error');
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex compact cancelled', true));
   }
@@ -3958,7 +4492,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearPendingSessionSystemTextUpdate(state);
       state.currentMessageId = null;
       state.currentText = '';
-      state.activeItemIds.clear();
+      this.clearActiveItemEvidence(state);
       this.closeOpenProviderToolCalls(sessionId, state, 'error');
       this.emitError(sessionId, this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,

@@ -21,7 +21,16 @@ import type {
   ProviderSupportClass,
   SharedScopePolicyOverride,
 } from '../../shared/context-types.js';
-import type { ProviderActiveWorkSnapshot } from '../../shared/session-activity-types.js';
+import {
+  SDK_TURN_LOST_RECOVERY_REASON as SHARED_SDK_TURN_LOST_RECOVERY_REASON,
+  isSdkTurnLostRecoveryPhase as isSharedSdkTurnLostRecoveryPhase,
+  sanitizeSdkTurnLostRecoveryMetadata as sanitizeSharedSdkTurnLostRecoveryMetadata,
+  type SdkTurnLostClassifier as SharedSdkTurnLostClassifier,
+  type SdkTurnLostRecoveryMetadata as SharedSdkTurnLostRecoveryMetadata,
+  type SdkTurnLostRecoveryPhase as SharedSdkTurnLostRecoveryPhase,
+  type SdkTurnLostReplayDecision as SharedSdkTurnLostReplayDecision,
+  type ProviderActiveWorkSnapshot,
+} from '../../shared/session-activity-types.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -53,6 +62,7 @@ export const PROVIDER_ERROR_CODES = {
   CANCELLED:        'CANCELLED',
   PARSE_ERROR:      'PARSE_ERROR',
   PROVIDER_NOT_FOUND:'PROVIDER_NOT_FOUND',
+  SDK_TURN_LOST:    'SDK_TURN_LOST',
 } as const;
 
 // ── Derived types ───────────────────────────────────────────────────────────
@@ -65,6 +75,61 @@ export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWN
 
 /** Error code from a provider operation. */
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
+
+/** Machine-readable recovery reason for Codex SDK app-server lost foreground turns. */
+export const SDK_TURN_LOST_REASON = SHARED_SDK_TURN_LOST_RECOVERY_REASON;
+export const SDK_TURN_LOST_RECOVERY_REASON = SDK_TURN_LOST_REASON;
+
+/** Agent status used for privacy-safe lost-turn recovery timeline phases. */
+export const SDK_TURN_LOST_RECOVERY_STATUS = 'sdk_turn_lost_recovery' as const;
+
+export const SDK_TURN_LOST_RECOVERY_PHASES = {
+  DETECTED: 'detected',
+  RECOVERING: 'recovering',
+  RECOVERED: 'recovered',
+  FAILED: 'failed',
+} as const;
+
+export const SDK_TURN_LOST_RECOVERY_CLASSIFIERS = {
+  IDLE_MISSING_TURN: 'idle_missing_turn',
+  NOT_LOADED_WITH_ACTIVE_LEASE: 'not_loaded_with_active_lease',
+  START_GRACE_EXPIRED_NO_CURRENT_TURN: 'start_grace_expired_no_current_turn',
+} as const;
+
+export const SDK_TURN_LOST_REPLAY_DECISIONS = {
+  PENDING: 'pending',
+  SAFE_REPLAY: 'safe_replay',
+  UNSAFE_SIDE_EFFECT: 'unsafe_side_effect',
+  UNSAFE_TERMINAL: 'unsafe_terminal',
+  UNSAFE_AMBIGUOUS: 'unsafe_ambiguous',
+  BUDGET_EXHAUSTED: 'budget_exhausted',
+  FAILED: 'failed',
+  NOT_APPLICABLE: 'not_applicable',
+} as const;
+
+export type SdkTurnLostRecoveryReason = typeof SDK_TURN_LOST_RECOVERY_REASON;
+export type SdkTurnLostRecoveryPhase = SharedSdkTurnLostRecoveryPhase;
+export type SdkTurnLostRecoveryClassifier =
+  typeof SDK_TURN_LOST_RECOVERY_CLASSIFIERS[keyof typeof SDK_TURN_LOST_RECOVERY_CLASSIFIERS];
+export type SdkTurnLostClassifier = SharedSdkTurnLostClassifier;
+export type SdkTurnLostReplayDecision = SharedSdkTurnLostReplayDecision;
+export type SdkTurnLostRecoveryMetadata = SharedSdkTurnLostRecoveryMetadata;
+
+export type SdkTurnLostProviderError = ProviderError & {
+  details: SdkTurnLostRecoveryMetadata;
+};
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isSdkTurnLostRecoveryDetails(value: unknown): value is SdkTurnLostRecoveryMetadata {
+  return sanitizeSharedSdkTurnLostRecoveryMetadata(value) !== null;
+}
+
+export function isSdkTurnLostProviderError(error: ProviderError | null | undefined): error is SdkTurnLostProviderError {
+  return !!error && error.recoverable === true && isSdkTurnLostRecoveryDetails(error.details);
+}
 
 // ── Supporting types ────────────────────────────────────────────────────────
 
@@ -204,8 +269,42 @@ export interface ProviderError {
   message: string;
   /** Whether the caller may retry after this error without reconnecting. */
   recoverable: boolean;
-  /** Optional raw details from the provider (for logging/debugging). */
+  /** Optional structured details. Recovery details must be privacy-whitelisted; do not store raw provider payloads here. */
   details?: unknown;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+export function isSdkTurnLostRecoveryPhase(value: unknown): value is SdkTurnLostRecoveryPhase {
+  return isSharedSdkTurnLostRecoveryPhase(value);
+}
+
+/**
+ * Whitelist sanitizer for the typed Codex SDK lost-turn recovery contract.
+ *
+ * This intentionally copies only bounded metadata needed for routing/recovery
+ * diagnostics. It never projects raw thread/read responses, raw turn objects,
+ * prompts, tool input/output, provider payloads, environment values, secrets,
+ * or arbitrary error strings from provider details.
+ */
+export function sanitizeSdkTurnLostRecoveryMetadata(input: unknown): SdkTurnLostRecoveryMetadata | null {
+  return sanitizeSharedSdkTurnLostRecoveryMetadata(input);
+}
+
+export function isSdkTurnLostRecovery(error: unknown): error is SdkTurnLostProviderError {
+  const candidate = record(error);
+  if (!candidate) return false;
+  const details = sanitizeSdkTurnLostRecoveryMetadata(candidate.details);
+  if (!details) return false;
+  if (candidate.code !== PROVIDER_ERROR_CODES.SDK_TURN_LOST
+    && candidate.code !== PROVIDER_ERROR_CODES.PROVIDER_ERROR) {
+    return false;
+  }
+  return typeof candidate.message === 'string' && typeof candidate.recoverable === 'boolean';
 }
 
 /** Info about a remote session returned by listSessions(). */

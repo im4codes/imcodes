@@ -10,8 +10,16 @@ import {
   TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES,
   appendTransportEvent,
   replayTransportHistory,
+  sanitizeTransportHistoryEvent,
   trimTransportHistoryEventsToReplayBudget,
 } from '../../src/daemon/transport-history.js';
+import {
+  SDK_TURN_LOST_RECOVERY_CLASSIFIERS,
+  SDK_TURN_LOST_RECOVERY_PHASES,
+  SDK_TURN_LOST_RECOVERY_REASON,
+  SDK_TURN_LOST_RECOVERY_STATUS,
+  SDK_TURN_LOST_REPLAY_DECISIONS,
+} from '../../src/agent/transport-provider.js';
 
 // Use a unique session ID per test run to avoid cross-test file system collisions.
 const TS = `test-transport-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -23,6 +31,32 @@ function transportSessionFile(sessionId: string): string {
 
 function byteLength(value: unknown): number {
   return Buffer.byteLength(String(value), 'utf8');
+}
+
+function sdkTurnLostRecovery(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    localSessionKey: 'hist-session',
+    sessionName: 'hist-session',
+    providerId: 'codex-sdk',
+    providerSessionId: 'provider-session',
+    threadId: 'thread-hist',
+    turnId: 'turn-hist',
+    activityGeneration: 9,
+    leaseStartedAt: 1_800_000_000_000,
+    lastStrongActivityAt: 1_800_000_001_000,
+    heartbeatStartedAt: 1_800_000_060_000,
+    heartbeatCompletedAt: 1_800_000_060_100,
+    heartbeatDurationMs: 100,
+    silenceDurationMs: 59_000,
+    heartbeatFailureCount: 1,
+    classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.NOT_LOADED_WITH_ACTIVE_LEASE,
+    attempt: 2,
+    correlationId: 'hist-correlation',
+    replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.SAFE_REPLAY,
+    phase: SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING,
+    ...overrides,
+  };
 }
 
 describe('transport-history', () => {
@@ -86,6 +120,99 @@ describe('transport-history', () => {
     expect(events).toHaveLength(1);
     expect(events[0]['type']).toBe('assistant.text');
     expect(events[0]['text']).toBe('kept');
+  });
+
+  it('keeps privacy-safe sdk_turn_lost recovery phase history without raw provider data', async () => {
+    const session = `${TS}-sdk-turn-lost-phase`;
+    await appendTransportEvent(session, {
+      type: 'agent.status',
+      sessionId: session,
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      phase: SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING,
+      label: 'Recovering lost Codex SDK turn',
+      recovery: sdkTurnLostRecovery({
+        rawThreadRead: { prompt: 'SECRET_PROMPT_SHOULD_NOT_REPLAY' },
+        rawTurn: { input: 'SECRET_TOOL_INPUT_SHOULD_NOT_REPLAY' },
+        providerPayload: { env: 'SECRET_ENV_SHOULD_NOT_REPLAY' },
+        error: 'UNBOUNDED_ERROR_SHOULD_NOT_REPLAY',
+      }),
+    });
+
+    const events = await replayTransportHistory(session);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'agent.status',
+      sessionId: session,
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      phase: SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING,
+      reason: SDK_TURN_LOST_RECOVERY_REASON,
+      correlationId: 'hist-correlation',
+      recovery: {
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.NOT_LOADED_WITH_ACTIVE_LEASE,
+        replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.SAFE_REPLAY,
+      },
+    });
+    const projected = JSON.stringify(events);
+    expect(projected).not.toContain('SECRET_PROMPT_SHOULD_NOT_REPLAY');
+    expect(projected).not.toContain('SECRET_TOOL_INPUT_SHOULD_NOT_REPLAY');
+    expect(projected).not.toContain('SECRET_ENV_SHOULD_NOT_REPLAY');
+    expect(projected).not.toContain('UNBOUNDED_ERROR_SHOULD_NOT_REPLAY');
+    expect(projected).not.toContain('rawThreadRead');
+    expect(projected).not.toContain('rawTurn');
+  });
+
+  it('drops malformed sdk_turn_lost recovery status rows from replay projection', async () => {
+    const session = `${TS}-sdk-turn-lost-malformed`;
+    await appendTransportEvent(session, {
+      type: 'agent.status',
+      sessionId: session,
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      recovery: {
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        rawThreadRead: { prompt: 'SECRET_PROMPT_SHOULD_NOT_REPLAY' },
+      },
+    });
+    await appendTransportEvent(session, {
+      type: 'assistant.text',
+      sessionId: session,
+      text: 'kept',
+    });
+
+    const events = await replayTransportHistory(session);
+    expect(events).toHaveLength(1);
+    expect(events[0]['type']).toBe('assistant.text');
+    expect(JSON.stringify(events)).not.toContain('SECRET_PROMPT_SHOULD_NOT_REPLAY');
+  });
+
+  it('sanitizes sdk_turn_lost recovery history by whitelist only', () => {
+    const sanitized = sanitizeTransportHistoryEvent({
+      type: 'agent.status',
+      sessionId: 'hist-session',
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      phase: SDK_TURN_LOST_RECOVERY_PHASES.FAILED,
+      label: 'Label is intentionally not persisted',
+      recovery: sdkTurnLostRecovery({
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.FAILED,
+        replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.FAILED,
+        commandOutput: 'SECRET_COMMAND_OUTPUT_SHOULD_NOT_PROJECT',
+        secret: 'SECRET_VALUE_SHOULD_NOT_PROJECT',
+      }),
+    });
+
+    expect(sanitized).toMatchObject({
+      type: 'agent.status',
+      sessionId: 'hist-session',
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      phase: SDK_TURN_LOST_RECOVERY_PHASES.FAILED,
+      reason: SDK_TURN_LOST_RECOVERY_REASON,
+      recovery: {
+        replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.FAILED,
+      },
+    });
+    expect(sanitized['label']).toBeUndefined();
+    expect(JSON.stringify(sanitized)).not.toContain('SECRET_COMMAND_OUTPUT_SHOULD_NOT_PROJECT');
+    expect(JSON.stringify(sanitized)).not.toContain('SECRET_VALUE_SHOULD_NOT_PROJECT');
   });
 
   it('preserves tool call/result identity for restore replay without raw tool input', async () => {

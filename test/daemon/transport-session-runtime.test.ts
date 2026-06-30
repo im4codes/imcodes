@@ -10,6 +10,14 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
 } from '../../shared/session-control-commands.js';
+import {
+  SDK_TURN_LOST_RECOVERY_REASON,
+  isProviderSnapshotNonBlockingForStoppedGeneration,
+  readSdkTurnLostRecoveryMetadata,
+  type ActivityGeneration,
+  type SdkTurnLostClassifier,
+  type SdkTurnLostReplayDecision,
+} from '../../shared/session-activity-types.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
@@ -128,6 +136,37 @@ function makeSearchResult(items: MemorySearchResultItem[]): MemorySearchResult {
       stagedEventCount: 0,
       dirtyTargetCount: 0,
       pendingJobCount: 0,
+    },
+  };
+}
+
+function sdkTurnLostError(options: {
+  sessionKey?: string;
+  generation?: ActivityGeneration;
+  classifier?: SdkTurnLostClassifier;
+  replayDecision?: SdkTurnLostReplayDecision;
+} = {}): ProviderError {
+  return {
+    code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+    message: 'lost turn',
+    recoverable: true,
+    details: {
+      reason: SDK_TURN_LOST_RECOVERY_REASON,
+      localSessionKey: options.sessionKey ?? 'deck_test_brain',
+      providerId: 'codex',
+      providerSessionId: 'sess-1',
+      codexThreadId: 'thread-1',
+      codexTurnId: 'turn-1',
+      activityGeneration: options.generation ?? {
+        scope: 'session',
+        sessionName: options.sessionKey ?? 'deck_test_brain',
+        generation: 1,
+      },
+      heartbeatFailureCount: 1,
+      classifier: options.classifier ?? 'idle_missing_turn',
+      recoveryAttemptId: 'recovery-1',
+      correlationId: 'corr-1',
+      replayDecision: options.replayDecision ?? 'pending',
     },
   };
 }
@@ -1167,6 +1206,206 @@ describe('TransportSessionRuntime', () => {
       userMessage: 'queued after stop',
     }));
     expect(runtime.pendingMessages).not.toContain('being retried');
+    expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('safe sdk_turn_lost replay preserves batch identity, attachments, shared actor metadata, and committed flags', async () => {
+    const drains: Array<{ entries: PendingTransportMessage[]; metadataEntries: unknown[] }> = [];
+    runtime.onDrain = (entries, _merged, _count, metadata) => {
+      drains.push({
+        entries: entries.map((entry) => ({ ...entry })),
+        metadataEntries: metadata.entries,
+      });
+    };
+
+    expect(runtime.send('active turn', 'msg-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    const attachment = { id: 'att-1', daemonPath: '/tmp/one.png', originalName: 'one.png', type: 'image' as const };
+    expect(runtime.send('queued with attachment', 'msg-queued-a', [attachment], undefined, {
+      sharedActor: sharedActorFixture,
+    })).toBe('queued');
+    expect(runtime.send('queued plain', 'msg-queued-b')).toBe('queued');
+
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(drains).toHaveLength(1);
+    expect(drains[0]?.entries.map((entry) => entry.clientMessageId)).toEqual(['msg-queued-a', 'msg-queued-b']);
+    expect(drains[0]?.metadataEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-queued-a',
+        attachmentIds: ['att-1'],
+        actorSessionName: 'deck_test_brain',
+        sharedActionId: 'action-shared',
+      }),
+      expect.objectContaining({ clientMessageId: 'msg-queued-b' }),
+    ]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'active turn',
+      'queued with attachment\n\nqueued plain',
+    ]);
+
+    mock.fireError('sess-1', sdkTurnLostError({
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    }));
+    await waitForProviderSendCount(mock.provider, 3);
+
+    expect(drains).toHaveLength(2);
+    expect(drains[1]?.entries).toEqual([]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'active turn',
+      'queued with attachment\n\nqueued plain',
+    ]);
+    const replayPayload = mock.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(replayPayload).toMatchObject({
+      userMessage: 'queued with attachment\n\nqueued plain',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 3 },
+    });
+    expect(replayPayload.attachments).toEqual([attachment]);
+  });
+
+  it('handles rejected sdk_turn_lost as typed recovery without generic error pollution', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(sdkTurnLostError())
+      .mockResolvedValueOnce(undefined);
+
+    expect(runtime.send('lost before callback', 'msg-reject-lost')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.getStatus()).toBe('thinking');
+    const phaseCalls = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain' && call[1] === 'agent.status')
+      .map((call) => (call[2] as Record<string, unknown>).phase);
+    expect(phaseCalls).toContain('detected');
+    expect(phaseCalls).toContain('recovering');
+    expect(phaseCalls).not.toContain('recovered');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'lost before callback',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    }));
+  });
+
+  it('emits recovered only after replacement dispatch is accepted and produces post-acceptance strong activity', async () => {
+    expect(runtime.send('lost active turn', 'msg-lost-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    mock.fireError('sess-1', sdkTurnLostError());
+    // A late old-turn delta before the replacement dispatch has been accepted
+    // must not be queued and reclassified as recovered later.
+    mock.fireDelta('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    const phasesBeforeReplacementActivity = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain' && call[1] === 'agent.status')
+      .map((call) => (call[2] as Record<string, unknown>).phase);
+    expect(phasesBeforeReplacementActivity).toEqual(expect.arrayContaining(['detected', 'recovering']));
+    expect(phasesBeforeReplacementActivity).not.toContain('recovered');
+
+    mock.fireDelta('sess-1');
+    await flushDispatch();
+    mock.fireDelta('sess-1');
+    await flushDispatch();
+
+    const recoveredCalls = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain'
+        && call[1] === 'agent.status'
+        && (call[2] as Record<string, unknown>).phase === 'recovered');
+    expect(recoveredCalls).toHaveLength(1);
+    expect((recoveredCalls[0]?.[2] as Record<string, unknown>).correlationId).toBe('corr-1');
+  });
+
+  it.each([
+    ['assistant output', (_r: TransportSessionRuntime, m: ReturnType<typeof makeMockProvider>) => m.fireDelta('sess-1'), sdkTurnLostError()],
+    ['provider tool call', (_r: TransportSessionRuntime, m: ReturnType<typeof makeMockProvider>) => m.fireTool('sess-1', { id: 'tool-1', name: 'Bash', status: 'running' }), sdkTurnLostError()],
+    ['ambiguous heartbeat evidence', () => undefined, sdkTurnLostError({ replayDecision: 'unsafe_ambiguous' })],
+  ])('denies unsafe sdk_turn_lost replay after %s', async (_name, makeUnsafe, error) => {
+    expect(runtime.send('unsafe lost turn', 'msg-unsafe')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    makeUnsafe(runtime, mock);
+
+    mock.fireError('sess-1', error);
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      recoverable: false,
+    });
+    expect(readSdkTurnLostRecoveryMetadata(error)).not.toBeNull();
+  });
+
+  it('denies sdk_turn_lost replay for terminal local truth and exhausted isolated budget', async () => {
+    expect(runtime.send('terminal truth lost turn', 'msg-terminal')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (runtime as unknown as { _currentActivityGenerationLocallyCancelled: boolean })._currentActivityGenerationLocallyCancelled = true;
+    mock.fireError('sess-1', sdkTurnLostError());
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/automatic replay was not safe/i);
+
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_test_brain');
+    await fresh.initialize(defaultConfig);
+    fresh.send('budget exhausted lost turn', 'msg-budget');
+    await waitForProviderSendCount(freshProvider.provider, 1);
+    (fresh as unknown as { _sdkTurnLostRecoveryAttempts: Map<string, number> })
+      ._sdkTurnLostRecoveryAttempts
+      .set('deck_test_brain:session:deck_test_brain:1:sdk_turn_lost', 2);
+
+    freshProvider.fireError('sess-1', sdkTurnLostError());
+    await flushDispatch();
+
+    expect(freshProvider.provider.send).toHaveBeenCalledTimes(1);
+    expect(fresh.getStatus()).toBe('error');
+    expect(fresh.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/automatic replay was not safe/i);
+  });
+
+  it('treats stopped-generation provider_tool_item evidence as non-blocking but keeps ordinary stale and unattributed snapshots blocking', async () => {
+    const generation = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    expect(isProviderSnapshotNonBlockingForStoppedGeneration({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+    }, generation)).toBe(true);
+    expect(isProviderSnapshotNonBlockingForStoppedGeneration({
+      status: 'stale',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+    }, generation)).toBe(false);
+    expect(isProviderSnapshotNonBlockingForStoppedGeneration({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      providerDiagnosticGeneration: 'turn-only',
+    }, generation)).toBe(false);
+
+    expect(runtime.send('stoppable active turn', 'msg-stop-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+      updatedAt: Date.now(),
+    }));
+    expect(runtime.send('queued after stop', 'msg-stop-queued')).toBe('queued');
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stop',
+    }));
     expect(runtime.pendingCount).toBe(0);
   });
 
