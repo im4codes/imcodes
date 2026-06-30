@@ -240,6 +240,13 @@ function readRuntimeSubagentPrompt(record: Record<string, unknown>): string | un
     ?? meaningfulString(record.request);
 }
 
+function readRuntimeSubagentBackgrounded(record: Record<string, unknown>): boolean {
+  return record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true
+    || record.detached === true;
+}
+
 function readRuntimeSubagentStatusInfo(record: Record<string, unknown>): { status?: string; message?: string } {
   const value = record.status ?? record.state ?? record.phase ?? record.lifecycle;
   if (typeof value === 'string') return { status: value };
@@ -344,6 +351,7 @@ function geminiRuntimeSubagentToolFromPayload(
   const agentName = readRuntimeSubagentName(record);
   const model = readRuntimeSubagentModel(record, state.model);
   const prompt = readRuntimeSubagentPrompt(record);
+  const backgrounded = readRuntimeSubagentBackgrounded(record);
   const summary = agentName ? `Gemini sub-agent ${agentName}` : rawAgentPath ? `Gemini sub-agent ${rawAgentPath}` : 'Gemini sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? statusInfo.status ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
@@ -369,6 +377,7 @@ function geminiRuntimeSubagentToolFromPayload(
       ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
       ...(agentName ? { agentName } : {}),
       ...(model ? { model } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });

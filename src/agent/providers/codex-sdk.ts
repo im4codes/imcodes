@@ -67,6 +67,7 @@ import {
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
   buildSdkSubagentSafeDetail,
+  isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
@@ -1252,6 +1253,13 @@ function readRuntimeSubagentUsageTotalTokens(record: Record<string, any>): numbe
     ?? finiteNumber(record.total_tokens);
 }
 
+function readRuntimeSubagentBackgrounded(record: Record<string, any>): boolean {
+  return record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true
+    || record.detached === true;
+}
+
 function mapCodexRuntimeSubagentStatus(
   rawStatus: string,
   diagnosticCode: SdkSubagentDiagnosticCode | undefined,
@@ -1376,6 +1384,7 @@ function runtimeSubagentToolFromPayload(
   const model = readRuntimeSubagentModel(record);
   const prompt = readRuntimeSubagentPrompt(record);
   const usageTotalTokens = readRuntimeSubagentUsageTotalTokens(record);
+  const backgrounded = readRuntimeSubagentBackgrounded(record);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
@@ -1401,7 +1410,7 @@ function runtimeSubagentToolFromPayload(
       ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
       ...(agentName ? { agentName } : {}),
       ...(model ? { model } : {}),
-      ...(record.backgrounded === true ? { backgrounded: true } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
       ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
       diagnosticCode: statusMapping.diagnosticCode,
     },
@@ -3886,7 +3895,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (classification.outcome === 'terminal') {
       this.clearActiveTurnLease(state);
       if (classification.status === 'completed') {
-        void this.completeTurn(sessionId, state, classification.turnId);
+        void this.completeTurn(sessionId, state, classification.turnId, 'thread_idle_settle');
         return;
       }
       this.rememberTerminatedActiveTurn(state, classification.turnId);
@@ -4254,7 +4263,8 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private emitTrackedProviderToolCall(sessionId: string, state: CodexSdkSessionState, tool: ToolCallEvent): void {
-    if (tool.status === 'running') {
+    const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
+    if (tool.status === 'running' && !backgroundedSubagent) {
       state.openProviderToolCalls.set(tool.id, tool);
     } else {
       state.openProviderToolCalls.delete(tool.id);

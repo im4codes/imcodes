@@ -18,6 +18,12 @@ import {
   type SdkTurnLostClassifier,
   type SdkTurnLostReplayDecision,
 } from '../../shared/session-activity-types.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
@@ -487,6 +493,59 @@ describe('TransportSessionRuntime', () => {
     });
     expect(mock.provider.getSessionDiagnostics).toHaveBeenCalledWith('sess-1');
     expect(snapshot.pendingVersion).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each([
+    ['Claude task', SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK],
+    ['Claude runtime', SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT],
+    ['Codex runtime', SDK_SUBAGENT_PROVIDERS.CODEX_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT],
+    ['Qwen runtime', SDK_SUBAGENT_PROVIDERS.QWEN, SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT],
+    ['Gemini runtime', SDK_SUBAGENT_PROVIDERS.GEMINI_SDK, SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT],
+  ] as const)('treats backgrounded %s SDK sub-agent heartbeats as non-blocking display state', async (_label, provider, providerKind) => {
+    runtime.send('spawn a long helper', 'cmd-parent');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    const backgroundedSubagentTool: ToolCallEvent = {
+      id: `${provider}:deck_test_brain:runtime:019f-child`,
+      name: 'SDK Sub-agent',
+      status: 'running',
+      input: { action: 'sdk-subagent', description: 'sleep 600' },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        schemaVersion: 1,
+        provider,
+        status: SDK_SUBAGENT_STATUS.RUNNING,
+        label: 'SDK Sub-agent running',
+        meta: {
+          isSdkSubagent: true,
+          schemaVersion: 1,
+          provider,
+          providerKind,
+          canonicalKey: `${provider}:deck_test_brain:runtime:019f-child`,
+          agentPath: '019f-child',
+          rawStatus: 'running',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          backgrounded: true,
+        },
+      },
+    };
+
+    mock.fireTool('sess-1', backgroundedSubagentTool);
+    await flushDispatch();
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(0);
+
+    await runtime.cancel();
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.getStatus()).toBe('idle');
+
+    expect(runtime.send('next user message', 'cmd-after-subagent-heartbeat')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   it('diagnostic snapshot keeps the latest provider error for recovery debugging', async () => {

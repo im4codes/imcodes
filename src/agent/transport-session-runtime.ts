@@ -3,7 +3,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -49,6 +49,9 @@ import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem 
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import {
+  isBackgroundedSdkSubagentTool,
+} from '../../shared/sdk-subagent-status.js';
 import { type MemorySearchResultItem } from '../context/memory-search.js';
 import { searchLocalMemorySemanticFrontOfTurn } from '../context/memory-recall-client.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
@@ -670,8 +673,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (sid !== this._providerSessionId) return;
       this._lastActivityAt = Date.now();
       this._lastProviderOutputAt = this._lastActivityAt;
+      const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
       this.recordToolActivity(tool);
-      this._activeDispatchHasSideEffectEvidence = true;
+      if (!backgroundedSubagent) this._activeDispatchHasSideEffectEvidence = true;
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -1224,7 +1228,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     };
   }
 
-  private recordToolActivity(tool: { id: string; name: string; status: 'running' | 'complete' | 'error' }): void {
+  private recordToolActivity(tool: Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'detail'>): void {
+    if (isBackgroundedSdkSubagentTool(tool)) {
+      this._openTools.delete(tool.id);
+      if (this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
+        this.drainPendingIfNoActiveTurn(`backgrounded-sdk-subagent-${tool.status}`);
+      }
+      return;
+    }
     const generation = this._activityGeneration;
     if (tool.status === 'running') {
       this._openTools.set(tool.id, { generation, name: tool.name, status: 'running' });
@@ -1475,6 +1486,15 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (dispatchId !== null) {
       this._locallyCancelledDispatchIds.add(dispatchId);
       this._activeDispatchCancelled = true;
+    }
+    if (
+      !this._activeTurn
+      && !this._sending
+      && this._activeDispatchEntries.length === 0
+      && !this.hasActiveTurnWork()
+    ) {
+      if (!this._drainPending()) this.setStatus('idle');
+      return;
     }
     if (this._activeTurn && !this._activeDispatchProviderStarted) {
       this.cancelActiveDispatchLocally(dispatchId);

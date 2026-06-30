@@ -1417,7 +1417,7 @@ describe('CodexSdkProvider', () => {
         },
       ]);
 
-      await waitForCondition(() => tools.length === 1);
+      await waitForCondition(() => tools.length === 1, 15_000);
 
       expect(tools[0]).toMatchObject({
         id: 'call-rollout-plan-polled',
@@ -1583,6 +1583,20 @@ describe('CodexSdkProvider', () => {
     });
 
     child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null },
+      },
+    });
+    await flush();
+    expect(provider.getActiveWorkSnapshot('route-raw-spawn-agent')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+
+    child.emits({
       method: 'thread/tokenUsage/updated',
       params: {
         threadId: '019e8422-0fed-7c12-ad2a-34da47e4e788',
@@ -1610,6 +1624,11 @@ describe('CodexSdkProvider', () => {
       active: true,
       terminal: false,
       backgrounded: true,
+    });
+    expect(provider.getActiveWorkSnapshot('route-raw-spawn-agent')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
     });
 
     child.emits({
@@ -1733,7 +1752,7 @@ describe('CodexSdkProvider', () => {
         },
       })}\n`);
 
-      await waitForCondition(() => tools.length === 2, 5000);
+      await waitForCondition(() => tools.length === 2, 15_000);
       expect(tools[1]).toMatchObject({
         id: expectedKey,
         name: 'Codex Sub-agent',

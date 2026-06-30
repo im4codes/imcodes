@@ -176,6 +176,7 @@ describe('QwenProvider', () => {
         name: 'planner',
         status: 'running',
         prompt: 'Check the Qwen handoff',
+        backgrounded: true,
       },
     })}\n`);
     spawned.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'OK' })}\n`);
@@ -202,6 +203,7 @@ describe('QwenProvider', () => {
           agentPath: '019e-qwen-agent',
           agentName: 'planner',
           model: 'qwen3-coder-plus',
+          backgrounded: true,
         },
       },
     });

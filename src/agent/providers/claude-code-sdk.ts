@@ -431,19 +431,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (!state) return null;
     this.expireStaleClaudeSubagentTasks(sessionId, state);
     const activeToolCount = state.toolCalls.size + Array.from(state.runtimeAgentToolCalls.values()).length;
-    const activeSubagentCount = this.activeClaudeSubagentTasks(state).length;
-    const waitingForTaskNotification = state.completed && !state.pendingComplete && activeSubagentCount > 0;
+    const activeSubagentTasks = this.activeClaudeSubagentTasks(state);
+    const blockingSubagentCount = activeSubagentTasks.filter((task) => task.backgrounded !== true).length;
+    const onlyBackgroundedSubagents = activeSubagentTasks.length > 0 && blockingSubagentCount === 0;
+    const waitingForTaskNotification = state.completed && !state.pendingComplete && blockingSubagentCount > 0;
     const backgroundActive = Boolean(
       state.resultCompletionTimer
-      || (state.currentQuery && !waitingForTaskNotification)
-      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification),
+      || (state.currentQuery && !waitingForTaskNotification && !onlyBackgroundedSubagents)
+      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification && !onlyBackgroundedSubagents),
     );
     const busyReasons: SessionActivityBusyReason[] = [];
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
-    if (activeSubagentCount > 0 || backgroundActive) busyReasons.push('background_monitor');
+    if (blockingSubagentCount > 0 || backgroundActive) busyReasons.push('background_monitor');
     return {
       status: 'current',
-      activeWorkCount: activeToolCount + activeSubagentCount + (backgroundActive ? 1 : 0),
+      activeWorkCount: activeToolCount + blockingSubagentCount + (backgroundActive ? 1 : 0),
       activeToolCount,
       busyReasons,
       activityGeneration: state.runtimeActivityGeneration,
@@ -1142,6 +1144,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const agentName = this.readRuntimeSubagentName(record);
     const model = this.readRuntimeSubagentModel(record);
     const prompt = this.readRuntimeSubagentPrompt(record);
+    const backgrounded = this.readRuntimeSubagentBackgrounded(record);
     const summary = agentName ? `Claude sub-agent ${agentName}` : rawAgentPath ? `Claude sub-agent ${rawAgentPath}` : 'Claude sub-agent';
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
@@ -1163,6 +1166,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
         ...(agentName ? { agentName } : {}),
         ...(model ? { model } : {}),
+        ...(backgrounded ? { backgrounded: true } : {}),
         diagnosticCode: statusMapping.diagnosticCode,
       },
     } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -1254,6 +1258,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ?? this.pickShortString(record.instruction)
       ?? this.pickShortString(record.instructions)
       ?? this.pickShortString(record.message);
+  }
+
+  private readRuntimeSubagentBackgrounded(record: Record<string, unknown>): boolean {
+    return record.backgrounded === true
+      || record.is_backgrounded === true
+      || record.background === true
+      || record.detached === true;
   }
 
   private normalizeClaudeRuntimeSubagentStatus(

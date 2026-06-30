@@ -226,6 +226,16 @@ export function parseSdkRuntimeSubagentTag(value: string): Record<string, unknow
   }
 }
 
+export function isBackgroundedSdkSubagentDetail(value: unknown): boolean {
+  if (!isRecord(value) || value.kind !== SDK_SUBAGENT_DETAIL_KIND) return false;
+  const meta = isRecord(value.meta) ? value.meta : undefined;
+  return meta?.isSdkSubagent === true && meta.backgrounded === true;
+}
+
+export function isBackgroundedSdkSubagentTool(tool: Pick<ToolCallEvent, 'detail'>): boolean {
+  return isBackgroundedSdkSubagentDetail(tool.detail);
+}
+
 export function isSdkRuntimeSubagentEventName(value: unknown): boolean {
   return typeof value === 'string' && RUNTIME_SUBAGENT_EVENT_VALUES.has(value);
 }
