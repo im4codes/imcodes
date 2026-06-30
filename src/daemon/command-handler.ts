@@ -33,7 +33,7 @@ import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportPendingQueueSnapshot } from './transport-pending-snapshot.js';
-import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
+import { bumpTransportQueueRevision, observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import {
   startSubSession,
   stopSubSession,
@@ -4082,12 +4082,13 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       return;
     }
     supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
+    const pendingMessageVersion = bumpTransportQueueRevision(sessionName);
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.sending ? 'queued' : 'idle',
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+      pendingMessageVersion,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -4119,12 +4120,13 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
+    const pendingMessageVersion = bumpTransportQueueRevision(sessionName);
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.sending ? 'queued' : 'idle',
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
       pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+      pendingMessageVersion,
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });

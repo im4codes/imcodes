@@ -523,6 +523,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeDispatchProviderStarted = false;
         this._activeDispatchId = null;
         this._activeDispatchStaleRecoveryStarted = false;
+        // Provider completion is authoritative terminal evidence for the
+        // foreground turn. Some SDKs can deliver the final assistant message
+        // without a matching final tool event for every previously-running
+        // provider tool (or the timeline/display path may observe the tool
+        // terminal while the runtime-local _openTools map misses it). Leaving
+        // those open locally makes the activity reconciler map the subsequent
+        // idle state back to running and blocks pending queue drain. Close any
+        // remaining runtime-local tool evidence before drain/idle reconciliation.
+        this.closeOpenTools('succeeded', 'provider_result');
         // Drain pending messages before transitioning to idle.
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {

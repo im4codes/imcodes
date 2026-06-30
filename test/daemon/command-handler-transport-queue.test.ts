@@ -345,6 +345,10 @@ import {
 import { getDefaultTimelineDetailStore } from '../../src/daemon/timeline-detail-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import {
+  bumpTransportQueueRevision,
+  clearAllTransportQueueRevisions,
+} from '../../src/daemon/transport-queue-revision.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -486,6 +490,7 @@ describe('handleWebCommand transport queue behavior', () => {
     getProviderMock.mockReset();
     ensureProviderConnectedMock.mockReset();
     __resetTransportListModelsCacheForTests();
+    clearAllTransportQueueRevisions();
     getDefaultTimelineDetailStore().clear();
     searchLocalMemoryMock.mockResolvedValue(emptyMemorySearchResult());
     searchLocalMemoryAuthorizedMock.mockReturnValue(emptyMemorySearchResult());
@@ -502,6 +507,7 @@ describe('handleWebCommand transport queue behavior', () => {
 
   afterEach(() => {
     resetMemoryFeatureConfigStoreForTests();
+    clearAllTransportQueueRevisions();
     vi.unstubAllEnvs();
     if (memoryFeatureConfigTempDir) {
       rmSync(memoryFeatureConfigTempDir, { recursive: true, force: true });
@@ -3177,6 +3183,7 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('edits a queued transport message by clientMessageId', async () => {
+    const previousRevision = bumpTransportQueueRevision('deck_transport_brain');
     const editPendingMessage = vi.fn(() => true);
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -3198,6 +3205,9 @@ describe('handleWebCommand transport queue behavior', () => {
 
     expect(editPendingMessage).toHaveBeenCalledWith('cmd-queued', 'edited queued');
     expect(updateQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-queued', 'edited queued');
+    const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
+    expect(stateCall).toBeTruthy();
+    expect((stateCall?.[2] as { pendingMessageVersion?: number }).pendingMessageVersion).toBeGreaterThan(previousRevision);
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -3213,6 +3223,7 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('removes a queued transport message by clientMessageId', async () => {
+    const previousRevision = bumpTransportQueueRevision('deck_transport_brain');
     const removePendingMessage = vi.fn(() => ({ clientMessageId: 'cmd-queued', text: 'queued msg' }));
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -3233,10 +3244,13 @@ describe('handleWebCommand transport queue behavior', () => {
 
     expect(removePendingMessage).toHaveBeenCalledWith('cmd-queued');
     expect(removeQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-queued');
+    const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
+    expect(stateCall).toBeTruthy();
+    expect((stateCall?.[2] as { pendingMessageVersion?: number }).pendingMessageVersion).toBeGreaterThan(previousRevision);
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      expect.objectContaining({ state: 'queued', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [], pendingMessageVersion: expect.any(Number) }),
+      expect.objectContaining({ state: 'running', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [], pendingMessageVersion: expect.any(Number) }),
       expect.any(Object),
     );
   });

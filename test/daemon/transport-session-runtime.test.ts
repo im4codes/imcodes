@@ -548,6 +548,38 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
   });
 
+  it('closes runtime-local open tools on provider completion so idle and queued drain are not blocked', async () => {
+    runtime.send('run a short tool', 'cmd-tool-parent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    mock.fireTool('sess-1', {
+      id: 'tool-stuck-open',
+      name: 'Bash',
+      status: 'running',
+      input: { command: 'true' },
+    });
+    await flushDispatch();
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(1);
+
+    expect(runtime.send('next queued message', 'cmd-after-tool-complete')).toBe('queued');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(0);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-stuck-open',
+        tool: 'Bash',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
   it('diagnostic snapshot keeps the latest provider error for recovery debugging', async () => {
     runtime.send('fail this turn', 'cmd-fail');
     await waitForProviderSendCount(mock.provider, 1);
@@ -831,7 +863,7 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
-  it('emits clean idle after the last open tool terminal clears active work', async () => {
+  it('emits clean idle when provider completion closes the last open tool', async () => {
     const statuses: string[] = [];
     runtime.onStatusChange = (status) => {
       statuses.push(status);
@@ -847,7 +879,9 @@ describe('TransportSessionRuntime', () => {
     mock.fireComplete('sess-1');
     await flushDispatch();
 
-    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+    expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+    expect(statuses.at(-1)).toBe('idle');
 
     mock.fireTool('sess-1', {
       id: 'tool-background',
