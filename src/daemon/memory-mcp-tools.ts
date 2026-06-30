@@ -23,7 +23,7 @@ import {
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
-import { resolveRuntimeScope } from '../../shared/session-scope.js';
+import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
   isMcpFeatureEnabled,
@@ -204,9 +204,35 @@ function localUnavailableToolFields(result: Pick<MemoryMcpSearchResult, 'degrade
   return { reason: degradedReasons[0] ?? MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE, degradedReasons };
 }
 
-async function refreshSendSessionStore(deps: MemoryMcpToolDeps): Promise<void> {
-  if (deps.sendDeps?.listSessions) return;
-  await loadStore({ probe: false });
+const SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS = 30_000;
+
+function sendVisibleSiblingCount(caller: McpRuntimeCaller, sessions: SessionRecord[]): number {
+  if (!caller.sessionName) return 0;
+  const callerProjectName = resolveRuntimeScope(caller, sessions).projectName;
+  if (!callerProjectName) return 0;
+  return sessions.filter((session) => (
+    session.state !== 'stopped'
+    && session.name !== caller.sessionName
+    && session.executionCloneMetadata?.kind !== EXECUTION_CLONE_KIND
+    && resolveEffectiveProjectName(session, sessions) === callerProjectName
+  )).length;
+}
+
+function hasSendCaller(caller: McpRuntimeCaller, sessions: SessionRecord[]): boolean {
+  return Boolean(caller.sessionName && sessions.some((session) => session.name === caller.sessionName));
+}
+
+function shouldUsePreviousSendSessions(
+  caller: McpRuntimeCaller,
+  current: SessionRecord[],
+  previous: SessionRecord[] | null,
+  previousAt: number,
+  now: number,
+): previous is SessionRecord[] {
+  if (!previous || previous.length === 0) return false;
+  if (now - previousAt > SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS) return false;
+  if (hasSendCaller(caller, previous) && !hasSendCaller(caller, current)) return true;
+  return sendVisibleSiblingCount(caller, previous) > 0 && sendVisibleSiblingCount(caller, current) === 0;
 }
 
 function memoryGate(
@@ -355,6 +381,31 @@ function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
+  let lastGoodSendSessions: SessionRecord[] | null = null;
+  let lastGoodSendSessionsAt = 0;
+  const sendSessions = async (): Promise<SessionRecord[]> => {
+    if (deps.sendDeps?.listSessions) return deps.sendDeps.listSessions();
+    await loadStore({ probe: false });
+    const current = listStoredSessions();
+    const now = Date.now();
+    const selected = shouldUsePreviousSendSessions(
+      caller,
+      current,
+      lastGoodSendSessions,
+      lastGoodSendSessionsAt,
+      now,
+    ) ? lastGoodSendSessions : current;
+    if (hasSendCaller(caller, selected) || sendVisibleSiblingCount(caller, selected) > 0) {
+      lastGoodSendSessions = selected;
+      lastGoodSendSessionsAt = now;
+    }
+    return selected;
+  };
+  const sendDepsWithSessions = (sessions: SessionRecord[], extra: Partial<SendToolDeps> = {}): SendToolDeps => ({
+    ...deps.sendDeps,
+    ...extra,
+    listSessions: () => sessions,
+  });
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
   // branch without involving cache/cloud resolution.
@@ -513,18 +564,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
       return listSendTargets(caller, {
         query: stringArg(args, 'query'),
         limit: numberArg(args, 'limit'),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
-      }) as unknown as ToolResult;
+      })) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
@@ -536,35 +586,32 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(clone ? { clone } : {}),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
-      }) as unknown as Promise<ToolResult>;
+      })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'idempotencyKey']);
       return dispatchDestroyExecutionClone(caller, {
         target: stringArg(args, 'target'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
-      }) as unknown as Promise<ToolResult>;
+      })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'broadcast', 'idempotencyKey']);
       return dispatchSendStop(caller, {
         target: stringArg(args, 'target'),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
-      }) as unknown as Promise<ToolResult>;
+      })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
