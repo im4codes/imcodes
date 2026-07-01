@@ -37,6 +37,32 @@ describe('transport-resend-queue', () => {
     expect(getResendCount('s-sqlite-fail')).toBe(0);
   });
 
+  it('preserves resend memory when SQLite already owns the same live entry', () => {
+    getTransportQueueStore().enqueue({
+      sessionName: 's-existing-live',
+      clientMessageId: 'msg-existing-live',
+      commandId: 'cmd-existing-live',
+      text: 'already stored',
+      now: Date.now(),
+    });
+
+    const result = enqueueResend('s-existing-live', {
+      text: 'already stored',
+      commandId: 'cmd-existing-live',
+      clientMessageId: 'msg-existing-live',
+      queuedAt: Date.now(),
+    });
+
+    expect(result.accepted).toBe(true);
+    expect(getResendEntries('s-existing-live')).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-existing-live',
+        commandId: 'cmd-existing-live',
+        text: 'already stored',
+      }),
+    ]);
+  });
+
   it('isolates queues per session', () => {
     enqueueResend('alpha', { text: 'a', commandId: 'ca', queuedAt: 0 });
     enqueueResend('beta', { text: 'b', commandId: 'cb', queuedAt: 0 });
@@ -129,6 +155,29 @@ describe('transport-resend-queue', () => {
       { text: 'second', commandId: 'c2' },
     ]);
     expect(getResendCount('s1')).toBe(0);
+  });
+
+  it('does not finalize SQLite delivery when dispatcher queues into a live runtime', async () => {
+    enqueueResend('s-runtime-queued', {
+      text: 'queued behind active turn',
+      commandId: 'cmd-runtime-queued',
+      clientMessageId: 'msg-runtime-queued',
+      queuedAt: Date.now(),
+    });
+
+    const count = await drainResend('s-runtime-queued', () => 'queued');
+    const snapshot = getTransportQueueStore().readSnapshot('s-runtime-queued');
+
+    expect(count).toBe(1);
+    expect(getResendCount('s-runtime-queued')).toBe(0);
+    expect(snapshot.pendingMessageEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-runtime-queued',
+        commandId: 'cmd-runtime-queued',
+        status: 'handoff_inflight',
+      }),
+    ]);
+    expect(snapshot.failedMessageEntries).toEqual([]);
   });
 
   it('does not remove from memory or dispatch when SQLite handoff lease fails', async () => {

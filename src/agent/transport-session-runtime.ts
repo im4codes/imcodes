@@ -1603,7 +1603,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    *  turn (wedged provider) and avoid blocking upgrades forever. */
   get lastActivityAt(): number { return this._lastActivityAt; }
 
-  async kill(): Promise<void> {
+  async kill(options: { preserveTransportQueue?: boolean } = {}): Promise<void> {
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
 
@@ -1631,14 +1631,21 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.clearRecoverableRetryTimer();
     this._recoverableDispatchRetries = 0;
     if (this._pendingMessages.length > 0) {
-      logger.warn(
-        { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
-        'transport runtime kill cleared pending messages',
-      );
-      try {
-        getTransportQueueStore().reset(this.sessionKey, 'user_clear');
-      } catch (err) {
-        logger.warn({ err, sessionKey: this.sessionKey }, 'transport queue sqlite reset failed during runtime kill');
+      if (options.preserveTransportQueue) {
+        logger.info(
+          { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+          'transport runtime kill cleared local pending messages after preserving queue authority',
+        );
+      } else {
+        logger.warn(
+          { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+          'transport runtime kill cleared pending messages',
+        );
+        try {
+          getTransportQueueStore().reset(this.sessionKey, 'user_clear');
+        } catch (err) {
+          logger.warn({ err, sessionKey: this.sessionKey }, 'transport queue sqlite reset failed during runtime kill');
+        }
       }
       this._pendingVersion++;
     }

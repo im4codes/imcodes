@@ -988,9 +988,17 @@ describe('sdk transport session restore', () => {
       expect.objectContaining({
         state: 'idle',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
-        pendingCount: 0,
-        pendingMessages: [],
         pendingMessageEntries: [],
+        failedMessageEntries: [],
+        pendingMessageVersion: expect.any(Number),
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          source: 'restore_reconnect_observed',
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+        }),
       }),
       { source: 'daemon', confidence: 'high' },
     );

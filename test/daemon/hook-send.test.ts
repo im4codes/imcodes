@@ -55,6 +55,7 @@ vi.mock('../../src/daemon/watcher-controls.js', () => ({
 import { startHookServer, clearQueues, getQueue, resolveTarget } from '../../src/daemon/hook-server.js';
 import { detectStatus } from '../../src/agent/detect.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,7 @@ describe('Hook server /send endpoint', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     clearQueues();
+    resetTransportQueueStoreForTests();
     refreshSessionWatcherMock.mockReset();
     refreshSessionWatcherMock.mockResolvedValue(false);
     const result = await startHookServer(hookCallback);
@@ -423,12 +425,17 @@ describe('Hook server /send endpoint', () => {
       listSessionsMock.mockReturnValue([brain, transport]);
 
       const mockRuntime = {
-        send: vi.fn().mockReturnValue('queued'),
+        send: vi.fn((text: string, clientMessageId: string) => {
+          getTransportQueueStore().enqueue({
+            sessionName: 'deck_proj_w1',
+            clientMessageId,
+            commandId: clientMessageId,
+            text,
+            now: Date.now(),
+          });
+          return 'queued';
+        }),
         getStatus: vi.fn().mockReturnValue('running'),
-        pendingCount: 1,
-        pendingMessages: ['queued transport'],
-        pendingEntries: [{ clientMessageId: 'send_message_queued', text: 'queued transport' }],
-        pendingVersion: 7,
       };
       getTransportRuntimeMock.mockReturnValue(mockRuntime);
 
@@ -447,13 +454,24 @@ describe('Hook server /send endpoint', () => {
       expect(timelineEmitMock).toHaveBeenCalledWith(
         'deck_proj_w1',
         'session.state',
-        {
+        expect.objectContaining({
           state: 'queued',
-          pendingCount: 1,
-          pendingMessages: ['queued transport'],
-          pendingMessageEntries: [{ clientMessageId: 'send_message_queued', text: 'queued transport' }],
-          pendingMessageVersion: 7,
-        },
+          pendingMessageEntries: [
+            expect.objectContaining({
+              clientMessageId: res.body.messageId,
+              commandId: res.body.messageId,
+              text: 'queued transport',
+            }),
+          ],
+          failedMessageEntries: [],
+          pendingMessageVersion: expect.any(Number),
+          queueEpoch: expect.any(String),
+          queueAuthorityId: expect.any(String),
+          queueSnapshot: expect.objectContaining({
+            type: 'transport.queue.snapshot',
+            source: 'send_tool',
+          }),
+        }),
         { source: 'daemon', confidence: 'high' },
       );
     });

@@ -298,7 +298,11 @@ describe('buildSessionList', () => {
         name: 'deck_codex_missing_runtime_brain',
         state: 'queued',
         pendingMessageEntries: [
-          expect.objectContaining({ clientMessageId: 'cmd-offline', text: 'queued while offline' }),
+          expect.objectContaining({
+            clientMessageId: expect.any(String),
+            commandId: 'cmd-offline',
+            text: 'queued while offline',
+          }),
         ],
         pendingMessageVersion: expect.any(Number),
       }),
@@ -345,7 +349,14 @@ describe('buildSessionList', () => {
         name: 'deck_codex_expired_resend_brain',
         state: 'running',
         pendingMessageEntries: [],
-        pendingMessageVersion: 0,
+        failedMessageEntries: [
+          expect.objectContaining({
+            commandId: 'cmd-expired',
+            text: 'expired queued while offline',
+            failureReason: 'expired',
+          }),
+        ],
+        pendingMessageVersion: expect.any(Number),
       }),
     ]));
     const item = sessions.find((session) => session.name === 'deck_codex_expired_resend_brain') as Record<string, unknown>;

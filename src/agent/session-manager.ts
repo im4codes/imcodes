@@ -975,13 +975,16 @@ function stopStructuredWatchers(sessionName: string): void {
   stopOpenCodeWatching(sessionName);
 }
 
-export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
+export async function stopTransportRuntimeSession(
+  sessionName: string,
+  options: { preserveTransportQueue?: boolean } = {},
+): Promise<void> {
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
   transportRuntimes.delete(sessionName);
   if (providerSid) unregisterProviderRoute(providerSid);
-  await transportRuntime.kill();
+  await transportRuntime.kill(options);
 }
 
 async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
@@ -1265,7 +1268,7 @@ async function recoverTransportRuntimeAfterError(
       );
     }
 
-    await stopTransportRuntimeSession(sessionName).catch((err) => {
+    await stopTransportRuntimeSession(sessionName, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
       logger.warn({ err, sessionName }, 'Failed to stop errored transport runtime before auto-restart');
     });
 
@@ -2031,7 +2034,7 @@ export async function restoreTransportSessions(
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName: s.name, ...preservation }, 'preserved unbound transport runtime queues before restore');
       }
-      await stopTransportRuntimeSession(s.name).catch((err) => {
+      await stopTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
         logger.warn({ err, session: s.name }, 'Failed to stop unbound transport runtime before restore');
       });
     }
@@ -2644,7 +2647,7 @@ export async function ensureTransportRuntimeForPendingResend(sessionName: string
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before pending-resend relaunch');
       }
-      await stopTransportRuntimeSession(sessionName).catch(() => {});
+      await stopTransportRuntimeSession(sessionName, { preserveTransportQueue: preservation.preservedCount > 0 }).catch(() => {});
     }
     await launchTransportSession(buildTransportResumeLaunchOpts(record));
   } catch (err) {

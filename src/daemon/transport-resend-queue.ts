@@ -104,13 +104,31 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
     queueSnapshot = result.queueSnapshot;
     dropSnapshot = result.dropSnapshot;
   } catch (err) {
-    logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite enqueue failed for resend entry; resend enqueue rejected');
-    return {
-      accepted: false,
-      droppedOldest: false,
-      pendingVersion: bumpTransportQueueRevision(sessionName),
-      reason: 'sqlite_enqueue_failed',
-    };
+    const existingSnapshot = (() => {
+      try {
+        return getTransportQueueStore().readSnapshot(sessionName);
+      } catch {
+        return null;
+      }
+    })();
+    const alreadyAuthoritative = existingSnapshot?.pendingMessageEntries.some(
+      (candidate) => candidate.clientMessageId === normalizedEntry.clientMessageId,
+    ) === true;
+    if (alreadyAuthoritative && existingSnapshot) {
+      queueSnapshot = existingSnapshot;
+      logger.warn(
+        { err, sessionName, commandId: entry.commandId, clientMessageId: normalizedEntry.clientMessageId },
+        'transport queue sqlite enqueue found existing live entry; preserving resend memory handoff',
+      );
+    } else {
+      logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite enqueue failed for resend entry; resend enqueue rejected');
+      return {
+        accepted: false,
+        droppedOldest: false,
+        pendingVersion: bumpTransportQueueRevision(sessionName),
+        reason: 'sqlite_enqueue_failed',
+      };
+    }
   }
   if (list.length >= MAX_RESEND_ENTRIES) {
     const removed = list.shift();
@@ -156,6 +174,42 @@ export function listFreshResendQueues(nowMs: number = Date.now()): Array<{ sessi
 /** Number of entries currently queued for a session. */
 export function getResendCount(sessionName: string): number {
   return queues.get(sessionName)?.length ?? 0;
+}
+
+/** Expire stale resend entries before projecting queue state without dispatching. */
+export function expireResendEntries(sessionName: string, nowMs: number = Date.now()): QueueSnapshot | undefined {
+  const list = queues.get(sessionName);
+  if (!list || list.length === 0) return undefined;
+
+  const freshEntries = list.filter((entry) => nowMs - entry.queuedAt <= RESEND_EXPIRY_MS);
+  const expiredEntries = list.filter((entry) => nowMs - entry.queuedAt > RESEND_EXPIRY_MS);
+  if (expiredEntries.length === 0) return undefined;
+
+  if (freshEntries.length > 0) {
+    queues.set(sessionName, freshEntries);
+  } else {
+    queues.delete(sessionName);
+  }
+  bumpTransportQueueRevision(sessionName);
+
+  let snapshot: QueueSnapshot | undefined;
+  for (const entry of expiredEntries) {
+    const clientMessageId = entry.clientMessageId;
+    if (!clientMessageId) {
+      logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue mark expired skipped for resend entry without clientMessageId');
+      continue;
+    }
+    try {
+      snapshot = getTransportQueueStore().markFailed(sessionName, clientMessageId, 'expired', nowMs);
+    } catch (err) {
+      logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark expired failed for resend projection');
+    }
+  }
+  logger.info(
+    { sessionName, expiredCount: expiredEntries.length, freshCount: freshEntries.length },
+    'transport resend expired stale entries before queue projection',
+  );
+  return snapshot;
 }
 
 /** Drop queued entries matching a predicate. Returns the number removed. */
@@ -311,26 +365,30 @@ export async function drainResend(
       continue;
     }
     try {
-      await dispatch(entry);
+      const dispatchResult = await dispatch(entry);
       const clientMessageId = entry.clientMessageId;
       if (!clientMessageId) {
         failedCount += 1;
         logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend dispatch finalized as failed: missing clientMessageId');
         continue;
       }
-      try {
-        const result = getTransportQueueStore().finalizeSentBatch(
-          sessionName,
-          [clientMessageId],
-        );
-        if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
-      } catch (err) {
-        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
+      if (dispatchResult !== 'queued') {
+        try {
+          const result = getTransportQueueStore().finalizeSentBatch(
+            sessionName,
+            [clientMessageId],
+          );
+          if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
+        } catch (err) {
+          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
+        }
       }
       dispatched++;
       logger.info(
-        { sessionName, commandId: entry.commandId },
-        'transport resend delivered after reconnect',
+        { sessionName, commandId: entry.commandId, dispatchResult },
+        dispatchResult === 'queued'
+          ? 'transport resend accepted into runtime queue after reconnect'
+          : 'transport resend delivered after reconnect',
       );
     } catch (err) {
       failedCount += 1;

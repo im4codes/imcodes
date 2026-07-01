@@ -15,6 +15,7 @@ import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { expireResendEntries } from './transport-resend-queue.js';
 import { validateExecutionTemplateCandidate } from './execution-clone.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
@@ -113,6 +114,9 @@ function resolveTransportSessionListState(
 function baseItem(s: SessionRecord): SessionListItem {
   const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
   const runtimeState = resolveTransportSessionListState(s, runtime);
+  if (s.runtimeType === 'transport') {
+    expireResendEntries(s.name);
+  }
   const queuePayload = s.runtimeType === 'transport'
     ? buildTransportQueueSnapshotPayload(s.name, 'session_list')
     : null;
