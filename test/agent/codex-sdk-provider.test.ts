@@ -1581,6 +1581,7 @@ describe('CodexSdkProvider', () => {
       terminal: false,
       backgrounded: true,
     });
+    expect(typeof runningDetail.meta.startedAtMs).toBe('number');
 
     child.emits({
       method: 'turn/completed',
@@ -1625,6 +1626,7 @@ describe('CodexSdkProvider', () => {
       terminal: false,
       backgrounded: true,
     });
+    expect(usageDetail.meta.startedAtMs).toBe(runningDetail.meta.startedAtMs);
     expect(provider.getActiveWorkSnapshot('route-raw-spawn-agent')).toMatchObject({
       activeWorkCount: 0,
       activeToolCount: 0,
@@ -1657,6 +1659,7 @@ describe('CodexSdkProvider', () => {
       terminal: true,
       backgrounded: true,
     });
+    expect(completeDetail.meta.startedAtMs).toBe(runningDetail.meta.startedAtMs);
 
     child.emits({
       method: 'thread/tokenUsage/updated',
@@ -1682,9 +1685,10 @@ describe('CodexSdkProvider', () => {
       const tools: ToolCallEvent[] = [];
       provider.onToolCall((_, tool) => tools.push(tool));
 
+      const rolloutStartedAt = new Date('2026-06-01T00:00:00.000Z');
       const rolloutPath = await writeCodexRolloutFile(codexHome, 'child-rollout-only', [
         {
-          timestamp: new Date().toISOString(),
+          timestamp: rolloutStartedAt.toISOString(),
           type: 'session_meta',
           payload: {
             id: '019f-child-rollout-only',
@@ -1740,6 +1744,7 @@ describe('CodexSdkProvider', () => {
         active: true,
         terminal: false,
         backgrounded: true,
+        startedAtMs: rolloutStartedAt.getTime(),
       });
 
       await appendFile(rolloutPath, `${JSON.stringify({
@@ -1767,6 +1772,7 @@ describe('CodexSdkProvider', () => {
         active: false,
         terminal: true,
         backgrounded: true,
+        startedAtMs: rolloutStartedAt.getTime(),
       });
     } finally {
       await provider.disconnect().catch(() => {});
@@ -4454,13 +4460,15 @@ describe('CodexSdkProvider', () => {
     expect(timeoutDiagnostics.lastHeartbeatAttemptAtMs as number).toBeGreaterThan(activeDiagnostics.lastHeartbeatAttemptAtMs as number);
     expect(timeoutDiagnostics.lastHeartbeatResponseAtMs).toBe(activeDiagnostics.lastHeartbeatResponseAtMs);
     expect(timeoutDiagnostics.lastAliveHeartbeatAtMs).toBe(activeDiagnostics.lastAliveHeartbeatAtMs);
+    await provider.disconnect();
   }, 60_000);
 
   it('enforces provider-wide heartbeat cap and releases capacity exactly once when an in-flight lease is cleared', async () => {
     vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    let provider: CodexSdkProvider | undefined;
     try {
-      const provider = new CodexSdkProvider();
+      provider = new CodexSdkProvider();
       await provider.connect({ binaryPath: 'codex' });
       for (const sessionKey of ['route-heartbeat-cap-1', 'route-heartbeat-cap-2', 'route-heartbeat-cap-3']) {
         await provider.createSession({ sessionKey, cwd: '/tmp/project' });
@@ -4507,6 +4515,7 @@ describe('CodexSdkProvider', () => {
       expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: false });
       expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: false });
     } finally {
+      await provider?.disconnect().catch(() => {});
       randomSpy.mockRestore();
     }
   }, 60_000);
@@ -4533,19 +4542,25 @@ describe('CodexSdkProvider', () => {
     expect(aliveAfterActive).toEqual(expect.any(Number));
     expect(responseAfterActive).toBe(aliveAfterActive);
 
-    childProcessMock.enqueueThreadReadResult({ thread: { status: 'idle' } });
+    childProcessMock.enqueueThreadReadResult(() => {
+      vi.setSystemTime(Date.now() + 1);
+      return { thread: { status: 'idle' } };
+    });
     await vi.advanceTimersByTimeAsync(25_100);
     await vi.advanceTimersByTimeAsync(0);
     const afterMalformed = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
     expect(afterMalformed.lastHeartbeatResponseAtMs as number).toBeGreaterThan(responseAfterActive as number);
     expect(afterMalformed.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
 
-    childProcessMock.enqueueThreadReadResult({
-      status: 'idle',
-      turns: [
-        { id: 'turn-a', status: 'inProgress', current: true },
-        { id: 'turn-b', status: 'inProgress', current: true },
-      ],
+    childProcessMock.enqueueThreadReadResult(() => {
+      vi.setSystemTime(Date.now() + 1);
+      return {
+        status: 'idle',
+        turns: [
+          { id: 'turn-a', status: 'inProgress', current: true },
+          { id: 'turn-b', status: 'inProgress', current: true },
+        ],
+      };
     });
     await vi.advanceTimersByTimeAsync(25_100);
     await vi.advanceTimersByTimeAsync(0);
@@ -4553,7 +4568,10 @@ describe('CodexSdkProvider', () => {
     expect(afterAmbiguous.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterMalformed.lastHeartbeatResponseAtMs as number);
     expect(afterAmbiguous.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
 
-    childProcessMock.enqueueThreadReadResult({ status: 'mystery', turns: [{ id: 'turn-1', status: 'weird' }] });
+    childProcessMock.enqueueThreadReadResult(() => {
+      vi.setSystemTime(Date.now() + 1);
+      return { status: 'mystery', turns: [{ id: 'turn-1', status: 'weird' }] };
+    });
     await vi.advanceTimersByTimeAsync(25_100);
     await vi.advanceTimersByTimeAsync(0);
     const afterUnknown = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
@@ -4562,6 +4580,7 @@ describe('CodexSdkProvider', () => {
 
     expect(child.requests.filter((req) => req.method === 'thread/read').length).toBeGreaterThanOrEqual(4);
     expect(errors.some((entry) => (entry.details as any)?.reason === 'sdk_turn_lost')).toBe(false);
+    await provider.disconnect();
   });
 
   it('emits privacy-bounded sdk_turn_lost for deterministic idle-missing-turn and notLoaded summaries', async () => {
@@ -4607,8 +4626,18 @@ describe('CodexSdkProvider', () => {
       lastAliveHeartbeatAtMs: null,
     });
 
-    await provider.createSession({ sessionKey: 'route-heartbeat-notloaded', cwd: '/tmp/project', fresh: true });
-    await provider.send('route-heartbeat-notloaded', 'hello again');
+    await provider.disconnect();
+
+    const provider2 = new CodexSdkProvider();
+    provider2.onError((sid, error) => errors.push({
+      sid,
+      details: error.details,
+      message: error.message,
+      recoverable: error.recoverable,
+    }));
+    await provider2.connect({ binaryPath: 'codex' });
+    await provider2.createSession({ sessionKey: 'route-heartbeat-notloaded', cwd: '/tmp/project' });
+    await provider2.send('route-heartbeat-notloaded', 'hello again');
     childProcessMock.enqueueThreadReadResult({
       thread: { id: 'thread-1', status: 'notLoaded' },
       turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
@@ -4620,6 +4649,7 @@ describe('CodexSdkProvider', () => {
       reason: 'sdk_turn_lost',
       classifier: 'not_loaded_with_active_lease',
     });
+    await provider2.disconnect();
   });
 
   it('makes completed/failed/interrupted local truth deactivate the lease and ignores late strong-looking events', async () => {

@@ -111,6 +111,7 @@ import {
   isSdkRuntimeSubagentEventName,
   makeGeminiSubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  readSdkSubagentStartedAtMs,
   startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
@@ -152,6 +153,7 @@ interface GeminiSdkSessionState {
   /** Map<toolCallId, accumulated ToolCall state> so ToolCallUpdate can merge
    *  onto the original ToolCall (ACP spec: each update is a partial merge). */
   toolCalls: Map<string, MergedToolCall>;
+  runtimeSubagentStartedAtByKey: Map<string, number>;
   /** Track last emitted signature per tool to deduplicate identical updates. */
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
@@ -352,6 +354,13 @@ function geminiRuntimeSubagentToolFromPayload(
   const model = readRuntimeSubagentModel(record, state.model);
   const prompt = readRuntimeSubagentPrompt(record);
   const backgrounded = readRuntimeSubagentBackgrounded(record);
+  const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+  const startedAtMs = readSdkSubagentStartedAtMs(record)
+    ?? startedAtByKey.get(canonicalKey)
+    ?? Date.now();
+  if (statusMapping.active && !statusMapping.terminal) {
+    startedAtByKey.set(canonicalKey, startedAtMs);
+  }
   const summary = agentName ? `Gemini sub-agent ${agentName}` : rawAgentPath ? `Gemini sub-agent ${rawAgentPath}` : 'Gemini sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? statusInfo.status ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
@@ -378,6 +387,7 @@ function geminiRuntimeSubagentToolFromPayload(
       ...(agentName ? { agentName } : {}),
       ...(model ? { model } : {}),
       ...(backgrounded ? { backgrounded: true } : {}),
+      startedAtMs,
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -508,6 +518,7 @@ export class GeminiSdkProvider implements TransportProvider {
       currentMessageId: null,
       currentText: '',
       toolCalls: new Map(),
+      runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,

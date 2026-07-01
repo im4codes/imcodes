@@ -13,6 +13,7 @@ import {
   isSdkRuntimeSubagentEventName,
   isSdkSubagentDetail,
   normalizeSdkSubagentCanonicalKey,
+  readSdkSubagentStartedAtMs,
   parseSdkSubagentDetail,
   parseSdkRuntimeSubagentTag,
   sdkSubagentDedupSignature,
@@ -145,6 +146,22 @@ describe('sdk-subagent-status shared contract', () => {
     expect(parsed.detail.meta.receiverCount).toBe(999);
     expect(parsed.detail.meta.runningChildCount).toBe(999);
     expect(parsed.detail.meta.receiverIndex).toBe(999);
+  });
+
+  it('preserves safe SDK sub-agent start timestamps for replayed duration calculations', () => {
+    const startedAtMs = Date.parse('2026-05-31T12:00:00.000Z');
+    const parsed = parseSdkSubagentDetail(makeDetail({
+      meta: {
+        ...makeDetail().meta,
+        startedAtMs,
+      },
+    }));
+
+    expect(parsed.kind).toBe('ok');
+    if (parsed.kind !== 'ok') return;
+    expect(parsed.detail.meta.startedAtMs).toBe(startedAtMs);
+    expect(readSdkSubagentStartedAtMs({ started_at: '2026-05-31T12:00:00.000Z' })).toBe(startedAtMs);
+    expect(buildSdkSubagentMinimalReplayDetail(parsed.detail).meta.startedAtMs).toBe(startedAtMs);
   });
 
   it('builds minimal replay detail with only flat SDK status metadata', () => {

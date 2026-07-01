@@ -69,6 +69,7 @@ import {
   buildSdkSubagentSafeDetail,
   isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
+  readSdkSubagentStartedAtMs,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
@@ -149,6 +150,7 @@ interface CodexRawSpawnAgentCall {
   sessionId: string;
   callId: string;
   args: Record<string, any>;
+  startedAtMs: number;
 }
 
 interface CodexTrackedSubagentThread {
@@ -161,6 +163,7 @@ interface CodexTrackedSubagentThread {
   lastStatus?: unknown;
   usageTotalTokens?: number;
   rolloutPath?: string;
+  startedAtMs?: number;
 }
 
 interface CodexChildSubagentRolloutSnapshot {
@@ -175,6 +178,7 @@ interface CodexChildSubagentRolloutSnapshot {
   completed: boolean;
   output?: string;
   usageTotalTokens?: number;
+  startedAtMs?: number;
 }
 
 function errorMessage(err: unknown): string {
@@ -329,9 +333,15 @@ async function readCodexChildSubagentRolloutSnapshot(
   let completed = false;
   let output: string | undefined;
   let usageTotalTokens: number | undefined;
+  let startedAtMs: number | undefined;
   for (const line of text.split('\n')) {
     const record = parseCodexRolloutJsonLine(line);
     if (!record) continue;
+    if (startedAtMs === undefined) {
+      const timestamp = meaningfulString(record.timestamp);
+      const parsedTimestamp = timestamp ? Date.parse(timestamp) : NaN;
+      if (Number.isFinite(parsedTimestamp)) startedAtMs = parsedTimestamp;
+    }
     const payload = codexRolloutPayload(record);
     const nextSpawn = readCodexChildSubagentSpawn(payload);
     if (nextSpawn) spawn = nextSpawn;
@@ -369,6 +379,7 @@ async function readCodexChildSubagentRolloutSnapshot(
     completed,
     ...(output ? { output } : {}),
     ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
+    ...(startedAtMs !== undefined ? { startedAtMs } : {}),
   };
 }
 
@@ -724,6 +735,7 @@ interface CodexSdkSessionState {
   activeToolItemIds: Set<string>;
   activeCompactionItemIds: Set<string>;
   openProviderToolCalls: Map<string, ToolCallEvent>;
+  runtimeSubagentStartedAtByKey: Map<string, number>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
   compactSettleTimer: ReturnType<typeof setTimeout> | null;
@@ -1385,6 +1397,7 @@ function runtimeSubagentToolFromPayload(
   const prompt = readRuntimeSubagentPrompt(record);
   const usageTotalTokens = readRuntimeSubagentUsageTotalTokens(record);
   const backgrounded = readRuntimeSubagentBackgrounded(record);
+  const startedAtMs = readSdkSubagentStartedAtMs(record) ?? readSdkSubagentStartedAtMs(payload);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
@@ -1412,6 +1425,7 @@ function runtimeSubagentToolFromPayload(
       ...(model ? { model } : {}),
       ...(backgrounded ? { backgrounded: true } : {}),
       ...(usageTotalTokens !== undefined ? { usageTotalTokens } : {}),
+      ...(startedAtMs !== undefined ? { startedAtMs } : {}),
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -1588,6 +1602,7 @@ function buildRawSpawnAgentRuntimePayload(
     ...(prompt ? { prompt } : {}),
     ...(model ? { model } : {}),
     backgrounded: true,
+    startedAtMs: call.startedAtMs,
   };
 }
 
@@ -2027,6 +2042,7 @@ export class CodexSdkProvider implements TransportProvider {
       activeToolItemIds: new Set(),
       activeCompactionItemIds: new Set(),
       openProviderToolCalls: new Map(),
+      runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       cancelled: false,
       cancelTimer: null,
       compactSettleTimer: null,
@@ -2832,6 +2848,17 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearStatus(sessionId, state);
     const tool = runtimeSubagentToolFromPayload(sessionId, params);
     if (!tool) return;
+    const detail = tool.detail as SdkSubagentDetail | undefined;
+    const canonicalKey = detail?.meta?.canonicalKey;
+    if (canonicalKey) {
+      const startedAtMs = detail.meta.startedAtMs
+        ?? state.runtimeSubagentStartedAtByKey.get(canonicalKey)
+        ?? Date.now();
+      detail.meta.startedAtMs = startedAtMs;
+      if (detail.meta.active && !detail.meta.terminal) {
+        state.runtimeSubagentStartedAtByKey.set(canonicalKey, startedAtMs);
+      }
+    }
     for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
@@ -3022,6 +3049,7 @@ export class CodexSdkProvider implements TransportProvider {
       tracked.prompt = snapshot.prompt ?? tracked.prompt;
       tracked.model = snapshot.model ?? tracked.model;
       tracked.rolloutPath = snapshot.rolloutPath;
+      tracked.startedAtMs = tracked.startedAtMs ?? snapshot.startedAtMs ?? Date.now();
       if (snapshot.usageTotalTokens !== undefined) tracked.usageTotalTokens = snapshot.usageTotalTokens;
       this.trackedSubagentThreads.set(snapshot.agentId, tracked);
 
@@ -3064,6 +3092,7 @@ export class CodexSdkProvider implements TransportProvider {
         sessionId,
         callId,
         args: parseJsonRecord(item.arguments) ?? {},
+        startedAtMs: Date.now(),
       });
       return true;
     }
@@ -3087,6 +3116,7 @@ export class CodexSdkProvider implements TransportProvider {
         sessionId: call.sessionId,
         callId,
         agentId,
+        startedAtMs: call.startedAtMs,
         agentName: meaningfulString(outputRecord.nickname)
           ?? meaningfulString(outputRecord.name)
           ?? meaningfulString(call.args.nickname)
@@ -3124,6 +3154,7 @@ export class CodexSdkProvider implements TransportProvider {
       ...(tracked.prompt ? { prompt: tracked.prompt } : {}),
       ...(tracked.model ? { model: tracked.model } : {}),
       ...(tracked.usageTotalTokens !== undefined ? { usageTotalTokens: tracked.usageTotalTokens } : {}),
+      ...(tracked.startedAtMs !== undefined ? { startedAtMs: tracked.startedAtMs } : {}),
       backgrounded: true,
     });
     if (!tool) return null;

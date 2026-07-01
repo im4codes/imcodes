@@ -45,6 +45,7 @@ import {
   SDK_SUBAGENT_STATUS,
   buildSdkSubagentSafeDetail,
   makeClaudeSubagentCanonicalKey,
+  readSdkSubagentStartedAtMs,
   sanitizeSdkSubagentText,
   sdkSubagentDedupSignature,
   type SdkSubagentDetail,
@@ -150,7 +151,8 @@ interface ClaudeSdkSessionState {
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
   resultCompletionGeneration?: number;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
-  runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string }>;
+  runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string; startedAtMs: number }>;
+  runtimeSubagentStartedAtByKey: Map<string, number>;
   emittedToolStates: Map<string, string>;
   subagentTasks: Map<string, ClaudeTaskState>;
   emittedSubagentStates: Map<string, string>;
@@ -189,6 +191,7 @@ interface ClaudeTaskState {
   diagnosticCode?: SdkSubagentDiagnosticCode;
   terminal: boolean;
   active: boolean;
+  startedAtMs: number;
   lastUpdatedAt: number;
 }
 
@@ -381,6 +384,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       resultCompletionGeneration: undefined,
       toolCalls: new Map(),
       runtimeAgentToolCalls: new Map(),
+      runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolStates: new Map(),
       subagentTasks: existing?.subagentTasks ?? new Map(),
       emittedSubagentStates: new Map(),
@@ -1145,6 +1149,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const model = this.readRuntimeSubagentModel(record);
     const prompt = this.readRuntimeSubagentPrompt(record);
     const backgrounded = this.readRuntimeSubagentBackgrounded(record);
+    const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+    const startedAtMs = readSdkSubagentStartedAtMs(record)
+      ?? startedAtByKey.get(canonicalKey)
+      ?? Date.now();
+    if (statusMapping.active && !statusMapping.terminal) {
+      startedAtByKey.set(canonicalKey, startedAtMs);
+    }
     const summary = agentName ? `Claude sub-agent ${agentName}` : rawAgentPath ? `Claude sub-agent ${rawAgentPath}` : 'Claude sub-agent';
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
@@ -1167,6 +1178,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ...(agentName ? { agentName } : {}),
         ...(model ? { model } : {}),
         ...(backgrounded ? { backgrounded: true } : {}),
+        startedAtMs,
         diagnosticCode: statusMapping.diagnosticCode,
       },
     } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -1379,6 +1391,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
       terminal: false,
       active: true,
+      startedAtMs: Date.now(),
       lastUpdatedAt: Date.now(),
     };
   }
@@ -1488,10 +1501,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const model = existing?.model ?? this.readRuntimeSubagentModel(input ?? {});
     const canonicalKey = existing?.canonicalKey
       ?? makeClaudeSubagentCanonicalKey(this.subagentSessionKey(sessionId, state), `runtime:${agentPath}`);
+    const startedAtMs = existing?.startedAtMs ?? Date.now();
     if (status === 'running' && !existing) {
       state.runtimeAgentToolCalls.set(tool.id, {
         canonicalKey,
         agentPath,
+        startedAtMs,
         ...(agentName ? { agentName } : {}),
         ...(model ? { model } : {}),
         ...(prompt ? { prompt } : {}),
@@ -1524,6 +1539,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         agentPath,
         ...(agentName ? { agentName } : {}),
         ...(model ? { model } : {}),
+        startedAtMs,
       },
     } satisfies SdkSubagentDetail, { allowRaw: false });
     this.emitSubagentToolCall(sessionId, state, {
@@ -1700,6 +1716,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ...(task.workflowName ? { workflowName: task.workflowName } : {}),
       ...(task.model ? { model: task.model } : {}),
       ...(typeof task.backgrounded === 'boolean' ? { backgrounded: task.backgrounded } : {}),
+      startedAtMs: task.startedAtMs,
       ...(task.usage?.total_tokens !== undefined ? { usageTotalTokens: task.usage.total_tokens } : {}),
       ...(task.usage?.tool_uses !== undefined ? { usageToolUses: task.usage.tool_uses } : {}),
       ...(task.usage?.duration_ms !== undefined ? { usageDurationMs: task.usage.duration_ms } : {}),

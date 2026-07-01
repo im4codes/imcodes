@@ -279,6 +279,57 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByText('4,321')).toBeTruthy();
   });
 
+  it('uses provider startedAtMs so active sub-agent duration survives app reopen from latest heartbeat only', () => {
+    const start = new Date('2026-05-31T12:00:00.000Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(start + 600_000);
+    const event = makeSdkEvent(
+      'agent-running-latest-heartbeat',
+      makeMeta({
+        canonicalKey: 'codex:deck_agents:runtime:019f1926',
+        provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+        agentPath: '019f1926-a1f2-7391-90e4-e149c2dd9312',
+        startedAtMs: start,
+        backgrounded: true,
+      }),
+      { summary: 'Godel' },
+    );
+    event.ts = start + 600_000;
+
+    render(<ChatView events={[event]} loading={false} sessionId="deck_agents" />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }));
+
+    expect(screen.getByText('10m 0s')).toBeTruthy();
+    expect(screen.queryByText('0s')).toBeNull();
+  });
+
+  it('does not keep an old cached backgrounded sub-agent heartbeat running forever when terminal result is missing', () => {
+    const start = new Date('2026-05-31T12:00:00.000Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(start + 20 * 60_000);
+    const event = makeSdkEvent(
+      'agent-running-stale-heartbeat',
+      makeMeta({
+        canonicalKey: 'codex:deck_agents:runtime:019f1b60',
+        provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+        agentPath: '019f1b60-5e57-7943-bc1b-32d1ea8151da',
+        startedAtMs: start,
+        backgrounded: true,
+      }),
+      { summary: 'Godel' },
+    );
+    event.ts = start;
+
+    render(<ChatView events={[event]} loading={false} sessionId="deck_agents" />);
+
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' })).toBeTruthy();
+    expect(screen.queryByText('Godel')).toBeNull();
+    expect(screen.queryByText('20m 0s')).toBeNull();
+  });
+
   it('renders agent id, model, start time, duration, prompt, and terminal result details', () => {
     const start = new Date('2026-05-31T12:00:00.000Z');
     vi.useFakeTimers();
