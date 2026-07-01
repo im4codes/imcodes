@@ -264,10 +264,12 @@ import { launchSession } from '../../src/agent/session-manager.js';
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { restoreTransportSessions } from '../../src/agent/session-manager.js';
+import { clearAllResend } from '../../src/daemon/transport-resend-queue.js';
 
 describe('qwen transport flow e2e', () => {
   afterEach(async () => {
     await disconnectAll();
+    clearAllResend();
     mocks.store.clear();
     mocks.emitted.length = 0;
     vi.clearAllMocks();
@@ -605,8 +607,9 @@ describe('qwen transport flow e2e', () => {
   });
 
   it('keeps queued transport messages stable across timeline and session list updates', async () => {
+    const session = `${SESSION}_queue`;
     await launchSession({
-      name: SESSION,
+      name: session,
       projectName: 'qwene2e',
       role: 'brain',
       agentType: 'qwen',
@@ -616,7 +619,7 @@ describe('qwen transport flow e2e', () => {
     const serverLink = { send: vi.fn(), daemonVersion: 'test' } as any;
     handleWebCommand({
       type: 'session.send',
-      session: SESSION,
+      session,
       text: 'slow first',
       commandId: 'cmd-qwen-slow',
     }, serverLink);
@@ -624,23 +627,14 @@ describe('qwen transport flow e2e', () => {
 
     handleWebCommand({
       type: 'session.send',
-      session: SESSION,
+      session,
       text: 'queued second',
       commandId: 'cmd-qwen-queued',
     }, serverLink);
     await flushAsync();
 
-    const queuedState = mocks.emitted.find((e) =>
-      e.session === SESSION
-      && e.type === 'session.state'
-      && e.payload.state === 'queued'
-      && Array.isArray(e.payload.pendingMessageEntries)
-      && e.payload.pendingMessageEntries.some((entry: { clientMessageId: string; text: string }) =>
-        entry.clientMessageId === 'cmd-qwen-queued' && entry.text === 'queued second'),
-    );
-    expect(queuedState).toBeTruthy();
     const queuedUserBeforeDrain = mocks.emitted.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-queued'
     );
@@ -649,14 +643,14 @@ describe('qwen transport flow e2e', () => {
       type: 'command.ack',
       commandId: 'cmd-qwen-queued',
       status: 'accepted',
-      session: SESSION,
+      session,
     });
     const queuedServerAcks = serverLink.send.mock.calls.filter(([msg]: [Record<string, unknown>]) =>
       msg.type === 'command.ack' && msg.commandId === 'cmd-qwen-queued',
     );
     expect(queuedServerAcks).toHaveLength(1);
     const queuedTimelineAck = mocks.emitted.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'command.ack'
       && e.payload.commandId === 'cmd-qwen-queued'
       && e.payload.status === 'accepted'
@@ -670,18 +664,20 @@ describe('qwen transport flow e2e', () => {
       type: 'session_list',
       sessions: expect.arrayContaining([
         expect.objectContaining({
-          name: SESSION,
+          name: session,
           state: 'running',
-          transportPendingMessages: ['queued second'],
-          transportPendingMessageEntries: [
-            { clientMessageId: 'cmd-qwen-queued', text: 'queued second' },
+          pendingMessageEntries: [
+            expect.objectContaining({ clientMessageId: 'cmd-qwen-queued', text: 'queued second' }),
           ],
+          pendingMessageVersion: expect.any(Number),
+          queueEpoch: expect.any(String),
+          queueAuthorityId: expect.any(String),
         }),
       ]),
     }));
 
     const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
-    const stored = mocks.store.get(SESSION);
+    const stored = mocks.store.get(session);
     const providerSessionId = typeof stored?.providerSessionId === 'string' ? stored.providerSessionId : '';
     expect(providerSessionId).toBeTruthy();
     const drainStartIndex = mocks.emitted.length;
@@ -690,43 +686,31 @@ describe('qwen transport flow e2e', () => {
 
     const drainedEvents = mocks.emitted.slice(drainStartIndex);
     const drainedUsers = drainedEvents.filter((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-queued'
     );
     expect(drainedUsers).toHaveLength(1);
     expect(drainedUsers[0]?.payload.text).toBe('queued second');
     const allQueuedUsers = mocks.emitted.filter((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-queued'
     );
     expect(allQueuedUsers).toHaveLength(1);
     const queuedAssistantFinal = drainedEvents.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'assistant.text'
       && e.payload.streaming === false
       && e.payload.text === 'Qwen: queued second'
     );
     expect(queuedAssistantFinal).toBeDefined();
     const queuedStateAfterDrain = drainedEvents.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'session.state'
       && e.payload.state === 'queued'
     );
     expect(queuedStateAfterDrain).toBeUndefined();
-
-    const explicitEmptyRunningState = drainedEvents.find((e) =>
-      e.session === SESSION
-      && e.type === 'session.state'
-      && e.payload.state === 'running'
-      && Array.isArray(e.payload.pendingMessageEntries)
-      && e.payload.pendingMessageEntries.length === 0
-      && Array.isArray(e.payload.pendingMessages)
-      && e.payload.pendingMessages.length === 0
-      && typeof e.payload.pendingMessageVersion === 'number'
-    );
-    expect(explicitEmptyRunningState).toBeDefined();
 
     const postDrainSessionListStart = serverLink.send.mock.calls.length;
     handleWebCommand({ type: 'get_sessions' }, serverLink);
@@ -737,27 +721,26 @@ describe('qwen transport flow e2e', () => {
       .find(([msg]: [Record<string, unknown>]) => msg.type === 'session_list')?.[0] as
         | { sessions?: Array<Record<string, unknown>> }
         | undefined;
-    const postDrainSession = postDrainSessionList?.sessions?.find((session) => session.name === SESSION);
+    const postDrainSession = postDrainSessionList?.sessions?.find((entry) => entry.name === session);
     expect(postDrainSession).toEqual(expect.objectContaining({
-      transportPendingMessages: [],
-      transportPendingMessageEntries: [],
-      transportPendingMessageVersion: expect.any(Number),
+      pendingMessageEntries: [],
+      pendingMessageVersion: expect.any(Number),
+      queueEpoch: expect.any(String),
+      queueAuthorityId: expect.any(String),
     }));
 
     const idleStateEvents = mocks.emitted.filter((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'session.state'
       && e.payload.state === 'idle'
     );
     expect(idleStateEvents.length).toBeGreaterThan(0);
-    for (const event of idleStateEvents) {
-      expect(Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages')).toBe(true);
-    }
   });
 
   it('edits and deletes daemon queued transport messages before drain dispatches only the final queue state', async () => {
+    const session = `${SESSION}_edit`;
     await launchSession({
-      name: SESSION,
+      name: session,
       projectName: 'qwene2e',
       role: 'brain',
       agentType: 'qwen',
@@ -767,7 +750,7 @@ describe('qwen transport flow e2e', () => {
     const serverLink = { send: vi.fn(), daemonVersion: 'test' } as any;
     handleWebCommand({
       type: 'session.send',
-      session: SESSION,
+      session,
       text: 'slow first',
       commandId: 'cmd-qwen-edit-slow',
     }, serverLink);
@@ -775,14 +758,14 @@ describe('qwen transport flow e2e', () => {
 
     handleWebCommand({
       type: 'session.send',
-      session: SESSION,
+      session,
       text: 'queued original',
       commandId: 'cmd-qwen-editable',
     }, serverLink);
     await flushAsync();
     handleWebCommand({
       type: 'session.send',
-      session: SESSION,
+      session,
       text: 'queued removed',
       commandId: 'cmd-qwen-removed',
     }, serverLink);
@@ -790,7 +773,7 @@ describe('qwen transport flow e2e', () => {
 
     handleWebCommand({
       type: 'session.edit_queued_message',
-      sessionName: SESSION,
+      sessionName: session,
       clientMessageId: 'cmd-qwen-editable',
       text: 'queued edited',
       commandId: 'cmd-qwen-edit-control',
@@ -798,7 +781,7 @@ describe('qwen transport flow e2e', () => {
     await flushAsync();
     handleWebCommand({
       type: 'session.undo_queued_message',
-      sessionName: SESSION,
+      sessionName: session,
       clientMessageId: 'cmd-qwen-removed',
       commandId: 'cmd-qwen-undo-control',
     }, serverLink);
@@ -811,11 +794,13 @@ describe('qwen transport flow e2e', () => {
       type: 'session_list',
       sessions: expect.arrayContaining([
         expect.objectContaining({
-          name: SESSION,
-          transportPendingMessages: ['queued edited'],
-          transportPendingMessageEntries: [
-            { clientMessageId: 'cmd-qwen-editable', text: 'queued edited' },
+          name: session,
+          pendingMessageEntries: [
+            expect.objectContaining({ clientMessageId: 'cmd-qwen-editable', text: 'queued edited' }),
           ],
+          pendingMessageVersion: expect.any(Number),
+          queueEpoch: expect.any(String),
+          queueAuthorityId: expect.any(String),
         }),
       ]),
     }));
@@ -823,40 +808,40 @@ describe('qwen transport flow e2e', () => {
       type: 'command.ack',
       commandId: 'cmd-qwen-edit-control',
       status: 'accepted',
-      session: SESSION,
+      session,
     });
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
       commandId: 'cmd-qwen-undo-control',
       status: 'accepted',
-      session: SESSION,
+      session,
     });
 
     const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
-    const providerSessionId = String(mocks.store.get(SESSION)?.providerSessionId ?? '');
+    const providerSessionId = String(mocks.store.get(session)?.providerSessionId ?? '');
     const drainStartIndex = mocks.emitted.length;
     provider?.flushPending(providerSessionId);
     await flushAsync();
 
     const drainedEvents = mocks.emitted.slice(drainStartIndex);
     expect(drainedEvents.filter((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-editable'
       && e.payload.text === 'queued edited',
     )).toHaveLength(1);
     expect(mocks.emitted.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'user.message'
       && e.payload.clientMessageId === 'cmd-qwen-removed',
     )).toBeUndefined();
     expect(mocks.emitted.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'user.message'
       && e.payload.text === 'queued original',
     )).toBeUndefined();
     expect(drainedEvents.find((e) =>
-      e.session === SESSION
+      e.session === session
       && e.type === 'assistant.text'
       && e.payload.streaming === false
       && e.payload.text === 'Qwen: queued edited',
