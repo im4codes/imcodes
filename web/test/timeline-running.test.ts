@@ -164,6 +164,34 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(false);
   });
 
+  it('does not revive the parent turn when SDK subagent heartbeats continue after idle', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      summary: 'Godel',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_main_brain:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+    expect(isRunningTimelineEvent({
+      type: 'tool.call',
+      payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail },
+    } as any)).toBe(false);
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'assistant.text', payload: { text: 'spawned', streaming: false } },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ] as any)).toBe(false);
+  });
+
   it('keeps one of multiple keyed tools active across weak idle', () => {
     expect(hasActiveTimelineTurn([
       { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },

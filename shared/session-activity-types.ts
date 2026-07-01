@@ -607,6 +607,11 @@ function readToolKey(payload: Record<string, unknown> | undefined): string | nul
   return null;
 }
 
+function isSdkSubagentTimelinePayload(payload: Record<string, unknown> | undefined): boolean {
+  const detail = payload?.detail;
+  return isRecord(detail) && detail.kind === 'sdkSubagent';
+}
+
 export function reduceTimelineActivity(events: TimelineActivityEvent[]): TimelineActivityState {
   const openToolIds = new Set<string>();
   let anonymousOpenToolCount = 0;
@@ -619,6 +624,7 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
 
   for (const event of events) {
     if (event.type === 'tool.call') {
+      if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
       if (key) openToolIds.add(key);
       else anonymousOpenToolCount += 1;
@@ -626,6 +632,7 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
       continue;
     }
     if (event.type === 'tool.result') {
+      if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
       if (key) {
         if (openToolIds.has(key)) openToolIds.delete(key);

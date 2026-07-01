@@ -136,6 +136,34 @@ describe('session activity shared contract', () => {
     });
   });
 
+  it('does not count SDK sub-agent timeline rows as parent active work', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_test:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ])).toMatchObject({ active: false, degraded: false, openToolCount: 0 });
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+      { type: 'tool.result', payload: { toolCallId: 'agent-1', detail: { ...sdkDetail, meta: { ...sdkDetail.meta, normalizedStatus: 'complete', active: false, terminal: true } } } },
+    ])).toMatchObject({ active: false, degraded: false, openToolCount: 0 });
+  });
+
   it('treats stale-generation authoritative idle as weak over open tools', () => {
     expect(reduceTimelineActivity([
       {
