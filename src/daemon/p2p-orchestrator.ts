@@ -15,7 +15,6 @@ import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
-import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
 import {
   P2P_BASELINE_PROMPT,
   getLegacyExecutionRoundCount,
@@ -112,7 +111,8 @@ import ruLocale from '../../web/src/i18n/locales/ru.json' with { type: 'json' };
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { getFreshResendEntries, removeResendEntries } from './transport-resend-queue.js';
+import { removeResendEntries } from './transport-resend-queue.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import {
   evaluateP2pLaunchAdmission,
   sanitizeP2pLaunchOriginForProjection,
@@ -1036,19 +1036,11 @@ function isP2pRunPromptEntry(run: P2pRun, entry: { clientMessageId?: string; com
 }
 
 function emitP2pQueueSnapshot(session: string, runtime: ReturnType<typeof getTransportRuntime> | undefined): void {
-  const resendEntries = runtime ? [] : getFreshResendEntries(session);
+  void runtime;
+  const queuePayload = buildTransportQueueSnapshotPayload(session, 'p2p_orchestrator');
   timelineEmitter.emit(session, 'session.state', {
-    state: runtime?.pendingCount || resendEntries.length > 0 ? 'queued' : 'idle',
-    pendingCount: runtime?.pendingCount ?? resendEntries.length,
-    pendingMessages: runtime?.pendingMessages ?? resendEntries.map((entry) => entry.text),
-    pendingMessageEntries: runtime?.pendingEntries ?? resendEntries.map((entry) => ({
-      clientMessageId: entry.commandId,
-      text: entry.text,
-      ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-    })),
-    ...(runtime
-      ? { pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion) }
-      : (typeof getTransportQueueRevision(session) === 'number' ? { pendingMessageVersion: getTransportQueueRevision(session) } : {})),
+    state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+    ...queuePayload,
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -1147,17 +1139,15 @@ function emitP2pTransportQueuedState(
       runId: run.id,
       session,
       reason,
-      pendingCount: runtime.pendingCount,
-      pendingVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
+      runtimePendingCount: runtime.pendingCount,
+      runtimePendingVersion: runtime.pendingVersion,
     },
     'P2P: transport prompt queued behind active turn',
   );
+  const queuePayload = buildTransportQueueSnapshotPayload(session, 'p2p_orchestrator');
   timelineEmitter.emit(session, 'session.state', {
-    state: 'queued',
-    pendingCount: runtime.pendingCount,
-    pendingMessages: runtime.pendingMessages,
-    pendingMessageEntries: runtime.pendingEntries,
-    pendingMessageVersion: observeTransportQueueRevision(session, runtime.pendingVersion),
+    state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+    ...queuePayload,
   }, { source: 'daemon', confidence: 'high' });
 }
 

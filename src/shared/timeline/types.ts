@@ -26,6 +26,11 @@ export type TimelineEventType =
   | 'session.state'
   | 'terminal.snapshot'
   | 'command.ack'
+  | 'transport.queue.snapshot'
+  | 'transport.queue.delivery'
+  | 'transport.queue.receipt'
+  | 'transport.queue.failure'
+  | 'transport.queue.reset'
   | 'agent.status'
   | 'usage.update'
   | 'ask.question'
@@ -51,6 +56,11 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'mode.state',
   'terminal.snapshot',
   'command.ack',
+  'transport.queue.snapshot',
+  'transport.queue.delivery',
+  'transport.queue.receipt',
+  'transport.queue.failure',
+  'transport.queue.reset',
   'agent.status',
   'usage.update',
   'ask.question',

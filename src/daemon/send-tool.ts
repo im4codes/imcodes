@@ -31,7 +31,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { observeTransportQueueRevision } from './transport-queue-revision.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -1109,12 +1109,10 @@ async function dispatchSessionMessage(
     if (result === 'sent') {
       emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
     } else if (result === 'queued') {
+      const queuePayload = buildTransportQueueSnapshotPayload(target.name, 'send_tool');
       timelineEmitter.emit(target.name, 'session.state', {
         state: 'queued',
-        pendingCount: runtime.pendingCount,
-        pendingMessages: runtime.pendingMessages,
-        pendingMessageEntries: runtime.pendingEntries,
-        pendingMessageVersion: observeTransportQueueRevision(target.name, runtime.pendingVersion),
+        ...queuePayload,
       }, { source: 'daemon', confidence: 'high' });
     }
     return result;

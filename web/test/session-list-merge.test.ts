@@ -346,7 +346,7 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.runtimeType).toBe('transport');
   });
 
-  it('clears pending messages when daemon reports a terminal state', () => {
+  it('preserves pending messages when daemon reports a terminal state without structured queue evidence', () => {
     const existing = makeExisting({
       state: 'running',
       transportPendingMessages: ['pending one'],
@@ -355,8 +355,8 @@ describe('mergeSessionListEntry — general field behavior', () => {
 
     const merged = mergeSessionListEntry({ ...BASE_INCOMING, state: 'idle' }, existing);
 
-    expect(merged.transportPendingMessages).toEqual([]);
-    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessages).toEqual(['pending one']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
   });
 
   it('keeps the existing pending queue on running state when broadcast omits it', () => {
@@ -372,7 +372,7 @@ describe('mergeSessionListEntry — general field behavior', () => {
     expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
   });
 
-  it('keeps an explicit queued snapshot even when the daemon session state is idle', () => {
+  it('ignores legacy queued snapshots even when the daemon session state is idle', () => {
     const existing = makeExisting({
       state: 'running',
       transportPendingMessages: ['stale pending'],
@@ -386,11 +386,11 @@ describe('mergeSessionListEntry — general field behavior', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'id-1', text: 'pending one' }],
     }, existing);
 
-    expect(merged.transportPendingMessages).toEqual(['pending one']);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
+    expect(merged.transportPendingMessages).toEqual(['stale pending']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-stale', text: 'stale pending' }]);
   });
 
-  it('clears the existing queue when running snapshot carries explicit empty arrays', () => {
+  it('ignores legacy empty arrays instead of clearing the existing queue', () => {
     const existing = makeExisting({
       state: 'running',
       transportPendingMessages: ['pending one'],
@@ -404,8 +404,8 @@ describe('mergeSessionListEntry — general field behavior', () => {
       transportPendingMessageEntries: [],
     }, existing);
 
-    expect(merged.transportPendingMessages).toEqual([]);
-    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessages).toEqual(['pending one']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'id-1', text: 'pending one' }]);
   });
 });
 
@@ -469,7 +469,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('applies a newer snapshot and advances the baseline', () => {
+  it('ignores a newer legacy snapshot without structured queue identity', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
       state: 'queued',
@@ -477,11 +477,11 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'm9', text: 'fresh one' }],
       transportPendingMessageVersion: 9,
     }, existing);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm9', text: 'fresh one' }]);
-    expect(merged.transportPendingMessageVersion).toBe(9);
+    expect(merged.transportPendingMessageEntries).toEqual([]);
+    expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
-  it('accepts an equal-version snapshot (idempotent redelivery)', () => {
+  it('ignores an equal-version legacy snapshot without structured queue identity', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,
       state: 'queued',
@@ -489,7 +489,7 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
       transportPendingMessageEntries: [{ clientMessageId: 'm7', text: 'v7 entry' }],
       transportPendingMessageVersion: 7,
     }, existing);
-    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'm7', text: 'v7 entry' }]);
+    expect(merged.transportPendingMessageEntries).toEqual([]);
     expect(merged.transportPendingMessageVersion).toBe(7);
   });
 
@@ -517,5 +517,57 @@ describe('mergeSessionListEntry — pending-queue version guard', () => {
     expect(merged.transportPendingMessageEntries).toEqual(existing.transportPendingMessageEntries);
     // Baseline unchanged when the snapshot is unversioned.
     expect(merged.transportPendingMessageVersion).toBe(7);
+  });
+});
+
+describe('mergeSessionListEntry — structured transport queue sync', () => {
+  const existing: SessionInfo = {
+    name: 'deck_proj_brain',
+    project: 'proj',
+    role: 'brain',
+    agentType: 'codex-sdk',
+    state: 'running',
+    runtimeType: 'transport',
+    queueEpoch: 'epoch-1',
+    queueAuthorityId: 'authority-1',
+    transportPendingMessageVersion: 3,
+    transportPendingMessages: ['keep'],
+    transportPendingMessageEntries: [{ clientMessageId: 'keep', text: 'keep' }],
+    failedMessageEntries: [],
+  };
+
+  it('routes structured queue snapshots through the shared reducer and preserves multiline text', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 4,
+      pendingMessageEntries: [{ clientMessageId: 'msg-1', text: '  hello\n\nworld  ' }],
+      failedMessageEntries: [{ clientMessageId: 'failed-1', text: 'failed text' }],
+    }, existing);
+
+    expect(merged.queueEpoch).toBe('epoch-1');
+    expect(merged.queueAuthorityId).toBe('authority-1');
+    expect(merged.transportPendingMessages).toEqual(['  hello\n\nworld  ']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'msg-1', text: '  hello\n\nworld  ' }]);
+    expect(merged.failedMessageEntries).toEqual([{ clientMessageId: 'failed-1', text: 'failed text' }]);
+    expect(merged.transportPendingMessageVersion).toBe(4);
+  });
+
+  it('rejects same-epoch authority mismatch without falling back to legacy merge rules', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-2',
+      pendingMessageVersion: 4,
+      pendingMessageEntries: [{ clientMessageId: 'bad', text: 'must not apply' }],
+    }, existing);
+
+    expect(merged.queueAuthorityId).toBe('authority-1');
+    expect(merged.transportPendingMessages).toEqual(['keep']);
+    expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'keep', text: 'keep' }]);
+    expect(merged.transportPendingMessageVersion).toBe(3);
   });
 });

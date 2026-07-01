@@ -38,7 +38,6 @@ import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersis
 import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
-import { observeTransportQueueRevision } from './transport-queue-revision.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
@@ -59,6 +58,7 @@ import {
   type WorkerSessionSyncStatus,
 } from '../../shared/worker-session-snapshot.js';
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -749,11 +749,7 @@ export async function startup(): Promise<DaemonContext> {
               quotaMeta: session.quotaMeta ?? null,
               effort: session.effort ?? null,
               transportConfig: session.transportConfig ?? null,
-              ...(transportRuntime ? {
-                transportPendingMessages: transportRuntime.pendingMessages,
-                transportPendingMessageEntries: transportRuntime.pendingEntries,
-                transportPendingMessageVersion: observeTransportQueueRevision(session.name, transportRuntime.pendingVersion),
-              } : {}),
+              ...(transportRuntime ? buildTransportQueueSnapshotPayload(session.name, 'lifecycle') : {}),
             });
           } catch { /* ignore */ }
         }

@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildTransportPendingSyncPatch,
   extractTransportPendingMessageEntries,
   extractTransportPendingMessages,
   extractTransportPendingVersion,
-  isLegacyTransportPendingMessageId,
   mergeTransportPendingEntriesForIdleState,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForIdleState,
@@ -17,8 +17,8 @@ import {
 } from '../src/transport-queue.js';
 
 describe('extractTransportPendingMessages', () => {
-  it('keeps only non-empty string entries', () => {
-    expect(extractTransportPendingMessages([' one ', '', 1, null, 'two'])).toEqual(['one', 'two']);
+  it('rejects legacy text-only pending messages for live queue state', () => {
+    expect(extractTransportPendingMessages([' one ', '', 1, null, 'two\nthree'])).toEqual([]);
   });
 });
 
@@ -27,17 +27,16 @@ describe('mergeTransportPendingMessagesForRunningState', () => {
     expect(mergeTransportPendingMessagesForRunningState(['queued one'], undefined, false)).toEqual(['queued one']);
   });
 
-  it('clears queue when running reports explicit empty pending (drain completed)', () => {
-    // Daemon emits explicit empty on drain — messages moved to timeline via user.message
-    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], [], true)).toEqual([]);
+  it('ignores explicit empty legacy pending arrays instead of clearing live queue', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], [], true)).toEqual(['queued one', 'queued two']);
   });
 
   it('preserves queue when running event omits pending field (not queue-authoritative)', () => {
     expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], undefined, false)).toEqual(['queued one', 'queued two']);
   });
 
-  it('replaces the queue when running reports a non-empty pendingMessages array', () => {
-    expect(mergeTransportPendingMessagesForRunningState(['queued one'], ['queued two'], true)).toEqual(['queued two']);
+  it('rejects non-empty legacy pendingMessages arrays from running state', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['queued one'], ['queued two'], true)).toEqual(['queued one']);
   });
 
   it('returns an empty queue when nothing is queued yet', () => {
@@ -45,44 +44,34 @@ describe('mergeTransportPendingMessagesForRunningState', () => {
   });
 
   it('clears when running reports empty after drain (was: preserved, now authoritative)', () => {
-    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], [], true)).toEqual([]);
+    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], [], true)).toEqual(['a', 'b', 'c']);
   });
 
-  it('updates to remaining queue after partial drain', () => {
-    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], ['c'], true)).toEqual(['c']);
+  it('does not accept partial legacy text-only drain snapshots', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], ['c'], true)).toEqual(['a', 'b', 'c']);
   });
 });
 
 describe('extractTransportPendingMessageEntries', () => {
-  it('keeps only entries with a stable id and non-empty text', () => {
+  it('keeps only entries with a stable id and non-empty lossless text', () => {
     expect(extractTransportPendingMessageEntries([
-      { clientMessageId: ' msg-1 ', text: ' one ' },
+      { clientMessageId: ' msg-1 ', text: ' one\n ' },
       { clientMessageId: '', text: 'nope' },
       { clientMessageId: 'msg-2', text: '' },
       null,
       1,
       { clientMessageId: 'msg-3', text: 'two' },
     ])).toEqual([
-      { clientMessageId: 'msg-1', text: 'one' },
+      { clientMessageId: 'msg-1', text: ' one\n ' },
       { clientMessageId: 'msg-3', text: 'two' },
     ]);
   });
 });
 
 describe('synthesizeTransportPendingMessageEntries', () => {
-  it('builds stable legacy entries from pending messages', () => {
+  it('rejects legacy text-only pending messages for live queue state', () => {
     expect(synthesizeTransportPendingMessageEntries(['queued one', 'queued two'], 'deck_test')).toEqual([
-      { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
-      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
-  });
-});
-
-describe('isLegacyTransportPendingMessageId', () => {
-  it('detects synthesized fallback ids only within the same queue scope', () => {
-    expect(isLegacyTransportPendingMessageId('deck_test:legacy:0:queued one', 'deck_test')).toBe(true);
-    expect(isLegacyTransportPendingMessageId('deck_other:legacy:0:queued one', 'deck_test')).toBe(false);
-    expect(isLegacyTransportPendingMessageId('msg-real-1', 'deck_test')).toBe(false);
   });
 });
 
@@ -103,14 +92,11 @@ describe('normalizeTransportPendingMessageEntries', () => {
     ]);
   });
 
-  it('synthesizes legacy entries when only pending messages are present', () => {
+  it('rejects legacy entries when only pending messages are present', () => {
     expect(normalizeTransportPendingEntries(undefined, ['queued one', 'queued two'], 'deck_test', {
       hasEntriesField: false,
       hasMessagesField: true,
-    })).toEqual([
-      { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
-      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
-    ]);
+    })).toEqual([]);
   });
 });
 
@@ -131,16 +117,16 @@ describe('removeTransportPendingEntryForUserMessage', () => {
     });
   });
 
-  it('falls back to normalized text when the echoed user message has no id', () => {
+  it('does not fall back to normalized text when the echoed user message has no id', () => {
     expect(removeTransportPendingEntryForUserMessage(
       [],
       ['queued   one', 'queued two'],
       { text: 'queued one' },
       'deck_test',
     )).toEqual({
-      messages: ['queued two'],
-      entries: [{ clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' }],
-      changed: true,
+      messages: [],
+      entries: [],
+      changed: false,
     });
   });
 
@@ -167,12 +153,12 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ]);
   });
 
-  it('clears entries when running reports explicit empty pending (drain completed)', () => {
+  it('ignores explicit empty legacy entry snapshots instead of clearing live entries', () => {
     const existing = [
       { clientMessageId: 'msg-1', text: 'queued one' },
       { clientMessageId: 'msg-2', text: 'queued two' },
     ];
-    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual([]);
+    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual(existing);
   });
 
   it('preserves entries when running event omits pending field', () => {
@@ -182,13 +168,13 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     expect(mergeTransportPendingEntriesForRunningState(existing, undefined, undefined, false, 'deck_test')).toEqual(existing);
   });
 
-  it('replaces the queue when running reports non-empty pendingMessageEntries', () => {
+  it('ignores non-structured pendingMessageEntries outside the strict queue patch helper', () => {
     expect(mergeTransportPendingEntriesForRunningState([
       { clientMessageId: 'msg-1', text: 'queued one' },
     ], [
       { clientMessageId: 'msg-2', text: 'queued two' },
     ], ['queued two'], true, 'deck_test')).toEqual([
-      { clientMessageId: 'msg-2', text: 'queued two' },
+      { clientMessageId: 'msg-1', text: 'queued one' },
     ]);
   });
 
@@ -208,7 +194,7 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
       { clientMessageId: 'msg-2', text: 'b' },
       { clientMessageId: 'msg-3', text: 'c' },
     ];
-    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual([]);
+    expect(mergeTransportPendingEntriesForRunningState(existing, [], [], true, 'deck_test')).toEqual(existing);
   });
 
   it('updates to remaining entries after partial drain', () => {
@@ -218,6 +204,7 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ], [
       { clientMessageId: 'msg-2', text: 'b' },
     ], ['b'], true, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'a' },
       { clientMessageId: 'msg-2', text: 'b' },
     ]);
   });
@@ -236,12 +223,12 @@ describe('mergeTransportPendingMessagesForIdleState', () => {
     expect(mergeTransportPendingMessagesForIdleState(['queued one'], undefined, false)).toEqual(['queued one']);
   });
 
-  it('clears the queue when idle reports explicit empty pending', () => {
-    expect(mergeTransportPendingMessagesForIdleState(['queued one'], [], true)).toEqual([]);
+  it('ignores explicit empty legacy pending arrays while idle', () => {
+    expect(mergeTransportPendingMessagesForIdleState(['queued one'], [], true)).toEqual(['queued one']);
   });
 
-  it('replaces the queue when idle reports explicit pending messages', () => {
-    expect(mergeTransportPendingMessagesForIdleState(['queued one'], ['queued two'], true)).toEqual(['queued two']);
+  it('rejects non-empty legacy pending messages from idle state', () => {
+    expect(mergeTransportPendingMessagesForIdleState(['queued one'], ['queued two'], true)).toEqual(['queued one']);
   });
 });
 
@@ -254,19 +241,21 @@ describe('mergeTransportPendingEntriesForIdleState', () => {
     ]);
   });
 
-  it('clears entries when idle reports explicit empty queue', () => {
+  it('ignores explicit empty legacy entry snapshots while idle', () => {
     expect(mergeTransportPendingEntriesForIdleState([
       { clientMessageId: 'msg-1', text: 'queued one' },
-    ], [], [], true, 'deck_test')).toEqual([]);
+    ], [], [], true, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ]);
   });
 
-  it('replaces entries when idle reports an explicit queue snapshot', () => {
+  it('ignores non-structured idle queue snapshots outside the strict queue patch helper', () => {
     expect(mergeTransportPendingEntriesForIdleState([
       { clientMessageId: 'msg-1', text: 'queued one' },
     ], [
       { clientMessageId: 'msg-2', text: 'queued two' },
     ], ['queued two'], true, 'deck_test')).toEqual([
-      { clientMessageId: 'msg-2', text: 'queued two' },
+      { clientMessageId: 'msg-1', text: 'queued one' },
     ]);
   });
 });
@@ -318,5 +307,101 @@ describe('nextTransportQueueVersion', () => {
     expect(nextTransportQueueVersion(5, 5)).toBe(5);
     // Never moves backward even if a caller passes a stale value.
     expect(nextTransportQueueVersion(5, 3)).toBe(5);
+  });
+});
+
+describe('buildTransportPendingSyncPatch new queue protocol', () => {
+  it('applies structured epoch/authority snapshots without normalizing multiline text', () => {
+    const patch = buildTransportPendingSyncPatch({}, {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: '  hello\n\nworld   ' },
+      ],
+      failedMessageEntries: [
+        { clientMessageId: 'msg-failed', text: 'failed text' },
+      ],
+    }, 'deck_test');
+
+    expect(patch).toEqual({
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 1,
+      transportPendingMessages: ['  hello\n\nworld   '],
+      transportPendingMessageEntries: [{ clientMessageId: 'msg-1', text: '  hello\n\nworld   ' }],
+      failedMessageEntries: [{ clientMessageId: 'msg-failed', text: 'failed text' }],
+    });
+  });
+
+  it('rejects same-epoch authority mismatch', () => {
+    const patch = buildTransportPendingSyncPatch({
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 3,
+      transportPendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'keep' }],
+    }, {
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-2',
+      pendingMessageVersion: 4,
+      pendingMessageEntries: [{ clientMessageId: 'msg-2', text: 'reject' }],
+    }, 'deck_test');
+
+    expect(patch).toEqual({});
+  });
+
+  it('does not treat wire pendingCount or legacy text arrays as live queue evidence', () => {
+    const patch = buildTransportPendingSyncPatch({
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 2,
+      transportPendingMessageEntries: [{ clientMessageId: 'keep', text: 'keep\nmultiline' }],
+      transportPendingMessages: ['keep\nmultiline'],
+    }, {
+      transportPendingMessages: ['legacy stale text'],
+      pendingCount: 12,
+    }, 'deck_test');
+
+    expect(patch).toEqual({});
+  });
+
+  it('applies recognized runtime_recreated reset and does not resurrect old entries', () => {
+    const patch = buildTransportPendingSyncPatch({
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 5,
+      transportPendingMessageEntries: [{ clientMessageId: 'old', text: 'old text' }],
+      transportPendingMessages: ['old text'],
+    }, {
+      queueEpoch: 'epoch-2',
+      queueAuthorityId: 'authority-2',
+      pendingMessageVersion: 1,
+      resetReason: 'runtime_recreated',
+      pendingMessageEntries: [{ clientMessageId: 'new', text: 'new\ntext' }],
+    }, 'deck_test');
+
+    expect(patch.transportPendingMessageEntries).toEqual([{ clientMessageId: 'new', text: 'new\ntext' }]);
+    expect(patch.transportPendingMessages).toEqual(['new\ntext']);
+    expect(patch.queueEpoch).toBe('epoch-2');
+    expect(patch.queueAuthorityId).toBe('authority-2');
+  });
+
+  it('rejects unknown cross-epoch resets even when pendingCount is non-zero', () => {
+    const patch = buildTransportPendingSyncPatch({
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 5,
+      transportPendingMessageEntries: [{ clientMessageId: 'old', text: 'old text' }],
+      transportPendingMessages: ['old text'],
+    }, {
+      queueEpoch: 'epoch-2',
+      queueAuthorityId: 'authority-2',
+      pendingMessageVersion: 1,
+      resetReason: 'not_real',
+      pendingMessageEntries: [{ clientMessageId: 'bad', text: 'bad text' }],
+      pendingCount: 1,
+    }, 'deck_test');
+
+    expect(patch).toEqual({});
   });
 });

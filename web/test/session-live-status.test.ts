@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../src/session-live-status.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
+import {
+  createTransportQueueReducerState,
+  reduceTransportQueueEvent,
+} from '../../shared/transport-queue-reducer.js';
 
 describe('session-live-status', () => {
   it('treats authoritative running state as busy even when timeline tail is settled', () => {
@@ -32,6 +36,60 @@ describe('session-live-status', () => {
   it('keeps agentless sessions out of live agent status', () => {
     const status = deriveSessionLiveStatus({ sessionState: 'running', isAgentless: true, activeThinking: true });
     expect(status.mode).toBeNull();
+    expect(status.busy).toBe(false);
+  });
+
+  it('uses reducer live entries for queued status and ignores failed-only entries', () => {
+    const liveQueueState = reduceTransportQueueEvent(createTransportQueueReducerState('deck'), {
+      type: 'transport.queue.snapshot',
+      sessionName: 'deck',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [{
+        clientMessageId: 'live',
+        text: 'live',
+        status: 'queued',
+        placement: 'normal',
+        ordinal: 0,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      failedMessageEntries: [],
+      source: 'test',
+    });
+    expect(deriveSessionLiveStatus({ sessionState: 'idle', transportQueueState: liveQueueState }).busy).toBe(true);
+
+    const failedOnlyState = reduceTransportQueueEvent(createTransportQueueReducerState('deck'), {
+      type: 'transport.queue.snapshot',
+      sessionName: 'deck',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+      failedMessageEntries: [{
+        clientMessageId: 'failed',
+        text: 'failed',
+        status: 'failed',
+        placement: 'normal',
+        ordinal: 0,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      source: 'test',
+    });
+    expect(deriveSessionLiveStatus({ sessionState: 'idle', transportQueueState: failedOnlyState }).busy).toBe(false);
+  });
+
+  it('does not treat diagnostic pendingCount or legacy text arrays as live queue authority', () => {
+    const status = deriveSessionLiveStatus({
+      sessionState: 'idle',
+      pendingCount: 99,
+      pendingMessages: ['legacy'],
+      transportPendingMessages: ['legacy'],
+    } as never);
+
+    expect(status.mode).toBe('idle');
     expect(status.busy).toBe(false);
   });
 });

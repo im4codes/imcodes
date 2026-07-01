@@ -97,6 +97,11 @@ export interface AuthoritativeIdlePayload {
   blockingWorkCount: 0;
   activeWorkCount: 0;
   activeToolCount: 0;
+  /**
+   * Diagnostic-only legacy queue count. Transport queue authority lives in the
+   * structured queue snapshot/reducer protocol; this value must not drive live
+   * queue cards, session-live-status, or watch/server queue state.
+   */
   pendingCount: number;
   pendingVersion: number;
   decisionReason: string;

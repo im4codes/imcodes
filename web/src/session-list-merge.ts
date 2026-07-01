@@ -24,11 +24,8 @@ import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-c
 import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
 import {
-  extractTransportPendingMessages,
-  extractTransportPendingVersion,
-  nextTransportQueueVersion,
-  normalizeTransportPendingEntries,
-  shouldApplyTransportQueueSnapshotForPayload,
+  buildTransportPendingSyncPatch,
+  hasTransportPendingSyncSnapshot,
 } from './transport-queue.js';
 
 /**
@@ -68,7 +65,12 @@ export interface IncomingSessionListEntry {
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
+  pendingMessageEntries?: unknown;
   transportPendingMessageVersion?: unknown;
+  queueEpoch?: unknown;
+  queueAuthorityId?: unknown;
+  failedMessageEntries?: unknown;
+  pendingMessageVersion?: unknown;
   sharedState?: SessionInfo['sharedState'];
   /** DAEMON-AUTHORITATIVE: whether this session may serve as an execution-clone
    *  template. Computed by the daemon; the UI renders it rather than recomputing
@@ -113,55 +115,26 @@ export function mergeSessionListEntry(
   // preserve the last known value so the footer doesn't flicker blank between
   // updates instead of dropping it to undefined.
   const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk';
-  const shouldKeepPendingQueue = incoming.state === 'queued' || incoming.state === 'running';
-  const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(incoming, 'transportPendingMessages');
-  const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(incoming, 'transportPendingMessageEntries');
-  const hasExplicitPendingSnapshot = hasPendingMessagesField || hasPendingEntriesField;
-
-  const parsedMessages = extractTransportPendingMessages(incoming.transportPendingMessages);
-  const normalizedEntries = normalizeTransportPendingEntries(
-    incoming.transportPendingMessageEntries,
-    parsedMessages,
-    incoming.name,
-    {
-      hasEntriesField: hasPendingEntriesField,
-      hasMessagesField: hasPendingMessagesField,
-    },
-  );
-  const normalizedMessages = hasPendingEntriesField
-    ? normalizedEntries.map((entry) => entry.text)
-    : parsedMessages;
-
-  // Monotonic version guard: a `session_list` heartbeat can be built before
-  // a drain but delivered after it. If this snapshot's queue version is older
-  // than what we've already applied, it is stale — keep the existing queue so
-  // it can't resurrect already-drained entries.
-  const incomingVersion = extractTransportPendingVersion(incoming.transportPendingMessageVersion);
-  const existingVersion = existing?.transportPendingMessageVersion;
-  const applyPendingSnapshot = hasExplicitPendingSnapshot
-    && shouldApplyTransportQueueSnapshotForPayload(existingVersion, incomingVersion, {
-      hasExplicitSnapshot: true,
-      isExplicitEmpty: normalizedMessages.length === 0 && normalizedEntries.length === 0,
-    });
-
-  const nextPendingMessages = applyPendingSnapshot
-    ? normalizedMessages
-    : hasExplicitPendingSnapshot
-      // Stale snapshot — keep what we have rather than overwrite.
-      ? (existing?.transportPendingMessages ?? [])
-      : shouldKeepPendingQueue
-        ? (existing?.transportPendingMessages ?? [])
-        : [];
-  const nextPendingEntries = applyPendingSnapshot
-    ? normalizedEntries
-    : hasExplicitPendingSnapshot
-      ? (existing?.transportPendingMessageEntries ?? [])
-      : shouldKeepPendingQueue
-        ? (existing?.transportPendingMessageEntries ?? [])
-        : [];
-  const nextPendingVersion = applyPendingSnapshot
-    ? nextTransportQueueVersion(existingVersion, incomingVersion)
-    : existingVersion;
+  const pendingSyncPatch = hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
+    ? buildTransportPendingSyncPatch({
+      transportPendingMessages: existing?.transportPendingMessages,
+      transportPendingMessageEntries: existing?.transportPendingMessageEntries,
+      transportPendingMessageVersion: existing?.transportPendingMessageVersion,
+      queueEpoch: existing?.queueEpoch,
+      queueAuthorityId: existing?.queueAuthorityId,
+      failedMessageEntries: existing?.failedMessageEntries,
+    }, incoming as unknown as Record<string, unknown>, incoming.name)
+    : {};
+  const hasPendingSyncPatch = Object.keys(pendingSyncPatch).length > 0;
+  const nextPendingMessages = hasPendingSyncPatch
+    ? pendingSyncPatch.transportPendingMessages ?? []
+    : existing?.transportPendingMessages ?? [];
+  const nextPendingEntries = hasPendingSyncPatch
+    ? pendingSyncPatch.transportPendingMessageEntries ?? []
+    : existing?.transportPendingMessageEntries ?? [];
+  const nextPendingVersion = hasPendingSyncPatch
+    ? pendingSyncPatch.transportPendingMessageVersion ?? existing?.transportPendingMessageVersion
+    : existing?.transportPendingMessageVersion;
 
   return {
     name: incoming.name,
@@ -203,6 +176,9 @@ export function mergeSessionListEntry(
     ),
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
+    queueEpoch: hasPendingSyncPatch ? (pendingSyncPatch.queueEpoch ?? existing?.queueEpoch) : existing?.queueEpoch,
+    queueAuthorityId: hasPendingSyncPatch ? (pendingSyncPatch.queueAuthorityId ?? existing?.queueAuthorityId) : existing?.queueAuthorityId,
+    failedMessageEntries: hasPendingSyncPatch ? (pendingSyncPatch.failedMessageEntries ?? []) : (existing?.failedMessageEntries ?? []),
     transportPendingMessageVersion: nextPendingVersion,
     sharedState: incoming.sharedState ?? existing?.sharedState,
     executionTemplateEligible: incoming.executionTemplateEligible ?? existing?.executionTemplateEligible,

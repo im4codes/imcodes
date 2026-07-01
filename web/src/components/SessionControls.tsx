@@ -44,7 +44,7 @@ import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
-import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
+import { normalizeTransportPendingEntries } from '../transport-queue.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -366,10 +366,6 @@ function dataTransferHasFiles(dataTransfer: DataTransfer | null | undefined): bo
   } catch {
     return false;
   }
-}
-
-function normalizeQueuedText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
 }
 
 function appendComposerNewline(parts: string[]): void {
@@ -928,16 +924,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
-        activeSession?.transportPendingMessages,
+        undefined,
         activeSession?.name ?? '',
         {
           // This is already-normalized session state, not a raw daemon payload.
-          // Keep legacy messages visible when older state lacks structured
-          // entries, but do not synthesize tails for partial structured entries.
           hasEntriesField: Array.isArray(activeSession?.transportPendingMessageEntries)
             && (activeSession.transportPendingMessageEntries.length > 0
               || typeof activeSession.transportPendingMessageVersion === 'number'),
-          hasMessagesField: Array.isArray(activeSession?.transportPendingMessages),
+          hasMessagesField: false,
         },
       )
     : [];
@@ -997,7 +991,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     : null;
 
   const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
-    !!activeSession && !isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
+    !!activeSession && !!entry.clientMessageId
   ), [activeSession]);
   const isLocalQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
     !!optimisticQueuedEntries?.some((item) => item.clientMessageId === entry.clientMessageId)
@@ -1493,27 +1487,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws || !activeSession) return;
     return ws.onMessage((msg: ServerMessage) => {
       const removeLocalQueuedEntry = (commandId: string, text?: string) => {
-        if (!commandId && !text) return;
-        const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
+        void text;
+        if (!commandId) return;
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
-          const matchIndex = commandId
-            ? prev.findIndex((entry) => entry.clientMessageId === commandId)
-            : -1;
-          const fallbackIndex = matchIndex >= 0
-            ? matchIndex
-            : (() => {
-                // If a stable id/command id was provided but did not match, do
-                // not fall back to text: duplicate prompts would remove the
-                // wrong queued card and leave the real one stuck.
-                if (commandId || !normalizedText) return -1;
-                const matches = prev
-                  .map((entry, index) => ({ entry, index }))
-                  .filter(({ entry }) => normalizeQueuedText(entry.text) === normalizedText);
-                return matches.length === 1 ? matches[0].index : -1;
-              })();
-          if (fallbackIndex < 0) return prev;
-          const next = prev.filter((_, index) => index !== fallbackIndex);
+          const next = prev.filter((entry) => entry.clientMessageId !== commandId);
+          if (next.length === prev.length) return prev;
           return next.length > 0 ? next : null;
         });
       };
@@ -1575,18 +1554,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         removeLocalQueuedEntry(commandId, deliveredText);
         // Record the delivered id so a stale daemon pending snapshot can't keep
         // showing it as queued (the incoming snapshot is not under our control,
-        // unlike the optimistic set cleared above).  Legacy snapshots synthesize
-        // ids from text, so also settle the single matching legacy id when the
-        // authoritative timeline echo carries a newer real command/client id.
+        // unlike the optimistic set cleared above).
         const idsToSettle = commandId ? [commandId] : [];
-        const normalizedDeliveredText = typeof deliveredText === 'string' ? normalizeQueuedText(deliveredText) : '';
-        if (normalizedDeliveredText) {
-          const legacyTextMatches = incomingQueuedTransportEntries
-            .filter((entry) => isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
-              && normalizeQueuedText(entry.text) === normalizedDeliveredText)
-            .map((entry) => entry.clientMessageId);
-          if (legacyTextMatches.length === 1) idsToSettle.push(legacyTextMatches[0]);
-        }
         if (idsToSettle.length > 0) {
           setSettledQueuedIds((prev) => {
             let changed = false;
@@ -1601,12 +1570,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           });
         }
       } else if (event.type === 'session.state') {
-        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries')
-          || Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries');
         const queuedEntries = normalizeTransportPendingEntries(
           event.payload.pendingMessageEntries,
-          event.payload.pendingMessages,
+          undefined,
           activeSession.name,
+          { hasEntriesField: Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries') },
         );
         if (queuedEntries.length === 0) {
           if (hasPendingSnapshot) setOptimisticQueuedEntries(null);

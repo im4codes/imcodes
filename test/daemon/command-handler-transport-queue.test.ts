@@ -346,9 +346,12 @@ import { getDefaultTimelineDetailStore } from '../../src/daemon/timeline-detail-
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
 import {
-  bumpTransportQueueRevision,
   clearAllTransportQueueRevisions,
 } from '../../src/daemon/transport-queue-revision.js';
+import {
+  getTransportQueueStore,
+  resetTransportQueueStoreForTests,
+} from '../../src/daemon/transport-queue-store.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -491,6 +494,7 @@ describe('handleWebCommand transport queue behavior', () => {
     ensureProviderConnectedMock.mockReset();
     __resetTransportListModelsCacheForTests();
     clearAllTransportQueueRevisions();
+    resetTransportQueueStoreForTests();
     getDefaultTimelineDetailStore().clear();
     searchLocalMemoryMock.mockResolvedValue(emptyMemorySearchResult());
     searchLocalMemoryAuthorizedMock.mockReturnValue(emptyMemorySearchResult());
@@ -508,6 +512,7 @@ describe('handleWebCommand transport queue behavior', () => {
   afterEach(() => {
     resetMemoryFeatureConfigStoreForTests();
     clearAllTransportQueueRevisions();
+    resetTransportQueueStoreForTests();
     vi.unstubAllEnvs();
     if (memoryFeatureConfigTempDir) {
       rmSync(memoryFeatureConfigTempDir, { recursive: true, force: true });
@@ -652,6 +657,21 @@ describe('handleWebCommand transport queue behavior', () => {
         nextCoverageRecheckAt: null,
       },
     };
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued',
+      text: 'queued msg',
+      commandId: 'cmd-queued',
+      sharedActor,
+      now: 100,
+    });
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued-2',
+      text: 'queued msg 2',
+      commandId: 'cmd-queued-2',
+      now: 101,
+    });
     const send = vi.fn(() => 'queued');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -679,16 +699,26 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       expect.objectContaining({
         state: 'queued',
-        pendingCount: 2,
-        pendingMessages: ['queued msg', 'queued msg 2'],
         pendingMessageEntries: [
-          { clientMessageId: 'cmd-queued', text: 'queued msg', sharedActor },
-          { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+          expect.objectContaining({ clientMessageId: 'cmd-queued', text: 'queued msg' }),
+          expect.objectContaining({ clientMessageId: 'cmd-queued-2', text: 'queued msg 2' }),
         ],
         pendingMessageVersion: expect.any(Number),
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          pendingMessageEntries: [
+            expect.objectContaining({ clientMessageId: 'cmd-queued', text: 'queued msg' }),
+            expect.objectContaining({ clientMessageId: 'cmd-queued-2', text: 'queued msg 2' }),
+          ],
+        }),
       }),
       expect.any(Object),
     );
+    const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
+    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'user.message',
@@ -705,6 +735,13 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('re-acks a bridge-retried session.send for an already-owned commandId (recovers a lost ack, no stuck spinner)', async () => {
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-retry',
+      text: 'retry msg',
+      commandId: 'cmd-retry',
+      now: 100,
+    });
     const send = vi.fn(() => 'queued');
     getProviderMock.mockReturnValue({ id: 'mock-provider' });
     getTransportRuntimeMock.mockReturnValue({
@@ -743,13 +780,38 @@ describe('handleWebCommand transport queue behavior', () => {
     // Re-syncs the authoritative queue snapshot.
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'session.state', expect.objectContaining({
       state: 'queued',
-      pendingMessageEntries: [{ clientMessageId: 'cmd-retry', text: 'retry msg' }],
+      pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'cmd-retry', text: 'retry msg' })],
+      queueEpoch: expect.any(String),
+      queueAuthorityId: expect.any(String),
+      queueSnapshot: expect.objectContaining({
+        type: 'transport.queue.snapshot',
+        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'cmd-retry', text: 'retry msg' })],
+      }),
     }), expect.any(Object));
     // The retry must NOT re-dispatch the message to the provider.
     expect(send).toHaveBeenCalledTimes(1);
   });
 
   it('queues ask.answer at the front when no provider pending-question resolver accepts it', async () => {
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'ask-answer-id',
+      text: 'selected option',
+      placement: 'front',
+      now: 100,
+    });
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued',
+      text: 'queued msg',
+      now: 101,
+    });
+    const committed = getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued-2',
+      text: 'queued msg 2',
+      now: 102,
+    });
     const send = vi.fn(() => 'queued');
     getProviderMock.mockReturnValue({ id: 'mock-provider' });
     getTransportRuntimeMock.mockReturnValue({
@@ -784,17 +846,24 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       expect.objectContaining({
         state: 'queued',
-        pendingCount: 3,
-        pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
         pendingMessageEntries: [
-          { clientMessageId: 'ask-answer-id', text: 'selected option' },
-          { clientMessageId: 'cmd-queued', text: 'queued msg' },
-          { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+          expect.objectContaining({ clientMessageId: 'ask-answer-id', text: 'selected option', placement: 'front' }),
+          expect.objectContaining({ clientMessageId: 'cmd-queued', text: 'queued msg', placement: 'normal' }),
+          expect.objectContaining({ clientMessageId: 'cmd-queued-2', text: 'queued msg 2', placement: 'normal' }),
         ],
-        pendingMessageVersion: 7,
+        pendingMessageVersion: committed.pendingMessageVersion,
+        queueEpoch: committed.queueEpoch,
+        queueAuthorityId: committed.queueAuthorityId,
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          source: 'command_handler_ask_answer',
+        }),
       }),
       expect.any(Object),
     );
+    const answerStateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
+    expect(answerStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(answerStateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
   it('dispatches /clear as a fresh claude-code-sdk relaunch', async () => {
@@ -1028,6 +1097,12 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('dispatches direct session.cancel immediately for transport sessions without emitting /stop text', async () => {
+    const committed = getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'sqlite-queued',
+      text: 'sqlite queued',
+      now: 100,
+    });
     const cancel = vi.fn().mockResolvedValue(undefined);
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -1058,15 +1133,26 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      {
+      expect.objectContaining({
         state: 'idle',
-        pendingCount: 3,
-        pendingMessages: ['a', 'b', 'c'],
-        pendingMessageEntries: [],
-        pendingMessageVersion: expect.any(Number),
-      },
+        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'sqlite-queued', text: 'sqlite queued' })],
+        pendingMessageVersion: committed.pendingMessageVersion,
+        queueEpoch: committed.queueEpoch,
+        queueAuthorityId: committed.queueAuthorityId,
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          source: 'command_handler_cancel_idle',
+        }),
+      }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
+    const idleStateCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle'
+    ));
+    expect(idleStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(idleStateCall?.[2]).not.toHaveProperty('pendingMessages');
     const stopFeedbackOrder = firstInvocationOrder((call) =>
       call[0] === 'deck_transport_brain'
       && call[1] === 'session.state'
@@ -2617,13 +2703,27 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       expect.objectContaining({
         state: 'queued',
-        pendingCount: 1,
         pendingMessageEntries: [
-          { clientMessageId: 'cmd-offline-1', text: 'first msg while offline' },
+          expect.objectContaining({ commandId: 'cmd-offline-1', clientMessageId: expect.any(String), text: 'first msg while offline' }),
         ],
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
       }),
       expect.objectContaining({ source: 'daemon' }),
     );
+    const offlineStateCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as { pendingMessageEntries?: unknown[] }).pendingMessageEntries?.some((entry) => (
+        (entry as { commandId?: string }).commandId === 'cmd-offline-1'
+      ))
+    ));
+    const offlineEntry = ((offlineStateCall?.[2] as { pendingMessageEntries?: Array<{ clientMessageId?: string; commandId?: string }> } | undefined)?.pendingMessageEntries ?? [])
+      .find((entry) => entry.commandId === 'cmd-offline-1');
+    expect(offlineEntry?.clientMessageId).toEqual(expect.any(String));
+    expect(offlineEntry?.clientMessageId).not.toBe('cmd-offline-1');
+    expect(offlineStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(offlineStateCall?.[2]).not.toHaveProperty('pendingMessages');
 
     // 5. The entry is actually sitting in the resend queue for later drain.
     expect(getResendEntries('deck_transport_brain')).toEqual([
@@ -2819,13 +2919,27 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       expect.objectContaining({
         state: 'queued',
-        pendingCount: 1,
         pendingMessageEntries: [
-          { clientMessageId: 'cmd-stale-runtime', text: 'hello after restart' },
+          expect.objectContaining({ commandId: 'cmd-stale-runtime', clientMessageId: expect.any(String), text: 'hello after restart' }),
         ],
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
       }),
       expect.objectContaining({ source: 'daemon' }),
     );
+    const staleRuntimeStateCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as { pendingMessageEntries?: unknown[] }).pendingMessageEntries?.some((entry) => (
+        (entry as { commandId?: string }).commandId === 'cmd-stale-runtime'
+      ))
+    ));
+    const staleRuntimeEntry = ((staleRuntimeStateCall?.[2] as { pendingMessageEntries?: Array<{ clientMessageId?: string; commandId?: string }> } | undefined)?.pendingMessageEntries ?? [])
+      .find((entry) => entry.commandId === 'cmd-stale-runtime');
+    expect(staleRuntimeEntry?.clientMessageId).toEqual(expect.any(String));
+    expect(staleRuntimeEntry?.clientMessageId).not.toBe('cmd-stale-runtime');
+    expect(staleRuntimeStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(staleRuntimeStateCall?.[2]).not.toHaveProperty('pendingMessages');
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
       commandId: 'cmd-stale-runtime',
@@ -3183,7 +3297,13 @@ describe('handleWebCommand transport queue behavior', () => {
   });
 
   it('edits a queued transport message by clientMessageId', async () => {
-    const previousRevision = bumpTransportQueueRevision('deck_transport_brain');
+    const before = getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued',
+      text: 'queued send',
+      now: 100,
+    });
+    const previousRevision = before.pendingMessageVersion;
     const editPendingMessage = vi.fn(() => true);
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -3208,22 +3328,37 @@ describe('handleWebCommand transport queue behavior', () => {
     const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
     expect(stateCall).toBeTruthy();
     expect((stateCall?.[2] as { pendingMessageVersion?: number }).pendingMessageVersion).toBeGreaterThan(previousRevision);
+    expect(stateCall?.[2]).toEqual(expect.objectContaining({
+      queueEpoch: before.queueEpoch,
+      queueAuthorityId: before.queueAuthorityId,
+      failedMessageEntries: [],
+    }));
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
       expect.objectContaining({
         state: 'queued',
-        pendingCount: 1,
-        pendingMessages: ['edited queued'],
-        pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'edited queued' }],
+        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'cmd-queued', text: 'edited queued' })],
         pendingMessageVersion: expect.any(Number),
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'cmd-queued', text: 'edited queued' })],
+        }),
       }),
       expect.any(Object),
     );
+    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
   it('removes a queued transport message by clientMessageId', async () => {
-    const previousRevision = bumpTransportQueueRevision('deck_transport_brain');
+    const before = getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued',
+      text: 'queued msg',
+      now: 100,
+    });
+    const previousRevision = before.pendingMessageVersion;
     const removePendingMessage = vi.fn(() => ({ clientMessageId: 'cmd-queued', text: 'queued msg' }));
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -3247,12 +3382,29 @@ describe('handleWebCommand transport queue behavior', () => {
     const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
     expect(stateCall).toBeTruthy();
     expect((stateCall?.[2] as { pendingMessageVersion?: number }).pendingMessageVersion).toBeGreaterThan(previousRevision);
+    expect(stateCall?.[2]).toEqual(expect.objectContaining({
+      queueEpoch: before.queueEpoch,
+      queueAuthorityId: before.queueAuthorityId,
+      failedMessageEntries: [],
+      dropReason: 'user_cleared',
+    }));
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      expect.objectContaining({ state: 'running', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [], pendingMessageVersion: expect.any(Number) }),
+      expect.objectContaining({
+        state: 'running',
+        pendingMessageEntries: [],
+        pendingMessageVersion: expect.any(Number),
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          pendingMessageEntries: [],
+          dropReason: 'user_cleared',
+        }),
+      }),
       expect.any(Object),
     );
+    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
   it('deduplicates concurrent session.restart requests for the same transport session', async () => {

@@ -26,6 +26,7 @@ import {
 } from '../../shared/sdk-subagent-status.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -216,6 +217,7 @@ describe('TransportSessionRuntime', () => {
   let runtime: TransportSessionRuntime;
 
   beforeEach(async () => {
+    resetTransportQueueStoreForTests();
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
@@ -226,6 +228,7 @@ describe('TransportSessionRuntime', () => {
   });
 
   afterEach(() => {
+    resetTransportQueueStoreForTests();
     vi.unstubAllEnvs();
   });
 
@@ -662,6 +665,21 @@ describe('TransportSessionRuntime', () => {
     await flushDispatch();
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.pendingVersion).toBe(5);
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'transport.queue.delivery',
+      expect.objectContaining({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_test_brain',
+        clientMessageId: 'q2',
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        pendingMessageVersion: expect.any(Number),
+        deliveryFrameId: expect.any(String),
+        deliveryFrameVersion: expect.any(Number),
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
   });
 
   it('fails closed on provider active/stale snapshots and drains after current-clear without Stop', async () => {

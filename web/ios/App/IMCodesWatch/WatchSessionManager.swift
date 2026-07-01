@@ -68,6 +68,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     func syncSnapshot(_ context: WatchApplicationContext) {
         applicationContext = context
+        reconcileCommandReceipts(from: context)
         bootstrapFromContext(context, triggerReload: true)
         resolvePendingRouteIfPossible()
     }
@@ -391,6 +392,28 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
     }
 
+    private func reconcileCommandReceipts(from context: WatchApplicationContext) {
+        for row in context.sessions {
+            let receipts = row.allCommandReceipts
+            guard !receipts.isEmpty else { continue }
+            let route = WatchRoute(serverId: row.serverId, sessionName: row.sessionName, title: row.title)
+            updateHistoryState(for: route) { state in
+                state.items = state.items.map { item in
+                    guard let commandId = item.commandId,
+                          let receipt = receipts.last(where: { $0.commandId == commandId }) else {
+                        return item
+                    }
+                    guard receipt.status == "error" else { return item }
+                    var updated = item
+                    updated.isPending = false
+                    updated.isFailed = true
+                    updated.failureReason = receipt.reason ?? "Send failed"
+                    return updated
+                }
+            }
+        }
+    }
+
     private func pruneSessionState(for serverId: String, keepingSessionNames: Set<String>) {
         historyByRoute = historyByRoute.filter { key, _ in
             let prefix = "\(serverId):"
@@ -498,6 +521,7 @@ extension WatchSessionManager: WCSessionDelegate {
         Task { @MainActor in
             if let decoded = self.decodeContext(applicationContext) {
                 self.applicationContext = decoded
+                self.reconcileCommandReceipts(from: decoded)
                 self.bootstrapFromContext(decoded, triggerReload: true)
                 self.lastErrorMessage = nil
                 self.resolvePendingRouteIfPossible()

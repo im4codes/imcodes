@@ -66,6 +66,7 @@ import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { buildTransportQueueSnapshotPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
@@ -347,7 +348,7 @@ export async function stopProject(
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
-        clearResend(record.name);
+        clearResend(record.name, 'session_removed');
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -1060,6 +1061,19 @@ function previewTransportQueueText(text: string): string {
   return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
 }
 
+function buildTransportQueueSessionStatePayload(
+  sessionName: string,
+  state: SessionState | 'queued',
+  source: string,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    state,
+    ...(extra ?? {}),
+    ...buildTransportQueueSnapshotPayload(sessionName, source),
+  };
+}
+
 export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): DaemonTransportQueuesSnapshot {
   const resendQueues = listFreshResendQueues(nowMs);
   const resendBySession = new Map(resendQueues.map((queue) => [queue.sessionName, queue.entries]));
@@ -1223,21 +1237,18 @@ async function recoverTransportRuntimeAfterError(
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
       if (pendingCount > 0) {
-        const queued = getResendEntries(sessionName);
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'queued',
-          pendingCount,
-          pendingMessages: queued.map((entry) => entry.text),
-          pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
-          pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
-        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_error_recovery_loop'),
+          { source: 'daemon', confidence: 'high' },
+        );
       }
       return false;
     }
     transportErrorRecoveryTimestamps.set(sessionName, [...recentRecoveries, now]);
 
     if (pendingCount > 0) {
-      const queued = getResendEntries(sessionName);
       const recoveryReason = providerError?.code === PROVIDER_ERROR_CODES.CONNECTION_LOST
         ? 'Provider connection lost'
         : 'Provider became stuck busy';
@@ -1246,13 +1257,12 @@ async function recoverTransportRuntimeAfterError(
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'session.state', {
-        state: 'queued',
-        pendingCount,
-        pendingMessages: queued.map((entry) => entry.text),
-        pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
-        pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
-      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_error_recovery'),
+        { source: 'daemon', confidence: 'high' },
+      );
     }
 
     await stopTransportRuntimeSession(sessionName).catch((err) => {
@@ -1385,6 +1395,11 @@ async function drainTransportResendQueueIntoRuntime(
                     ...(entry.historyCommitted ? { historyCommitted: true } : {}),
                   })));
         if (result === 'sent' && !entry.timelineCommitted) {
+          const clientMessageId = entry.clientMessageId;
+          if (!clientMessageId) {
+            logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend drain sent without clientMessageId; user.message projection skipped');
+            return result;
+          }
           timelineEmitter.emit(
             sessionName,
             'user.message',
@@ -1392,36 +1407,33 @@ async function drainTransportResendQueueIntoRuntime(
               text: entry.text,
               allowDuplicate: true,
               commandId: entry.commandId,
-              clientMessageId: entry.commandId,
+              clientMessageId,
               pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
               ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             },
-            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+            { source: 'daemon', confidence: 'high', eventId: `transport-user:${clientMessageId}` },
           );
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'running',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
+            { source: 'daemon', confidence: 'high' },
+          );
         } else if (result === 'sent') {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'running',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
+            { source: 'daemon', confidence: 'high' },
+          );
         } else if (result === 'queued') {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'queued',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_resend_drain_queued'),
+            { source: 'daemon', confidence: 'high' },
+          );
         }
         return result;
       },
@@ -1456,14 +1468,25 @@ async function drainTransportResendQueueIntoRuntime(
           { source: 'daemon', confidence: 'high' },
         );
       },
+      ({ deliveryFacts }) => {
+        for (const fact of deliveryFacts) {
+          timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
+            source: 'daemon',
+            confidence: 'high',
+          });
+        }
+      },
     );
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      buildTransportQueueSessionStatePayload(
+        sessionName,
+        runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        'transport_resend_drain_complete',
+      ),
+      { source: 'daemon', confidence: 'high' },
+    );
   } catch (err) {
     logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
   }
@@ -1520,11 +1543,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.clearInputs = [
         { source: 'transport-runtime', reason: 'clear', count: 0 },
       ];
-      payload.pendingCount = runtime.pendingCount;
-      payload.pendingMessages = runtime.pendingMessages;
-      payload.pendingMessageEntries = runtime.pendingEntries;
-      payload.pendingVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
-      payload.pendingMessageVersion = payload.pendingVersion;
+      Object.assign(payload, buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle'));
     } else if (mapped === 'error' && providerError?.message) {
       payload.error = providerError.message;
     }
@@ -1561,16 +1580,15 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // leave the queue UI simultaneously. The runtime's pending queue is now [] (or
     // contains any NEW messages queued since drain started).
     persistTransportState('running');
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'running',
-      activityGeneration: metadata.activityGeneration,
-      drainMetadata: metadata,
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_drain', {
+        activityGeneration: metadata.activityGeneration,
+        drainMetadata: metadata,
+      }),
+      { source: 'daemon', confidence: 'high' },
+    );
   };
   runtime.onProviderSessionReady = () => {
     // The provider session just bound (initialize/reconnect completed). Drain
@@ -2199,8 +2217,7 @@ export async function restoreTransportSessions(
       await reconcileTransportRestoreOrphanTools(s.name, runtime);
       await reconcileTimelineRestoreOrphanSdkSubagents(s.name, runtime);
       const restoredActivity = runtime.getDiagnosticSnapshot();
-      timelineEmitter.emit(s.name, 'session.state', {
-        state: 'idle',
+      timelineEmitter.emit(s.name, 'session.state', buildTransportQueueSessionStatePayload(s.name, 'idle', 'restore_reconnect_observed', {
         activityGeneration: restoredActivity.activityGeneration,
         blockingWorkCount: restoredActivity.blockingWorkCount,
         activeWorkCount: restoredActivity.blockingWorkCount,
@@ -2208,12 +2225,7 @@ export async function restoreTransportSessions(
         busyReasons: restoredActivity.busyReasons,
         decisionReason: 'restore_reconnect_observed',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
-        pendingCount: runtime.pendingCount,
-        pendingMessages: runtime.pendingMessages,
-        pendingMessageEntries: runtime.pendingEntries,
-        pendingVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
-        pendingMessageVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
-      }, { source: 'daemon', confidence: 'high' });
+      }), { source: 'daemon', confidence: 'high' });
       logger.info({
         session: s.name,
         providerId: s.providerId,

@@ -141,6 +141,226 @@ describe('watch projection store', () => {
     expect(store.getSnapshot().sessions[0]?.state).toBe('working');
   });
 
+  it('does not treat legacy pendingCount or text-only queue fields as watch working evidence', () => {
+    const { store } = makeSnapshotStore(2_600);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'idle' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'legacy-pending-count',
+      sessionId: 'deck_proj_brain',
+      ts: 2_610,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'low',
+      type: 'session.state',
+      payload: {
+        state: 'idle',
+        pendingCount: 7,
+        pendingMessages: ['legacy queued'],
+        transportPendingMessages: ['legacy queued'],
+      },
+    } as any);
+
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+    expect(store.getSnapshot().sessions[0]?.transportPendingMessageEntries).toBeUndefined();
+    expect(store.getSnapshot().sessions[0]?.transportPendingMessageVersion).toBeUndefined();
+  });
+
+  it('uses structured queue identity for watch rows without normalizing multiline pending text', () => {
+    const { store } = makeSnapshotStore(2_700);
+    const multiline = '  first line\n\nsecond line  ';
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        {
+          name: 'deck_proj_brain',
+          project: 'Project',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+          queueEpoch: 'epoch-1',
+          queueAuthorityId: 'authority-1',
+          transportPendingMessageVersion: 2,
+          transportPendingMessageEntries: [{ clientMessageId: 'client-1', text: multiline, commandId: 'cmd-1' }],
+          transportPendingMessages: ['legacy stale text'],
+          pendingCount: 99,
+        } as any,
+      ],
+    );
+
+    const row = store.getSnapshot().sessions[0];
+    expect(row).toMatchObject({
+      state: 'working',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 2,
+      transportPendingMessageEntries: [{ clientMessageId: 'client-1', text: multiline, status: 'queued', commandId: 'cmd-1' }],
+    });
+    expect(JSON.stringify(row)).not.toContain('legacy stale text');
+  });
+
+  it('applies reducer-equivalent queue gates across delivery, stale snapshot, and reset', () => {
+    const { store } = makeSnapshotStore(2_800);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [{ name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'idle' }],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'q1',
+      sessionId: 'deck_proj_brain',
+      ts: 1,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'transport.queue.snapshot',
+      payload: {
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 2,
+        pendingMessageEntries: [{ clientMessageId: 'client-new', text: 'new\ntext', status: 'queued', placement: 'normal', ordinal: 0, createdAt: 1, updatedAt: 1 }],
+        failedMessageEntries: [],
+        source: 'test',
+      },
+    } as any);
+    expect(store.getSnapshot().sessions[0]?.transportPendingMessageEntries?.map((entry) => entry.text)).toEqual(['new\ntext']);
+
+    store.handleTimelineEvent({
+      eventId: 'q-stale',
+      sessionId: 'deck_proj_brain',
+      ts: 2,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'transport.queue.snapshot',
+      payload: {
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [{ clientMessageId: 'client-old', text: 'old resurrected', status: 'queued', placement: 'normal', ordinal: 0, createdAt: 1, updatedAt: 1 }],
+        failedMessageEntries: [],
+        source: 'test',
+      },
+    } as any);
+    expect(store.getSnapshot().sessions[0]?.transportPendingMessageEntries?.map((entry) => entry.clientMessageId)).toEqual(['client-new']);
+
+    store.handleTimelineEvent({
+      eventId: 'q-delivery',
+      sessionId: 'deck_proj_brain',
+      ts: 3,
+      seq: 3,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'transport.queue.delivery',
+      payload: {
+        clientMessageId: 'client-new',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 3,
+        deliveryFrameId: 'frame-1',
+        deliveryFrameVersion: 1,
+      },
+    } as any);
+    expect(store.getSnapshot().sessions[0]).toMatchObject({
+      state: 'idle',
+      transportPendingMessageVersion: 3,
+      transportPendingMessageEntries: [],
+    });
+
+    store.handleTimelineEvent({
+      eventId: 'q-cross-epoch',
+      sessionId: 'deck_proj_brain',
+      ts: 4,
+      seq: 4,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'transport.queue.snapshot',
+      payload: {
+        queueEpoch: 'epoch-2',
+        queueAuthorityId: 'authority-2',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [{ clientMessageId: 'bad-cross-epoch', text: 'bad', status: 'queued', placement: 'normal', ordinal: 0, createdAt: 1, updatedAt: 1 }],
+        failedMessageEntries: [],
+        source: 'test',
+      },
+    } as any);
+    expect(store.getSnapshot().sessions[0]?.queueEpoch).toBe('epoch-1');
+
+    store.handleTimelineEvent({
+      eventId: 'q-reset',
+      sessionId: 'deck_proj_brain',
+      ts: 5,
+      seq: 5,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'transport.queue.reset',
+      payload: {
+        queueEpoch: 'epoch-2',
+        queueAuthorityId: 'authority-2',
+        pendingMessageVersion: 1,
+        resetReason: 'runtime_recreated',
+      },
+    } as any);
+    expect(store.getSnapshot().sessions[0]).toMatchObject({
+      queueEpoch: 'epoch-2',
+      queueAuthorityId: 'authority-2',
+      transportPendingMessageVersion: 1,
+      transportPendingMessageEntries: [],
+    });
+  });
+
+  // Native Watch XCTest is not wired into this repo's Vitest CI. This fixture is
+  // the shared substitute consumed by the iOS Codable snapshot shape.
+  it('projects command receipts for the watch optimistic-send shared fixture substitute', () => {
+    const { store } = makeSnapshotStore(2_900);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [{ name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex', state: 'idle' }],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'ack-error',
+      sessionId: 'deck_proj_brain',
+      ts: 1,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'command.ack',
+      payload: { commandId: 'cmd-failed', status: 'error', error: 'Transport session unavailable' },
+    } as any);
+    store.handleTimelineEvent({
+      eventId: 'receipt-accepted',
+      sessionId: 'deck_proj_brain',
+      ts: 2,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'transport.queue.receipt',
+      payload: { commandId: 'cmd-accepted', status: 'accepted' },
+    } as any);
+
+    const row = store.getSnapshot().sessions[0];
+    expect(row?.commandReceipts).toEqual([
+      { commandId: 'cmd-failed', status: 'error', reason: 'Transport session unavailable' },
+    ]);
+    expect(row?.transportQueueReceipts).toEqual([
+      { commandId: 'cmd-accepted', status: 'accepted' },
+    ]);
+  });
+
   it('debounces semantic snapshot pushes and skips identical projections', async () => {
     const { store, pushes } = makeSnapshotStore(2_000);
     store.updateFromSessionList(

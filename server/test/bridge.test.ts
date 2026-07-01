@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
+import { readFileSync } from 'node:fs';
 import { WsBridge, __setIdlePushSettleMsForTests, __setTimelineDataPlaneQueueConfigForTests } from '../src/ws/bridge.js';
 import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 import {
@@ -33,6 +34,7 @@ import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-er
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -524,6 +526,56 @@ describe('WsBridge', () => {
       expect(thirdWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
     });
 
+    it('retries auto daemon.upgrade after transient daemon upgrade blockers clear without waiting for reconnect', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'auto_deliver_active' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(59_999);
+      await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(2);
+    });
+
+    it('does not retry auto daemon.upgrade after non-retryable daemon upgrade blockers', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'toolchain_unavailable' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+    });
+
     it('does not send a stale scheduled daemon.upgrade after the daemon socket is replaced', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
@@ -660,6 +712,22 @@ describe('WsBridge', () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'admin.shutdown' }));
       expect(daemonWs.sentStrings.some((s) => s.includes('admin.shutdown'))).toBe(true);
+    });
+
+    it('rejects browser-origin legacy transport queue evidence instead of forwarding or offline replaying it', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      daemonWs.sent.length = 0;
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.state',
+        sessionName: 'deck_test_brain',
+        pendingMessages: ['legacy text'],
+        transportPendingMessages: ['legacy text'],
+        pendingCount: 1,
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings).toHaveLength(0);
     });
 
     it('authorizes repo.checkout_branch against the browser user session/project binding before forwarding', async () => {
@@ -1728,6 +1796,51 @@ describe('WsBridge', () => {
       [TIMELINE_MESSAGES.HISTORY, { type: TIMELINE_MESSAGES.HISTORY, sessionName: 'session-a', events: [{ eventId: 'e1' }], epoch: 1 }, 'session-a'],
       [TIMELINE_MESSAGES.REPLAY, { type: TIMELINE_MESSAGES.REPLAY, sessionName: 'session-a', events: [], truncated: false, epoch: 1 }, 'session-a'],
       [TIMELINE_MESSAGES.EVENT, { type: TIMELINE_MESSAGES.EVENT, event: { sessionId: 'session-a', eventId: 'e2', type: 'test' } }, 'session-a'],
+      ['transport.queue.snapshot', {
+        type: 'transport.queue.snapshot',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [{
+          clientMessageId: 'msg-1',
+          text: 'line one\nline two',
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: 100,
+          updatedAt: 100,
+        }],
+        failedMessageEntries: [],
+        source: 'server-test',
+      }, 'session-a'],
+      ['transport.queue.delivery', {
+        type: 'transport.queue.delivery',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 2,
+        clientMessageId: 'msg-1',
+        deliveryFrameId: 'frame-1',
+        deliveryFrameVersion: 2,
+      }, 'session-a'],
+      ['transport.queue.failure', {
+        type: 'transport.queue.failure',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 3,
+        clientMessageId: 'msg-2',
+        dropReason: 'user_stopped',
+      }, 'session-a'],
+      ['transport.queue.reset', {
+        type: 'transport.queue.reset',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-2',
+        queueAuthorityId: 'authority-2',
+        pendingMessageVersion: 1,
+        resetReason: 'user_clear',
+      }, 'session-a'],
       ['command.ack', { type: 'command.ack', session: 'session-a', commandId: 'c1', status: 'ok' }, 'session-a'],
       ['subsession.response', { type: 'subsession.response', sessionName: 'session-a', status: 'idle' }, 'session-a'],
       ['session.idle', { type: 'session.idle', session: 'session-a', project: 'p', agentType: 'claude-code' }, 'session-a'],
@@ -1763,6 +1876,54 @@ describe('WsBridge', () => {
 
       expect(browserA.sentStrings.length).toBe(0); // session-a browser must be silent
       expect(browserB.sentStrings.length).toBeGreaterThan(0);
+    });
+
+    it('invalid transport queue wire events are rejected instead of default-broadcast', async () => {
+      const { daemonWs, browserA, browserB } = await setupTwoBrowsers();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'transport.queue.snapshot',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        source: 'server-test',
+        pendingCount: 1,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'transport.queue.snapshot',
+        sessionName: 'session-a',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [{
+          clientMessageId: 'msg-1',
+          text: 'safe',
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: 100,
+          updatedAt: 100,
+          messagePreamble: 'private',
+        }],
+        failedMessageEntries: [],
+        source: 'server-test',
+      }));
+      await flushAsync();
+
+      expect(browserA.sentStrings).toHaveLength(0);
+      expect(browserB.sentStrings).toHaveLength(0);
+    });
+
+    it('server bridge remains relay-only and does not import queue SQLite authority', () => {
+      const bridgeSource = readFileSync(new URL('../src/ws/bridge.ts', import.meta.url), 'utf8');
+
+      expect(bridgeSource).not.toContain('transport-queue-store');
+      expect(bridgeSource).not.toContain('transport-queue-projection');
+      expect(bridgeSource).not.toContain('node:sqlite');
+      expect(bridgeSource).not.toContain('transport-queue.sqlite');
     });
 
     it('session_event (lifecycle) is broadcast to all browsers', async () => {
@@ -2171,9 +2332,41 @@ describe('WsBridge', () => {
         activeModel: 'sonnet',
         effort: 'high',
         transportConfig: { provider: { mode: 'safe' } },
+        queueSnapshot: {
+          type: 'transport.queue.snapshot',
+          sessionName: 'deck_sub_sub-123',
+          queueEpoch: 'epoch-sub',
+          queueAuthorityId: 'authority-sub',
+          pendingMessageVersion: 7,
+          pendingMessageEntries: [{
+            clientMessageId: 'msg-sub',
+            text: 'queued',
+            status: 'queued',
+            placement: 'normal',
+            ordinal: 0,
+            createdAt: 100,
+            updatedAt: 100,
+          }],
+          failedMessageEntries: [],
+          source: 'subsession_sync',
+        },
+        queueEpoch: 'epoch-sub',
+        queueAuthorityId: 'authority-sub',
+        pendingMessageVersion: 7,
+        pendingMessageEntries: [{
+          clientMessageId: 'msg-sub',
+          text: 'queued',
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: 100,
+          updatedAt: 100,
+        }],
+        failedMessageEntries: [],
         transportPendingMessages: [],
         transportPendingMessageEntries: [],
         transportPendingMessageVersion: 7,
+        pendingCount: 1,
       }));
       await flushAsync();
 
@@ -2191,9 +2384,22 @@ describe('WsBridge', () => {
       expect(msg.activeModel).toBe('sonnet');
       expect(msg.effort).toBe('high');
       expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
-      expect(msg.transportPendingMessages).toEqual([]);
-      expect(msg.transportPendingMessageEntries).toEqual([]);
-      expect(msg.transportPendingMessageVersion).toBe(7);
+      expect(msg.queueSnapshot).toMatchObject({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_sub_sub-123',
+        queueEpoch: 'epoch-sub',
+        queueAuthorityId: 'authority-sub',
+        pendingMessageVersion: 7,
+      });
+      expect(msg.queueEpoch).toBe('epoch-sub');
+      expect(msg.queueAuthorityId).toBe('authority-sub');
+      expect(msg.pendingMessageVersion).toBe(7);
+      expect(msg.pendingMessageEntries).toEqual([expect.objectContaining({ clientMessageId: 'msg-sub', text: 'queued' })]);
+      expect(msg.failedMessageEntries).toEqual([]);
+      expect(msg.transportPendingMessages).toBeUndefined();
+      expect(msg.transportPendingMessageEntries).toBeUndefined();
+      expect(msg.transportPendingMessageVersion).toBeUndefined();
+      expect(msg.pendingCount).toBeUndefined();
       expect(msg.state).toBe('idle');
     });
 

@@ -28,6 +28,23 @@ struct WatchRecentTextRow: Identifiable, Codable, Equatable {
     var id: String { eventId }
 }
 
+struct WatchQueueEntry: Identifiable, Codable, Equatable {
+    let clientMessageId: String
+    let text: String
+    let status: String?
+    let commandId: String?
+
+    var id: String { clientMessageId }
+}
+
+struct WatchQueueReceipt: Identifiable, Codable, Equatable {
+    let commandId: String
+    let status: String
+    let reason: String?
+
+    var id: String { commandId }
+}
+
 struct WatchSessionRow: Identifiable, Codable, Equatable {
     var sessionName: String
     var serverId: String
@@ -41,6 +58,13 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
     var previewText: String?
     var previewUpdatedAt: Double?
     var recentText: [WatchRecentTextRow]?
+    var queueEpoch: String?
+    var queueAuthorityId: String?
+    var transportPendingMessageVersion: Double?
+    var transportPendingMessageEntries: [WatchQueueEntry]?
+    var failedMessageEntries: [WatchQueueEntry]?
+    var transportQueueReceipts: [WatchQueueReceipt]?
+    var commandReceipts: [WatchQueueReceipt]?
 
     enum CodingKeys: String, CodingKey {
         case sessionName
@@ -55,6 +79,13 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
         case previewText
         case previewUpdatedAt
         case recentText
+        case queueEpoch
+        case queueAuthorityId
+        case transportPendingMessageVersion
+        case transportPendingMessageEntries
+        case failedMessageEntries
+        case transportQueueReceipts
+        case commandReceipts
     }
 
     init(from decoder: Decoder) throws {
@@ -76,6 +107,13 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
         self.previewText = try container.decodeIfPresent(String.self, forKey: .previewText)
         self.previewUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .previewUpdatedAt)
         self.recentText = try container.decodeIfPresent([WatchRecentTextRow].self, forKey: .recentText) ?? []
+        self.queueEpoch = try container.decodeIfPresent(String.self, forKey: .queueEpoch)
+        self.queueAuthorityId = try container.decodeIfPresent(String.self, forKey: .queueAuthorityId)
+        self.transportPendingMessageVersion = try container.decodeIfPresent(Double.self, forKey: .transportPendingMessageVersion)
+        self.transportPendingMessageEntries = try container.decodeIfPresent([WatchQueueEntry].self, forKey: .transportPendingMessageEntries) ?? []
+        self.failedMessageEntries = try container.decodeIfPresent([WatchQueueEntry].self, forKey: .failedMessageEntries) ?? []
+        self.transportQueueReceipts = try container.decodeIfPresent([WatchQueueReceipt].self, forKey: .transportQueueReceipts) ?? []
+        self.commandReceipts = try container.decodeIfPresent([WatchQueueReceipt].self, forKey: .commandReceipts) ?? []
     }
 
     var id: String { "\(serverId):\(sessionName)" }
@@ -94,6 +132,10 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
 
     var effectivePreviewUpdatedAt: Double? {
         previewUpdatedAt ?? latestRecentText?.ts
+    }
+
+    var allCommandReceipts: [WatchQueueReceipt] {
+        (transportQueueReceipts ?? []) + (commandReceipts ?? [])
     }
 }
 
@@ -173,6 +215,11 @@ struct WatchTimelineEvent: Identifiable, Codable, Equatable {
 
     var text: String? {
         payload?.objectValue?["text"]?.stringValue
+    }
+
+    var commandId: String? {
+        payload?.objectValue?["commandId"]?.stringValue
+            ?? payload?.objectValue?["clientMessageId"]?.stringValue
     }
 }
 
@@ -304,21 +351,24 @@ struct WatchConversationItem: Identifiable, Equatable {
             sessionId: sessionId,
             ts: row.ts,
             type: row.type,
-            text: trimmed,
+            text: row.text,
             isWarmCache: true
         )
     }
 
     static func fromTimelineEvent(_ event: WatchTimelineEvent) -> WatchConversationItem? {
         guard event.type == "user.message" || event.type == "assistant.text" else { return nil }
-        guard let text = event.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+        guard let rawText = event.text else { return nil }
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
         return WatchConversationItem(
             eventId: event.eventId,
             sessionId: event.sessionId,
             ts: event.ts,
             type: event.type,
-            text: text,
-            isWarmCache: false
+            text: rawText,
+            isWarmCache: false,
+            commandId: event.commandId
         )
     }
 

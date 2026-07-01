@@ -11,21 +11,24 @@
  *
  * Drain:
  *   - `drainResend()` is invoked from `restoreTransportSessions()` after the
- *     runtime is added to `transportRuntimes`. The queue is emptied before any
- *     dispatch so re-queueing inside the dispatcher is safe.
+ *     runtime is added to `transportRuntimes`. SQLite handoff is committed
+ *     before entries leave the in-memory holder or dispatch begins.
  *
  * Cancellation:
  *   - `clearResend(session)` is called on explicit user actions that should
  *     discard pending work (`/stop`, `/clear`, session removal).
  */
 
+import { randomUUID } from 'node:crypto';
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import type { QueueDeliveryFact, QueueDropReason, QueueResetReason, QueueSnapshot } from '../../shared/transport-queue-types.js';
 import {
   bumpTransportQueueRevision,
   clearAllTransportQueueRevisions,
 } from './transport-queue-revision.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from './transport-queue-store.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -39,6 +42,8 @@ export interface ResendEntry {
   messagePreamble?: string;
   /** Original clientMessageId so command.ack correlation survives the resend. */
   commandId: string;
+  /** Stable queue identity. Command ids are receipts only and never queue authority ids. */
+  clientMessageId?: string;
   /** Attachment refs at enqueue time. Not resolved lazily — we do not re-walk the store. */
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
@@ -57,9 +62,56 @@ const queues = new Map<string, ResendEntry[]>();
  * Append an entry. If the queue is already at MAX_RESEND_ENTRIES the oldest
  * entry is discarded (FIFO) so newly-typed messages always take priority.
  */
-export function enqueueResend(sessionName: string, entry: ResendEntry): { accepted: true; droppedOldest: boolean; pendingVersion: number } {
+export function enqueueResend(sessionName: string, entry: ResendEntry): {
+  accepted: true;
+  droppedOldest: boolean;
+  pendingVersion: number;
+  queueSnapshot?: QueueSnapshot;
+  dropSnapshot?: QueueSnapshot;
+} | {
+  accepted: false;
+  droppedOldest: false;
+  pendingVersion: number;
+  reason: 'sqlite_enqueue_failed';
+} {
   const list = queues.get(sessionName) ?? [];
+  const clientMessageId = entry.clientMessageId?.trim() || randomUUID();
   let droppedOldest = false;
+  const normalizedEntry: ResendEntry = {
+    ...entry,
+    clientMessageId,
+  };
+  const evicted = list.length >= MAX_RESEND_ENTRIES ? list[0] : undefined;
+  let queueSnapshot: QueueSnapshot;
+  let dropSnapshot: QueueSnapshot | undefined;
+  try {
+    const result = getTransportQueueStore().enqueueWithCapacityEviction({
+      sessionName,
+      clientMessageId: normalizedEntry.clientMessageId,
+      commandId: normalizedEntry.commandId,
+      text: normalizedEntry.text,
+      now: normalizedEntry.queuedAt,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: normalizedEntry.clientMessageId,
+        text: normalizedEntry.text,
+        ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
+        ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
+        ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
+        ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
+        ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
+      }),
+    }, evicted?.clientMessageId);
+    queueSnapshot = result.queueSnapshot;
+    dropSnapshot = result.dropSnapshot;
+  } catch (err) {
+    logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite enqueue failed for resend entry; resend enqueue rejected');
+    return {
+      accepted: false,
+      droppedOldest: false,
+      pendingVersion: bumpTransportQueueRevision(sessionName),
+      reason: 'sqlite_enqueue_failed',
+    };
+  }
   if (list.length >= MAX_RESEND_ENTRIES) {
     const removed = list.shift();
     droppedOldest = true;
@@ -68,9 +120,9 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): { accept
       'transport resend queue full — dropped oldest entry',
     );
   }
-  list.push(entry);
+  list.push(normalizedEntry);
   queues.set(sessionName, list);
-  return { accepted: true, droppedOldest, pendingVersion: bumpTransportQueueRevision(sessionName) };
+  return { accepted: true, droppedOldest, pendingVersion: queueSnapshot.pendingMessageVersion, queueSnapshot, ...(dropSnapshot ? { dropSnapshot } : {}) };
 }
 
 /** Non-mutating snapshot of the queue for UI / diagnostics. */
@@ -121,19 +173,51 @@ export function removeResendEntries(
     queues.set(sessionName, kept);
   }
   if (removed > 0) bumpTransportQueueRevision(sessionName);
+  if (removed > 0) {
+    for (const entry of list) {
+      if (predicate(entry)) {
+        if (!entry.clientMessageId) {
+          logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue drop skipped for resend entry without clientMessageId');
+          continue;
+        }
+        try {
+          getTransportQueueStore().drop(sessionName, entry.clientMessageId, 'user_cleared');
+        } catch (err) {
+          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite drop failed for removed resend entry');
+        }
+      }
+    }
+  }
   return removed;
 }
 
 /** Drop every queued entry for a session. Used by /stop, /clear, session delete. */
-export function clearResend(sessionName: string): void {
+export function clearResend(
+  sessionName: string,
+  reason: QueueResetReason | QueueDropReason = 'user_clear',
+): QueueSnapshot | undefined {
+  let snapshot: QueueSnapshot | undefined;
   if (queues.has(sessionName)) bumpTransportQueueRevision(sessionName);
+  if (queues.has(sessionName)) {
+    try {
+      if (reason === 'user_clear' || reason === 'sqlite_restore' || reason === 'runtime_recreated' || reason === 'authority_corrupt_reinitialized') {
+        snapshot = getTransportQueueStore().reset(sessionName, reason);
+      } else {
+        snapshot = getTransportQueueStore().dropAll(sessionName, reason);
+      }
+    } catch (err) {
+      logger.warn({ err, sessionName, reason }, 'transport queue sqlite clear failed for clearResend');
+    }
+  }
   queues.delete(sessionName);
+  return snapshot;
 }
 
 /** Drop every queued entry everywhere. Test helper. */
 export function clearAllResend(): void {
   queues.clear();
   clearAllTransportQueueRevisions();
+  if (process.env.VITEST) resetTransportQueueStoreForTests();
 }
 
 export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknown;
@@ -155,12 +239,13 @@ export type ResendDispatcher = (entry: ResendEntry) => Promise<unknown> | unknow
  */
 export type ResendExpireCallback = (info: { expiredCount: number }) => void;
 export type ResendDispatchFailureCallback = (info: { failedCount: number }) => void;
+export type ResendDeliveryCallback = (info: { deliveryFacts: QueueDeliveryFact[] }) => void;
 
 /**
- * Drain and dispatch. The internal queue is cleared BEFORE calling `dispatch`
- * so a dispatcher that wants to re-enqueue (e.g. still not really ready) can
- * do so safely. Expired entries are dropped. Failed dispatches are logged but
- * not retried — the next user action will resurface any real error.
+ * Drain and dispatch. Fresh entries first acquire a committed SQLite handoff
+ * lease. If the lease cannot be written, the in-memory holder is preserved and
+ * dispatch does not begin. Expired entries are removed only after their failed
+ * status commits.
  *
  * Returns the number of entries successfully dispatched.
  *
@@ -174,19 +259,51 @@ export async function drainResend(
   dispatch: ResendDispatcher,
   onExpired?: ResendExpireCallback,
   onDispatchFailed?: ResendDispatchFailureCallback,
+  onDelivered?: ResendDeliveryCallback,
 ): Promise<number> {
   const list = queues.get(sessionName);
   if (!list || list.length === 0) return 0;
-  queues.delete(sessionName);
-  bumpTransportQueueRevision(sessionName);
 
   const now = Date.now();
+  const freshEntries = list.filter((entry) => now - entry.queuedAt <= RESEND_EXPIRY_MS);
+  const expiredEntries = list.filter((entry) => now - entry.queuedAt > RESEND_EXPIRY_MS);
+  const freshClientMessageIds = freshEntries.map((entry) => entry.clientMessageId).filter((id): id is string => typeof id === 'string' && id.length > 0);
+  if (freshClientMessageIds.length !== freshEntries.length) {
+    logger.warn({ sessionName }, 'transport resend drain blocked: entry missing clientMessageId');
+    return 0;
+  }
+  try {
+    const leased = getTransportQueueStore().markHandoffInFlight(
+      sessionName,
+      freshClientMessageIds,
+      RESEND_EXPIRY_MS,
+      now,
+    );
+    if (leased.length !== freshEntries.length) {
+      logger.warn({ sessionName, requested: freshEntries.length, leased: leased.length }, 'transport queue sqlite handoff lease incomplete for resend drain');
+      return 0;
+    }
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'transport queue sqlite handoff mark failed for resend drain; preserving resend queue');
+    return 0;
+  }
+  queues.delete(sessionName);
+  bumpTransportQueueRevision(sessionName);
   let dispatched = 0;
   let expiredCount = 0;
   let failedCount = 0;
   for (const entry of list) {
     if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
+      if (!entry.clientMessageId) {
+        logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue mark expired skipped for resend entry without clientMessageId');
+        continue;
+      }
       expiredCount += 1;
+      try {
+        getTransportQueueStore().markFailed(sessionName, entry.clientMessageId, 'expired', now);
+      } catch (err) {
+        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark expired failed for resend entry');
+      }
       logger.info(
         { sessionName, commandId: entry.commandId, ageMs: now - entry.queuedAt },
         'transport resend entry expired — dropping without redelivery',
@@ -195,6 +312,21 @@ export async function drainResend(
     }
     try {
       await dispatch(entry);
+      const clientMessageId = entry.clientMessageId;
+      if (!clientMessageId) {
+        failedCount += 1;
+        logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend dispatch finalized as failed: missing clientMessageId');
+        continue;
+      }
+      try {
+        const result = getTransportQueueStore().finalizeSentBatch(
+          sessionName,
+          [clientMessageId],
+        );
+        if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
+      } catch (err) {
+        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
+      }
       dispatched++;
       logger.info(
         { sessionName, commandId: entry.commandId },
@@ -202,6 +334,16 @@ export async function drainResend(
       );
     } catch (err) {
       failedCount += 1;
+      const clientMessageId = entry.clientMessageId;
+      if (!clientMessageId) {
+        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed skipped for resend entry without clientMessageId');
+        continue;
+      }
+      try {
+        getTransportQueueStore().markFailed(sessionName, clientMessageId, 'dispatch_failed', now);
+      } catch (storeErr) {
+        logger.warn({ err: storeErr, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed failed for resend entry');
+      }
       logger.warn(
         { err, sessionName, commandId: entry.commandId },
         'transport resend dispatch failed — dropping entry to avoid loops',

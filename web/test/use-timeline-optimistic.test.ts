@@ -259,7 +259,10 @@ describe('useTimeline optimistic send flow', () => {
           type: 'session.state',
           payload: {
             state: 'queued',
-            pendingMessages: ['queue me'],
+            queueEpoch: 'epoch-queued',
+            queueAuthorityId: 'authority-queued',
+            pendingMessageVersion: 1,
+            pendingMessages: ['legacy ignored'],
             pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'queue me' }],
           },
         },
@@ -268,6 +271,392 @@ describe('useTimeline optimistic send flow', () => {
 
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].type).toBe('session.state');
+  });
+
+  it('routes structured queue snapshots through the shared reducer and ignores pendingCount as authority', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_structured_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('line one\nline two', 'cmd-structured');
+    });
+    expect(ref.current!.events).toHaveLength(1);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-structured',
+          sessionId: 'deck_opt_structured_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-1',
+            queueAuthorityId: 'authority-1',
+            pendingMessageVersion: 1,
+            pendingCount: 99,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-structured', text: 'line one\nline two' }],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].eventId).toBe('queued-state-structured');
+    expect(ref.current!.events[0].payload.pendingCount).toBe(99);
+  });
+
+  it('rejects stale same-epoch queue snapshots before they can clear optimistic bubbles', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_stale_queue' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-v2',
+          sessionId: 'deck_opt_stale_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-stale',
+            queueAuthorityId: 'authority-stale',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+      ref.current!.addOptimisticUserMessage('must survive stale', 'cmd-stale');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-v1-stale',
+          sessionId: 'deck_opt_stale_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-stale',
+            queueAuthorityId: 'authority-stale',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-stale', text: 'must survive stale' }],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
+  });
+
+  it('rejects same-epoch authority mismatch queue snapshots before they can clear optimistic bubbles', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_authority_queue' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-authority-1',
+          sessionId: 'deck_opt_authority_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-authority',
+            queueAuthorityId: 'authority-a',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+      ref.current!.addOptimisticUserMessage('must survive mismatch', 'cmd-mismatch');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-authority-2',
+          sessionId: 'deck_opt_authority_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-authority',
+            queueAuthorityId: 'authority-b',
+            pendingMessageVersion: 2,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-mismatch', text: 'must survive mismatch' }],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
+  });
+
+  it('routes direct queue receipts and failures through timeline optimistic reconciliation', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_direct_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('accepted direct', 'cmd-direct-accepted');
+      ref.current!.addOptimisticUserMessage('failed direct', 'cmd-direct-failed');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.receipt',
+        sessionName: 'deck_opt_direct_queue',
+        commandId: 'cmd-direct-accepted',
+        status: 'accepted',
+      } as unknown as ServerMessage);
+    });
+
+    const accepted = ref.current!.events.find((event) => event.payload.commandId === 'cmd-direct-accepted');
+    expect(accepted?.payload.acked).toBe(true);
+    expect(accepted?.payload.pending).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.failure',
+        sessionName: 'deck_opt_direct_queue',
+        queueEpoch: 'epoch-direct',
+        queueAuthorityId: 'authority-direct',
+        pendingMessageVersion: 1,
+        clientMessageId: 'cmd-direct-failed',
+        failureReason: 'failed',
+      } as unknown as ServerMessage);
+    });
+
+    const failed = ref.current!.events.find((event) => event.payload.commandId === 'cmd-direct-failed');
+    expect(failed?.payload.failed).toBe(true);
+    expect(failed?.payload.pending).toBe(false);
+  });
+
+  it('routes direct queue delivery facts through the reducer and clears delivered optimistic bubbles', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delivery_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delivered direct', 'cmd-delivered');
+      handlerBox.fn?.({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_opt_delivery_queue',
+        queueEpoch: 'epoch-delivery',
+        queueAuthorityId: 'authority-delivery',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        source: 'test',
+      } as unknown as ServerMessage);
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_opt_delivery_queue',
+        clientMessageId: 'cmd-delivered',
+        queueEpoch: 'epoch-delivery',
+        queueAuthorityId: 'authority-delivery',
+        pendingMessageVersion: 2,
+        deliveryFrameId: 'frame-1',
+        deliveryFrameVersion: 1,
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+  });
+
+  it('routes timeline-wrapped queue delivery facts through the reducer', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_timeline_delivery_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('timeline delivered', 'cmd-timeline-delivered');
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queue-delivery-event',
+          sessionId: 'deck_opt_timeline_delivery_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'transport.queue.delivery',
+          payload: {
+            type: 'transport.queue.delivery',
+            sessionName: 'deck_opt_timeline_delivery_queue',
+            clientMessageId: 'cmd-timeline-delivered',
+            queueEpoch: 'epoch-timeline-delivery',
+            queueAuthorityId: 'authority-timeline-delivery',
+            pendingMessageVersion: 2,
+            deliveryFrameId: 'frame-timeline',
+            deliveryFrameVersion: 2,
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+    expect(ref.current!.events.some((event) => event.eventId === 'queue-delivery-event')).toBe(true);
+  });
+
+  it('routes direct queue reset events so the next epoch snapshot is accepted', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_reset_queue' }));
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_opt_reset_queue',
+        queueEpoch: 'epoch-before-reset',
+        queueAuthorityId: 'authority-before-reset',
+        pendingMessageVersion: 1,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+        source: 'test',
+      } as unknown as ServerMessage);
+      ref.current!.addOptimisticUserMessage('reset accepted', 'cmd-reset');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.reset',
+        sessionName: 'deck_opt_reset_queue',
+        queueEpoch: 'epoch-after-reset',
+        queueAuthorityId: 'authority-after-reset',
+        pendingMessageVersion: 1,
+        resetReason: 'runtime_recreated',
+      } as unknown as ServerMessage);
+      handlerBox.fn?.({
+        type: 'transport.queue.snapshot',
+        sessionName: 'deck_opt_reset_queue',
+        queueEpoch: 'epoch-after-reset',
+        queueAuthorityId: 'authority-after-reset',
+        pendingMessageVersion: 2,
+        pendingMessageEntries: [{ clientMessageId: 'cmd-reset', text: 'reset accepted', status: 'queued', placement: 'normal', ordinal: 0, createdAt: 0, updatedAt: 0 }],
+        failedMessageEntries: [],
+        source: 'test',
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(false);
+  });
+
+  it('applies running empty queue snapshots through the reducer without using pendingCount', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_running_empty_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('running empty', 'cmd-running-empty');
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'running-empty-state',
+          sessionId: 'deck_opt_running_empty_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'running',
+            queueEpoch: 'epoch-running',
+            queueAuthorityId: 'authority-running',
+            pendingMessageVersion: 1,
+            pendingCount: 7,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
+    expect(ref.current!.events.some((event) => event.eventId === 'running-empty-state')).toBe(true);
+  });
+
+  it('does not clear optimistic bubbles from legacy text-only queue evidence or pendingCount', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_legacy_queue' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('legacy text', 'cmd-legacy');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'queued-state-legacy',
+          sessionId: 'deck_opt_legacy_queue',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            pendingCount: 1,
+            pendingMessages: ['legacy text'],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events.map((event) => event.eventId)).toContain('queued-state-legacy');
+    expect(ref.current!.events.some((event) => event.eventId.startsWith('optimistic:'))).toBe(true);
   });
 
   it('late echo also clears a previously-failed bubble (retry arrived)', () => {

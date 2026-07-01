@@ -195,9 +195,69 @@ import {
   rawSubSessionIdFromDisplayName,
   type SharedActorEnvelope,
 } from '../../../shared/tab-sharing.js';
+import {
+  containsLegacyLiveQueueEvidence,
+  isTransportQueueEventType,
+  isValidTransportQueueWireEvent,
+} from '../../../shared/transport-queue-wire.js';
+import type { QueueSnapshot } from '../../../shared/transport-queue-types.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
+const DAEMON_UPGRADE_BLOCKED_RETRY_MS = 60_000;
+const DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS = 5_000;
+const DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS = 15 * 60 * 1000;
+const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
+  'p2p_active',
+  'auto_deliver_active',
+  'master_compaction_active',
+  'compression_active',
+  'transport_busy',
+  'session_busy',
+]);
+
+const SUBSESSION_QUEUE_RELAY_FIELDS = [
+  'queueEpoch',
+  'queueAuthorityId',
+  'pendingMessageVersion',
+  'pendingMessageEntries',
+  'failedMessageEntries',
+  'resetReason',
+  'dropReason',
+  'activityGeneration',
+  'degraded',
+  'degradedReason',
+] as const;
+
+function buildSubsessionQueueRelay(msg: Record<string, unknown>): Partial<{
+  queueSnapshot: QueueSnapshot;
+  queueEpoch: unknown;
+  queueAuthorityId: unknown;
+  pendingMessageVersion: unknown;
+  pendingMessageEntries: unknown;
+  failedMessageEntries: unknown;
+  resetReason: unknown;
+  dropReason: unknown;
+  activityGeneration: unknown;
+  degraded: unknown;
+  degradedReason: unknown;
+}> {
+  const relay: Record<string, unknown> = {};
+  const queueSnapshot = msg.queueSnapshot;
+  if (
+    queueSnapshot
+    && typeof queueSnapshot === 'object'
+    && !Array.isArray(queueSnapshot)
+    && isValidTransportQueueWireEvent(queueSnapshot)
+    && queueSnapshot.type === 'transport.queue.snapshot'
+  ) {
+    relay.queueSnapshot = queueSnapshot;
+  }
+  for (const field of SUBSESSION_QUEUE_RELAY_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(msg, field)) relay[field] = msg[field];
+  }
+  return relay;
+}
 const MAX_BROWSER_PAYLOAD = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
 const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
@@ -2490,6 +2550,10 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        this.handleDaemonUpgradeBlocked(msg, ws);
+      }
+
       if (msg.type === 'heartbeat') {
         const heartbeatDaemonVersion = typeof msg.daemonVersion === 'string'
           ? msg.daemonVersion
@@ -3047,6 +3111,11 @@ export class WsBridge {
       if (msg.type === TRANSPORT_MSG.CHAT_UNSUBSCRIBE && typeof msg.sessionId === 'string') {
         this.bumpTransportSubscriptionRevision(ws, msg.sessionId);
         this.transportSubscriptions.get(ws)?.delete(msg.sessionId);
+        return;
+      }
+
+      if (containsLegacyLiveQueueEvidence(msg)) {
+        logger.warn({ serverId: this.serverId, type: browserMessageType }, 'legacy transport queue evidence from browser rejected');
         return;
       }
 
@@ -4169,6 +4238,15 @@ export class WsBridge {
       return;
     }
 
+    if (isTransportQueueEventType(type)) {
+      if (!isValidTransportQueueWireEvent(msg)) {
+        logger.warn({ serverId: this.serverId, type }, 'invalid transport queue wire event rejected');
+        return;
+      }
+      this.sendJsonToSessionSubscribers(msg.sessionName, JSON.stringify(msg));
+      return;
+    }
+
     // ── Lifecycle events: broadcast whitelist ─────────────────────────────────
     if (type === 'session_event') {
       this.broadcastToBrowsers(JSON.stringify({ ...msg, type: 'session.event' }));
@@ -4195,11 +4273,7 @@ export class WsBridge {
       }
       if (rawEvent.type === 'user.message') {
         const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        const commandId = typeof payload?.commandId === 'string'
-          ? payload.commandId
-          : typeof payload?.clientMessageId === 'string'
-            ? payload.clientMessageId
-            : '';
+        const commandId = typeof payload?.commandId === 'string' ? payload.commandId : '';
         if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
       }
       if (rawEvent.type === 'session.state') {
@@ -4344,9 +4418,7 @@ export class WsBridge {
           (msg.executionCloneMetadata as Record<string, unknown>) || null,
         );
         // Notify browsers so sub-session appears immediately without page refresh
-        const hasTransportPendingMessages = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessages');
-        const hasTransportPendingMessageEntries = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessageEntries');
-        const hasTransportPendingMessageVersion = Object.prototype.hasOwnProperty.call(msg, 'transportPendingMessageVersion');
+        const queueRelay = buildSubsessionQueueRelay(msg);
         const executionCloneMetadata = (msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object')
           ? msg.executionCloneMetadata as Record<string, unknown>
           : null;
@@ -4375,9 +4447,7 @@ export class WsBridge {
           activeModel: msg.activeModel || msg.modelDisplay || null,
           effort: msg.effort || null,
           transportConfig: msg.transportConfig || null,
-          ...(hasTransportPendingMessages ? { transportPendingMessages: msg.transportPendingMessages } : {}),
-          ...(hasTransportPendingMessageEntries ? { transportPendingMessageEntries: msg.transportPendingMessageEntries } : {}),
-          ...(hasTransportPendingMessageVersion ? { transportPendingMessageVersion: msg.transportPendingMessageVersion } : {}),
+          ...queueRelay,
           ...executionCloneProjection,
           qwenModel: msg.qwenModel || null,
           qwenAuthType: msg.qwenAuthType || null,
@@ -5550,6 +5620,55 @@ export class WsBridge {
   }
   _hasSeenAckForTest(commandId: string): boolean {
     return this.seenCommandAcks.has(commandId);
+  }
+
+  private handleDaemonUpgradeBlocked(msg: Record<string, unknown>, ws: WebSocket): void {
+    const serverVersion = process.env.APP_VERSION;
+    if (!serverVersion || serverVersion === '0.0.0' || !this.daemonVersion || this.daemonVersion === serverVersion) return;
+
+    const retryDelayMs = this.daemonUpgradeBlockedRetryDelayMs(msg);
+    if (retryDelayMs == null) {
+      logger.info({
+        serverId: this.serverId,
+        daemonVersion: this.daemonVersion,
+        serverVersion,
+        reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
+      }, 'daemon.upgrade blocked by non-retryable reason');
+      return;
+    }
+
+    const result = this.daemonUpgradeCoordinator.retryAutoAfterBlocked({
+      retryDelayMs,
+      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
+      isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
+      send: (message) => this.sendDirectToDaemon(message),
+    });
+    if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      logger.info({
+        serverId: this.serverId,
+        daemonVersion: this.daemonVersion,
+        serverVersion,
+        reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
+        nextAttemptAt: result.nextAttemptAt,
+        upgradeId: result.upgradeId,
+      }, 'daemon.upgrade blocked by transient daemon state — retry scheduled');
+    }
+  }
+
+  private daemonUpgradeBlockedRetryDelayMs(msg: Record<string, unknown>): number | null {
+    const reason = typeof msg.reason === 'string' ? msg.reason : 'unknown';
+    if (reason === 'cooldown_active') {
+      const cooldownRemainingMs = typeof msg.cooldownRemainingMs === 'number' && Number.isFinite(msg.cooldownRemainingMs)
+        ? msg.cooldownRemainingMs
+        : null;
+      if (cooldownRemainingMs == null || cooldownRemainingMs <= 0) return DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS;
+      return Math.min(
+        DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS,
+        Math.max(DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS, Math.ceil(cooldownRemainingMs)),
+      );
+    }
+    if (!DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS.has(reason)) return null;
+    return DAEMON_UPGRADE_BLOCKED_RETRY_MS;
   }
 
   requestDaemonUpgrade(input: {

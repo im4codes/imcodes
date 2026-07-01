@@ -70,6 +70,7 @@ import { buildTransportStartupMemory, type TransportContextBootstrap } from './r
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -1394,6 +1395,27 @@ export class TransportSessionRuntime implements SessionRuntime {
       } else {
         this._pendingMessages.push(entry);
       }
+      try {
+        getTransportQueueStore().enqueue({
+          sessionName: this.sessionKey,
+          clientMessageId: entry.clientMessageId,
+          commandId: entry.clientMessageId,
+          text: entry.text,
+          placement: metadata?.queuePlacement ?? 'normal',
+          activityGeneration: normalizeActivityGeneration(this.currentActivityGeneration()) ?? undefined,
+          privateMaterialJson: JSON.stringify({
+            clientMessageId: entry.clientMessageId,
+            text: entry.text,
+            ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
+            ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
+            ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
+            ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+            ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+          }),
+        });
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
+      }
       this._pendingVersion++;
       return 'queued';
     }
@@ -1435,12 +1457,17 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   editPendingMessage(clientMessageId: string, text: string): boolean {
-    const nextText = text.trim();
-    if (!clientMessageId || !nextText) return false;
+    const nextText = text;
+    if (!clientMessageId || nextText.length === 0) return false;
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
     entry.messagePreamble = undefined;
+    try {
+      getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite edit failed; preserving runtime-local edit');
+    }
     this._pendingVersion++;
     return true;
   }
@@ -1450,6 +1477,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     const index = this._pendingMessages.findIndex((item) => item.clientMessageId === clientMessageId);
     if (index < 0) return null;
     const [removed] = this._pendingMessages.splice(index, 1);
+    try {
+      getTransportQueueStore().drop(this.sessionKey, clientMessageId, 'user_cleared');
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite drop failed; preserving runtime-local removal');
+    }
     this._pendingVersion++;
     return removed ?? null;
   }
@@ -1603,6 +1635,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
         'transport runtime kill cleared pending messages',
       );
+      try {
+        getTransportQueueStore().reset(this.sessionKey, 'user_clear');
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey }, 'transport queue sqlite reset failed during runtime kill');
+      }
       this._pendingVersion++;
     }
     this._pendingMessages = [];
@@ -2307,12 +2344,31 @@ export class TransportSessionRuntime implements SessionRuntime {
     const messages = this._pendingMessages.splice(0);
     const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
     for (const entry of timelineMessages) entry.timelineCommitted = true;
-    // Bump the queue version the moment the queue empties. The onDrain
+    try {
+      const queueResult = getTransportQueueStore().finalizeSentBatch(
+        this.sessionKey,
+        messages.map((entry) => entry.clientMessageId),
+        randomUUID(),
+      );
+      for (const fact of queueResult.deliveryFacts) {
+        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+          source: 'daemon',
+          confidence: 'high',
+        });
+      }
+      this._pendingVersion = Math.max(this._pendingVersion, queueResult.snapshot.pendingMessageVersion);
+    } catch (err) {
+      logger.warn(
+        { err, sessionKey: this.sessionKey, clientMessageIds: messages.map((entry) => entry.clientMessageId) },
+        'transport queue sqlite finalizeSentBatch failed during drain',
+      );
+      this._pendingVersion++;
+    }
+    // Advance the queue version the moment the queue empties. The onDrain
     // callback below emits this new version on both the per-entry
     // `user.message` events and the cleared `session.state`, so a stale
     // pre-drain snapshot (lower version) delivered later cannot resurrect
     // these entries in the UI.
-    this._pendingVersion++;
     const merged = messages.map((entry) => entry.text).join('\n\n');
     const attachments = messages.flatMap((entry) => entry.attachments ?? []);
     const drainMetadata: ActivityDrainMetadata = {

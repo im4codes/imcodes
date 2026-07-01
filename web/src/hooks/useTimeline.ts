@@ -23,6 +23,13 @@ import {
   MSG_DAEMON_OFFLINE,
   type AckFailureReason,
 } from '@shared/ack-protocol.js';
+import {
+  createTransportQueueReducerState,
+  reduceTransportQueueEvent,
+  selectLiveQueueEntries,
+  type TransportQueueReducerState,
+} from '@shared/transport-queue-reducer.js';
+import type { QueueEvent, QueueProjectionEntry, QueueSnapshot } from '@shared/transport-queue-types.js';
 import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
@@ -59,7 +66,82 @@ import {
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
-import { normalizeTransportPendingEntries } from '../transport-queue.js';
+import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
+
+const TRANSPORT_QUEUE_EVENT_TYPES = new Set([
+  'transport.queue.snapshot',
+  'transport.queue.delivery',
+  'transport.queue.receipt',
+  'transport.queue.failure',
+  'transport.queue.reset',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isTransportQueueEvent(value: unknown): value is QueueEvent {
+  return isRecord(value) && typeof value.type === 'string' && TRANSPORT_QUEUE_EVENT_TYPES.has(value.type);
+}
+
+function extractQueueVersion(value: Record<string, unknown>): number | undefined {
+  const version = value.pendingMessageVersion;
+  return typeof version === 'number' && Number.isFinite(version) ? version : undefined;
+}
+
+function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['status']): QueueProjectionEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry, ordinal) => {
+    if (!isRecord(entry)) return [];
+    const clientMessageId = typeof entry.clientMessageId === 'string' ? entry.clientMessageId : '';
+    const text = typeof entry.text === 'string' ? entry.text : '';
+    if (!clientMessageId) return [];
+    return [{
+      clientMessageId,
+      text,
+      status: typeof entry.status === 'string' ? entry.status as QueueProjectionEntry['status'] : status,
+      placement: entry.placement === 'front' ? 'front' : 'normal',
+      ordinal: typeof entry.ordinal === 'number' && Number.isFinite(entry.ordinal) ? entry.ordinal : ordinal,
+      createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) ? entry.createdAt : 0,
+      updatedAt: typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? entry.updatedAt : 0,
+      ...(typeof entry.commandId === 'string' ? { commandId: entry.commandId } : {}),
+      ...(typeof entry.activityGeneration === 'string' || typeof entry.activityGeneration === 'number'
+        ? { activityGeneration: entry.activityGeneration }
+        : {}),
+      ...(typeof entry.replacesClientMessageId === 'string' ? { replacesClientMessageId: entry.replacesClientMessageId } : {}),
+    } satisfies QueueProjectionEntry];
+  });
+}
+
+function queueEventFromTimelineEvent(event: TimelineEvent): QueueEvent | null {
+  if (TRANSPORT_QUEUE_EVENT_TYPES.has(event.type) && isRecord(event.payload)) {
+    return {
+      ...event.payload,
+      type: event.type,
+      sessionName: typeof event.payload.sessionName === 'string' ? event.payload.sessionName : event.sessionId,
+    } as QueueEvent;
+  }
+  if (event.type !== 'session.state' || !isRecord(event.payload)) return null;
+  const queueEpoch = typeof event.payload.queueEpoch === 'string' ? event.payload.queueEpoch : '';
+  const queueAuthorityId = typeof event.payload.queueAuthorityId === 'string' ? event.payload.queueAuthorityId : '';
+  const pendingMessageVersion = extractQueueVersion(event.payload);
+  if (!queueEpoch || !queueAuthorityId || pendingMessageVersion === undefined) return null;
+  return {
+    type: 'transport.queue.snapshot',
+    sessionName: event.sessionId,
+    queueEpoch,
+    queueAuthorityId,
+    pendingMessageVersion,
+    pendingMessageEntries: toQueueProjectionEntries(event.payload.pendingMessageEntries, 'queued'),
+    failedMessageEntries: toQueueProjectionEntries(event.payload.failedMessageEntries, 'failed'),
+    source: typeof event.payload.source === 'string' ? event.payload.source : 'timeline-session-state',
+    ...(typeof event.payload.resetReason === 'string' ? { resetReason: event.payload.resetReason as QueueSnapshot['resetReason'] } : {}),
+    ...(typeof event.payload.dropReason === 'string' ? { dropReason: event.payload.dropReason as QueueSnapshot['dropReason'] } : {}),
+    ...(typeof event.payload.activityGeneration === 'string' || typeof event.payload.activityGeneration === 'number'
+      ? { activityGeneration: event.payload.activityGeneration }
+      : {}),
+  };
+}
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -1371,6 +1453,14 @@ export function useTimeline(
   });
   const eventsRef = useRef(events);
   eventsRef.current = events;
+  const transportQueueStateRef = useRef<TransportQueueReducerState>(
+    createTransportQueueReducerState(sessionId ?? undefined),
+  );
+  const transportQueueStateSessionRef = useRef<string | undefined>(sessionId ?? undefined);
+  if (transportQueueStateSessionRef.current !== (sessionId ?? undefined)) {
+    transportQueueStateSessionRef.current = sessionId ?? undefined;
+    transportQueueStateRef.current = createTransportQueueReducerState(sessionId ?? undefined);
+  }
   const [hasOlderHistory, setHasOlderHistory] = useState(true);
   // Loading starts false when we already have a synchronous cache hit at
   // mount — otherwise the first paint shows messages but ChatView still
@@ -2023,8 +2113,7 @@ export function useTimeline(
     });
   }, [clearAutoRetryState, clearOptimisticTimer]);
 
-  const reconcileQueuedOptimisticMessages = useCallback((pendingEntries: unknown, pendingMessages: unknown) => {
-    const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? '');
+  const reconcileQueuedOptimisticEntries = useCallback((queuedEntries: Array<{ clientMessageId?: string }>) => {
     if (queuedEntries.length === 0) return;
     const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
     if (queuedIds.size === 0) return;
@@ -2046,6 +2135,19 @@ export function useTimeline(
       return next;
     });
   }, [clearOptimisticTimer, rememberSettledCommandId, sessionId]);
+
+  const reconcileQueuedOptimisticMessages = useCallback((
+    pendingEntries: unknown,
+    pendingMessages: unknown,
+    queuePayload?: Record<string, unknown>,
+  ) => {
+    const reducerPatch = queuePayload
+      ? buildTransportPendingSyncPatch({}, queuePayload, sessionId ?? '')
+      : {};
+    const queuedEntries = reducerPatch.transportPendingMessageEntries
+      ?? (queuePayload ? [] : normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? ''));
+    reconcileQueuedOptimisticEntries(queuedEntries);
+  }, [reconcileQueuedOptimisticEntries, sessionId]);
 
   const markOptimisticAccepted = useCallback((commandId: string, options?: { clearPending?: boolean }) => {
     if (!commandId) return;
@@ -2108,6 +2210,33 @@ export function useTimeline(
     const status = typeof event.payload.status === 'string' ? event.payload.status : '';
     settleOptimisticByCommandAck(commandId, status, event.payload.error);
   }, [settleOptimisticByCommandAck]);
+
+  const applyTransportQueueEvidence = useCallback((event: QueueEvent) => {
+    if (event.sessionName && event.sessionName !== sessionId) return;
+    const previous = transportQueueStateRef.current;
+    const next = reduceTransportQueueEvent(previous, event);
+    transportQueueStateRef.current = next;
+    const accepted = next.degradedEvidence.length === previous.degradedEvidence.length;
+    if (accepted) {
+      reconcileQueuedOptimisticEntries(selectLiveQueueEntries(next));
+    }
+    if (event.type === 'transport.queue.receipt') {
+      settleOptimisticByCommandAck(event.commandId, event.status, event.reason);
+      return;
+    }
+    if (event.type === 'transport.queue.failure') {
+      markOptimisticFailed(event.clientMessageId, event.failureReason ?? event.dropReason);
+      return;
+    }
+    if (event.type === 'transport.queue.delivery') {
+      reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }]);
+    }
+  }, [markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
+
+  const applyTimelineTransportQueueEvidence = useCallback((event: TimelineEvent) => {
+    const queueEvent = queueEventFromTimelineEvent(event);
+    if (queueEvent) applyTransportQueueEvidence(queueEvent);
+  }, [applyTransportQueueEvidence]);
 
   const retryOptimisticMessage = useCallback((
     oldCommandId: string,
@@ -2968,6 +3097,10 @@ export function useTimeline(
     if (disableHistory || !ws || !sessionId) return;
 
     const handler = (msg: ServerMessage) => {
+      if (isTransportQueueEvent(msg)) {
+        applyTransportQueueEvidence(msg);
+        return;
+      }
       // ── Real-time event ──
       if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
@@ -2982,8 +3115,10 @@ export function useTimeline(
         if (event.type !== 'session.state') {
           lastTimelineEventAtRef.current = Date.now();
         }
-        if (event.type === 'session.state' && event.payload?.state === 'queued') {
-          reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages);
+        const structuredQueueEvent = queueEventFromTimelineEvent(event);
+        if (structuredQueueEvent) applyTransportQueueEvidence(structuredQueueEvent);
+        if (!structuredQueueEvent && event.type === 'session.state' && event.payload?.state === 'queued') {
+          reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages, event.payload);
         }
         settleOptimisticByCommandAckEvent(event);
 
@@ -3198,6 +3333,7 @@ export function useTimeline(
             mergeEvents(msg.events);
           }
           for (const historyEvent of msg.events) {
+            applyTimelineTransportQueueEvidence(historyEvent);
             settleOptimisticByCommandAckEvent(historyEvent);
             settleOptimisticByTimelineProgress(historyEvent);
           }
@@ -3242,6 +3378,7 @@ export function useTimeline(
           seqRef.current = Math.max(seqRef.current, maxSeq);
           mergeEvents(replayEvents);
           for (const replayEvent of replayEvents) {
+            applyTimelineTransportQueueEvidence(replayEvent);
             settleOptimisticByCommandAckEvent(replayEvent);
             settleOptimisticByTimelineProgress(replayEvent);
           }
@@ -3454,7 +3591,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [applyTimelineTransportQueueEvidence, applyTransportQueueEvidence, beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;

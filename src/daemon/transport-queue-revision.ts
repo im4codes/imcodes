@@ -1,13 +1,15 @@
+import logger from '../util/logger.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
+
 /**
- * Daemon-scoped protocol revision for transport pending-queue snapshots.
+ * Deprecated compatibility shim for old pending-queue revision call sites.
  *
- * TransportSessionRuntime has its own internal pendingVersion, but resend queues
- * also exist while no runtime is available. The web client compares a single
- * pendingMessageVersion number per session, so every runtime/resend snapshot
- * must share one comparable revision namespace.
+ * The queue authority is SQLite (`TransportQueueStore`). These functions must
+ * not mint authoritative versions; they only expose the committed SQLite
+ * `pendingMessageVersion` while remaining source-compatible with older emit
+ * paths that are being migrated to structured queue snapshots.
  */
 
-const revisions = new Map<string, number>();
 const observedRuntimeVersions = new Map<string, number>();
 
 function normalizeRevision(value: unknown): number | undefined {
@@ -17,52 +19,37 @@ function normalizeRevision(value: unknown): number | undefined {
 }
 
 export function getTransportQueueRevision(sessionName: string): number | undefined {
-  return revisions.get(sessionName);
+  const snapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'revision_shim');
+  if (snapshot.degraded) return undefined;
+  return snapshot.pendingMessageVersion;
 }
 
 export function observeTransportQueueRevision(sessionName: string, observed: unknown): number {
-  const current = revisions.get(sessionName);
   const normalized = normalizeRevision(observed);
-  if (current === undefined) {
-    // Never use 0 as an ordinary queue revision. Older UI code treated 0 as a
-    // reset and would lower its baseline, allowing stale queued snapshots to
-    // resurrect already-drained queue cards. A future epoch/generation field can
-    // model true restarts explicitly; within this numeric namespace revisions
-    // must be monotonic and positive.
-    const initial = normalized === undefined || normalized < 1 ? 1 : normalized;
-    revisions.set(sessionName, initial);
-    if (normalized !== undefined) observedRuntimeVersions.set(sessionName, normalized);
-    return initial;
-  }
   if (normalized !== undefined) {
-    const lastObserved = observedRuntimeVersions.get(sessionName);
     observedRuntimeVersions.set(sessionName, normalized);
-    if (lastObserved === undefined && normalized > current) {
-      revisions.set(sessionName, normalized);
-      return normalized;
+    const committed = getTransportQueueRevision(sessionName) ?? 0;
+    if (normalized > committed) {
+      logger.debug(
+        { sessionName, observedRuntimeVersion: normalized, committedQueueVersion: committed },
+        'ignored runtime pending version for SQLite transport queue revision shim',
+      );
     }
-    if (lastObserved !== undefined && normalized > lastObserved) {
-      const next = current + (normalized - lastObserved);
-      revisions.set(sessionName, next);
-      return next;
-    }
+    return committed;
   }
-  return current;
+  return getTransportQueueRevision(sessionName) ?? 0;
 }
 
 export function bumpTransportQueueRevision(sessionName: string): number {
-  const current = revisions.get(sessionName);
-  const next = current === undefined ? 1 : current + 1;
-  revisions.set(sessionName, next);
-  return next;
+  const committed = getTransportQueueRevision(sessionName) ?? 0;
+  logger.debug({ sessionName, committedQueueVersion: committed }, 'ignored deprecated transport queue revision bump');
+  return committed;
 }
 
 export function clearTransportQueueRevision(sessionName: string): void {
-  revisions.delete(sessionName);
   observedRuntimeVersions.delete(sessionName);
 }
 
 export function clearAllTransportQueueRevisions(): void {
-  revisions.clear();
   observedRuntimeVersions.clear();
 }

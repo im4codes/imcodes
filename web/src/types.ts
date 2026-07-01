@@ -67,6 +67,9 @@ export interface SessionInfo {
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: string[];
   transportPendingMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];
+  queueEpoch?: string;
+  queueAuthorityId?: string;
+  failedMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];
   /** Newest pending-queue version the UI has applied for this session.
    *  Used to drop stale out-of-order snapshots. See transport-queue.ts. */
   transportPendingMessageVersion?: number;

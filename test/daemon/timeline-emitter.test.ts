@@ -276,12 +276,12 @@ describe('TimelineEmitter — on/off handlers', () => {
  * frozen at pendingCount=1.
  *
  * These tests pin the fixed contract:
- *   T1 — queued events with changing pendingCount MUST all reach handlers.
+ *   T1 — structured queue fields MUST all reach handlers.
  *   T2 — plain idle/running events (no payload mutation) ARE still deduped.
  *   T2b — events with `error` payload are NEVER deduped.
  */
 describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression)', () => {
-  it('T1: successive queued events with changing pendingCount all reach handlers', () => {
+  it('T1: successive queued events with changing structured queue entries all reach handlers', () => {
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
     emitter.on((e) => {
@@ -298,17 +298,25 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     expect(received[2].pendingCount).toBe(3);
   });
 
-  it('T1b: queued events that only carry the state string (no pending fields) still broadcast each time', () => {
-    // Because `state === 'queued'` is itself treated as a mutation gate, the
-    // emitter must not silently dedup these even with identical payloads.
-    // This protects against future changes that emit lean queued events.
+  it('T1b: queued events that only carry the state string are deduped', () => {
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
     emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
 
     emitter.emit('session-q', 'session.state', { state: 'queued' });
     emitter.emit('session-q', 'session.state', { state: 'queued' });
-    expect(received).toHaveLength(2);
+    expect(received).toHaveLength(1);
+  });
+
+  it('T1c: legacy pendingCount and text arrays do not bypass same-state dedup', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
+
+    emitter.emit('session-legacy', 'session.state', { state: 'queued', pendingCount: 1, pendingMessages: ['a'], transportPendingMessages: ['a'] });
+    emitter.emit('session-legacy', 'session.state', { state: 'queued', pendingCount: 2, pendingMessages: ['a', 'b'], transportPendingMessages: ['a', 'b'] });
+    expect(received).toHaveLength(1);
+    expect(received[0].pendingCount).toBe(1);
   });
 
   it('T2: successive idle (or running) events with no payload mutation are still deduped (avoid UI flicker)', () => {
@@ -345,7 +353,7 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
   });
 
   it('T2c: pendingMessageEntries as empty array is still treated as a snapshot (drain-to-zero broadcast)', () => {
-    // After a drain, daemon emits `session.state {state:'running', pendingCount:0,
+    // After a drain, daemon emits `session.state {state:'running',
     // pendingMessageEntries:[]}` to tell the UI the queue is empty. The dedup
     // gate must NOT silently swallow that just because `state` happens to
     // match the previous one.
@@ -354,9 +362,38 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
 
     emitter.emit('session-d', 'session.state', { state: 'running' });
-    emitter.emit('session-d', 'session.state', { state: 'running', pendingCount: 0, pendingMessageEntries: [] });
+    emitter.emit('session-d', 'session.state', { state: 'running', pendingMessageEntries: [] });
     expect(received).toHaveLength(2);
-    expect(received[1].pendingCount).toBe(0);
+    expect(received[1].pendingMessageEntries).toEqual([]);
+  });
+
+  it('T2d: structured queue epoch/version fields bypass same-state dedup', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
+
+    emitter.emit('session-newq', 'session.state', { state: 'running' });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 1,
+      transportPendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }],
+      failedMessageEntries: [],
+    });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 2,
+      transportPendingMessageEntries: [],
+      failedMessageEntries: [{ clientMessageId: 'a', text: 'failed' }],
+    });
+
+    expect(received).toHaveLength(3);
+    expect(received[1].transportPendingMessageVersion).toBe(1);
+    expect(received[2].transportPendingMessageVersion).toBe(2);
+    expect(received[2].failedMessageEntries).toEqual([{ clientMessageId: 'a', text: 'failed' }]);
   });
 });
 

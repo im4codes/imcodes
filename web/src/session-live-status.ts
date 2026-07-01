@@ -2,6 +2,10 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
 } from '@shared/session-control-commands.js';
+import {
+  selectSessionHasLiveQueue,
+  type TransportQueueReducerState,
+} from '../../shared/transport-queue-reducer.js';
 
 export type SessionLiveStatusMode =
   | 'idle'
@@ -26,6 +30,7 @@ export interface SessionLiveStatusInput {
   sessionError?: string | null;
   stopRequested?: boolean;
   isAgentless?: boolean;
+  transportQueueState?: TransportQueueReducerState | null;
 }
 
 export interface SessionLiveStatus {
@@ -62,7 +67,8 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   const isAgentless = input.isAgentless === true;
   const activeThinking = input.activeThinking === true;
   const activeToolCall = input.activeToolCall === true;
-  const activeTransportTurn = input.activeTransportTurn === true;
+  const hasLiveQueue = input.transportQueueState ? selectSessionHasLiveQueue(input.transportQueueState) : false;
+  const activeTransportTurn = input.activeTransportTurn === true || hasLiveQueue;
   const stopRequested = input.stopRequested === true;
   const statusText = normalizeDetail(input.statusText);
   const activityDetail = normalizeDetail(input.transportActivityDetail);

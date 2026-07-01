@@ -51,6 +51,10 @@ export interface RequestDaemonUpgradeResult {
   reason?: string;
 }
 
+export interface RetryAutoDaemonUpgradeAfterBlockedInput extends Omit<RequestDaemonUpgradeInput, 'targetVersion' | 'source'> {
+  retryDelayMs: number;
+}
+
 export class DaemonUpgradeCoordinator {
   private current: UpgradeState | null = null;
   private lastAutoSentAt: number | null = null;
@@ -188,6 +192,30 @@ export class DaemonUpgradeCoordinator {
       upgradeId: state.upgradeId,
       targetVersion: state.targetVersion,
       deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+    };
+  }
+
+  retryAutoAfterBlocked(input: RetryAutoDaemonUpgradeAfterBlockedInput): RequestDaemonUpgradeResult | null {
+    const state = this.current;
+    if (!state || state.source !== 'auto' || state.status !== 'sent') return null;
+
+    const retryDelayMs = Math.max(0, Math.floor(input.retryDelayMs));
+    const now = input.now ?? Date.now();
+    if (state.timer) clearTimeout(state.timer);
+    state.status = 'scheduled';
+    state.updatedAt = now;
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      if (this.current !== state || !input.isDaemonReady() || input.isStillCurrent?.() === false) return;
+      this.sendNow(state, { ...input, targetVersion: state.targetVersion, source: 'auto' }, Date.now());
+    }, retryDelayMs);
+
+    return {
+      ok: true,
+      upgradeId: state.upgradeId,
+      targetVersion: state.targetVersion,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+      nextAttemptAt: new Date(now + retryDelayMs).toISOString(),
     };
   }
 

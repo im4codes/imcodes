@@ -21,6 +21,7 @@ function preserveEntries(
       text: entry.text,
       ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
       commandId: entry.clientMessageId,
+      clientMessageId: entry.clientMessageId,
       ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
       ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
       ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),

@@ -301,8 +301,8 @@ struct SessionDetailView: View {
             return
         }
 
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let text = rawText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         isSending = true
         defer { isSending = false }
