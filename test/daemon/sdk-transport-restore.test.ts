@@ -534,7 +534,7 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 200 });
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 2000 });
     const terminalIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
       call[0] === sessionName
       && call[1] === 'tool.result'
@@ -575,6 +575,83 @@ describe('sdk transport session restore', () => {
     });
     expect(JSON.stringify(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2])).not.toContain('SECRET_CHILD_PROMPT');
     expect(timelineEmitterEmitMock.mock.calls[restoreStateIndex]?.[2]).not.toHaveProperty('authoritative');
+  });
+
+  it('scans a broad timeline tail so daemon restart closes older SDK sub-agent rows after noisy restores', async () => {
+    const sessionName = `deck_sdk_hidden_old_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const detail = makeRestoreSdkSubagentDetail({
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      canonicalKey: 'codex:restore:runtime:agent-old',
+    });
+    const oldRunning = {
+      eventId: 'hidden-sdk-old-call',
+      sessionId: sessionName,
+      ts: Date.now() - 120_000,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      hidden: true,
+      payload: {
+        toolCallId: 'sdk-hidden-old',
+        tool: 'Codex Sub-agent',
+        detail,
+      },
+    } as const;
+    const noisyTools = Array.from({ length: 350 }, (_, index) => ({
+      eventId: `noise-${index}`,
+      sessionId: sessionName,
+      ts: Date.now() - 60_000 + index,
+      seq: 2 + index,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: index % 2 === 0 ? 'tool.call' : 'tool.result',
+      payload: { toolCallId: `noise-${index}`, tool: 'Bash' },
+    } as const));
+    timelineReadByTypesPreferredMock.mockResolvedValue([oldRunning, ...noisyTools]);
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkhiddenold',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-hidden-old',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-hidden-old-orphan',
+      codexSessionId: 'codex-thread-hidden-old-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 2000 });
+    expect(timelineEmitterEmitMock.mock.calls).toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        sessionName,
+        'tool.result',
+        expect.objectContaining({
+          toolCallId: 'sdk-hidden-old',
+          terminalStatus: 'stale',
+          terminalReason: 'daemon_restart_orphan',
+          detail: expect.objectContaining({
+            kind: SDK_SUBAGENT_DETAIL_KIND,
+            meta: expect.objectContaining({
+              canonicalKey: 'codex:restore:runtime:agent-old',
+              normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+              active: false,
+              terminal: true,
+            }),
+          }),
+        }),
+      ]),
+    ]));
   });
 
   it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {

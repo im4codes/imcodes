@@ -1132,6 +1132,10 @@ const TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS = (() => {
   const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS);
   return Number.isFinite(raw) && raw >= 0 ? Math.trunc(raw) : 75;
 })();
+const TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT = (() => {
+  const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT);
+  return Number.isFinite(raw) && raw >= 200 ? Math.trunc(raw) : 2_000;
+})();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
 function pauseBetweenTransportRestores(index: number, delayMs = TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS): Promise<void> {
@@ -1882,7 +1886,9 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
 async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, runtime: TransportSessionRuntime): Promise<number> {
   let events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   try {
-    const timelineEvents = await timelineStore.readByTypesPreferred(sessionName, ['tool.call', 'tool.result'], { limit: 200 });
+    const timelineEvents = await timelineStore.readByTypesPreferred(sessionName, ['tool.call', 'tool.result'], {
+      limit: TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT,
+    });
     events = timelineEvents.map((event) => ({ type: event.type, payload: event.payload }));
   } catch (err) {
     logger.warn({ err, sessionName }, 'transport restore sdk orphan reconcile could not read timeline history');
