@@ -180,6 +180,7 @@ const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
 const MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS = 2;
+const LOCALLY_CANCELLED_ACTIVITY_GENERATION_LIMIT = 16;
 // A turn with a RUNNING TOOL can be legitimately silent for minutes — a command
 // that sleeps / polls / builds (e.g. a 180s `tcpdump` wait, a long test/build)
 // emits no provider events while it runs. The phantom-turn recovery must NOT
@@ -416,6 +417,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
   private readonly _locallyCancelledDispatchIds = new Set<number>();
+  private readonly _locallyCancelledActivityGenerations = new Set<string>();
   private _currentActivityGenerationLocallyCancelled = false;
   private _activeDispatchHasSideEffectEvidence = false;
   private readonly _sdkTurnLostRecoveryAttempts = new Map<string, number>();
@@ -955,6 +957,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (activity.blockingWorkCount <= 0) return false;
     const dispatchId = this._activeDispatchId;
     if (dispatchId !== null) this._locallyCancelledDispatchIds.add(dispatchId);
+    this.markCurrentActivityGenerationLocallyCancelled();
     const providerSessionId = this._providerSessionId;
     const providerStarted = this._activeDispatchProviderStarted;
     const providerCanCancel = !!this.provider.cancel && !!providerSessionId;
@@ -1110,6 +1113,20 @@ export class TransportSessionRuntime implements SessionRuntime {
   private markCurrentActivityGenerationLocallyCancelled(): void {
     if (this._activityGeneration <= 0) return;
     this._currentActivityGenerationLocallyCancelled = true;
+    const generationKey = normalizeActivityGeneration(this.currentActivityGeneration());
+    if (!generationKey) return;
+    this._locallyCancelledActivityGenerations.add(generationKey);
+    while (this._locallyCancelledActivityGenerations.size > LOCALLY_CANCELLED_ACTIVITY_GENERATION_LIMIT) {
+      const oldest = this._locallyCancelledActivityGenerations.values().next().value;
+      if (!oldest) break;
+      this._locallyCancelledActivityGenerations.delete(oldest);
+    }
+  }
+
+  private hasLocallyCancelledActivityGeneration(providerSnapshot: ProviderActiveWorkSnapshot): boolean {
+    const snapshotGeneration = providerSnapshot.activityGeneration ?? providerSnapshot.generation;
+    const generationKey = normalizeActivityGeneration(snapshotGeneration);
+    return Boolean(generationKey && this._locallyCancelledActivityGenerations.has(generationKey));
   }
 
   private hasInFlightDispatchWork(): boolean {
@@ -1120,8 +1137,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     providerSnapshot: ProviderActiveWorkSnapshot,
     evaluationState: ProviderSnapshotEvaluation['state'],
   ): boolean {
-    if (this._currentActivityGenerationLocallyCancelled
-      && isProviderSnapshotNonBlockingForStoppedGeneration(providerSnapshot, this.currentActivityGeneration())) {
+    if (this.hasLocallyCancelledActivityGeneration(providerSnapshot)
+      && isProviderSnapshotNonBlockingForStoppedGeneration(providerSnapshot, providerSnapshot.activityGeneration ?? providerSnapshot.generation)) {
       return true;
     }
     if (providerSnapshot.activeWorkCount > 0 || providerSnapshot.activeToolCount > 0) return false;
@@ -1575,6 +1592,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
+    this._locallyCancelledActivityGenerations.clear();
     this._currentActivityGenerationLocallyCancelled = false;
     this._externalCompletionSettlementsToIgnore = 0;
     this._cancelledProviderErrorsToIgnore = 0;
@@ -2378,11 +2396,15 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._activeTurn && !this._sending) {
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this._activeDispatchEntries = [];
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
       this._activeDispatchProviderStarted = false;
       this._activeDispatchId = null;
       this._activeDispatchStaleRecoveryStarted = false;
+      if (!this._drainPending()) {
+        this.setStatus('idle');
+      }
       return;
     }
     this._sending = false;

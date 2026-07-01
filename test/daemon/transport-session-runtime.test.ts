@@ -1500,6 +1500,68 @@ describe('TransportSessionRuntime', () => {
       userMessage: 'queued after stop',
     }));
     expect(runtime.pendingCount).toBe(0);
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
+  });
+
+  it('external completion settles idle even when Codex still reports provider_tool_item for the stopped generation', async () => {
+    const generation = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    expect(runtime.send('marker-backed turn with orphan provider tool', 'msg-orphan-tool')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('marker-complete-but-provider-tool-stale')).toBe(true);
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
+  });
+
+  it('stop clears no-active-turn orphan provider_tool_item evidence instead of leaving the session tool_running', async () => {
+    const generation = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    expect(runtime.send('turn whose local dispatch already settled externally', 'msg-orphan-stop')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+      updatedAt: Date.now(),
+    }));
+    Object.assign(runtime as unknown as {
+      _activeTurn: null;
+      _sending: boolean;
+      _activeDispatchEntries: unknown[];
+      _activeDispatchId: null;
+      _activeDispatchProviderStarted: boolean;
+      _activeDispatchCancelled: boolean;
+    }, {
+      _activeTurn: null,
+      _sending: false,
+      _activeDispatchEntries: [],
+      _activeDispatchId: null,
+      _activeDispatchProviderStarted: false,
+      _activeDispatchCancelled: false,
+    });
+
+    await runtime.cancel();
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
   });
 
   it('send() merges description and runtime prompt into normalized systemText', async () => {

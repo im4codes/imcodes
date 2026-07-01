@@ -4135,6 +4135,56 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('terminalizes orphan provider tools on cancel when app-server no longer has a running turn id', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-orphan-cancel', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    const errors: string[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    provider.onError((_, error) => errors.push(error.code));
+
+    await provider.send('route-websearch-orphan-cancel', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-orphan-cancel')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-orphan-cancel', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(
+      () => provider.getActiveWorkSnapshot('route-websearch-orphan-cancel')?.activeToolCount === 1,
+    );
+
+    const state = (provider as unknown as {
+      sessions: Map<string, { runningTurnId?: string; turnStartInFlight: boolean }>;
+    }).sessions.get('route-websearch-orphan-cancel')!;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+
+    await provider.cancel('route-websearch-orphan-cancel');
+
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+    expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED);
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-orphan-cancel',
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: 'user_cancelled',
+      terminalSynthetic: true,
+      terminalSource: 'daemon_synthetic',
+      terminalDecisionReason: 'user_cancelled',
+      lifecycleItemKind: 'web_search',
+    }));
+    expect(provider.getActiveWorkSnapshot('route-websearch-orphan-cancel')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
   it('abandons stale open provider tools at the next send boundary before starting a new turn', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });

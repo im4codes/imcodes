@@ -2230,8 +2230,35 @@ export class CodexSdkProvider implements TransportProvider {
       return;
     }
     const turnId = state.runningTurnId;
-    if (!turnId) return;
+    if (!turnId) {
+      this.cancelOrphanProviderWorkLocally(sessionId, state);
+      return;
+    }
     await this.interruptRunningTurn(sessionId, state, turnId);
+  }
+
+  private cancelOrphanProviderWorkLocally(sessionId: string, state: CodexSdkSessionState): boolean {
+    if (state.turnStartInFlight) return false;
+    const work = this.getCurrentTurnWorkState(state);
+    if (work.activeWorkCount <= 0 && !state.cancelTimer) return false;
+    this.clearCancelTimer(state);
+    this.clearActiveTurnLease(state);
+    this.clearCompactTimers(state);
+    this.clearRawChecklistPollTimer(state);
+    this.clearChildSubagentRolloutPollTimer(state);
+    this.clearStatus(sessionId, state);
+    this.rememberTerminatedActiveTurn(state);
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+    state.runningCompact = false;
+    state.compactObserved = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
+    this.clearActiveItemEvidence(state);
+    this.clearPendingSessionSystemTextUpdate(state);
+    this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+    return true;
   }
 
   private async interruptRunningTurn(
