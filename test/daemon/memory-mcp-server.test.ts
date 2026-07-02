@@ -139,7 +139,7 @@ describe('memory MCP stdio server', () => {
     }
   });
 
-  it('lists exactly the ten shared tools over stdio and does not leak secret env', async () => {
+  it('lists the registered shared tools over stdio and does not leak secret env', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stdio-'));
     const serverConfigPath = join(dir, 'server.json');
     await writeFile(serverConfigPath, JSON.stringify({ serverId: 'srv-local' }), 'utf8');

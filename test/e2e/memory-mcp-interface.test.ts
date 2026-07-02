@@ -102,7 +102,7 @@ describe('memory MCP interface e2e', () => {
     };
   }
 
-  it('runs the real stdio server, exposes exactly eleven tools, and persists runtime-derived preference provenance', async () => {
+  it('runs the real stdio server, exposes the registered shared tools, and persists runtime-derived preference provenance', async () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
       expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
