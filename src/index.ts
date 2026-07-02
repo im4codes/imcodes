@@ -483,6 +483,40 @@ program
       } catch { /* not using systemd */ }
     }
     const daemonPidNumber = daemonPid ? parseInt(daemonPid, 10) : NaN;
+
+    // Live-state overlay: sessions.json is a multi-writer read-modify-write
+    // file whose `state` can be resurrected stale (a slow spread-writer can
+    // bring back 'running' minutes after the runtime settled idle). When the
+    // daemon is running, ask it for the authoritative live transport states
+    // and overlay them; fall back to the persisted records when the daemon is
+    // stopped or the hook does not answer in time.
+    if (daemonRunning) {
+      try {
+        const port = await resolveLiveHookPort();
+        if (port) {
+          const live = await Promise.race([
+            postToHookServer(port, '/sessions/live', {}),
+            new Promise<never>((_, reject) => {
+              const t = setTimeout(() => reject(new Error('sessions/live timeout')), 1500);
+              t.unref?.();
+            }),
+          ]) as { ok?: boolean; sessions?: Array<{ name?: string; state?: string; live?: boolean }> };
+          if (live?.ok && Array.isArray(live.sessions)) {
+            const liveStates = new Map<string, string>();
+            for (const entry of live.sessions) {
+              if (entry && typeof entry.name === 'string' && entry.live === true && typeof entry.state === 'string') {
+                liveStates.set(entry.name, entry.state);
+              }
+            }
+            for (const s of sessions) {
+              const liveState = liveStates.get(s.name);
+              if (liveState) s.state = liveState as typeof s.state;
+            }
+          }
+        }
+      } catch { /* hook unreachable — persisted records remain the fallback */ }
+    }
+
     const daemonUptimeSeconds = daemonRunning && Number.isSafeInteger(daemonPidNumber)
       ? readProcessUptimeSeconds(daemonPidNumber) ?? readPersistedDaemonUptimeSeconds(daemonPidNumber)
       : null;
