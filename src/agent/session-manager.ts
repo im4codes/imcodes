@@ -1546,7 +1546,18 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.clearInputs = [
         { source: 'transport-runtime', reason: 'clear', count: 0 },
       ];
-      Object.assign(payload, buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle'));
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle');
+      Object.assign(payload, queuePayload);
+      // Canonical authoritative-idle contract fields. The shared validator
+      // (`isAuthoritativeIdlePayloadShape`) requires numeric `pendingCount` and
+      // `pendingVersion`; the queue snapshot only carries
+      // `pendingMessageVersion`/`pendingMessageEntries`, so without these two
+      // aliases the web demotes every daemon idle to a WEAK idle — and any
+      // unmatched tool.call in the timeline then keeps the session rendered
+      // "working" forever even though the reconciler proved clean idle
+      // (observed live on deck_sub_3l6z4l39).
+      payload.pendingCount = queuePayload.pendingMessageEntries.length;
+      payload.pendingVersion = queuePayload.pendingMessageVersion;
     } else if (mapped === 'error' && providerError?.message) {
       payload.error = providerError.message;
     }

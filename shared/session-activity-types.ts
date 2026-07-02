@@ -34,6 +34,7 @@ export type ToolTerminalReason =
   | 'app_server_disconnect'
   | 'auth_refresh_recovery_failed'
   | 'app_server_restart_recovery_failed'
+  | 'rollout_task_complete'
   | 'unexpected_eof'
   | 'no_current_work_disconnect'
   | 'unknown_tool'
@@ -186,6 +187,7 @@ const TOOL_TERMINAL_REASONS = new Set<ToolTerminalReason>([
   'app_server_disconnect',
   'auth_refresh_recovery_failed',
   'app_server_restart_recovery_failed',
+  'rollout_task_complete',
   'unexpected_eof',
   'no_current_work_disconnect',
   'unknown_tool',

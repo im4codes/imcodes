@@ -4513,6 +4513,128 @@ describe('CodexSdkProvider', () => {
     await provider.disconnect();
   }, 60_000);
 
+  // Regression (deck_cd_brain zombie turn): codex core finished the turn —
+  // the rollout recorded `task_complete` — but the app-server never sent
+  // `turn/completed` and `thread/read` kept reporting the turn active. The
+  // provider must cross-check the rollout once the event stream is silent past
+  // the confirm threshold and settle the turn from that durable evidence,
+  // instead of staying "working" until the daemon's 30-min last resort.
+  it('settles a zombie turn from rollout task_complete evidence when heartbeats keep reporting active', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-turn-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-zombie-turn', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+      const errors: Array<{ code: string }> = [];
+      provider.onError((_sid, error) => errors.push({ code: error.code }));
+
+      await provider.send('route-zombie-turn', 'finish the openspec change');
+      const child = childProcessMock.children[0];
+
+      // codex core records the turn as complete in the rollout, but the
+      // app-server keeps answering thread/read with an active current turn.
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-1',
+            last_agent_message: '已按完整 OpenSpec 流程处理完变更',
+          },
+        },
+      ]);
+      const zombieReadResult = {
+        thread: { id: 'thread-1', status: { type: 'active' } },
+        turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+      };
+      childProcessMock.enqueueThreadReadResult(zombieReadResult);
+      childProcessMock.enqueueThreadReadResult(zombieReadResult);
+
+      // Heartbeat #1 at the 50s strong-grace boundary: silence (50s) is below
+      // the 60s rollout-confirm threshold → no cross-check yet, stays working.
+      await vi.advanceTimersByTimeAsync(50_100);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(completed).toHaveLength(0);
+
+      // Heartbeat #2 (+20s interval): silence ~70s ≥ 60s → rollout cross-check
+      // finds task_complete for turn-1 and settles the zombie turn. Advance in
+      // small async steps so the real fs read can resolve under fake timers.
+      for (let i = 0; i < 300 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(1);
+      expect(completed[0]).toMatchObject({ role: 'assistant', status: 'complete' });
+      // Settled from evidence — never via the destructive interrupt RPC, and
+      // never surfaced as an error.
+      expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+      expect(errors).toEqual([]);
+      const diagnostics = provider.getSessionDiagnostics('route-zombie-turn')!;
+      expect(diagnostics.heartbeatLeaseActive).toBe(false);
+
+      // A follow-up turn dispatches normally after the zombie settle.
+      await provider.send('route-zombie-turn', 'next task');
+      expect(child.requests.filter((req) => req.method === 'turn/start').length).toBeGreaterThanOrEqual(2);
+      await provider.disconnect();
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('does not settle from rollout evidence when task_complete belongs to a different turn', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-other-turn-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-zombie-other', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+
+      await provider.send('route-zombie-other', 'long real work');
+      // Stale record from a PREVIOUS turn only — the current turn (turn-1) is
+      // genuinely still running and must not be settled.
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-0', last_agent_message: 'previous turn' },
+        },
+      ]);
+      const activeReadResult = {
+        thread: { id: 'thread-1', status: { type: 'active' } },
+        turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+      };
+      childProcessMock.enqueueThreadReadResult(activeReadResult);
+      childProcessMock.enqueueThreadReadResult(activeReadResult);
+      childProcessMock.enqueueThreadReadResult(activeReadResult);
+
+      await vi.advanceTimersByTimeAsync(50_100);
+      for (let i = 0; i < 300; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(0);
+      const diagnostics = provider.getSessionDiagnostics('route-zombie-other')!;
+      expect(diagnostics.heartbeatLeaseActive).toBe(true);
+      await provider.disconnect();
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('enforces provider-wide heartbeat cap and releases capacity exactly once when an in-flight lease is cleared', async () => {
     vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);

@@ -89,6 +89,23 @@ const CODEX_IDLE_SETTLE_DEBOUNCE_MS = 1_500;
 const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
 const CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS = 50_000;
 const CODEX_TURN_HEARTBEAT_INTERVAL_MS = 20_000;
+// Cross-check for an app-server zombie turn: codex core can finish a turn
+// (rollout records `task_complete`, needs_follow_up=false) while the
+// app-server's turn state never transitions — no `turn/completed` is sent,
+// `thread/read` keeps reporting the turn active, and `turn/interrupt` will
+// happily "cancel" the already-finished turn. Observed on deck_cd_brain:
+// task_complete written at 07:20:03, zero further thread activity, heartbeats
+// classified "active" for 34 minutes until the daemon's 30-min last-resort
+// force-settled the session. When the heartbeat says "active" but the event
+// stream has been silent past this threshold, read the thread's own rollout
+// tail; a recorded `task_complete` for the running turn is authoritative
+// completion evidence and settles the turn immediately.
+// Env override for tuning: IMCODES_CODEX_ROLLOUT_COMPLETE_SILENCE_MS.
+const CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS = (() => {
+  const raw = Number.parseInt(process.env.IMCODES_CODEX_ROLLOUT_COMPLETE_SILENCE_MS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
+})();
+const CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES = 256 * 1024;
 const CODEX_TURN_HEARTBEAT_JITTER_MS = 5_000;
 const CODEX_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 const CODEX_TURN_HEARTBEAT_FAILURE_THRESHOLD = 3;
@@ -786,6 +803,8 @@ interface CodexSdkSessionState {
   rawChecklistStartedAt: number;
   rawChecklistRolloutPath?: string;
   rawChecklistRolloutOffset?: number;
+  /** Guards the async rollout task_complete cross-check (one in flight per session). */
+  rolloutTaskCompleteCheckInFlight?: boolean;
   rawChecklistSeenCallIds: Set<string>;
   rawChecklistScanPromise?: Promise<void>;
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
@@ -3936,9 +3955,22 @@ export class CodexSdkProvider implements TransportProvider {
     if (classification.outcome === 'active') {
       lease.heartbeatFailureCount = 0;
       lease.lastAliveHeartbeatAtMs = summary.requestEndedAtMs;
+      // Zombie-turn cross-check: the app-server says the turn is active, but if
+      // the event stream has been silent past the rollout-confirm threshold,
+      // consult codex core's own durable record. A `task_complete` in the
+      // thread's rollout for this turn is authoritative completion evidence the
+      // app-server failed to deliver — settle instead of waiting for the
+      // daemon's 30-min last resort.
+      this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, summary.requestEndedAtMs);
       return;
     }
-    if (classification.outcome === 'inconclusive' || classification.outcome === 'degraded' || classification.outcome === 'stale') return;
+    if (classification.outcome === 'inconclusive' || classification.outcome === 'degraded' || classification.outcome === 'stale') {
+      // Heartbeat could not prove liveness either way — the rollout record can
+      // still prove completion (e.g. an unresponsive app-server whose core
+      // already finished the turn).
+      this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, summary.requestEndedAtMs);
+      return;
+    }
     if (classification.outcome === 'provider_error') {
       this.clearActiveTurnLease(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex thread heartbeat reported systemError', false, {
@@ -3976,6 +4008,107 @@ export class CodexSdkProvider implements TransportProvider {
         summary,
         classification.classifier as 'idle_missing_turn' | 'not_loaded_with_active_lease' | 'start_grace_expired_no_current_turn',
       );
+    }
+  }
+
+  /**
+   * Fire-and-forget zombie-turn cross-check. Only runs when the provider event
+   * stream has been silent past CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS while
+   * the heartbeat cannot prove the turn terminal. Reads the thread's rollout
+   * tail; a recorded `task_complete` for the running turn settles it as
+   * completed (the final agent_message text already reached the runtime via
+   * deltas before the app-server went zombie).
+   */
+  private maybeConfirmTaskCompleteFromRollout(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    lease: CodexActiveTurnLease,
+    nowMs: number,
+  ): void {
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    if (!state.threadId) return;
+    const turnId = state.runningTurnId ?? lease.turnId;
+    if (!turnId) return;
+    const silenceMs = nowMs - Math.max(lease.lastStrongActivityAtMs, lease.lastWeakActivityAtMs ?? 0);
+    if (silenceMs < CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    void this.confirmTaskCompleteFromRollout(sessionId, lease.id, lease.attemptId, turnId)
+      .catch((err) => {
+        logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout task_complete cross-check failed');
+      })
+      .finally(() => {
+        const latest = this.sessions.get(sessionId);
+        if (latest) latest.rolloutTaskCompleteCheckInFlight = false;
+      });
+  }
+
+  private async confirmTaskCompleteFromRollout(
+    sessionId: string,
+    leaseId: string,
+    attemptId: number,
+    turnId: string,
+  ): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const lease = state?.activeTurnLease;
+    if (!state || !lease || lease.id !== leaseId || lease.attemptId !== attemptId) return;
+    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    const confirmed = await this.rolloutTailReportsTaskComplete(state, turnId);
+    if (!confirmed) return;
+    // Re-validate after the await — the turn may have settled or rolled over
+    // through the normal paths while the file read was in flight.
+    const latestState = this.sessions.get(sessionId);
+    const latestLease = latestState?.activeTurnLease;
+    if (!latestState || !latestLease || latestLease.id !== leaseId || latestLease.attemptId !== attemptId) return;
+    if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
+    if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
+    logger.warn({
+      provider: this.id,
+      sessionId,
+      ...(latestState.imcodesSessionName ? { sessionName: latestState.imcodesSessionName } : {}),
+      threadId: latestState.threadId,
+      turnId,
+    }, 'Codex rollout records task_complete for the running turn but the app-server never closed it; settling the zombie turn from rollout evidence');
+    await this.completeTurn(sessionId, latestState, turnId, 'rollout_task_complete');
+  }
+
+  /** Reads the tail of the thread's rollout file looking for a `task_complete` event for `turnId`. */
+  private async rolloutTailReportsTaskComplete(state: CodexSdkSessionState, turnId: string): Promise<boolean> {
+    if (!state.threadId) return false;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
+    if (!rolloutPath) return false;
+    state.rawChecklistRolloutPath = rolloutPath;
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const start = Math.max(0, size - CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES);
+      if (start >= size) return false;
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      if (bytesRead <= 0) return false;
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        // Cheap pre-filter before JSON.parse.
+        if (!trimmed || !trimmed.includes('task_complete') || !trimmed.includes(turnId)) continue;
+        try {
+          const record = JSON.parse(trimmed) as Record<string, unknown>;
+          const payload = isRecord(record.payload) ? record.payload : record;
+          if (payload.type !== 'task_complete') continue;
+          const completedTurnId = meaningfulString(payload.turn_id) ?? meaningfulString(payload.turnId);
+          if (completedTurnId === turnId) return true;
+        } catch {
+          // Partial first line of the tail window or non-JSON noise — skip.
+        }
+      }
+      return false;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, turnId, err }, 'Codex rollout task_complete tail read failed');
+      return false;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
     }
   }
 

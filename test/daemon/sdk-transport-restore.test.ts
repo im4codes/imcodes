@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { isAuthoritativeCleanIdlePayload } from '../../shared/session-activity-types.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -423,6 +424,18 @@ describe('sdk transport session restore', () => {
     });
     expect(idleCall?.[2]).not.toHaveProperty('error');
     expect(idleCall?.[2]).not.toHaveProperty('reason');
+    // Regression (deck_sub_3l6z4l39 stuck "working" in the web): the emitted
+    // daemon idle MUST satisfy the exact shared validator the web uses to
+    // accept an authoritative clean idle. The payload previously carried only
+    // `pendingMessageVersion` (no numeric `pendingCount`/`pendingVersion`), so
+    // isAuthoritativeIdlePayloadShape failed, every daemon idle was demoted to
+    // a WEAK idle, and any unmatched tool.call kept the session rendered
+    // "working" even after the reconciler proved clean idle.
+    expect(idleCall?.[2]).toMatchObject({
+      pendingCount: expect.any(Number),
+      pendingVersion: expect.any(Number),
+    });
+    expect(isAuthoritativeCleanIdlePayload(idleCall?.[2] as Record<string, unknown>)).toBe(true);
   });
 
   it('reconciles unmatched persisted transport tool calls as daemon restart orphans before restore idle observation', async () => {
