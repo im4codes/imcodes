@@ -356,6 +356,21 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 const MAX_MEMORY_EVENTS = 300;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
+
+// A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
+// partially-persisted IDB read) can be a LOW-COMPLETENESS tail: it shows a few
+// recent messages but is not the full history. A tail-anchored HTTP backfill
+// then only fetches `(seedTail, newest]` and never pulls the bulk history
+// BELOW the seed — the "open the chat and only the latest few lines show;
+// force-sync fixes it" symptom. When the seed looks low-completeness we pull
+// the full newest window (manualLatestWindow) instead of a tail catch-up.
+// Threshold kept small/conservative so a genuinely short-but-complete session
+// is NOT misclassified (it would still use the cheap tail path).
+const LOW_COMPLETENESS_SEED_THRESHOLD = 5;
+function isLowCompletenessSeed(events: readonly TimelineEvent[] | undefined): boolean {
+  if (!events || events.length === 0) return true;
+  return events.length < LOW_COMPLETENESS_SEED_THRESHOLD;
+}
 const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
 const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
@@ -1710,7 +1725,10 @@ export function useTimeline(
       // Background HTTP backfill — catches events missed while this window
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
-      // strictly additive catch-up, merged by eventId.
+      // strictly additive catch-up, merged by eventId. (Tail mode is correct
+      // here: the module cache is only ever written by full sources — IDB /
+      // daemon / HTTP — never by the low-completeness localStorage seed, so a
+      // small memCached is a genuinely small session, not a truncated tail.)
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
@@ -1748,7 +1766,10 @@ export function useTimeline(
       requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
-      // state, not whatever the WS subscription happened to catch.
+      // state, not whatever the WS subscription happened to catch. (path-2 is
+      // only reached when a prior full load already completed for this session
+      // — see the IDB-stored branch which only locks historyLoadedRef when the
+      // restore is NOT low-completeness — so tail mode is correct here.)
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
@@ -1805,12 +1826,25 @@ export function useTimeline(
         setCachedEvents(cacheKey!, restored);
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
-        historyLoadedRef.current = cacheKeyRef.current;
+        // Only treat this session as "fully loaded" (path-2 skip on re-open)
+        // when the restored set is NOT a low-completeness tail. IDB can hold
+        // just a WS-replay tail (daemon closed before flushing full history);
+        // locking historyLoadedRef on that would make every re-open hit path-2
+        // (tail backfill only) and never self-heal the truncation.
+        const restoredLooksComplete = !isLowCompletenessSeed(restored);
+        // Single completeness gate (see markHistoryLoadedIfComplete): only a
+        // NON-low-completeness restore locks path-2. A truncated tail stays
+        // unlocked so re-open re-reads/self-heals.
+        markHistoryLoadedIfComplete(restored);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
-        // WS event; reopening after a mid-chat close may leave a gap.
+        // WS event; reopening after a mid-chat close may leave a gap. A
+        // low-completeness restore pulls the full newest window instead of a
+        // tail catch-up so the bulk history below the seed is recovered.
         if (isActiveSession) {
-          fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+          fireHttpBackfillRef.current(200, restoredLooksComplete
+            ? { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' }
+            : { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' });
         }
         // Phase 2 (split-key heal): scoped had data, but the bare key may ALSO
         // hold a segment (serverId resolved mid-session). Merge it in the
@@ -2405,6 +2439,21 @@ export function useTimeline(
   }, [sessionId, clearOptimisticTimer, markOptimisticFailed]);
 
   const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Single completeness gate for `historyLoadedRef` (the path-2 "already fully
+  // loaded, skip reload on re-open" token). INVARIANT: historyLoadedRef.current
+  // === cacheKeyRef.current  ⟺  this session has loaded a NON-low-completeness
+  // history. This is the sole write channel for that token except the
+  // deliberate disableHistory early-lock. The idempotent guard evaluates
+  // completeness ONLY while unlocked and NEVER unlocks — so once any complete
+  // source locks it, later calls early-return (no "later write clobbers earlier"
+  // anti-pattern), and a low-completeness forward/restore never locks (this is
+  // what makes the IDB-stored low-completeness self-heal actually take effect:
+  // the forward response no longer unconditionally re-locks a truncated tail).
+  const markHistoryLoadedIfComplete = useCallback((events: readonly TimelineEvent[] | undefined) => {
+    if (historyLoadedRef.current === cacheKeyRef.current) return;
+    if (!isLowCompletenessSeed(events)) historyLoadedRef.current = cacheKeyRef.current;
+  }, []);
+
   const resetOlderState = useCallback(() => {
     loadingOlderRef.current = false;
     olderRequestIdRef.current = null;
@@ -2419,8 +2468,17 @@ export function useTimeline(
     if (!supportsTimelineProtocol(ws)) return;
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
-    if (!cached || cached.length === 0) return;
-    const cursor = olderCursorRef.current ?? buildFallbackOlderCursor(cached, epochRef.current);
+    // Base for the fallback cursor: prefer the module cache, but fall back to
+    // the ON-SCREEN events when the cache is empty. The localStorage first-paint
+    // seed path deliberately does NOT write the global eventsCache (avoids the
+    // path-1 short-circuit that would skip the fuller IDB read), so a pane that
+    // is showing seed events would otherwise have an empty cache here and bail —
+    // exactly the "scroll-to-top load-older does nothing" bug. Deriving the
+    // cursor from `eventsRef.current` lets pagination work off what the user
+    // actually sees. We do NOT write the cache here (preserves that protection).
+    const base = (cached && cached.length > 0) ? cached : eventsRef.current;
+    if (!base || base.length === 0) return;
+    const cursor = olderCursorRef.current ?? buildFallbackOlderCursor(base, epochRef.current);
     if (!cursor) return;
     olderCursorRef.current = cursor;
     loadingOlderRef.current = true;
@@ -2871,7 +2929,10 @@ export function useTimeline(
       const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
-      historyLoadedRef.current = key;
+      // Single completeness gate (forceRefresh path): don't lock path-2 on a
+      // low-completeness reload — forceRefresh also fires manualLatestWindow,
+      // and a truncated reload should stay re-readable.
+      markHistoryLoadedIfComplete(restored);
       // Phase 2 split-key heal (same as bootstrap) — merge the bare segment.
       if (rawSessionId && !rawAlreadyRead) mergeRawSegmentLater(sharedDb, rawSessionId, key);
     }
@@ -3305,7 +3366,12 @@ export function useTimeline(
         }
         updateHistoryStep('daemon', 'done', loading ? 'bootstrap' : 'refresh');
         recordTimelineResponse(msg, loading ? 'bootstrap' : 'refresh');
-        historyLoadedRef.current = cacheKeyRef.current;
+        // Route through the single completeness gate instead of an
+        // unconditional write: a low-completeness forward (empty / <5 events)
+        // must NOT re-lock path-2 and clobber an intentionally-unlocked
+        // low-completeness IDB restore (the bug that made S2 a no-op for active
+        // sessions). Idempotent + never-unlock: a complete restore stays locked.
+        markHistoryLoadedIfComplete(msg.events);
         const forwardOlderCursor = getOlderTimelineCursor(msg);
         if (hasStructuredOlderPage(msg) && forwardOlderCursor) {
           olderCursorRef.current = forwardOlderCursor;
