@@ -165,6 +165,13 @@ const CODEX_RAW_CHECKLIST_HISTORY_TAIL_BYTES = 512 * 1024;
 const CODEX_RAW_CHECKLIST_HISTORY_CLOCK_SKEW_MS = 5_000;
 const CODEX_RAW_CHECKLIST_POLL_INTERVAL_MS = 2_000;
 const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
+// Lightweight per-turn rollout tail poll whose only job is to catch app-server
+// zombie turns fast (settle from core's `task_complete`). A tail read is far
+// cheaper than a `thread/read` RPC, so this runs on a short cadence for the whole
+// turn instead of piggybacking the ~20s heartbeat — bounding zombie recovery to
+// a few seconds. The read itself is still gated by CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS
+// (so healthy, actively-streaming turns never touch the file).
+const CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS = 2_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS = 2_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS = 15 * 60_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS = 5_000;
@@ -770,6 +777,7 @@ interface CodexSdkSessionState {
   rawChecklistScanPromise?: Promise<void>;
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
+  rolloutSettlePollTimer: ReturnType<typeof setTimeout> | null;
   childSubagentRolloutStartedAt: number;
   childSubagentRolloutSeenIds: Set<string>;
   childSubagentRolloutCompletedIds: Set<string>;
@@ -2049,6 +2057,7 @@ export class CodexSdkProvider implements TransportProvider {
       rawChecklistScanPromise: undefined,
       rawChecklistPollTimer: null,
       rawChecklistPollUntil: 0,
+      rolloutSettlePollTimer: null,
       childSubagentRolloutStartedAt: Date.now(),
       childSubagentRolloutSeenIds: existing?.childSubagentRolloutSeenIds ?? new Set(),
       childSubagentRolloutCompletedIds: existing?.childSubagentRolloutCompletedIds ?? new Set(),
@@ -2974,6 +2983,34 @@ export class CodexSdkProvider implements TransportProvider {
     state.rawChecklistPollTimer.unref?.();
   }
 
+  // Dedicated fast poll so a zombie turn is settled from rollout evidence within
+  // a few seconds instead of waiting for the next ~20s thread/read heartbeat.
+  private armRolloutSettlePoll(sessionId: string, state: CodexSdkSessionState): void {
+    if (!state.threadId) return;
+    if (state.rolloutSettlePollTimer) return;
+    const tick = () => {
+      state.rolloutSettlePollTimer = null;
+      if (!this.sessions.has(sessionId)) return;
+      const lease = state.activeTurnLease;
+      if (!lease || !this.isHeartbeatLeaseActive(sessionId, state, lease)) {
+        this.clearRolloutSettlePoll(state);
+        return;
+      }
+      // No-ops until the turn has been silent past the gate, so healthy,
+      // actively-streaming turns never touch the file; only zombies settle here.
+      this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, Date.now());
+      state.rolloutSettlePollTimer = setTimeout(tick, CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS);
+      state.rolloutSettlePollTimer.unref?.();
+    };
+    state.rolloutSettlePollTimer = setTimeout(tick, CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS);
+    state.rolloutSettlePollTimer.unref?.();
+  }
+
+  private clearRolloutSettlePoll(state: CodexSdkSessionState): void {
+    if (state.rolloutSettlePollTimer) clearTimeout(state.rolloutSettlePollTimer);
+    state.rolloutSettlePollTimer = null;
+  }
+
   private clearChildSubagentRolloutPollTimer(state: CodexSdkSessionState): void {
     if (state.childSubagentRolloutTimer) clearTimeout(state.childSubagentRolloutTimer);
     state.childSubagentRolloutTimer = null;
@@ -3665,6 +3702,7 @@ export class CodexSdkProvider implements TransportProvider {
   private clearActiveTurnLease(state: CodexSdkSessionState): void {
     const lease = state.activeTurnLease;
     if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
+    this.clearRolloutSettlePoll(state);
     state.activeTurnLease = undefined;
   }
 
@@ -3709,6 +3747,7 @@ export class CodexSdkProvider implements TransportProvider {
       lease.lastWeakActivityAtMs = now;
     }
     this.scheduleHeartbeat(sessionId, state, lease);
+    this.armRolloutSettlePoll(sessionId, state);
   }
 
   private recordStrongActivity(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {

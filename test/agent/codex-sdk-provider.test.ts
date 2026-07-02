@@ -4557,16 +4557,18 @@ describe('CodexSdkProvider', () => {
       childProcessMock.enqueueThreadReadResult(zombieReadResult);
       childProcessMock.enqueueThreadReadResult(zombieReadResult);
 
-      // Heartbeat #1 at the 50s strong-grace boundary: silence (50s) is below
-      // the 60s rollout-confirm threshold → no cross-check yet, stays working.
-      await vi.advanceTimersByTimeAsync(50_100);
+      // task_complete is already durable in the rollout, but below the confirm
+      // gate the provider stays working (no premature settle from a turn that
+      // could still be streaming):
+      await vi.advanceTimersByTimeAsync(3_000);
       await vi.advanceTimersByTimeAsync(0);
       expect(completed).toHaveLength(0);
 
-      // Heartbeat #2 (+20s interval): silence ~70s ≥ 60s → rollout cross-check
-      // finds task_complete for turn-1 and settles the zombie turn. Advance in
-      // small async steps so the real fs read can resolve under fake timers.
-      for (let i = 0; i < 300 && completed.length === 0; i++) {
+      // The dedicated rollout-settle poll then finds task_complete for turn-1 a
+      // few seconds later — long before the ~20s heartbeat or the 30-min last
+      // resort. Advance in small async steps so the real fs read resolves under
+      // fake timers.
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
         await vi.advanceTimersByTimeAsync(100);
       }
 
