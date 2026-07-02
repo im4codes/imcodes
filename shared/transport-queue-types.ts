@@ -177,6 +177,14 @@ export type QueueEvent =
   | QueueFailureDropEvent
   | QueueResetEvent;
 
+/**
+ * Canonical value-position constant for the delivery-fact event type. Typed
+ * against the interface discriminator so it can never drift from
+ * `QueueDeliveryFact['type']`. Import this instead of hardcoding the string
+ * in daemon/server/web (zero-tolerance shared-constant rule).
+ */
+export const TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE: QueueDeliveryFact['type'] = 'transport.queue.delivery';
+
 export const LIVE_QUEUE_ENTRY_STATUSES = new Set<QueueEntryStatus>([
   'queued',
   'handoff_inflight',

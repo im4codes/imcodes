@@ -42,6 +42,7 @@ import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { normalizeTransportPendingEntries } from '../transport-queue.js';
@@ -1509,6 +1510,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           return changed ? next : prev;
         });
       };
+      const rememberSettledQueuedId = (commandId: string) => {
+        if (!commandId) return;
+        setSettledQueuedIds((prev) => {
+          if (prev.has(commandId)) return prev;
+          const ids = [...prev, commandId];
+          return new Set(ids.length > 500 ? ids.slice(-500) : ids);
+        });
+      };
 
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== activeSession.name) return;
@@ -1541,6 +1550,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         markLocalQueuedEntry(msg.commandId, 'failed');
         return;
       }
+      const maybeQueueDelivery = msg as unknown as {
+        type?: string;
+        sessionName?: string;
+        clientMessageId?: string;
+      };
+      if (maybeQueueDelivery.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
+        // The wire validator requires sessionName on delivery facts — a frame
+        // without one is malformed and must NOT default to clearing the active
+        // session's optimistic entries.
+        if (!maybeQueueDelivery.sessionName || maybeQueueDelivery.sessionName !== activeSession.name) return;
+        const clientMessageId = typeof maybeQueueDelivery.clientMessageId === 'string'
+          ? maybeQueueDelivery.clientMessageId.trim()
+          : '';
+        removeLocalQueuedEntry(clientMessageId);
+        rememberSettledQueuedId(clientMessageId);
+        return;
+      }
       if (msg.type !== 'timeline.event') return;
       const event = msg.event;
       if (event.sessionId !== activeSession.name) return;
@@ -1557,18 +1583,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         // unlike the optimistic set cleared above).
         const idsToSettle = commandId ? [commandId] : [];
         if (idsToSettle.length > 0) {
-          setSettledQueuedIds((prev) => {
-            let changed = false;
-            const ids = [...prev];
-            for (const id of idsToSettle) {
-              if (!id || prev.has(id)) continue;
-              ids.push(id);
-              changed = true;
-            }
-            if (!changed) return prev;
-            return new Set(ids.length > 500 ? ids.slice(-500) : ids);
-          });
+          for (const id of idsToSettle) rememberSettledQueuedId(id);
         }
+      } else if (event.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
+        const payload = event.payload as Record<string, unknown>;
+        const clientMessageId = typeof payload.clientMessageId === 'string' ? payload.clientMessageId.trim() : '';
+        removeLocalQueuedEntry(clientMessageId);
+        rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
         const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries');
         const queuedEntries = normalizeTransportPendingEntries(

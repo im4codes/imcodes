@@ -21,6 +21,7 @@ import {
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -381,6 +382,46 @@ export function useSubSessions(
 
       if (msg.type === 'timeline.event') {
         const ev = msg.event;
+        if (ev.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
+          const subSessionName = ev.sessionId;
+          if (!subSessionName || !subSessionName.startsWith('deck_sub_')) return;
+          const payload = ev.payload as Record<string, unknown>;
+          const clientMessageId = typeof payload.clientMessageId === 'string' ? payload.clientMessageId.trim() : '';
+          if (!clientMessageId) return;
+          const incomingVersion = extractTransportPendingVersion(payload.pendingMessageVersion);
+          const queueEpoch = typeof payload.queueEpoch === 'string' ? payload.queueEpoch : undefined;
+          const queueAuthorityId = typeof payload.queueAuthorityId === 'string' ? payload.queueAuthorityId : undefined;
+          setSubSessions((prev) => {
+            const idx = prev.findIndex((s) => s.sessionName === subSessionName);
+            if (idx === -1) return prev;
+            const existing = prev[idx];
+            if (existing.queueEpoch && queueEpoch && existing.queueEpoch !== queueEpoch) return prev;
+            if (existing.queueAuthorityId && queueAuthorityId && existing.queueAuthorityId !== queueAuthorityId) return prev;
+            const nextQueue = removeTransportPendingEntryForUserMessage(
+              existing.transportPendingMessageEntries,
+              existing.transportPendingMessages,
+              { clientMessageId },
+              subSessionName,
+            );
+            const advancedVersion = nextTransportQueueVersion(existing.transportPendingMessageVersion ?? undefined, incomingVersion);
+            if (!nextQueue.changed) {
+              if (advancedVersion === (existing.transportPendingMessageVersion ?? undefined)) return prev;
+              const nextSame = [...prev];
+              nextSame[idx] = { ...existing, transportPendingMessageVersion: advancedVersion };
+              return nextSame;
+            }
+            const next = [...prev];
+            next[idx] = {
+              ...existing,
+              state: existing.state === 'queued' && nextQueue.messages.length === 0 ? 'running' : existing.state,
+              transportPendingMessages: nextQueue.messages,
+              transportPendingMessageEntries: nextQueue.entries,
+              transportPendingMessageVersion: advancedVersion,
+            };
+            return next;
+          });
+          return;
+        }
         if (ev.type === 'user.message') {
           const subSessionName = ev.sessionId;
           if (!subSessionName || !subSessionName.startsWith('deck_sub_')) return;
