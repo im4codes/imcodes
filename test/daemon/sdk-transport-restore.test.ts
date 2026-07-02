@@ -161,6 +161,7 @@ import { getTransportRuntime, launchTransportSession, relaunchSessionWithSetting
 import { newSession } from '../../src/agent/tmux.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import {
@@ -368,6 +369,60 @@ describe('sdk transport session restore', () => {
       expect.objectContaining({ state: 'running' }),
       { source: 'daemon', confidence: 'high' },
     );
+  });
+
+  it('restoreTransportSessions rehydrates a SQLite-queued message and dispatches it after restart', async () => {
+    // The "restart doesn't resync the queue" bug: a message queued behind an
+    // in-flight turn is persisted to transport-queue.sqlite, but a fresh daemon
+    // rebuilds the runtime with an EMPTY in-memory queue and never reads the row
+    // back — so it lingers `queued` forever. This exercises the real restore
+    // wiring end to end: seed a `queued` row, restore, assert it drains.
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_rehydrate_brain';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkrehydrate',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-rehydrate',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-rehydrate',
+      codexSessionId: 'codex-thread-rehydrate',
+    });
+
+    // A message that was queued behind an in-flight turn before the crash —
+    // it survives ONLY in SQLite (both in-memory holders are gone on restart).
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-restart-recover',
+      commandId: 'msg-restart-recover',
+      text: 'recovered after restart',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-restart-recover', text: 'recovered after restart' }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    // The restored+idle runtime rehydrates the row and drains it to the provider.
+    await settleCodexRun(sessionName, 'resume');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('recovered after restart') && Date.now() < deadline) {
+      await flush();
+    }
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('recovered after restart');
+
+    // And the persisted row no longer lingers as live `queued` (it dispatched).
+    const stillQueued = getTransportQueueStore()
+      .readSnapshot(sessionName)
+      .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-restart-recover' && entry.status === 'queued');
+    expect(stillQueued).toBe(false);
   });
 
   it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {

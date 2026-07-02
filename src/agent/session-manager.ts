@@ -2270,6 +2270,25 @@ export async function restoreTransportSessions(
       // a real race window letting msg-2 arrive at `handleSend` while
       // `_sending` is still false.
       await drainTransportResendQueueIntoRuntime(runtime, s.name, 'reconnect');
+
+      // Rehydrate the runtime's pending queue from the SQLite queue authority.
+      // On a fresh daemon restart BOTH in-memory holders start empty (the resend
+      // queue drained just above AND this runtime's `_pendingMessages`), so a
+      // message that was `queued` behind an in-flight turn before the crash
+      // survives only in transport-queue.sqlite and would otherwise linger
+      // forever (daemon reports pending 0 while SQLite still holds the row —
+      // the "restart doesn't resync the queue" bug). Runs AFTER the resend drain
+      // so resend-claimed entries (now handoff_inflight/sent) are skipped by the
+      // clientMessageId + delivery-tombstone dedup inside the runtime method.
+      try {
+        const recoveredPending = runtime.rehydratePendingFromStore();
+        if (recoveredPending > 0) {
+          logger.info({ session: s.name, recovered: recoveredPending }, 'Rehydrated queued transport messages from SQLite after restart');
+          runtime.drainPendingIfIdle('sqlite-restore-rehydrate');
+        }
+      } catch (err) {
+        logger.warn({ err, session: s.name }, 'Failed to rehydrate transport pending queue from SQLite after restart');
+      }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }

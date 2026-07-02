@@ -845,6 +845,108 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
+   * Rehydrate the in-memory pending queue from the SQLite queue authority after
+   * a daemon restart / runtime recreation. On a fresh daemon process BOTH
+   * in-memory holders start empty — this runtime's `_pendingMessages` AND the
+   * resend queue — so a message that was `queued` (enqueued behind an in-flight
+   * turn, then the daemon died before it drained) survives ONLY in
+   * `transport-queue.sqlite`. Nothing reads it back, so the daemon reports
+   * `pending 0` while SQLite still holds the `queued` row and the message lingers
+   * forever. This method closes that read-back gap.
+   *
+   * Safety contract — MUST never cause a queued send to dispatch twice:
+   *   - Recovers ONLY `queued` (never-dispatched) rows. `handoff_inflight` rows
+   *     were mid-dispatch when the daemon died and MAY already have executed at
+   *     the provider; re-sending them risks double execution, so they are left to
+   *     a dedicated proof-backed handoff-recovery path (out of scope here).
+   *   - Intended to run AFTER the resend drain, and dedups by `clientMessageId`
+   *     against everything already live (`_pendingMessages`, active dispatch) plus
+   *     delivery tombstones — an id recovered/dispatched by any other path is
+   *     skipped.
+   *   - Preserves store order (front placement + ordinal already applied by
+   *     `readSnapshot`). Does NOT itself dispatch; the caller kicks a drain.
+   * Returns the number of entries recovered into `_pendingMessages`.
+   */
+  rehydratePendingFromStore(): number {
+    if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
+    const store = getTransportQueueStore();
+    const snapshot = (() => {
+      try {
+        return store.readSnapshot(this.sessionKey, 'restart_rehydrate');
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey }, 'rehydratePendingFromStore: readSnapshot failed; skipping recovery');
+        return null;
+      }
+    })();
+    if (!snapshot) return 0;
+    const liveIds = new Set<string>([
+      ...this._pendingMessages.map((entry) => entry.clientMessageId),
+      ...this._activeDispatchEntries.map((entry) => entry.clientMessageId),
+    ]);
+    const recovered: PendingTransportMessage[] = [];
+    for (const projection of snapshot.pendingMessageEntries) {
+      if (projection.status !== 'queued') continue; // only never-dispatched work is re-send-safe
+      const clientMessageId = projection.clientMessageId;
+      if (liveIds.has(clientMessageId)) continue; // already live via resend/runtime — no double
+      try {
+        if (store.hasDeliveryTombstone(this.sessionKey, clientMessageId)) continue; // already delivered
+      } catch { /* treat missing tombstone table as "no tombstone" */ }
+      let entry: PendingTransportMessage | null = null;
+      try {
+        const materialJson = store.readPrivateDispatchMaterial(this.sessionKey, clientMessageId);
+        if (materialJson) {
+          const material = JSON.parse(materialJson) as {
+            text?: unknown;
+            messagePreamble?: unknown;
+            attachmentRefs?: unknown;
+            sharedActorEnvelope?: unknown;
+            timelineCommitted?: unknown;
+            historyCommitted?: unknown;
+          };
+          if (typeof material.text === 'string') {
+            entry = {
+              clientMessageId,
+              text: material.text,
+              ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
+              ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
+              ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
+              ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
+              ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
+            };
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'rehydratePendingFromStore: private material parse failed; falling back to projection text');
+      }
+      if (!entry) {
+        // Private material gone/corrupt. The projection `text` is lossless per the
+        // queue privacy contract, so use it. If even that is empty there is nothing
+        // to dispatch — mark the row failed so it stops lingering as a stuck bubble.
+        if (typeof projection.text === 'string' && projection.text.length > 0) {
+          entry = { clientMessageId, text: projection.text };
+        } else {
+          try { store.markMissingPrivateMaterialFailed(this.sessionKey, clientMessageId); } catch { /* best-effort */ }
+          continue;
+        }
+      }
+      recovered.push(entry);
+      liveIds.add(clientMessageId);
+    }
+    if (recovered.length === 0) return 0;
+    // Append in store order. On a genuine fresh restart the resend drain found an
+    // empty in-memory queue, so `_pendingMessages` is empty here and this is the
+    // exact persisted order; in the rarer reconnect-with-resend case recovered
+    // (older) work simply trails any resend entries — still single-dispatch-safe.
+    this._pendingMessages.push(...recovered);
+    this._pendingVersion++;
+    logger.info(
+      { sessionKey: this.sessionKey, recovered: recovered.length },
+      'rehydratePendingFromStore: recovered queued transport messages from SQLite after restart',
+    );
+    return recovered.length;
+  }
+
+  /**
    * Queue-visible watchdog for the harder split-brain case: the provider/UI
    * has gone quiet, but the runtime never received onComplete/onError, so an
    * active dispatch pins `_sending=true` and queued user messages never drain.

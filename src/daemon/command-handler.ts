@@ -4110,13 +4110,24 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   const release = await getMutex(sessionName).acquire();
   try {
     const removed = runtime.removePendingMessage(clientMessageId);
-    if (!removed) {
+    // The SQLite queue authority — not the runtime's in-memory queue — is what
+    // keeps the UI queued bubble alive. After a daemon restart the row can still
+    // exist in SQLite while the runtime's _pendingMessages is empty (not yet
+    // rehydrated), so removePendingMessage no-ops. The old `!removed`
+    // early-return then skipped the store drop entirely and the bubble became
+    // undeletable ("daemon queue is empty but the frontend can't delete it").
+    // Treat the entry as deletable whenever it is a live `queued` row in the
+    // store, independent of runtime membership; `drop` itself is idempotent.
+    let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
+    const queuedInStore = queueSnapshot.pendingMessageEntries.some(
+      (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
+    );
+    if (!removed && !queuedInStore) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
       emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
-    let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
     try {
       queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
     } catch (err) {

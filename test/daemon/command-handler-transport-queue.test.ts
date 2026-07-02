@@ -866,6 +866,64 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(answerStateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
+  it('undo_queued_message deletes a SQLite-only queued orphan when the runtime in-memory queue is empty', async () => {
+    // The undeletable-bubble bug: after a daemon restart a row lives in the
+    // SQLite queue authority while the runtime's in-memory _pendingMessages is
+    // empty, so removePendingMessage no-ops. The old handler then early-returned
+    // "Queued message not found" and never dropped the store row, leaving the UI
+    // bubble undeletable. The drop must run against the store authority.
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-orphan',
+      commandId: 'msg-orphan',
+      text: 'stuck queued message',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-orphan', text: 'stuck queued message' }),
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null), // orphan — not in the in-memory queue
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-orphan', commandId: 'cmd-undo-orphan' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    // Accepted — NOT the old "Queued message not found" error.
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-orphan', status: 'accepted' }),
+    );
+    expect(serverLink.send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'cmd-undo-orphan', status: 'error' }),
+    );
+    // The store row is gone → the UI bubble clears on the next snapshot.
+    const stillPresent = getTransportQueueStore()
+      .readSnapshot('deck_transport_brain')
+      .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-orphan');
+    expect(stillPresent).toBe(false);
+  });
+
+  it('undo_queued_message still errors "not found" when neither the runtime nor the store has the id', async () => {
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-absent', commandId: 'cmd-undo-absent' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-absent', status: 'error', error: 'Queued message not found' }),
+    );
+  });
+
   it('dispatches /clear as a fresh claude-code-sdk relaunch', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',

@@ -26,7 +26,7 @@ import {
 } from '../../shared/sdk-subagent-status.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
-import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -319,6 +319,98 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  // Stability: the transport queue is persisted to transport-queue.sqlite, but a
+  // fresh daemon process starts BOTH in-memory holders empty (resend queue AND
+  // the runtime's _pendingMessages). Before this fix nothing read the persisted
+  // `queued` rows back, so a message queued behind an in-flight turn survived only
+  // in SQLite and never drained — the daemon reported pending 0 while the row sat
+  // `queued` forever. rehydratePendingFromStore() closes that read-back gap, and
+  // MUST never re-dispatch work that already ran.
+  describe('rehydratePendingFromStore (SQLite queue restart recovery)', () => {
+    // Rebuild a runtime for the SAME session name WITHOUT resetting the (in-memory,
+    // VITEST) queue store — mirrors a daemon restart where the SQLite authority
+    // survives but every in-memory runtime is gone.
+    const simulateRestart = async (sessionName = 'deck_test_brain') => {
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, sessionName);
+      await restarted.initialize(defaultConfig);
+      return { restartMock, restarted };
+    };
+
+    it('recovers a queued message that only survives in SQLite after a restart', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send('create pr and merge to master', 'msg-stuck')).toBe('queued');
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.pendingCount).toBe(0); // regression baseline: empty until rehydrate
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingCount).toBe(1);
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: 'msg-stuck', text: 'create pr and merge to master' },
+      ]);
+    });
+
+    it('drains the rehydrated message to the provider once idle', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+
+      const { restartMock, restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.drainPendingIfIdle('test')).toBe(true);
+
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect(restartMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        assembledMessage: expect.stringContaining('second'),
+      }));
+    });
+
+    it('is idempotent — a second rehydrate does not double-recover the same id', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.rehydratePendingFromStore()).toBe(0); // already live → deduped
+      expect(restarted.pendingCount).toBe(1);
+    });
+
+    it('does NOT recover a handoff_inflight entry (may already have executed at the provider)', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+      // Entry was mid-dispatch (handoff lease) when the daemon died — re-sending
+      // risks double execution, so it must be left for proof-backed recovery.
+      getTransportQueueStore().markHandoffInFlight('deck_test_brain', ['msg-2']);
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingCount).toBe(0);
+    });
+
+    it('does NOT recover an already-delivered entry', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+      // The turn actually dispatched before the crash — finalizeSent writes the
+      // delivery tombstone that keeps it from resurrecting.
+      getTransportQueueStore().finalizeSent('deck_test_brain', 'msg-2');
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingCount).toBe(0);
+    });
+
+    it('is a no-op when SQLite holds no queued entries', async () => {
+      const { restarted } = await simulateRestart('deck_test_fresh');
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingCount).toBe(0);
+    });
   });
 
   it('places front-queued ask answers before ordinary pending messages when busy', async () => {
