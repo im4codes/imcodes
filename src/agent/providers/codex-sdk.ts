@@ -97,14 +97,19 @@ const CODEX_TURN_HEARTBEAT_INTERVAL_MS = 20_000;
 // happily "cancel" the already-finished turn. Observed on deck_cd_brain:
 // task_complete written at 07:20:03, zero further thread activity, heartbeats
 // classified "active" for 34 minutes until the daemon's 30-min last-resort
-// force-settled the session. When the heartbeat says "active" but the event
-// stream has been silent past this threshold, read the thread's own rollout
-// tail; a recorded `task_complete` for the running turn is authoritative
-// completion evidence and settles the turn immediately.
+// force-settled the session. A `task_complete` for the running turn in the
+// rollout is AUTHORITATIVE completion evidence — verified live that the
+// app-server's `turn/started` id equals the core rollout `turn_id`, so the match
+// cannot mistake a different turn. Because it is authoritative we do NOT wait
+// long: this threshold only has to be large enough to let the normal
+// `turn/completed` path (which lands ~1s after task_complete on healthy turns)
+// settle first, so healthy turns go through it and only zombies fall through to
+// the rollout cross-check — settled at the next heartbeat rather than after a
+// minute of silence. (Detection is still bounded below by CODEX_TURN_HEARTBEAT_INTERVAL_MS.)
 // Env override for tuning: IMCODES_CODEX_ROLLOUT_COMPLETE_SILENCE_MS.
 const CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_CODEX_ROLLOUT_COMPLETE_SILENCE_MS ?? '', 10);
-  return Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : 5_000;
 })();
 const CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES = 256 * 1024;
 const CODEX_TURN_HEARTBEAT_JITTER_MS = 5_000;
