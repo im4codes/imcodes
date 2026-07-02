@@ -2,6 +2,7 @@ import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
+import { getCodexHome, recentCodexSessionDirs, findCodexRolloutPathByUuid } from '../../util/codex-rollout-path.js';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -202,54 +203,9 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function getCodexHome(env: Record<string, string | undefined>): string {
-  return typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
-    ? resolve(env.CODEX_HOME.trim())
-    : resolve(homedir(), '.codex');
-}
-
-function codexSessionDir(codexHome: string, date: Date): string {
-  const yyyy = date.getUTCFullYear();
-  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(date.getUTCDate()).padStart(2, '0');
-  return join(codexHome, 'sessions', String(yyyy), mm, dd);
-}
-
-function recentCodexSessionDirs(codexHome: string): string[] {
-  const dirs: string[] = [];
-  for (let i = 0; i < 30; i += 1) {
-    dirs.push(codexSessionDir(codexHome, new Date(Date.now() - i * 86_400_000)));
-  }
-  return dirs;
-}
-
-async function findCodexRolloutPathByUuid(env: Record<string, string | undefined>, uuid: string): Promise<string | null> {
-  const codexHome = getCodexHome(env);
-  let latestPath: string | null = null;
-  let latestMtime = -1;
-  for (const dir of recentCodexSessionDirs(codexHome)) {
-    let entries: string[];
-    try {
-      entries = await readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const name of entries) {
-      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl') || !name.includes(uuid)) continue;
-      const candidate = join(dir, name);
-      try {
-        const info = await stat(candidate);
-        if (info.mtimeMs > latestMtime) {
-          latestMtime = info.mtimeMs;
-          latestPath = candidate;
-        }
-      } catch {
-        continue;
-      }
-    }
-  }
-  return latestPath;
-}
+// Rollout path helpers (getCodexHome, recentCodexSessionDirs, and the
+// age/timezone-robust findCodexRolloutPathByUuid) are shared via
+// ../../util/codex-rollout-path.ts — do not re-implement per-provider.
 
 function parseCodexRolloutJsonLine(line: string): Record<string, any> | null {
   if (!line.trim()) return null;
@@ -2912,7 +2868,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.threadId) return null;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
-    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
     if (!rolloutPath) return null;
     state.rawChecklistRolloutPath = rolloutPath;
 
@@ -3069,7 +3025,7 @@ export class CodexSdkProvider implements TransportProvider {
     for (const tracked of this.trackedSubagentThreads.values()) {
       if (tracked.sessionId !== sessionId) continue;
       if (state.childSubagentRolloutCompletedIds.has(tracked.agentId)) continue;
-      const rolloutPath = tracked.rolloutPath ?? await findCodexRolloutPathByUuid(env, tracked.agentId);
+      const rolloutPath = tracked.rolloutPath ?? await findCodexRolloutPathByUuid(tracked.agentId, { env });
       if (!rolloutPath || seenRolloutPaths.has(rolloutPath)) continue;
       const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
       if (snapshot?.agentId === tracked.agentId) {
@@ -4076,7 +4032,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.threadId) return false;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
-    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(env, state.threadId);
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
     if (!rolloutPath) return false;
     state.rawChecklistRolloutPath = rolloutPath;
     let fh: Awaited<ReturnType<typeof open>> | null = null;
