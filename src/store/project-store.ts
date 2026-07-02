@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import logger from '../util/logger.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'projects.json');
@@ -52,9 +53,23 @@ export async function loadProjectStore(): Promise<ProjectStore> {
 
 function scheduleWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimer = setTimeout(async () => {
-    await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+  writeTimer = setTimeout(() => {
     writeTimer = null;
+    // The debounced write MUST be exception-safe: a rejected background write
+    // (store dir missing/removed, disk error) would otherwise surface as an
+    // unhandled rejection — it failed CI's coverage run when a test's temp
+    // home was cleaned up while a debounced write was still in flight, and in
+    // production it would crash the daemon. Recreate the dir and warn on
+    // failure; the next mutation reschedules, and flushProjectStore() remains
+    // the awaited, error-propagating path.
+    void (async () => {
+      try {
+        await mkdir(STORE_DIR, { recursive: true });
+        await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+      } catch (err) {
+        logger.warn({ err, path: STORE_PATH }, 'project-store debounced write failed');
+      }
+    })();
   }, DEBOUNCE_MS);
 }
 
