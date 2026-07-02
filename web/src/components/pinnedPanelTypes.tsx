@@ -281,6 +281,7 @@ registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
         .filter((session) => Boolean(session.projectDir))
         .map((session) => ({
           projectDir: session.projectDir,
+          canonicalRepoId: session.contextNamespace?.projectId,
           displayName: session.label || session.project || session.name,
           sessionName: session.name,
           source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,

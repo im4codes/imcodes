@@ -16,6 +16,7 @@ import type { WsClient } from '../ws-client.js';
 import type { PinnedPanel } from '../app.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import type { FileBrowserPreviewRequest, FileBrowserPreviewUpdate } from './FileBrowser.js';
+import type { SessionContextBootstrapState } from '@shared/session-context-bootstrap.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
@@ -38,7 +39,7 @@ export interface PanelRenderContext {
   /** Quote callback — adds quoted text to the main session's input */
   onQuote?: (text: string) => void;
   /** Main sessions list — for panels that need session info (e.g., cron manager) */
-  sessions?: Array<{ name: string; project: string; role: string; agentType: string; label?: string | null; state: string; runtimeType?: string; projectDir?: string }>;
+  sessions?: Array<{ name: string; project: string; role: string; agentType: string; label?: string | null; state: string; runtimeType?: string; projectDir?: string; contextNamespace?: SessionContextBootstrapState['contextNamespace'] }>;
   /** All servers — for cron manager cross-server view */
   servers?: Array<{ id: string; name: string }>;
   /** Translation function for panel headers and status copy. */
