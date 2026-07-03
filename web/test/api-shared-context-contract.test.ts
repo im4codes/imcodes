@@ -251,7 +251,8 @@ describe('shared-context and file API contracts', () => {
         'Content-Disposition': "attachment; filename*=UTF-8''report%20final.txt",
       }))
       .mockResolvedValueOnce(blobResponse('preview'))
-      .mockResolvedValueOnce(jsonResponse({ token: 'x'.repeat(32) }));
+      .mockResolvedValueOnce(jsonResponse({ token: 'x'.repeat(32) }))
+      .mockResolvedValueOnce(jsonResponse({ token: 'y'.repeat(32) }));
 
     const objectUrlSpy = vi.fn(() => 'blob:imcodes');
     const revokeSpy = vi.fn();
@@ -266,8 +267,12 @@ describe('shared-context and file API contracts', () => {
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
 
-    const { configure, downloadAttachment, previewAttachment } = await import('../src/api.js');
+    const { buildAttachmentDownloadUrl, configure, downloadAttachment, previewAttachment } = await import('../src/api.js');
     configure('https://api.example');
+
+    await expect(buildAttachmentDownloadUrl('srv-1', 'att-media')).resolves.toBe(
+      'https://api.example/api/server/srv-1/uploads/att-media/download',
+    );
 
     await downloadAttachment('srv-1', 'att-1');
     const link = document.querySelector('a');
@@ -284,6 +289,9 @@ describe('shared-context and file API contracts', () => {
     expect(browserOpenMock).toHaveBeenCalledWith({
       url: `https://api.example/api/server/srv-1/uploads/att-3/download?token=${'x'.repeat(32)}`,
     });
+    await expect(buildAttachmentDownloadUrl('srv-1', 'att-media')).resolves.toBe(
+      `https://api.example/api/server/srv-1/uploads/att-media/download?token=${'y'.repeat(32)}`,
+    );
     expect(objectUrlSpy).toHaveBeenCalledTimes(2);
   });
 });

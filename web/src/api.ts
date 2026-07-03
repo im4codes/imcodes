@@ -126,6 +126,22 @@ export function getApiBaseUrl(): string {
   return _baseUrl || window.location.origin;
 }
 
+export async function buildAttachmentDownloadUrl(serverId: string, attachmentId: string): Promise<string> {
+  const encodedServerId = encodeURIComponent(serverId);
+  const encodedAttachmentId = encodeURIComponent(attachmentId);
+  const baseUrl = _baseUrl || window.location.origin;
+  const isNativeRuntime = !!(globalThis as Record<string, unknown>).Capacitor;
+  if (!isNativeRuntime) {
+    return `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download`;
+  }
+  const tokenRes = await apiFetch(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, { method: 'POST' });
+  const downloadToken = (tokenRes as { token?: string }).token;
+  if (!downloadToken || typeof downloadToken !== 'string' || downloadToken.length < 32) {
+    throw new Error('Failed to acquire download token');
+  }
+  return `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download?token=${encodeURIComponent(downloadToken)}`;
+}
+
 /** Normalize the initial preview document path so it always starts with `/` and preserves query/hash. */
 export function normalizeLocalWebPreviewPath(path: string): string {
   const trimmed = path.trim();
@@ -1485,15 +1501,7 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
   // Get a one-time token and open in system browser which handles save natively.
   const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
   if (isNative) {
-    const encodedServerId = encodeURIComponent(serverId);
-    const encodedAttachmentId = encodeURIComponent(attachmentId);
-    const tokenRes = await apiFetch(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, { method: 'POST' });
-    const downloadToken = (tokenRes as { token?: string }).token;
-    if (!downloadToken || typeof downloadToken !== 'string' || downloadToken.length < 32) {
-      throw new Error('Failed to acquire download token');
-    }
-    const baseUrl = _baseUrl || window.location.origin;
-    const downloadUrl = `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download?token=${encodeURIComponent(downloadToken)}`;
+    const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId);
     const { Browser } = await import('@capacitor/browser');
     await Browser.open({ url: downloadUrl });
     return;

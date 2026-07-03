@@ -1176,6 +1176,8 @@ describe('FileBrowser', () => {
       });
     });
 
+    await waitFor(() => expect(document.querySelector('.fb-preview-audio audio')).not.toBeNull());
+
     const audio = document.querySelector('.fb-preview-audio audio') as HTMLAudioElement | null;
     expect(audio).not.toBeNull();
     expect(audio?.getAttribute('controls')).not.toBeNull();
