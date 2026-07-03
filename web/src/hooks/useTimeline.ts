@@ -24,6 +24,10 @@ import {
   type AckFailureReason,
 } from '@shared/ack-protocol.js';
 import {
+  AGENT_DELEGATION_ERROR_CODES,
+  AGENT_DELEGATION_TARGET_FIELD,
+} from '@shared/agent-delegation.js';
+import {
   createTransportQueueReducerState,
   reduceTransportQueueEvent,
   selectLiveQueueEntries,
@@ -47,6 +51,16 @@ function localizedAckFailureReason(reason: AckFailureReason): string {
     case 'daemon_error':
       return withFallback('chat.sendFailedReason.daemonError', 'Server error');
   }
+}
+
+const AGENT_DELEGATION_ERROR_CODE_SET = new Set<string>(Object.values(AGENT_DELEGATION_ERROR_CODES));
+
+function localizedDelegationAckError(error: unknown): string | undefined {
+  if (typeof error !== 'string') return undefined;
+  const code = error.trim().split(/[:\s]/, 1)[0] ?? '';
+  if (!AGENT_DELEGATION_ERROR_CODE_SET.has(code)) return undefined;
+  const value = i18next.t(`delegation.error.${code}`, error);
+  return typeof value === 'string' && value.trim() ? value : error;
 }
 /**
  * React hook for timeline event state management.
@@ -1950,6 +1964,14 @@ export function useTimeline(
     autoRetryPayloadsRef.current.delete(commandId);
   }, []);
 
+  const isDelegationOptimisticCommand = useCallback((commandId: string): boolean => {
+    const eventId = optimisticIdsByCommandRef.current.get(commandId);
+    if (!eventId) return false;
+    const event = eventsRef.current.find((candidate) => candidate.eventId === eventId);
+    const resendExtra = event?.payload?._resendExtra;
+    return isRecord(resendExtra) && Object.prototype.hasOwnProperty.call(resendExtra, AGENT_DELEGATION_TARGET_FIELD);
+  }, []);
+
   // Flip a pending optimistic entry to failed state (red "!" bubble with retry).
   const markOptimisticFailed = useCallback((commandId: string, error?: string) => {
     if (!commandId) return;
@@ -2207,6 +2229,7 @@ export function useTimeline(
     // intended terminal-state semantic.
     if (settledCommandIdsRef.current.has(commandId)) return;
     const eventId = optimisticIdsByCommandRef.current.get(commandId);
+    const clearPending = options?.clearPending === true || isDelegationOptimisticCommand(commandId);
     clearOptimisticTimer(commandId);
     clearAutoRetryState(commandId);
     if (!eventId) return;
@@ -2217,7 +2240,7 @@ export function useTimeline(
       const existing = base[idx]!;
       const payload: Record<string, unknown> = {
         ...existing.payload,
-        pending: options?.clearPending === true ? false : true,
+        pending: clearPending ? false : true,
         failed: false,
         acked: true,
       };
@@ -2227,22 +2250,23 @@ export function useTimeline(
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
       return updated;
     });
-  }, [clearOptimisticTimer, rememberSettledCommandId]);
+    if (clearPending) rememberSettledCommandId(commandId);
+  }, [clearAutoRetryState, clearOptimisticTimer, isDelegationOptimisticCommand, rememberSettledCommandId]);
 
-  const settleOptimisticByCommandAck = useCallback((commandId: string, status: string, error?: unknown) => {
+  const settleOptimisticByCommandAck = useCallback((commandId: string, status: string, error?: unknown, options?: { delegated?: boolean }) => {
     if (!commandId || !status) return;
     if (status === 'error' || status === 'conflict') {
-      markOptimisticFailed(commandId, typeof error === 'string' ? error : status);
+      markOptimisticFailed(commandId, localizedDelegationAckError(error) ?? (typeof error === 'string' ? error : status));
       return;
     }
-    markOptimisticAccepted(commandId);
+    markOptimisticAccepted(commandId, { clearPending: options?.delegated === true });
   }, [markOptimisticAccepted, markOptimisticFailed]);
 
   const settleOptimisticByCommandAckEvent = useCallback((event: TimelineEvent) => {
     if (event.type !== 'command.ack') return;
     const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
     const status = typeof event.payload.status === 'string' ? event.payload.status : '';
-    settleOptimisticByCommandAck(commandId, status, event.payload.error);
+    settleOptimisticByCommandAck(commandId, status, event.payload.error, { delegated: event.payload.delegated === true });
   }, [settleOptimisticByCommandAck]);
 
   const applyTransportQueueEvidence = useCallback((event: QueueEvent) => {
@@ -3598,7 +3622,8 @@ export function useTimeline(
         const status = typeof (msg as { status?: unknown }).status === 'string'
           ? (msg as { status: string }).status
           : '';
-        settleOptimisticByCommandAck(commandId, status, (msg as unknown as Record<string, unknown>).error);
+        const record = msg as unknown as Record<string, unknown>;
+        settleOptimisticByCommandAck(commandId, status, record.error, { delegated: record.delegated === true });
       }
 
       // ── command.failed: server-surfaced send failure.

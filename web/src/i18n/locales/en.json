@@ -2474,5 +2474,30 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "Collapse",
     "expand": "Expand"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "Agents",
+      "delegate_to_agent": "Delegate a task to one agent"
+    },
+    "chip_label": "Delegate to {{target}}",
+    "chip_title": "Delegation target: {{target}}",
+    "warning_empty_task": "Enter a task before delegating to an agent.",
+    "warning_attachments": "Delegation does not support attachments yet. Remove attachments and describe the task in text.",
+    "warning_quotes": "Delegation does not support quoted chat excerpts yet. Remove quotes and include the needed context in the task.",
+    "warning_file_refs": "Delegation does not support @ file references yet. Paste the relevant path or context into the task.",
+    "warning_p2p_tokens": "Delegation is separate from Team/P2P controls. Remove @@ tokens or switch back to Team mode.",
+    "warning_control_command": "Delegation cannot run session control commands. Remove /stop, /model, /thinking, or /effort and describe the task instead.",
+    "error": {
+      "mixed_delegation_p2p_fields": "Delegation cannot be combined with Team/P2P controls.",
+      "invalid_delegation_target": "Choose a valid agent delegation target.",
+      "delegation_self_target": "You cannot delegate a task to the current session.",
+      "delegation_target_unavailable": "That agent is unavailable. Choose another target.",
+      "delegation_target_forbidden": "That agent is outside this project or not allowed.",
+      "delegation_target_not_reply_capable": "That target cannot reply to delegated tasks.",
+      "delegation_empty_task": "Enter a task before delegating to an agent.",
+      "delegation_unsupported_input": "Delegation does not support this input yet.",
+      "delegation_dispatch_failed": "Delegation failed before the task was sent."
+    }
   }
 }

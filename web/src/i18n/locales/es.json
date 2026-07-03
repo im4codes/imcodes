@@ -2473,5 +2473,30 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "Contraer",
     "expand": "Expandir"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "Agentes",
+      "delegate_to_agent": "Delegar una tarea a un agente"
+    },
+    "chip_label": "Delegar a {{target}}",
+    "chip_title": "Destino de delegación: {{target}}",
+    "warning_empty_task": "Escribe una tarea antes de delegarla a un agente.",
+    "warning_attachments": "La delegación aún no admite adjuntos. Quita los adjuntos y describe la tarea en texto.",
+    "warning_quotes": "La delegación aún no admite citas del chat. Quita las citas e incluye el contexto necesario en la tarea.",
+    "warning_file_refs": "La delegación aún no admite referencias de archivo con @. Pega la ruta o el contexto relevante en la tarea.",
+    "warning_p2p_tokens": "La delegación está separada de los controles Team/P2P. Quita los tokens @@ o vuelve al modo Team.",
+    "warning_control_command": "La delegación no puede ejecutar comandos de control de sesión. Quita /stop, /model, /thinking o /effort y describe la tarea.",
+    "error": {
+      "mixed_delegation_p2p_fields": "La delegación no se puede combinar con controles de Equipo/P2P.",
+      "invalid_delegation_target": "Elige un agente válido para la delegación.",
+      "delegation_self_target": "No puedes delegar una tarea en la sesión actual.",
+      "delegation_target_unavailable": "Ese agente no está disponible. Elige otro destino.",
+      "delegation_target_forbidden": "Ese agente está fuera de este proyecto o no está permitido.",
+      "delegation_target_not_reply_capable": "Ese destino no puede responder tareas delegadas.",
+      "delegation_empty_task": "Escribe una tarea antes de delegarla a un agente.",
+      "delegation_unsupported_input": "La delegación aún no admite esta entrada.",
+      "delegation_dispatch_failed": "La delegación falló antes de enviar la tarea."
+    }
   }
 }

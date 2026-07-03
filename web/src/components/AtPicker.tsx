@@ -16,6 +16,7 @@ import {
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
+import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 
 interface SessionEntry {
   name: string;
@@ -35,6 +36,7 @@ interface AtPickerProps {
   projectDir?: string;
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
+  onSelectDelegateAgent: (session: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
@@ -180,6 +182,7 @@ export function AtPicker({
   projectDir,
   onSelectFile,
   onSelectAgent,
+  onSelectDelegateAgent,
   onSelectAllConfig,
   onLaunchTeam,
   p2pConfig,
@@ -240,7 +243,9 @@ export function AtPicker({
     return sessionLookup.get(sessionKey)?.agentType ?? '';
   }, [sessionLookup]);
 
-  // Deduplicate sessions by name, keep isSelf flag, exclude shell/script
+  // Deduplicate same-project sessions for Team/P2P rows. Team behavior keeps
+  // the broader P2P-eligible set; the Agents category further narrows to
+  // daemon reply-capable, non-self delegation targets below.
   const agents = useMemo(() => {
     const seen = new Map<string, SessionEntry>();
     for (const s of sessions) {
@@ -268,6 +273,18 @@ export function AtPicker({
       })
       .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()));
   }, [sessions, query, rootSession]);
+
+  const delegateAgents = useMemo(() => (
+    agents.filter((a) => (
+      !a.isSelf
+      && isDelegationReplyCapableAgentType(a.agentType)
+      && a.session !== rootSession
+    ))
+      .filter((a) => {
+        const source = sessions.find((s) => s.name === a.session);
+        return source?.state !== 'stopped' && source?.state !== 'error';
+      })
+  ), [agents, rootSession, sessions]);
 
   // Debounced file search — only when in files category
   useEffect(() => {
@@ -433,66 +450,73 @@ export function AtPicker({
 
       // Team discussion: ↑↓ pick combo, ←→ pick rounds, Enter launches directly.
       if (category === 'team') {
+        const kbConfigMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+        const kbCfgFiltered = kbConfigMap
+          ? agents.filter(a => { const entry = kbConfigMap.get(a.session); return entry ? (entry.enabled && entry.mode !== 'skip') : false; })
+          : null;
+        const kbCfgActive = kbCfgFiltered && kbCfgFiltered.length > 0;
+        const nonSelfCount = agents.filter(a => !a.isSelf).length;
+        const hasAllRow = nonSelfCount > 1;
+        const cfgRowCount = kbCfgActive ? 2 : 0;
+        const regAllOffset = cfgRowCount;
+        const comboOffset = regAllOffset + (hasAllRow ? 1 : 0);
+        const count = comboOffset + teamComboOptions.length;
         if (e.key === 'Escape') { consumeEscapeKey(e); onClose(); return; }
         if (e.key === 'Backspace') { e.preventDefault(); setCategory('choose'); setHighlightIdx(1); return; }
         if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => Math.max(0, h - 1)); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => Math.min(teamComboOptions.length - 1, h + 1)); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => Math.min(Math.max(0, count - 1), h + 1)); return; }
         if (e.key === 'ArrowLeft') { e.preventDefault(); setTeamRoundsIdx((i) => Math.max(0, i - 1)); return; }
         if (e.key === 'ArrowRight') { e.preventDefault(); setTeamRoundsIdx((i) => Math.min(CONFIG_ROUNDS_OPTIONS.length - 1, i + 1)); return; }
         if (e.key === 'Enter') {
           e.preventDefault(); e.stopPropagation();
-          const key = teamComboOptions[highlightIdx];
+          if (kbCfgActive && highlightIdx === 0) {
+            onSelectAllConfig?.(p2pConfig!, p2pConfig!.rounds ?? 1, 'config');
+            return;
+          }
+          if (kbCfgActive && highlightIdx === 1) {
+            setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); setConfigPickerFocus('rounds');
+            return;
+          }
+          if (hasAllRow && highlightIdx === regAllOffset) {
+            setModeAgent('__all__'); setModeHighlight(0);
+            return;
+          }
+          const key = teamComboOptions[highlightIdx - comboOffset];
           if (key) onLaunchTeam?.(key, CONFIG_ROUNDS_OPTIONS[teamRoundsIdx]);
           return;
         }
         return;
       }
 
-      // Files or Agents list — config only affects @@all rows, individual agents always show all
-      const kbConfigMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
-      const kbCfgFiltered = kbConfigMap
-        ? agents.filter(a => { const entry = kbConfigMap.get(a.session); return entry ? (entry.enabled && entry.mode !== 'skip') : false; })
-        : null;
-      const kbCfgActive = kbCfgFiltered && kbCfgFiltered.length > 0;
-      const nonSelfCount = agents.filter(a => !a.isSelf).length;
-      const hasAllRow = category === 'agents' && nonSelfCount > 1;
-      const cfgParticipants = kbCfgActive
-        ? kbCfgFiltered.map(a => [a.session, kbConfigMap!.get(a.session)!] as [string, { enabled: boolean; mode: string }])
-        : [];
-      const cfgRowCount = category === 'agents' && cfgParticipants.length > 0 ? 2 : 0;
-      const regAllOffset = cfgRowCount;
-      const agentsOff = regAllOffset + (hasAllRow ? 1 : 0);
-      const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + agents.length;
+      const count = category === 'files' ? fileResults.length : delegateAgents.length;
       if (e.key === 'Escape') {
         consumeEscapeKey(e);
         setCategory('choose');
         setHighlightIdx(0);
         return;
       }
-      if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h - 1 + count) % count); return; }
-      if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % count); return; }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (count > 0) setHighlightIdx((h) => (h - 1 + count) % count);
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (count > 0) setHighlightIdx((h) => (h + 1) % count);
+        return;
+      }
       if (e.key === 'Enter' && count > 0) {
         e.preventDefault(); e.stopPropagation();
         if (category === 'files') {
           const f = fileResults[highlightIdx];
           if (f) onSelectFile(f.path);
-        } else if (cfgRowCount > 0 && highlightIdx === 0) {
-          // @all with saved rounds
-          const rounds = p2pConfig!.rounds ?? 1;
-          onSelectAllConfig?.(p2pConfig!, rounds, 'config');
-        } else if (cfgRowCount > 0 && highlightIdx === 1) {
-          // @all+ — open rounds picker
-          setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); setConfigPickerFocus('rounds');
-        } else if (hasAllRow && highlightIdx === regAllOffset) {
-          setModeAgent('__all__'); setModeHighlight(0);
         } else {
-          const agentIdx = highlightIdx - agentsOff;
-          const a = agents[agentIdx];
-          if (a) { setModeAgent(a.session); setModeHighlight(0); }
+          const a = delegateAgents[highlightIdx];
+          if (a) onSelectDelegateAgent(a.session);
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, comboHighlight, teamRoundsIdx, teamComboOptions, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig, onLaunchTeam],
+    [visible, category, highlightIdx, fileResults, agents, delegateAgents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, comboHighlight, teamRoundsIdx, teamComboOptions, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectDelegateAgent, onSelectAllConfig, onLaunchTeam],
   );
 
   useEffect(() => {
@@ -687,31 +711,97 @@ export function AtPicker({
           onMouseEnter={() => setHighlightIdx(2)}
         >
           <span style={{ fontSize: 16 }}>🤖</span>
-          <span style={{ fontWeight: 500 }}>{t('p2p.picker.agents')}</span>
-          <span style={dimStyle}>{t('p2p.picker.quick_discussion_with_agent')}</span>
+          <span style={{ fontWeight: 500 }}>{t('delegation.picker.agents')}</span>
+          <span style={dimStyle}>{t('delegation.picker.delegate_to_agent')}</span>
         </div>
       </div>
     );
   }
 
-  // ── Team discussion: pick combo (↑↓) + rounds (←→), Enter launches ──
+  // ── Team discussion: P2P @all/config rows plus combo (↑↓) + rounds (←→) ──
   if (category === 'team') {
     const teamRounds = CONFIG_ROUNDS_OPTIONS[teamRoundsIdx];
+    const cfgMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+    const cfgFiltered = cfgMap
+      ? agents.filter(a => { const e = cfgMap.get(a.session); return e ? (e.enabled && e.mode !== 'skip') : false; })
+      : null;
+    const cfgActive = cfgFiltered && cfgFiltered.length > 0;
+    const configParticipants: [string, { enabled: boolean; mode: string }][] = cfgActive
+      ? cfgFiltered.map(a => [a.session, cfgMap!.get(a.session)!] as [string, { enabled: boolean; mode: string }])
+      : [];
+    const showConfigRows = cfgActive && configParticipants.length > 0;
+    const nonSelfAgents = agents.filter(a => !a.isSelf);
+    const showAll = nonSelfAgents.length > 1;
+    const configRowCount = showConfigRows ? 2 : 0;
+    const regularAllOffset = configRowCount;
+    const comboOffset = regularAllOffset + (showAll ? 1 : 0);
     return (
       <div ref={containerRef} style={containerStyle}>
         <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(1); }}>← {t('p2p.picker.back')}</div>
         <div style={groupLabelStyle}>
           {t('p2p.picker.team')} · {t('p2p.settings_rounds')}: ◂ {teamRounds} ▸
         </div>
+        {showConfigRows && (() => {
+          const rounds = p2pConfig!.rounds ?? 1;
+          const hlAll = highlightIdx === 0;
+          const hlAllPlus = highlightIdx === 1;
+          return (
+            <>
+              <div
+                data-hl={hlAll ? 'true' : undefined}
+                style={hlAll ? itemHighlightStyle : itemStyle}
+                onClick={() => { onSelectAllConfig?.(p2pConfig!, rounds, 'config'); }}
+                onMouseEnter={() => setHighlightIdx(0)}
+              >
+                <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_label')}</span>
+                <span style={{ ...dimStyle, color: '#94a3b8' }}>({rounds} {t('p2p.settings_rounds').toLowerCase()})</span>
+              </div>
+              {hlAll && (
+                <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
+                  {configParticipants.map(([session, entry]) => {
+                    const shortName = resolveDisplayName(session);
+                    const aType = resolveAgentType(session);
+                    return (
+                      <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
+                        {shortName}{aType ? ` (${aType})` : ''} · {entry.mode}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div
+                data-hl={hlAllPlus ? 'true' : undefined}
+                style={hlAllPlus ? itemHighlightStyle : itemStyle}
+                onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); setConfigPickerFocus('rounds'); }}
+                onMouseEnter={() => setHighlightIdx(1)}
+              >
+                <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_plus')}</span>
+                <span style={{ ...dimStyle, color: '#94a3b8' }}>{t('p2p.settings_mode')}: {t('p2p.mode_config')}</span>
+              </div>
+            </>
+          );
+        })()}
+        {showAll && (
+          <div
+            data-hl={highlightIdx === regularAllOffset ? 'true' : undefined}
+            style={highlightIdx === regularAllOffset ? itemHighlightStyle : itemStyle}
+            onClick={() => { setModeAgent('__all__'); setModeHighlight(0); }}
+            onMouseEnter={() => setHighlightIdx(regularAllOffset)}
+          >
+            <span style={{ fontWeight: 500, color: '#22c55e' }}>⚡ {t('p2p.picker.all_agents', 'All Agents')}</span>
+            <span style={dimStyle}>{nonSelfAgents.length} {t('p2p.picker.sessions', 'sessions')}</span>
+          </div>
+        )}
         {teamComboOptions.map((key, idx) => {
-          const hl = idx === highlightIdx;
+          const adjustedIdx = comboOffset + idx;
+          const hl = adjustedIdx === highlightIdx;
           return (
             <div
               key={key}
               data-hl={hl ? 'true' : undefined}
               style={hl ? itemHighlightStyle : itemStyle}
               onClick={() => onLaunchTeam?.(key, teamRounds)}
-              onMouseEnter={() => setHighlightIdx(idx)}
+              onMouseEnter={() => setHighlightIdx(adjustedIdx)}
             >
               <span style={{ fontWeight: 500 }}>{teamOptionLabel(key)}</span>
             </div>
@@ -755,124 +845,27 @@ export function AtPicker({
   }
 
   // ── Agents list ──
-  // Config filtering only affects @@all(config) rows — individual agents always show all.
-  const cfgMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
-  const cfgFiltered = cfgMap
-    ? agents.filter(a => { const e = cfgMap.get(a.session); return e ? (e.enabled && e.mode !== 'skip') : false; })
-    : null;
-  const cfgActive = cfgFiltered && cfgFiltered.length > 0;
-  // Config participants — for @@all(config) preview only
-  const configParticipants: [string, { enabled: boolean; mode: string }][] = cfgActive
-    ? cfgFiltered.map(a => [a.session, cfgMap!.get(a.session)!] as [string, { enabled: boolean; mode: string }])
-    : [];
-  const showConfigRows = cfgActive && configParticipants.length > 0;
-  // Individual agents list — always show all (unfiltered)
-  const nonSelfAgents = agents.filter(a => !a.isSelf);
-  const showAll = nonSelfAgents.length > 1;
-  const configRowCount = showConfigRows ? 2 : 0; // @all and @all+
-  // Index offset: configRows come first, then regular @all, then individual agents
-  const regularAllOffset = configRowCount;
-  const agentsOffset = regularAllOffset + (showAll ? 1 : 0);
-
   return (
     <div ref={containerRef} style={containerStyle}>
       <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← {t('p2p.picker.back')}</div>
-      <div style={groupLabelStyle}>{t('p2p.picker.agents')}</div>
-      {agents.length === 0 && !showConfigRows && (
+      <div style={groupLabelStyle}>{t('delegation.picker.agents')}</div>
+      {delegateAgents.length === 0 && (
         <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>{t('p2p.picker.no_agents_available')}</div>
       )}
 
-      {/* Config @all rows */}
-      {showConfigRows && (() => {
-        const rounds = p2pConfig!.rounds ?? 1;
-        const hlAll = highlightIdx === 0;
-        const hlAllPlus = highlightIdx === 1;
-        return (
-          <>
-            {/* @all (N轮) — use saved rounds, dispatch immediately */}
-            <div
-              data-hl={hlAll ? 'true' : undefined}
-              style={hlAll ? itemHighlightStyle : itemStyle}
-              onClick={() => { onSelectAllConfig?.(p2pConfig!, rounds, 'config'); }}
-              onMouseEnter={() => setHighlightIdx(0)}
-            >
-              <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_label')}</span>
-              <span style={{ ...dimStyle, color: '#94a3b8' }}>({rounds} {t('p2p.settings_rounds').toLowerCase()})</span>
-            </div>
-            {/* Participant preview under @all */}
-            {hlAll && (
-              <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
-                {configParticipants.map(([session, entry]) => {
-                  const shortName = resolveDisplayName(session);
-                  const aType = resolveAgentType(session);
-                  return (
-                    <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
-                      {shortName}{aType ? ` (${aType})` : ''} · {entry.mode}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-            {/* @all+ — pop rounds picker */}
-            <div
-              data-hl={hlAllPlus ? 'true' : undefined}
-              style={hlAllPlus ? itemHighlightStyle : itemStyle}
-              onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); setConfigPickerFocus('rounds'); }}
-              onMouseEnter={() => setHighlightIdx(1)}
-            >
-              <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_plus')}</span>
-              <span style={{ ...dimStyle, color: '#94a3b8' }}>{t('p2p.settings_mode')}: {t('p2p.mode_config')}</span>
-            </div>
-            {/* Participant preview under @all+ */}
-            {hlAllPlus && (
-              <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
-                <div style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
-                  {t('p2p.settings_mode')}: {t('p2p.mode_config')} · {t('p2p.settings_rounds')}
-                </div>
-                {configParticipants.map(([session, entry]) => {
-                  const shortName = resolveDisplayName(session);
-                  const aType = resolveAgentType(session);
-                  return (
-                    <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
-                      {shortName}{aType ? ` (${aType})` : ''} · {entry.mode}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        );
-      })()}
-
-      {/* Regular @all */}
-      {showAll && (
-        <div
-          data-hl={highlightIdx === regularAllOffset ? 'true' : undefined}
-          style={highlightIdx === regularAllOffset ? itemHighlightStyle : itemStyle}
-          onClick={() => { setModeAgent('__all__'); setModeHighlight(0); }}
-          onMouseEnter={() => setHighlightIdx(regularAllOffset)}
-        >
-          <span style={{ fontWeight: 500, color: '#22c55e' }}>⚡ {t('p2p.picker.all_agents', 'All Agents')}</span>
-          <span style={dimStyle}>{nonSelfAgents.length} {t('p2p.picker.sessions', 'sessions')}</span>
-        </div>
-      )}
-
-      {/* Individual agents — always show all, unfiltered */}
-      {agents.map((a, idx) => {
-        const adjustedIdx = agentsOffset + idx;
-        const hl = adjustedIdx === highlightIdx;
-        const cfgMode = cfgMap ? cfgMap.get(a.session) : undefined;
+      {/* Individual delegation agents only. */}
+      {delegateAgents.map((a, idx) => {
+        const hl = idx === highlightIdx;
         return (
           <div
             key={a.session}
             data-hl={hl ? 'true' : undefined}
             style={hl ? itemHighlightStyle : itemStyle}
-            onClick={() => { setModeAgent(a.session); setModeHighlight(0); }}
-            onMouseEnter={() => setHighlightIdx(adjustedIdx)}
+            onClick={() => onSelectDelegateAgent(a.session)}
+            onMouseEnter={() => setHighlightIdx(idx)}
           >
             <span style={{ fontWeight: 500 }}>{a.shortName}</span>
-            <span style={dimStyle}>{a.agentType}{cfgMode?.enabled ? ` · ${cfgMode.mode}` : ''}</span>
-            {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>({t('p2p.picker.you')})</span>}
+            <span style={dimStyle}>{a.agentType}</span>
             {a.busy && <span style={busyDotStyle} title={t('p2p.picker.busy')} />}
           </div>
         );

@@ -245,6 +245,20 @@ import {
   type SdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
 
+const activeCodexProviders = new Set<CodexSdkProvider>();
+
+function createCodexProvider(): CodexSdkProvider {
+  const provider = new CodexSdkProvider();
+  activeCodexProviders.add(provider);
+  return provider;
+}
+
+async function disconnectActiveCodexProviders(): Promise<void> {
+  const providers = Array.from(activeCodexProviders);
+  activeCodexProviders.clear();
+  await Promise.all(providers.map((provider) => provider.disconnect().catch(() => {})));
+}
+
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 async function waitForCondition(
@@ -258,6 +272,19 @@ async function waitForCondition(
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error('Timed out waiting for condition');
+}
+
+async function advanceFakeTimersUntil(
+  check: () => boolean,
+  timeoutMs = 1000,
+  stepMs = 1,
+): Promise<void> {
+  const steps = Math.max(1, Math.ceil(timeoutMs / stepMs));
+  for (let i = 0; i <= steps; i += 1) {
+    if (check()) return;
+    await vi.advanceTimersByTimeAsync(stepMs);
+  }
+  throw new Error('Timed out waiting for fake-timer condition');
 }
 
 async function writeCodexAuthFile(codexHome: string, version: number): Promise<void> {
@@ -331,14 +358,15 @@ describe('CodexSdkProvider', () => {
     childProcessMock.releaseHeldTurnInterrupts();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await disconnectActiveCodexProviders();
     vi.unstubAllEnvs();
     vi.clearAllTimers();
     vi.useRealTimers();
   });
 
   it('reports Memory MCP ready after app-server connect', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     expect(provider.getMemoryMcpStatus()).toMatchObject({
       providerId: 'codex-sdk',
       status: MEMORY_MCP_STATUS.UNKNOWN,
@@ -358,7 +386,7 @@ describe('CodexSdkProvider', () => {
 
   it('restarts the app-server before creating a session when Codex auth changes', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
       await writeCodexAuthFile(codexHome, 1);
@@ -380,7 +408,7 @@ describe('CodexSdkProvider', () => {
 
   it('preserves Codex thread ids across auth-change app-server restarts', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
       await writeCodexAuthFile(codexHome, 1);
@@ -407,7 +435,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('restarts the app-server when Codex reports a bearer auth failure', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
     const tools: ToolCallEvent[] = [];
     provider.onError((_sid, error) => errors.push({
@@ -462,7 +490,7 @@ describe('CodexSdkProvider', () => {
 
   it('defers auth-change app-server restart while any session has active current work', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-active-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
       await writeCodexAuthFile(codexHome, 1);
@@ -516,7 +544,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('does not emit a connection error when the app-server exits with no current work', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     const errors: ProviderError[] = [];
     provider.onError((_sid, error) => errors.push(error));
 
@@ -534,7 +562,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes active current work before reporting app-server crash exit', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     const errors: ProviderError[] = [];
     const tools: ToolCallEvent[] = [];
     provider.onError((_sid, error) => errors.push(error));
@@ -578,7 +606,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes active current work before reporting app-server stdout EOF', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     const errors: ProviderError[] = [];
     const tools: ToolCallEvent[] = [];
     provider.onError((_sid, error) => errors.push(error));
@@ -622,7 +650,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes open provider tools during intentional app-server shutdown without connection error', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     const errors: ProviderError[] = [];
     const tools: ToolCallEvent[] = [];
     provider.onError((_sid, error) => errors.push(error));
@@ -657,7 +685,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits SDK sub-agent snapshots for Codex collaboration start, completion, and failure', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab', cwd: '/tmp/project' });
 
@@ -746,7 +774,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes open SDK sub-agent details when closing provider tool calls', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-close-open', cwd: '/tmp/project' });
 
@@ -795,7 +823,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('closes prior Codex collaboration wrapper rows when terminal evidence uses a different call id', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-different-terminal-id', cwd: '/tmp/project' });
 
@@ -832,7 +860,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('handles empty Codex collaboration receiver lists without inventing child work', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-empty', cwd: '/tmp/project' });
 
@@ -866,7 +894,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('diagnoses mismatched and extra Codex collaboration child state without counting it as running', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-mismatch', cwd: '/tmp/project' });
 
@@ -919,7 +947,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('diagnoses unknown Codex child states without counting them as running', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-unknown-child', cwd: '/tmp/project' });
 
@@ -950,7 +978,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('keeps Codex completed lifecycle snapshots running when child state is still running', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-completed-stale-status', cwd: '/tmp/project' });
 
@@ -982,7 +1010,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('keeps Codex completed collaboration actions running while child agents are still running', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-completed-running-child', cwd: '/tmp/project' });
 
@@ -1019,7 +1047,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('diagnoses malformed Codex collaboration item ids without throwing or counting running work', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-malformed', cwd: '/tmp/project' });
 
@@ -1047,7 +1075,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('surfaces bounded Codex child prompts for collaboration rows without raw payloads', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-collab-prompt-safe', cwd: '/tmp/project' });
 
@@ -1089,7 +1117,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits SDK sub-agent snapshots for Codex runtime subagent notifications', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-runtime-subagent', cwd: '/tmp/project' });
 
@@ -1169,7 +1197,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits SDK sub-agent snapshots for raw Codex runtime subagent notification tags', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-runtime-subagent-tag', cwd: '/tmp/project' });
 
@@ -1203,7 +1231,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('surfaces raw update_plan function calls as checklist tool events', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-raw-update-plan', cwd: '/tmp/project' });
 
@@ -1254,7 +1282,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('surfaces codex>=0.139 native turn/plan/updated events as checklist tool events (new+old compatible)', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-native-plan', cwd: '/tmp/project' });
 
@@ -1318,7 +1346,7 @@ describe('CodexSdkProvider', () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-'));
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
-      const provider = new CodexSdkProvider();
+      const provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       await provider.createSession({ sessionKey: 'route-rollout-update-plan', cwd: '/tmp/project' });
 
@@ -1390,7 +1418,7 @@ describe('CodexSdkProvider', () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-poll-'));
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
-      const provider = new CodexSdkProvider();
+      const provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       await provider.createSession({ sessionKey: 'route-rollout-update-plan-poll', cwd: '/tmp/project' });
 
@@ -1440,7 +1468,7 @@ describe('CodexSdkProvider', () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-plan-offset-'));
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
-      const provider = new CodexSdkProvider();
+      const provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       await provider.createSession({ sessionKey: 'route-rollout-update-plan-offset', cwd: '/tmp/project' });
 
@@ -1515,7 +1543,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits backgrounded SDK sub-agent snapshots for raw spawn_agent response items', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-raw-spawn-agent', cwd: '/tmp/project' });
 
@@ -1677,7 +1705,7 @@ describe('CodexSdkProvider', () => {
 
   it('emits backgrounded SDK sub-agent snapshots from Codex child rollout metadata', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
       await provider.createSession({ sessionKey: 'route-child-rollout-subagent', cwd: '/tmp/project' });
@@ -1782,7 +1810,7 @@ describe('CodexSdkProvider', () => {
 
   it('completes raw spawn_agent sub-agents from child rollout even when rollout parent id differs', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-agent-id-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
       await provider.createSession({ sessionKey: 'route-child-rollout-agent-id', cwd: '/tmp/project' });
@@ -1868,7 +1896,7 @@ describe('CodexSdkProvider', () => {
 
   it('discovers child rollout sub-agents by IM.codes session identity when Codex parent id differs', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-session-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
       await provider.createSession({
@@ -1975,7 +2003,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('marks raw spawn_agent sub-agent rows complete from child turn completion', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-raw-spawn-agent-turn-complete', cwd: '/tmp/project' });
 
@@ -2047,7 +2075,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('diagnoses Codex runtime subagent notifications without an agent id', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-runtime-subagent-missing-id', cwd: '/tmp/project' });
 
@@ -2078,7 +2106,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
 
@@ -2209,7 +2237,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('uses final agentMessage from turn/completed items when item/completed was not observed', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-turn-items-final', cwd: '/tmp/project' });
 
@@ -2257,7 +2285,7 @@ describe('CodexSdkProvider', () => {
   it('resets the streaming accumulator across agentMessages so a second message is not prefixed with the first', async () => {
     // A turn with a tool round produces TWO agentMessage items. The second
     // message's deltas must start fresh, not carry the first message's text.
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-multi', cwd: '/tmp/project' });
 
@@ -2285,7 +2313,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('never drops an agentMessage delta whose turnId differs from runningTurnId (provider field-shape drift)', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-mismatch-delta', cwd: '/tmp/project' });
 
@@ -2309,7 +2337,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('never drops an agentMessage delta when runningTurnId is unset (turn/start result had no turn id) and backfills it', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-unset-turnid', cwd: '/tmp/project' });
 
@@ -2341,7 +2369,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('exposes only safe allowlisted Codex session diagnostics', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({
       binaryPath: 'codex',
       env: { SHOULD_NOT_LEAK: 'secret-env-value' },
@@ -2393,7 +2421,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('clears provider compaction active-work evidence when compact is cancelled locally', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-cancel-snapshot', cwd: '/tmp/project' });
 
@@ -2441,7 +2469,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('completes a normal turn only from turn/completed; idle thread status mid-turn does not end it', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-idle-not-completion', cwd: '/tmp/project' });
 
@@ -2484,7 +2512,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('settles a turn from thread-idle when the app-server sends no turn/completed (debounced)', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-idle-settles', cwd: '/tmp/project' });
 
@@ -2517,7 +2545,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('defers thread-idle fallback while a Codex commandExecution item is active', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-idle-active-command', cwd: '/tmp/project' });
 
@@ -2584,7 +2612,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes active Codex commandExecution items on turn/completed', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-turn-completed-active-command', cwd: '/tmp/project' });
 
@@ -2632,7 +2660,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('resumes with stored thread id on existing session', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-2', cwd: '/tmp/project', resumeId: 'thread-existing' });
 
@@ -2643,7 +2671,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('starts a replacement thread when stored Codex history is unreadable', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-corrupt', cwd: '/tmp/project', resumeId: 'thread-corrupt' });
 
@@ -2678,7 +2706,7 @@ describe('CodexSdkProvider', () => {
 
   it('forwards codex-cached base_instructions on thread/start for catalog model (gpt-5.4)', async () => {
     codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cat', cwd: '/tmp/project', agentId: 'gpt-5.4' });
     await provider.send('route-cat', 'hello');
@@ -2699,7 +2727,7 @@ describe('CodexSdkProvider', () => {
 
   it('sends fallback baseInstructions on thread/start when model is NOT in codex catalog (custom provider)', async () => {
     codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4']);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-mini', cwd: '/tmp/project', agentId: 'codex-MiniMax-M2.5' });
     await provider.send('route-mini', 'hello');
@@ -2716,7 +2744,7 @@ describe('CodexSdkProvider', () => {
 
   it('sends fallback baseInstructions on thread/resume for non-catalog model (heals previously-broken threads)', async () => {
     codexRuntimeConfigMock.set(['gpt-5.5']);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({
       sessionKey: 'route-resume-mini',
@@ -2737,7 +2765,7 @@ describe('CodexSdkProvider', () => {
 
   it('forwards codex-cached base_instructions on thread/resume for catalog model', async () => {
     codexRuntimeConfigMock.set(['gpt-5.5', 'gpt-5.4']);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({
       sessionKey: 'route-resume-cat',
@@ -2757,7 +2785,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('lists codex models across paginated model/list responses', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
 
     const resultPromise = provider.readModelList();
@@ -2812,7 +2840,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('maps normalized payloads into a message-side codex context block', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-payload', cwd: '/tmp/project' });
 
@@ -2851,7 +2879,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('moves split stable IM.codes context into codex baseInstructions and keeps only turn context in turn/start', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-split-context', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
@@ -2907,7 +2935,7 @@ describe('CodexSdkProvider', () => {
     // once per thread/start beats sending it every turn, (c) it joins
     // Codex's prefix cache, (d) zero token cost for non-Codex providers.
     codexRuntimeConfigMock.set(['gpt-5.4']);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-image', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
@@ -2961,7 +2989,7 @@ describe('CodexSdkProvider', () => {
 
   it('still appends image-reporting when sessionSystemText is absent (image-reporting is Codex-static, not gated on identity)', async () => {
     codexRuntimeConfigMock.set(['gpt-5.4']);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-image-only', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
@@ -3000,7 +3028,7 @@ describe('CodexSdkProvider', () => {
 
   it('appends exact Codex generated image file paths to the completed assistant message', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-images-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
       await provider.connect({ binaryPath: 'codex' });
@@ -3044,7 +3072,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('delivers changed split stable IM.codes context once after a Codex thread is loaded', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-stable-change', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
@@ -3099,7 +3127,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('re-sends a changed split stable context when the Codex update turn fails before completion', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     const errors: string[] = [];
     provider.onError((_sid, error) => errors.push(error.message));
     await provider.connect({ binaryPath: 'codex' });
@@ -3173,7 +3201,7 @@ describe('CodexSdkProvider', () => {
 
   it('caps Codex SDK injected context while preserving the user turn text', async () => {
     vi.stubEnv('IMCODES_CODEX_SDK_CONTEXT_MAX_CHARS', '4000');
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-context-cap', cwd: '/tmp/project' });
     const userMessage = 'Please preserve this exact user request after context trimming';
@@ -3217,7 +3245,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('maps normalized system context into the turn input text', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-context', cwd: '/tmp/project' });
 
@@ -3258,7 +3286,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('maps raw /compact to Codex app-server native compaction instead of a model turn', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact', cwd: '/tmp/project' });
 
@@ -3295,7 +3323,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('recognizes snake_case thread compact notifications and clears compact busy state', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-snake', cwd: '/tmp/project' });
 
@@ -3314,7 +3342,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('completes compact on contextCompaction item completion even without turn/completed', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-item', cwd: '/tmp/project' });
 
@@ -3347,7 +3375,7 @@ describe('CodexSdkProvider', () => {
 
   it('ignores duplicate compact turn completion without scanning stale generated images', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-compact-images-'));
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
       await provider.connect({ binaryPath: 'codex' });
@@ -3392,7 +3420,7 @@ describe('CodexSdkProvider', () => {
 
   it('settles accepted compact requests that emit no native completion signal', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-no-signal', cwd: '/tmp/project' });
 
@@ -3416,7 +3444,7 @@ describe('CodexSdkProvider', () => {
 
   it('does not settle compact by fallback after an active compact signal arrives', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-active', cwd: '/tmp/project' });
 
@@ -3436,7 +3464,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('uses the raw userMessage when detecting /compact in normalized payloads', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-context', cwd: '/tmp/project' });
 
@@ -3474,7 +3502,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('cancels an in-flight compact locally so the session can continue', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-compact-cancel', cwd: '/tmp/project' });
 
@@ -3504,7 +3532,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-context', cwd: '/tmp/project' });
 
@@ -3540,7 +3568,7 @@ describe('CodexSdkProvider', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' });
 
     try {
-      const provider = new CodexSdkProvider();
+      const provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       await provider.createSession({ sessionKey: 'route-win', cwd: 'C:\\Users\\admin\\project' });
 
@@ -3557,7 +3585,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('fresh createSession ignores previous stored thread state for the same route', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', resumeId: 'thread-old' });
     await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', fresh: true });
@@ -3569,7 +3597,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('cancels an in-flight turn through turn/interrupt', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel', cwd: '/tmp/project' });
 
@@ -3581,7 +3609,7 @@ describe('CodexSdkProvider', () => {
 
   it('interrupts a Codex turn when cancel arrives before turn/start returns a turn id', async () => {
     childProcessMock.setHoldTurnStart(true);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-pending-start', cwd: '/tmp/project' });
 
@@ -3602,7 +3630,7 @@ describe('CodexSdkProvider', () => {
 
   it('remembers Codex cancel when it arrives before thread/start returns a thread id', async () => {
     childProcessMock.setHoldThreadStart(true);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-pending-thread', cwd: '/tmp/project' });
 
@@ -3622,7 +3650,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('ignores late Codex deltas and completed output after cancel', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-late-output', cwd: '/tmp/project' });
 
@@ -3654,7 +3682,7 @@ describe('CodexSdkProvider', () => {
   it('starts the Codex cancel watchdog even when turn/interrupt never acknowledges', async () => {
     vi.useFakeTimers();
     childProcessMock.setHoldTurnInterrupt(true);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-interrupt-hangs', cwd: '/tmp/project' });
 
@@ -3672,7 +3700,7 @@ describe('CodexSdkProvider', () => {
 
   it('recovers the session when turn/interrupt never produces an interrupted completion', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-timeout', cwd: '/tmp/project' });
 
@@ -3695,7 +3723,7 @@ describe('CodexSdkProvider', () => {
   it('does not let late Codex item events re-adopt a cancelled turn after the cancel watchdog', async () => {
     vi.useFakeTimers();
     childProcessMock.setHoldTurnInterrupt(true);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-late-item-turnid', cwd: '/tmp/project' });
 
@@ -3725,7 +3753,7 @@ describe('CodexSdkProvider', () => {
   it('does not let late contextCompaction items re-enter compacting after cancel', async () => {
     vi.useFakeTimers();
     childProcessMock.setHoldTurnInterrupt(true);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-cancel-late-compact-item', cwd: '/tmp/project' });
 
@@ -3753,7 +3781,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('does not let late Codex item events re-adopt a failed turn', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-failed-late-item-turnid', cwd: '/tmp/project' });
 
@@ -3791,7 +3819,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('does not render late plan updates for a failed turn', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-failed-late-plan', cwd: '/tmp/project' });
 
@@ -3823,7 +3851,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits WebSearch tool events for webSearch items (legacy top-level query)', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch', cwd: '/tmp/project' });
 
@@ -3854,7 +3882,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('extracts WebSearch query from action.query when item.query is absent (current Codex CLI shape)', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-action', cwd: '/tmp/project' });
 
@@ -3883,7 +3911,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('falls back to action url/pattern/type for non-search WebSearch actions', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-other', cwd: '/tmp/project' });
 
@@ -3936,7 +3964,7 @@ describe('CodexSdkProvider', () => {
     // The started-state label must be a non-empty string so
     // `summarizeToolInput` short-circuits on `query` instead of
     // JSON-stringifying the whole input object.
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-start', cwd: '/tmp/project' });
 
@@ -3959,7 +3987,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('ignores empty-string WebSearch query fields and still falls back to action type', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-empty-query', cwd: '/tmp/project' });
 
@@ -3993,7 +4021,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('surfaces the final WebSearch query on completion even if started emitted only a generic fallback', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-late-query', cwd: '/tmp/project' });
 
@@ -4033,7 +4061,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes a WebSearch started event when the turn completes without item/completed', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-start-only-turn-complete', cwd: '/tmp/project' });
 
@@ -4091,7 +4119,7 @@ describe('CodexSdkProvider', () => {
 
   it('reports turn-start in-flight as provider active work until Codex returns a turn id', async () => {
     childProcessMock.setHoldTurnStart(true);
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-turn-start-snapshot', cwd: '/tmp/project' });
 
@@ -4111,7 +4139,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('reports started-only WebSearch provider tools in the active-work snapshot', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-snapshot', cwd: '/tmp/project' });
 
@@ -4136,7 +4164,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes orphan provider tools on cancel when app-server no longer has a running turn id', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-orphan-cancel', cwd: '/tmp/project' });
 
@@ -4186,7 +4214,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('abandons stale open provider tools at the next send boundary before starting a new turn', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-rollover', cwd: '/tmp/project' });
 
@@ -4225,7 +4253,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('terminalizes a WebSearch started event when thread-idle settles a turn without turn/completed', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch-start-only-idle-settle', cwd: '/tmp/project' });
 
@@ -4289,7 +4317,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-todo-list', cwd: '/tmp/project' });
 
@@ -4334,7 +4362,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('applies thinking level to subsequent Codex SDK turns', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-think', cwd: '/tmp/project', effort: 'medium' });
     provider.setSessionEffort('route-think', 'high');
@@ -4346,7 +4374,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('propagates per-session IM.codes sender identity env through Codex app-server requests', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({
       sessionKey: 'route-env',
@@ -4373,7 +4401,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('injects Memory MCP identity through per-thread config instead of app-server argv', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({
       sessionKey: 'route-mcp',
@@ -4417,7 +4445,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('re-sends Memory MCP identity config when resuming an existing Codex thread', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({
       sessionKey: 'route-mcp-resume',
@@ -4448,7 +4476,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('emits thinking status from reasoning items and clears it on streamed assistant text', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-status', cwd: '/tmp/project' });
 
@@ -4473,7 +4501,7 @@ describe('CodexSdkProvider', () => {
 
   it('heartbeats active turns with thread/read, classifies active/degraded without using turn/interrupt, and never polls idle sessions', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-heartbeat-active', cwd: '/tmp/project' });
     await provider.createSession({ sessionKey: 'route-heartbeat-idle', cwd: '/tmp/project' });
@@ -4489,7 +4517,9 @@ describe('CodexSdkProvider', () => {
     });
 
     await vi.advanceTimersByTimeAsync(55_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => (
+      provider.getSessionDiagnostics('route-heartbeat-active')?.lastHeartbeatResponseAtMs != null
+    ));
 
     expect(child.requests.filter((req) => req.method === 'thread/read')).toHaveLength(1);
     expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
@@ -4525,7 +4555,7 @@ describe('CodexSdkProvider', () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-turn-'));
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
-      const provider = new CodexSdkProvider();
+      const provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       await provider.createSession({ sessionKey: 'route-zombie-turn', cwd: '/tmp/project' });
 
@@ -4597,7 +4627,7 @@ describe('CodexSdkProvider', () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-other-turn-'));
     try {
       vi.stubEnv('CODEX_HOME', codexHome);
-      const provider = new CodexSdkProvider();
+      const provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       await provider.createSession({ sessionKey: 'route-zombie-other', cwd: '/tmp/project' });
 
@@ -4642,7 +4672,7 @@ describe('CodexSdkProvider', () => {
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     let provider: CodexSdkProvider | undefined;
     try {
-      provider = new CodexSdkProvider();
+      provider = createCodexProvider();
       await provider.connect({ binaryPath: 'codex' });
       for (const sessionKey of ['route-heartbeat-cap-1', 'route-heartbeat-cap-2', 'route-heartbeat-cap-3']) {
         await provider.createSession({ sessionKey, cwd: '/tmp/project' });
@@ -4696,7 +4726,7 @@ describe('CodexSdkProvider', () => {
 
   it('normalizes heartbeat status aliases and treats malformed/ambiguous/unknown summaries as inconclusive', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-heartbeat-aliases', cwd: '/tmp/project' });
 
@@ -4710,7 +4740,9 @@ describe('CodexSdkProvider', () => {
       turns: [{ id: 'turn-1', status: 'in_progress', current: true }],
     });
     await vi.advanceTimersByTimeAsync(55_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => (
+      provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs != null
+    ));
     const aliveAfterActive = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastAliveHeartbeatAtMs;
     const responseAfterActive = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs;
     expect(aliveAfterActive).toEqual(expect.any(Number));
@@ -4721,7 +4753,10 @@ describe('CodexSdkProvider', () => {
       return { thread: { status: 'idle' } };
     });
     await vi.advanceTimersByTimeAsync(25_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => {
+      const value = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs;
+      return typeof value === 'number' && value > (responseAfterActive as number);
+    });
     const afterMalformed = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
     expect(afterMalformed.lastHeartbeatResponseAtMs as number).toBeGreaterThan(responseAfterActive as number);
     expect(afterMalformed.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
@@ -4737,7 +4772,10 @@ describe('CodexSdkProvider', () => {
       };
     });
     await vi.advanceTimersByTimeAsync(25_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => {
+      const value = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs;
+      return typeof value === 'number' && value > (afterMalformed.lastHeartbeatResponseAtMs as number);
+    });
     const afterAmbiguous = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
     expect(afterAmbiguous.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterMalformed.lastHeartbeatResponseAtMs as number);
     expect(afterAmbiguous.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
@@ -4747,7 +4785,10 @@ describe('CodexSdkProvider', () => {
       return { status: 'mystery', turns: [{ id: 'turn-1', status: 'weird' }] };
     });
     await vi.advanceTimersByTimeAsync(25_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => {
+      const value = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs;
+      return typeof value === 'number' && value > (afterAmbiguous.lastHeartbeatResponseAtMs as number);
+    });
     const afterUnknown = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
     expect(afterUnknown.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterAmbiguous.lastHeartbeatResponseAtMs as number);
     expect(afterUnknown.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
@@ -4759,7 +4800,7 @@ describe('CodexSdkProvider', () => {
 
   it('emits privacy-bounded sdk_turn_lost for deterministic idle-missing-turn and notLoaded summaries', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
 
     const errors: Array<{ sid: string; details?: any; message: string; recoverable: boolean }> = [];
@@ -4779,7 +4820,7 @@ describe('CodexSdkProvider', () => {
       prompt: 'must-not-leak',
     });
     await vi.advanceTimersByTimeAsync(55_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => errors.length === 1);
 
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({ sid: 'route-heartbeat-lost', recoverable: true });
@@ -4802,7 +4843,7 @@ describe('CodexSdkProvider', () => {
 
     await provider.disconnect();
 
-    const provider2 = new CodexSdkProvider();
+    const provider2 = createCodexProvider();
     provider2.onError((sid, error) => errors.push({
       sid,
       details: error.details,
@@ -4817,7 +4858,7 @@ describe('CodexSdkProvider', () => {
       turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
     });
     await vi.advanceTimersByTimeAsync(55_100);
-    await vi.advanceTimersByTimeAsync(0);
+    await advanceFakeTimersUntil(() => errors.at(-1)?.sid === 'route-heartbeat-notloaded');
 
     expect(errors.at(-1)?.details).toMatchObject({
       reason: 'sdk_turn_lost',
@@ -4828,7 +4869,7 @@ describe('CodexSdkProvider', () => {
 
   it('makes completed/failed/interrupted local truth deactivate the lease and ignores late strong-looking events', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-heartbeat-terminal', cwd: '/tmp/project' });
 
@@ -4859,7 +4900,7 @@ describe('CodexSdkProvider', () => {
 
   it('does not let weak token-usage activity reset strong heartbeat grace indefinitely', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-heartbeat-weak', cwd: '/tmp/project' });
 
@@ -4885,7 +4926,7 @@ describe('CodexSdkProvider', () => {
   });
 
   it('uses heartbeat before idle-settle so idle missing-current-turn is not masked as normal completion', async () => {
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-heartbeat-idle-lost', cwd: '/tmp/project' });
 
@@ -4913,7 +4954,7 @@ describe('CodexSdkProvider', () => {
 
   it('cleans heartbeat/tool/compact evidence on disconnect and keeps child/compact scopes isolated from ordinary lost-turn recovery', async () => {
     vi.useFakeTimers();
-    const provider = new CodexSdkProvider();
+    const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-heartbeat-disconnect', cwd: '/tmp/project' });
 

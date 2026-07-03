@@ -82,6 +82,10 @@ import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import {
+  AGENT_DELEGATION_TARGET_FIELD,
+  isDelegationUnsupportedControlText,
+} from '@shared/agent-delegation.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -619,6 +623,11 @@ interface PendingAtTarget {
   label: string;
 }
 
+interface PendingDelegateTarget {
+  session: string;
+  label: string;
+}
+
 interface PendingSendPayload {
   text: string;
   extra: Record<string, unknown>;
@@ -1024,6 +1033,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
@@ -2508,6 +2518,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return `@@${display}(${modeLabel})`;
   };
 
+  const buildDelegateLabel = useCallback((session: string) => {
+    const sub = (subSessions ?? []).find(s => s.sessionName === session);
+    const main = (sessions ?? []).find(s => s.name === session);
+    return sub?.label || main?.label || session.replace(/^deck_sub_/, '').split('_').pop() || session;
+  }, [sessions, subSessions]);
+
   /** Pending @-selected P2P targets + their display labels for removal at send time. */
   const pendingAtTargetsRef = useRef<PendingAtTarget[]>([]);
   /** Custom config/rounds override from @@all+ picker (cleared on send). */
@@ -2573,7 +2589,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       (!!normalizedOptions.modeOverride && isComboMode(normalizedOptions.modeOverride)) ||
       (!!syntheticModeOverride && isComboMode(syntheticModeOverride))
     );
-    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !activeSession) return null;
+    if (((!text && attachments.length === 0 && !pendingDelegateTarget) && !allowEmptyCombo) || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
@@ -2581,7 +2597,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ? [...normalizedOptions.syntheticAtTargets]
       : [...pendingAtTargetsRef.current];
 
-    if (pendingTargets.length > 0) {
+    if (pendingDelegateTarget && !normalizedOptions.syntheticAtTargets) {
+      extra[AGENT_DELEGATION_TARGET_FIELD] = { session: pendingDelegateTarget.session };
+    } else if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
       const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
       text = cleanText;
@@ -2651,8 +2669,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
 
-    // Prepend quotes
-    if (quotes && quotes.length > 0) {
+    // Prepend quotes (delegation sends must be a clean task only; validation blocks quotes).
+    if (!pendingDelegateTarget && quotes && quotes.length > 0) {
       const quoteBlock = quotes.map((q) => `> ${q.replace(/\n/g, '\n> ')}`).join('\n\n');
       text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
     }
@@ -2660,12 +2678,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     // R3 v2 PR-ρ/υ — Keep the compact user-facing tag (`#1`, `#2`, ...)
     // but map it to the full daemon path, not just the display filename.
     // The path is what the receiving LLM can actually open.
-    if (attachments.length > 0) {
+    if (!pendingDelegateTarget && attachments.length > 0) {
       const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [activeSession, applySavedP2pConfigSelection, attachments, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -2875,9 +2893,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
+    const isDelegationSend = Boolean(payload.extra[AGENT_DELEGATION_TARGET_FIELD]);
     const clearComposerState = () => {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
+      setPendingDelegateTarget(null);
       if (divRef.current) setComposerElementText(divRef.current, '');
       setHasText(false);
       publishComposerText('');
@@ -2894,7 +2914,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.removeItem(draftKey);
       if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
     };
-    if (effectiveRuntimeType === 'transport' && !isP2pSend && payload.text.trim() === '/stop') {
+    if (effectiveRuntimeType === 'transport' && !isP2pSend && !isDelegationSend && payload.text.trim() === '/stop') {
       showStopFeedback();
       if (!cancelActiveTransportTurn()) return;
       if (options?.clearComposer) clearComposerState();
@@ -2940,6 +2960,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
       && transportSendShouldQueue
       && !isP2pSend
+      && !isDelegationSend
       && !payload.text.trim().startsWith('/');
     if (shouldShowAsQueued) {
       setOptimisticQueuedEntries((prev) => {
@@ -3043,6 +3064,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
     const text = payload.text.trim();
+    if (payload.extra[AGENT_DELEGATION_TARGET_FIELD]) {
+      if (!text) return t('delegation.warning_empty_task');
+      if (isDelegationUnsupportedControlText(text)) return t('delegation.warning_control_command');
+      if (attachments.length > 0) return t('delegation.warning_attachments');
+      if ((quotes?.length ?? 0) > 0) return t('delegation.warning_quotes');
+      if (/(^|\s)@[^@\s][^\s]*/.test(text)) return t('delegation.warning_file_refs');
+      if (text.includes('@@') || p2pMode !== 'solo' || pendingAtTargetsRef.current.length > 0 || pendingConfigOverrideRef.current) {
+        return t('delegation.warning_p2p_tokens');
+      }
+    }
     const routedModes: string[] = [];
     const directMode = payload.extra.p2pMode;
     if (typeof directMode === 'string') routedModes.push(directMode);
@@ -3061,7 +3092,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return t('p2p.combo_requires_participants_hint');
     }
     return null;
-  }, [hasConfiguredP2pParticipants, t]);
+  }, [attachments.length, hasConfiguredP2pParticipants, p2pMode, quotes, t]);
 
   const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
     if (!payload) return;
@@ -4414,6 +4445,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
 
+      {/* Delegation target chip — separate from Team/P2P routing tokens. */}
+      {pendingDelegateTarget && (
+        <div class="attachment-badges">
+          <span class="attachment-badge" title={t('delegation.chip_title', { target: pendingDelegateTarget.label })}>
+            <span class="attachment-badge-icon">🤖</span>
+            <span class="attachment-badge-name">{t('delegation.chip_label', { target: pendingDelegateTarget.label })}</span>
+            <button
+              class="attachment-badge-remove"
+              onClick={() => setPendingDelegateTarget(null)}
+              title={t('common.delete')}
+            >×</button>
+          </span>
+        </div>
+      )}
+
       {/* Attachment badges — above input row */}
       {attachments.length > 0 && (
         <div class="attachment-badges">
@@ -4560,7 +4606,31 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
             }}
+            onSelectDelegateAgent={(session) => {
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              if (divRef.current) setComposerElementText(divRef.current, before);
+              setPendingDelegateTarget({ session, label: buildDelegateLabel(session) });
+              pendingAtTargetsRef.current = [];
+              pendingConfigOverrideRef.current = null;
+              atSelectionSnapshotRef.current = before;
+              atSelectionLockRef.current = true;
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              setHasText(!!before.trim());
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
+            }}
             onSelectAgent={(session, mode) => {
+              setPendingDelegateTarget(null);
               const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
               // Show short @@label in input (double-@ = P2P, single-@ = file ref)
@@ -4586,6 +4656,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               } catch { /* jsdom lacks Selection API */ }
             }}
             onSelectAllConfig={(config, rounds, modeOverride) => {
+              setPendingDelegateTarget(null);
               // Show @@all(config) — daemon expands per config. Store custom rounds + config override.
               const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
@@ -4780,7 +4851,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class="btn btn-primary"
             onClick={handleSend}
-            disabled={inputDisabled || uploading || (!hasText && attachments.length === 0) || !connected}
+            disabled={inputDisabled || uploading || (!hasText && attachments.length === 0 && !pendingDelegateTarget) || !connected}
           >
             {t('common.send')}
           </button>

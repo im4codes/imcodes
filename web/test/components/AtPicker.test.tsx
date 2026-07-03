@@ -66,6 +66,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onClose={vi.fn()}
         visible
       />,
@@ -82,7 +83,7 @@ describe('AtPicker', () => {
     expect(filesLabel.closest('div')?.getAttribute('data-hl')).toBe('true');
     expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
     expect(screen.getByText('search_project_files')).toBeDefined();
-    expect(screen.getByText('quick_discussion_with_agent')).toBeDefined();
+    expect(screen.getByText('delegate_to_agent')).toBeDefined();
   });
 
   it('does not handle picker keyboard shortcuts while IME composition is active', () => {
@@ -106,6 +107,87 @@ describe('AtPicker', () => {
     expect(screen.getByText('worker1')).toBeDefined();
     expect(screen.getByText('worker2')).toBeDefined();
     expect(screen.queryByText('other9')).toBeNull();
+  });
+
+  it('agents step shows only individual non-self reply-capable delegation targets', () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_shell', agentType: 'shell', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_transport', agentType: 'codex-sdk', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_stopped', agentType: 'gemini', state: 'stopped', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('agents'));
+
+    expect(screen.getByText('worker1')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.queryByText('shell')).toBeNull();
+    expect(screen.queryByText('transport')).toBeNull();
+    expect(screen.queryByText('stopped')).toBeNull();
+    expect(screen.queryByText('All Agents')).toBeNull();
+  });
+
+  it('team step retains P2P all/config rows and combo launch behavior', () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    const onSelectAgent = vi.fn();
+    const onSelectAllConfig = vi.fn();
+    const onLaunchTeam = vi.fn();
+    const config = {
+      sessions: {
+        'deck_sub_w1': { enabled: true, mode: 'audit' },
+        'deck_sub_w2': { enabled: true, mode: 'review' },
+      },
+      rounds: 2,
+    };
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_w2', agentType: 'gemini', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={onSelectAgent}
+        onSelectDelegateAgent={vi.fn()}
+        onSelectAllConfig={onSelectAllConfig}
+        onLaunchTeam={onLaunchTeam}
+        p2pConfig={config}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('team'));
+    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_label') ?? false)).closest('div')!);
+    expect(onSelectAllConfig).toHaveBeenCalledWith(config, 2, 'config');
+
+    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('All Agents') ?? false)).closest('div')!);
+    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el.textContent === 'Audit'));
+    expect(onSelectAgent).toHaveBeenCalledWith('__all__', 'audit');
+
+    fireEvent.click(screen.getByText('audit › review › plan', { selector: 'span' }));
+    expect(onLaunchTeam).toHaveBeenCalled();
   });
 
   it('Escape from agents step returns to category chooser', () => {
@@ -139,6 +221,7 @@ describe('AtPicker', () => {
           projectDir="/tmp/proj"
           onSelectFile={vi.fn()}
           onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
           onClose={vi.fn()}
           visible
         />
@@ -170,6 +253,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         p2pConfig={{
           sessions: {
             'deck_sub_w1': { enabled: true, mode: 'audit' },
@@ -207,6 +291,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         p2pConfig={{
           sessions: {
             'deck_sub_w1': { enabled: true, mode: 'audit' },
@@ -243,6 +328,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onClose={vi.fn()}
         visible
       />,
@@ -253,13 +339,14 @@ describe('AtPicker', () => {
     expect(screen.getByText(/← back/i)).toBeDefined();
   });
 
-  it('passes the selected mode for a single agent', () => {
+  it('delegates immediately for a single agent without showing the P2P mode chooser', () => {
     const wsClient = {
       connected: true,
       send: vi.fn(),
       onMessage: vi.fn(() => () => {}),
     };
     const onSelectAgent = vi.fn();
+    const onSelectDelegateAgent = vi.fn();
 
     render(
       <AtPicker
@@ -273,6 +360,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={onSelectAgent}
+        onSelectDelegateAgent={onSelectDelegateAgent}
         onClose={vi.fn()}
         visible
       />,
@@ -280,9 +368,10 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('worker1'));
-    fireEvent.click(screen.getByText('Discuss'));
 
-    expect(onSelectAgent).toHaveBeenCalledWith('deck_sub_worker1', 'discuss');
+    expect(onSelectDelegateAgent).toHaveBeenCalledWith('deck_sub_worker1');
+    expect(onSelectAgent).not.toHaveBeenCalled();
+    expect(screen.queryByText('Discuss')).toBeNull();
   });
 
   it('all + custom rounds applies the selected mode override to all configured participants', () => {
@@ -302,6 +391,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onSelectAllConfig={onSelectAllConfig}
         p2pConfig={{
           sessions: {
@@ -315,7 +405,7 @@ describe('AtPicker', () => {
       />,
     );
 
-    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('team'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el?.textContent === 'mode_audit'));
     fireEvent.click(screen.getByText('3'));
@@ -344,6 +434,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onSelectAllConfig={vi.fn()}
         p2pConfig={{
           sessions: {
@@ -357,7 +448,7 @@ describe('AtPicker', () => {
       />,
     );
 
-    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('team'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el?.textContent === 'mode_audit'));
 
@@ -383,6 +474,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onSelectAllConfig={onSelectAllConfig}
         p2pConfig={{
           sessions: {
@@ -396,7 +488,7 @@ describe('AtPicker', () => {
       />,
     );
 
-    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('team'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
 
     fireEvent.keyDown(document, { key: 'ArrowRight' }); // rounds: 1 -> 2
@@ -430,6 +522,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onSelectAllConfig={onSelectAllConfig}
         p2pConfig={{
           sessions: {
@@ -444,7 +537,7 @@ describe('AtPicker', () => {
     );
 
     await flush();
-    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('team'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
     fireEvent.click(screen.getByText('mode_audit→mode_discuss'));
 
@@ -474,6 +567,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onSelectAllConfig={onSelectAllConfig}
         p2pConfig={{
           sessions: {
@@ -488,7 +582,7 @@ describe('AtPicker', () => {
     );
 
     await flush();
-    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('team'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
     fireEvent.click(screen.getByText('mode_audit→mode_discuss'));
 

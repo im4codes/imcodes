@@ -49,6 +49,17 @@ import logger from '../util/logger.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import {
+  AGENT_DELEGATION_ERROR_CODES,
+  AGENT_DELEGATION_TARGET_FIELD,
+  findForbiddenAgentDelegationCommandFields,
+  findMixedAgentDelegationP2pFields,
+  hasLegacyP2pControlToken,
+  isDelegationUnsupportedControlText,
+  parseAgentDelegationTargetPayload,
+  type AgentDelegationErrorCode,
+  type DelegationContextStatus,
+} from '../../shared/agent-delegation.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { hashSessionName } from '../../shared/session-hash.js';
@@ -160,6 +171,7 @@ import {
   type DedicatedExecutionRoutingGlobalPreference,
 } from '../../shared/execution-clone.js';
 import { dispatchSendMessage } from './send-tool.js';
+import { dispatchDelegatedSessionSend } from './session-dispatch.js';
 import { getP2pConfigStoreScope, handleSessionGroupCloneCancel, handleSessionGroupCloneCommand } from './session-group-clone.js';
 import { buildDefaultP2pStaticPolicy } from '../../shared/p2p-workflow-policy.js';
 import {
@@ -571,6 +583,7 @@ function emitCommandAckReliable(
     sessionName: string;
     status: string;
     error?: string;
+    [key: string]: unknown;
   },
 ): void {
   const outbox = getDefaultAckOutbox();
@@ -580,6 +593,9 @@ function emitCommandAckReliable(
       sessionName: params.sessionName,
       status: params.status,
       ...(params.error ? { error: params.error } : {}),
+      extras: Object.fromEntries(Object.entries(params).filter(([key, value]) => (
+        !['commandId', 'sessionName', 'status', 'error'].includes(key) && value !== undefined
+      ))),
       ts: Date.now(),
     })
     .catch((err) =>
@@ -590,6 +606,7 @@ function emitCommandAckReliable(
     sessionName: params.sessionName,
     status: params.status,
     error: params.error,
+    ...Object.fromEntries(Object.entries(params).filter(([key]) => !['commandId', 'sessionName', 'status', 'error'].includes(key))),
   });
   if (sent) {
     outbox
@@ -612,6 +629,7 @@ function trySendCommandAck(
     sessionName: string;
     status: string;
     error?: string;
+    [key: string]: unknown;
   },
 ): boolean {
   if (!serverLink) return false;
@@ -622,6 +640,10 @@ function trySendCommandAck(
     session: params.sessionName,
   };
   if (params.error) wireMsg.error = params.error;
+  for (const [key, value] of Object.entries(params)) {
+    if (['commandId', 'sessionName', 'status', 'error'].includes(key)) continue;
+    if (value !== undefined) wireMsg[key] = value;
+  }
   if (typeof serverLink.trySend === 'function') {
     return serverLink.trySend(wireMsg);
   }
@@ -2739,6 +2761,97 @@ async function handleSessionExecutionClones(cmd: Record<string, unknown>, server
     : 'execution clone dispatch failed');
 }
 
+
+
+type DelegationTerminalAck = {
+  commandId: string;
+  sessionName: string;
+  status: string;
+  error?: string;
+  delegated: true;
+  targetSession?: string;
+  delegationContextStatus?: DelegationContextStatus;
+};
+
+const delegationTerminalAcks = new Map<string, DelegationTerminalAck>();
+const delegationAckKey = (sessionName: string, commandId: string): string => `${sessionName}:${commandId}`;
+
+function recordDelegationTerminalAck(payload: DelegationTerminalAck): void {
+  delegationTerminalAcks.set(delegationAckKey(payload.sessionName, payload.commandId), payload);
+}
+
+function emitDelegationTerminalAck(
+  serverLink: ServerLink,
+  payload: DelegationTerminalAck,
+): void {
+  recordDelegationTerminalAck(payload);
+  const timelinePayload: Record<string, unknown> = {
+    commandId: payload.commandId,
+    status: payload.status,
+    delegated: true,
+    ...(payload.error ? { error: payload.error } : {}),
+    ...(payload.targetSession ? { targetSession: payload.targetSession } : {}),
+    ...(payload.delegationContextStatus ? { delegationContextStatus: payload.delegationContextStatus } : {}),
+  };
+  timelineEmitter.emit(payload.sessionName, 'command.ack', timelinePayload);
+  emitCommandAckReliable(serverLink, payload);
+}
+
+function replayDelegationTerminalAckIfPresent(
+  serverLink: ServerLink,
+  sessionName: string,
+  commandId: string,
+): boolean {
+  const payload = delegationTerminalAcks.get(delegationAckKey(sessionName, commandId));
+  if (!payload) return false;
+  emitDelegationTerminalAck(serverLink, payload);
+  return true;
+}
+
+const DELEGATION_MIXED_P2P_FIELDS = [
+  'p2pAtTargets',
+  'directTargetSession',
+  'directTargetMode',
+  'p2pMode',
+  'p2pSessionConfig',
+  'p2pWorkflowLaunchEnvelope',
+  'workflowLaunchEnvelope',
+  'p2pRounds',
+  'p2pExtraPrompt',
+  'p2pLocale',
+  'p2pHopTimeoutMs',
+  'p2pAdvancedPresetKey',
+  'p2pAdvancedRounds',
+  'p2pAdvancedRunTimeoutMinutes',
+  'p2pContextReducer',
+  'dedicatedExecutionRouting',
+] as const;
+
+const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
+  'replyTo',
+  'originSession',
+  'originOverride',
+  'contextTail',
+  'delegationContext',
+  'files',
+  'attachments',
+  'quotes',
+  'fileRefs',
+  'fileReferences',
+  'broadcast',
+  'clone',
+  'idempotencyKey',
+  'delegationId',
+] as const;
+
+function hasMixedDelegationP2pFields(cmd: Record<string, unknown>): boolean {
+  return findMixedAgentDelegationP2pFields(cmd).length > 0;
+}
+
+function hasUnsupportedDelegationFields(cmd: Record<string, unknown>): boolean {
+  return findForbiddenAgentDelegationCommandFields(cmd).length > 0;
+}
+
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
@@ -2755,7 +2868,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     ? cmd.shareScope as SharedP2pRunScope
     : undefined;
 
-  if (!sessionName || !text) {
+  if (!sessionName || typeof text !== 'string') {
     logger.warn('session.send: missing sessionName or text');
     return;
   }
@@ -2812,6 +2925,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const dedup = getDedup(sessionName);
   if (dedup.has(effectiveId)) {
     if ((cmd as any).__bridgeRetry === true) {
+      if (replayDelegationTerminalAckIfPresent(serverLink, sessionName, effectiveId)) return;
       // The bridge only retries session.send when it never saw our ack — so the
       // original receipt ack was lost in transit. RE-EMIT it (reliably) plus the
       // current queue snapshot instead of silently ignoring; otherwise the web's
@@ -2864,6 +2978,65 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
   };
+
+  const emitDelegationError = (error: AgentDelegationErrorCode | 'delegation_dispatch_failed', detail?: string, targetSession?: string): void => {
+    const errorText = detail ? `${error}: ${detail}` : error;
+    emitDelegationTerminalAck(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: 'error',
+      error: errorText,
+      delegated: true,
+      ...(targetSession ? { targetSession } : {}),
+    });
+  };
+
+  if (Object.prototype.hasOwnProperty.call(cmd, AGENT_DELEGATION_TARGET_FIELD)) {
+    if (wantsStructuredP2pRouting || wantsLegacyP2pRouting || hasMixedDelegationP2pFields(cmd) || hasLegacyP2pControlToken(text)) {
+      emitDelegationError(AGENT_DELEGATION_ERROR_CODES.MIXED_DELEGATION_P2P_FIELDS);
+      return;
+    }
+    if (hasUnsupportedDelegationFields(cmd) || isDelegationUnsupportedControlText(trimmedText)) {
+      emitDelegationError(AGENT_DELEGATION_ERROR_CODES.DELEGATION_UNSUPPORTED_INPUT);
+      return;
+    }
+    const parsedTarget = parseAgentDelegationTargetPayload(cmd[AGENT_DELEGATION_TARGET_FIELD]);
+    if (!parsedTarget.ok) {
+      emitDelegationError(parsedTarget.error);
+      return;
+    }
+    if (trimmedText.length === 0) {
+      emitDelegationError(AGENT_DELEGATION_ERROR_CODES.DELEGATION_EMPTY_TASK);
+      return;
+    }
+    const result = await dispatchDelegatedSessionSend({
+      caller: {
+        userId: 'web',
+        sessionName,
+        projectName: getSession(sessionName)?.projectName ?? null,
+        projectRoot: getSession(sessionName)?.projectDir ?? null,
+      },
+      targetSession: parsedTarget.payload.session,
+      message: trimmedText,
+    }, {
+      listSessions,
+      getSession,
+      readTimeline: (originSessionName: string, limit: number) => timelineStore.read(originSessionName, { limit }),
+    });
+    if (result.status === 'error') {
+      emitDelegationError(result.error, result.detail, parsedTarget.payload.session);
+      return;
+    }
+    emitDelegationTerminalAck(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: isLegacy ? 'accepted_legacy' : 'accepted',
+      delegated: true,
+      targetSession: result.target,
+      delegationContextStatus: result.contextStatus,
+    });
+    return;
+  }
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
   }

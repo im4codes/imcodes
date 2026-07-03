@@ -72,6 +72,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, readFileSync
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
+import { buildAgentDelegationReplyInstruction } from '../shared/agent-delegation.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
 import { resolveLiveHookPort } from './daemon/hook-port.js';
 import {
@@ -729,7 +730,7 @@ program
             console.error('Error: --reply requires a managed sender session. Set IMCODES_SESSION to the session that should receive the reply, or omit --reply.');
             process.exit(1);
           }
-          message += `\n\nAfter completing the above task, send your response using: imcodes send --no-reply "${detectedFrom}" "Task: <brief summary of the request>\nResult: <your response>"`;
+          message += `\n\n${buildAgentDelegationReplyInstruction(detectedFrom)}`;
         }
 
         if (opts.all) {

@@ -2472,5 +2472,30 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "접기",
     "expand": "펼치기"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "에이전트",
+      "delegate_to_agent": "한 에이전트에게 작업 위임"
+    },
+    "chip_label": "{{target}}에게 위임",
+    "chip_title": "위임 대상: {{target}}",
+    "warning_empty_task": "에이전트에게 위임하기 전에 작업을 입력하세요.",
+    "warning_attachments": "위임은 아직 첨부 파일을 지원하지 않습니다. 첨부를 제거하고 작업을 텍스트로 설명하세요.",
+    "warning_quotes": "위임은 아직 채팅 인용을 지원하지 않습니다. 인용을 제거하고 필요한 맥락을 작업에 포함하세요.",
+    "warning_file_refs": "위임은 아직 @ 파일 참조를 지원하지 않습니다. 관련 경로나 맥락을 작업에 붙여넣으세요.",
+    "warning_p2p_tokens": "위임은 Team/P2P 컨트롤과 별개입니다. @@ 토큰을 제거하거나 Team 모드로 돌아가세요.",
+    "warning_control_command": "위임에서는 세션 제어 명령을 실행할 수 없습니다. /stop, /model, /thinking, /effort를 제거하고 작업을 설명하세요.",
+    "error": {
+      "mixed_delegation_p2p_fields": "위임은 Team/P2P 제어와 함께 사용할 수 없습니다.",
+      "invalid_delegation_target": "올바른 에이전트 위임 대상을 선택하세요.",
+      "delegation_self_target": "현재 세션에는 작업을 위임할 수 없습니다.",
+      "delegation_target_unavailable": "해당 에이전트를 사용할 수 없습니다. 다른 대상을 선택하세요.",
+      "delegation_target_forbidden": "해당 에이전트는 이 프로젝트 밖에 있거나 허용되지 않습니다.",
+      "delegation_target_not_reply_capable": "해당 대상은 위임된 작업에 답장할 수 없습니다.",
+      "delegation_empty_task": "에이전트에 위임하기 전에 작업을 입력하세요.",
+      "delegation_unsupported_input": "위임은 아직 이 입력을 지원하지 않습니다.",
+      "delegation_dispatch_failed": "작업을 보내기 전에 위임이 실패했습니다."
+    }
   }
 }
