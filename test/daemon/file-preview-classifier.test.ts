@@ -63,6 +63,24 @@ describe('file preview classifier', () => {
     });
   });
 
+  it('classifies audio previews as stream mode', () => {
+    expect(classifyPreviewByPath('/repo/voice.MP3', 10)).toMatchObject({
+      previewType: 'audio',
+      previewKind: 'audio',
+      extension: 'mp3',
+      size: 10,
+      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      mimeType: 'audio/mpeg',
+      previewMode: 'stream',
+    });
+    expect(classifyPreviewByPath('/repo/clip.wav', 10).mimeType).toBe('audio/wav');
+    expect(classifyPreviewByPath('/repo/song.flac', 10).previewType).toBe('audio');
+    expect(classifyPreviewByPath('/repo/note.ogg', 10)).toMatchObject({
+      previewType: 'audio',
+      mimeType: 'audio/ogg',
+    });
+  });
+
   it('classifies too-large files before inline preview type', () => {
     expect(classifyPreviewByPath('/repo/huge.png', FS_READ_SIZE_LIMIT + 1)).toMatchObject({
       previewType: 'too_large',
@@ -90,6 +108,7 @@ describe('file preview classifier', () => {
   it('looks up MIME types and extensions consistently', () => {
     expect(getFileExtension('/repo/archive.TS')).toBe('ts');
     expect(lookupPreviewMimeByExtension('.webm')).toBe('video/webm');
+    expect(lookupPreviewMimeByExtension('.mp3')).toBe('audio/mpeg');
     expect(lookupPreviewMimeType('/repo/image.jpeg')).toBe('image/jpeg');
   });
 

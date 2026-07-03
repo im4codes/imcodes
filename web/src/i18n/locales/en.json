@@ -718,6 +718,7 @@
     "preview_error": "Preview unavailable",
     "preview_binary": "Binary file — preview unavailable",
     "preview_video_unsupported": "Your browser cannot play this video format.",
+    "preview_audio_unsupported": "Your browser cannot play this audio format.",
     "mkdir_failed": "Failed to create folder",
     "create_file_failed": "Failed to create file",
     "file_exists": "File already exists",

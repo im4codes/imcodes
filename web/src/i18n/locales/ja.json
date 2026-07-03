@@ -718,6 +718,7 @@
     "preview_error": "プレビュー不可",
     "preview_binary": "バイナリファイル — プレビュー不可",
     "preview_video_unsupported": "お使いのブラウザはこの動画形式を再生できません。",
+    "preview_audio_unsupported": "お使いのブラウザはこの音声形式を再生できません。",
     "mkdir_failed": "フォルダを作成できませんでした",
     "create_file_failed": "ファイルを作成できませんでした",
     "file_exists": "ファイルはすでに存在します",

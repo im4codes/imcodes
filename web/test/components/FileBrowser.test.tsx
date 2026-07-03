@@ -1157,6 +1157,32 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-diff-toggle')).not.toBeNull();
   });
 
+  it('renders streamed audio previews with browser audio controls', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(<FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+      autoPreviewPath="/home/user/voice.mp3" serverId="srv-1" onConfirm={vi.fn()} />);
+
+    await act(async () => { respond([{ name: 'voice.mp3', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.read_response',
+        requestId: 'mock-read-id',
+        path: '/home/user/voice.mp3',
+        status: 'ok',
+        previewMode: 'stream',
+        mimeType: 'audio/mpeg',
+        downloadId: 'audio-handle',
+        size: 1024,
+      });
+    });
+
+    const audio = document.querySelector('.fb-preview-audio audio') as HTMLAudioElement | null;
+    expect(audio).not.toBeNull();
+    expect(audio?.getAttribute('controls')).not.toBeNull();
+    expect(audio?.getAttribute('src')).toContain('/api/server/srv-1/uploads/audio-handle/download');
+    expect(document.querySelector('.fb-preview-audio-name')?.textContent).toBe('voice.mp3');
+  });
+
   it('defaults to diff mode when opening a file from the Changes tab', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     render(

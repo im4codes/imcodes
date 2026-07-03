@@ -718,6 +718,7 @@
     "preview_error": "Vista previa no disponible",
     "preview_binary": "Archivo binario — vista previa no disponible",
     "preview_video_unsupported": "Tu navegador no puede reproducir este formato de vídeo.",
+    "preview_audio_unsupported": "Tu navegador no puede reproducir este formato de audio.",
     "mkdir_failed": "No se pudo crear la carpeta",
     "create_file_failed": "No se pudo crear el archivo",
     "file_exists": "El archivo ya existe",

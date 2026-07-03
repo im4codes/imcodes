@@ -718,6 +718,7 @@
     "preview_error": "预览不可用",
     "preview_binary": "二进制文件 — 无法预览",
     "preview_video_unsupported": "您的浏览器不支持此视频格式。",
+    "preview_audio_unsupported": "你的浏览器无法播放此音频格式。",
     "mkdir_failed": "创建文件夹失败",
     "create_file_failed": "创建文件失败",
     "file_exists": "文件已存在",

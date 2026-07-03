@@ -718,6 +718,7 @@
     "preview_error": "預覽不可用",
     "preview_binary": "二進位檔案 — 無法預覽",
     "preview_video_unsupported": "您的瀏覽器不支援此影片格式。",
+    "preview_audio_unsupported": "你的瀏覽器無法播放此音訊格式。",
     "mkdir_failed": "建立資料夾失敗",
     "create_file_failed": "建立檔案失敗",
     "file_exists": "檔案已存在",

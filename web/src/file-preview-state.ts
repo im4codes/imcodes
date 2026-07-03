@@ -55,6 +55,12 @@ export function filePreviewStatesEqual(a: FileBrowserPreviewState, b: FileBrowse
         && a.streamUrl === b.streamUrl
         && a.mimeType === b.mimeType
         && a.downloadId === b.downloadId;
+    case 'audio':
+      return b.status === 'audio'
+        && a.path === b.path
+        && a.streamUrl === b.streamUrl
+        && a.mimeType === b.mimeType
+        && a.downloadId === b.downloadId;
     case 'error':
       return b.status === 'error'
         && a.path === b.path

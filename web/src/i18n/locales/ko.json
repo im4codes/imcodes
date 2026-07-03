@@ -718,6 +718,7 @@
     "preview_error": "미리보기 불가",
     "preview_binary": "바이너리 파일 — 미리보기 불가",
     "preview_video_unsupported": "브라우저가 이 동영상 형식을 재생할 수 없습니다.",
+    "preview_audio_unsupported": "브라우저에서 이 오디오 형식을 재생할 수 없습니다.",
     "mkdir_failed": "폴더를 만들 수 없습니다",
     "create_file_failed": "파일을 만들 수 없습니다",
     "file_exists": "파일이 이미 있습니다",

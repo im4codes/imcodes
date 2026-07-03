@@ -34,7 +34,11 @@ export function assemblePreflightTerminal(args: {
   preflight: PreviewReadPreflightSuccess;
 }): PreviewReadPublicTerminal | null {
   const { preflight, requestId, rawPath } = args;
-  if (preflight.classification.previewKind !== 'too_large' && preflight.classification.previewKind !== 'video') {
+  if (
+    preflight.classification.previewKind !== 'too_large'
+    && preflight.classification.previewKind !== 'video'
+    && preflight.classification.previewKind !== 'audio'
+  ) {
     return null;
   }
   const downloadId = createHandle(
