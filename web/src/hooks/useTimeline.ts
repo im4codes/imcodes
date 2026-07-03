@@ -3376,9 +3376,6 @@ export function useTimeline(
         if (hasStructuredOlderPage(msg) && forwardOlderCursor) {
           olderCursorRef.current = forwardOlderCursor;
           setHasOlderHistory(true);
-        } else if (msg.hasMore === false) {
-          olderCursorRef.current = null;
-          setHasOlderHistory(false);
         }
 
         epochRef.current = msg.epoch;
