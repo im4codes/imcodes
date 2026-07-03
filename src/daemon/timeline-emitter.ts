@@ -93,28 +93,24 @@ export class TimelineEmitter {
     // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
     // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
     //
-    // NF1 fix (audit f395d49c-78c) — the previous predicate compared ONLY the
-    // `state` string. That meant a sequence of `session.state {state:'queued',
-    // pendingCount:1}`, `{state:'queued', pendingCount:2}`,
-    // `{state:'queued', pendingCount:3}` would broadcast only the first event:
-    // subsequent ones share the same state string but carry NEW
-    // pendingCount / pendingMessages / pendingMessageEntries values that the
-    // UI relies on. This produced bug 3 ("queue not empty yet new messages
-    // directly enter chat history") — daemon was queueing, but the UI's
-    // authoritative queue snapshot stayed stale, so web optimistic bubbles
-    // were the only visible path for messages 2+.
-    //
-    // Fix: when payload carries a mutating snapshot (queued state, any
-    // pending* field, or an error), always broadcast. Pure idle/running
-    // events with no payload variation keep the original dedup behaviour.
+    // Structured queue authority fields bypass state-only dedupe. Legacy
+    // diagnostic fields such as pendingCount/pendingMessages must not trigger
+    // queue mutation delivery.
     if (type === 'session.state') {
       const state = String(payload.state ?? '');
-      const hasPendingMutation = state === 'queued'
-        || typeof payload.pendingCount === 'number'
-        || Array.isArray(payload.pendingMessages)
-        || Array.isArray(payload.pendingMessageEntries)
+      const hasQueueMutation = Array.isArray(payload.pendingMessageEntries)
+        || Array.isArray(payload.transportPendingMessageEntries)
+        || Array.isArray(payload.failedMessageEntries)
+        || typeof payload.queueEpoch === 'string'
+        || typeof payload.queueAuthorityId === 'string'
+        || typeof payload.pendingMessageVersion === 'number'
+        || typeof payload.transportPendingMessageVersion === 'number'
+        || typeof payload.resetReason === 'string'
+        || typeof payload.dropReason === 'string'
+        || typeof payload.degradedReason === 'string'
+        || typeof payload.queueError === 'string'
         || 'error' in payload;
-      if (!hasPendingMutation && this.lastSessionState.get(sessionId) === state) {
+      if (!hasQueueMutation && this.lastSessionState.get(sessionId) === state) {
         // State unchanged AND no queue/error snapshot — don't emit to
         // handlers/UI, but still return synthetic event for caller.
         finishTrace('synthetic');

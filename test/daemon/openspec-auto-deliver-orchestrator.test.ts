@@ -76,6 +76,7 @@ import {
 import { clearAllResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
 let projectDir: string;
 let extraTempDirs: string[];
@@ -702,7 +703,15 @@ exec "${realGit}" "$@"
       pendingVersion: 0,
       send: vi.fn((text: string, commandId?: string) => {
         const clientMessageId = commandId ?? `queued-${queuedRuntime.pendingVersion + 1}`;
+        const committed = getTransportQueueStore().enqueue({
+          sessionName: 'deck_demo_brain',
+          clientMessageId,
+          commandId: clientMessageId,
+          text,
+          now: Date.now(),
+        });
         queuedRuntime.pendingVersion += 1;
+        queuedRuntime.pendingVersion = Math.max(queuedRuntime.pendingVersion, committed.pendingMessageVersion);
         queuedRuntime.pendingEntries = [{ clientMessageId, text }];
         return 'queued' as const;
       }),
@@ -736,13 +745,23 @@ exec "${realGit}" "$@"
           || (payload as Record<string, unknown>).clientMessageId === commandId
         )
       )).toBe(false);
-      expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
+      const queuedStateCall = timelineSpy.mock.calls.find(([session, type, payload]) =>
         session === 'deck_demo_brain'
         && type === 'session.state'
         && (payload as Record<string, unknown>).state === 'queued'
         && typeof (payload as Record<string, unknown>).pendingMessageVersion === 'number'
         && Array.isArray((payload as Record<string, unknown>).pendingMessageEntries)
-      )).toBe(true);
+      );
+      expect(queuedStateCall).toBeTruthy();
+      const queuedPayload = queuedStateCall?.[2] as Record<string, unknown>;
+      expect(queuedPayload.pendingMessageEntries).toEqual([
+        expect.objectContaining({ clientMessageId: commandId }),
+      ]);
+      expect(queuedPayload.pendingMessageVersion).toBe(
+        getTransportQueueStore().readSnapshot('deck_demo_brain').pendingMessageVersion,
+      );
+      expect(queuedPayload.pendingMessages).toBeUndefined();
+      expect(queuedPayload.pendingCount).toBeUndefined();
 
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
       await new Promise((resolve) => setTimeout(resolve, 60));

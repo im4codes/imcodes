@@ -32,8 +32,9 @@ import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type Memo
 import { emitSessionInlineError } from './session-error.js';
 import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
-import { buildTransportPendingQueueSnapshot } from './transport-pending-snapshot.js';
+import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
 import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
 import {
   startSubSession,
   stopSubSession,
@@ -43,7 +44,7 @@ import {
   subSessionName,
   type SubSessionRecord,
 } from './subsession-manager.js';
-import { sendSubSessionSync, type SubSessionSyncOptions } from './subsession-sync.js';
+import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -812,16 +813,18 @@ async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLin
   try { await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(sessionName)); } catch { /* ignore */ }
 }
 
-function getSubSessionSyncOptions(sessionName: string): SubSessionSyncOptions | undefined {
-  const runtime = getTransportRuntime(sessionName);
-  const pendingQueue = buildTransportPendingQueueSnapshot(sessionName, runtime);
-  if (pendingQueue.source === 'empty') return undefined;
+function getSubSessionSyncOptions(_sessionName: string): undefined {
+  return undefined;
+}
+
+function buildTransportQueueSessionStatePayload(
+  sessionName: string,
+  state: string,
+  source = 'command_handler',
+): Record<string, unknown> {
   return {
-    transportQueue: {
-      pendingMessages: pendingQueue.pendingMessages,
-      pendingEntries: pendingQueue.pendingEntries,
-      ...(typeof pendingQueue.pendingVersion === 'number' ? { pendingVersion: pendingQueue.pendingVersion } : {}),
-    },
+    state,
+    ...buildTransportQueueSnapshotPayload(sessionName, source),
   };
 }
 
@@ -2092,17 +2095,15 @@ function resolveSessionCommandName(cmd: Record<string, unknown>): string | undef
 }
 
 function markTransportCancelIdle(sessionName: string, error?: string): void {
-  const runtime = getTransportRuntime(sessionName);
-  timelineEmitter.emit(sessionName, 'session.state', {
-    state: 'idle',
-    pendingCount: runtime?.pendingCount ?? 0,
-    pendingMessages: runtime?.pendingMessages ?? [],
-    pendingMessageEntries: runtime?.pendingEntries ?? [],
-    pendingMessageVersion: runtime
-      ? observeTransportQueueRevision(sessionName, runtime.pendingVersion)
-      : (getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined)),
-    ...(error ? { error } : {}),
-  }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(
+    sessionName,
+    'session.state',
+    {
+      ...buildTransportQueueSessionStatePayload(sessionName, 'idle', 'command_handler_cancel_idle'),
+      ...(error ? { error } : {}),
+    },
+    { source: 'daemon', confidence: 'high' },
+  );
 }
 
 function emitSessionControlTimelineFeedback(sessionName: string, controlId: 'stop'): void {
@@ -2126,7 +2127,7 @@ function cancelTransportTurnNow(
     || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
   if (!isTransportStop) return false;
 
-  clearResend(sessionName);
+  clearResend(sessionName, 'user_stopped');
   if (commandId) emitCommandAck(sessionName, commandId, 'accepted', undefined, serverLink);
   emitSessionControlTimelineFeedback(sessionName, 'stop');
   // Reflect idle PROMPTLY so the "working" spinner clears on STOP even when the
@@ -2742,6 +2743,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
+  const inboundClientMessageId = typeof cmd.clientMessageId === 'string' && cmd.clientMessageId.trim()
+    ? cmd.clientMessageId.trim()
+    : undefined;
   const directTargetSession = (cmd as any).directTargetSession as string | undefined;
   const directTargetMode = ((cmd as any).directTargetMode as string | undefined) ?? 'discuss';
   const sharedActor = cmd.sharedActor && typeof cmd.sharedActor === 'object'
@@ -2818,13 +2822,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       emitAcceptedReceiptAck();
       const retryRuntime = getTransportRuntime(sessionName);
       if (retryRuntime && retryRuntime.pendingCount > 0) {
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'queued',
-          pendingCount: retryRuntime.pendingCount,
-          pendingMessages: retryRuntime.pendingMessages,
-          pendingMessageEntries: retryRuntime.pendingEntries,
-          pendingMessageVersion: observeTransportQueueRevision(sessionName, retryRuntime.pendingVersion),
-        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_bridge_retry'),
+          { source: 'daemon', confidence: 'high' },
+        );
       }
       return;
     }
@@ -3340,8 +3343,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
+      ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       queuedAt: Date.now(),
     });
+    if (!enqueueResult.accepted) {
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'error', error: 'transport_queue_unavailable' }, { source: 'daemon', confidence: 'high' });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: 'transport_queue_unavailable' });
+      return;
+    }
     // N-R3 fix (audit 0419d1ac-1f4) — surface a user-visible warning when
     // the resend queue overflow drops the oldest entry. Previously the
     // drop only logged at warn-level on the daemon, and the dropped
@@ -3375,17 +3384,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'session.state',
-      {
-        state: 'queued',
-        pendingCount: queued.length,
-        pendingMessages: queued.map((e) => e.text),
-        pendingMessageEntries: queued.map((e) => ({
-          clientMessageId: e.commandId,
-          text: e.text,
-          ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
-        })),
-        pendingMessageVersion: enqueueResult.pendingVersion,
-      },
+      buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_missing_runtime'),
       { source: 'daemon', confidence: 'high' },
     );
     emitAcceptedReceiptAck();
@@ -3430,8 +3429,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
+      ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       queuedAt: Date.now(),
     });
+    if (!enqueueResultMissingSid.accepted) {
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'error', error: 'transport_queue_unavailable' }, { source: 'daemon', confidence: 'high' });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: 'transport_queue_unavailable' });
+      return;
+    }
     // N-R3 fix (audit 0419d1ac-1f4) — surface droppedOldest the same way as
     // the no-runtime branch above.
     if (enqueueResultMissingSid.droppedOldest) {
@@ -3460,17 +3465,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'session.state',
-      {
-        state: 'queued',
-        pendingCount: queued.length,
-        pendingMessages: queued.map((e) => e.text),
-        pendingMessageEntries: queued.map((e) => ({
-          clientMessageId: e.commandId,
-          text: e.text,
-          ...(e.sharedActor ? { sharedActor: e.sharedActor } : {}),
-        })),
-        pendingMessageVersion: enqueueResultMissingSid.pendingVersion,
-      },
+      buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_provider_recovery'),
       { source: 'daemon', confidence: 'high' },
     );
     emitAcceptedReceiptAck();
@@ -3795,13 +3790,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
       }
       if (result === 'queued') {
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'queued',
-          pendingCount: transportRuntime.pendingCount,
-          pendingMessages: transportRuntime.pendingMessages,
-          pendingMessageEntries: transportRuntime.pendingEntries,
-          pendingMessageVersion: observeTransportQueueRevision(sessionName, transportRuntime.pendingVersion),
-        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_runtime_send'),
+          { source: 'daemon', confidence: 'high' },
+        );
       }
       // Clear fresh-start flag — the new conversation is now active
       if (record?.qwenFreshOnResume) {
@@ -4061,11 +4055,11 @@ async function resolveProcessRecallQueryContext(
 async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
   const clientMessageId = typeof cmd.clientMessageId === 'string' ? cmd.clientMessageId.trim() : '';
-  const text = typeof cmd.text === 'string' ? cmd.text.trim() : '';
+  const text = typeof cmd.text === 'string' ? cmd.text : '';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
     ? cmd.commandId.trim()
     : `edit-queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  if (!sessionName || !clientMessageId || !text) return;
+  if (!sessionName || !clientMessageId || text.length === 0) return;
   const runtime = getTransportRuntime(sessionName);
   const record = getSession(sessionName);
   if (!runtime || record?.runtimeType !== 'transport') {
@@ -4082,12 +4076,15 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       return;
     }
     supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
+    let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'edit_queued_message_before');
+    try {
+      queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text);
+    } catch (err) {
+      logger.warn({ err, sessionName, clientMessageId }, 'transport queue sqlite edit failed for queued message');
+    }
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.sending ? 'queued' : 'idle',
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+      ...transportQueueSnapshotToPayload(queueSnapshot),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -4113,18 +4110,32 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   const release = await getMutex(sessionName).acquire();
   try {
     const removed = runtime.removePendingMessage(clientMessageId);
-    if (!removed) {
+    // The SQLite queue authority — not the runtime's in-memory queue — is what
+    // keeps the UI queued bubble alive. After a daemon restart the row can still
+    // exist in SQLite while the runtime's _pendingMessages is empty (not yet
+    // rehydrated), so removePendingMessage no-ops. The old `!removed`
+    // early-return then skipped the store drop entirely and the bubble became
+    // undeletable ("daemon queue is empty but the frontend can't delete it").
+    // Treat the entry as deletable whenever it is a live `queued` row in the
+    // store, independent of runtime membership; `drop` itself is idempotent.
+    let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
+    const queuedInStore = queueSnapshot.pendingMessageEntries.some(
+      (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
+    );
+    if (!removed && !queuedInStore) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
       emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
+    try {
+      queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
+    } catch (err) {
+      logger.warn({ err, sessionName, clientMessageId }, 'transport queue sqlite drop failed for undo queued message');
+    }
     timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.sending ? 'queued' : 'idle',
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
+      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+      ...transportQueueSnapshotToPayload(queueSnapshot),
     }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
@@ -5499,13 +5510,12 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
         if (result === 'sent') {
           emitTransportUserMessageEvent(sessionName, answer);
         } else {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'queued',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_ask_answer'),
+            { source: 'daemon', confidence: 'high' },
+          );
         }
       } else {
         // Timed out / already self-continued and no live runtime snapshot is
@@ -10340,6 +10350,11 @@ function memoryMcpToolFamilyGate(): MemoryMcpToolFamilyGateView {
     MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
     MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
     MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+    MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+    MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY,
+    MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY,
+    MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY,
+    MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
     MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
     MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
   ];

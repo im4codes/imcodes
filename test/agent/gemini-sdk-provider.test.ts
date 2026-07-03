@@ -46,6 +46,7 @@ describe('GeminiSdkProvider runtime subagent status', () => {
           name: 'researcher',
           status: 'running',
           prompt: 'Check the Gemini handoff',
+          is_backgrounded: true,
         },
       },
     });
@@ -71,6 +72,7 @@ describe('GeminiSdkProvider runtime subagent status', () => {
           agentPath: '019e-gemini-agent',
           agentName: 'researcher',
           model: 'gemini-2.5-pro',
+          backgrounded: true,
         },
       },
     });

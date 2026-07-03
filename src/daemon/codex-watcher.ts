@@ -14,6 +14,7 @@ import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
 import logger from '../util/logger.js';
 import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
 import { updateSessionState } from '../store/session-store.js';
+import { getCodexHome, codexSessionDir, recentCodexSessionDirs, findCodexRolloutPathByUuid, extractCodexRolloutUuid } from '../util/codex-rollout-path.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
@@ -67,21 +68,10 @@ async function getCodexVersion(): Promise<string> {
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
 
-function codexSessionDir(d: Date): string {
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  return join(homedir(), '.codex', 'sessions', String(yyyy), mm, dd);
-}
-
-function recentSessionDirs(): string[] {
-  const dirs: string[] = [];
-  for (let i = 0; i < 30; i++) {
-    const d = new Date(Date.now() - i * 86_400_000);
-    dirs.push(codexSessionDir(d));
-  }
-  return dirs;
-}
+// codexSessionDir / recentCodexSessionDirs / findCodexRolloutPathByUuid /
+// extractCodexRolloutUuid live in ../util/codex-rollout-path.ts (shared with the
+// codex-sdk transport). This file uses recentCodexSessionDirs() only for
+// discovering FRESH files by mtime/cwd; id lookups go through the shared finder.
 
 // ── JSONL matching ─────────────────────────────────────────────────────────────
 
@@ -146,7 +136,7 @@ async function findLatestRollout(
 async function findLatestMatchingRollout(sessionName: string, projectDir: string, currentUuid: string | null, currentPath: string | null): Promise<string | null> {
   let latestPath: string | null = null;
   let latestMtime = -1;
-  for (const dir of recentSessionDirs()) {
+  for (const dir of recentCodexSessionDirs()) {
     const found = await findLatestRollout(dir, projectDir, false, sessionName, currentUuid);
     if (!found || found === currentPath) continue;
     try {
@@ -406,8 +396,7 @@ export function isFileClaimedByOther(sessionName: string, filePath: string): boo
 }
 
 export function extractUuidFromPath(p: string): string | null {
-  const m = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/.exec(p);
-  return m ? m[1] : null;
+  return extractCodexRolloutUuid(p);
 }
 
 /**
@@ -417,7 +406,7 @@ export function extractUuidFromPath(p: string): string | null {
 export async function extractNewRolloutUuid(workDir: string, launchTime: number, timeoutMs = 5000): Promise<string | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       let entries: string[];
       try { entries = await readdir(dir); } catch { continue; }
       for (const name of entries) {
@@ -439,15 +428,11 @@ export async function extractNewRolloutUuid(workDir: string, launchTime: number,
   return null;
 }
 
-/** Search recent session dirs for the rollout file containing the given UUID. */
-export async function findRolloutPathByUuid(uuid: string): Promise<string | null> {
-  for (const dir of recentSessionDirs()) {
-    let entries: string[];
-    try { entries = await readdir(dir); } catch { continue; }
-    const match = entries.find(e => e.includes(uuid) && e.endsWith('.jsonl'));
-    if (match) return join(dir, match);
-  }
-  return null;
+/** Locate the rollout file for a codex thread uuid (any age). Delegates to the
+ *  shared window/timezone-robust resolver so the CLI watcher and the codex-sdk
+ *  transport share one correct implementation. */
+export function findRolloutPathByUuid(uuid: string): Promise<string | null> {
+  return findCodexRolloutPathByUuid(uuid);
 }
 
 /**
@@ -460,7 +445,7 @@ export async function ensureSessionFile(uuid: string, cwd: string, sessionName?:
   if (existing) return existing;
 
   const now = new Date();
-  const dir = codexSessionDir(now);
+  const dir = codexSessionDir(getCodexHome(), now);
   await mkdir(dir, { recursive: true });
 
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -529,9 +514,9 @@ export async function startWatching(sessionName: string, workDir: string, model?
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
   startPoll(sessionName, state);
-  void watchDir(sessionName, state, state.workDir || codexSessionDir(new Date()));
+  void watchDir(sessionName, state, state.workDir || codexSessionDir(getCodexHome(), new Date()));
   void (async () => {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       if (state.stopped) return;
       const found = await findLatestRollout(dir, workDir);
       if (!found || state.stopped) continue;
@@ -590,7 +575,7 @@ export async function startWatchingById(sessionName: string, uuid: string, model
   // Helper: one pass over the recent-session dirs looking for a file whose
   // name contains the target uuid. Returns true when activation succeeds.
   const tryActivate = async (): Promise<boolean> => {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       try {
         const entries = await readdir(dir);
         const match = entries.find((e) => e.includes(uuid));
@@ -739,7 +724,7 @@ async function refreshTrackedSessionInner(sessionName: string, state: WatcherSta
     claimedFiles.set(latestPath, sessionName);
     void watchDir(sessionName, state, state.workDir);
   } else if (uuid) {
-    for (const dir of recentSessionDirs()) {
+    for (const dir of recentCodexSessionDirs()) {
       if (dir === state.workDir) continue;
       try {
         const entries = await readdir(dir);

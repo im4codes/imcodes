@@ -3,8 +3,8 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate } from './transport-provider.js';
-import { PROVIDER_ERROR_CODES } from './transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -16,10 +16,18 @@ import {
 } from '../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import {
+  buildCodexLifecycleTerminalMetadata,
   evaluateProviderSnapshot,
+  isProviderSnapshotNonBlockingForStoppedGeneration,
+  normalizeActivityGeneration,
+  readSdkTurnLostRecoveryMetadata,
+  sameActivityGeneration,
+  SDK_TURN_LOST_RECOVERY_REASON,
+  type ProviderSnapshotEvaluation,
   type ActivityDrainMetadata,
   type ActivityGeneration,
   type ProviderActiveWorkSnapshot,
+  type SdkTurnLostRecoveryMetadata,
   type SessionActivityBusyReason,
   type ToolTerminalReason,
   type ToolTerminalStatus,
@@ -39,7 +47,11 @@ import type {
 } from '../../shared/context-types.js';
 import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem } from '../shared/timeline/types.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
+import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import {
+  isBackgroundedSdkSubagentTool,
+} from '../../shared/sdk-subagent-status.js';
 import { type MemorySearchResultItem } from '../context/memory-search.js';
 import { searchLocalMemorySemanticFrontOfTurn } from '../context/memory-recall-client.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
@@ -58,6 +70,7 @@ import { buildTransportStartupMemory, type TransportContextBootstrap } from './r
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -74,8 +87,28 @@ export interface PendingTransportMessage {
   historyCommitted?: boolean;
 }
 
+type SdkTurnLostRecoveryAttemptStatus =
+  | 'detected'
+  | 'recovering'
+  | 'awaiting_replacement_activity'
+  | 'recovered'
+  | 'failed';
+
+interface SdkTurnLostRecoveryAttemptState {
+  metadata: SdkTurnLostRecoveryMetadata;
+  correlationId: string;
+  replayEntryIds: string[];
+  sourceGeneration: ActivityGeneration;
+  status: SdkTurnLostRecoveryAttemptStatus;
+  expectedReplacementDispatchId?: number;
+  expectedReplacementGeneration?: ActivityGeneration;
+  providerAccepted: boolean;
+}
+
 function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMessage {
-  const { timelineCommitted: _timelineCommitted, historyCommitted: _historyCommitted, ...publicEntry } = entry;
+  const publicEntry: PendingTransportMessage = { ...entry };
+  delete publicEntry.timelineCommitted;
+  delete publicEntry.historyCommitted;
   return publicEntry;
 }
 
@@ -147,6 +180,8 @@ const MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES = 3;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
+const MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS = 2;
+const LOCALLY_CANCELLED_ACTIVITY_GENERATION_LIMIT = 16;
 // A turn with a RUNNING TOOL can be legitimately silent for minutes — a command
 // that sleeps / polls / builds (e.g. a 180s `tcpdump` wait, a long test/build)
 // emits no provider events while it runs. The phantom-turn recovery must NOT
@@ -366,6 +401,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchId: number | null = null;
   private _activeDispatchStaleRecoveryStarted = false;
   private _stalePendingCancelFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private _ignoreProviderSnapshotForNextLocalStopDrain = false;
   // Consecutive recoverable dispatch-failure count for the current run of
   // retries; reset to 0 on any provider activity / successful send.
   private _recoverableDispatchRetries = 0;
@@ -382,9 +418,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
   private readonly _locallyCancelledDispatchIds = new Set<number>();
+  private readonly _locallyCancelledActivityGenerations = new Set<string>();
+  private _currentActivityGenerationLocallyCancelled = false;
+  private _activeDispatchHasSideEffectEvidence = false;
+  private readonly _sdkTurnLostRecoveryAttempts = new Map<string, number>();
+  private readonly _sdkTurnLostRecoveryPhaseKeys = new Set<string>();
+  private _sdkTurnLostRecoveryAttempt: SdkTurnLostRecoveryAttemptState | null = null;
   private _externalCompletionSettlementsToIgnore = 0;
   private _cancelledProviderErrorsToIgnore = 0;
-  private _ignoreProviderSnapshotForNextLocalStopDrain = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
@@ -409,6 +450,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         this._lastProviderOutputAt = this._lastActivityAt;
+        this._activeDispatchHasSideEffectEvidence = true;
         if (this._activeDispatchCancelled) return;
         // A delta with no active turn is a late/stray callback from an
         // already-settled turn (provider callbacks are not dispatch-id scoped).
@@ -418,6 +460,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // (Reply delivery is governed by onComplete/onError below, which must
         // never silently drop a settlement.)
         if (!this.hasActiveTurnWork()) return;
+        this.markSdkTurnLostRecoveredOnProviderActivity();
         this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
@@ -468,6 +511,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
           return;
         }
+        if (!this._activeDispatchCancelled && this.hasActiveTurnWork()) {
+          this.markSdkTurnLostRecoveredOnProviderActivity();
+        }
         if (isTransportCompactionCompletion(message)) {
           this._lastInjectedPreferenceContextSignature = null;
         }
@@ -480,6 +526,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeDispatchProviderStarted = false;
         this._activeDispatchId = null;
         this._activeDispatchStaleRecoveryStarted = false;
+        // Provider completion is authoritative terminal evidence for the
+        // foreground turn. Some SDKs can deliver the final assistant message
+        // without a matching final tool event for every previously-running
+        // provider tool (or the timeline/display path may observe the tool
+        // terminal while the runtime-local _openTools map misses it). Leaving
+        // those open locally makes the activity reconciler map the subsequent
+        // idle state back to running and blocks pending queue drain. Close any
+        // remaining runtime-local tool evidence before drain/idle reconciliation.
+        this.closeOpenTools('succeeded', 'provider_result');
         // Drain pending messages before transitioning to idle.
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
@@ -518,22 +573,22 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
           // The cancellation belongs to the turn that STOP already settled
           // locally, so do not surface it as a user-visible error. It is still
-          // an authoritative provider terminal signal: if the first local drain
-          // was deferred by a stale provider active-work snapshot, retry the
-          // pending queue now without letting that old snapshot pin the queue
-          // forever. Do not touch state when a newer drained turn is already
-          // active; provider callbacks are session-scoped and cannot identify
-          // the old dispatch.
+          // an authoritative provider terminal signal: retry queued work now
+          // and let the reconciler evaluate the provider snapshot. Only
+          // zero-work stale/unattributed evidence may be ignored; real active
+          // work, snapshot errors, and unavailable snapshots still block.
           if (!this.hasLocalActiveTurnWork() && this._pendingMessages.length > 0) {
             this.clearStalePendingCancelFallbackTimer();
             this._activeDispatchCancelled = false;
             this._activeDispatchProviderStarted = false;
             this._activeDispatchId = null;
             this._activeDispatchStaleRecoveryStarted = false;
-            this._ignoreProviderSnapshotForNextLocalStopDrain = true;
             if (this._drainPending()) return;
             if (this.isInProgressStatus(this._status)) this.setStatus('idle');
           }
+          return;
+        }
+        if (this.handleSdkTurnLostRecovery(error)) {
           return;
         }
         if (!this.hasActiveTurnWork()) {
@@ -630,7 +685,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       if (sid !== this._providerSessionId) return;
       this._lastActivityAt = Date.now();
       this._lastProviderOutputAt = this._lastActivityAt;
+      const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
       this.recordToolActivity(tool);
+      if (!backgroundedSubagent) this._activeDispatchHasSideEffectEvidence = true;
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
       // even if the shared-context dispatcher has not crossed its provider.send
@@ -638,6 +695,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // SDKs can abort/rotate poisoned sessions instead of taking the purely
       // local pre-send skip path.
       this._activeDispatchProviderStarted = true;
+      this.markSdkTurnLostRecoveredOnProviderActivity();
     }) as unknown;
     if (typeof unsubscribeToolCall === 'function') {
       this._unsubscribes.push(unsubscribeToolCall as () => void);
@@ -646,6 +704,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        this._activeDispatchHasSideEffectEvidence = true;
         this._onApprovalRequest?.(req);
       });
     }
@@ -786,6 +845,108 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
+   * Rehydrate the in-memory pending queue from the SQLite queue authority after
+   * a daemon restart / runtime recreation. On a fresh daemon process BOTH
+   * in-memory holders start empty — this runtime's `_pendingMessages` AND the
+   * resend queue — so a message that was `queued` (enqueued behind an in-flight
+   * turn, then the daemon died before it drained) survives ONLY in
+   * `transport-queue.sqlite`. Nothing reads it back, so the daemon reports
+   * `pending 0` while SQLite still holds the `queued` row and the message lingers
+   * forever. This method closes that read-back gap.
+   *
+   * Safety contract — MUST never cause a queued send to dispatch twice:
+   *   - Recovers ONLY `queued` (never-dispatched) rows. `handoff_inflight` rows
+   *     were mid-dispatch when the daemon died and MAY already have executed at
+   *     the provider; re-sending them risks double execution, so they are left to
+   *     a dedicated proof-backed handoff-recovery path (out of scope here).
+   *   - Intended to run AFTER the resend drain, and dedups by `clientMessageId`
+   *     against everything already live (`_pendingMessages`, active dispatch) plus
+   *     delivery tombstones — an id recovered/dispatched by any other path is
+   *     skipped.
+   *   - Preserves store order (front placement + ordinal already applied by
+   *     `readSnapshot`). Does NOT itself dispatch; the caller kicks a drain.
+   * Returns the number of entries recovered into `_pendingMessages`.
+   */
+  rehydratePendingFromStore(): number {
+    if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
+    const store = getTransportQueueStore();
+    const snapshot = (() => {
+      try {
+        return store.readSnapshot(this.sessionKey, 'restart_rehydrate');
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey }, 'rehydratePendingFromStore: readSnapshot failed; skipping recovery');
+        return null;
+      }
+    })();
+    if (!snapshot) return 0;
+    const liveIds = new Set<string>([
+      ...this._pendingMessages.map((entry) => entry.clientMessageId),
+      ...this._activeDispatchEntries.map((entry) => entry.clientMessageId),
+    ]);
+    const recovered: PendingTransportMessage[] = [];
+    for (const projection of snapshot.pendingMessageEntries) {
+      if (projection.status !== 'queued') continue; // only never-dispatched work is re-send-safe
+      const clientMessageId = projection.clientMessageId;
+      if (liveIds.has(clientMessageId)) continue; // already live via resend/runtime — no double
+      try {
+        if (store.hasDeliveryTombstone(this.sessionKey, clientMessageId)) continue; // already delivered
+      } catch { /* treat missing tombstone table as "no tombstone" */ }
+      let entry: PendingTransportMessage | null = null;
+      try {
+        const materialJson = store.readPrivateDispatchMaterial(this.sessionKey, clientMessageId);
+        if (materialJson) {
+          const material = JSON.parse(materialJson) as {
+            text?: unknown;
+            messagePreamble?: unknown;
+            attachmentRefs?: unknown;
+            sharedActorEnvelope?: unknown;
+            timelineCommitted?: unknown;
+            historyCommitted?: unknown;
+          };
+          if (typeof material.text === 'string') {
+            entry = {
+              clientMessageId,
+              text: material.text,
+              ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
+              ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
+              ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
+              ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
+              ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
+            };
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'rehydratePendingFromStore: private material parse failed; falling back to projection text');
+      }
+      if (!entry) {
+        // Private material gone/corrupt. The projection `text` is lossless per the
+        // queue privacy contract, so use it. If even that is empty there is nothing
+        // to dispatch — mark the row failed so it stops lingering as a stuck bubble.
+        if (typeof projection.text === 'string' && projection.text.length > 0) {
+          entry = { clientMessageId, text: projection.text };
+        } else {
+          try { store.markMissingPrivateMaterialFailed(this.sessionKey, clientMessageId); } catch { /* best-effort */ }
+          continue;
+        }
+      }
+      recovered.push(entry);
+      liveIds.add(clientMessageId);
+    }
+    if (recovered.length === 0) return 0;
+    // Append in store order. On a genuine fresh restart the resend drain found an
+    // empty in-memory queue, so `_pendingMessages` is empty here and this is the
+    // exact persisted order; in the rarer reconnect-with-resend case recovered
+    // (older) work simply trails any resend entries — still single-dispatch-safe.
+    this._pendingMessages.push(...recovered);
+    this._pendingVersion++;
+    logger.info(
+      { sessionKey: this.sessionKey, recovered: recovered.length },
+      'rehydratePendingFromStore: recovered queued transport messages from SQLite after restart',
+    );
+    return recovered.length;
+  }
+
+  /**
    * Queue-visible watchdog for the harder split-brain case: the provider/UI
    * has gone quiet, but the runtime never received onComplete/onError, so an
    * active dispatch pins `_sending=true` and queued user messages never drain.
@@ -899,6 +1060,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (activity.blockingWorkCount <= 0) return false;
     const dispatchId = this._activeDispatchId;
     if (dispatchId !== null) this._locallyCancelledDispatchIds.add(dispatchId);
+    this.markCurrentActivityGenerationLocallyCancelled();
     const providerSessionId = this._providerSessionId;
     const providerStarted = this._activeDispatchProviderStarted;
     const providerCanCancel = !!this.provider.cancel && !!providerSessionId;
@@ -1051,22 +1213,87 @@ export class TransportSessionRuntime implements SessionRuntime {
     };
   }
 
+  private markCurrentActivityGenerationLocallyCancelled(): void {
+    if (this._activityGeneration <= 0) return;
+    this._currentActivityGenerationLocallyCancelled = true;
+    const generationKey = normalizeActivityGeneration(this.currentActivityGeneration());
+    if (!generationKey) return;
+    this._locallyCancelledActivityGenerations.add(generationKey);
+    while (this._locallyCancelledActivityGenerations.size > LOCALLY_CANCELLED_ACTIVITY_GENERATION_LIMIT) {
+      const oldest = this._locallyCancelledActivityGenerations.values().next().value;
+      if (!oldest) break;
+      this._locallyCancelledActivityGenerations.delete(oldest);
+    }
+  }
+
+  private hasLocallyCancelledActivityGeneration(providerSnapshot: ProviderActiveWorkSnapshot): boolean {
+    const snapshotGeneration = providerSnapshot.activityGeneration ?? providerSnapshot.generation;
+    const generationKey = normalizeActivityGeneration(snapshotGeneration);
+    return Boolean(generationKey && this._locallyCancelledActivityGenerations.has(generationKey));
+  }
+
+  private hasInFlightDispatchWork(): boolean {
+    return this._sending || !!this._activeTurn || this._activeDispatchEntries.length > 0;
+  }
+
+  private shouldIgnoreZeroWorkProviderSnapshot(
+    providerSnapshot: ProviderActiveWorkSnapshot,
+    evaluationState: ProviderSnapshotEvaluation['state'],
+  ): boolean {
+    if (this.hasLocallyCancelledActivityGeneration(providerSnapshot)
+      && isProviderSnapshotNonBlockingForStoppedGeneration(providerSnapshot, providerSnapshot.activityGeneration ?? providerSnapshot.generation)) {
+      return true;
+    }
+    if (providerSnapshot.activeWorkCount > 0 || providerSnapshot.activeToolCount > 0) return false;
+    const isCurrentOrImplicitStatus = (providerSnapshot.status ?? 'current') === 'current';
+    const isGenerationDriftClear = evaluationState === 'unattributed_clear'
+      || (evaluationState === 'stale' && isCurrentOrImplicitStatus);
+    if (!isGenerationDriftClear && evaluationState !== 'stale') return false;
+    const hasNonSnapshotBusyReasons = providerSnapshot.busyReasons.some((reason) => (
+      reason !== 'snapshot_stale' && reason !== 'snapshot_unavailable'
+    ));
+    if (hasNonSnapshotBusyReasons) return false;
+    // STOP is a local terminal decision for the current dispatch generation;
+    // after STOP, a zero-work stale/unattributed provider snapshot is stale
+    // information, not evidence that should keep queued user messages blocked.
+    if (this._currentActivityGenerationLocallyCancelled && (evaluationState === 'stale' || evaluationState === 'unattributed_clear')) {
+      return true;
+    }
+    // If the runtime has already settled the turn locally and has no in-flight
+    // dispatch records, a clear provider snapshot from an older generation must
+    // not resurrect "working" or prevent the next user message from dispatching.
+    if (!this.hasInFlightDispatchWork() && isGenerationDriftClear) {
+      return true;
+    }
+    // Explicit status:"stale" snapshots still fail closed unless the user
+    // already stopped the generation above.
+    return false;
+  }
+
   private emitSyntheticToolTerminal(
     toolId: string,
     tool: { generation: number; name: string },
     terminalStatus: ToolTerminalStatus,
     terminalReason: ToolTerminalReason,
   ): void {
-    timelineEmitter.emit(this.sessionKey, 'tool.result', {
-      toolCallId: toolId,
-      tool: tool.name,
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: this.sessionKey,
       terminalStatus,
       terminalReason,
       activityGeneration: this.activityGenerationFor(tool.generation),
+      toolCallId: toolId,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: terminalReason,
+    });
+    timelineEmitter.emit(this.sessionKey, 'tool.result', {
+      toolCallId: toolId,
+      tool: tool.name,
+      ...metadata,
     }, {
       source: 'daemon',
       confidence: 'high',
-      eventId: `transport-tool:${this.sessionKey}:${toolId}:${terminalReason}`,
+      eventId: metadata.idempotencyKey,
     });
   }
 
@@ -1085,7 +1312,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     return closed;
   }
 
-  private getActivitySnapshot(options?: { ignoreProviderSnapshot?: boolean }): {
+  private getActivitySnapshot(): {
     blockingWorkCount: number;
     activeToolCount: number;
     busyReasons: SessionActivityBusyReason[];
@@ -1105,15 +1332,19 @@ export class TransportSessionRuntime implements SessionRuntime {
     const openToolCount = this._openTools.size;
     add('open_tool_call', openToolCount);
 
-    const providerSnapshot = options?.ignoreProviderSnapshot ? null : this.getProviderActiveWorkSnapshot();
+    const providerSnapshot = this.getProviderActiveWorkSnapshot();
     if (providerSnapshot) {
-      const expectedGeneration = this._activityGeneration > 0 ? this.currentActivityGeneration() : undefined;
+      const expectedGeneration = this._activityGeneration > 0
+        ? this.currentActivityGeneration()
+        : undefined;
       const evaluation = evaluateProviderSnapshot(providerSnapshot, expectedGeneration);
       if (evaluation.blocking) {
-        const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
-        add(evaluation.reason, count);
-        for (const reason of providerSnapshot.busyReasons) {
-          if (!busyReasons.includes(reason)) busyReasons.push(reason);
+        if (!this.shouldIgnoreZeroWorkProviderSnapshot(providerSnapshot, evaluation.state)) {
+          const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
+          add(evaluation.reason, count);
+          for (const reason of providerSnapshot.busyReasons) {
+            if (!busyReasons.includes(reason)) busyReasons.push(reason);
+          }
         }
       }
     }
@@ -1126,7 +1357,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     };
   }
 
-  private recordToolActivity(tool: { id: string; name: string; status: 'running' | 'complete' | 'error' }): void {
+  private recordToolActivity(tool: Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'detail'>): void {
+    if (isBackgroundedSdkSubagentTool(tool)) {
+      this._openTools.delete(tool.id);
+      if (this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
+        this.drainPendingIfNoActiveTurn(`backgrounded-sdk-subagent-${tool.status}`);
+      }
+      return;
+    }
     const generation = this._activityGeneration;
     if (tool.status === 'running') {
       this._openTools.set(tool.id, { generation, name: tool.name, status: 'running' });
@@ -1259,6 +1497,27 @@ export class TransportSessionRuntime implements SessionRuntime {
       } else {
         this._pendingMessages.push(entry);
       }
+      try {
+        getTransportQueueStore().enqueue({
+          sessionName: this.sessionKey,
+          clientMessageId: entry.clientMessageId,
+          commandId: entry.clientMessageId,
+          text: entry.text,
+          placement: metadata?.queuePlacement ?? 'normal',
+          activityGeneration: normalizeActivityGeneration(this.currentActivityGeneration()) ?? undefined,
+          privateMaterialJson: JSON.stringify({
+            clientMessageId: entry.clientMessageId,
+            text: entry.text,
+            ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
+            ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
+            ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
+            ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+            ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+          }),
+        });
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
+      }
       this._pendingVersion++;
       return 'queued';
     }
@@ -1300,12 +1559,17 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   editPendingMessage(clientMessageId: string, text: string): boolean {
-    const nextText = text.trim();
-    if (!clientMessageId || !nextText) return false;
+    const nextText = text;
+    if (!clientMessageId || nextText.length === 0) return false;
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
     entry.messagePreamble = undefined;
+    try {
+      getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite edit failed; preserving runtime-local edit');
+    }
     this._pendingVersion++;
     return true;
   }
@@ -1315,6 +1579,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     const index = this._pendingMessages.findIndex((item) => item.clientMessageId === clientMessageId);
     if (index < 0) return null;
     const [removed] = this._pendingMessages.splice(index, 1);
+    try {
+      getTransportQueueStore().drop(this.sessionKey, clientMessageId, 'user_cleared');
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite drop failed; preserving runtime-local removal');
+    }
     this._pendingVersion++;
     return removed ?? null;
   }
@@ -1358,6 +1627,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._pendingMessages.splice(0, retriedEntryCount);
         this._pendingVersion++;
       }
+      this.markCurrentActivityGenerationLocallyCancelled();
       this.closeOpenTools('cancelled', 'user_cancelled');
       // Remaining queued messages drain (deliver) after the cancelled turn;
       // settle idle when nothing is left.
@@ -1376,6 +1646,15 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (dispatchId !== null) {
       this._locallyCancelledDispatchIds.add(dispatchId);
       this._activeDispatchCancelled = true;
+    }
+    if (
+      !this._activeTurn
+      && !this._sending
+      && this._activeDispatchEntries.length === 0
+      && !this.hasActiveTurnWork()
+    ) {
+      if (!this._drainPending()) this.setStatus('idle');
+      return;
     }
     if (this._activeTurn && !this._activeDispatchProviderStarted) {
       this.cancelActiveDispatchLocally(dispatchId);
@@ -1426,7 +1705,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    *  turn (wedged provider) and avoid blocking upgrades forever. */
   get lastActivityAt(): number { return this._lastActivityAt; }
 
-  async kill(): Promise<void> {
+  async kill(options: { preserveTransportQueue?: boolean } = {}): Promise<void> {
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
 
@@ -1447,15 +1726,29 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
+    this._locallyCancelledActivityGenerations.clear();
+    this._currentActivityGenerationLocallyCancelled = false;
     this._externalCompletionSettlementsToIgnore = 0;
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
     this._recoverableDispatchRetries = 0;
     if (this._pendingMessages.length > 0) {
-      logger.warn(
-        { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
-        'transport runtime kill cleared pending messages',
-      );
+      if (options.preserveTransportQueue) {
+        logger.info(
+          { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+          'transport runtime kill cleared local pending messages after preserving queue authority',
+        );
+      } else {
+        logger.warn(
+          { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+          'transport runtime kill cleared pending messages',
+        );
+        try {
+          getTransportQueueStore().reset(this.sessionKey, 'user_clear');
+        } catch (err) {
+          logger.warn({ err, sessionKey: this.sessionKey }, 'transport queue sqlite reset failed during runtime kill');
+        }
+      }
       this._pendingVersion++;
     }
     this._pendingMessages = [];
@@ -1509,6 +1802,220 @@ export class TransportSessionRuntime implements SessionRuntime {
       recoverable: error.recoverable,
     };
     this._lastProviderErrorAt = Date.now();
+  }
+
+  private sdkTurnLostRecoveryKey(metadata: SdkTurnLostRecoveryMetadata): string {
+    const generation = this._activeDispatchEntries.length > 0
+      ? this.currentActivityGeneration()
+      : metadata.activityGeneration;
+    return `${this.sessionKey}:${normalizeActivityGeneration(generation) ?? 'unknown'}:${metadata.reason}`;
+  }
+
+  private sdkTurnLostRecoveryBudgetUsed(metadata: SdkTurnLostRecoveryMetadata): number {
+    const key = this.sdkTurnLostRecoveryKey(metadata);
+    return this._sdkTurnLostRecoveryAttempts.get(key) ?? 0;
+  }
+
+  private consumeSdkTurnLostRecoveryBudget(metadata: SdkTurnLostRecoveryMetadata): boolean {
+    const key = this.sdkTurnLostRecoveryKey(metadata);
+    const used = this._sdkTurnLostRecoveryAttempts.get(key) ?? 0;
+    if (used >= MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS) return false;
+    this._sdkTurnLostRecoveryAttempts.set(key, used + 1);
+    return true;
+  }
+
+  private sdkTurnLostRecoveryCorrelationId(metadata: SdkTurnLostRecoveryMetadata): string {
+    return metadata.correlationId
+      ?? metadata.recoveryAttemptId
+      ?? `${this.sessionKey}:${normalizeActivityGeneration(metadata.activityGeneration) ?? 'unknown'}:${metadata.classifier}`;
+  }
+
+  private emitSdkTurnLostRecoveryPhase(
+    metadata: SdkTurnLostRecoveryMetadata,
+    phase: SdkTurnLostRecoveryPhase,
+    replayDecision?: SdkTurnLostReplayDecision | string,
+  ): void {
+    const correlationId = this.sdkTurnLostRecoveryCorrelationId(metadata);
+    const dedupKey = `${correlationId}:${phase}`;
+    if (this._sdkTurnLostRecoveryPhaseKeys.has(dedupKey)) return;
+    this._sdkTurnLostRecoveryPhaseKeys.add(dedupKey);
+    const recovery = {
+      ...metadata,
+      phase,
+      correlationId,
+      ...(replayDecision ? { replayDecision } : {}),
+    };
+    const payload = {
+      status: SDK_TURN_LOST_RECOVERY_STATUS,
+      phase,
+      reason: SDK_TURN_LOST_RECOVERY_REASON,
+      correlationId,
+      recovery,
+    };
+    timelineEmitter.emit(this.sessionKey, 'agent.status', payload, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-runtime-recovery:${this.sessionKey}:${correlationId}:${phase}`,
+    });
+    void appendTransportEvent(this.sessionKey, {
+      type: 'agent.status',
+      sessionId: this.sessionKey,
+      ...payload,
+    });
+  }
+
+  private markSdkTurnLostRecoveredOnProviderActivity(): void {
+    const attempt = this._sdkTurnLostRecoveryAttempt;
+    if (!attempt || attempt.status === 'recovered' || attempt.status === 'failed') return;
+    if (attempt.expectedReplacementDispatchId === undefined || attempt.expectedReplacementGeneration === undefined) return;
+    if (this._activeDispatchId !== attempt.expectedReplacementDispatchId) return;
+    if (!sameActivityGeneration(this.currentActivityGeneration(), attempt.expectedReplacementGeneration)) return;
+    if (!this._activeDispatchProviderStarted || !attempt.providerAccepted) return;
+    attempt.status = 'recovered';
+    this.emitSdkTurnLostRecoveryPhase(attempt.metadata, SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED, 'safe_replay');
+    this._sdkTurnLostRecoveryAttempt = null;
+  }
+
+  private bindSdkTurnLostReplacementDispatch(dispatchId: number, entries: PendingTransportMessage[]): void {
+    const attempt = this._sdkTurnLostRecoveryAttempt;
+    if (!attempt || attempt.status !== 'recovering') return;
+    const dispatchedIds = new Set(entries.map((entry) => entry.clientMessageId));
+    if (!attempt.replayEntryIds.every((id) => dispatchedIds.has(id))) return;
+    attempt.expectedReplacementDispatchId = dispatchId;
+    attempt.expectedReplacementGeneration = this.currentActivityGeneration();
+    attempt.providerAccepted = false;
+    attempt.status = 'awaiting_replacement_activity';
+  }
+
+  private markSdkTurnLostReplacementProviderAccepted(dispatchId: number): void {
+    const attempt = this._sdkTurnLostRecoveryAttempt;
+    if (!attempt || attempt.status !== 'awaiting_replacement_activity') return;
+    if (attempt.expectedReplacementDispatchId !== dispatchId) return;
+    if (!sameActivityGeneration(this.currentActivityGeneration(), attempt.expectedReplacementGeneration)) return;
+    attempt.providerAccepted = true;
+  }
+
+  private makeSdkTurnLostFailure(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): ProviderError {
+    return {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Codex SDK turn was lost and automatic replay was not safe. Please review the session and resend if appropriate.',
+      recoverable: false,
+      details: {
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        localSessionKey: this.sessionKey,
+        providerId: this.provider.id,
+        providerSessionId: this._providerSessionId ?? undefined,
+        activityGeneration: this.currentActivityGeneration(),
+        classifier: metadata.classifier,
+        replayDecision,
+        recoveryAttemptId: metadata.recoveryAttemptId,
+        correlationId: metadata.correlationId,
+      },
+    };
+  }
+
+  private failSdkTurnLostRecovery(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): void {
+    const existingAttempt = this._sdkTurnLostRecoveryAttempt;
+    if (existingAttempt) existingAttempt.status = 'failed';
+    this.emitSdkTurnLostRecoveryPhase(metadata, SDK_TURN_LOST_RECOVERY_PHASES.FAILED, replayDecision);
+    const failure = this.makeSdkTurnLostFailure(metadata, replayDecision);
+    this.recordProviderError(failure);
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: metadata.classifier,
+        replayDecision,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport runtime sdk turn lost recovery failed',
+    );
+    this._sending = false;
+    this._activeTurn?.reject(failure);
+    this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchHasSideEffectEvidence = false;
+    this._sdkTurnLostRecoveryAttempt = null;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+    this._activeDispatchEntries = [];
+    this.setStatus('error');
+  }
+
+  private handleSdkTurnLostRecovery(error: ProviderError): boolean {
+    const metadata = readSdkTurnLostRecoveryMetadata(error);
+    if (!metadata) return false;
+    if (metadata.localSessionKey !== this.sessionKey) return true;
+    if (this._currentActivityGenerationLocallyCancelled || this._activeDispatchCancelled) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_terminal');
+      return true;
+    }
+    if (!sameActivityGeneration(metadata.activityGeneration, this.currentActivityGeneration())) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
+      return true;
+    }
+    if (metadata.replayDecision !== 'pending' && metadata.replayDecision !== 'safe_replay') {
+      this.failSdkTurnLostRecovery(metadata, metadata.replayDecision);
+      return true;
+    }
+    if (this._activeDispatchEntries.length === 0 || !this._activeTurn) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
+      return true;
+    }
+    if (this._activeDispatchHasSideEffectEvidence || this._openTools.size > 0) {
+      this.failSdkTurnLostRecovery(metadata, 'unsafe_side_effect');
+      return true;
+    }
+    if (!this.consumeSdkTurnLostRecoveryBudget(metadata)) {
+      this.failSdkTurnLostRecovery(metadata, 'budget_exhausted');
+      return true;
+    }
+
+    const replayEntries = this._activeDispatchEntries.map((entry) => ({ ...entry }));
+    const recoveryMetadata = { ...metadata, replayDecision: 'safe_replay' as const };
+    this._sdkTurnLostRecoveryAttempt = {
+      metadata: recoveryMetadata,
+      correlationId: this.sdkTurnLostRecoveryCorrelationId(recoveryMetadata),
+      replayEntryIds: replayEntries.map((entry) => entry.clientMessageId),
+      sourceGeneration: this.currentActivityGeneration(),
+      status: 'detected',
+      providerAccepted: false,
+    };
+    this.emitSdkTurnLostRecoveryPhase(recoveryMetadata, SDK_TURN_LOST_RECOVERY_PHASES.DETECTED, 'safe_replay');
+    this.emitSdkTurnLostRecoveryPhase(metadata, SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING, 'safe_replay');
+    this._sdkTurnLostRecoveryAttempt.status = 'recovering';
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: metadata.classifier,
+        attempt: this.sdkTurnLostRecoveryBudgetUsed(metadata),
+        maxAttempts: MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS,
+        activeDispatchCount: replayEntries.length,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
+    );
+    this._sending = false;
+    this._activeTurn.resolve();
+    this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
+    this._activeDispatchEntries = [];
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchHasSideEffectEvidence = false;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+    this._pendingMessages.unshift(...replayEntries);
+    this._pendingVersion++;
+    this._ignoreProviderSnapshotForNextLocalStopDrain = true;
+    if (!this._drainPending()) this.setStatus('thinking');
+    return true;
   }
 
   private clearStalePendingCancelFallbackTimer(): void {
@@ -1625,6 +2132,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const dispatchId = ++this._nextDispatchId;
     this._activityGeneration++;
+    this._currentActivityGenerationLocallyCancelled = false;
     this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
     this._lastActivityAt = Date.now();
     this._sending = true;
@@ -1632,6 +2140,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._lastProviderErrorAt = 0;
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
+    this._activeDispatchHasSideEffectEvidence = false;
     this._activeDispatchId = dispatchId;
     this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
@@ -1639,6 +2148,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       text: message,
       ...(attachments?.length ? { attachments } : {}),
     }]).map((entry) => ({ ...entry }));
+    this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     let resolve!: () => void;
     let reject!: (err: ProviderError) => void;
@@ -1771,6 +2281,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Provider accepted the send — the turn was delivered. Resolve any
       // recoverable-retry streak so a later failure starts with a full budget.
       this._recoverableDispatchRetries = 0;
+      this.markSdkTurnLostReplacementProviderAccepted(dispatchId);
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
         if (hitIds.length > 0) {
@@ -1834,6 +2345,9 @@ export class TransportSessionRuntime implements SessionRuntime {
                   message: err instanceof Error ? err.message : String(err),
                   recoverable: false,
                 });
+        if (this.handleSdkTurnLostRecovery(providerError)) {
+          return;
+        }
         this.recordProviderError(providerError);
         logger.warn(
           {
@@ -1917,9 +2431,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
-    const ignoreProviderSnapshot = this._ignoreProviderSnapshotForNextLocalStopDrain;
-    this._ignoreProviderSnapshotForNextLocalStopDrain = false;
-    const activity = this.getActivitySnapshot({ ignoreProviderSnapshot });
+    const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {
       logger.warn(
         {
@@ -1941,12 +2453,31 @@ export class TransportSessionRuntime implements SessionRuntime {
     const messages = this._pendingMessages.splice(0);
     const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
     for (const entry of timelineMessages) entry.timelineCommitted = true;
-    // Bump the queue version the moment the queue empties. The onDrain
+    try {
+      const queueResult = getTransportQueueStore().finalizeSentBatch(
+        this.sessionKey,
+        messages.map((entry) => entry.clientMessageId),
+        randomUUID(),
+      );
+      for (const fact of queueResult.deliveryFacts) {
+        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+          source: 'daemon',
+          confidence: 'high',
+        });
+      }
+      this._pendingVersion = Math.max(this._pendingVersion, queueResult.snapshot.pendingMessageVersion);
+    } catch (err) {
+      logger.warn(
+        { err, sessionKey: this.sessionKey, clientMessageIds: messages.map((entry) => entry.clientMessageId) },
+        'transport queue sqlite finalizeSentBatch failed during drain',
+      );
+      this._pendingVersion++;
+    }
+    // Advance the queue version the moment the queue empties. The onDrain
     // callback below emits this new version on both the per-entry
     // `user.message` events and the cleared `session.state`, so a stale
     // pre-drain snapshot (lower version) delivered later cannot resurrect
     // these entries in the UI.
-    this._pendingVersion++;
     const merged = messages.map((entry) => entry.text).join('\n\n');
     const attachments = messages.flatMap((entry) => entry.attachments ?? []);
     const drainMetadata: ActivityDrainMetadata = {
@@ -2026,14 +2557,19 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._locallyCancelledDispatchIds.delete(dispatchId);
       return;
     }
+    this.markCurrentActivityGenerationLocallyCancelled();
     if (!this._activeTurn && !this._sending) {
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this._activeDispatchEntries = [];
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
       this._activeDispatchProviderStarted = false;
       this._activeDispatchId = null;
       this._activeDispatchStaleRecoveryStarted = false;
+      if (!this._drainPending()) {
+        this.setStatus('idle');
+      }
       return;
     }
     this._sending = false;
@@ -2281,7 +2817,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         return { artifact: null };
       }
       // 1) Template-origin legacy summaries never surface through recall.
-      const processed = result.items
+      // Guard the worker/degrade path: a degraded/unavailable context-store
+      // worker can yield a nullish result — recall must never throw and abort the
+      // turn (211: "Cannot read properties of undefined (reading 'items')").
+      const processed = (result?.items ?? [])
         .filter((item): item is MemorySearchResultItem => item.type === 'processed')
         .filter((item) => !isTemplateOriginSummary(item.summary));
       // 2) Per-session dedup: skip items injected in this session's last

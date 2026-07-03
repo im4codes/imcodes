@@ -1570,6 +1570,148 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('keeps scroll-top older loading enabled after forward history reports hasMore false', async () => {
+    const sessionName = `deck_forward_hasmore_false_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestSeq = 0;
+    let lastRequestId = '';
+    const sendTimelineHistoryRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `history-${requestSeq}`;
+      return lastRequestId;
+    });
+    const sendTimelinePageRequest = vi.fn(() => {
+      requestSeq += 1;
+      lastRequestId = `page-${requestSeq}`;
+      return lastRequestId;
+    });
+
+    __setTimelineCacheForTests(sessionName, [{
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 1000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }]);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'older-forward-false',
+        'data-older': String(timeline.hasOlderHistory),
+        onClick: timeline.loadOlderEvents,
+      }, 'older');
+    }
+
+    render(h(Probe));
+
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalled();
+      expect(screen.getByTestId('older-forward-false').getAttribute('data-older')).toBe('true');
+    });
+    const initialRequestId = lastRequestId;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: initialRequestId,
+        epoch: 1,
+        events: [],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        hasMore: false,
+        nextCursor: null,
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('older-forward-false').getAttribute('data-older')).toBe('true');
+
+    await act(async () => {
+      screen.getByTestId('older-forward-false').click();
+    });
+
+    expect(sendTimelinePageRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      expect.objectContaining({ direction: TIMELINE_CURSOR_DIRECTIONS.OLDER, beforeTs: 1000 }),
+      300,
+    );
+  });
+
+  it('loadOlder derives its cursor from on-screen events when the module cache is empty (localStorage seed + scroll-top)', async () => {
+    // Regression for the reported bug "刷新/打开对话时只有几行、下翻到顶加载旧记录失效":
+    // the localStorage first-paint seed path (rcc_timeline_snapshot) intentionally
+    // does NOT write the global module cache (avoids a path-1 short-circuit that
+    // would skip the fuller IDB read). loadOlderEvents used to hard-depend on that
+    // module cache and silently return when it was empty — so a pane showing seed
+    // events could never paginate older history. The fix falls back to the
+    // on-screen `eventsRef.current`. This test proves: seed on screen + empty
+    // module cache + loadOlder → a PAGE request IS issued with a cursor derived
+    // from the seed's earliest ts.
+    const sessionName = `deck_sub_seed_only_${Date.now()}`;
+    const serverId = 'srv';
+    // Seed ONLY localStorage (first-paint). Do NOT call __setTimelineCacheForTests —
+    // the module cache stays empty, reproducing the cold-refresh window.
+    localStorage.setItem(
+      `rcc_timeline_snapshot:${serverId}:${sessionName}`,
+      JSON.stringify(makeEvents(sessionName, 4)), // ts 0..3, epoch 1
+    );
+
+    let requestSeq = 0;
+    let lastRequestId = '';
+    const sendTimelineHistoryRequest = vi.fn(() => { requestSeq += 1; lastRequestId = `history-${requestSeq}`; return lastRequestId; });
+    const sendTimelinePageRequest = vi.fn(() => { requestSeq += 1; lastRequestId = `page-${requestSeq}`; return lastRequestId; });
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    let loadOlder: () => void = () => {};
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId);
+      loadOlder = timeline.loadOlderEvents;
+      return h('div', { 'data-testid': 'p', 'data-events': String(timeline.events.length) });
+    }
+
+    render(h(Probe));
+    // Seed is painted synchronously from localStorage on first paint.
+    await waitFor(() => {
+      expect(screen.getByTestId('p').getAttribute('data-events')).toBe('4');
+    });
+
+    // Trigger scroll-to-top load-older directly (bypasses ChatView's
+    // hasOlderHistory gate to isolate loadOlderEvents itself).
+    await act(async () => { loadOlder(); });
+
+    // BEFORE the fix this asserted nothing was sent (silent return on empty
+    // cache). AFTER the fix a PAGE request is issued with the seed-derived
+    // OLDER cursor (beforeTs = earliest seed ts = 0).
+    expect(sendTimelinePageRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionName,
+      expect.objectContaining({ direction: TIMELINE_CURSOR_DIRECTIONS.OLDER, beforeTs: 0 }),
+      expect.anything(),
+    );
+  });
+
   it('does not close older pagination on terminal or deferred page outcomes', async () => {
     const sessionName = `deck_older_errors_${Date.now()}`;
     let handler: ((msg: ServerMessage) => void) | null = null;

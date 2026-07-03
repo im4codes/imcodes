@@ -6,6 +6,14 @@
  * that produce structured message streams instead of raw terminal output.
  */
 
+import type {
+  ActivityGenerationLike,
+  CodexLifecycleEvidenceSource,
+  CodexLifecycleItemKind,
+  ToolTerminalReason,
+  ToolTerminalStatus,
+} from './session-activity-types.js';
+
 // ── String constant unions ────────────────────────────────────────────────────
 
 /** Discriminant for AgentMessage.kind — what kind of content this message carries. */
@@ -152,4 +160,22 @@ export interface ToolCallEvent {
   output?: string;
   /** Structured detail payload for richer UI rendering and future provider parity. */
   detail?: ToolCallDetail;
+  /** Canonical terminal status for projection/runtime lifecycle consumers. */
+  terminalStatus?: ToolTerminalStatus;
+  /** Canonical terminal reason for projection/runtime lifecycle consumers. */
+  terminalReason?: ToolTerminalReason;
+  /** True when the provider/daemon synthesized a terminal event rather than receiving a paired provider result. */
+  terminalSynthetic?: boolean;
+  /** Source class that produced this lifecycle terminal event. */
+  terminalSource?: CodexLifecycleEvidenceSource;
+  /** Human-readable bounded reason for the lifecycle decision. */
+  terminalDecisionReason?: string;
+  /** Stable dedupe key for replay/retry of the same terminal decision. */
+  terminalIdempotencyKey?: string;
+  /** Runtime activity generation associated with the tool/item when known. */
+  activityGeneration?: ActivityGenerationLike;
+  /** App-server turn id associated with the event when known. */
+  turnId?: string;
+  /** Codex lifecycle item family when known. */
+  lifecycleItemKind?: CodexLifecycleItemKind;
 }

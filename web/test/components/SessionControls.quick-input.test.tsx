@@ -115,4 +115,87 @@ describe('SessionControls quick input integration', () => {
 
     expect(document.querySelector('.qp')).toBeTruthy();
   });
+
+  it('preserves visual newlines from the composer when sending and recording history', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const quickData = makeQuickData();
+
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={quickData}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    input.innerHTML = 'first line<div>second line</div>';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_main',
+      text: 'first line\nsecond line',
+    }));
+    expect(quickData.recordHistory).toHaveBeenCalledWith('first line\nsecond line', 'deck_main');
+  });
+
+  it('preserves multiline quick history through arrow restore and quick panel selection', () => {
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      sendInput: vi.fn(),
+      subSessionSetModel: vi.fn(),
+      fsListDir: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    } as any;
+    const multiline = 'restore alpha\nrestore beta';
+    const quickData = {
+      ...makeQuickData(),
+      data: {
+        history: [],
+        sessionHistory: { deck_main: [multiline] },
+        commands: [],
+        phrases: [],
+      },
+    };
+
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={quickData}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', expect.objectContaining({
+      text: multiline,
+    }));
+
+    fireEvent.click(screen.getByTitle('Quick input'));
+    const historyText = screen.getByText((_, element) => element?.classList.contains('qp-item-text') === true);
+    fireEvent.click(historyText.closest('.qp-item')!);
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', expect.objectContaining({
+      text: multiline,
+    }));
+  });
 });

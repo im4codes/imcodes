@@ -5,7 +5,20 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type ProviderStatusUpdate, type ProviderUsageUpdate } from '../agent/transport-provider.js';
+import {
+  PROVIDER_ERROR_CODES,
+  SDK_TURN_LOST_RECOVERY_PHASES,
+  SDK_TURN_LOST_RECOVERY_REASON,
+  SDK_TURN_LOST_RECOVERY_STATUS,
+  isSdkTurnLostRecovery,
+  sanitizeSdkTurnLostRecoveryMetadata,
+  type SdkTurnLostRecoveryMetadata,
+  type SdkTurnLostRecoveryPhase,
+  type TransportProvider,
+  type ProviderError,
+  type ProviderStatusUpdate,
+  type ProviderUsageUpdate,
+} from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
@@ -26,6 +39,12 @@ import {
   normalizeSdkSubagentKeyComponent,
   parseSdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+  type CodexLifecycleEvidenceSource,
+  type ToolTerminalReason,
+  type ToolTerminalStatus,
+} from '../../shared/session-activity-types.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
@@ -53,6 +72,75 @@ const CHECKLIST_TOOL_NAMES = new Set([
 // it doesn't render as a stray "< error: <answer>" line in the timeline.
 const askQuestionToolIds = new Set<string>();
 const MAX_TRACKED_FILE_TOOLS = 512;
+const emittedSdkTurnLostRecoveryPhases = new Set<string>();
+
+const SDK_TURN_LOST_RECOVERY_PHASE_LABELS: Record<SdkTurnLostRecoveryPhase, string> = {
+  [SDK_TURN_LOST_RECOVERY_PHASES.DETECTED]: 'Detected lost Codex SDK turn',
+  [SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING]: 'Recovering lost Codex SDK turn',
+  [SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED]: 'Recovered lost Codex SDK turn',
+  [SDK_TURN_LOST_RECOVERY_PHASES.FAILED]: 'Lost Codex SDK turn recovery needs user action',
+};
+
+function sdkTurnLostRecoveryPhaseFromMetadata(
+  metadata: SdkTurnLostRecoveryMetadata,
+  fallbackPhase: SdkTurnLostRecoveryPhase,
+): SdkTurnLostRecoveryPhase {
+  return metadata.phase ?? fallbackPhase;
+}
+
+export function emitSdkTurnLostRecoveryPhase(
+  sessionName: string,
+  input: unknown,
+  fallbackPhase: SdkTurnLostRecoveryPhase = SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+  expectedProviderSessionId?: string,
+): boolean {
+  const metadata = sanitizeSdkTurnLostRecoveryMetadata(input);
+  if (!metadata) return false;
+  const explicitSession = metadata.sessionName ?? metadata.localSessionKey;
+  if (explicitSession && explicitSession !== sessionName) {
+    logger.warn(
+      { sessionName, recoverySessionName: metadata.sessionName, recoveryLocalSessionKey: metadata.localSessionKey },
+      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting session metadata',
+    );
+    return false;
+  }
+  if (expectedProviderSessionId && metadata.providerSessionId && metadata.providerSessionId !== expectedProviderSessionId) {
+    logger.warn(
+      { sessionName, providerSid: expectedProviderSessionId, recoveryProviderSessionId: metadata.providerSessionId },
+      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting provider session metadata',
+    );
+    return false;
+  }
+  const phase = sdkTurnLostRecoveryPhaseFromMetadata(metadata, fallbackPhase);
+  const dedupKey = `${sessionName}:${metadata.correlationId}:${phase}`;
+  if (emittedSdkTurnLostRecoveryPhases.has(dedupKey)) return true;
+  emittedSdkTurnLostRecoveryPhases.add(dedupKey);
+
+  const recovery = {
+    ...metadata,
+    phase,
+  };
+  const payload = {
+    status: SDK_TURN_LOST_RECOVERY_STATUS,
+    label: SDK_TURN_LOST_RECOVERY_PHASE_LABELS[phase],
+    phase,
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    correlationId: metadata.correlationId,
+    recovery,
+  };
+
+  timelineEmitter.emit(sessionName, 'agent.status', payload, {
+    source: 'daemon',
+    confidence: 'high',
+    eventId: `transport-recovery:${sessionName}:${metadata.correlationId}:${phase}`,
+  });
+  void appendTransportEvent(sessionName, {
+    type: 'agent.status',
+    sessionId: sessionName,
+    ...payload,
+  });
+  return true;
+}
 
 function isCompactControlCompletion(message: AgentMessage): boolean {
   return message.kind === 'system'
@@ -106,11 +194,36 @@ function emitChecklistToolCall(sessionName: string, tool: ToolCallEvent): void {
   });
 }
 
+function terminalStatusForTool(tool: ToolCallEvent): string {
+  return tool.terminalStatus ?? (tool.status === 'error' ? 'errored' : 'succeeded');
+}
+
+function terminalReasonForTool(tool: ToolCallEvent): string {
+  return tool.terminalReason ?? (tool.status === 'error' ? 'provider_error' : 'provider_result');
+}
+
+function terminalMetadataForTool(sessionName: string, tool: ToolCallEvent): Record<string, unknown> {
+  const terminalStatus = terminalStatusForTool(tool) as ToolTerminalStatus;
+  const terminalReason = terminalReasonForTool(tool) as ToolTerminalReason;
+  return { ...buildCodexLifecycleTerminalMetadata({
+    sessionId: sessionName,
+    terminalStatus,
+    terminalReason,
+    synthetic: tool.terminalSynthetic ?? false,
+    source: (tool.terminalSource ?? 'app_server_jsonrpc') as CodexLifecycleEvidenceSource,
+    decisionReason: tool.terminalDecisionReason ?? terminalReason,
+    ...(tool.terminalIdempotencyKey !== undefined ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+    ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+    toolCallId: tool.id,
+    ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+    ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+  }) };
+}
+
 function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   timelineEmitter.emit(sessionName, 'tool.result', {
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...terminalMetadataForTool(sessionName, tool),
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -126,8 +239,7 @@ function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
     type: 'tool.result',
     sessionId: sessionName,
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...terminalMetadataForTool(sessionName, tool),
     ...(tool.status === 'error'
       ? { error: tool.output ?? 'error' }
       : tool.output !== undefined
@@ -363,6 +475,19 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     inFlightMessages.delete(sessionName);
     if (tracked) clearPendingStreamUpdate(tracked.eventId);
 
+    if (isSdkTurnLostRecovery(error)) {
+      const details = sanitizeSdkTurnLostRecoveryMetadata(error.details);
+      if (details) {
+        emitSdkTurnLostRecoveryPhase(
+          sessionName,
+          details,
+          error.recoverable ? SDK_TURN_LOST_RECOVERY_PHASES.DETECTED : SDK_TURN_LOST_RECOVERY_PHASES.FAILED,
+          providerSid,
+        );
+      }
+      return;
+    }
+
     if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
       timelineEmitter.emit(sessionName, 'assistant.text', {
         text: `⚠️ Turn cancelled: ${error.message}`,
@@ -460,6 +585,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         detail: sdkDetail.detail,
       }, {
         allowRaw: Boolean(sdkDetail.detail.meta.diagnosticCode),
+        sessionId: sessionName,
       });
       if (!sdkPayload) return;
       const eventToolId = normalizeSdkSubagentKeyComponent(tool.id || sdkDetail.detail.meta.canonicalKey);
@@ -566,8 +692,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       });
       timelineEmitter.emit(sessionName, 'tool.result', {
         toolCallId: effectiveTool.id,
-        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
-        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
+        ...terminalMetadataForTool(sessionName, effectiveTool),
         ...(effectiveTool.status === 'error'
           ? { error: effectiveTool.output ?? 'error' }
           : effectiveTool.output !== undefined
@@ -584,8 +709,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         type: 'tool.result',
         sessionId: sessionName,
         toolCallId: effectiveTool.id,
-        terminalStatus: effectiveTool.status === 'error' ? 'errored' : 'succeeded',
-        terminalReason: effectiveTool.status === 'error' ? 'provider_error' : 'provider_result',
+        ...terminalMetadataForTool(sessionName, effectiveTool),
         tool: effectiveTool.name,
         ...(effectiveTool.detail !== undefined ? { detail: effectiveTool.detail } : {}),
         ...(effectiveTool.status === 'error'
@@ -744,6 +868,7 @@ async function pushProviderSessions(providerId: string): Promise<void> {
 /** @internal Exported for tests only — see test/daemon/transport-relay-usage-payload.test.ts. */
 export const __testing__ = {
   normalizeUsageUpdatePayload,
+  emitSdkTurnLostRecoveryPhaseForTest: emitSdkTurnLostRecoveryPhase,
   /**
    * Clear all module-global per-session relay state. Tests reuse session names
    * across cases; without this, a prior test's in-flight message leaks and the
@@ -758,5 +883,6 @@ export const __testing__ = {
     pendingFileLikeTools.clear();
     completedFileLikeTools.clear();
     askQuestionToolIds.clear();
+    emittedSdkTurnLostRecoveryPhases.clear();
   },
 };

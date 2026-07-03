@@ -23,6 +23,7 @@ const childProcessMock = vi.hoisted(() => {
   const heldThreadStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldTurnStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldTurnInterrupts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const threadReadResults: Array<Record<string, any> | ((msg: Request) => Record<string, any> | undefined)> = [];
   let holdThreadStart = false;
   let holdTurnStart = false;
   let holdTurnInterrupt = false;
@@ -88,6 +89,13 @@ const childProcessMock = vi.hoisted(() => {
           }
           if (msg.method === 'thread/compact/start' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
+          }
+          if (msg.method === 'thread/read' && typeof msg.id === 'number') {
+            const next = threadReadResults.shift();
+            if (next) {
+              const result = typeof next === 'function' ? next(msg) : next;
+              if (result !== undefined) childRecord.emits({ id: msg.id, result });
+            }
           }
           if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
             if (holdTurnInterrupt) {
@@ -161,6 +169,12 @@ const childProcessMock = vi.hoisted(() => {
       const held = heldTurnInterrupts.splice(0);
       for (const entry of held) emitTurnInterruptResult(entry.childRecord, entry.msg);
     },
+    enqueueThreadReadResult(result: Record<string, any> | ((msg: Request) => Record<string, any> | undefined)) {
+      threadReadResults.push(result);
+    },
+    clearThreadReadResults() {
+      threadReadResults.length = 0;
+    },
   };
 });
 
@@ -207,7 +221,7 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
-import { PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type ProviderError, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -311,6 +325,7 @@ describe('CodexSdkProvider', () => {
     childProcessMock.setHoldThreadStart(false);
     childProcessMock.setHoldTurnStart(false);
     childProcessMock.setHoldTurnInterrupt(false);
+    childProcessMock.clearThreadReadResults();
     childProcessMock.releaseHeldThreadStarts();
     childProcessMock.releaseHeldTurnStarts();
     childProcessMock.releaseHeldTurnInterrupts();
@@ -318,6 +333,8 @@ describe('CodexSdkProvider', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.clearAllTimers();
+    vi.useRealTimers();
   });
 
   it('reports Memory MCP ready after app-server connect', async () => {
@@ -392,16 +409,23 @@ describe('CodexSdkProvider', () => {
   it('restarts the app-server when Codex reports a bearer auth failure', async () => {
     const provider = new CodexSdkProvider();
     const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
+    const tools: ToolCallEvent[] = [];
     provider.onError((_sid, error) => errors.push({
       code: error.code,
       recoverable: error.recoverable,
       message: error.message,
     }));
+    provider.onToolCall((_, tool) => tools.push(tool));
 
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
     await provider.send('route-1', 'hello');
     const firstChild = childProcessMock.children[0]!;
+    firstChild.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-auth', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-auth' && tool.status === 'running'));
 
     firstChild.emits({
       method: 'turn/completed',
@@ -422,9 +446,214 @@ describe('CodexSdkProvider', () => {
       code: PROVIDER_ERROR_CODES.AUTH_FAILED,
       recoverable: false,
     }]);
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-auth',
+      status: 'error',
+      terminalStatus: 'errored',
+      terminalReason: 'app_server_failed',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      lifecycleItemKind: 'web_search',
+    }));
     expect(childProcessMock.children).toHaveLength(2);
     expect(firstChild.child.killed).toBe(true);
     await provider.disconnect();
+  });
+
+  it('defers auth-change app-server restart while any session has active current work', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-active-'));
+    const provider = new CodexSdkProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-auth-active', cwd: '/tmp/project' });
+      await provider.send('route-auth-active', 'search');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-auth-active')?.runningTurnId === 'turn-1',
+      );
+      const firstChild = childProcessMock.children[0]!;
+      firstChild.emits({
+        method: 'item/started',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-auth-active', type: 'webSearch', action: { type: 'other' } } },
+      });
+      await waitForCondition(
+        () => provider.getActiveWorkSnapshot('route-auth-active')?.activeToolCount === 1,
+      );
+
+      await writeCodexAuthFile(codexHome, 2);
+      await expect(provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' }))
+        .rejects.toMatchObject({
+          code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          recoverable: true,
+          details: {
+            disconnectClass: 'auth_refresh_restart',
+            activeSessionCount: 1,
+            activeSessionIds: ['route-auth-active'],
+          },
+        });
+      expect(childProcessMock.children).toHaveLength(1);
+      expect(firstChild.child.killed).toBe(false);
+      expect(provider.getActiveWorkSnapshot('route-auth-active')).toMatchObject({
+        activeWorkCount: 1,
+        activeToolCount: 1,
+      });
+
+      firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+      await waitForCondition(
+        () => provider.getActiveWorkSnapshot('route-auth-active')?.activeWorkCount === 0,
+      );
+
+      await provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' });
+      expect(childProcessMock.children).toHaveLength(2);
+      expect(firstChild.child.killed).toBe(true);
+      expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'initialize')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not emit a connection error when the app-server exits with no current work', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-no-work-disconnect', cwd: '/tmp/project' });
+    childProcessMock.children[0]!.child.emit('exit', 1);
+    await flush();
+
+    expect(errors).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-no-work-disconnect')).toMatchObject({
+      active: false,
+      runningTurnId: null,
+      turnStartInFlight: false,
+    });
+  });
+
+  it('terminalizes active current work before reporting app-server crash exit', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-active-crash', cwd: '/tmp/project' });
+    await provider.send('route-active-crash', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-active-crash')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-crash', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-crash' && tool.status === 'running'));
+
+    child.child.emit('exit', 2);
+
+    await waitForCondition(() => errors.length === 1 && tools.some((tool) => tool.id === 'ws-crash' && tool.status === 'error'));
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: false,
+    });
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-crash',
+      status: 'error',
+      terminalStatus: 'errored',
+      terminalReason: 'app_server_disconnect',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: 'app_server_disconnect',
+      lifecycleItemKind: 'web_search',
+    }));
+    expect(provider.getActiveWorkSnapshot('route-active-crash')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('terminalizes active current work before reporting app-server stdout EOF', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-active-eof', cwd: '/tmp/project' });
+    await provider.send('route-active-eof', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-active-eof')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-eof', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-eof' && tool.status === 'running'));
+
+    child.child.stdout.end();
+
+    await waitForCondition(() => errors.length === 1 && tools.some((tool) => tool.id === 'ws-eof' && tool.status === 'error'));
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: false,
+    });
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-eof',
+      status: 'error',
+      terminalStatus: 'errored',
+      terminalReason: 'unexpected_eof',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: 'unexpected_eof',
+      lifecycleItemKind: 'web_search',
+    }));
+    expect(provider.getActiveWorkSnapshot('route-active-eof')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('terminalizes open provider tools during intentional app-server shutdown without connection error', async () => {
+    const provider = new CodexSdkProvider();
+    const errors: ProviderError[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-intentional-shutdown', cwd: '/tmp/project' });
+    await provider.send('route-intentional-shutdown', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-intentional-shutdown')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0]!;
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-shutdown', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-shutdown' && tool.status === 'running'));
+
+    await provider.disconnect();
+
+    expect(errors).toEqual([]);
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-shutdown',
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: 'provider_cancelled',
+      terminalSynthetic: true,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: 'provider_cancelled',
+      lifecycleItemKind: 'web_search',
+    }));
   });
 
   it('emits SDK sub-agent snapshots for Codex collaboration start, completion, and failure', async () => {
@@ -513,6 +742,92 @@ describe('CodexSdkProvider', () => {
       normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
       active: false,
       terminal: true,
+    });
+  });
+
+  it('terminalizes open SDK sub-agent details when closing provider tool calls', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-close-open', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-close-open', 'spawn a helper that reports only wrapper running');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'collab-open-wrapper',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'pendingInit' } },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'collab-open-wrapper',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'pendingInit' } },
+    }));
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        turn: { id: 'turn-1', status: 'completed' },
+      },
+    });
+    await waitForCondition(() => tools.length === 3);
+
+    expect(tools[2]).toMatchObject({
+      id: 'collab-open-wrapper',
+      name: 'Codex Collaboration',
+      status: 'complete',
+      output: 'completed',
+    });
+    const detail = expectCodexSubagentDetail(tools[2]!);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-close-open', 'collab-open-wrapper'),
+      rawStatus: 'completed',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      runningChildCount: 0,
+    });
+  });
+
+  it('closes prior Codex collaboration wrapper rows when terminal evidence uses a different call id', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-collab-different-terminal-id', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-collab-different-terminal-id', 'spawn then wait for a helper');
+    const child = childProcessMock.children[0];
+    emitCodexItem(child, 'item/started', collabItem({
+      id: 'spawn-call-id',
+      status: 'inProgress',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'pendingInit' } },
+    }));
+    emitCodexItem(child, 'item/completed', collabItem({
+      id: 'wait-call-id',
+      status: 'completed',
+      receiverThreadIds: ['agent-a'],
+      agentsStates: { 'agent-a': { status: 'completed' } },
+    }));
+    await waitForCondition(() => tools.length === 3);
+
+    const closedSpawn = tools.find((tool) => tool.id === 'spawn-call-id' && tool.status === 'complete');
+    expect(closedSpawn).toBeTruthy();
+    const closedDetail = expectCodexSubagentDetail(closedSpawn!);
+    expect(closedDetail.meta).toMatchObject({
+      canonicalKey: makeCodexSubagentCanonicalKey('route-collab-different-terminal-id', 'spawn-call-id'),
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      rawStatus: 'completed',
+      active: false,
+      terminal: true,
+      runningChildCount: 0,
     });
   });
 
@@ -1102,7 +1417,7 @@ describe('CodexSdkProvider', () => {
         },
       ]);
 
-      await waitForCondition(() => tools.length === 1);
+      await waitForCondition(() => tools.length === 1, 15_000);
 
       expect(tools[0]).toMatchObject({
         id: 'call-rollout-plan-polled',
@@ -1266,6 +1581,21 @@ describe('CodexSdkProvider', () => {
       terminal: false,
       backgrounded: true,
     });
+    expect(typeof runningDetail.meta.startedAtMs).toBe('number');
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null },
+      },
+    });
+    await flush();
+    expect(provider.getActiveWorkSnapshot('route-raw-spawn-agent')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
 
     child.emits({
       method: 'thread/tokenUsage/updated',
@@ -1296,6 +1626,12 @@ describe('CodexSdkProvider', () => {
       terminal: false,
       backgrounded: true,
     });
+    expect(usageDetail.meta.startedAtMs).toBe(runningDetail.meta.startedAtMs);
+    expect(provider.getActiveWorkSnapshot('route-raw-spawn-agent')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
 
     child.emits({
       method: 'thread/status/changed',
@@ -1323,6 +1659,7 @@ describe('CodexSdkProvider', () => {
       terminal: true,
       backgrounded: true,
     });
+    expect(completeDetail.meta.startedAtMs).toBe(runningDetail.meta.startedAtMs);
 
     child.emits({
       method: 'thread/tokenUsage/updated',
@@ -1336,6 +1673,305 @@ describe('CodexSdkProvider', () => {
     });
     await flush();
     expect(tools).toHaveLength(3);
+  });
+
+  it('emits backgrounded SDK sub-agent snapshots from Codex child rollout metadata', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-'));
+    const provider = new CodexSdkProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({ sessionKey: 'route-child-rollout-subagent', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      const rolloutStartedAt = new Date('2026-06-01T00:00:00.000Z');
+      const rolloutPath = await writeCodexRolloutFile(codexHome, 'child-rollout-only', [
+        {
+          timestamp: rolloutStartedAt.toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f-child-rollout-only',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'thread-1',
+                  agent_nickname: 'Rawls',
+                  agent_role: 'default',
+                },
+              },
+            },
+            agent_nickname: 'Rawls',
+            agent_role: 'default',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'turn_context',
+          payload: { model: 'gpt-5.5' },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'Wait for 200 seconds',
+          },
+        },
+      ]);
+
+      await provider.send('route-child-rollout-subagent', 'spawn a child helper');
+      await waitForCondition(() => tools.length === 1);
+
+      const expectedKey = makeCodexSubagentCanonicalKey(
+        'route-child-rollout-subagent',
+        'runtime:019f-child-rollout-only',
+      );
+      expect(tools[0]).toMatchObject({
+        id: expectedKey,
+        name: 'Codex Sub-agent',
+        status: 'running',
+        input: { action: 'codex-runtime-subagent', description: 'Wait for 200 seconds' },
+      });
+      const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(runningDetail.meta).toMatchObject({
+        canonicalKey: expectedKey,
+        agentPath: '019f-child-rollout-only',
+        agentName: 'Rawls',
+        model: 'gpt-5.5',
+        rawStatus: 'running',
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
+        backgrounded: true,
+        startedAtMs: rolloutStartedAt.getTime(),
+      });
+
+      await appendFile(rolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          last_agent_message: '子代理 200 秒计时完成。',
+          duration_ms: 200_000,
+        },
+      })}\n`);
+
+      await waitForCondition(() => tools.length === 2, 15_000);
+      expect(tools[1]).toMatchObject({
+        id: expectedKey,
+        name: 'Codex Sub-agent',
+        status: 'complete',
+        output: '子代理 200 秒计时完成。',
+      });
+      const completeDetail = expectCodexSubagentDetail(tools[1]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(completeDetail.meta).toMatchObject({
+        canonicalKey: expectedKey,
+        rawStatus: 'completed',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        backgrounded: true,
+        startedAtMs: rolloutStartedAt.getTime(),
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('completes raw spawn_agent sub-agents from child rollout even when rollout parent id differs', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-agent-id-'));
+    const provider = new CodexSdkProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({ sessionKey: 'route-child-rollout-agent-id', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-child-rollout-agent-id', 'spawn a helper');
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call',
+            name: 'spawn_agent',
+            call_id: 'call-spawn-rollout-agent-id',
+            arguments: JSON.stringify({ message: 'Wait for 60 seconds' }),
+          },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call_output',
+            call_id: 'call-spawn-rollout-agent-id',
+            output: JSON.stringify({
+              agent_id: '019f09e7-6e21-7493-a591-d55acec21e85',
+              nickname: 'Chandrasekhar',
+            }),
+          },
+        },
+      });
+      await waitForCondition(() => tools.length === 1);
+
+      await writeCodexRolloutFile(codexHome, '019f09e7-6e21-7493-a591-d55acec21e85', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f09e7-6e21-7493-a591-d55acec21e85',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'codex-cli-parent-rollout-id-not-thread-1',
+                  agent_nickname: 'Chandrasekhar',
+                },
+              },
+            },
+            agent_nickname: 'Chandrasekhar',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            last_agent_message: 'Codex 子代理状态测试完成。',
+          },
+        },
+      ]);
+
+      await waitForCondition(() => tools.some((tool) => tool.status === 'complete'), 10000);
+      const completedTool = tools.find((tool) => tool.status === 'complete')!;
+      expect(completedTool).toMatchObject({
+        id: makeCodexSubagentCanonicalKey(
+          'route-child-rollout-agent-id',
+          'runtime:019f09e7-6e21-7493-a591-d55acec21e85',
+        ),
+        name: 'Codex Sub-agent',
+        status: 'complete',
+        output: 'Codex 子代理状态测试完成。',
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers child rollout sub-agents by IM.codes session identity when Codex parent id differs', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-session-'));
+    const provider = new CodexSdkProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({
+        sessionKey: '89545d81-5ea0-4cf1-8eb3-8d0e9ff188a9',
+        sessionName: 'route-child-rollout-session',
+        cwd: '/tmp/project',
+      });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('89545d81-5ea0-4cf1-8eb3-8d0e9ff188a9', 'spawn a helper through the SDK wrapper');
+      const child = childProcessMock.children[0];
+      emitCodexItem(child, 'item/started', collabItem({
+        id: 'call-wrapper-spawn',
+        status: 'inProgress',
+        receiverThreadIds: ['unknown-pending-child'],
+        agentsStates: { 'unknown-pending-child': { status: 'pendingInit' } },
+        prompt: 'Wait for 45 seconds',
+      }));
+
+      await writeCodexRolloutFile(codexHome, '019f09f3-10d1-7832-91ae-666517d65455', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f09f3-10d1-7832-91ae-666517d65455',
+            cwd: '/tmp/project',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'codex-cli-parent-rollout-id-not-thread-1',
+                  agent_nickname: 'Linnaeus',
+                  agent_role: 'default',
+                },
+              },
+            },
+            agent_nickname: 'Linnaeus',
+            agent_role: 'default',
+            base_instructions: {
+              text: [
+                'You are Codex.',
+                '',
+                '# IM.codes runtime instructions',
+                '',
+                '- Exact session name: route-child-rollout-session',
+                '- Display label: route-child-rollout-session',
+              ].join('\n'),
+            },
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'Wait for 45 seconds',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            last_agent_message: 'Codex SDK 子代理 UI 状态测试完成。',
+          },
+        },
+      ]);
+
+      await waitForCondition(
+        () => tools.some((tool) => (
+          tool.name === 'Codex Sub-agent'
+          && tool.status === 'complete'
+        )),
+        10000,
+      );
+      const runtimeTool = tools.find((tool) => tool.name === 'Codex Sub-agent' && tool.status === 'complete')!;
+      const expectedKey = makeCodexSubagentCanonicalKey(
+        '89545d81-5ea0-4cf1-8eb3-8d0e9ff188a9',
+        'runtime:019f09f3-10d1-7832-91ae-666517d65455',
+      );
+      expect(runtimeTool).toMatchObject({
+        id: expectedKey,
+        name: 'Codex Sub-agent',
+        status: 'complete',
+        input: { action: 'codex-runtime-subagent', description: 'Wait for 45 seconds' },
+        output: 'Codex SDK 子代理 UI 状态测试完成。',
+      });
+      const detail = expectCodexSubagentDetail(runtimeTool, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(detail.meta).toMatchObject({
+        canonicalKey: expectedKey,
+        agentPath: '019f09f3-10d1-7832-91ae-666517d65455',
+        agentName: 'Linnaeus',
+        rawStatus: 'completed',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        active: false,
+        terminal: true,
+        backgrounded: true,
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('marks raw spawn_agent sub-agent rows complete from child turn completion', async () => {
@@ -1736,6 +2372,13 @@ describe('CodexSdkProvider', () => {
       'currentTextLength',
       'deferredIdleSettleTurnId',
       'deferredCompactSettleTurnId',
+      'heartbeatFailureCount',
+      'heartbeatInFlight',
+      'heartbeatLeaseActive',
+      'heartbeatLeaseTurnId',
+      'lastAliveHeartbeatAtMs',
+      'lastHeartbeatAttemptAtMs',
+      'lastHeartbeatResponseAtMs',
       'loaded',
       'provider',
       'rawChecklistPollArmed',
@@ -1815,6 +2458,10 @@ describe('CodexSdkProvider', () => {
     // must not end the turn (no idle timers, no guessing when the turn ends).
     // Emit idle BEFORE the agent message: if idle wrongly completed the turn,
     // the later turn/completed would be de-duped and 'Done' would never surface.
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'active' },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
     child.emits({
       method: 'item/completed',
@@ -1857,6 +2504,10 @@ describe('CodexSdkProvider', () => {
     child.emits({
       method: 'item/completed',
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+    });
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'turn-1', status: 'completed', current: false }],
     });
     child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
@@ -1932,7 +2583,7 @@ describe('CodexSdkProvider', () => {
     });
   });
 
-  it('defers turn/completed while a Codex commandExecution item is active', async () => {
+  it('terminalizes active Codex commandExecution items on turn/completed', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-turn-completed-active-command', cwd: '/tmp/project' });
@@ -1971,25 +2622,13 @@ describe('CodexSdkProvider', () => {
       },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(completed).toEqual([]);
-    expect(provider.getSessionDiagnostics('route-turn-completed-active-command')).toMatchObject({
-      runningTurnId: 'turn-1',
-      activeToolItemCount: 1,
-      deferredIdleSettleTurnId: 'turn-1',
-    });
-
-    child.emits({
-      method: 'item/completed',
-      params: {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        item: { id: 'cmd-1', type: 'commandExecution', status: 'completed', exitCode: 0 },
-      },
-    });
-
     await waitForCondition(() => completed.length === 1);
     expect(completed[0]).toContain('Done after command');
+    expect(provider.getSessionDiagnostics('route-turn-completed-active-command')).toMatchObject({
+      runningTurnId: null,
+      activeToolItemCount: 0,
+      deferredIdleSettleTurnId: null,
+    });
   });
 
   it('resumes with stored thread id on existing session', async () => {
@@ -3393,6 +4032,262 @@ describe('CodexSdkProvider', () => {
     expect(detail.input).toEqual({ query: 'apple stock today', action: { type: 'search', query: 'apple stock today' } });
   });
 
+  it('terminalizes a WebSearch started event when the turn completes without item/completed', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-start-only-turn-complete', cwd: '/tmp/project' });
+
+    const tools: Array<Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'input' | 'terminalStatus' | 'terminalReason' | 'terminalSynthetic' | 'terminalSource' | 'terminalDecisionReason' | 'terminalIdempotencyKey' | 'turnId' | 'lifecycleItemKind'>> = [];
+    provider.onToolCall((_, tool) => tools.push({
+      id: tool.id,
+      name: tool.name,
+      status: tool.status,
+      input: tool.input,
+      terminalStatus: tool.terminalStatus,
+      terminalReason: tool.terminalReason,
+      terminalSynthetic: tool.terminalSynthetic,
+      terminalSource: tool.terminalSource,
+      terminalDecisionReason: tool.terminalDecisionReason,
+      terminalIdempotencyKey: tool.terminalIdempotencyKey,
+      turnId: tool.turnId,
+      lifecycleItemKind: tool.lifecycleItemKind,
+    }));
+
+    await provider.send('route-websearch-start-only-turn-complete', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-start-only-turn-complete')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-start-only', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.length === 1);
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+
+    await waitForCondition(() => tools.length === 2);
+    expect(tools).toEqual([
+      expect.objectContaining({ id: 'ws-start-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
+      expect.objectContaining({
+        id: 'ws-start-only',
+        name: 'WebSearch',
+        status: 'complete',
+        input: { query: '(other)' },
+        terminalStatus: 'succeeded',
+        terminalReason: 'app_server_completed',
+        terminalSynthetic: true,
+        terminalSource: 'app_server_jsonrpc',
+        terminalDecisionReason: 'app_server_completed',
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      }),
+    ]);
+    expect(tools[1]?.terminalIdempotencyKey).toContain('ws-start-only:succeeded:app_server_completed');
+  });
+
+  it('reports turn-start in-flight as provider active work until Codex returns a turn id', async () => {
+    childProcessMock.setHoldTurnStart(true);
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-turn-start-snapshot', cwd: '/tmp/project' });
+
+    const sendPromise = provider.send('route-turn-start-snapshot', 'hello');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-turn-start-snapshot')?.turnStartInFlight === true,
+    );
+
+    expect(provider.getActiveWorkSnapshot('route-turn-start-snapshot')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
+
+    childProcessMock.releaseHeldTurnStarts();
+    await sendPromise;
+  });
+
+  it('reports started-only WebSearch provider tools in the active-work snapshot', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-snapshot', cwd: '/tmp/project' });
+
+    await provider.send('route-websearch-snapshot', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-snapshot')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-snapshot', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(
+      () => provider.getActiveWorkSnapshot('route-websearch-snapshot')?.activeToolCount === 1,
+    );
+
+    expect(provider.getActiveWorkSnapshot('route-websearch-snapshot')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+    });
+  });
+
+  it('terminalizes orphan provider tools on cancel when app-server no longer has a running turn id', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-orphan-cancel', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    const errors: string[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    provider.onError((_, error) => errors.push(error.code));
+
+    await provider.send('route-websearch-orphan-cancel', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-orphan-cancel')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-orphan-cancel', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(
+      () => provider.getActiveWorkSnapshot('route-websearch-orphan-cancel')?.activeToolCount === 1,
+    );
+
+    const state = (provider as unknown as {
+      sessions: Map<string, { runningTurnId?: string; turnStartInFlight: boolean }>;
+    }).sessions.get('route-websearch-orphan-cancel')!;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+
+    await provider.cancel('route-websearch-orphan-cancel');
+
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+    expect(errors).toContain(PROVIDER_ERROR_CODES.CANCELLED);
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-orphan-cancel',
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: 'user_cancelled',
+      terminalSynthetic: true,
+      terminalSource: 'daemon_synthetic',
+      terminalDecisionReason: 'user_cancelled',
+      lifecycleItemKind: 'web_search',
+    }));
+    expect(provider.getActiveWorkSnapshot('route-websearch-orphan-cancel')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+  });
+
+  it('abandons stale open provider tools at the next send boundary before starting a new turn', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-rollover', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-websearch-rollover', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-rollover')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-rollover', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.some((tool) => tool.id === 'ws-rollover' && tool.status === 'running'));
+
+    const state = (provider as unknown as {
+      sessions: Map<string, { runningTurnId?: string; turnStartInFlight: boolean }>;
+    }).sessions.get('route-websearch-rollover')!;
+    state.runningTurnId = undefined;
+    state.turnStartInFlight = false;
+
+    await provider.send('route-websearch-rollover', 'next');
+
+    expect(tools).toContainEqual(expect.objectContaining({
+      id: 'ws-rollover',
+      status: 'error',
+      terminalStatus: 'abandoned',
+      terminalReason: 'generation_rollover',
+      terminalSynthetic: true,
+      terminalSource: 'daemon_synthetic',
+      terminalDecisionReason: 'generation_rollover',
+      lifecycleItemKind: 'web_search',
+    }));
+  });
+
+  it('terminalizes a WebSearch started event when thread-idle settles a turn without turn/completed', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch-start-only-idle-settle', cwd: '/tmp/project' });
+
+    const tools: Array<Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'input' | 'terminalStatus' | 'terminalReason' | 'terminalSynthetic' | 'terminalSource' | 'terminalDecisionReason' | 'terminalIdempotencyKey' | 'turnId' | 'lifecycleItemKind'>> = [];
+    const completed: string[] = [];
+    provider.onToolCall((_, tool) => tools.push({
+      id: tool.id,
+      name: tool.name,
+      status: tool.status,
+      input: tool.input,
+      terminalStatus: tool.terminalStatus,
+      terminalReason: tool.terminalReason,
+      terminalSynthetic: tool.terminalSynthetic,
+      terminalSource: tool.terminalSource,
+      terminalDecisionReason: tool.terminalDecisionReason,
+      terminalIdempotencyKey: tool.terminalIdempotencyKey,
+      turnId: tool.turnId,
+      lifecycleItemKind: tool.lifecycleItemKind,
+    }));
+    provider.onComplete((_, message) => completed.push(message.content));
+
+    await provider.send('route-websearch-start-only-idle-settle', 'search');
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-websearch-start-only-idle-settle')?.runningTurnId === 'turn-1',
+    );
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-idle-only', type: 'webSearch', action: { type: 'other' } } },
+    });
+    await waitForCondition(() => tools.length === 1);
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
+    });
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'turn-1', status: 'completed', current: false }],
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+
+    await waitForCondition(() => completed.length === 1 && tools.length === 2);
+    expect(completed).toEqual(['Done.']);
+    expect(tools).toEqual([
+      expect.objectContaining({ id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
+      expect.objectContaining({
+        id: 'ws-idle-only',
+        name: 'WebSearch',
+        status: 'complete',
+        input: { query: '(other)' },
+        terminalStatus: 'succeeded',
+        terminalReason: 'thread_idle_settle',
+        terminalSynthetic: true,
+        terminalSource: 'daemon_synthetic',
+        terminalDecisionReason: 'thread_idle_settle',
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      }),
+    ]);
+    expect(tools[1]?.terminalIdempotencyKey).toContain('ws-idle-only:succeeded:thread_idle_settle');
+  });
+
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
@@ -3574,5 +4469,475 @@ describe('CodexSdkProvider', () => {
       { status: 'thinking', label: 'Thinking...' },
       { status: null, label: null },
     ]);
+  });
+
+  it('heartbeats active turns with thread/read, classifies active/degraded without using turn/interrupt, and never polls idle sessions', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-active', cwd: '/tmp/project' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-idle', cwd: '/tmp/project' });
+
+    const errors: Array<{ code: string; details?: unknown }> = [];
+    provider.onError((_sid, error) => errors.push({ code: error.code, details: error.details }));
+
+    await provider.send('route-heartbeat-active', 'hello');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: { type: 'active' } },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
+
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(child.requests.filter((req) => req.method === 'thread/read')).toHaveLength(1);
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+    expect(errors).toEqual([]);
+    const activeDiagnostics = provider.getSessionDiagnostics('route-heartbeat-active')!;
+    expect(activeDiagnostics.lastHeartbeatAttemptAtMs).toEqual(expect.any(Number));
+    expect(activeDiagnostics.lastHeartbeatResponseAtMs).toEqual(expect.any(Number));
+    expect(activeDiagnostics.lastAliveHeartbeatAtMs).toBe(activeDiagnostics.lastHeartbeatResponseAtMs);
+
+    // Timeout-only/degraded evidence is never sdk_turn_lost and still does not
+    // use the destructive interrupt RPC as a liveness probe.
+    await vi.advanceTimersByTimeAsync(30_500);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(child.requests.filter((req) => req.method === 'thread/read').length).toBeGreaterThanOrEqual(2);
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+    expect(errors.some((entry) => (entry.details as any)?.reason === 'sdk_turn_lost')).toBe(false);
+    const timeoutDiagnostics = provider.getSessionDiagnostics('route-heartbeat-active')!;
+    expect(timeoutDiagnostics.lastHeartbeatAttemptAtMs as number).toBeGreaterThan(activeDiagnostics.lastHeartbeatAttemptAtMs as number);
+    expect(timeoutDiagnostics.lastHeartbeatResponseAtMs).toBe(activeDiagnostics.lastHeartbeatResponseAtMs);
+    expect(timeoutDiagnostics.lastAliveHeartbeatAtMs).toBe(activeDiagnostics.lastAliveHeartbeatAtMs);
+    await provider.disconnect();
+  }, 60_000);
+
+  // Regression (deck_cd_brain zombie turn): codex core finished the turn —
+  // the rollout recorded `task_complete` — but the app-server never sent
+  // `turn/completed` and `thread/read` kept reporting the turn active. The
+  // provider must cross-check the rollout once the event stream is silent past
+  // the confirm threshold and settle the turn from that durable evidence,
+  // instead of staying "working" until the daemon's 30-min last resort.
+  it('settles a zombie turn from rollout task_complete evidence when heartbeats keep reporting active', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-turn-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-zombie-turn', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+      const errors: Array<{ code: string }> = [];
+      provider.onError((_sid, error) => errors.push({ code: error.code }));
+
+      await provider.send('route-zombie-turn', 'finish the openspec change');
+      const child = childProcessMock.children[0];
+
+      // codex core records the turn as complete in the rollout, but the
+      // app-server keeps answering thread/read with an active current turn.
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-1',
+            last_agent_message: '已按完整 OpenSpec 流程处理完变更',
+          },
+        },
+      ]);
+      const zombieReadResult = {
+        thread: { id: 'thread-1', status: { type: 'active' } },
+        turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+      };
+      childProcessMock.enqueueThreadReadResult(zombieReadResult);
+      childProcessMock.enqueueThreadReadResult(zombieReadResult);
+
+      // task_complete is already durable in the rollout, but below the confirm
+      // gate the provider stays working (no premature settle from a turn that
+      // could still be streaming):
+      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(completed).toHaveLength(0);
+
+      // The dedicated rollout-settle poll then finds task_complete for turn-1 a
+      // few seconds later — long before the ~20s heartbeat or the 30-min last
+      // resort. Advance in small async steps so the real fs read resolves under
+      // fake timers.
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(1);
+      expect(completed[0]).toMatchObject({ role: 'assistant', status: 'complete' });
+      // Settled from evidence — never via the destructive interrupt RPC, and
+      // never surfaced as an error.
+      expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+      expect(errors).toEqual([]);
+      const diagnostics = provider.getSessionDiagnostics('route-zombie-turn')!;
+      expect(diagnostics.heartbeatLeaseActive).toBe(false);
+
+      // A follow-up turn dispatches normally after the zombie settle.
+      await provider.send('route-zombie-turn', 'next task');
+      expect(child.requests.filter((req) => req.method === 'turn/start').length).toBeGreaterThanOrEqual(2);
+      await provider.disconnect();
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('does not settle from rollout evidence when task_complete belongs to a different turn', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-other-turn-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-zombie-other', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+
+      await provider.send('route-zombie-other', 'long real work');
+      // Stale record from a PREVIOUS turn only — the current turn (turn-1) is
+      // genuinely still running and must not be settled.
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-0', last_agent_message: 'previous turn' },
+        },
+      ]);
+      const activeReadResult = {
+        thread: { id: 'thread-1', status: { type: 'active' } },
+        turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+      };
+      childProcessMock.enqueueThreadReadResult(activeReadResult);
+      childProcessMock.enqueueThreadReadResult(activeReadResult);
+      childProcessMock.enqueueThreadReadResult(activeReadResult);
+
+      await vi.advanceTimersByTimeAsync(50_100);
+      for (let i = 0; i < 300; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(0);
+      const diagnostics = provider.getSessionDiagnostics('route-zombie-other')!;
+      expect(diagnostics.heartbeatLeaseActive).toBe(true);
+      await provider.disconnect();
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('enforces provider-wide heartbeat cap and releases capacity exactly once when an in-flight lease is cleared', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    let provider: CodexSdkProvider | undefined;
+    try {
+      provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      for (const sessionKey of ['route-heartbeat-cap-1', 'route-heartbeat-cap-2', 'route-heartbeat-cap-3']) {
+        await provider.createSession({ sessionKey, cwd: '/tmp/project' });
+        await provider.send(sessionKey, `hello ${sessionKey}`);
+      }
+      const child = childProcessMock.children[0];
+
+      await vi.advanceTimersByTimeAsync(50_100);
+      await vi.advanceTimersByTimeAsync(0);
+
+      let reads = child.requests.filter((req) => req.method === 'thread/read');
+      expect(reads).toHaveLength(2);
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-1')).toMatchObject({ heartbeatInFlight: true });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: true });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: false });
+
+      await provider.cancel('route-heartbeat-cap-1');
+      child.emits({
+        id: reads[0]!.id,
+        result: {
+          thread: { id: 'thread-1', status: { type: 'active' } },
+          turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The capped third lease was rescheduled instead of spinning at 0ms.
+      // Once in-flight requests settle, exactly one new heartbeat can enter.
+      await vi.advanceTimersByTimeAsync(20_100);
+      await vi.advanceTimersByTimeAsync(0);
+      reads = child.requests.filter((req) => req.method === 'thread/read');
+      expect(reads).toHaveLength(3);
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: false });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: true });
+
+      child.emits({
+        id: reads[2]!.id,
+        result: {
+          thread: { id: 'thread-1', status: { type: 'active' } },
+          turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-2')).toMatchObject({ heartbeatInFlight: false });
+      expect(provider.getSessionDiagnostics('route-heartbeat-cap-3')).toMatchObject({ heartbeatInFlight: false });
+    } finally {
+      await provider?.disconnect().catch(() => {});
+      randomSpy.mockRestore();
+    }
+  }, 60_000);
+
+  it('normalizes heartbeat status aliases and treats malformed/ambiguous/unknown summaries as inconclusive', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-aliases', cwd: '/tmp/project' });
+
+    const errors: Array<{ message: string; details?: unknown }> = [];
+    provider.onError((_sid, error) => errors.push({ message: error.message, details: error.details }));
+
+    await provider.send('route-heartbeat-aliases', 'hello');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread_status: { state: 'running' },
+      turns: [{ id: 'turn-1', status: 'in_progress', current: true }],
+    });
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const aliveAfterActive = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastAliveHeartbeatAtMs;
+    const responseAfterActive = provider.getSessionDiagnostics('route-heartbeat-aliases')?.lastHeartbeatResponseAtMs;
+    expect(aliveAfterActive).toEqual(expect.any(Number));
+    expect(responseAfterActive).toBe(aliveAfterActive);
+
+    childProcessMock.enqueueThreadReadResult(() => {
+      vi.setSystemTime(Date.now() + 1);
+      return { thread: { status: 'idle' } };
+    });
+    await vi.advanceTimersByTimeAsync(25_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const afterMalformed = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
+    expect(afterMalformed.lastHeartbeatResponseAtMs as number).toBeGreaterThan(responseAfterActive as number);
+    expect(afterMalformed.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
+
+    childProcessMock.enqueueThreadReadResult(() => {
+      vi.setSystemTime(Date.now() + 1);
+      return {
+        status: 'idle',
+        turns: [
+          { id: 'turn-a', status: 'inProgress', current: true },
+          { id: 'turn-b', status: 'inProgress', current: true },
+        ],
+      };
+    });
+    await vi.advanceTimersByTimeAsync(25_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const afterAmbiguous = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
+    expect(afterAmbiguous.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterMalformed.lastHeartbeatResponseAtMs as number);
+    expect(afterAmbiguous.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
+
+    childProcessMock.enqueueThreadReadResult(() => {
+      vi.setSystemTime(Date.now() + 1);
+      return { status: 'mystery', turns: [{ id: 'turn-1', status: 'weird' }] };
+    });
+    await vi.advanceTimersByTimeAsync(25_100);
+    await vi.advanceTimersByTimeAsync(0);
+    const afterUnknown = provider.getSessionDiagnostics('route-heartbeat-aliases')!;
+    expect(afterUnknown.lastHeartbeatResponseAtMs as number).toBeGreaterThan(afterAmbiguous.lastHeartbeatResponseAtMs as number);
+    expect(afterUnknown.lastAliveHeartbeatAtMs).toBe(aliveAfterActive);
+
+    expect(child.requests.filter((req) => req.method === 'thread/read').length).toBeGreaterThanOrEqual(4);
+    expect(errors.some((entry) => (entry.details as any)?.reason === 'sdk_turn_lost')).toBe(false);
+    await provider.disconnect();
+  });
+
+  it('emits privacy-bounded sdk_turn_lost for deterministic idle-missing-turn and notLoaded summaries', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+
+    const errors: Array<{ sid: string; details?: any; message: string; recoverable: boolean }> = [];
+    provider.onError((sid, error) => errors.push({
+      sid,
+      details: error.details,
+      message: error.message,
+      recoverable: error.recoverable,
+    }));
+
+    await provider.createSession({ sessionKey: 'route-heartbeat-lost', sessionName: 'deck_repo_w1', cwd: '/tmp/project' });
+    await provider.send('route-heartbeat-lost', 'secret user prompt');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'other-turn', status: 'completed' }],
+      prompt: 'must-not-leak',
+    });
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ sid: 'route-heartbeat-lost', recoverable: true });
+    expect(errors[0]!.details).toMatchObject({
+      reason: 'sdk_turn_lost',
+      localSessionKey: 'route-heartbeat-lost',
+      sessionName: 'deck_repo_w1',
+      providerId: 'codex-sdk',
+      codexThreadId: 'thread-1',
+      codexTurnId: 'turn-1',
+      classifier: 'idle_missing_turn',
+      replayDecision: 'pending',
+    });
+    expect(JSON.stringify(errors[0]!.details)).not.toContain('secret user prompt');
+    expect(JSON.stringify(errors[0]!.details)).not.toContain('must-not-leak');
+    expect(provider.getSessionDiagnostics('route-heartbeat-lost')).toMatchObject({
+      heartbeatLeaseActive: false,
+      lastAliveHeartbeatAtMs: null,
+    });
+
+    await provider.disconnect();
+
+    const provider2 = new CodexSdkProvider();
+    provider2.onError((sid, error) => errors.push({
+      sid,
+      details: error.details,
+      message: error.message,
+      recoverable: error.recoverable,
+    }));
+    await provider2.connect({ binaryPath: 'codex' });
+    await provider2.createSession({ sessionKey: 'route-heartbeat-notloaded', cwd: '/tmp/project' });
+    await provider2.send('route-heartbeat-notloaded', 'hello again');
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'notLoaded' },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
+    await vi.advanceTimersByTimeAsync(55_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors.at(-1)?.details).toMatchObject({
+      reason: 'sdk_turn_lost',
+      classifier: 'not_loaded_with_active_lease',
+    });
+    await provider2.disconnect();
+  });
+
+  it('makes completed/failed/interrupted local truth deactivate the lease and ignores late strong-looking events', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-terminal', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-heartbeat-terminal', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'late-msg', delta: 'late' } });
+    child.emits({ method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'late-reason', type: 'reasoning' } } });
+    child.emits({ method: 'turn/plan/updated', params: { threadId: 'thread-1', turnId: 'turn-1', plan: [{ step: 'late', status: 'pending' }] } });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'active' } });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(child.requests.some((req) => req.method === 'thread/read')).toBe(false);
+    expect(errors.some((message) => message.includes('lost'))).toBe(false);
+    expect(provider.getSessionDiagnostics('route-heartbeat-terminal')).toMatchObject({
+      runningTurnId: null,
+      heartbeatLeaseActive: false,
+      lastAliveHeartbeatAtMs: null,
+    });
+  });
+
+  it('does not let weak token-usage activity reset strong heartbeat grace indefinitely', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-weak', cwd: '/tmp/project' });
+
+    await provider.send('route-heartbeat-weak', 'hello');
+    const child = childProcessMock.children[0];
+    await vi.advanceTimersByTimeAsync(40_000);
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'thread-1',
+        tokenUsage: { last: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 0 } },
+      },
+    });
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'active' },
+      turns: [{ id: 'turn-1', status: 'inProgress', current: true }],
+    });
+
+    await vi.advanceTimersByTimeAsync(15_100);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(child.requests.some((req) => req.method === 'thread/read')).toBe(true);
+  });
+
+  it('uses heartbeat before idle-settle so idle missing-current-turn is not masked as normal completion', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-idle-lost', cwd: '/tmp/project' });
+
+    const completes: string[] = [];
+    const errors: any[] = [];
+    provider.onComplete((_sid, message) => completes.push(message.content));
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.send('route-heartbeat-idle-lost', 'hello');
+    const child = childProcessMock.children[0];
+    childProcessMock.enqueueThreadReadResult({
+      thread: { id: 'thread-1', status: 'idle' },
+      turns: [{ id: 'different-turn', status: 'completed' }],
+    });
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: 'idle' } });
+    await flush();
+
+    expect(completes).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].details).toMatchObject({
+      reason: 'sdk_turn_lost',
+      classifier: 'idle_missing_turn',
+    });
+  });
+
+  it('cleans heartbeat/tool/compact evidence on disconnect and keeps child/compact scopes isolated from ordinary lost-turn recovery', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-disconnect', cwd: '/tmp/project' });
+
+    const errors: any[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.send('route-heartbeat-disconnect', 'run a tool');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 10' } },
+    });
+    expect(provider.getActiveWorkSnapshot('route-heartbeat-disconnect')?.busyReasons).toContain('provider_tool_item');
+
+    await provider.disconnect();
+    expect(provider.getActiveWorkSnapshot('route-heartbeat-disconnect')).toBeNull();
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-heartbeat-compact', cwd: '/tmp/project' });
+    await provider.send('route-heartbeat-compact', '/compact');
+    child.emits({ method: 'thread/status/changed', params: { threadId: 'unowned-child-thread', status: 'notLoaded' } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors.some((error) => error.details?.reason === 'sdk_turn_lost')).toBe(false);
   });
 });

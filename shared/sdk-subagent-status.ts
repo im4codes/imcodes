@@ -1,5 +1,11 @@
 import type { ToolCallDetail } from './agent-message.js';
 import type { ToolCallEvent } from './agent-message.js';
+import {
+  buildCodexLifecycleTerminalMetadata,
+  type CodexLifecycleEvidenceSource,
+  type ToolTerminalReason,
+  type ToolTerminalStatus,
+} from './session-activity-types.js';
 
 export const SDK_SUBAGENT_DETAIL_KIND = 'sdkSubagent' as const;
 export const SDK_SUBAGENT_SCHEMA_VERSION = 1 as const;
@@ -51,6 +57,7 @@ export const SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES = 4096;
 export const SDK_SUBAGENT_CANONICAL_KEY_MAX_LENGTH = 192;
 export const SDK_SUBAGENT_CANONICAL_COMPONENT_MAX_LENGTH = 48;
 export const SDK_SUBAGENT_MAX_CHILD_COUNT = 999;
+export const SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS = 4_102_444_800_000; // 2100-01-01T00:00:00.000Z
 export const SDK_SUBAGENT_REDACTED_VALUE = '[REDACTED]';
 export const SDK_RUNTIME_SUBAGENT_EVENT_NAMES = [
   'subagent_notification',
@@ -98,6 +105,8 @@ export interface SdkSubagentDetailMeta {
   usageTotalTokens?: number;
   usageToolUses?: number;
   usageDurationMs?: number;
+  /** Stable provider/daemon-observed start timestamp in epoch milliseconds. */
+  startedAtMs?: number;
   diagnosticCode?: SdkSubagentDiagnosticCode;
 }
 
@@ -121,6 +130,7 @@ export type SdkSubagentDetailParseResult =
 
 export interface SdkSubagentSafeDetailOptions {
   allowRaw?: boolean;
+  sessionId?: string;
 }
 
 const PROVIDER_VALUES = new Set<string>(Object.values(SDK_SUBAGENT_PROVIDERS));
@@ -152,6 +162,7 @@ const SAFE_META_NUMBER_KEYS = new Set([
   'usageTotalTokens',
   'usageToolUses',
   'usageDurationMs',
+  'startedAtMs',
 ]);
 const SAFE_META_BOOLEAN_KEYS = new Set(['backgrounded']);
 
@@ -219,6 +230,16 @@ export function parseSdkRuntimeSubagentTag(value: string): Record<string, unknow
   }
 }
 
+export function isBackgroundedSdkSubagentDetail(value: unknown): boolean {
+  if (!isRecord(value) || value.kind !== SDK_SUBAGENT_DETAIL_KIND) return false;
+  const meta = isRecord(value.meta) ? value.meta : undefined;
+  return meta?.isSdkSubagent === true && meta.backgrounded === true;
+}
+
+export function isBackgroundedSdkSubagentTool(tool: Pick<ToolCallEvent, 'detail'>): boolean {
+  return isBackgroundedSdkSubagentDetail(tool.detail);
+}
+
 export function isSdkRuntimeSubagentEventName(value: unknown): boolean {
   return typeof value === 'string' && RUNTIME_SUBAGENT_EVENT_VALUES.has(value);
 }
@@ -240,6 +261,34 @@ function safeFiniteNumber(value: unknown, max = Number.MAX_SAFE_INTEGER): number
   return Math.max(0, Math.min(Math.floor(value), max));
 }
 
+export function normalizeSdkSubagentStartedAtMs(value: unknown): number | undefined {
+  if (typeof value === 'number') return safeFiniteNumber(value, SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS);
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return safeFiniteNumber(numeric, SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS);
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? safeFiniteNumber(parsed, SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS) : undefined;
+}
+
+export function readSdkSubagentStartedAtMs(record: Record<string, unknown>): number | undefined {
+  for (const key of [
+    'startedAtMs',
+    'started_at_ms',
+    'startedAt',
+    'started_at',
+    'createdAtMs',
+    'created_at_ms',
+    'createdAt',
+    'created_at',
+    'startTime',
+    'start_time',
+  ]) {
+    const value = normalizeSdkSubagentStartedAtMs(record[key]);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
 function safeMeta(meta: SdkSubagentDetailMeta): SdkSubagentDetailMeta {
   const next: SdkSubagentDetailMeta = {
     isSdkSubagent: true,
@@ -259,7 +308,9 @@ function safeMeta(meta: SdkSubagentDetailMeta): SdkSubagentDetailMeta {
   for (const key of SAFE_META_NUMBER_KEYS) {
     const max = key === 'receiverIndex' || key === 'receiverCount' || key === 'runningChildCount'
       ? SDK_SUBAGENT_MAX_CHILD_COUNT
-      : 1_000_000_000;
+      : key === 'startedAtMs'
+        ? SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS
+        : 1_000_000_000;
     const value = safeFiniteNumber(meta[key], max);
     if (value !== undefined) next[key] = value;
   }
@@ -363,6 +414,7 @@ export function buildSdkSubagentMinimalReplayDetail(detail: SdkSubagentDetail): 
       ...(safe.meta.diagnosticCode ? { diagnosticCode: safe.meta.diagnosticCode } : {}),
       ...(typeof safe.meta.receiverCount === 'number' ? { receiverCount: safe.meta.receiverCount } : {}),
       ...(typeof safe.meta.runningChildCount === 'number' ? { runningChildCount: safe.meta.runningChildCount } : {}),
+      ...(typeof safe.meta.startedAtMs === 'number' ? { startedAtMs: safe.meta.startedAtMs } : {}),
       ...(safe.meta.rawStatus ? { rawStatus: safe.meta.rawStatus } : {}),
       ...(safe.meta.childStatusSummary ? { childStatusSummary: safe.meta.childStatusSummary } : {}),
     },
@@ -387,10 +439,36 @@ export function buildSdkSubagentTimelinePayload(
       },
     };
   }
+  const terminalStatus = (tool.terminalStatus ?? (tool.status === 'error' ? 'errored' : 'succeeded')) as ToolTerminalStatus;
+  const terminalReason = (tool.terminalReason ?? (tool.status === 'error' ? 'provider_error' : 'provider_result')) as ToolTerminalReason;
+  const lifecycleMetadata = options.sessionId
+    ? buildCodexLifecycleTerminalMetadata({
+      sessionId: options.sessionId,
+      terminalStatus,
+      terminalReason,
+      synthetic: tool.terminalSynthetic ?? false,
+      source: (tool.terminalSource ?? 'app_server_jsonrpc') as CodexLifecycleEvidenceSource,
+      decisionReason: tool.terminalDecisionReason ?? terminalReason,
+      ...(tool.terminalIdempotencyKey ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+      ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+      toolCallId: tool.id,
+      ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+      ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+    })
+    : {
+      terminalStatus,
+      terminalReason,
+      ...(tool.terminalSynthetic !== undefined ? { synthetic: tool.terminalSynthetic } : {}),
+      ...(tool.terminalSource !== undefined ? { source: tool.terminalSource } : {}),
+      ...(tool.terminalDecisionReason !== undefined ? { decisionReason: tool.terminalDecisionReason } : {}),
+      ...(tool.terminalIdempotencyKey !== undefined ? { idempotencyKey: tool.terminalIdempotencyKey } : {}),
+      ...(tool.activityGeneration !== undefined ? { activityGeneration: tool.activityGeneration } : {}),
+      ...(tool.turnId !== undefined ? { turnId: tool.turnId } : {}),
+      ...(tool.lifecycleItemKind !== undefined ? { itemKind: tool.lifecycleItemKind } : {}),
+    };
   const payload: Record<string, unknown> = {
     toolCallId: tool.id,
-    terminalStatus: tool.status === 'error' ? 'errored' : 'succeeded',
-    terminalReason: tool.status === 'error' ? 'provider_error' : 'provider_result',
+    ...lifecycleMetadata,
     detail,
   };
   if (tool.status === 'error') payload.error = detail.output ?? 'error';

@@ -38,7 +38,6 @@ import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersis
 import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
-import { observeTransportQueueRevision } from './transport-queue-revision.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
@@ -59,6 +58,7 @@ import {
   type WorkerSessionSyncStatus,
 } from '../../shared/worker-session-snapshot.js';
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -749,11 +749,7 @@ export async function startup(): Promise<DaemonContext> {
               quotaMeta: session.quotaMeta ?? null,
               effort: session.effort ?? null,
               transportConfig: session.transportConfig ?? null,
-              ...(transportRuntime ? {
-                transportPendingMessages: transportRuntime.pendingMessages,
-                transportPendingMessageEntries: transportRuntime.pendingEntries,
-                transportPendingMessageVersion: observeTransportQueueRevision(session.name, transportRuntime.pendingVersion),
-              } : {}),
+              ...(transportRuntime ? buildTransportQueueSnapshotPayload(session.name, 'lifecycle') : {}),
             });
           } catch { /* ignore */ }
         }
@@ -1585,6 +1581,23 @@ function startHealthPoller(): void {
         });
       } catch (err) {
         logger.warn({ err, sessionName: s.name }, 'transport stale-active-turn recovery sweep error');
+      }
+      // Safety net: rehydrate transport-queue rows that survive only in SQLite
+      // (a message queued behind an in-flight turn before a restart, then the
+      // runtime was rebuilt with an empty in-memory queue) and drain them. The
+      // restore-path rehydrate in restoreTransportSessions can be missed when the
+      // runtime was already bound by another path or an intervening await threw,
+      // so this poller reconciles the desync within one cycle regardless of how
+      // the runtime came to exist. Idempotent: during normal operation the store
+      // rows are already in _pendingMessages and dedup by clientMessageId +
+      // delivery tombstone skips them, so it only acts on genuine orphans.
+      try {
+        const rehydrateRuntime = getTransportRuntime(s.name);
+        if (rehydrateRuntime && rehydrateRuntime.rehydratePendingFromStore() > 0) {
+          rehydrateRuntime.drainPendingIfIdle('health-poll-sqlite-rehydrate');
+        }
+      } catch (err) {
+        logger.warn({ err, sessionName: s.name }, 'transport queue rehydrate sweep error');
       }
     }
     try {

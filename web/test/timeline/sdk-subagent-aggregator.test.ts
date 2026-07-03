@@ -324,6 +324,43 @@ describe('deriveSdkSubagentStatusRows', () => {
     expect(result.rows.map((row) => row.receiverThreadId)).toEqual(['thread-a', 'thread-b']);
   });
 
+  it('marks Codex collaboration wrapper rows stale after a later assistant message', () => {
+    const running = makeEvent('codex-collab-running', makeMeta({
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: 'codex:deck_main_brain:call-spawn',
+      parentItemId: 'call-spawn',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      receiverCount: 1,
+      runningChildCount: 1,
+      childStatusSummary: 'pendingInit:1',
+    }), { ts: NOW - 20_000 });
+    const assistantText: TimelineEvent = {
+      eventId: 'assistant-after-wrapper',
+      sessionId: 'deck_main_brain',
+      ts: NOW - 1_000,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: '已启动子代理。' },
+    };
+
+    const result = deriveSdkSubagentStatusRows([running, assistantText], NOW);
+
+    expect(result.runningCount).toBe(0);
+    expect(result.rows).toMatchObject([{
+      canonicalKey: 'codex:deck_main_brain:call-spawn',
+      normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+      active: false,
+      terminal: true,
+      eventId: 'assistant-after-wrapper',
+    }]);
+  });
+
   it('diagnostic/unknown terminal event deletes active row so runningCount drops to 0', () => {
     // P0 fix: when a diagnostic or unknown-status terminal event arrives for a canonicalKey
     // that already has an active row, the active row must be deleted so runningCount

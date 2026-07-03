@@ -65,6 +65,27 @@ describe('hasActiveToolCall', () => {
     ] as any)).toBe(false);
   });
 
+  it('does not treat a backgrounded SDK sub-agent heartbeat after idle as an active parent tool call', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_main:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+    expect(hasActiveToolCall([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ] as any)).toBe(false);
+  });
+
   it('does not close one keyed tool when another keyed tool completes', () => {
     expect(hasActiveToolCall([
       { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
@@ -99,5 +120,27 @@ describe('getTailSessionState', () => {
       { type: 'assistant.thinking', ts: 1 },
       { type: 'tool.call', payload: { tool: 'Read' } },
     ] as any)).toBe(null);
+  });
+
+  it('keeps the tail session state idle while backgrounded SDK sub-agent heartbeats continue', () => {
+    const sdkDetail = {
+      kind: 'sdkSubagent',
+      meta: {
+        isSdkSubagent: true,
+        schemaVersion: 1,
+        provider: 'codex-sdk',
+        providerKind: 'codexRuntimeAgent',
+        canonicalKey: 'codex:deck_main:runtime:agent-1',
+        normalizedStatus: 'running',
+        active: true,
+        terminal: false,
+        backgrounded: true,
+      },
+    };
+    expect(getTailSessionState([
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+      { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
+    ] as any)).toBe('idle');
   });
 });

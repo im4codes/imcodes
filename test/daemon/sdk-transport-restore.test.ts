@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { isAuthoritativeCleanIdlePayload } from '../../shared/session-activity-types.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -11,6 +12,7 @@ const mocks = vi.hoisted(() => {
 });
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
+const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -123,6 +125,9 @@ vi.mock('../../src/util/logger.js', () => ({
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
+vi.mock('../../src/daemon/timeline-store.js', () => ({
+  timelineStore: { readByTypesPreferred: timelineReadByTypesPreferredMock },
+}));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
@@ -156,8 +161,18 @@ import { getTransportRuntime, launchTransportSession, relaunchSessionWithSetting
 import { newSession } from '../../src/agent/tmux.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_SCHEMA_VERSION,
+  SDK_SUBAGENT_STATUS,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -218,6 +233,28 @@ function forceRuntimeProviderError(
   internal.setStatus('error');
 }
 
+function makeRestoreSdkSubagentDetail(overrides: Partial<SdkSubagentDetail['meta']> = {}): SdkSubagentDetail {
+  return {
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: 'Child agent is running',
+    input: { action: 'start', receiverCount: 1 },
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT,
+      canonicalKey: 'codex:restore:collab:child-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      rawStatus: 'running',
+      active: true,
+      terminal: false,
+      receiverCount: 1,
+      runningChildCount: 1,
+      ...overrides,
+    },
+  };
+}
+
 describe('sdk transport session restore', () => {
   let tempDir: string;
 
@@ -228,6 +265,8 @@ describe('sdk transport session restore', () => {
     mocks.claudeFailures.clear();
     clearAllResend();
     timelineEmitterEmitMock.mockClear();
+    timelineReadByTypesPreferredMock.mockReset();
+    timelineReadByTypesPreferredMock.mockResolvedValue([]);
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
   });
@@ -332,6 +371,60 @@ describe('sdk transport session restore', () => {
     );
   });
 
+  it('restoreTransportSessions rehydrates a SQLite-queued message and dispatches it after restart', async () => {
+    // The "restart doesn't resync the queue" bug: a message queued behind an
+    // in-flight turn is persisted to transport-queue.sqlite, but a fresh daemon
+    // rebuilds the runtime with an EMPTY in-memory queue and never reads the row
+    // back — so it lingers `queued` forever. This exercises the real restore
+    // wiring end to end: seed a `queued` row, restore, assert it drains.
+    resetTransportQueueStoreForTests();
+    const sessionName = 'deck_sdk_cx_rehydrate_brain';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkrehydrate',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-rehydrate',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-rehydrate',
+      codexSessionId: 'codex-thread-rehydrate',
+    });
+
+    // A message that was queued behind an in-flight turn before the crash —
+    // it survives ONLY in SQLite (both in-memory holders are gone on restart).
+    getTransportQueueStore().enqueue({
+      sessionName,
+      clientMessageId: 'msg-restart-recover',
+      commandId: 'msg-restart-recover',
+      text: 'recovered after restart',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-restart-recover', text: 'recovered after restart' }),
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    // The restored+idle runtime rehydrates the row and drains it to the provider.
+    await settleCodexRun(sessionName, 'resume');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('recovered after restart') && Date.now() < deadline) {
+      await flush();
+    }
+    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('recovered after restart');
+
+    // And the persisted row no longer lingers as live `queued` (it dispatched).
+    const stillQueued = getTransportQueueStore()
+      .readSnapshot(sessionName)
+      .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-restart-recover' && entry.status === 'queued');
+    expect(stillQueued).toBe(false);
+  });
+
   it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {
     mocks.store.set('deck_sdk_cancel_idle_brain', {
       name: 'deck_sdk_cancel_idle_brain',
@@ -386,6 +479,18 @@ describe('sdk transport session restore', () => {
     });
     expect(idleCall?.[2]).not.toHaveProperty('error');
     expect(idleCall?.[2]).not.toHaveProperty('reason');
+    // Regression (deck_sub_3l6z4l39 stuck "working" in the web): the emitted
+    // daemon idle MUST satisfy the exact shared validator the web uses to
+    // accept an authoritative clean idle. The payload previously carried only
+    // `pendingMessageVersion` (no numeric `pendingCount`/`pendingVersion`), so
+    // isAuthoritativeIdlePayloadShape failed, every daemon idle was demoted to
+    // a WEAK idle, and any unmatched tool.call kept the session rendered
+    // "working" even after the reconciler proved clean idle.
+    expect(idleCall?.[2]).toMatchObject({
+      pendingCount: expect.any(Number),
+      pendingVersion: expect.any(Number),
+    });
+    expect(isAuthoritativeCleanIdlePayload(idleCall?.[2] as Record<string, unknown>)).toBe(true);
   });
 
   it('reconciles unmatched persisted transport tool calls as daemon restart orphans before restore idle observation', async () => {
@@ -395,6 +500,7 @@ describe('sdk transport session restore', () => {
       sessionId: sessionName,
       toolCallId: 'restore-tool-1',
       tool: 'Bash',
+      activityGeneration: { scope: 'session', sessionName, generation: 7 },
       input: { command: 'SECRET_RESTORE_COMMAND' },
     });
     mocks.store.set(sessionName, {
@@ -441,9 +547,179 @@ describe('sdk transport session restore', () => {
         toolCallId: 'restore-tool-1',
         terminalStatus: 'stale',
         terminalReason: 'daemon_restart_orphan',
+        activityGeneration: { scope: 'session', sessionName, generation: 7 },
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'restore_reconnect_orphan_reconcile',
+        idempotencyKey: expect.stringContaining('restore-tool-1:stale:daemon_restart_orphan'),
       }),
     ]));
     expect(JSON.stringify(replayed)).not.toContain('SECRET_RESTORE_COMMAND');
+  });
+
+  it('reconciles hidden SDK sub-agent timeline rows as daemon restart orphans before restore idle observation', async () => {
+    const sessionName = `deck_sdk_hidden_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const activityGeneration = { scope: 'session', sessionName, generation: 11 };
+    const detail = makeRestoreSdkSubagentDetail();
+    timelineReadByTypesPreferredMock.mockResolvedValue([
+      {
+        eventId: 'hidden-sdk-call',
+        sessionId: sessionName,
+        ts: Date.now(),
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        hidden: true,
+        payload: {
+          toolCallId: 'sdk-hidden-1',
+          tool: 'Task',
+          activityGeneration,
+          turnId: 'turn-hidden-1',
+          input: { action: 'SECRET_CHILD_PROMPT' },
+          detail,
+        },
+      },
+    ]);
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkhidden',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-hidden',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-hidden-orphan',
+      codexSessionId: 'codex-thread-hidden-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 2000 });
+    const terminalIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'tool.result'
+      && call[2]?.toolCallId === 'sdk-hidden-1'
+      && call[2]?.terminalStatus === 'stale'
+      && call[2]?.terminalReason === 'daemon_restart_orphan'
+    );
+    const restoreStateIndex = timelineEmitterEmitMock.mock.calls.findIndex((call) =>
+      call[0] === sessionName
+      && call[1] === 'session.state'
+      && call[2]?.decisionReason === 'restore_reconnect_observed'
+    );
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(restoreStateIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeLessThan(restoreStateIndex);
+    expect(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2]).toMatchObject({
+      activityGeneration,
+      turnId: 'turn-hidden-1',
+      itemKind: 'codex_collaboration',
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        meta: {
+          canonicalKey: 'codex:restore:collab:child-1',
+          normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+          active: false,
+          terminal: true,
+          diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+          runningChildCount: 0,
+        },
+      },
+    });
+    expect(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[3]).toMatchObject({
+      hidden: true,
+      eventId: `transport-tool:${sessionName}:sdk-hidden-1:restore-orphan-result`,
+    });
+    expect(JSON.stringify(timelineEmitterEmitMock.mock.calls[terminalIndex]?.[2])).not.toContain('SECRET_CHILD_PROMPT');
+    expect(timelineEmitterEmitMock.mock.calls[restoreStateIndex]?.[2]).not.toHaveProperty('authoritative');
+  });
+
+  it('scans a broad timeline tail so daemon restart closes older SDK sub-agent rows after noisy restores', async () => {
+    const sessionName = `deck_sdk_hidden_old_orphan_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const detail = makeRestoreSdkSubagentDetail({
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT,
+      canonicalKey: 'codex:restore:runtime:agent-old',
+    });
+    const oldRunning = {
+      eventId: 'hidden-sdk-old-call',
+      sessionId: sessionName,
+      ts: Date.now() - 120_000,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      hidden: true,
+      payload: {
+        toolCallId: 'sdk-hidden-old',
+        tool: 'Codex Sub-agent',
+        detail,
+      },
+    } as const;
+    const noisyTools = Array.from({ length: 350 }, (_, index) => ({
+      eventId: `noise-${index}`,
+      sessionId: sessionName,
+      ts: Date.now() - 60_000 + index,
+      seq: 2 + index,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: index % 2 === 0 ? 'tool.call' : 'tool.result',
+      payload: { toolCallId: `noise-${index}`, tool: 'Bash' },
+    } as const));
+    timelineReadByTypesPreferredMock.mockResolvedValue([oldRunning, ...noisyTools]);
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'sdkhiddenold',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-hidden-old',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-hidden-old-orphan',
+      codexSessionId: 'codex-thread-hidden-old-orphan',
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(timelineReadByTypesPreferredMock).toHaveBeenCalledWith(sessionName, ['tool.call', 'tool.result'], { limit: 2000 });
+    expect(timelineEmitterEmitMock.mock.calls).toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        sessionName,
+        'tool.result',
+        expect.objectContaining({
+          toolCallId: 'sdk-hidden-old',
+          terminalStatus: 'stale',
+          terminalReason: 'daemon_restart_orphan',
+          detail: expect.objectContaining({
+            kind: SDK_SUBAGENT_DETAIL_KIND,
+            meta: expect.objectContaining({
+              canonicalKey: 'codex:restore:runtime:agent-old',
+              normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+              active: false,
+              terminal: true,
+            }),
+          }),
+        }),
+      ]),
+    ]));
   });
 
   it('normalizes the `fable` picker alias to the API id (claude-fable-5) on restore (regression)', async () => {
@@ -652,6 +928,12 @@ describe('sdk transport session restore', () => {
 
     runtime!.send('What token did I ask you to remember?');
     await settleCodexRun('deck_sdk_cx_brain', 'resume');
+    {
+      const deadline = Date.now() + 5_000;
+      while (mocks.store.get('deck_sdk_cx_brain')?.state !== 'idle' && Date.now() < deadline) {
+        await flush();
+      }
+    }
 
     expect(codexRunForSession('deck_sdk_cx_brain', 'resume')).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
     expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
@@ -725,7 +1007,7 @@ describe('sdk transport session restore', () => {
     });
   });
 
-  it('publishes idle after restoring a transport session from stale persisted running state', async () => {
+  it('starts a fresh codex thread after restoring a transport session from persisted running state', async () => {
     const persistedRecords: Array<Record<string, any> | null> = [];
     setSessionPersistCallback(async (record) => {
       persistedRecords.push(record);
@@ -746,6 +1028,8 @@ describe('sdk transport session restore', () => {
       providerId: 'codex-sdk',
       providerSessionId: 'route-cx-stale-running',
       codexSessionId: 'codex-thread-stale-running',
+      startupMemoryInjected: true,
+      recentInjectionHistory: [['memory-old']],
       requestedModel: 'gpt-5.5',
       activeModel: 'gpt-5.5',
     });
@@ -753,11 +1037,18 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    expect(getTransportRuntime('deck_sub_sdk_stale_running')?.getStatus()).toBe('idle');
+    const runtime = getTransportRuntime('deck_sub_sdk_stale_running');
+    expect(runtime?.getStatus()).toBe('idle');
+    expect(runtime?.providerSessionId).not.toBe('route-cx-stale-running');
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.state).toBe('idle');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBeUndefined();
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBeUndefined();
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toBeUndefined();
     expect(persistedRecords.at(-1)).toMatchObject({
       name: 'deck_sub_sdk_stale_running',
       state: 'idle',
+      codexSessionId: undefined,
+      startupMemoryInjected: undefined,
     });
     expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_sub_sdk_stale_running',
@@ -765,12 +1056,30 @@ describe('sdk transport session restore', () => {
       expect.objectContaining({
         state: 'idle',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
-        pendingCount: 0,
-        pendingMessages: [],
         pendingMessageEntries: [],
+        failedMessageEntries: [],
+        pendingMessageVersion: expect.any(Number),
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        queueSnapshot: expect.objectContaining({
+          type: 'transport.queue.snapshot',
+          source: 'restore_reconnect_observed',
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+        }),
       }),
       { source: 'daemon', confidence: 'high' },
     );
+
+    runtime!.send('continue after daemon restart');
+    await settleCodexRun('deck_sub_sdk_stale_running', 'start');
+
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'resume')).toBeUndefined();
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'start')).toMatchObject({
+      mode: 'start',
+      input: 'continue after daemon restart',
+    });
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('thread-restored');
   });
 
   it('emits started idle when launching a new transport session', async () => {

@@ -23,14 +23,15 @@ import {
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
-import { resolveRuntimeScope } from '../../shared/session-scope.js';
+import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
   isMcpFeatureEnabled,
   type MCPFeatureFlagValues,
 } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
-import type { ContextNamespace } from '../../shared/context-types.js';
+import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
+import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionCloneParentStage } from '../../shared/execution-clone.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
@@ -38,7 +39,10 @@ import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type O
 import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
+import { serializeContextNamespace } from '../context/context-keys.js';
+import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
@@ -85,6 +89,17 @@ export interface MemoryMcpToolDeps {
   orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
+  getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
+  archiveMemory?: (id: string) => Promise<boolean> | boolean;
+  restoreArchivedMemory?: (id: string) => Promise<boolean> | boolean;
+  deleteMemory?: (id: string) => Promise<boolean> | boolean;
+  updateProcessedProjectionSummary?: (input: {
+    projectionId: string;
+    summary: string;
+    ownerUserId?: string;
+    updatedByUserId?: string;
+  }) => Promise<ProcessedContextProjection | null> | ProcessedContextProjection | null;
+  recordMemoryHits?: (ids: string[]) => Promise<void> | void;
   sendDeps?: SendToolDeps;
   cronOptions?: CronMcpClientOptions;
   cronCreate?: typeof cronMcpCreate;
@@ -204,9 +219,35 @@ function localUnavailableToolFields(result: Pick<MemoryMcpSearchResult, 'degrade
   return { reason: degradedReasons[0] ?? MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE, degradedReasons };
 }
 
-async function refreshSendSessionStore(deps: MemoryMcpToolDeps): Promise<void> {
-  if (deps.sendDeps?.listSessions) return;
-  await loadStore({ probe: false });
+const SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS = 30_000;
+
+function sendVisibleSiblingCount(caller: McpRuntimeCaller, sessions: SessionRecord[]): number {
+  if (!caller.sessionName) return 0;
+  const callerProjectName = resolveRuntimeScope(caller, sessions).projectName;
+  if (!callerProjectName) return 0;
+  return sessions.filter((session) => (
+    session.state !== 'stopped'
+    && session.name !== caller.sessionName
+    && session.executionCloneMetadata?.kind !== EXECUTION_CLONE_KIND
+    && resolveEffectiveProjectName(session, sessions) === callerProjectName
+  )).length;
+}
+
+function hasSendCaller(caller: McpRuntimeCaller, sessions: SessionRecord[]): boolean {
+  return Boolean(caller.sessionName && sessions.some((session) => session.name === caller.sessionName));
+}
+
+function shouldUsePreviousSendSessions(
+  caller: McpRuntimeCaller,
+  current: SessionRecord[],
+  previous: SessionRecord[] | null,
+  previousAt: number,
+  now: number,
+): previous is SessionRecord[] {
+  if (!previous || previous.length === 0) return false;
+  if (now - previousAt > SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS) return false;
+  if (hasSendCaller(caller, previous) && !hasSendCaller(caller, current)) return true;
+  return sendVisibleSiblingCount(caller, previous) > 0 && sendVisibleSiblingCount(caller, current) === 0;
 }
 
 function memoryGate(
@@ -352,9 +393,78 @@ function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'
   return projectId || undefined;
 }
 
+function canManageProjectionNamespace(projectionNamespace: ContextNamespace, callerNamespace: ContextNamespace, callerUserId: string): boolean {
+  if (serializeContextNamespace(projectionNamespace) === serializeContextNamespace(callerNamespace)) return true;
+  if (projectionNamespace.scope !== 'personal' || callerNamespace.scope !== 'personal') return false;
+  if (!projectionNamespace.projectId || projectionNamespace.projectId !== callerNamespace.projectId) return false;
+  if ((projectionNamespace.enterpriseId ?? undefined) !== (callerNamespace.enterpriseId ?? undefined)) return false;
+  if ((projectionNamespace.workspaceId ?? undefined) !== (callerNamespace.workspaceId ?? undefined)) return false;
+  const projectionUserId = projectionNamespace.userId?.trim();
+  return !projectionUserId || projectionUserId === LEGACY_DAEMON_LOCAL_USER_ID || projectionUserId === callerUserId;
+}
+
+function resolveProjectionRefArg(args: Record<string, unknown>, namespace: ContextNamespace): string | ToolResult {
+  const projectionId = stringArg(args, 'projectionId');
+  const ref = stringArg(args, 'ref');
+  if (projectionId && ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'ref cannot be combined with projectionId');
+  if (projectionId) return projectionId;
+  if (!ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId or ref is required');
+  const resolved = resolveMemoryShortRef(ref, namespace);
+  if (!resolved || resolved.kind !== 'projection') {
+    return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
+  }
+  return resolved.id;
+}
+
+async function loadManageableProjection(
+  projectionId: string,
+  scopedCaller: McpRuntimeCaller,
+  getProcessedProjectionById: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined,
+): Promise<ProcessedContextProjection | ToolResult> {
+  const projectId = callerProjectId(scopedCaller);
+  if (!projectId) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, MEMORY_PROJECT_SCOPE_REASON.UNAVAILABLE);
+  const projection = await getProcessedProjectionById(projectionId);
+  if (!projection || !canManageProjectionNamespace(projection.namespace, scopedCaller.namespace, scopedCaller.userId)) {
+    return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
+  }
+  if (projection.namespace.projectId !== projectId) {
+    return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller project');
+  }
+  return projection;
+}
+
+function isToolResultValue(value: ProcessedContextProjection | ToolResult): value is ToolResult {
+  return !('namespace' in value);
+}
+
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
+  let lastGoodSendSessions: SessionRecord[] | null = null;
+  let lastGoodSendSessionsAt = 0;
+  const sendSessions = async (): Promise<SessionRecord[]> => {
+    if (deps.sendDeps?.listSessions) return deps.sendDeps.listSessions();
+    await loadStore({ probe: false });
+    const current = listStoredSessions();
+    const now = Date.now();
+    const selected = shouldUsePreviousSendSessions(
+      caller,
+      current,
+      lastGoodSendSessions,
+      lastGoodSendSessionsAt,
+      now,
+    ) ? lastGoodSendSessions : current;
+    if (hasSendCaller(caller, selected) || sendVisibleSiblingCount(caller, selected) > 0) {
+      lastGoodSendSessions = selected;
+      lastGoodSendSessionsAt = now;
+    }
+    return selected;
+  };
+  const sendDepsWithSessions = (sessions: SessionRecord[], extra: Partial<SendToolDeps> = {}): SendToolDeps => ({
+    ...deps.sendDeps,
+    ...extra,
+    listSessions: () => sessions,
+  });
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
   // branch without involving cache/cloud resolution.
@@ -366,6 +476,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     ));
   const saveObservationTool = deps.saveObservation ?? saveObservation;
   const savePreferenceTool = deps.savePreference ?? savePreference;
+  const contextStoreClient = () => getContextStoreClient();
+  const getProcessedProjectionById = deps.getProcessedProjectionById
+    ?? ((id: string) => contextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]));
+  const archiveMemory = deps.archiveMemory
+    ?? ((id: string) => contextStoreClient().run<boolean>('archiveMemory', [id]));
+  const restoreArchivedMemory = deps.restoreArchivedMemory
+    ?? ((id: string) => contextStoreClient().run<boolean>('restoreArchivedMemory', [id]));
+  const deleteMemory = deps.deleteMemory
+    ?? ((id: string) => contextStoreClient().run<boolean>('deleteMemory', [id]));
+  const updateProcessedProjectionSummary = deps.updateProcessedProjectionSummary
+    ?? ((input: Parameters<NonNullable<MemoryMcpToolDeps['updateProcessedProjectionSummary']>>[0]) => (
+      contextStoreClient().run<ProcessedContextProjection | null>('updateProcessedProjectionSummary', [input])
+    ));
+  const recordMemoryHits = deps.recordMemoryHits
+    ?? ((ids: string[]) => contextStoreClient().run<void>('recordMemoryHits', [ids]));
   const cronCreate = deps.cronCreate ?? cronMcpCreate;
   const cronUpdate = deps.cronUpdate ?? cronMcpUpdate;
   const cronDelete = deps.cronDelete ?? cronMcpDelete;
@@ -502,6 +627,88 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return sanitizeCaughtError(err);
       }
     },
+    [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: async (input) => {
+      const gate = memorySurfaceGate(deps);
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
+      const scopedCaller = scopedCallerForDeps(caller, deps);
+      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      if (typeof projectionId !== 'string') return projectionId;
+      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      if (isToolResultValue(projection)) return projection;
+      const changed = await archiveMemory(projectionId);
+      if (changed) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: projection.namespace });
+      return { status: 'ok', projectionId, changed };
+    },
+    [MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]: async (input) => {
+      const gate = memorySurfaceGate(deps);
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
+      const scopedCaller = scopedCallerForDeps(caller, deps);
+      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      if (typeof projectionId !== 'string') return projectionId;
+      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      if (isToolResultValue(projection)) return projection;
+      const changed = await restoreArchivedMemory(projectionId);
+      if (changed) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: projection.namespace });
+      return { status: 'ok', projectionId, changed };
+    },
+    [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: async (input) => {
+      const gate = memorySurfaceGate(deps);
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
+      const scopedCaller = scopedCallerForDeps(caller, deps);
+      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      if (typeof projectionId !== 'string') return projectionId;
+      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      if (isToolResultValue(projection)) return projection;
+      const changed = await deleteMemory(projectionId);
+      if (changed) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: projection.namespace });
+      return { status: 'ok', projectionId, changed };
+    },
+    [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: async (input) => {
+      const gate = memorySurfaceGate(deps);
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref', 'text']);
+      const text = stringArg(args, 'text');
+      if (!text) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'text is required');
+      const scopedCaller = scopedCallerForDeps(caller, deps);
+      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      if (typeof projectionId !== 'string') return projectionId;
+      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      if (isToolResultValue(projection)) return projection;
+      const updated = await updateProcessedProjectionSummary({
+        projectionId,
+        summary: text,
+        ownerUserId: scopedCaller.userId,
+        updatedByUserId: scopedCaller.userId,
+      });
+      if (!updated) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
+      publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: updated.namespace });
+      return { status: 'ok', projectionId, changed: true };
+    },
+    [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: async (input) => {
+      const gate = memorySurfaceGate(deps);
+      if (gate) return gate;
+      const args = pickAllowedMcpArgs(input, ['projectionId', 'ref', 'feedback', 'reason']);
+      const feedback = stringArg(args, 'feedback');
+      if (feedback !== 'not_relevant' && feedback !== 'relevant') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'feedback must be not_relevant or relevant');
+      }
+      const scopedCaller = scopedCallerForDeps(caller, deps);
+      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      if (typeof projectionId !== 'string') return projectionId;
+      const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
+      if (isToolResultValue(projection)) return projection;
+      if (feedback === 'not_relevant') {
+        const changed = await archiveMemory(projectionId);
+        if (changed) publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: projection.namespace });
+        return { status: 'ok', projectionId, feedback, action: 'archived', changed };
+      }
+      await recordMemoryHits([projectionId]);
+      publishRuntimeMemoryCacheInvalidation({ kind: 'projection', projectionId, namespace: projection.namespace });
+      return { status: 'ok', projectionId, feedback, action: 'hit_recorded', changed: true };
+    },
     [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.observationStore, MEMORY_MCP_DISABLED_FLAGS.OBSERVATION_STORE);
       if (gate) return gate;
@@ -513,18 +720,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
       return listSendTargets(caller, {
         query: stringArg(args, 'query'),
         limit: numberArg(args, 'limit'),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
-      }) as unknown as ToolResult;
+      })) as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
@@ -536,35 +742,32 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(clone ? { clone } : {}),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
-      }) as unknown as Promise<ToolResult>;
+      })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'idempotencyKey']);
       return dispatchDestroyExecutionClone(caller, {
         target: stringArg(args, 'target'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
-      }) as unknown as Promise<ToolResult>;
+      })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
-      await refreshSendSessionStore(deps);
+      const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['target', 'broadcast', 'idempotencyKey']);
       return dispatchSendStop(caller, {
         target: stringArg(args, 'target'),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
-      }, {
-        ...deps.sendDeps,
+      }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
-      }) as unknown as Promise<ToolResult>;
+      })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
@@ -673,6 +876,29 @@ const schemas = {
     observationId: z.string().optional().describe('Observation id returned by search_memory for a relevant observation hit.'),
     ref: z.string().optional().describe('Compact ref returned by search_memory or startup memory, such as obs:abc123 or proj:abc123.'),
     kind: z.enum(['projection', 'observation']).optional().describe('Optional source lookup kind copied from search_memory.sourceLookup.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: z.object({
+    projectionId: z.string().optional().describe('Projection id for the memory to archive.'),
+    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]: z.object({
+    projectionId: z.string().optional().describe('Projection id for the archived memory to restore.'),
+    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: z.object({
+    projectionId: z.string().optional().describe('Projection id for the memory to permanently delete.'),
+    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: z.object({
+    projectionId: z.string().optional().describe('Projection id for the memory to update.'),
+    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+    text: z.string().describe('Replacement memory summary text.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: z.object({
+    projectionId: z.string().optional().describe('Projection id for the memory receiving feedback.'),
+    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+    feedback: z.enum(['not_relevant', 'relevant']).describe('not_relevant archives; relevant records a positive hit.'),
+    reason: z.string().optional().describe('Optional short human-readable feedback reason.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
     content: z.string().describe('Observation text to persist as a candidate memory.'),

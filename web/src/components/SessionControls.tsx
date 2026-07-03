@@ -40,11 +40,12 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
-import { isRunningSessionState } from '../thinking-utils.js';
+import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
-import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
+import { normalizeTransportPendingEntries } from '../transport-queue.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -368,8 +369,35 @@ function dataTransferHasFiles(dataTransfer: DataTransfer | null | undefined): bo
   }
 }
 
-function normalizeQueuedText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
+function appendComposerNewline(parts: string[]): void {
+  if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
+}
+
+function readComposerElementText(root: HTMLElement): string {
+  const parts: string[] = [];
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent ?? '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as HTMLElement;
+    const tag = element.tagName;
+    const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
+    if (tag === 'BR') {
+      appendComposerNewline(parts);
+      return;
+    }
+    if (isBlock && parts.length > 0) appendComposerNewline(parts);
+    element.childNodes.forEach(walk);
+    if (isBlock) appendComposerNewline(parts);
+  };
+  root.childNodes.forEach(walk);
+  return parts.join('').replace(/\n+$/g, '');
+}
+
+function setComposerElementText(root: HTMLElement, text: string): void {
+  root.textContent = text.replace(/\r\n?/g, '\n');
 }
 
 function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
@@ -874,7 +902,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
+  const activeSessionLiveStatus = deriveSessionLiveStatus({
+    sessionState: activeSession?.state,
+    activeThinking,
+    activeTransportTurn,
+    isAgentless: activeSession?.agentType === 'shell' || activeSession?.agentType === 'script',
+  });
+  const showRunningSweep = !compact && activeSessionLiveStatus.sweep;
   const openSpecAutoDeliver = useOpenSpecAutoDeliver({
     ws,
     serverId,
@@ -887,20 +921,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const effectiveRuntimeType = activeSession ? resolveSessionInfoRuntimeType(activeSession) : undefined;
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
-    && (isRunningSessionState(activeSession.state) || activeThinking || activeTransportTurn);
+    && activeSessionLiveStatus.busy;
   const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
-        activeSession?.transportPendingMessages,
+        undefined,
         activeSession?.name ?? '',
         {
           // This is already-normalized session state, not a raw daemon payload.
-          // Keep legacy messages visible when older state lacks structured
-          // entries, but do not synthesize tails for partial structured entries.
           hasEntriesField: Array.isArray(activeSession?.transportPendingMessageEntries)
             && (activeSession.transportPendingMessageEntries.length > 0
               || typeof activeSession.transportPendingMessageVersion === 'number'),
-          hasMessagesField: Array.isArray(activeSession?.transportPendingMessages),
+          hasMessagesField: false,
         },
       )
     : [];
@@ -960,7 +992,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     : null;
 
   const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
-    !!activeSession && !isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
+    !!activeSession && !!entry.clientMessageId
   ), [activeSession]);
   const isLocalQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
     !!optimisticQueuedEntries?.some((item) => item.clientMessageId === entry.clientMessageId)
@@ -1031,9 +1063,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   useEffect(() => {
     if (!pendingPrefillText || !divRef.current) return;
-    divRef.current.textContent = (divRef.current.textContent || '') + pendingPrefillText;
-    setHasText(!!divRef.current.textContent.trim());
-    publishComposerText(divRef.current.textContent ?? '');
+    const nextText = `${readComposerElementText(divRef.current)}${pendingPrefillText}`;
+    setComposerElementText(divRef.current, nextText);
+    setHasText(!!nextText.trim());
+    publishComposerText(nextText);
     divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
     divRef.current.focus();
     try {
@@ -1070,14 +1103,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!draftKey || !divRef.current) return;
     const saved = sessionStorage.getItem(draftKey);
     if (saved) {
-      divRef.current.textContent = saved;
+      setComposerElementText(divRef.current, saved);
       setHasText(!!saved.trim());
       publishComposerText(saved);
     } else {
       publishComposerText('');
     }
     return () => {
-      const text = divRef.current?.textContent ?? '';
+      const text = divRef.current ? readComposerElementText(divRef.current) : '';
       if (draftKey) sessionStorage.setItem(draftKey, text);
     };
   }, [draftKey, publishComposerText]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1455,27 +1488,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws || !activeSession) return;
     return ws.onMessage((msg: ServerMessage) => {
       const removeLocalQueuedEntry = (commandId: string, text?: string) => {
-        if (!commandId && !text) return;
-        const normalizedText = typeof text === 'string' ? normalizeQueuedText(text) : '';
+        void text;
+        if (!commandId) return;
         setOptimisticQueuedEntries((prev) => {
           if (!prev) return prev;
-          const matchIndex = commandId
-            ? prev.findIndex((entry) => entry.clientMessageId === commandId)
-            : -1;
-          const fallbackIndex = matchIndex >= 0
-            ? matchIndex
-            : (() => {
-                // If a stable id/command id was provided but did not match, do
-                // not fall back to text: duplicate prompts would remove the
-                // wrong queued card and leave the real one stuck.
-                if (commandId || !normalizedText) return -1;
-                const matches = prev
-                  .map((entry, index) => ({ entry, index }))
-                  .filter(({ entry }) => normalizeQueuedText(entry.text) === normalizedText);
-                return matches.length === 1 ? matches[0].index : -1;
-              })();
-          if (fallbackIndex < 0) return prev;
-          const next = prev.filter((_, index) => index !== fallbackIndex);
+          const next = prev.filter((entry) => entry.clientMessageId !== commandId);
+          if (next.length === prev.length) return prev;
           return next.length > 0 ? next : null;
         });
       };
@@ -1490,6 +1508,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             return { ...entry, status };
           });
           return changed ? next : prev;
+        });
+      };
+      const rememberSettledQueuedId = (commandId: string) => {
+        if (!commandId) return;
+        setSettledQueuedIds((prev) => {
+          if (prev.has(commandId)) return prev;
+          const ids = [...prev, commandId];
+          return new Set(ids.length > 500 ? ids.slice(-500) : ids);
         });
       };
 
@@ -1524,6 +1550,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         markLocalQueuedEntry(msg.commandId, 'failed');
         return;
       }
+      const maybeQueueDelivery = msg as unknown as {
+        type?: string;
+        sessionName?: string;
+        clientMessageId?: string;
+      };
+      if (maybeQueueDelivery.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
+        // The wire validator requires sessionName on delivery facts — a frame
+        // without one is malformed and must NOT default to clearing the active
+        // session's optimistic entries.
+        if (!maybeQueueDelivery.sessionName || maybeQueueDelivery.sessionName !== activeSession.name) return;
+        const clientMessageId = typeof maybeQueueDelivery.clientMessageId === 'string'
+          ? maybeQueueDelivery.clientMessageId.trim()
+          : '';
+        removeLocalQueuedEntry(clientMessageId);
+        rememberSettledQueuedId(clientMessageId);
+        return;
+      }
       if (msg.type !== 'timeline.event') return;
       const event = msg.event;
       if (event.sessionId !== activeSession.name) return;
@@ -1537,38 +1580,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         removeLocalQueuedEntry(commandId, deliveredText);
         // Record the delivered id so a stale daemon pending snapshot can't keep
         // showing it as queued (the incoming snapshot is not under our control,
-        // unlike the optimistic set cleared above).  Legacy snapshots synthesize
-        // ids from text, so also settle the single matching legacy id when the
-        // authoritative timeline echo carries a newer real command/client id.
+        // unlike the optimistic set cleared above).
         const idsToSettle = commandId ? [commandId] : [];
-        const normalizedDeliveredText = typeof deliveredText === 'string' ? normalizeQueuedText(deliveredText) : '';
-        if (normalizedDeliveredText) {
-          const legacyTextMatches = incomingQueuedTransportEntries
-            .filter((entry) => isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
-              && normalizeQueuedText(entry.text) === normalizedDeliveredText)
-            .map((entry) => entry.clientMessageId);
-          if (legacyTextMatches.length === 1) idsToSettle.push(legacyTextMatches[0]);
-        }
         if (idsToSettle.length > 0) {
-          setSettledQueuedIds((prev) => {
-            let changed = false;
-            const ids = [...prev];
-            for (const id of idsToSettle) {
-              if (!id || prev.has(id)) continue;
-              ids.push(id);
-              changed = true;
-            }
-            if (!changed) return prev;
-            return new Set(ids.length > 500 ? ids.slice(-500) : ids);
-          });
+          for (const id of idsToSettle) rememberSettledQueuedId(id);
         }
+      } else if (event.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
+        const payload = event.payload as Record<string, unknown>;
+        const clientMessageId = typeof payload.clientMessageId === 'string' ? payload.clientMessageId.trim() : '';
+        removeLocalQueuedEntry(clientMessageId);
+        rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
-        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries')
-          || Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries');
         const queuedEntries = normalizeTransportPendingEntries(
           event.payload.pendingMessageEntries,
-          event.payload.pendingMessages,
+          undefined,
           activeSession.name,
+          { hasEntriesField: Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries') },
         );
         if (queuedEntries.length === 0) {
           if (hasPendingSnapshot) setOptimisticQueuedEntries(null);
@@ -1764,7 +1792,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     t,
   ]);
 
-  const getText = () => (divRef.current?.textContent ?? '').trim();
+  const getText = () => (divRef.current ? readComposerElementText(divRef.current) : '').trim();
 
   const getCaretLineBoundary = (direction: 'up' | 'down') => {
     const root = divRef.current;
@@ -1801,7 +1829,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const fillInput = (text: string) => {
     if (divRef.current) {
-      divRef.current.textContent = text;
+      setComposerElementText(divRef.current, text);
       // Place cursor at end
       const sel = window.getSelection();
       const range = document.createRange();
@@ -1819,9 +1847,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
     const suffix = paths.join(' ');
+    let nextText = suffix;
     if (divRef.current) {
-      const current = divRef.current.textContent ?? '';
-      divRef.current.textContent = current ? `${current} ${suffix}` : suffix;
+      const current = readComposerElementText(divRef.current);
+      nextText = current ? `${current} ${suffix}` : suffix;
+      setComposerElementText(divRef.current, nextText);
       const sel = window.getSelection();
       const range = document.createRange();
       range.selectNodeContents(divRef.current);
@@ -1831,7 +1861,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(true);
-    publishComposerText(divRef.current?.textContent ?? suffix);
+    publishComposerText(nextText);
     syncMobileComposerMetrics();
   };
 
@@ -2848,7 +2878,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const clearComposerState = () => {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
-      if (divRef.current) divRef.current.textContent = '';
+      if (divRef.current) setComposerElementText(divRef.current, '');
       setHasText(false);
       publishComposerText('');
       setMobileComposerExpanded(false);
@@ -2954,7 +2984,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleQueuedMessageDelete = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
     if (editingQueuedMessageId === entry.clientMessageId || (!editingQueuedMessageId && getText() === entry.text)) {
-      if (divRef.current) divRef.current.textContent = '';
+      if (divRef.current) setComposerElementText(divRef.current, '');
       setHasText(false);
       publishComposerText('');
       setMobileComposerExpanded(false);
@@ -3177,7 +3207,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         e.preventDefault();
         if (histIdxRef.current === -1) {
           // Save current draft before navigating
-          draftRef.current = divRef.current?.textContent ?? '';
+          draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
           if (draftKey) sessionStorage.setItem(draftKey, draftRef.current);
         }
         const next = Math.min(histIdxRef.current + 1, history.length - 1);
@@ -3207,7 +3237,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (histIdxRef.current !== -1 && e.key !== 'Shift' && !e.metaKey && !e.ctrlKey) {
       histIdxRef.current = -1;
       // Preserve current input as draft so Up→Down still restores it
-      draftRef.current = divRef.current?.textContent ?? '';
+      draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
     }
   };
 
@@ -3361,7 +3391,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     document.execCommand('insertText', false, text);
-    setHasText(!!(divRef.current?.textContent?.trim()));
+    setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
 
   const handleShortcut = (data: string) => {
@@ -3607,7 +3637,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               disabled={disabled || activeSession?.state === 'stopped'}
               onPointerDown={(e) => { e.preventDefault(); handleStopPress(); }}
               onClick={handleStopPress}
-              style={isRunningSessionState(activeSession?.state) ? { color: '#f87171' } : undefined}
+              style={activeSessionLiveStatus.sweep ? { color: '#f87171' } : undefined}
             >
               <span aria-hidden="true">■</span>
             </button>
@@ -4509,10 +4539,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             wsClient={ws}
             projectDir={activeSession.projectDir ?? ''}
             onSelectFile={(path) => {
-              const text = divRef.current?.textContent ?? '';
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
-              divRef.current!.textContent = `${before}@${path} `;
-              atSelectionSnapshotRef.current = divRef.current!.textContent;
+              const nextText = `${before}@${path} `;
+              setComposerElementText(divRef.current!, nextText);
+              atSelectionSnapshotRef.current = nextText;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
               setAtPickerStage('choose');
@@ -4530,13 +4561,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               } catch { /* jsdom lacks Selection API */ }
             }}
             onSelectAgent={(session, mode) => {
-              const text = divRef.current?.textContent ?? '';
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
               // Show short @@label in input (double-@ = P2P, single-@ = file ref)
               const label = buildAgentLabel(session, mode);
-              divRef.current!.textContent = `${before}${label} `;
+              const nextText = `${before}${label} `;
+              setComposerElementText(divRef.current!, nextText);
               pendingAtTargetsRef.current.push({ session, mode, label });
-              atSelectionSnapshotRef.current = divRef.current!.textContent;
+              atSelectionSnapshotRef.current = nextText;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
               setAtPickerStage('choose');
@@ -4555,15 +4587,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             }}
             onSelectAllConfig={(config, rounds, modeOverride) => {
               // Show @@all(config) — daemon expands per config. Store custom rounds + config override.
-              const text = divRef.current?.textContent ?? '';
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
               const labelMode = modeOverride === 'config' ? 'config' : modeOverride;
               const label = rounds > 1 ? `@@all(${labelMode} ×${rounds})` : `@@all(${labelMode})`;
-              divRef.current!.textContent = `${before}${label} `;
+              const nextText = `${before}${label} `;
+              setComposerElementText(divRef.current!, nextText);
               pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label });
               // Store custom config + rounds for handleSend
               pendingConfigOverrideRef.current = { config, rounds, modeOverride };
-              atSelectionSnapshotRef.current = divRef.current!.textContent;
+              atSelectionSnapshotRef.current = nextText;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
               setAtPickerStage('choose');
@@ -4583,9 +4616,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               // From the @ picker → TEAM stage: strip the @, close the picker,
               // and launch the discussion directly (reuses the member-gated
               // combo launcher with the chosen round count).
-              const text = divRef.current?.textContent ?? '';
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
               const before = text.replace(/@[^\s@]*$/, '');
-              if (divRef.current) divRef.current.textContent = before;
+              if (divRef.current) setComposerElementText(divRef.current, before);
               setHasText(before.trim().length > 0);
               setAtPickerOpen(false);
               setAtPickerStage('choose');
@@ -4620,7 +4653,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
             onFocus={handleFocus}
             onInput={() => {
-              const currentText = divRef.current?.textContent ?? '';
+              const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());
               publishComposerText(currentText);
               syncMobileComposerMetrics();
@@ -4640,7 +4673,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               const doubleAt = text.match(/@@[\w-]*$/);
               if (doubleAt) {
                 const before = text.replace(/@@[\w-]*$/, '');
-                if (divRef.current) divRef.current.textContent = before;
+                if (divRef.current) setComposerElementText(divRef.current, before);
                 setHasText(!!before.trim());
                 setAtPickerOpen(false);
                 setAtPickerStage('choose');
@@ -4996,7 +5029,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       </div>
     )}
-    <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
+    <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current ? readComposerElementText(divRef.current) : ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel
         sessions={(sessions ?? []).map(s => ({

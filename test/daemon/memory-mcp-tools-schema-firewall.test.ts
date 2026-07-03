@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ContextNamespace } from '../../shared/context-types.js';
+import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
+import { registerMemoryShortRef, resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
@@ -35,6 +36,21 @@ function sessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     restartTimestamps: [],
     createdAt: 1,
     updatedAt: 1,
+    ...overrides,
+  };
+}
+
+function projection(overrides: Partial<ProcessedContextProjection> = {}): ProcessedContextProjection {
+  return {
+    id: 'proj-1',
+    namespace: { scope: 'personal', userId: 'user-1', projectId: 'repo-1' },
+    class: 'durable_memory_candidate',
+    sourceEventIds: ['evt-1'],
+    summary: 'existing memory',
+    content: { text: 'existing memory' },
+    createdAt: 1,
+    updatedAt: 1,
+    status: 'active',
     ...overrides,
   };
 }
@@ -111,6 +127,93 @@ describe('memory MCP tool schema firewall', () => {
       sourceProjectName: 'proj',
       sourceServerId: 'srv-1',
     }));
+  });
+
+  it('strips forged authority fields before MCP memory management actions', async () => {
+    const getProcessedProjectionById = vi.fn((id: string) => projection({ id }));
+    const archiveMemory = vi.fn(() => true);
+    const restoreArchivedMemory = vi.fn(() => true);
+    const deleteMemory = vi.fn(() => true);
+    const updateProcessedProjectionSummary = vi.fn((input: { projectionId: string; summary: string }) => projection({ id: input.projectionId, summary: input.summary }));
+    const recordMemoryHits = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      getProcessedProjectionById,
+      archiveMemory,
+      restoreArchivedMemory,
+      deleteMemory,
+      updateProcessedProjectionSummary,
+      recordMemoryHits,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]({
+      projectionId: 'proj-1',
+      userId: 'mallory',
+      namespace: { scope: 'personal', userId: 'mallory', projectId: 'evil' },
+      projectId: 'evil',
+    })).resolves.toMatchObject({ status: 'ok', projectionId: 'proj-1', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]({ projectionId: 'proj-1', canonicalRepoId: 'evil' })).resolves.toMatchObject({ status: 'ok', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]({
+      projectionId: 'proj-1',
+      text: 'corrected memory',
+      ownerUserId: 'mallory',
+      updatedByUserId: 'mallory',
+    })).resolves.toMatchObject({ status: 'ok', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]({
+      projectionId: 'proj-1',
+      feedback: 'relevant',
+      projectRoot: '/evil',
+    })).resolves.toMatchObject({ status: 'ok', action: 'hit_recorded', changed: true });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]({ projectionId: 'proj-1', scope: 'org_shared' })).resolves.toMatchObject({ status: 'ok', changed: true });
+
+    expect(getProcessedProjectionById).toHaveBeenCalledWith('proj-1');
+    expect(archiveMemory).toHaveBeenCalledWith('proj-1');
+    expect(restoreArchivedMemory).toHaveBeenCalledWith('proj-1');
+    expect(deleteMemory).toHaveBeenCalledWith('proj-1');
+    expect(recordMemoryHits).toHaveBeenCalledWith(['proj-1']);
+    expect(updateProcessedProjectionSummary).toHaveBeenCalledWith({
+      projectionId: 'proj-1',
+      summary: 'corrected memory',
+      ownerUserId: 'user-1',
+      updatedByUserId: 'user-1',
+    });
+  });
+
+  it('blocks MCP memory management for projections outside the caller namespace', async () => {
+    const archiveMemory = vi.fn(() => true);
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      getProcessedProjectionById: vi.fn(() => projection({
+        namespace: { scope: 'personal', userId: 'other-user', projectId: 'repo-1' },
+      })),
+      archiveMemory,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]({ projectionId: 'proj-foreign' })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE,
+    });
+    expect(archiveMemory).not.toHaveBeenCalled();
+  });
+
+  it('supports compact projection refs and not_relevant feedback archives memory', async () => {
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ref = registerMemoryShortRef({ kind: 'projection', id: 'proj-ref', namespace });
+    const archiveMemory = vi.fn(() => true);
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getProcessedProjectionById: vi.fn(() => projection({ id: 'proj-ref', namespace })),
+      archiveMemory,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]({ ref, feedback: 'not_relevant' })).resolves.toMatchObject({
+      status: 'ok',
+      projectionId: 'proj-ref',
+      feedback: 'not_relevant',
+      action: 'archived',
+      changed: true,
+    });
+    expect(archiveMemory).toHaveBeenCalledWith('proj-ref');
   });
 
   it('short-circuits memory disabled gates before backend calls', async () => {

@@ -8,6 +8,8 @@ import { getSession, type SessionRecord } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import logger from '../util/logger.js';
+import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
+import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -30,9 +32,15 @@ function isExecutionClone(metadata: ExecutionCloneMetadata | null | undefined): 
 }
 
 export interface SubSessionSyncTransportQueueSnapshot {
-  pendingMessages: string[];
-  pendingEntries: Array<{ clientMessageId: string; text: string }>;
+  pendingMessages?: string[];
+  pendingEntries?: Array<{ clientMessageId: string; text: string }>;
   pendingVersion?: number;
+  queueSnapshot?: QueueSnapshot;
+  pendingMessageEntries?: QueueSnapshot['pendingMessageEntries'];
+  pendingMessageVersion?: number;
+  queueEpoch?: string;
+  queueAuthorityId?: string;
+  failedMessageEntries?: QueueSnapshot['failedMessageEntries'];
 }
 
 export interface SubSessionSyncOptions {
@@ -85,7 +93,11 @@ export async function buildSubSessionSyncPayload(
   // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota for a
   // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
   const usageQuota = isClaudeSdkSession(r.agentType) ? await getClaudeUsageQuota().catch(() => null) : null;
-  const transportQueue = options?.transportQueue ?? null;
+  void options;
+  let transportQueue: TransportQueueSnapshotPayload | null = null;
+  if (r.runtimeType === 'transport') {
+    transportQueue = buildTransportQueueSnapshotPayload(sessionName, 'subsession_sync');
+  }
 
   // Execution clones inherit runtime CONFIG but NEVER runtime IDENTITY. Null out
   // every identity field so stale identity never replicates to Postgres (and
@@ -136,13 +148,7 @@ export async function buildSubSessionSyncPayload(
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r.quotaUsageLabel ?? null,
     quotaMeta: usageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
     effort: r.effort ?? null,
-    ...(transportQueue ? {
-      transportPendingMessages: transportQueue.pendingMessages,
-      transportPendingMessageEntries: transportQueue.pendingEntries,
-      ...(typeof transportQueue.pendingVersion === 'number'
-        ? { transportPendingMessageVersion: transportQueue.pendingVersion }
-        : {}),
-    } : {}),
+    ...(transportQueue ?? {}),
   };
 }
 

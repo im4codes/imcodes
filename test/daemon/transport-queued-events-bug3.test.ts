@@ -145,18 +145,37 @@ describe('bug 3 end-to-end: queued session.state snapshots reach UI handler (aud
     const sessionA: typeof received = [];
     const sessionB: typeof received = [];
     const newEmitter = new TimelineEmitter();
+    const queuePayload = (sessionId: string, version: number, clientMessageId: string) => ({
+      state: 'queued',
+      queueEpoch: `epoch-${sessionId}`,
+      queueAuthorityId: `authority-${sessionId}`,
+      pendingMessageVersion: version,
+      pendingMessageEntries: [
+        {
+          clientMessageId,
+          commandId: `cmd-${clientMessageId}`,
+          text: clientMessageId,
+          status: 'queued',
+          placement: 'normal',
+          ordinal: 0,
+          createdAt: version,
+          updatedAt: version,
+        },
+      ],
+      failedMessageEntries: [],
+    });
     newEmitter.on((event) => {
       if (event.type !== 'session.state') return;
-      const payload = event.payload as { state: string; pendingCount?: number };
-      const entry = { type: event.type, state: payload.state, pendingCount: payload.pendingCount };
+      const payload = event.payload as { state: string; pendingMessageVersion?: number };
+      const entry = { type: event.type, state: payload.state, pendingCount: payload.pendingMessageVersion };
       if (event.sessionId === 'deck_a') sessionA.push(entry);
       if (event.sessionId === 'deck_b') sessionB.push(entry);
     });
 
-    newEmitter.emit('deck_a', 'session.state', { state: 'queued', pendingCount: 1 });
-    newEmitter.emit('deck_b', 'session.state', { state: 'queued', pendingCount: 5 });
-    newEmitter.emit('deck_a', 'session.state', { state: 'queued', pendingCount: 2 });
-    newEmitter.emit('deck_b', 'session.state', { state: 'queued', pendingCount: 6 });
+    newEmitter.emit('deck_a', 'session.state', queuePayload('deck_a', 1, 'a-1'));
+    newEmitter.emit('deck_b', 'session.state', queuePayload('deck_b', 5, 'b-5'));
+    newEmitter.emit('deck_a', 'session.state', queuePayload('deck_a', 2, 'a-2'));
+    newEmitter.emit('deck_b', 'session.state', queuePayload('deck_b', 6, 'b-6'));
 
     expect(sessionA.map((entry) => entry.pendingCount)).toEqual([1, 2]);
     expect(sessionB.map((entry) => entry.pendingCount)).toEqual([5, 6]);

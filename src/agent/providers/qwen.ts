@@ -54,6 +54,7 @@ import {
   isSdkRuntimeSubagentEventName,
   makeQwenSubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  readSdkSubagentStartedAtMs,
   startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
@@ -173,6 +174,7 @@ interface QwenSessionState {
   cancelled?: boolean;
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
+  runtimeSubagentStartedAtByKey: Map<string, number>;
   emittedToolSignatures: Map<string, string>;
   lastStatusSignature: string | null;
   /** Stable IM.codes context already injected into this Qwen conversation. */
@@ -391,6 +393,13 @@ function readRuntimeSubagentPrompt(record: Record<string, unknown>): string | un
     ?? meaningfulString(record.request);
 }
 
+function readRuntimeSubagentBackgrounded(record: Record<string, unknown>): boolean {
+  return record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true
+    || record.detached === true;
+}
+
 function readRuntimeSubagentStatusInfo(record: Record<string, unknown>): { status?: string; message?: string } {
   const value = record.status ?? record.state ?? record.phase ?? record.lifecycle;
   if (typeof value === 'string') return { status: value };
@@ -495,6 +504,14 @@ function qwenRuntimeSubagentToolFromPayload(
   const agentName = readRuntimeSubagentName(record);
   const model = readRuntimeSubagentModel(record, state.model);
   const prompt = readRuntimeSubagentPrompt(record);
+  const backgrounded = readRuntimeSubagentBackgrounded(record);
+  const startedAtByKey = state.runtimeSubagentStartedAtByKey ??= new Map<string, number>();
+  const startedAtMs = readSdkSubagentStartedAtMs(record)
+    ?? startedAtByKey.get(canonicalKey)
+    ?? Date.now();
+  if (statusMapping.active && !statusMapping.terminal) {
+    startedAtByKey.set(canonicalKey, startedAtMs);
+  }
   const summary = agentName ? `Qwen sub-agent ${agentName}` : rawAgentPath ? `Qwen sub-agent ${rawAgentPath}` : 'Qwen sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? statusInfo.status ?? 'unknown') : undefined;
   const detail = buildSdkSubagentSafeDetail({
@@ -520,6 +537,8 @@ function qwenRuntimeSubagentToolFromPayload(
       ...(rawAgentPath ? { agentPath: rawAgentPath } : {}),
       ...(agentName ? { agentName } : {}),
       ...(model ? { model } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
+      startedAtMs,
       diagnosticCode: statusMapping.diagnosticCode,
     },
   } satisfies SdkSubagentDetail, { allowRaw: false });
@@ -694,6 +713,7 @@ export class QwenProvider implements TransportProvider {
       cancelled: existing?.cancelled ?? false,
       toolUseByIndex: existing?.toolUseByIndex ?? new Map(),
       toolUseById: existing?.toolUseById ?? new Map(),
+      runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
       lastStatusSignature: existing?.lastStatusSignature ?? null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
@@ -802,6 +822,7 @@ export class QwenProvider implements TransportProvider {
       cancelled: false,
       toolUseByIndex: new Map(),
       toolUseById: new Map(),
+      runtimeSubagentStartedAtByKey: new Map(),
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
     };

@@ -805,6 +805,9 @@ export interface SubSessionData {
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
+  queueEpoch?: string | null;
+  queueAuthorityId?: string | null;
+  failedMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
   transportPendingMessageVersion?: number | null;
   /** Execution-clone discriminant projection (the canonical
    *  `EXECUTION_CLONE_KIND` value) when this sub-session is an ephemeral

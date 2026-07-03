@@ -45,7 +45,17 @@ import {
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
-import { PROVIDER_ERROR_CODES, type TransportProvider } from '../../src/agent/transport-provider.js';
+import {
+  PROVIDER_ERROR_CODES,
+  SDK_TURN_LOST_RECOVERY_CLASSIFIERS,
+  SDK_TURN_LOST_RECOVERY_PHASES,
+  SDK_TURN_LOST_RECOVERY_REASON,
+  SDK_TURN_LOST_RECOVERY_STATUS,
+  SDK_TURN_LOST_REPLAY_DECISIONS,
+  sanitizeSdkTurnLostRecoveryMetadata,
+  isSdkTurnLostRecovery,
+  type TransportProvider,
+} from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -62,7 +72,8 @@ import {
 
 type DeltaCb = (sessionId: string, delta: MessageDelta) => void;
 type CompleteCb = (sessionId: string, message: AgentMessage) => void;
-type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
+type MockProviderError = { code: string; message: string; recoverable: boolean; details?: unknown };
+type ErrorCb = (sessionId: string, error: MockProviderError) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
 type UsageCb = (sessionId: string, update: { usage?: Record<string, unknown>; model?: string }) => void;
@@ -89,7 +100,7 @@ function makeMockProvider() {
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
-    fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
+    fireError: (sid: string, err: MockProviderError) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
     fireUsage: (sid: string, update: { usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
@@ -145,6 +156,31 @@ function makeSdkSubagentDetail(overrides: {
       taskId: 'task-1',
       ...overrides.meta,
     },
+  };
+}
+
+function makeSdkTurnLostDetails(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    localSessionKey: 'sess-lost',
+    sessionName: 'sess-lost',
+    providerId: 'codex-sdk',
+    providerSessionId: 'sess-lost',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    activityGeneration: 7,
+    leaseStartedAt: 1_800_000_000_000,
+    lastStrongActivityAt: 1_800_000_010_000,
+    heartbeatStartedAt: 1_800_000_060_000,
+    heartbeatCompletedAt: 1_800_000_060_120,
+    heartbeatDurationMs: 120,
+    silenceDurationMs: 50_000,
+    heartbeatFailureCount: 1,
+    classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN,
+    attempt: 1,
+    correlationId: 'sdk-turn-lost-correlation-1',
+    replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.PENDING,
+    ...overrides,
   };
 }
 
@@ -794,6 +830,160 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(appendMock).not.toHaveBeenCalled();
     });
 
+    it('recognizes typed sdk_turn_lost with a machine-readable helper, not message parsing', () => {
+      const details = makeSdkTurnLostDetails({
+        rawThreadRead: { prompt: 'SECRET_PROMPT_SHOULD_NOT_PROJECT' },
+        error: 'UNBOUNDED_ERROR_SHOULD_NOT_PROJECT',
+      });
+      const error = {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'any human text can change',
+        recoverable: true,
+        details,
+      };
+
+      expect(isSdkTurnLostRecovery(error)).toBe(true);
+      expect(isSdkTurnLostRecovery({
+        ...error,
+        message: 'a completely different localized message',
+      })).toBe(true);
+      expect(isSdkTurnLostRecovery({
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'sdk_turn_lost',
+        recoverable: true,
+        details: { classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN },
+      })).toBe(false);
+
+      const sanitized = sanitizeSdkTurnLostRecoveryMetadata(details);
+      expect(sanitized).toMatchObject({
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN,
+        correlationId: 'sdk-turn-lost-correlation-1',
+      });
+      expect(JSON.stringify(sanitized)).not.toContain('SECRET_PROMPT_SHOULD_NOT_PROJECT');
+      expect(JSON.stringify(sanitized)).not.toContain('UNBOUNDED_ERROR_SHOULD_NOT_PROJECT');
+    });
+
+    it('emits a privacy-safe detected phase for recoverable sdk_turn_lost and no generic final error', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-lost', makeDelta({ messageId: 'msg-lost', delta: 'partial before heartbeat' }));
+      emitMock.mockClear();
+
+      fireError('sess-lost', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'Raw provider error SECRET_PROMPT_SHOULD_NOT_PROJECT',
+        recoverable: true,
+        details: makeSdkTurnLostDetails({
+          rawThreadRead: { prompt: 'SECRET_PROMPT_SHOULD_NOT_PROJECT' },
+          toolInput: 'SECRET_TOOL_INPUT_SHOULD_NOT_PROJECT',
+          env: { OPENAI_API_KEY: 'SECRET_ENV_SHOULD_NOT_PROJECT' },
+        }),
+      });
+      await Promise.resolve();
+
+      expect(emitMock.mock.calls.some(c => c[1] === 'assistant.text')).toBe(false);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state' && c[2]?.state === 'error')).toBe(false);
+
+      const phaseCall = emitMock.mock.calls.find(c => c[1] === 'agent.status');
+      expect(phaseCall).toBeDefined();
+      expect(phaseCall![0]).toBe('sess-lost');
+      expect(phaseCall![2]).toMatchObject({
+        status: SDK_TURN_LOST_RECOVERY_STATUS,
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        correlationId: 'sdk-turn-lost-correlation-1',
+        recovery: {
+          reason: SDK_TURN_LOST_RECOVERY_REASON,
+          classifier: SDK_TURN_LOST_RECOVERY_CLASSIFIERS.IDLE_MISSING_TURN,
+          replayDecision: SDK_TURN_LOST_REPLAY_DECISIONS.PENDING,
+        },
+      });
+      expect(phaseCall![3]).toMatchObject({
+        eventId: 'transport-recovery:sess-lost:sdk-turn-lost-correlation-1:detected',
+      });
+
+      const projected = JSON.stringify([phaseCall![2], appendMock.mock.calls]);
+      expect(projected).not.toContain('SECRET_PROMPT_SHOULD_NOT_PROJECT');
+      expect(projected).not.toContain('SECRET_TOOL_INPUT_SHOULD_NOT_PROJECT');
+      expect(projected).not.toContain('SECRET_ENV_SHOULD_NOT_PROJECT');
+      expect(projected).not.toContain('Raw provider error');
+      expect(appendMock).toHaveBeenCalledWith('sess-lost', expect.objectContaining({
+        type: 'agent.status',
+        status: SDK_TURN_LOST_RECOVERY_STATUS,
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+      }));
+    });
+
+    it('drops recovery phases with conflicting provider session metadata instead of guessing ownership', () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const sharedProviderSessionId = 'ambiguous-provider-session-id';
+      const details = makeSdkTurnLostDetails({
+        providerSessionId: sharedProviderSessionId,
+        correlationId: 'correlation-shared-provider-sid',
+      });
+
+      fireError('owner-a', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'lost',
+        recoverable: true,
+        details,
+      });
+      fireError('owner-a', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'lost duplicate',
+        recoverable: true,
+        details,
+      });
+      fireError('owner-b', {
+        code: PROVIDER_ERROR_CODES.SDK_TURN_LOST,
+        message: 'lost',
+        recoverable: true,
+        details: makeSdkTurnLostDetails({
+          providerSessionId: sharedProviderSessionId,
+          correlationId: 'correlation-shared-provider-sid',
+        }),
+      });
+
+      const phases = emitMock.mock.calls.filter(c => c[1] === 'agent.status');
+      expect(phases).toHaveLength(0);
+      expect(emitMock.mock.calls.some(c => c[0] === sharedProviderSessionId)).toBe(false);
+    });
+
+    it('emits explicit recovery phase metadata for recovering/recovered/failed without generic error state', () => {
+      const phases = [
+        SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING,
+        SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED,
+        SDK_TURN_LOST_RECOVERY_PHASES.FAILED,
+      ];
+
+      for (const phase of phases) {
+        const emitted = relayTesting.emitSdkTurnLostRecoveryPhaseForTest('sess-phase', makeSdkTurnLostDetails({
+          localSessionKey: 'sess-phase',
+          sessionName: 'sess-phase',
+          phase,
+          correlationId: `corr-${phase}`,
+          replayDecision: phase === SDK_TURN_LOST_RECOVERY_PHASES.FAILED
+            ? SDK_TURN_LOST_REPLAY_DECISIONS.FAILED
+            : SDK_TURN_LOST_REPLAY_DECISIONS.SAFE_REPLAY,
+        }));
+        expect(emitted).toBe(true);
+      }
+
+      const phaseCalls = emitMock.mock.calls.filter(c => c[1] === 'agent.status');
+      expect(phaseCalls.map(c => c[2].phase)).toEqual(phases);
+      expect(phaseCalls.map(c => c[2].status)).toEqual([
+        SDK_TURN_LOST_RECOVERY_STATUS,
+        SDK_TURN_LOST_RECOVERY_STATUS,
+        SDK_TURN_LOST_RECOVERY_STATUS,
+      ]);
+      expect(emitMock.mock.calls.some(c => c[1] === 'assistant.text' && String(c[2].text).includes('⚠️ Error'))).toBe(false);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state' && c[2].state === 'error')).toBe(false);
+    });
+
     it('does NOT call sendToServer', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
@@ -968,15 +1158,65 @@ describe('transport-relay (timeline-emitter based)', () => {
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({
+      expect(call![2]).toMatchObject({
+        sessionId: 'sess-tool',
         toolCallId: 'tool-1',
         terminalStatus: 'succeeded',
         terminalReason: 'provider_result',
+        synthetic: false,
+        source: 'app_server_jsonrpc',
+        decisionReason: 'provider_result',
+        idempotencyKey: expect.stringContaining('tool-1:succeeded:provider_result'),
         output: 'done',
         detail: { kind: 'tool_result', output: 'done' },
       });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
       expect(call![3].hidden).not.toBe(true);
+    });
+
+    it('preserves canonical lifecycle terminal metadata from provider tool events', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-tool', {
+        id: 'tool-1',
+        name: 'WebSearch',
+        status: 'complete',
+        output: 'done',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        terminalSynthetic: true,
+        terminalSource: 'daemon_synthetic',
+        terminalDecisionReason: 'local_stop',
+        terminalIdempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+        activityGeneration: { scope: 'session', sessionName: 'sess-tool', generation: 1 },
+        turnId: 'turn-1',
+        lifecycleItemKind: 'web_search',
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call?.[2]).toMatchObject({
+        sessionId: 'sess-tool',
+        toolCallId: 'tool-1',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'local_stop',
+        idempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+        activityGeneration: { scope: 'session', sessionName: 'sess-tool', generation: 1 },
+        turnId: 'turn-1',
+        itemKind: 'web_search',
+      });
+      expect(appendMock).toHaveBeenCalledWith('sess-tool', expect.objectContaining({
+        type: 'tool.result',
+        terminalStatus: 'cancelled',
+        terminalReason: 'user_cancelled',
+        synthetic: true,
+        source: 'daemon_synthetic',
+        decisionReason: 'local_stop',
+        idempotencyKey: 'codex-terminal:sess-tool:session:sess-tool:1:tool:tool-1:cancelled:user_cancelled',
+      }));
     });
 
     it('emits a visible checklist tool.call for completed-only update_plan snapshots', () => {

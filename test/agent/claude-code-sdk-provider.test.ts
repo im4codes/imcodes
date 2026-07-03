@@ -1143,6 +1143,59 @@ describe('ClaudeCodeSdkProvider', () => {
     }
   });
 
+  it('excludes backgrounded Claude tasks from provider active-work snapshots after the foreground turn completes', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-backgrounded', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-backgrounded',
+        uuid: 'uuid-task-backgrounded-start',
+        task_id: 'task-backgrounded-1',
+        tool_use_id: 'tool-use-backgrounded',
+        description: 'Run a detached task',
+      },
+      {
+        type: 'system',
+        subtype: 'task_updated',
+        session_id: 'session-route-subagent-backgrounded',
+        uuid: 'uuid-task-backgrounded-update',
+        task_id: 'task-backgrounded-1',
+        patch: { status: 'running', is_backgrounded: true },
+      },
+      { type: 'result', session_id: 'session-route-subagent-backgrounded', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-subagent-backgrounded',
+      sessionName: 'deck_project_claude_backgrounded',
+      cwd: '/tmp/project',
+      resumeId: 'session-route-subagent-backgrounded',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-subagent-backgrounded', 'hello');
+    await flush();
+
+    expect(provider.getActiveWorkSnapshot('route-subagent-backgrounded')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(sdkSubagentTools(tools).at(-1)?.detail).toMatchObject({
+      meta: {
+        provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+        backgrounded: true,
+        active: true,
+        terminal: false,
+      },
+    });
+  });
+
   it('stops active Claude tasks through SDK stopTask before local cancellation state', async () => {
     vi.useFakeTimers();
     sdkMock.setWaitForClose(true);
@@ -1337,6 +1390,7 @@ describe('ClaudeCodeSdkProvider', () => {
         status: 'running',
         name: 'Hooke',
         prompt: 'Wait for the read-only sync worker',
+        is_backgrounded: true,
       },
       {
         type: 'system',
@@ -1379,6 +1433,7 @@ describe('ClaudeCodeSdkProvider', () => {
           normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
           active: true,
           terminal: false,
+          backgrounded: true,
         },
       },
     });

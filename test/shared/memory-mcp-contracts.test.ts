@@ -26,6 +26,11 @@ describe('memory MCP shared contracts', () => {
       'search_memory',
       'list_memory_summaries',
       'get_memory_sources',
+      'archive_memory',
+      'restore_memory',
+      'delete_memory',
+      'update_memory',
+      'memory_feedback',
       'save_observation',
       'save_preference',
       'send_list_targets',
@@ -49,6 +54,16 @@ describe('memory MCP shared contracts', () => {
     const summaries = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES].inputSchema.properties ?? {};
     expect(Object.keys(summaries)).toEqual(['projectionClass', 'limit']);
     expect(summaries).not.toHaveProperty('query');
+
+    const archive = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY].inputSchema.properties ?? {};
+    const update = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY].inputSchema.properties ?? {};
+    const feedback = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK].inputSchema.properties ?? {};
+    expect(Object.keys(archive)).toEqual(['projectionId', 'ref']);
+    expect(Object.keys(update)).toEqual(['projectionId', 'ref', 'text']);
+    expect(Object.keys(feedback)).toEqual(['projectionId', 'ref', 'feedback', 'reason']);
+    expect(archive).not.toHaveProperty('projectId');
+    expect(update).not.toHaveProperty('namespace');
+    expect(feedback).not.toHaveProperty('userId');
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;

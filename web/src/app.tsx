@@ -147,15 +147,10 @@ import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
-  extractTransportPendingMessages,
   extractTransportPendingVersion,
-  hasExplicitTransportPendingSnapshot,
-  mergeTransportPendingEntriesForIdleState,
-  mergeTransportPendingEntriesForRunningState,
+  buildTransportPendingSyncPatch,
   nextTransportQueueVersion,
-  normalizeTransportPendingEntries,
   removeTransportPendingEntryForUserMessage,
-  shouldApplyTransportQueueSnapshotForPayload,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
@@ -193,6 +188,35 @@ import {
 
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
+
+function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffix: string): void {
+  const parts: string[] = [];
+  const appendNewline = () => {
+    if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
+  };
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent ?? '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const child = node as HTMLElement;
+    const tag = child.tagName;
+    const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
+    if (tag === 'BR') {
+      appendNewline();
+      return;
+    }
+    if (isBlock && parts.length > 0) appendNewline();
+    child.childNodes.forEach(walk);
+    if (isBlock) appendNewline();
+  };
+  element.childNodes.forEach(walk);
+  const current = parts.join('').replace(/\n+$/g, '');
+  element.textContent = `${current}${suffix}`.replace(/\r\n?/g, '\n');
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.focus();
+}
 
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
@@ -2793,6 +2817,11 @@ export function App() {
           state: sub.state,
           label: sub.label,
           parentSession: sub.parentSession,
+          queueEpoch: sub.queueEpoch,
+          queueAuthorityId: sub.queueAuthorityId,
+          transportPendingMessageVersion: sub.transportPendingMessageVersion,
+          transportPendingMessageEntries: sub.transportPendingMessageEntries,
+          failedMessageEntries: sub.failedMessageEntries,
         }));
         watchProjectionStore.updateFromSessionListWithSubs(
           { id: selectedServerId, name: watchServerName, baseUrl: auth.baseUrl },
@@ -2957,110 +2986,21 @@ export function App() {
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
-          const hasPendingSnapshot = hasExplicitTransportPendingSnapshot(event.payload);
-          const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
-          if (liveState === 'queued') {
-            const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
-            const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
-            const parsedPendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-            const pendingEntries = normalizeTransportPendingEntries(
-              event.payload.pendingMessageEntries,
-              parsedPendingMessages,
-              event.sessionId,
-              { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
-            );
-            const pendingMessages = hasPendingEntriesField ? pendingEntries.map((entry) => entry.text) : parsedPendingMessages;
+          if (liveState === 'queued' || liveState === 'running' || liveState === 'idle') {
             setSessions((prev) => prev.map((s) => {
               if (s.name !== event.sessionId) return s;
-              // Drop a stale `queued` snapshot wholesale: it would otherwise
-              // both resurrect drained entries AND wrongly downgrade a session
-              // that has since moved past queued.
-              if (!shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: true,
-                isExplicitEmpty: pendingMessages.length === 0 && pendingEntries.length === 0,
-              })) return s;
-              return {
-                ...s,
-                state: 'queued' as SessionInfo['state'],
-                transportPendingMessages: pendingMessages,
-                transportPendingMessageEntries: pendingEntries,
-                transportPendingMessageVersion: nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion),
-              };
-            }));
-          } else if (liveState === 'running') {
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
-              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
-              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
-              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-              const incomingEntries = normalizeTransportPendingEntries(
-                event.payload.pendingMessageEntries,
-                parsedIncomingMessages,
-                event.sessionId,
-                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
-              );
-              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
-              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: hasPendingSnapshot,
-                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
-              });
-              return {
-                ...s,
-                state: 'running' as SessionInfo['state'],
-                transportPendingMessages: applyPending
-                  ? incomingMessages
-                  : (s.transportPendingMessages ?? []),
-                transportPendingMessageEntries: applyPending
-                  ? mergeTransportPendingEntriesForRunningState(
-                      s.transportPendingMessageEntries,
-                      event.payload.pendingMessageEntries,
-                      event.payload.pendingMessages,
-                      hasPendingSnapshot,
-                      event.sessionId,
-                      hasPendingEntriesField,
-                    )
-                  : (s.transportPendingMessageEntries ?? []),
-                transportPendingMessageVersion: applyPending
-                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
-                  : s.transportPendingMessageVersion,
-              };
-            }));
-          } else if (liveState === 'idle') {
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
-              const hasPendingEntriesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessageEntries');
-              const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload, 'pendingMessages');
-              const parsedIncomingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-              const incomingEntries = normalizeTransportPendingEntries(
-                event.payload.pendingMessageEntries,
-                parsedIncomingMessages,
-                event.sessionId,
-                { hasEntriesField: hasPendingEntriesField, hasMessagesField: hasPendingMessagesField },
-              );
-              const incomingMessages = hasPendingEntriesField ? incomingEntries.map((entry) => entry.text) : parsedIncomingMessages;
-              const applyPending = hasPendingSnapshot && shouldApplyTransportQueueSnapshotForPayload(s.transportPendingMessageVersion, incomingVersion, {
-                hasExplicitSnapshot: hasPendingSnapshot,
-                isExplicitEmpty: hasPendingSnapshot && incomingMessages.length === 0 && incomingEntries.length === 0,
-              });
+              const queuePatch = buildTransportPendingSyncPatch({
+                transportPendingMessages: s.transportPendingMessages,
+                transportPendingMessageEntries: s.transportPendingMessageEntries,
+                transportPendingMessageVersion: s.transportPendingMessageVersion,
+                queueEpoch: s.queueEpoch,
+                queueAuthorityId: s.queueAuthorityId,
+                failedMessageEntries: s.failedMessageEntries,
+              }, event.payload as Record<string, unknown>, event.sessionId);
               return {
                 ...s,
                 state: liveState as SessionInfo['state'],
-                transportPendingMessages: applyPending
-                  ? incomingMessages
-                  : (s.transportPendingMessages ?? []),
-                transportPendingMessageEntries: applyPending
-                  ? mergeTransportPendingEntriesForIdleState(
-                      s.transportPendingMessageEntries,
-                      event.payload.pendingMessageEntries,
-                      event.payload.pendingMessages,
-                      hasPendingSnapshot,
-                      event.sessionId,
-                      hasPendingEntriesField,
-                    )
-                  : (s.transportPendingMessageEntries ?? []),
-                transportPendingMessageVersion: applyPending
-                  ? nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion)
-                  : s.transportPendingMessageVersion,
+                ...queuePatch,
               };
             }));
           } else if (liveState === 'error') {
@@ -4699,9 +4639,7 @@ export function App() {
                   const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                   if (inputEl) {
                     const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                    inputEl.textContent = (inputEl.textContent || '') + quote;
-                    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                    inputEl.focus();
+                    appendContentEditableTextPreservingNewlines(inputEl, quote);
                   }
                 },
                 t: trans,
@@ -5118,9 +5056,7 @@ export function App() {
                       : paths.map((p) => '@' + p + ' ');
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
-                      inputEl.textContent = (inputEl.textContent || '') + rel.join('');
-                      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                      inputEl.focus();
+                      appendContentEditableTextPreservingNewlines(inputEl, rel.join(''));
                     }
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
@@ -5393,8 +5329,7 @@ export function App() {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
                       const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                      inputEl.textContent = (inputEl.textContent || '') + quote;
-                      inputEl.focus();
+                      appendContentEditableTextPreservingNewlines(inputEl, quote);
                     }
                   },
                   t: trans,
@@ -5657,6 +5592,7 @@ export function App() {
               .filter((session) => Boolean(session.projectDir))
               .map((session) => ({
                 projectDir: session.projectDir,
+                canonicalRepoId: session.contextNamespace?.projectId,
                 displayName: session.label || session.project || session.name,
                 sessionName: session.name,
                 source: session.name === activeSession ? 'active_session' as const : 'recent_session' as const,

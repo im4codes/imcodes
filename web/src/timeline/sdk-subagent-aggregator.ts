@@ -17,6 +17,7 @@ import type { TimelineEvent } from '../ws-client.js';
 export interface SdkSubagentAggregationOptions {
   terminalTtlMs?: number;
   maxTerminalRows?: number;
+  activeStaleMs?: number;
 }
 
 export interface SdkSubagentStatusRow {
@@ -49,6 +50,7 @@ export interface SdkSubagentStatusRow {
   usageTotalTokens?: number;
   usageToolUses?: number;
   usageDurationMs?: number;
+  startedAtMs?: number;
 }
 
 export interface SdkSubagentDiagnostic {
@@ -102,6 +104,8 @@ const TERMINAL_STATUSES = new Set<SdkSubagentNormalizedStatus>([
   SDK_SUBAGENT_STATUS.STALE,
 ]);
 
+const DEFAULT_ACTIVE_STALE_MS = 15 * 60_000;
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
@@ -122,6 +126,11 @@ function getSessionFinishState(event: TimelineEvent, order: number): SessionFini
   const state = typeof payload?.state === 'string' ? payload.state : undefined;
   if (state !== 'idle' && state !== 'error') return null;
   return { eventId: event.eventId, ts: event.ts, order };
+}
+
+function getCodexCollabWrapperFinishState(event: TimelineEvent, order: number): SessionFinishState | null {
+  if (event.type === 'assistant.text') return { eventId: event.eventId, ts: event.ts, order };
+  return getSessionFinishState(event, order);
 }
 
 function isKnownStatus(value: string): value is SdkSubagentNormalizedStatus {
@@ -171,16 +180,33 @@ function isTerminalish(row: Pick<SdkSubagentStatusRow, 'terminal' | 'normalizedS
   return row.terminal || TERMINAL_STATUSES.has(row.normalizedStatus);
 }
 
+function normalizeStartedAtMs(value: unknown, eventTs: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return eventTs;
+  const startedAtMs = Math.floor(value);
+  if (startedAtMs <= 0) return eventTs;
+  // Provider clocks can be a little ahead, but a future "start" would make
+  // elapsed time negative and produce the app-reopen reset this metadata is
+  // meant to prevent. Fall back rather than trusting impossible data.
+  if (startedAtMs > eventTs) return eventTs;
+  return startedAtMs;
+}
+
+function mergeStartTs(previous: RowState | undefined, next: RowState): number {
+  if (!previous) return next.startTs;
+  return Math.min(previous.startTs, next.startTs);
+}
+
 function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number): RowState | null {
   const meta = detail.meta;
   if (!isKnownStatus(meta.normalizedStatus)) return null;
   const terminal = isTerminalish(meta);
   const active = meta.active && !terminal && ACTIVE_STATUSES.has(meta.normalizedStatus);
+  const startTs = normalizeStartedAtMs(meta.startedAtMs, event.ts);
   return {
     canonicalKey: meta.canonicalKey,
     sessionId: event.sessionId,
     eventId: event.eventId,
-    startTs: event.ts,
+    startTs,
     ts: event.ts,
     provider: meta.provider,
     providerKind: meta.providerKind,
@@ -206,6 +232,7 @@ function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number)
     usageTotalTokens: meta.usageTotalTokens,
     usageToolUses: meta.usageToolUses,
     usageDurationMs: meta.usageDurationMs,
+    startedAtMs: meta.startedAtMs,
     firstOrder: order,
     lastOrder: order,
   };
@@ -275,6 +302,10 @@ function staleRowAfterFinish(row: RowState, finish: SessionFinishState): RowStat
   };
 }
 
+function isCodexCollabWrapperRow(row: Pick<SdkSubagentStatusRow, 'providerKind' | 'receiverThreadId'>): boolean {
+  return row.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT && !row.receiverThreadId;
+}
+
 function getRunningContribution(row: SdkSubagentStatusRow): number {
   if (!row.active || row.terminal || !ACTIVE_STATUSES.has(row.normalizedStatus)) return 0;
   if (
@@ -309,13 +340,17 @@ export function deriveSdkSubagentStatusRows(
 ): SdkSubagentAggregationResult {
   const terminalTtlMs = options.terminalTtlMs ?? SDK_SUBAGENT_TERMINAL_RETENTION_MS;
   const maxTerminalRows = options.maxTerminalRows ?? SDK_SUBAGENT_MAX_TERMINAL_ROWS;
+  const activeStaleMs = options.activeStaleMs ?? DEFAULT_ACTIVE_STALE_MS;
   const rowsByCanonicalKey = new Map<string, RowState>();
   const diagnosticsById = new Map<string, DiagnosticState>();
   const sessionFinishes: SessionFinishState[] = [];
+  const codexCollabWrapperFinishes: SessionFinishState[] = [];
 
   events.forEach((event, order) => {
     const finish = getSessionFinishState(event, order);
     if (finish) sessionFinishes.push(finish);
+    const codexCollabFinish = getCodexCollabWrapperFinishState(event, order);
+    if (codexCollabFinish) codexCollabWrapperFinishes.push(codexCollabFinish);
 
     const detail = getSdkSubagentDetail(event);
     if (!detail) return;
@@ -334,7 +369,7 @@ export function deriveSdkSubagentStatusRows(
           rowsByCanonicalKey.set(next.canonicalKey, {
             ...next,
             firstOrder: previous?.firstOrder ?? next.firstOrder,
-            startTs: previous?.startTs ?? next.startTs,
+            startTs: mergeStartTs(previous, next),
           });
         }
       }
@@ -361,14 +396,27 @@ export function deriveSdkSubagentStatusRows(
     rowsByCanonicalKey.set(next.canonicalKey, {
       ...next,
       firstOrder: previous?.firstOrder ?? next.firstOrder,
-      startTs: previous?.startTs ?? next.startTs,
+      startTs: mergeStartTs(previous, next),
     });
   });
 
   for (const [canonicalKey, row] of rowsByCanonicalKey.entries()) {
     if (!row.active || isTerminalish(row)) continue;
+    if (activeStaleMs > 0 && now - row.ts > activeStaleMs) {
+      rowsByCanonicalKey.set(canonicalKey, {
+        ...row,
+        normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+        rawStatus: row.rawStatus ?? SDK_SUBAGENT_STATUS.STALE,
+        active: false,
+        terminal: true,
+      });
+      continue;
+    }
     if (row.backgrounded) continue;
-    const finish = findFinishAfter(row, sessionFinishes);
+    const finish = findFinishAfter(
+      row,
+      isCodexCollabWrapperRow(row) ? codexCollabWrapperFinishes : sessionFinishes,
+    );
     if (!finish) continue;
     rowsByCanonicalKey.set(canonicalKey, staleRowAfterFinish(row, finish));
   }

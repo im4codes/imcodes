@@ -6,9 +6,9 @@ import { promisify } from 'node:util';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
-import { getTransportQueueRevision, observeTransportQueueRevision } from './transport-queue-revision.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import {
   activeOpenSpecPromptIdForAutoDeliverStage,
   evaluateOpenSpecAutoDeliverComboCompatibility,
@@ -88,7 +88,7 @@ import {
   type P2pRun,
 } from './p2p-orchestrator.js';
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
-import { enqueueResend, getResendEntries, removeResendEntries } from './transport-resend-queue.js';
+import { enqueueResend, removeResendEntries } from './transport-resend-queue.js';
 import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
 
 /**
@@ -347,20 +347,11 @@ function runtimeProviderSessionId(runtime: NonNullable<ReturnType<typeof getTran
   return runtime.providerSessionId ?? null;
 }
 
-function emitAutoDeliverQueuedState(
-  sessionName: string,
-  entries: Array<{ commandId: string; text: string }>,
-  pendingMessageVersion?: number,
-): void {
+function emitAutoDeliverQueuedState(sessionName: string): void {
+  const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'openspec_auto_deliver');
   timelineEmitter.emit(sessionName, 'session.state', {
-    state: 'queued',
-    pendingCount: entries.length,
-    pendingMessages: entries.map((entry) => entry.text),
-    pendingMessageEntries: entries.map((entry) => ({
-      clientMessageId: entry.commandId,
-      text: entry.text,
-    })),
-    ...(typeof pendingMessageVersion === 'number' ? { pendingMessageVersion } : {}),
+    state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+    ...queuePayload,
   }, { source: 'daemon', confidence: 'high' });
 }
 
@@ -374,10 +365,18 @@ function queueAutoDeliverPromptForTransportResend(
   const enqueueResult = enqueueResend(run.targetImplementationSessionName, {
     text: prompt,
     commandId,
+    clientMessageId: `auto-deliver:${randomUUID()}`,
     queuedAt: Date.now(),
   });
-  const queued = getResendEntries(run.targetImplementationSessionName);
-  emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued, enqueueResult.pendingVersion);
+  if (!enqueueResult.accepted) {
+    run.evidence = mergeEvidence(run.evidence, [{
+      source: 'daemon',
+      summary: `Auto Deliver prompt was not queued because the transport queue authority rejected enqueue: ${enqueueResult.reason}.`,
+      stale: false,
+    }]);
+    return 'skipped_terminal';
+  }
+  emitAutoDeliverQueuedState(run.targetImplementationSessionName);
   // Trigger the runtime (re)launch so the resend queue actually drains. Manual
   // sends do this inline (command-handler); Auto-Deliver delivers outside that
   // path, so without this an enqueued prompt for a transport session with no
@@ -425,17 +424,7 @@ async function sendAutoDeliverPromptToImplementationSession(
       }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
     }
     if (result === 'queued') {
-      const pendingEntries = Array.isArray(runtime.pendingEntries) ? runtime.pendingEntries : [];
-      emitAutoDeliverQueuedState(
-        run.targetImplementationSessionName,
-        pendingEntries.map((entry) => ({
-          commandId: entry.clientMessageId,
-          text: entry.text,
-        })),
-        typeof runtime.pendingVersion === 'number'
-          ? observeTransportQueueRevision(run.targetImplementationSessionName, runtime.pendingVersion)
-          : undefined,
-      );
+      emitAutoDeliverQueuedState(run.targetImplementationSessionName);
     }
     return result;
   } catch (error) {
@@ -475,17 +464,14 @@ function purgeQueuedAutoDeliverPrompts(run: AutoDeliverRun, reason: string): voi
   );
 
   if (runtimeRemoved > 0) {
+    const queuePayload = buildTransportQueueSnapshotPayload(run.targetImplementationSessionName, 'openspec_auto_deliver');
     timelineEmitter.emit(run.targetImplementationSessionName, 'session.state', {
-      state: runtime?.pendingCount && runtime.pendingCount > 0 ? 'queued' : 'idle',
-      pendingCount: runtime?.pendingCount ?? 0,
-      pendingMessages: runtime?.pendingMessages ?? [],
-      pendingMessageEntries: runtime?.pendingEntries ?? [],
-      pendingMessageVersion: runtime ? observeTransportQueueRevision(run.targetImplementationSessionName, runtime.pendingVersion) : getTransportQueueRevision(run.targetImplementationSessionName),
+      state: queuePayload.pendingMessageEntries.length > 0 ? 'queued' : 'idle',
+      ...queuePayload,
     }, { source: 'daemon', confidence: 'high' });
   }
   if (resendRemoved > 0) {
-    const queued = getResendEntries(run.targetImplementationSessionName);
-    emitAutoDeliverQueuedState(run.targetImplementationSessionName, queued, getTransportQueueRevision(run.targetImplementationSessionName));
+    emitAutoDeliverQueuedState(run.targetImplementationSessionName);
   }
   if (runtimeRemoved + resendRemoved > 0) {
     run.evidence = mergeEvidence(run.evidence, [{

@@ -329,6 +329,37 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
   recordSend(from);
 
+  // Transport command liveness mandate (CLAUDE.md): `/stop` is a CONTROL
+  // command and must take the priority stop path from EVERY ingress — never
+  // the ordinary send queue. Without this, `imcodes send <target> "/stop"`
+  // (CLI / MCP send_message pipeline) queues "/stop" as an ordinary message
+  // behind the running turn and eventually delivers it to the MODEL as text
+  // (observed live on 211: deck_cd_w41 answered "/stop isn't available in
+  // this environment." while its running turn kept going). Exact-match only:
+  // messages that merely contain "/stop" stay ordinary text.
+  if (message.trim() === '/stop') {
+    // Lazy import — same heavy-module-cycle rationale as handleStop below.
+    const { stopSessionNow } = await import('./command-handler.js');
+    const stopped: string[] = [];
+    const notStopped: string[] = [];
+    for (const target of result.targets) {
+      if (stopSessionNow(target.name)) stopped.push(target.name);
+      else notStopped.push(target.name);
+    }
+    if (result.targets.length === 1) {
+      const target = result.targets[0].name;
+      const ok = stopped.length === 1;
+      return {
+        status: 200,
+        body: { ok, stopped: ok, target, ...(ok ? {} : { error: 'session not found or not stoppable' }) },
+      };
+    }
+    return {
+      status: 200,
+      body: { ok: notStopped.length === 0, stopped, ...(notStopped.length > 0 ? { notStopped } : {}) },
+    };
+  }
+
   const sender = resolveSenderRecord(from, listSessions());
   const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
   let dispatch;
@@ -540,6 +571,46 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
           res.writeHead(400);
           res.end(JSON.stringify({ ok: false, error: 'bad request' }));
         }
+      }
+      return;
+    }
+
+    if (url === '/sessions/live') {
+      // Authoritative live session states for local tooling (`imcodes status`).
+      // sessions.json is a multi-writer read-modify-write file whose `state`
+      // can be resurrected stale (a slow spread-writer can bring back
+      // 'running' minutes after the runtime settled idle). For sessions with a
+      // live transport runtime the runtime IS the truth — report it, and
+      // self-heal the drifted record so every record reader converges.
+      try {
+        // Lazy import — session-manager pulls in the whole daemon graph (same
+        // heavy-module-cycle rationale as the command-handler import above).
+        const { getTransportRuntime } = await import('../agent/session-manager.js');
+        const sessions = listSessions().map((record) => {
+          const runtime = getTransportRuntime(record.name);
+          if (!runtime) {
+            return { name: record.name, state: record.state, live: false };
+          }
+          const status = runtime.getStatus();
+          const state = status === 'idle' ? 'idle' : status === 'error' ? 'error' : 'running';
+          if (record.state !== state && record.state !== 'stopped') {
+            const fresh = getSession(record.name);
+            if (fresh && fresh.state !== state && fresh.state !== 'stopped') {
+              upsertSession({ ...fresh, state, updatedAt: Date.now() });
+              logger.debug(
+                { sessionName: record.name, recordState: fresh.state, runtimeState: state },
+                'sessions/live: repaired drifted session record state from live runtime',
+              );
+            }
+          }
+          return { name: record.name, state, live: true, pendingCount: runtime.pendingCount };
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessions }));
+      } catch (err) {
+        logger.warn({ err }, 'sessions/live: failed to assemble live session states');
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, error: 'failed to assemble live session states' }));
       }
       return;
     }

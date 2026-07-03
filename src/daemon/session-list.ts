@@ -13,7 +13,9 @@ import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
-import { buildTransportPendingQueueSnapshot, type TransportPendingMessageEntry } from './transport-pending-snapshot.js';
+import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
+import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { expireResendEntries } from './transport-resend-queue.js';
 import { validateExecutionTemplateCandidate } from './execution-clone.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
@@ -49,11 +51,14 @@ export interface SessionListItem extends SessionContextBootstrapState {
   label?: string;
   userCreated?: boolean;
   transportConfig?: Record<string, unknown>;
-  transportPendingMessages?: string[];
-  transportPendingMessageEntries?: TransportPendingMessageEntry[];
+  queueSnapshot?: QueueSnapshot;
+  pendingMessageEntries?: QueueSnapshot['pendingMessageEntries'];
+  queueEpoch?: string;
+  queueAuthorityId?: string;
+  failedMessageEntries?: QueueSnapshot['failedMessageEntries'];
   /** Monotonic version of the pending-queue snapshot. Lets the UI ignore
    *  stale snapshots delivered out of order. See TransportSessionRuntime. */
-  transportPendingMessageVersion?: number;
+  pendingMessageVersion?: number;
   /** DAEMON-AUTHORITATIVE: whether this session may be used as an execution
    *  template (clone source). The UI renders this rather than recomputing
    *  eligibility client-side. Base eligibility is caller-independent — the
@@ -109,10 +114,13 @@ function resolveTransportSessionListState(
 function baseItem(s: SessionRecord): SessionListItem {
   const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
   const runtimeState = resolveTransportSessionListState(s, runtime);
-  const pendingQueue = s.runtimeType === 'transport'
-    ? buildTransportPendingQueueSnapshot(s.name, runtime)
-    : { pendingMessages: [], pendingEntries: [], source: 'empty' as const };
-  const hasPendingQueue = pendingQueue.pendingMessages.length > 0 || pendingQueue.pendingEntries.length > 0;
+  if (s.runtimeType === 'transport') {
+    expireResendEntries(s.name);
+  }
+  const queuePayload = s.runtimeType === 'transport'
+    ? buildTransportQueueSnapshotPayload(s.name, 'session_list')
+    : null;
+  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
   const state = hasPendingQueue
     ? runtime
       ? (runtimeState === 'idle' ? 'queued' : runtimeState)
@@ -161,11 +169,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     label: s.label,
     userCreated: s.userCreated,
     transportConfig: s.transportConfig,
-    transportPendingMessages: pendingQueue.pendingMessages,
-    transportPendingMessageEntries: pendingQueue.pendingEntries,
-    ...(typeof pendingQueue.pendingVersion === 'number'
-      ? { transportPendingMessageVersion: pendingQueue.pendingVersion }
-      : {}),
+    ...(queuePayload ?? {}),
     executionTemplateEligible: eligibility.eligible,
     ...(eligibility.eligible
       ? {}

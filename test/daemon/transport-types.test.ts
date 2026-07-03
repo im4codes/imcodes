@@ -163,7 +163,7 @@ describe("src/agent/transport-provider", () => {
     expect(Object.keys(SESSION_OWNERSHIP)).toHaveLength(3);
   });
 
-  it("PROVIDER_ERROR_CODES has all 9 codes", () => {
+  it("PROVIDER_ERROR_CODES has all 10 codes", () => {
     expect(PROVIDER_ERROR_CODES.AUTH_FAILED).toBe("AUTH_FAILED");
     expect(PROVIDER_ERROR_CODES.CONFIG_ERROR).toBe("CONFIG_ERROR");
     expect(PROVIDER_ERROR_CODES.CONNECTION_LOST).toBe("CONNECTION_LOST");
@@ -173,7 +173,8 @@ describe("src/agent/transport-provider", () => {
     expect(PROVIDER_ERROR_CODES.CANCELLED).toBe("CANCELLED");
     expect(PROVIDER_ERROR_CODES.PARSE_ERROR).toBe("PARSE_ERROR");
     expect(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND).toBe("PROVIDER_NOT_FOUND");
-    expect(Object.keys(PROVIDER_ERROR_CODES)).toHaveLength(9);
+    expect(PROVIDER_ERROR_CODES.SDK_TURN_LOST).toBe("SDK_TURN_LOST");
+    expect(Object.keys(PROVIDER_ERROR_CODES)).toHaveLength(10);
   });
 });
 

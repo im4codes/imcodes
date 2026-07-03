@@ -19,6 +19,7 @@ vi.mock('react-i18next', () => ({
         'session.state_running_detail': 'Agent working: {{detail}}',
         'session.state_error': 'Session error',
         'session.state_error_detail': 'Error: {{error}}',
+        'session.state_stop_requested': 'Stop requested',
       };
       if (translations[key]) {
         return translations[key].replace(/\{\{(\w+)\}\}/g, (_, name) => String(opts?.[name] ?? ''));
@@ -379,7 +380,7 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
   });
 
-  it('does not show Agent working when timeline tail has settled but the session snapshot is stale running', () => {
+  it('keeps the robot running from authoritative session state even when timeline tail has settled', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -394,8 +395,9 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.textContent ?? '').not.toContain('Agent working');
-    expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
+    expect(container.textContent ?? '').toContain('Agent working');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
   });
 
   it('shows tool-call icon when explicit running status text is present', () => {
@@ -418,6 +420,31 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.tool .session-live-status-emoji.tool')).toBeTruthy();
     expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Reading file...');
     expect((container.querySelector('.session-live-status-inline') as HTMLSpanElement | null)?.getAttribute('aria-label')).toBe('Reading file...');
+  });
+
+  it('shows stop requested and cancelled feedback from the shared live status', () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 1_000_000, model: 'coder-model' }}
+        sessionName="deck_test_brain"
+        sessionState="stopping"
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.stopping')).toBeTruthy();
+    expect(container.textContent).toContain('Stop requested');
+
+    rerender(
+      <UsageFooter
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 1_000_000, model: 'coder-model' }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        sessionError="Turn cancelled by user stop"
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.cancelled')).toBeTruthy();
+    expect(container.textContent).toContain('Error: Turn cancelled by user stop');
   });
 
   it('shows a waiting indicator when idle has an active supervision status', () => {

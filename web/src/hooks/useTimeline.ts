@@ -23,6 +23,13 @@ import {
   MSG_DAEMON_OFFLINE,
   type AckFailureReason,
 } from '@shared/ack-protocol.js';
+import {
+  createTransportQueueReducerState,
+  reduceTransportQueueEvent,
+  selectLiveQueueEntries,
+  type TransportQueueReducerState,
+} from '@shared/transport-queue-reducer.js';
+import type { QueueEvent, QueueProjectionEntry, QueueSnapshot } from '@shared/transport-queue-types.js';
 import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../local-storage-quota.js';
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
@@ -59,7 +66,82 @@ import {
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
-import { normalizeTransportPendingEntries } from '../transport-queue.js';
+import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
+
+const TRANSPORT_QUEUE_EVENT_TYPES = new Set([
+  'transport.queue.snapshot',
+  'transport.queue.delivery',
+  'transport.queue.receipt',
+  'transport.queue.failure',
+  'transport.queue.reset',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isTransportQueueEvent(value: unknown): value is QueueEvent {
+  return isRecord(value) && typeof value.type === 'string' && TRANSPORT_QUEUE_EVENT_TYPES.has(value.type);
+}
+
+function extractQueueVersion(value: Record<string, unknown>): number | undefined {
+  const version = value.pendingMessageVersion;
+  return typeof version === 'number' && Number.isFinite(version) ? version : undefined;
+}
+
+function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['status']): QueueProjectionEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry, ordinal) => {
+    if (!isRecord(entry)) return [];
+    const clientMessageId = typeof entry.clientMessageId === 'string' ? entry.clientMessageId : '';
+    const text = typeof entry.text === 'string' ? entry.text : '';
+    if (!clientMessageId) return [];
+    return [{
+      clientMessageId,
+      text,
+      status: typeof entry.status === 'string' ? entry.status as QueueProjectionEntry['status'] : status,
+      placement: entry.placement === 'front' ? 'front' : 'normal',
+      ordinal: typeof entry.ordinal === 'number' && Number.isFinite(entry.ordinal) ? entry.ordinal : ordinal,
+      createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) ? entry.createdAt : 0,
+      updatedAt: typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? entry.updatedAt : 0,
+      ...(typeof entry.commandId === 'string' ? { commandId: entry.commandId } : {}),
+      ...(typeof entry.activityGeneration === 'string' || typeof entry.activityGeneration === 'number'
+        ? { activityGeneration: entry.activityGeneration }
+        : {}),
+      ...(typeof entry.replacesClientMessageId === 'string' ? { replacesClientMessageId: entry.replacesClientMessageId } : {}),
+    } satisfies QueueProjectionEntry];
+  });
+}
+
+function queueEventFromTimelineEvent(event: TimelineEvent): QueueEvent | null {
+  if (TRANSPORT_QUEUE_EVENT_TYPES.has(event.type) && isRecord(event.payload)) {
+    return {
+      ...event.payload,
+      type: event.type,
+      sessionName: typeof event.payload.sessionName === 'string' ? event.payload.sessionName : event.sessionId,
+    } as QueueEvent;
+  }
+  if (event.type !== 'session.state' || !isRecord(event.payload)) return null;
+  const queueEpoch = typeof event.payload.queueEpoch === 'string' ? event.payload.queueEpoch : '';
+  const queueAuthorityId = typeof event.payload.queueAuthorityId === 'string' ? event.payload.queueAuthorityId : '';
+  const pendingMessageVersion = extractQueueVersion(event.payload);
+  if (!queueEpoch || !queueAuthorityId || pendingMessageVersion === undefined) return null;
+  return {
+    type: 'transport.queue.snapshot',
+    sessionName: event.sessionId,
+    queueEpoch,
+    queueAuthorityId,
+    pendingMessageVersion,
+    pendingMessageEntries: toQueueProjectionEntries(event.payload.pendingMessageEntries, 'queued'),
+    failedMessageEntries: toQueueProjectionEntries(event.payload.failedMessageEntries, 'failed'),
+    source: typeof event.payload.source === 'string' ? event.payload.source : 'timeline-session-state',
+    ...(typeof event.payload.resetReason === 'string' ? { resetReason: event.payload.resetReason as QueueSnapshot['resetReason'] } : {}),
+    ...(typeof event.payload.dropReason === 'string' ? { dropReason: event.payload.dropReason as QueueSnapshot['dropReason'] } : {}),
+    ...(typeof event.payload.activityGeneration === 'string' || typeof event.payload.activityGeneration === 'number'
+      ? { activityGeneration: event.payload.activityGeneration }
+      : {}),
+  };
+}
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -274,6 +356,21 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 const MAX_MEMORY_EVENTS = 300;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
+
+// A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
+// partially-persisted IDB read) can be a LOW-COMPLETENESS tail: it shows a few
+// recent messages but is not the full history. A tail-anchored HTTP backfill
+// then only fetches `(seedTail, newest]` and never pulls the bulk history
+// BELOW the seed — the "open the chat and only the latest few lines show;
+// force-sync fixes it" symptom. When the seed looks low-completeness we pull
+// the full newest window (manualLatestWindow) instead of a tail catch-up.
+// Threshold kept small/conservative so a genuinely short-but-complete session
+// is NOT misclassified (it would still use the cheap tail path).
+const LOW_COMPLETENESS_SEED_THRESHOLD = 5;
+function isLowCompletenessSeed(events: readonly TimelineEvent[] | undefined): boolean {
+  if (!events || events.length === 0) return true;
+  return events.length < LOW_COMPLETENESS_SEED_THRESHOLD;
+}
 const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
 const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
@@ -1371,6 +1468,14 @@ export function useTimeline(
   });
   const eventsRef = useRef(events);
   eventsRef.current = events;
+  const transportQueueStateRef = useRef<TransportQueueReducerState>(
+    createTransportQueueReducerState(sessionId ?? undefined),
+  );
+  const transportQueueStateSessionRef = useRef<string | undefined>(sessionId ?? undefined);
+  if (transportQueueStateSessionRef.current !== (sessionId ?? undefined)) {
+    transportQueueStateSessionRef.current = sessionId ?? undefined;
+    transportQueueStateRef.current = createTransportQueueReducerState(sessionId ?? undefined);
+  }
   const [hasOlderHistory, setHasOlderHistory] = useState(true);
   // Loading starts false when we already have a synchronous cache hit at
   // mount — otherwise the first paint shows messages but ChatView still
@@ -1620,7 +1725,10 @@ export function useTimeline(
       // Background HTTP backfill — catches events missed while this window
       // was minimized/backgrounded since the memory cache can be stale.
       // Kept short (~200ms) because the UI is already visible; this is
-      // strictly additive catch-up, merged by eventId.
+      // strictly additive catch-up, merged by eventId. (Tail mode is correct
+      // here: the module cache is only ever written by full sources — IDB /
+      // daemon / HTTP — never by the low-completeness localStorage seed, so a
+      // small memCached is a genuinely small session, not a truncated tail.)
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
@@ -1658,7 +1766,10 @@ export function useTimeline(
       requestDaemonHistory(false, MAX_MEMORY_EVENTS);
       // Same reasoning as path 1 — back-fill in the background so the
       // re-opened window is guaranteed to reflect authoritative daemon
-      // state, not whatever the WS subscription happened to catch.
+      // state, not whatever the WS subscription happened to catch. (path-2 is
+      // only reached when a prior full load already completed for this session
+      // — see the IDB-stored branch which only locks historyLoadedRef when the
+      // restore is NOT low-completeness — so tail mode is correct here.)
       if (isActiveSession) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
       }
@@ -1715,12 +1826,25 @@ export function useTimeline(
         setCachedEvents(cacheKey!, restored);
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
-        historyLoadedRef.current = cacheKeyRef.current;
+        // Only treat this session as "fully loaded" (path-2 skip on re-open)
+        // when the restored set is NOT a low-completeness tail. IDB can hold
+        // just a WS-replay tail (daemon closed before flushing full history);
+        // locking historyLoadedRef on that would make every re-open hit path-2
+        // (tail backfill only) and never self-heal the truncation.
+        const restoredLooksComplete = !isLowCompletenessSeed(restored);
+        // Single completeness gate (see markHistoryLoadedIfComplete): only a
+        // NON-low-completeness restore locks path-2. A truncated tail stays
+        // unlocked so re-open re-reads/self-heals.
+        markHistoryLoadedIfComplete(restored);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
-        // WS event; reopening after a mid-chat close may leave a gap.
+        // WS event; reopening after a mid-chat close may leave a gap. A
+        // low-completeness restore pulls the full newest window instead of a
+        // tail catch-up so the bulk history below the seed is recovered.
         if (isActiveSession) {
-          fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+          fireHttpBackfillRef.current(200, restoredLooksComplete
+            ? { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' }
+            : { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' });
         }
         // Phase 2 (split-key heal): scoped had data, but the bare key may ALSO
         // hold a segment (serverId resolved mid-session). Merge it in the
@@ -1745,7 +1869,20 @@ export function useTimeline(
           setLoading(false);
         }
         if (isActiveSession) {
-          fireHttpBackfillRef.current(200, { cooldownMs: 0, phase: 'bootstrap' });
+          // IDB came back EMPTY. If a low-completeness seed (localStorage tail
+          // snapshot / WS replay tail) is already painted, a tail-mode backfill
+          // would anchor afterTs at the seed's newest ts and never fetch the
+          // bulk history BELOW it — the "open the chat and only the latest few
+          // messages show; force-refresh fixes it" bug. With no IDB backing that
+          // seed is definitionally truncated, so pull the full newest window (no
+          // lower bound), exactly like forceRefresh's manualLatestWindow. A truly
+          // blank pane (no seed) keeps the tail path — afterTs=undefined there
+          // already fetches the full window — and is additionally covered by the
+          // blank-pane self-heal effect.
+          const truncatedSeedShowing = eventsRef.current.length > 0;
+          fireHttpBackfillRef.current(200, truncatedSeedShowing
+            ? { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' }
+            : { cooldownMs: 0, phase: 'bootstrap' });
         }
       }
     };
@@ -2010,8 +2147,7 @@ export function useTimeline(
     });
   }, [clearAutoRetryState, clearOptimisticTimer]);
 
-  const reconcileQueuedOptimisticMessages = useCallback((pendingEntries: unknown, pendingMessages: unknown) => {
-    const queuedEntries = normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? '');
+  const reconcileQueuedOptimisticEntries = useCallback((queuedEntries: Array<{ clientMessageId?: string }>) => {
     if (queuedEntries.length === 0) return;
     const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
     if (queuedIds.size === 0) return;
@@ -2033,6 +2169,19 @@ export function useTimeline(
       return next;
     });
   }, [clearOptimisticTimer, rememberSettledCommandId, sessionId]);
+
+  const reconcileQueuedOptimisticMessages = useCallback((
+    pendingEntries: unknown,
+    pendingMessages: unknown,
+    queuePayload?: Record<string, unknown>,
+  ) => {
+    const reducerPatch = queuePayload
+      ? buildTransportPendingSyncPatch({}, queuePayload, sessionId ?? '')
+      : {};
+    const queuedEntries = reducerPatch.transportPendingMessageEntries
+      ?? (queuePayload ? [] : normalizeTransportPendingEntries(pendingEntries, pendingMessages, sessionId ?? ''));
+    reconcileQueuedOptimisticEntries(queuedEntries);
+  }, [reconcileQueuedOptimisticEntries, sessionId]);
 
   const markOptimisticAccepted = useCallback((commandId: string, options?: { clearPending?: boolean }) => {
     if (!commandId) return;
@@ -2095,6 +2244,33 @@ export function useTimeline(
     const status = typeof event.payload.status === 'string' ? event.payload.status : '';
     settleOptimisticByCommandAck(commandId, status, event.payload.error);
   }, [settleOptimisticByCommandAck]);
+
+  const applyTransportQueueEvidence = useCallback((event: QueueEvent) => {
+    if (event.sessionName && event.sessionName !== sessionId) return;
+    const previous = transportQueueStateRef.current;
+    const next = reduceTransportQueueEvent(previous, event);
+    transportQueueStateRef.current = next;
+    const accepted = next.degradedEvidence.length === previous.degradedEvidence.length;
+    if (accepted) {
+      reconcileQueuedOptimisticEntries(selectLiveQueueEntries(next));
+    }
+    if (event.type === 'transport.queue.receipt') {
+      settleOptimisticByCommandAck(event.commandId, event.status, event.reason);
+      return;
+    }
+    if (event.type === 'transport.queue.failure') {
+      markOptimisticFailed(event.clientMessageId, event.failureReason ?? event.dropReason);
+      return;
+    }
+    if (event.type === 'transport.queue.delivery') {
+      reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }]);
+    }
+  }, [markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
+
+  const applyTimelineTransportQueueEvidence = useCallback((event: TimelineEvent) => {
+    const queueEvent = queueEventFromTimelineEvent(event);
+    if (queueEvent) applyTransportQueueEvidence(queueEvent);
+  }, [applyTransportQueueEvidence]);
 
   const retryOptimisticMessage = useCallback((
     oldCommandId: string,
@@ -2263,6 +2439,21 @@ export function useTimeline(
   }, [sessionId, clearOptimisticTimer, markOptimisticFailed]);
 
   const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Single completeness gate for `historyLoadedRef` (the path-2 "already fully
+  // loaded, skip reload on re-open" token). INVARIANT: historyLoadedRef.current
+  // === cacheKeyRef.current  ⟺  this session has loaded a NON-low-completeness
+  // history. This is the sole write channel for that token except the
+  // deliberate disableHistory early-lock. The idempotent guard evaluates
+  // completeness ONLY while unlocked and NEVER unlocks — so once any complete
+  // source locks it, later calls early-return (no "later write clobbers earlier"
+  // anti-pattern), and a low-completeness forward/restore never locks (this is
+  // what makes the IDB-stored low-completeness self-heal actually take effect:
+  // the forward response no longer unconditionally re-locks a truncated tail).
+  const markHistoryLoadedIfComplete = useCallback((events: readonly TimelineEvent[] | undefined) => {
+    if (historyLoadedRef.current === cacheKeyRef.current) return;
+    if (!isLowCompletenessSeed(events)) historyLoadedRef.current = cacheKeyRef.current;
+  }, []);
+
   const resetOlderState = useCallback(() => {
     loadingOlderRef.current = false;
     olderRequestIdRef.current = null;
@@ -2277,8 +2468,17 @@ export function useTimeline(
     if (!supportsTimelineProtocol(ws)) return;
     const key = cacheKeyRef.current;
     const cached = key ? getCachedEvents(key) : undefined;
-    if (!cached || cached.length === 0) return;
-    const cursor = olderCursorRef.current ?? buildFallbackOlderCursor(cached, epochRef.current);
+    // Base for the fallback cursor: prefer the module cache, but fall back to
+    // the ON-SCREEN events when the cache is empty. The localStorage first-paint
+    // seed path deliberately does NOT write the global eventsCache (avoids the
+    // path-1 short-circuit that would skip the fuller IDB read), so a pane that
+    // is showing seed events would otherwise have an empty cache here and bail —
+    // exactly the "scroll-to-top load-older does nothing" bug. Deriving the
+    // cursor from `eventsRef.current` lets pagination work off what the user
+    // actually sees. We do NOT write the cache here (preserves that protection).
+    const base = (cached && cached.length > 0) ? cached : eventsRef.current;
+    if (!base || base.length === 0) return;
+    const cursor = olderCursorRef.current ?? buildFallbackOlderCursor(base, epochRef.current);
     if (!cursor) return;
     olderCursorRef.current = cursor;
     loadingOlderRef.current = true;
@@ -2729,7 +2929,10 @@ export function useTimeline(
       const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
-      historyLoadedRef.current = key;
+      // Single completeness gate (forceRefresh path): don't lock path-2 on a
+      // low-completeness reload — forceRefresh also fires manualLatestWindow,
+      // and a truncated reload should stay re-readable.
+      markHistoryLoadedIfComplete(restored);
       // Phase 2 split-key heal (same as bootstrap) — merge the bare segment.
       if (rawSessionId && !rawAlreadyRead) mergeRawSegmentLater(sharedDb, rawSessionId, key);
     }
@@ -2955,6 +3158,10 @@ export function useTimeline(
     if (disableHistory || !ws || !sessionId) return;
 
     const handler = (msg: ServerMessage) => {
+      if (isTransportQueueEvent(msg)) {
+        applyTransportQueueEvidence(msg);
+        return;
+      }
       // ── Real-time event ──
       if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
@@ -2969,8 +3176,10 @@ export function useTimeline(
         if (event.type !== 'session.state') {
           lastTimelineEventAtRef.current = Date.now();
         }
-        if (event.type === 'session.state' && event.payload?.state === 'queued') {
-          reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages);
+        const structuredQueueEvent = queueEventFromTimelineEvent(event);
+        if (structuredQueueEvent) applyTransportQueueEvidence(structuredQueueEvent);
+        if (!structuredQueueEvent && event.type === 'session.state' && event.payload?.state === 'queued') {
+          reconcileQueuedOptimisticMessages(event.payload.pendingMessageEntries, event.payload.pendingMessages, event.payload);
         }
         settleOptimisticByCommandAckEvent(event);
 
@@ -3157,14 +3366,16 @@ export function useTimeline(
         }
         updateHistoryStep('daemon', 'done', loading ? 'bootstrap' : 'refresh');
         recordTimelineResponse(msg, loading ? 'bootstrap' : 'refresh');
-        historyLoadedRef.current = cacheKeyRef.current;
+        // Route through the single completeness gate instead of an
+        // unconditional write: a low-completeness forward (empty / <5 events)
+        // must NOT re-lock path-2 and clobber an intentionally-unlocked
+        // low-completeness IDB restore (the bug that made S2 a no-op for active
+        // sessions). Idempotent + never-unlock: a complete restore stays locked.
+        markHistoryLoadedIfComplete(msg.events);
         const forwardOlderCursor = getOlderTimelineCursor(msg);
         if (hasStructuredOlderPage(msg) && forwardOlderCursor) {
           olderCursorRef.current = forwardOlderCursor;
           setHasOlderHistory(true);
-        } else if (msg.hasMore === false) {
-          olderCursorRef.current = null;
-          setHasOlderHistory(false);
         }
 
         epochRef.current = msg.epoch;
@@ -3185,6 +3396,7 @@ export function useTimeline(
             mergeEvents(msg.events);
           }
           for (const historyEvent of msg.events) {
+            applyTimelineTransportQueueEvidence(historyEvent);
             settleOptimisticByCommandAckEvent(historyEvent);
             settleOptimisticByTimelineProgress(historyEvent);
           }
@@ -3229,6 +3441,7 @@ export function useTimeline(
           seqRef.current = Math.max(seqRef.current, maxSeq);
           mergeEvents(replayEvents);
           for (const replayEvent of replayEvents) {
+            applyTimelineTransportQueueEvidence(replayEvent);
             settleOptimisticByCommandAckEvent(replayEvent);
             settleOptimisticByTimelineProgress(replayEvent);
           }
@@ -3441,7 +3654,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [applyTimelineTransportQueueEvidence, applyTransportQueueEvidence, beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;

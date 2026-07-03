@@ -139,7 +139,7 @@ describe('memory MCP stdio server', () => {
     }
   });
 
-  it('lists exactly the ten shared tools over stdio and does not leak secret env', async () => {
+  it('lists the registered shared tools over stdio and does not leak secret env', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stdio-'));
     const serverConfigPath = join(dir, 'server.json');
     await writeFile(serverConfigPath, JSON.stringify({ serverId: 'srv-local' }), 'utf8');
@@ -316,6 +316,78 @@ describe('memory MCP stdio server', () => {
         message: 'hello late peer',
         depth: 0,
       });
+    } finally {
+      await client.close();
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('keeps listed send targets usable across a transient empty session-store refresh', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-send-stable-'));
+    await writeSessionStore(home);
+    const hookBodies: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== '/send') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as Record<string, unknown>;
+        hookBodies.push(body);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, delivered: true, target: body.to }));
+      });
+    });
+
+    await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+    const address = hookServer.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+    await writeFile(join(home, '.imcodes', 'hook-port'), String(address.port), 'utf8');
+
+    const client = new Client({ name: 'memory-mcp-stable-send-target-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: mcpEnv(home),
+      stderr: 'pipe',
+    });
+
+    try {
+      await client.connect(transport);
+      const listed = await client.callTool({
+        name: 'send_list_targets',
+        arguments: { query: 'Peer' },
+      });
+      expect(listed.structuredContent).toMatchObject({
+        status: 'ok',
+        items: [expect.objectContaining({ target: 'deck_sub_peer', label: 'Peer' })],
+      });
+
+      await writeFile(join(home, '.imcodes', 'sessions.json'), JSON.stringify({ sessions: {} }), 'utf8');
+
+      const sent = await client.callTool({
+        name: 'send_message',
+        arguments: {
+          target: 'deck_sub_peer',
+          message: 'hello after transient empty store',
+        },
+      });
+
+      expect(sent.structuredContent).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'delivered' })],
+      });
+      expect(hookBodies).toEqual([{
+        from: 'deck_sub_worker',
+        to: 'deck_sub_peer',
+        message: 'hello after transient empty store',
+        depth: 0,
+      }]);
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

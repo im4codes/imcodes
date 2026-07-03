@@ -27,6 +27,7 @@ import {
 import logger from '../util/logger.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { timelineStore } from '../daemon/timeline-store.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
@@ -47,6 +48,16 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { buildCodexLifecycleTerminalMetadata, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+  buildSdkSubagentSafeDetail,
+  parseSdkSubagentDetail,
+  type SdkSubagentDetail,
+} from '../../shared/sdk-subagent-status.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -55,6 +66,7 @@ import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { buildTransportQueueSnapshotPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
@@ -66,6 +78,15 @@ const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
     || isTransportAgent(record.agentType as AgentType);
+}
+
+function shouldStartFreshCodexThreadAfterInterruptedRestore(
+  record: Pick<SessionRecord, 'providerId' | 'agentType' | 'state' | 'codexSessionId'>,
+): boolean {
+  return (record.providerId ?? record.agentType) === 'codex-sdk'
+    && record.state === 'running'
+    && typeof record.codexSessionId === 'string'
+    && record.codexSessionId.trim().length > 0;
 }
 
 function shouldAutoRelaunchTransportRuntimeAfterError(
@@ -327,7 +348,7 @@ export async function stopProject(
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
-        clearResend(record.name);
+        clearResend(record.name, 'session_removed');
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -954,13 +975,16 @@ function stopStructuredWatchers(sessionName: string): void {
   stopOpenCodeWatching(sessionName);
 }
 
-export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
+export async function stopTransportRuntimeSession(
+  sessionName: string,
+  options: { preserveTransportQueue?: boolean } = {},
+): Promise<void> {
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
   transportRuntimes.delete(sessionName);
   if (providerSid) unregisterProviderRoute(providerSid);
-  await transportRuntime.kill();
+  await transportRuntime.kill(options);
 }
 
 async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
@@ -1040,6 +1064,19 @@ function previewTransportQueueText(text: string): string {
   return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
 }
 
+function buildTransportQueueSessionStatePayload(
+  sessionName: string,
+  state: SessionState | 'queued',
+  source: string,
+  extra?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    state,
+    ...(extra ?? {}),
+    ...buildTransportQueueSnapshotPayload(sessionName, source),
+  };
+}
+
 export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): DaemonTransportQueuesSnapshot {
   const resendQueues = listFreshResendQueues(nowMs);
   const resendBySession = new Map(resendQueues.map((queue) => [queue.sessionName, queue.entries]));
@@ -1111,6 +1148,10 @@ const TRANSPORT_RESTORE_CONCURRENCY = (() => {
 const TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS = (() => {
   const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_INTER_SESSION_DELAY_MS);
   return Number.isFinite(raw) && raw >= 0 ? Math.trunc(raw) : 75;
+})();
+const TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT = (() => {
+  const raw = Number(process.env.IMCODES_TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT);
+  return Number.isFinite(raw) && raw >= 200 ? Math.trunc(raw) : 2_000;
 })();
 const transportErrorRecoveryTimestamps = new Map<string, number[]>();
 
@@ -1199,21 +1240,18 @@ async function recoverTransportRuntimeAfterError(
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
       if (pendingCount > 0) {
-        const queued = getResendEntries(sessionName);
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'queued',
-          pendingCount,
-          pendingMessages: queued.map((entry) => entry.text),
-          pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
-          pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
-        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(
+          sessionName,
+          'session.state',
+          buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_error_recovery_loop'),
+          { source: 'daemon', confidence: 'high' },
+        );
       }
       return false;
     }
     transportErrorRecoveryTimestamps.set(sessionName, [...recentRecoveries, now]);
 
     if (pendingCount > 0) {
-      const queued = getResendEntries(sessionName);
       const recoveryReason = providerError?.code === PROVIDER_ERROR_CODES.CONNECTION_LOST
         ? 'Provider connection lost'
         : 'Provider became stuck busy';
@@ -1222,16 +1260,15 @@ async function recoverTransportRuntimeAfterError(
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'session.state', {
-        state: 'queued',
-        pendingCount,
-        pendingMessages: queued.map((entry) => entry.text),
-        pendingMessageEntries: queued.map((entry) => ({ clientMessageId: entry.commandId, text: entry.text })),
-        pendingMessageVersion: getTransportQueueRevision(sessionName) ?? observeTransportQueueRevision(sessionName, undefined),
-      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_error_recovery'),
+        { source: 'daemon', confidence: 'high' },
+      );
     }
 
-    await stopTransportRuntimeSession(sessionName).catch((err) => {
+    await stopTransportRuntimeSession(sessionName, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
       logger.warn({ err, sessionName }, 'Failed to stop errored transport runtime before auto-restart');
     });
 
@@ -1361,6 +1398,11 @@ async function drainTransportResendQueueIntoRuntime(
                     ...(entry.historyCommitted ? { historyCommitted: true } : {}),
                   })));
         if (result === 'sent' && !entry.timelineCommitted) {
+          const clientMessageId = entry.clientMessageId;
+          if (!clientMessageId) {
+            logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend drain sent without clientMessageId; user.message projection skipped');
+            return result;
+          }
           timelineEmitter.emit(
             sessionName,
             'user.message',
@@ -1368,36 +1410,33 @@ async function drainTransportResendQueueIntoRuntime(
               text: entry.text,
               allowDuplicate: true,
               commandId: entry.commandId,
-              clientMessageId: entry.commandId,
+              clientMessageId,
               pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
               ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             },
-            { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.commandId}` },
+            { source: 'daemon', confidence: 'high', eventId: `transport-user:${clientMessageId}` },
           );
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'running',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
+            { source: 'daemon', confidence: 'high' },
+          );
         } else if (result === 'sent') {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'running',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_resend_drain_sent'),
+            { source: 'daemon', confidence: 'high' },
+          );
         } else if (result === 'queued') {
-          timelineEmitter.emit(sessionName, 'session.state', {
-            state: 'queued',
-            pendingCount: runtime.pendingCount,
-            pendingMessages: runtime.pendingMessages,
-            pendingMessageEntries: runtime.pendingEntries,
-            pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(
+            sessionName,
+            'session.state',
+            buildTransportQueueSessionStatePayload(sessionName, 'queued', 'transport_resend_drain_queued'),
+            { source: 'daemon', confidence: 'high' },
+          );
         }
         return result;
       },
@@ -1432,14 +1471,25 @@ async function drainTransportResendQueueIntoRuntime(
           { source: 'daemon', confidence: 'high' },
         );
       },
+      ({ deliveryFacts }) => {
+        for (const fact of deliveryFacts) {
+          timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
+            source: 'daemon',
+            confidence: 'high',
+          });
+        }
+      },
     );
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      buildTransportQueueSessionStatePayload(
+        sessionName,
+        runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        'transport_resend_drain_complete',
+      ),
+      { source: 'daemon', confidence: 'high' },
+    );
   } catch (err) {
     logger.warn({ err, session: sessionName, context }, 'transport resend drain failed');
   }
@@ -1496,11 +1546,18 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.clearInputs = [
         { source: 'transport-runtime', reason: 'clear', count: 0 },
       ];
-      payload.pendingCount = runtime.pendingCount;
-      payload.pendingMessages = runtime.pendingMessages;
-      payload.pendingMessageEntries = runtime.pendingEntries;
-      payload.pendingVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
-      payload.pendingMessageVersion = payload.pendingVersion;
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle');
+      Object.assign(payload, queuePayload);
+      // Canonical authoritative-idle contract fields. The shared validator
+      // (`isAuthoritativeIdlePayloadShape`) requires numeric `pendingCount` and
+      // `pendingVersion`; the queue snapshot only carries
+      // `pendingMessageVersion`/`pendingMessageEntries`, so without these two
+      // aliases the web demotes every daemon idle to a WEAK idle — and any
+      // unmatched tool.call in the timeline then keeps the session rendered
+      // "working" forever even though the reconciler proved clean idle
+      // (observed live on deck_sub_3l6z4l39).
+      payload.pendingCount = queuePayload.pendingMessageEntries.length;
+      payload.pendingVersion = queuePayload.pendingMessageVersion;
     } else if (mapped === 'error' && providerError?.message) {
       payload.error = providerError.message;
     }
@@ -1537,16 +1594,15 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     // leave the queue UI simultaneously. The runtime's pending queue is now [] (or
     // contains any NEW messages queued since drain started).
     persistTransportState('running');
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'running',
-      activityGeneration: metadata.activityGeneration,
-      drainMetadata: metadata,
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-      pendingVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-      pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
-    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(
+      sessionName,
+      'session.state',
+      buildTransportQueueSessionStatePayload(sessionName, 'running', 'transport_drain', {
+        activityGeneration: metadata.activityGeneration,
+        drainMetadata: metadata,
+      }),
+      { source: 'daemon', confidence: 'high' },
+    );
   };
   runtime.onProviderSessionReady = () => {
     // The provider session just bound (initialize/reconnect completed). Drain
@@ -1774,8 +1830,20 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
 type RestoreOpenToolCall = {
   id: string;
   tool?: string;
-  activityGeneration?: unknown;
+  activityGeneration?: ActivityGenerationLike;
 };
+
+type RestoreOpenSdkSubagentCall = RestoreOpenToolCall & {
+  detail: SdkSubagentDetail;
+  key: string;
+  turnId?: string;
+};
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
 
 function readTransportToolCallId(event: Record<string, unknown>): string | null {
   for (const key of ['toolCallId', 'toolUseId', 'callId', 'id']) {
@@ -1804,7 +1872,7 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
       openTools.set(id, {
         id,
         ...(typeof event.tool === 'string' && event.tool.trim() ? { tool: event.tool.trim() } : {}),
-        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration } : {}),
+        ...(event.activityGeneration !== undefined ? { activityGeneration: event.activityGeneration as ActivityGenerationLike } : {}),
       });
     } else {
       openTools.delete(id);
@@ -1812,20 +1880,29 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
   }
   if (openTools.size === 0) return 0;
 
-  const activityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  const fallbackActivityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
   let closed = 0;
   for (const tool of openTools.values()) {
-    const payload: Record<string, unknown> = {
-      toolCallId: tool.id,
-      ...(tool.tool ? { tool: tool.tool } : {}),
+    const activityGeneration = tool.activityGeneration ?? fallbackActivityGeneration;
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: sessionName,
       terminalStatus: 'stale',
       terminalReason: 'daemon_restart_orphan',
       activityGeneration,
+      toolCallId: tool.id,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+    });
+    const payload: Record<string, unknown> = {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      ...metadata,
     };
     timelineEmitter.emit(sessionName, 'tool.result', payload, {
       source: 'daemon',
       confidence: 'high',
-      eventId: `transport-tool:${sessionName}:${tool.id}:daemon_restart_orphan`,
+      eventId: metadata.idempotencyKey,
     });
     await appendTransportEvent(sessionName, {
       type: 'tool.result',
@@ -1835,6 +1912,93 @@ async function reconcileTransportRestoreOrphanTools(sessionName: string, runtime
     closed++;
   }
   logger.info({ sessionName, closed }, 'transport restore reconciled orphan tool calls');
+  return closed;
+}
+
+async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, runtime: TransportSessionRuntime): Promise<number> {
+  let events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  try {
+    const timelineEvents = await timelineStore.readByTypesPreferred(sessionName, ['tool.call', 'tool.result'], {
+      limit: TRANSPORT_RESTORE_SDK_SUBAGENT_SCAN_LIMIT,
+    });
+    events = timelineEvents.map((event) => ({ type: event.type, payload: event.payload }));
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'transport restore sdk orphan reconcile could not read timeline history');
+    return 0;
+  }
+  if (events.length === 0) return 0;
+
+  const openSdk = new Map<string, RestoreOpenSdkSubagentCall>();
+  for (const event of events) {
+    const payload = record(event.payload);
+    if (!payload) continue;
+    const parsed = parseSdkSubagentDetail(payload.detail);
+    if (parsed.kind !== 'ok') continue;
+    const id = readTransportToolCallId(payload);
+    if (!id) continue;
+    const key = parsed.detail.meta.canonicalKey || id;
+    if (event.type === 'tool.call' && parsed.detail.meta.active && !parsed.detail.meta.terminal) {
+      openSdk.set(key, {
+        key,
+        id,
+        detail: parsed.detail,
+        ...(typeof payload.tool === 'string' && payload.tool.trim() ? { tool: payload.tool.trim() } : {}),
+        ...(payload.activityGeneration !== undefined ? { activityGeneration: payload.activityGeneration as ActivityGenerationLike } : {}),
+        ...(typeof payload.turnId === 'string' && payload.turnId.trim() ? { turnId: payload.turnId.trim() } : {}),
+      });
+    } else if (event.type === 'tool.result' || parsed.detail.meta.terminal) {
+      openSdk.delete(key);
+      openSdk.delete(id);
+    }
+  }
+  if (openSdk.size === 0) return 0;
+
+  const fallbackActivityGeneration = runtime.getDiagnosticSnapshot().activityGeneration;
+  let closed = 0;
+  for (const tool of openSdk.values()) {
+    const staleDetail = buildSdkSubagentSafeDetail({
+      ...tool.detail,
+      output: tool.detail.output ?? 'stale after daemon restart',
+      meta: {
+        ...tool.detail.meta,
+        normalizedStatus: SDK_SUBAGENT_STATUS.STALE,
+        rawStatus: 'daemon_restart_orphan',
+        active: false,
+        terminal: true,
+        diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.STALE_WITHOUT_TERMINAL,
+        ...(typeof tool.detail.meta.runningChildCount === 'number' ? { runningChildCount: 0 } : {}),
+      },
+    }, { allowRaw: false, sessionId: sessionName });
+    const itemKind = staleDetail.meta.providerKind === SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT
+      ? 'codex_collaboration'
+      : 'sdk_subagent';
+    const metadata = buildCodexLifecycleTerminalMetadata({
+      sessionId: sessionName,
+      terminalStatus: 'stale',
+      terminalReason: 'daemon_restart_orphan',
+      activityGeneration: tool.activityGeneration ?? fallbackActivityGeneration,
+      toolCallId: tool.id,
+      ...(tool.turnId ? { turnId: tool.turnId } : {}),
+      itemKind,
+      synthetic: true,
+      source: 'daemon_synthetic',
+      decisionReason: 'restore_reconnect_orphan_reconcile',
+    });
+    timelineEmitter.emit(sessionName, 'tool.result', {
+      toolCallId: tool.id,
+      ...(tool.tool ? { tool: tool.tool } : {}),
+      ...metadata,
+      output: staleDetail.output,
+      detail: staleDetail,
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-tool:${sessionName}:${tool.id}:restore-orphan-result`,
+      hidden: true,
+    });
+    closed += 1;
+  }
+  logger.info({ sessionName, closed }, 'transport restore reconciled orphan sdk sub-agent rows');
   return closed;
 }
 
@@ -1881,7 +2045,7 @@ export async function restoreTransportSessions(
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName: s.name, ...preservation }, 'preserved unbound transport runtime queues before restore');
       }
-      await stopTransportRuntimeSession(s.name).catch((err) => {
+      await stopTransportRuntimeSession(s.name, { preserveTransportQueue: preservation.preservedCount > 0 }).catch((err) => {
         logger.warn({ err, session: s.name }, 'Failed to stop unbound transport runtime before restore');
       });
     }
@@ -1906,19 +2070,30 @@ export async function restoreTransportSessions(
       wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
+      const freshAfterInterruptedCodexRestore = shouldStartFreshCodexThreadAfterInterruptedRestore(s);
+      const freshOnRestore = freshAfterCancel || freshAfterInterruptedCodexRestore;
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
         || s.providerId === 'cursor-headless'
         || s.providerId === 'copilot-sdk'
         || s.providerId === 'kimi-sdk';
-      const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
+      const effectiveSessionKey = freshOnRestore || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
-          ? s.codexSessionId
+          ? (freshAfterInterruptedCodexRestore ? undefined : s.codexSessionId)
           : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk' || s.providerId === 'kimi-sdk')
             ? s.providerResumeId
             : undefined;
+      const preserveStartupMemoryOnRestore = s.startupMemoryInjected === true && !freshAfterInterruptedCodexRestore;
+      if (freshAfterInterruptedCodexRestore) {
+        logger.warn({
+          session: s.name,
+          providerId: s.providerId,
+          previousCodexSessionId: s.codexSessionId,
+          previousProviderSessionId: s.providerSessionId,
+        }, 'Codex SDK restore found interrupted running session; starting fresh thread');
+      }
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
@@ -1928,7 +2103,7 @@ export async function restoreTransportSessions(
       const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
-        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
+        startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
       const contextBootstrap = await resolveRuntimeContextBootstrap();
       runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
@@ -1967,8 +2142,9 @@ export async function restoreTransportSessions(
         sessionName: s.name,
         projectName: s.projectName,
         serverId: boundServerId,
-        bindExistingKey: freshAfterCancel ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
-        skipCreate: !freshAfterCancel && !!s.providerSessionId,
+        fresh: freshOnRestore,
+        bindExistingKey: freshOnRestore ? undefined : (needsEphemeralRouteKey ? s.providerSessionId : s.providerSessionId),
+        skipCreate: !freshOnRestore && !!s.providerSessionId,
         env: buildTransportSessionEnv(s.name, s.label, extraEnv),
         cwd: s.projectDir,
         label: s.label ?? s.name,
@@ -1993,7 +2169,7 @@ export async function restoreTransportSessions(
         // Restore path: only re-inject startup memory if the prior run hadn't
         // yet delivered it (e.g. daemon crashed mid-first-turn). Otherwise the
         // conversation already has its history preamble and we must not repeat it.
-        startupMemoryAlreadyInjected: s.startupMemoryInjected === true,
+        startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
@@ -2007,7 +2183,10 @@ export async function restoreTransportSessions(
         ...s,
         state: 'idle',
         updatedAt: Date.now(),
-        ...((freshAfterCancel || s.providerSessionId !== actualProviderSid)
+        ...(freshAfterInterruptedCodexRestore
+          ? { codexSessionId: undefined, startupMemoryInjected: undefined, recentInjectionHistory: undefined }
+          : {}),
+        ...((freshOnRestore || s.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
           : {}),
         contextNamespace: contextBootstrap.namespace,
@@ -2050,9 +2229,9 @@ export async function restoreTransportSessions(
       upsertSession(restoredRecord);
       emitSessionPersist(restoredRecord, s.name);
       await reconcileTransportRestoreOrphanTools(s.name, runtime);
+      await reconcileTimelineRestoreOrphanSdkSubagents(s.name, runtime);
       const restoredActivity = runtime.getDiagnosticSnapshot();
-      timelineEmitter.emit(s.name, 'session.state', {
-        state: 'idle',
+      timelineEmitter.emit(s.name, 'session.state', buildTransportQueueSessionStatePayload(s.name, 'idle', 'restore_reconnect_observed', {
         activityGeneration: restoredActivity.activityGeneration,
         blockingWorkCount: restoredActivity.blockingWorkCount,
         activeWorkCount: restoredActivity.blockingWorkCount,
@@ -2060,13 +2239,14 @@ export async function restoreTransportSessions(
         busyReasons: restoredActivity.busyReasons,
         decisionReason: 'restore_reconnect_observed',
         [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
-        pendingCount: runtime.pendingCount,
-        pendingMessages: runtime.pendingMessages,
-        pendingMessageEntries: runtime.pendingEntries,
-        pendingVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
-        pendingMessageVersion: observeTransportQueueRevision(s.name, runtime.pendingVersion),
-      }, { source: 'daemon', confidence: 'high' });
-      logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
+      }), { source: 'daemon', confidence: 'high' });
+      logger.info({
+        session: s.name,
+        providerId: s.providerId,
+        providerSid: s.providerSessionId,
+        freshAfterCancel,
+        freshAfterInterruptedCodexRestore,
+      }, 'Restored transport session runtime');
 
       // Drain messages that arrived while the provider was offline. The
       // enqueue path deliberately did NOT emit a user.message event (the
@@ -2090,6 +2270,25 @@ export async function restoreTransportSessions(
       // a real race window letting msg-2 arrive at `handleSend` while
       // `_sending` is still false.
       await drainTransportResendQueueIntoRuntime(runtime, s.name, 'reconnect');
+
+      // Rehydrate the runtime's pending queue from the SQLite queue authority.
+      // On a fresh daemon restart BOTH in-memory holders start empty (the resend
+      // queue drained just above AND this runtime's `_pendingMessages`), so a
+      // message that was `queued` behind an in-flight turn before the crash
+      // survives only in transport-queue.sqlite and would otherwise linger
+      // forever (daemon reports pending 0 while SQLite still holds the row —
+      // the "restart doesn't resync the queue" bug). Runs AFTER the resend drain
+      // so resend-claimed entries (now handoff_inflight/sent) are skipped by the
+      // clientMessageId + delivery-tombstone dedup inside the runtime method.
+      try {
+        const recoveredPending = runtime.rehydratePendingFromStore();
+        if (recoveredPending > 0) {
+          logger.info({ session: s.name, recovered: recoveredPending }, 'Rehydrated queued transport messages from SQLite after restart');
+          runtime.drainPendingIfIdle('sqlite-restore-rehydrate');
+        }
+      } catch (err) {
+        logger.warn({ err, session: s.name }, 'Failed to rehydrate transport pending queue from SQLite after restart');
+      }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }
@@ -2478,7 +2677,7 @@ export async function ensureTransportRuntimeForPendingResend(sessionName: string
       if (preservation.preservedCount > 0) {
         logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before pending-resend relaunch');
       }
-      await stopTransportRuntimeSession(sessionName).catch(() => {});
+      await stopTransportRuntimeSession(sessionName, { preserveTransportQueue: preservation.preservedCount > 0 }).catch(() => {});
     }
     await launchTransportSession(buildTransportResumeLaunchOpts(record));
   } catch (err) {

@@ -8,6 +8,11 @@ import { appendFile, mkdir, open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import {
+  SDK_TURN_LOST_RECOVERY_STATUS,
+  isSdkTurnLostRecoveryPhase,
+  sanitizeSdkTurnLostRecoveryMetadata,
+} from '../agent/transport-provider.js';
 import logger from '../util/logger.js';
 
 const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
@@ -61,6 +66,10 @@ function shouldKeepTransportHistoryEvent(event: Record<string, unknown>): boolea
   if (event.hidden === true) return false;
   const type = typeof event.type === 'string' ? event.type : '';
   if (type === 'tool.call') return readToolCallId(event) !== null;
+  if (type === 'agent.status') {
+    return event.status === SDK_TURN_LOST_RECOVERY_STATUS
+      && sanitizeSdkTurnLostRecoveryMetadata(event.recovery) !== null;
+  }
   return RENDERABLE_TRANSPORT_HISTORY_TYPES.has(type);
 }
 
@@ -140,6 +149,21 @@ function preserveTruncationMetadata(source: Record<string, unknown>, out: Record
 }
 
 export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): Record<string, unknown> {
+  if (event.type === 'agent.status') {
+    const recovery = sanitizeSdkTurnLostRecoveryMetadata(event.recovery);
+    const out: Record<string, unknown> = { type: 'agent.status' };
+    if (event.sessionId !== undefined) out.sessionId = event.sessionId;
+    if (event._ts !== undefined) out._ts = event._ts;
+    if (!recovery) return out;
+    const phase = recovery.phase ?? (isSdkTurnLostRecoveryPhase(event.phase) ? event.phase : undefined);
+    out.status = SDK_TURN_LOST_RECOVERY_STATUS;
+    out.reason = recovery.reason;
+    out.correlationId = recovery.correlationId;
+    if (phase !== undefined) out.phase = phase;
+    out.recovery = recovery;
+    return out;
+  }
+
   if (event.type === 'tool.call') {
     const out: Record<string, unknown> = { type: 'tool.call' };
     for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', '_ts']) {
@@ -154,7 +178,7 @@ export function sanitizeTransportHistoryEvent(event: Record<string, unknown>): R
   const truncatedFields: string[] = [];
   const out: Record<string, unknown> = { type: 'tool.result' };
 
-  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', '_ts']) {
+  for (const key of ['sessionId', 'toolCallId', 'toolUseId', 'callId', 'id', 'tool', 'terminalStatus', 'terminalReason', 'activityGeneration', 'synthetic', 'source', 'decisionReason', 'idempotencyKey', 'turnId', 'itemKind', '_ts']) {
     if (event[key] !== undefined) out[key] = event[key];
   }
   previewField(out, 'output', pickToolResultOutput(event), truncatedFields);

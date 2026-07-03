@@ -179,7 +179,7 @@ describe('buildSessionList', () => {
     expect(store.getSession('deck_codex_stable_brain')?.quotaLabel).toBe('5h 22% 1h10m 4/6 14:40 · 7d 44% 1d04h 4/8 15:48');
   });
 
-  it('derives transport session state from the live runtime instead of stale persisted store state', async () => {
+  it('derives transport running state from runtime but queue entries from SQLite authority', async () => {
     const store = await import('../../src/store/session-store.js');
     store.upsertSession({
       name: 'deck_qwen_busy_brain',
@@ -207,10 +207,13 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_qwen_busy_brain',
         state: 'running',
-        transportPendingMessages: ['queued second'],
-        transportPendingMessageEntries: [{ clientMessageId: 'msg-2', text: 'queued second' }],
+        pendingMessageEntries: [],
+        pendingMessageVersion: 0,
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_qwen_busy_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
   });
 
   it('nudges an idle transport runtime to drain pending messages before returning the list', async () => {
@@ -254,10 +257,13 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_qwen_idle_pending_brain',
         state: 'running',
-        transportPendingMessages: [],
-        transportPendingMessageEntries: [],
+        pendingMessageEntries: [],
+        pendingMessageVersion: 0,
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_qwen_idle_pending_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
   });
 
   it('surfaces resend queue entries when a transport runtime is missing', async () => {
@@ -291,10 +297,24 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_codex_missing_runtime_brain',
         state: 'queued',
-        transportPendingMessages: ['queued while offline'],
-        transportPendingMessageEntries: [{ clientMessageId: 'cmd-offline', text: 'queued while offline' }],
+        pendingMessageEntries: [
+          expect.objectContaining({
+            clientMessageId: expect.any(String),
+            commandId: 'cmd-offline',
+            text: 'queued while offline',
+          }),
+        ],
+        pendingMessageVersion: expect.any(Number),
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_codex_missing_runtime_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
+    expect(item.queueSnapshot).toEqual(expect.objectContaining({
+      type: 'transport.queue.snapshot',
+      source: 'session_list',
+      pendingMessageVersion: expect.any(Number),
+    }));
   });
 
   it('does not surface expired resend queue entries as pending work', async () => {
@@ -328,10 +348,20 @@ describe('buildSessionList', () => {
       expect.objectContaining({
         name: 'deck_codex_expired_resend_brain',
         state: 'running',
-        transportPendingMessages: [],
-        transportPendingMessageEntries: [],
+        pendingMessageEntries: [],
+        failedMessageEntries: [
+          expect.objectContaining({
+            commandId: 'cmd-expired',
+            text: 'expired queued while offline',
+            failureReason: 'expired',
+          }),
+        ],
+        pendingMessageVersion: expect.any(Number),
       }),
     ]));
+    const item = sessions.find((session) => session.name === 'deck_codex_expired_resend_brain') as Record<string, unknown>;
+    expect(item.transportPendingMessages).toBeUndefined();
+    expect(item.transportPendingMessageEntries).toBeUndefined();
   });
 
   it('preset-backed qwen sessions surface preset model + BYO tier, dropping OAuth labels', async () => {

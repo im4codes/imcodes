@@ -113,5 +113,45 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
 
     expect(sent).toHaveLength(1);
   });
-});
 
+  it('retries the current auto upgrade after a transient daemon block without 15-minute suppression', async () => {
+    vi.useFakeTimers();
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const daemonReady = vi.fn(() => true);
+    const stillCurrent = vi.fn(() => true);
+
+    const result = coordinator.request({
+      source: 'auto',
+      isDaemonReady: daemonReady,
+      isStillCurrent: stillCurrent,
+      send: (message) => sent.push(message),
+      now: 0,
+    });
+
+    expect(result.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+    expect(sent).toHaveLength(1);
+
+    const retry = coordinator.retryAutoAfterBlocked({
+      retryDelayMs: 1_000,
+      isDaemonReady: daemonReady,
+      isStillCurrent: stillCurrent,
+      send: (message) => sent.push(message),
+      now: 5_000,
+    });
+
+    expect(retry).toMatchObject({
+      ok: true,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+    });
+    await vi.advanceTimersByTimeAsync(999);
+    await flushPromises();
+    expect(sent).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(sent).toHaveLength(2);
+  });
+});

@@ -2,7 +2,25 @@ import { formatLabel } from './format-label.js';
 import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
-import { isRunningTimelineEvent } from './timeline-running.js';
+import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
+import {
+  createTransportQueueReducerState,
+  reduceTransportQueueEvent,
+  selectFailedQueueEntries,
+  selectLiveQueueEntries,
+  selectSessionHasLiveQueue,
+  type TransportQueueReducerState,
+} from '../../shared/transport-queue-reducer.js';
+import type {
+  QueueEvent,
+  QueueProjectionEntry,
+  QueueSnapshot,
+} from '../../shared/transport-queue-types.js';
+import {
+  containsLegacyLiveQueueEvidence,
+  isTransportQueueEventType,
+  isValidTransportQueueWireEvent,
+} from '../../shared/transport-queue-wire.js';
 import {
   isAuthoritativeCleanIdlePayload,
   normalizeActivityGeneration,
@@ -18,6 +36,19 @@ export interface WatchServerRow {
   baseUrl: string;
 }
 
+export interface WatchQueueEntry {
+  clientMessageId: string;
+  text: string;
+  status: string;
+  commandId?: string;
+}
+
+export interface WatchQueueReceipt {
+  commandId: string;
+  status: string;
+  reason?: string;
+}
+
 export interface WatchSessionRow {
   serverId: string;
   sessionName: string;
@@ -30,6 +61,13 @@ export interface WatchSessionRow {
   isPinned?: boolean;
   previewText?: string;
   previewUpdatedAt?: number;
+  queueEpoch?: string;
+  queueAuthorityId?: string;
+  transportPendingMessageVersion?: number;
+  transportPendingMessageEntries?: WatchQueueEntry[];
+  failedMessageEntries?: WatchQueueEntry[];
+  transportQueueReceipts?: WatchQueueReceipt[];
+  commandReceipts?: WatchQueueReceipt[];
 }
 
 export interface WatchApplicationContext {
@@ -64,6 +102,12 @@ export interface WatchSessionInput {
   state: string;
   label?: string | null;
   parentSession?: string | null;
+  queueEpoch?: string | null;
+  queueAuthorityId?: string | null;
+  transportPendingMessageVersion?: number | null;
+  pendingMessageEntries?: unknown;
+  transportPendingMessageEntries?: unknown;
+  failedMessageEntries?: unknown;
 }
 
 export interface WatchSubSessionInput {
@@ -72,6 +116,12 @@ export interface WatchSubSessionInput {
   state?: string;
   label?: string | null;
   parentSession?: string | null;
+  queueEpoch?: string | null;
+  queueAuthorityId?: string | null;
+  transportPendingMessageVersion?: number | null;
+  pendingMessageEntries?: unknown;
+  transportPendingMessageEntries?: unknown;
+  failedMessageEntries?: unknown;
 }
 
 type WatchSessionLike = {
@@ -209,6 +259,106 @@ function cloneServerRows(servers: WatchServerRow[]): WatchServerRow[] {
   return servers.map((server) => ({ ...server }));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readQueueVersion(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['status']): QueueProjectionEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry, index) => {
+    if (!isRecord(entry)) return [];
+    const clientMessageId = typeof entry.clientMessageId === 'string' ? entry.clientMessageId.trim() : '';
+    const text = typeof entry.text === 'string' ? entry.text : '';
+    if (!clientMessageId || !text) return [];
+    return [{
+      clientMessageId,
+      text,
+      status,
+      placement: entry.placement === 'front' ? 'front' : 'normal',
+      ordinal: typeof entry.ordinal === 'number' && Number.isFinite(entry.ordinal) ? entry.ordinal : index,
+      createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) ? entry.createdAt : 0,
+      updatedAt: typeof entry.updatedAt === 'number' && Number.isFinite(entry.updatedAt) ? entry.updatedAt : 0,
+      ...(typeof entry.commandId === 'string' && entry.commandId.trim() ? { commandId: entry.commandId.trim() } : {}),
+    } satisfies QueueProjectionEntry];
+  });
+}
+
+function queueEventFromRecord(sessionName: string, value: Record<string, unknown>, source: string): QueueEvent | null {
+  const queueEpoch = typeof value.queueEpoch === 'string' ? value.queueEpoch : '';
+  const queueAuthorityId = typeof value.queueAuthorityId === 'string' ? value.queueAuthorityId : '';
+  const pendingMessageVersion = readQueueVersion(value.transportPendingMessageVersion ?? value.pendingMessageVersion);
+  if (!queueEpoch || !queueAuthorityId || pendingMessageVersion === undefined) return null;
+  const pendingEntriesValue = Object.prototype.hasOwnProperty.call(value, 'pendingMessageEntries')
+    ? value.pendingMessageEntries
+    : value.transportPendingMessageEntries;
+  const snapshot: QueueSnapshot = {
+    type: 'transport.queue.snapshot',
+    sessionName,
+    queueEpoch,
+    queueAuthorityId,
+    pendingMessageVersion,
+    pendingMessageEntries: toQueueProjectionEntries(pendingEntriesValue, 'queued'),
+    failedMessageEntries: toQueueProjectionEntries(value.failedMessageEntries, 'failed'),
+    source,
+    ...(typeof value.resetReason === 'string' ? { resetReason: value.resetReason as QueueSnapshot['resetReason'] } : {}),
+    ...(typeof value.dropReason === 'string' ? { dropReason: value.dropReason as QueueSnapshot['dropReason'] } : {}),
+    ...(typeof value.activityGeneration === 'string' || typeof value.activityGeneration === 'number'
+      ? { activityGeneration: value.activityGeneration }
+      : {}),
+  };
+  return isValidTransportQueueWireEvent(snapshot) ? snapshot : null;
+}
+
+function queueEventFromTimelineEvent(event: TimelineEvent): QueueEvent | null {
+  if (!isRecord(event.payload)) return null;
+  if (isTransportQueueEventType(event.type)) {
+    const candidate = {
+      ...event.payload,
+      type: event.type,
+      sessionName: typeof event.payload.sessionName === 'string' ? event.payload.sessionName : event.sessionId,
+    };
+    return isValidTransportQueueWireEvent(candidate) ? candidate : null;
+  }
+  if (event.type !== 'session.state') return null;
+  return queueEventFromRecord(event.sessionId, event.payload, 'watch-session-state');
+}
+
+function watchEntriesFromQueue(entries: QueueProjectionEntry[]): WatchQueueEntry[] {
+  return entries.map((entry) => ({
+    clientMessageId: entry.clientMessageId,
+    text: entry.text,
+    status: entry.status,
+    ...(entry.commandId ? { commandId: entry.commandId } : {}),
+  }));
+}
+
+function watchReceiptsFromQueue(state: TransportQueueReducerState): WatchQueueReceipt[] | undefined {
+  const receipts = Object.values(state.receipts)
+    .map((receipt) => ({
+      commandId: receipt.commandId,
+      status: receipt.status,
+      ...(receipt.reason ? { reason: receipt.reason } : {}),
+    }))
+    .sort((a, b) => a.commandId.localeCompare(b.commandId));
+  return receipts.length > 0 ? receipts : undefined;
+}
+
+function withoutQueueFields(row: WatchSessionRow): WatchSessionRow {
+  const next = { ...row };
+  delete next.queueEpoch;
+  delete next.queueAuthorityId;
+  delete next.transportPendingMessageVersion;
+  delete next.transportPendingMessageEntries;
+  delete next.failedMessageEntries;
+  delete next.transportQueueReceipts;
+  delete next.commandReceipts;
+  return next;
+}
+
 function buildComparableSnapshot(snapshot: WatchApplicationContext): string {
   return JSON.stringify({
     v: snapshot.v,
@@ -237,6 +387,10 @@ export class WatchProjectionStore {
   private openToolKeysBySession = new Map<string, Set<string>>();
   private activityGenerationBySession = new Map<string, string>();
   private previewBySession = new Map<string, { previewText: string; previewUpdatedAt: number }>();
+  private baseStateBySession = new Map<string, WatchSessionState>();
+  private queueStateBySession = new Map<string, TransportQueueReducerState>();
+  private queueWorkingBySession = new Set<string>();
+  private commandReceiptsBySession = new Map<string, Map<string, WatchQueueReceipt>>();
   private apiKeyOverride: string | null | undefined = undefined;
 
   private lastComparableSnapshot = '';
@@ -296,6 +450,10 @@ export class WatchProjectionStore {
       this.openToolKeysBySession.clear();
       this.activityGenerationBySession.clear();
       this.previewBySession.clear();
+      this.baseStateBySession.clear();
+      this.queueStateBySession.clear();
+      this.queueWorkingBySession.clear();
+      this.commandReceiptsBySession.clear();
       this.generatedAt = 0;
       this.maybePush(true);
       return;
@@ -321,6 +479,7 @@ export class WatchProjectionStore {
 
     // Main sessions from session_list
     for (const raw of sessions) {
+      this.applyQueueEventFromRecord(raw.name, raw as unknown as Record<string, unknown>, 'watch-session-list');
       const row = this.buildSessionRow(server.id, raw);
       nextParents.set(row.sessionName, raw.parentSession ?? null);
       const preview = this.previewBySession.get(row.sessionName);
@@ -333,6 +492,7 @@ export class WatchProjectionStore {
 
     // Sub-sessions from app state (daemon filters them from session_list)
     for (const sub of subs) {
+      this.applyQueueEventFromRecord(sub.sessionName, sub as unknown as Record<string, unknown>, 'watch-subsession-list');
       const row = this.buildSubSessionRow(server.id, sub);
       nextParents.set(row.sessionName, sub.parentSession ?? null);
       const preview = this.previewBySession.get(row.sessionName);
@@ -354,7 +514,9 @@ export class WatchProjectionStore {
   updateSessionState(sessionName: string, state: string): boolean {
     const row = this.sessionsByName.get(sessionName);
     if (!row) return false;
-    const nextState = normalizeState(state);
+    const baseState = normalizeState(state);
+    this.baseStateBySession.set(sessionName, baseState);
+    const nextState = this.effectiveStateForSession(sessionName, baseState);
     if (row.state === nextState) return false;
     this.sessionsByName.set(sessionName, { ...row, state: nextState });
     this.maybePush();
@@ -434,7 +596,17 @@ export class WatchProjectionStore {
 
   handleTimelineEvent(event: TimelineEvent): boolean {
     let changed = false;
+    const queueEvent = queueEventFromTimelineEvent(event);
+    if (queueEvent) {
+      changed = this.applyQueueEvent(queueEvent) || changed;
+    } else if (isRecord(event.payload) && isTransportQueueEventType(event.type) && containsLegacyLiveQueueEvidence(event.payload)) {
+      changed = false || changed;
+    }
+    if (event.type === 'command.ack') {
+      changed = this.trackCommandReceipt(event) || changed;
+    }
     if (event.type === 'tool.call') {
+      if (isSdkSubagentTimelineEvent(event)) return changed;
       const key = readToolActivityKey(event.payload);
       if (key) {
         const keys = this.openToolKeysBySession.get(event.sessionId) ?? new Set<string>();
@@ -444,6 +616,7 @@ export class WatchProjectionStore {
         this.openToolCountBySession.set(event.sessionId, (this.openToolCountBySession.get(event.sessionId) ?? 0) + 1);
       }
     } else if (event.type === 'tool.result') {
+      if (isSdkSubagentTimelineEvent(event)) return changed;
       const key = readToolActivityKey(event.payload);
       if (key) {
         const keys = this.openToolKeysBySession.get(event.sessionId);
@@ -578,11 +751,13 @@ export class WatchProjectionStore {
   }
 
   private buildSessionRow(serverId: string, raw: WatchSessionInput): WatchSessionRow {
+    const baseState = normalizeState(raw.state);
+    this.baseStateBySession.set(raw.name, baseState);
     const row: WatchSessionRow = {
       serverId,
       sessionName: raw.name,
       title: deriveTitle(raw),
-      state: normalizeState(raw.state),
+      state: this.effectiveStateForSession(raw.name, baseState),
       agentBadge: badgeForType(raw.agentType ?? raw.sessionType),
       isSubSession: isSubSessionName(raw.name, raw.parentSession),
     };
@@ -591,15 +766,17 @@ export class WatchProjectionStore {
       row.previewText = preview.previewText;
       row.previewUpdatedAt = preview.previewUpdatedAt;
     }
-    return row;
+    return this.withQueueProjection(row);
   }
 
   private buildSubSessionRow(serverId: string, session: WatchSubSessionInput): WatchSessionRow {
+    const baseState = normalizeState(session.state ?? 'working');
+    this.baseStateBySession.set(session.sessionName, baseState);
     const row: WatchSessionRow = {
       serverId,
       sessionName: session.sessionName,
       title: deriveTitle(session),
-      state: normalizeState(session.state ?? 'working'),
+      state: this.effectiveStateForSession(session.sessionName, baseState),
       agentBadge: badgeForType(session.sessionType),
       isSubSession: true,
     };
@@ -608,7 +785,7 @@ export class WatchProjectionStore {
       row.previewText = preview.previewText;
       row.previewUpdatedAt = preview.previewUpdatedAt;
     }
-    return row;
+    return this.withQueueProjection(row);
   }
 
   private buildSessions(): WatchSessionRow[] {
@@ -658,6 +835,102 @@ export class WatchProjectionStore {
     for (const key of [...this.previewBySession.keys()]) {
       if (!nextSessions.has(key)) this.previewBySession.delete(key);
     }
+    for (const key of [...this.baseStateBySession.keys()]) {
+      if (!nextSessions.has(key)) this.baseStateBySession.delete(key);
+    }
+    for (const key of [...this.queueStateBySession.keys()]) {
+      if (!nextSessions.has(key)) this.queueStateBySession.delete(key);
+    }
+    for (const key of [...this.queueWorkingBySession]) {
+      if (!nextSessions.has(key)) this.queueWorkingBySession.delete(key);
+    }
+    for (const key of [...this.commandReceiptsBySession.keys()]) {
+      if (!nextSessions.has(key)) this.commandReceiptsBySession.delete(key);
+    }
+  }
+
+  private trackCommandReceipt(event: TimelineEvent): boolean {
+    if (!isRecord(event.payload)) return false;
+    const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId.trim() : '';
+    const status = typeof event.payload.status === 'string' ? event.payload.status.trim() : '';
+    if (!commandId || !status) return false;
+    const receipt: WatchQueueReceipt = {
+      commandId,
+      status,
+      ...(typeof event.payload.error === 'string' && event.payload.error.trim() ? { reason: event.payload.error.trim() } : {}),
+    };
+    const receipts = this.commandReceiptsBySession.get(event.sessionId) ?? new Map<string, WatchQueueReceipt>();
+    receipts.set(commandId, receipt);
+    this.commandReceiptsBySession.set(event.sessionId, receipts);
+    return this.updateRowQueueProjection(event.sessionId);
+  }
+
+  private applyQueueEventFromRecord(sessionName: string, value: Record<string, unknown>, source: string): boolean {
+    const event = queueEventFromRecord(sessionName, value, source);
+    return event ? this.applyQueueEvent(event) : false;
+  }
+
+  private applyQueueEvent(event: QueueEvent): boolean {
+    const sessionName = event.sessionName;
+    const previous = this.queueStateBySession.get(sessionName) ?? createTransportQueueReducerState(sessionName);
+    const next = reduceTransportQueueEvent(previous, event);
+    const accepted = next.degradedEvidence.length === previous.degradedEvidence.length;
+    if (!accepted) {
+      this.queueStateBySession.set(sessionName, next);
+      return false;
+    }
+    this.queueStateBySession.set(sessionName, next);
+    return this.updateRowQueueProjection(sessionName);
+  }
+
+  private hasOpenToolWork(sessionName: string): boolean {
+    return (this.openToolCountBySession.get(sessionName) ?? 0) > 0
+      || (this.openToolKeysBySession.get(sessionName)?.size ?? 0) > 0;
+  }
+
+  private effectiveStateForSession(sessionName: string, baseState: WatchSessionState): WatchSessionState {
+    const queueState = this.queueStateBySession.get(sessionName);
+    if (queueState && selectSessionHasLiveQueue(queueState)) return 'working';
+    if (this.hasOpenToolWork(sessionName)) return 'working';
+    return baseState;
+  }
+
+  private withQueueProjection(row: WatchSessionRow): WatchSessionRow {
+    const queueState = this.queueStateBySession.get(row.sessionName);
+    const commandReceipts = this.commandReceiptsBySession.get(row.sessionName);
+    const queueReceipts = queueState ? watchReceiptsFromQueue(queueState) : undefined;
+    const baseRow: WatchSessionRow = {
+      ...withoutQueueFields(row),
+      ...(commandReceipts && commandReceipts.size > 0
+        ? { commandReceipts: [...commandReceipts.values()].sort((a, b) => a.commandId.localeCompare(b.commandId)) }
+        : {}),
+      ...(queueReceipts ? { transportQueueReceipts: queueReceipts } : {}),
+    };
+    if (!queueState?.queueEpoch || !queueState.queueAuthorityId || queueState.pendingMessageVersion === undefined) return baseRow;
+    const liveEntries = watchEntriesFromQueue(selectLiveQueueEntries(queueState));
+    const failedEntries = watchEntriesFromQueue(selectFailedQueueEntries(queueState));
+    if (liveEntries.length > 0) this.queueWorkingBySession.add(row.sessionName);
+    else this.queueWorkingBySession.delete(row.sessionName);
+    return {
+      ...baseRow,
+      state: this.effectiveStateForSession(row.sessionName, row.state),
+      queueEpoch: queueState.queueEpoch,
+      queueAuthorityId: queueState.queueAuthorityId,
+      transportPendingMessageVersion: queueState.pendingMessageVersion,
+      transportPendingMessageEntries: liveEntries,
+      failedMessageEntries: failedEntries,
+    };
+  }
+
+  private updateRowQueueProjection(sessionName: string): boolean {
+    const row = this.sessionsByName.get(sessionName);
+    if (!row) return false;
+    const baseState = this.baseStateBySession.get(sessionName) ?? row.state;
+    const nextRow = this.withQueueProjection({ ...row, state: this.effectiveStateForSession(sessionName, baseState) });
+    if (JSON.stringify(row) === JSON.stringify(nextRow)) return false;
+    this.sessionsByName.set(sessionName, nextRow);
+    this.maybePush();
+    return true;
   }
 
   private resolveApiKey(): string | null {

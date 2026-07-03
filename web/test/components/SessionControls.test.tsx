@@ -2805,7 +2805,7 @@ afterEach(() => {
     expect(input.textContent).toBe('');
   });
 
-  it('renders queued transport hints from legacy pendingMessages when pending entries are empty', () => {
+  it('ignores legacy pendingMessages when pending entries are empty', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2819,9 +2819,9 @@ afterEach(() => {
       />,
     );
 
-    expect(document.querySelector('.controls-queued-hint')).toBeTruthy();
-    expect(screen.getByText('queued first')).toBeDefined();
-    expect(screen.getByText('queued second')).toBeDefined();
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+    expect(screen.queryByText('queued first')).toBeNull();
+    expect(screen.queryByText('queued second')).toBeNull();
   });
 
   it('does not resurrect stale pendingMessages when a versioned empty entries snapshot is present', () => {
@@ -2843,7 +2843,7 @@ afterEach(() => {
     expect(screen.queryByText('stale queued')).toBeNull();
   });
 
-  it('clears a legacy queued card by unique text when the delivered timeline message has the real id', () => {
+  it('does not create or clear a queued card from legacy pendingMessages', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -2859,7 +2859,7 @@ afterEach(() => {
       />,
     );
 
-    expect(screen.getByText('legacy stale send')).toBeDefined();
+    expect(screen.queryByText('legacy stale send')).toBeNull();
 
     act(() => {
       ws.emit({
@@ -3517,7 +3517,7 @@ afterEach(() => {
     expect(screen.queryByText('sent while browser was offline')).toBeNull();
   });
 
-  it('clears an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
+  it('does not clear an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -3554,7 +3554,7 @@ afterEach(() => {
       });
     });
 
-    expect(screen.queryByText('queued text fallback')).toBeNull();
+    expect(screen.getByText('queued text fallback')).toBeDefined();
   });
 
   it('marks a local queued send failed instead of removing it when command.failed arrives', () => {

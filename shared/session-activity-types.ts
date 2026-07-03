@@ -22,12 +22,46 @@ export type ToolTerminalStatus = 'succeeded' | 'abandoned' | 'cancelled' | 'erro
 export type ToolTerminalReason =
   | 'provider_result'
   | 'provider_error'
+  | 'provider_cancelled'
+  | 'provider_interrupted'
   | 'user_cancelled'
   | 'generation_rollover'
   | 'daemon_restart_orphan'
   | 'provider_stale'
+  | 'thread_idle_settle'
+  | 'app_server_completed'
+  | 'app_server_failed'
+  | 'app_server_disconnect'
+  | 'auth_refresh_recovery_failed'
+  | 'app_server_restart_recovery_failed'
+  | 'rollout_task_complete'
+  | 'unexpected_eof'
+  | 'no_current_work_disconnect'
   | 'unknown_tool'
   | 'duplicate_terminal';
+
+export type CodexLifecycleEvidenceSource =
+  | 'app_server_jsonrpc'
+  | 'exec_jsonl_compat'
+  | 'rollout_jsonl_diagnostic'
+  | 'provider_snapshot'
+  | 'projection_only'
+  | 'daemon_synthetic';
+
+export type CodexLifecycleItemKind =
+  | 'turn_start'
+  | 'command_execution'
+  | 'web_search'
+  | 'mcp_tool_call'
+  | 'provider_tool_like'
+  | 'sdk_subagent'
+  | 'codex_collaboration'
+  | 'context_compaction'
+  | 'agent_message'
+  | 'reasoning'
+  | 'usage_or_status'
+  | 'diagnostic'
+  | 'unknown';
 
 export interface ActivityGeneration {
   scope: 'session';
@@ -64,6 +98,11 @@ export interface AuthoritativeIdlePayload {
   blockingWorkCount: 0;
   activeWorkCount: 0;
   activeToolCount: 0;
+  /**
+   * Diagnostic-only legacy queue count. Transport queue authority lives in the
+   * structured queue snapshot/reducer protocol; this value must not drive live
+   * queue cards, session-live-status, or watch/server queue state.
+   */
   pendingCount: number;
   pendingVersion: number;
   decisionReason: string;
@@ -84,6 +123,21 @@ export interface ActivityDrainMetadata {
   activityGeneration: ActivityGenerationLike;
   pendingVersion: number;
   entries: ActivityDrainEntryMetadata[];
+}
+
+export interface CodexLifecycleTerminalMetadata {
+  sessionId: string;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  synthetic: boolean;
+  source: CodexLifecycleEvidenceSource;
+  decisionReason: string;
+  idempotencyKey: string;
+  activityGeneration?: ActivityGenerationLike;
+  itemId?: string;
+  toolCallId?: string;
+  turnId?: string;
+  itemKind?: CodexLifecycleItemKind;
 }
 
 export interface TimelineActivityEvent {
@@ -108,6 +162,162 @@ export function normalizeActivityGeneration(value: ActivityGenerationLike): stri
   const sessionName = value.sessionName.trim();
   if (!sessionName || !Number.isFinite(value.generation)) return null;
   return `${value.scope}:${sessionName}:${value.generation}`;
+}
+
+const TOOL_TERMINAL_STATUSES = new Set<ToolTerminalStatus>([
+  'succeeded',
+  'abandoned',
+  'cancelled',
+  'errored',
+  'stale',
+]);
+
+const TOOL_TERMINAL_REASONS = new Set<ToolTerminalReason>([
+  'provider_result',
+  'provider_error',
+  'provider_cancelled',
+  'provider_interrupted',
+  'user_cancelled',
+  'generation_rollover',
+  'daemon_restart_orphan',
+  'provider_stale',
+  'thread_idle_settle',
+  'app_server_completed',
+  'app_server_failed',
+  'app_server_disconnect',
+  'auth_refresh_recovery_failed',
+  'app_server_restart_recovery_failed',
+  'rollout_task_complete',
+  'unexpected_eof',
+  'no_current_work_disconnect',
+  'unknown_tool',
+  'duplicate_terminal',
+]);
+
+const CODEX_LIFECYCLE_SOURCES = new Set<CodexLifecycleEvidenceSource>([
+  'app_server_jsonrpc',
+  'exec_jsonl_compat',
+  'rollout_jsonl_diagnostic',
+  'provider_snapshot',
+  'projection_only',
+  'daemon_synthetic',
+]);
+
+const CODEX_LIFECYCLE_ITEM_KINDS = new Set<CodexLifecycleItemKind>([
+  'turn_start',
+  'command_execution',
+  'web_search',
+  'mcp_tool_call',
+  'provider_tool_like',
+  'sdk_subagent',
+  'codex_collaboration',
+  'context_compaction',
+  'agent_message',
+  'reasoning',
+  'usage_or_status',
+  'diagnostic',
+  'unknown',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function cleanMetadataString(value: unknown, maxLength = 256): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+export function buildCodexLifecycleIdempotencyKey(input: {
+  sessionId: string;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  activityGeneration?: ActivityGenerationLike;
+  itemId?: string;
+  toolCallId?: string;
+  turnId?: string;
+}): string {
+  const generation = normalizeActivityGeneration(input.activityGeneration) ?? 'generation:unknown';
+  const workId = input.itemId?.trim()
+    ? `item:${input.itemId.trim()}`
+    : input.toolCallId?.trim()
+      ? `tool:${input.toolCallId.trim()}`
+      : input.turnId?.trim()
+        ? `turn:${input.turnId.trim()}`
+        : 'work:unknown';
+  return [
+    'codex-terminal',
+    input.sessionId.trim() || 'session:unknown',
+    generation,
+    workId,
+    input.terminalStatus,
+    input.terminalReason,
+  ].join(':');
+}
+
+export function isCodexLifecycleTerminalMetadata(value: unknown): value is CodexLifecycleTerminalMetadata {
+  if (!isRecord(value)) return false;
+  if (typeof value.sessionId !== 'string' || !value.sessionId.trim()) return false;
+  if (!TOOL_TERMINAL_STATUSES.has(value.terminalStatus as ToolTerminalStatus)) return false;
+  if (!TOOL_TERMINAL_REASONS.has(value.terminalReason as ToolTerminalReason)) return false;
+  if (typeof value.synthetic !== 'boolean') return false;
+  if (!CODEX_LIFECYCLE_SOURCES.has(value.source as CodexLifecycleEvidenceSource)) return false;
+  if (typeof value.decisionReason !== 'string' || !value.decisionReason.trim()) return false;
+  if (typeof value.idempotencyKey !== 'string' || !value.idempotencyKey.trim()) return false;
+  if (value.activityGeneration !== undefined && normalizeActivityGeneration(value.activityGeneration as ActivityGenerationLike) === null) return false;
+  if (value.itemId !== undefined && (typeof value.itemId !== 'string' || !value.itemId.trim())) return false;
+  if (value.toolCallId !== undefined && (typeof value.toolCallId !== 'string' || !value.toolCallId.trim())) return false;
+  if (value.turnId !== undefined && (typeof value.turnId !== 'string' || !value.turnId.trim())) return false;
+  if (value.itemKind !== undefined && !CODEX_LIFECYCLE_ITEM_KINDS.has(value.itemKind as CodexLifecycleItemKind)) return false;
+  return true;
+}
+
+export function buildCodexLifecycleTerminalMetadata(input: Omit<CodexLifecycleTerminalMetadata, 'idempotencyKey'> & { idempotencyKey?: string }): CodexLifecycleTerminalMetadata {
+  const idempotencyKey = input.idempotencyKey ?? buildCodexLifecycleIdempotencyKey(input);
+  return {
+    sessionId: input.sessionId,
+    terminalStatus: input.terminalStatus,
+    terminalReason: input.terminalReason,
+    synthetic: input.synthetic,
+    source: input.source,
+    decisionReason: input.decisionReason,
+    idempotencyKey,
+    ...(input.activityGeneration !== undefined ? { activityGeneration: input.activityGeneration } : {}),
+    ...(input.itemId !== undefined ? { itemId: input.itemId } : {}),
+    ...(input.toolCallId !== undefined ? { toolCallId: input.toolCallId } : {}),
+    ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
+    ...(input.itemKind !== undefined ? { itemKind: input.itemKind } : {}),
+  };
+}
+
+export function toPrivacySafeLifecycleMetadata(input: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  const stringKeys = [
+    'sessionId',
+    'itemId',
+    'toolCallId',
+    'turnId',
+    'terminalStatus',
+    'terminalReason',
+    'source',
+    'decisionReason',
+    'idempotencyKey',
+    'itemKind',
+  ];
+  for (const key of stringKeys) {
+    const value = cleanMetadataString(input[key]);
+    if (value !== undefined) output[key] = value;
+  }
+  if (typeof input.synthetic === 'boolean') output.synthetic = input.synthetic;
+  if (typeof input.activeWorkCount === 'number' && Number.isFinite(input.activeWorkCount)) output.activeWorkCount = input.activeWorkCount;
+  if (typeof input.activeToolCount === 'number' && Number.isFinite(input.activeToolCount)) output.activeToolCount = input.activeToolCount;
+  if (typeof input.blockingWorkCount === 'number' && Number.isFinite(input.blockingWorkCount)) output.blockingWorkCount = input.blockingWorkCount;
+  if (input.activityGeneration !== undefined && normalizeActivityGeneration(input.activityGeneration as ActivityGenerationLike) !== null) {
+    output.activityGeneration = input.activityGeneration;
+  }
+  return output;
 }
 
 export function sameActivityGeneration(a: ActivityGenerationLike, b: ActivityGenerationLike): boolean {
@@ -152,6 +362,17 @@ export function evaluateProviderSnapshot(
   return { state: 'clear', blocking: false, clear: true, reason: 'clear' };
 }
 
+export function isProviderSnapshotNonBlockingForStoppedGeneration(
+  snapshot: ProviderActiveWorkSnapshot | null | undefined,
+  stoppedGeneration: ActivityGenerationLike,
+): boolean {
+  if (!snapshot) return false;
+  if ((snapshot.status ?? 'current') !== 'current') return false;
+  if (snapshot.activeWorkCount <= 0 && snapshot.activeToolCount <= 0) return false;
+  const snapshotGeneration = snapshot.activityGeneration ?? snapshot.generation;
+  return sameActivityGeneration(snapshotGeneration, stoppedGeneration);
+}
+
 export function isProviderSnapshotBlocking(
   snapshot: ProviderActiveWorkSnapshot | null | undefined,
   currentGeneration?: ActivityGenerationLike,
@@ -161,6 +382,189 @@ export function isProviderSnapshotBlocking(
 
 export function hasProviderActiveWork(snapshot: ProviderActiveWorkSnapshot | null | undefined): boolean {
   return isProviderSnapshotBlocking(snapshot);
+}
+
+export const SDK_TURN_LOST_RECOVERY_REASON = 'sdk_turn_lost' as const;
+
+export type SdkTurnLostClassifier =
+  | 'idle_missing_turn'
+  | 'not_loaded_with_active_lease'
+  | 'start_grace_expired_no_current_turn';
+
+export type SdkTurnLostReplayDecision =
+  | 'pending'
+  | 'safe_replay'
+  | 'unsafe_side_effect'
+  | 'unsafe_ambiguous'
+  | 'unsafe_terminal'
+  | 'budget_exhausted'
+  | 'failed'
+  | 'not_applicable';
+
+export type SdkTurnLostRecoveryPhase = 'detected' | 'recovering' | 'recovered' | 'failed';
+
+export interface SdkTurnLostRecoveryMetadata {
+  reason: typeof SDK_TURN_LOST_RECOVERY_REASON;
+  localSessionKey: string;
+  sessionName?: string;
+  providerId?: string;
+  providerSessionId?: string;
+  codexThreadId?: string;
+  codexTurnId?: string;
+  activityGeneration: ActivityGenerationLike;
+  leaseStartedAt?: number;
+  lastStrongActivityAt?: number;
+  lastProviderEventAt?: number;
+  heartbeatStartedAt?: number;
+  heartbeatCompletedAt?: number;
+  heartbeatDurationMs?: number;
+  heartbeatFailureCount?: number;
+  silenceDurationMs?: number;
+  classifier: SdkTurnLostClassifier;
+  attempt?: number;
+  recoveryAttemptId?: string;
+  correlationId?: string;
+  replayDecision: SdkTurnLostReplayDecision;
+  phase?: SdkTurnLostRecoveryPhase;
+}
+
+export interface SdkTurnLostRecoveryEnvelope {
+  reason: typeof SDK_TURN_LOST_RECOVERY_REASON;
+  metadata: SdkTurnLostRecoveryMetadata;
+}
+
+const SDK_TURN_LOST_CLASSIFIERS = new Set<SdkTurnLostClassifier>([
+  'idle_missing_turn',
+  'not_loaded_with_active_lease',
+  'start_grace_expired_no_current_turn',
+]);
+
+const SDK_TURN_LOST_REPLAY_DECISIONS = new Set<SdkTurnLostReplayDecision>([
+  'pending',
+  'safe_replay',
+  'unsafe_side_effect',
+  'unsafe_ambiguous',
+  'unsafe_terminal',
+  'budget_exhausted',
+  'failed',
+  'not_applicable',
+]);
+
+const SDK_TURN_LOST_RECOVERY_PHASES = new Set<SdkTurnLostRecoveryPhase>([
+  'detected',
+  'recovering',
+  'recovered',
+  'failed',
+]);
+
+export interface SdkTurnLostRecoverySanitizeOptions {
+  expectedLocalSessionKey?: string;
+  expectedSessionName?: string;
+  expectedProviderSessionId?: string;
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null;
+}
+
+function readString(value: unknown, maxLength = 512): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function readFiniteNumber(value: unknown, maxValue = Number.MAX_SAFE_INTEGER): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.min(Math.trunc(value), maxValue);
+}
+
+function isActivityGenerationLikeValue(value: unknown): value is ActivityGenerationLike {
+  return normalizeActivityGeneration(value as ActivityGenerationLike) !== null;
+}
+
+function sanitizeActivityGenerationValue(value: unknown): ActivityGenerationLike | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed.slice(0, 256) : null;
+  }
+  const object = readObject(value);
+  if (!object) return null;
+  if (object.scope !== 'session') return null;
+  const sessionName = readString(object.sessionName, 256);
+  const generation = readFiniteNumber(object.generation);
+  if (!sessionName || generation === undefined) return null;
+  return {
+    scope: 'session',
+    sessionName,
+    generation,
+  };
+}
+
+function expectedMatches(actual: string | undefined, expected: string | undefined): boolean {
+  return !actual || !expected || actual === expected;
+}
+
+export function isSdkTurnLostRecoveryPhase(value: unknown): value is SdkTurnLostRecoveryPhase {
+  return SDK_TURN_LOST_RECOVERY_PHASES.has(value as SdkTurnLostRecoveryPhase);
+}
+
+export function readSdkTurnLostRecoveryMetadata(
+  value: unknown,
+  options: SdkTurnLostRecoverySanitizeOptions = {},
+): SdkTurnLostRecoveryMetadata | null {
+  const source = readObject(value);
+  if (!source) return null;
+  const details = readObject(source.details);
+  const candidate = readObject(details?.metadata) ?? details ?? source;
+  if (candidate.reason !== SDK_TURN_LOST_RECOVERY_REASON) return null;
+  const localSessionKey = readString(candidate.localSessionKey);
+  if (!localSessionKey) return null;
+  const activityGeneration = sanitizeActivityGenerationValue(candidate.activityGeneration);
+  if (activityGeneration === null || !isActivityGenerationLikeValue(activityGeneration)) return null;
+  if (!SDK_TURN_LOST_CLASSIFIERS.has(candidate.classifier as SdkTurnLostClassifier)) return null;
+  if (!SDK_TURN_LOST_REPLAY_DECISIONS.has(candidate.replayDecision as SdkTurnLostReplayDecision)) return null;
+  const sessionName = readString(candidate.sessionName);
+  const providerSessionId = readString(candidate.providerSessionId);
+  if (!expectedMatches(localSessionKey, options.expectedLocalSessionKey)) return null;
+  if (!expectedMatches(sessionName, options.expectedSessionName)) return null;
+  if (!expectedMatches(providerSessionId, options.expectedProviderSessionId)) return null;
+
+  return {
+    reason: SDK_TURN_LOST_RECOVERY_REASON,
+    localSessionKey,
+    ...(sessionName ? { sessionName } : {}),
+    ...(readString(candidate.providerId) ? { providerId: readString(candidate.providerId) } : {}),
+    ...(providerSessionId ? { providerSessionId } : {}),
+    ...(readString(candidate.codexThreadId) ? { codexThreadId: readString(candidate.codexThreadId) } : {}),
+    ...(readString(candidate.codexTurnId) ? { codexTurnId: readString(candidate.codexTurnId) } : {}),
+    activityGeneration,
+    ...(readFiniteNumber(candidate.leaseStartedAt) !== undefined ? { leaseStartedAt: readFiniteNumber(candidate.leaseStartedAt) } : {}),
+    ...(readFiniteNumber(candidate.lastStrongActivityAt) !== undefined ? { lastStrongActivityAt: readFiniteNumber(candidate.lastStrongActivityAt) } : {}),
+    ...(readFiniteNumber(candidate.lastProviderEventAt) !== undefined ? { lastProviderEventAt: readFiniteNumber(candidate.lastProviderEventAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatStartedAt) !== undefined ? { heartbeatStartedAt: readFiniteNumber(candidate.heartbeatStartedAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatCompletedAt) !== undefined ? { heartbeatCompletedAt: readFiniteNumber(candidate.heartbeatCompletedAt) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatDurationMs) !== undefined ? { heartbeatDurationMs: readFiniteNumber(candidate.heartbeatDurationMs) } : {}),
+    ...(readFiniteNumber(candidate.heartbeatFailureCount) !== undefined ? { heartbeatFailureCount: readFiniteNumber(candidate.heartbeatFailureCount) } : {}),
+    ...(readFiniteNumber(candidate.silenceDurationMs) !== undefined ? { silenceDurationMs: readFiniteNumber(candidate.silenceDurationMs) } : {}),
+    classifier: candidate.classifier as SdkTurnLostClassifier,
+    ...(readFiniteNumber(candidate.attempt) !== undefined ? { attempt: readFiniteNumber(candidate.attempt) } : {}),
+    ...(readString(candidate.recoveryAttemptId) ? { recoveryAttemptId: readString(candidate.recoveryAttemptId) } : {}),
+    ...(readString(candidate.correlationId) ? { correlationId: readString(candidate.correlationId) } : {}),
+    replayDecision: candidate.replayDecision as SdkTurnLostReplayDecision,
+    ...(isSdkTurnLostRecoveryPhase(candidate.phase) ? { phase: candidate.phase } : {}),
+  };
+}
+
+export function sanitizeSdkTurnLostRecoveryMetadata(
+  value: unknown,
+  options: SdkTurnLostRecoverySanitizeOptions = {},
+): SdkTurnLostRecoveryMetadata | null {
+  return readSdkTurnLostRecoveryMetadata(value, options);
+}
+
+export function isSdkTurnLostRecovery(value: unknown): value is SdkTurnLostRecoveryEnvelope {
+  return readSdkTurnLostRecoveryMetadata(value) !== null;
 }
 
 export function isAuthoritativeIdlePayloadShape(payload: Record<string, unknown> | null | undefined): boolean {
@@ -198,13 +602,7 @@ function readTerminalStatus(payload: Record<string, unknown> | undefined): ToolT
     : typeof payload?.status === 'string'
       ? payload.status
       : undefined;
-  return status === 'succeeded'
-    || status === 'abandoned'
-    || status === 'cancelled'
-    || status === 'errored'
-    || status === 'stale'
-    ? status
-    : undefined;
+  return TOOL_TERMINAL_STATUSES.has(status as ToolTerminalStatus) ? status as ToolTerminalStatus : undefined;
 }
 
 function readToolKey(payload: Record<string, unknown> | undefined): string | null {
@@ -214,6 +612,11 @@ function readToolKey(payload: Record<string, unknown> | undefined): string | nul
     if (typeof value === 'string' && value.trim()) return `${key}:${value.trim()}`;
   }
   return null;
+}
+
+function isSdkSubagentTimelinePayload(payload: Record<string, unknown> | undefined): boolean {
+  const detail = payload?.detail;
+  return isRecord(detail) && detail.kind === 'sdkSubagent';
 }
 
 export function reduceTimelineActivity(events: TimelineActivityEvent[]): TimelineActivityState {
@@ -228,6 +631,7 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
 
   for (const event of events) {
     if (event.type === 'tool.call') {
+      if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
       if (key) openToolIds.add(key);
       else anonymousOpenToolCount += 1;
@@ -235,6 +639,7 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
       continue;
     }
     if (event.type === 'tool.result') {
+      if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
       if (key) {
         if (openToolIds.has(key)) openToolIds.delete(key);

@@ -10,8 +10,23 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
 } from '../../shared/session-control-commands.js';
+import {
+  SDK_TURN_LOST_RECOVERY_REASON,
+  isProviderSnapshotNonBlockingForStoppedGeneration,
+  readSdkTurnLostRecoveryMetadata,
+  type ActivityGeneration,
+  type SdkTurnLostClassifier,
+  type SdkTurnLostReplayDecision,
+} from '../../shared/session-activity-types.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -132,6 +147,37 @@ function makeSearchResult(items: MemorySearchResultItem[]): MemorySearchResult {
   };
 }
 
+function sdkTurnLostError(options: {
+  sessionKey?: string;
+  generation?: ActivityGeneration;
+  classifier?: SdkTurnLostClassifier;
+  replayDecision?: SdkTurnLostReplayDecision;
+} = {}): ProviderError {
+  return {
+    code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+    message: 'lost turn',
+    recoverable: true,
+    details: {
+      reason: SDK_TURN_LOST_RECOVERY_REASON,
+      localSessionKey: options.sessionKey ?? 'deck_test_brain',
+      providerId: 'codex',
+      providerSessionId: 'sess-1',
+      codexThreadId: 'thread-1',
+      codexTurnId: 'turn-1',
+      activityGeneration: options.generation ?? {
+        scope: 'session',
+        sessionName: options.sessionKey ?? 'deck_test_brain',
+        generation: 1,
+      },
+      heartbeatFailureCount: 1,
+      classifier: options.classifier ?? 'idle_missing_turn',
+      recoveryAttemptId: 'recovery-1',
+      correlationId: 'corr-1',
+      replayDecision: options.replayDecision ?? 'pending',
+    },
+  };
+}
+
 const defaultConfig: SessionConfig = { sessionKey: 'deck_test_brain' };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const flushDispatch = async () => {
@@ -171,6 +217,7 @@ describe('TransportSessionRuntime', () => {
   let runtime: TransportSessionRuntime;
 
   beforeEach(async () => {
+    resetTransportQueueStoreForTests();
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
@@ -181,6 +228,7 @@ describe('TransportSessionRuntime', () => {
   });
 
   afterEach(() => {
+    resetTransportQueueStoreForTests();
     vi.unstubAllEnvs();
   });
 
@@ -271,6 +319,98 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  // Stability: the transport queue is persisted to transport-queue.sqlite, but a
+  // fresh daemon process starts BOTH in-memory holders empty (resend queue AND
+  // the runtime's _pendingMessages). Before this fix nothing read the persisted
+  // `queued` rows back, so a message queued behind an in-flight turn survived only
+  // in SQLite and never drained — the daemon reported pending 0 while the row sat
+  // `queued` forever. rehydratePendingFromStore() closes that read-back gap, and
+  // MUST never re-dispatch work that already ran.
+  describe('rehydratePendingFromStore (SQLite queue restart recovery)', () => {
+    // Rebuild a runtime for the SAME session name WITHOUT resetting the (in-memory,
+    // VITEST) queue store — mirrors a daemon restart where the SQLite authority
+    // survives but every in-memory runtime is gone.
+    const simulateRestart = async (sessionName = 'deck_test_brain') => {
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, sessionName);
+      await restarted.initialize(defaultConfig);
+      return { restartMock, restarted };
+    };
+
+    it('recovers a queued message that only survives in SQLite after a restart', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send('create pr and merge to master', 'msg-stuck')).toBe('queued');
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.pendingCount).toBe(0); // regression baseline: empty until rehydrate
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingCount).toBe(1);
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: 'msg-stuck', text: 'create pr and merge to master' },
+      ]);
+    });
+
+    it('drains the rehydrated message to the provider once idle', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+
+      const { restartMock, restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.drainPendingIfIdle('test')).toBe(true);
+
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect(restartMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        assembledMessage: expect.stringContaining('second'),
+      }));
+    });
+
+    it('is idempotent — a second rehydrate does not double-recover the same id', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.rehydratePendingFromStore()).toBe(0); // already live → deduped
+      expect(restarted.pendingCount).toBe(1);
+    });
+
+    it('does NOT recover a handoff_inflight entry (may already have executed at the provider)', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+      // Entry was mid-dispatch (handoff lease) when the daemon died — re-sending
+      // risks double execution, so it must be left for proof-backed recovery.
+      getTransportQueueStore().markHandoffInFlight('deck_test_brain', ['msg-2']);
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingCount).toBe(0);
+    });
+
+    it('does NOT recover an already-delivered entry', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('second', 'msg-2');
+      // The turn actually dispatched before the crash — finalizeSent writes the
+      // delivery tombstone that keeps it from resurrecting.
+      getTransportQueueStore().finalizeSent('deck_test_brain', 'msg-2');
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingCount).toBe(0);
+    });
+
+    it('is a no-op when SQLite holds no queued entries', async () => {
+      const { restarted } = await simulateRestart('deck_test_fresh');
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingCount).toBe(0);
+    });
   });
 
   it('places front-queued ask answers before ordinary pending messages when busy', async () => {
@@ -450,6 +590,91 @@ describe('TransportSessionRuntime', () => {
     expect(snapshot.pendingVersion).toBeGreaterThanOrEqual(1);
   });
 
+  it.each([
+    ['Claude task', SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK],
+    ['Claude runtime', SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT],
+    ['Codex runtime', SDK_SUBAGENT_PROVIDERS.CODEX_SDK, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT],
+    ['Qwen runtime', SDK_SUBAGENT_PROVIDERS.QWEN, SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT],
+    ['Gemini runtime', SDK_SUBAGENT_PROVIDERS.GEMINI_SDK, SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT],
+  ] as const)('treats backgrounded %s SDK sub-agent heartbeats as non-blocking display state', async (_label, provider, providerKind) => {
+    runtime.send('spawn a long helper', 'cmd-parent');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    const backgroundedSubagentTool: ToolCallEvent = {
+      id: `${provider}:deck_test_brain:runtime:019f-child`,
+      name: 'SDK Sub-agent',
+      status: 'running',
+      input: { action: 'sdk-subagent', description: 'sleep 600' },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        schemaVersion: 1,
+        provider,
+        status: SDK_SUBAGENT_STATUS.RUNNING,
+        label: 'SDK Sub-agent running',
+        meta: {
+          isSdkSubagent: true,
+          schemaVersion: 1,
+          provider,
+          providerKind,
+          canonicalKey: `${provider}:deck_test_brain:runtime:019f-child`,
+          agentPath: '019f-child',
+          rawStatus: 'running',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          backgrounded: true,
+        },
+      },
+    };
+
+    mock.fireTool('sess-1', backgroundedSubagentTool);
+    await flushDispatch();
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(0);
+
+    await runtime.cancel();
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.getStatus()).toBe('idle');
+
+    expect(runtime.send('next user message', 'cmd-after-subagent-heartbeat')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('closes runtime-local open tools on provider completion so idle and queued drain are not blocked', async () => {
+    runtime.send('run a short tool', 'cmd-tool-parent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    mock.fireTool('sess-1', {
+      id: 'tool-stuck-open',
+      name: 'Bash',
+      status: 'running',
+      input: { command: 'true' },
+    });
+    await flushDispatch();
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(1);
+
+    expect(runtime.send('next queued message', 'cmd-after-tool-complete')).toBe('queued');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(0);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({
+        toolCallId: 'tool-stuck-open',
+        tool: 'Bash',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
   it('diagnostic snapshot keeps the latest provider error for recovery debugging', async () => {
     runtime.send('fail this turn', 'cmd-fail');
     await waitForProviderSendCount(mock.provider, 1);
@@ -532,6 +757,21 @@ describe('TransportSessionRuntime', () => {
     await flushDispatch();
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.pendingVersion).toBe(5);
+    expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+      'deck_test_brain',
+      'transport.queue.delivery',
+      expect.objectContaining({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_test_brain',
+        clientMessageId: 'q2',
+        queueEpoch: expect.any(String),
+        queueAuthorityId: expect.any(String),
+        pendingMessageVersion: expect.any(Number),
+        deliveryFrameId: expect.any(String),
+        deliveryFrameVersion: expect.any(Number),
+      }),
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
   });
 
   it('fails closed on provider active/stale snapshots and drains after current-clear without Stop', async () => {
@@ -604,6 +844,34 @@ describe('TransportSessionRuntime', () => {
     const snapshot = runtime.getDiagnosticSnapshot();
     expect(snapshot.blockingWorkCount).toBeGreaterThan(0);
     expect(snapshot.busyReasons).toContain('snapshot_stale');
+  });
+
+  it('does not let a zero-work old-generation snapshot block a settled runtime without Stop', async () => {
+    runtime.send('first generation turn', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    const settledSnapshot = runtime.getDiagnosticSnapshot();
+    expect(settledSnapshot.blockingWorkCount).toBe(0);
+    expect(settledSnapshot.busyReasons).not.toContain('snapshot_stale');
+
+    expect(runtime.send('second generation turn', 'cmd-second')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'second generation turn',
+      assembledMessage: 'second generation turn',
+    }));
   });
 
   it('fails closed when provider clear snapshot lacks current runtime attribution', async () => {
@@ -700,12 +968,12 @@ describe('TransportSessionRuntime', () => {
       expect.objectContaining({
         source: 'daemon',
         confidence: 'high',
-        eventId: 'transport-tool:deck_test_brain:tool-old:generation_rollover',
+        eventId: expect.stringContaining('tool-old:abandoned:generation_rollover'),
       }),
     );
   });
 
-  it('emits clean idle after the last open tool terminal clears active work', async () => {
+  it('emits clean idle when provider completion closes the last open tool', async () => {
     const statuses: string[] = [];
     runtime.onStatusChange = (status) => {
       statuses.push(status);
@@ -721,7 +989,9 @@ describe('TransportSessionRuntime', () => {
     mock.fireComplete('sess-1');
     await flushDispatch();
 
-    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+    expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+    expect(statuses.at(-1)).toBe('idle');
 
     mock.fireTool('sess-1', {
       id: 'tool-background',
@@ -1140,6 +1410,268 @@ describe('TransportSessionRuntime', () => {
     }));
     expect(runtime.pendingMessages).not.toContain('being retried');
     expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('safe sdk_turn_lost replay preserves batch identity, attachments, shared actor metadata, and committed flags', async () => {
+    const drains: Array<{ entries: PendingTransportMessage[]; metadataEntries: unknown[] }> = [];
+    runtime.onDrain = (entries, _merged, _count, metadata) => {
+      drains.push({
+        entries: entries.map((entry) => ({ ...entry })),
+        metadataEntries: metadata.entries,
+      });
+    };
+
+    expect(runtime.send('active turn', 'msg-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    const attachment = { id: 'att-1', daemonPath: '/tmp/one.png', originalName: 'one.png', type: 'image' as const };
+    expect(runtime.send('queued with attachment', 'msg-queued-a', [attachment], undefined, {
+      sharedActor: sharedActorFixture,
+    })).toBe('queued');
+    expect(runtime.send('queued plain', 'msg-queued-b')).toBe('queued');
+
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(drains).toHaveLength(1);
+    expect(drains[0]?.entries.map((entry) => entry.clientMessageId)).toEqual(['msg-queued-a', 'msg-queued-b']);
+    expect(drains[0]?.metadataEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-queued-a',
+        attachmentIds: ['att-1'],
+        actorSessionName: 'deck_test_brain',
+        sharedActionId: 'action-shared',
+      }),
+      expect.objectContaining({ clientMessageId: 'msg-queued-b' }),
+    ]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'active turn',
+      'queued with attachment\n\nqueued plain',
+    ]);
+
+    mock.fireError('sess-1', sdkTurnLostError({
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    }));
+    await waitForProviderSendCount(mock.provider, 3);
+
+    expect(drains).toHaveLength(2);
+    expect(drains[1]?.entries).toEqual([]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content)).toEqual([
+      'active turn',
+      'queued with attachment\n\nqueued plain',
+    ]);
+    const replayPayload = mock.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(replayPayload).toMatchObject({
+      userMessage: 'queued with attachment\n\nqueued plain',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 3 },
+    });
+    expect(replayPayload.attachments).toEqual([attachment]);
+  });
+
+  it('handles rejected sdk_turn_lost as typed recovery without generic error pollution', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(sdkTurnLostError())
+      .mockResolvedValueOnce(undefined);
+
+    expect(runtime.send('lost before callback', 'msg-reject-lost')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.getStatus()).toBe('thinking');
+    const phaseCalls = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain' && call[1] === 'agent.status')
+      .map((call) => (call[2] as Record<string, unknown>).phase);
+    expect(phaseCalls).toContain('detected');
+    expect(phaseCalls).toContain('recovering');
+    expect(phaseCalls).not.toContain('recovered');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'lost before callback',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    }));
+  });
+
+  it('emits recovered only after replacement dispatch is accepted and produces post-acceptance strong activity', async () => {
+    expect(runtime.send('lost active turn', 'msg-lost-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    mock.fireError('sess-1', sdkTurnLostError());
+    // A late old-turn delta before the replacement dispatch has been accepted
+    // must not be queued and reclassified as recovered later.
+    mock.fireDelta('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    const phasesBeforeReplacementActivity = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain' && call[1] === 'agent.status')
+      .map((call) => (call[2] as Record<string, unknown>).phase);
+    expect(phasesBeforeReplacementActivity).toEqual(expect.arrayContaining(['detected', 'recovering']));
+    expect(phasesBeforeReplacementActivity).not.toContain('recovered');
+
+    mock.fireDelta('sess-1');
+    await flushDispatch();
+    mock.fireDelta('sess-1');
+    await flushDispatch();
+
+    const recoveredCalls = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain'
+        && call[1] === 'agent.status'
+        && (call[2] as Record<string, unknown>).phase === 'recovered');
+    expect(recoveredCalls).toHaveLength(1);
+    expect((recoveredCalls[0]?.[2] as Record<string, unknown>).correlationId).toBe('corr-1');
+  });
+
+  it.each([
+    ['assistant output', (_r: TransportSessionRuntime, m: ReturnType<typeof makeMockProvider>) => m.fireDelta('sess-1'), sdkTurnLostError()],
+    ['provider tool call', (_r: TransportSessionRuntime, m: ReturnType<typeof makeMockProvider>) => m.fireTool('sess-1', { id: 'tool-1', name: 'Bash', status: 'running' }), sdkTurnLostError()],
+    ['ambiguous heartbeat evidence', () => undefined, sdkTurnLostError({ replayDecision: 'unsafe_ambiguous' })],
+  ])('denies unsafe sdk_turn_lost replay after %s', async (_name, makeUnsafe, error) => {
+    expect(runtime.send('unsafe lost turn', 'msg-unsafe')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    makeUnsafe(runtime, mock);
+
+    mock.fireError('sess-1', error);
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      recoverable: false,
+    });
+    expect(readSdkTurnLostRecoveryMetadata(error)).not.toBeNull();
+  });
+
+  it('denies sdk_turn_lost replay for terminal local truth and exhausted isolated budget', async () => {
+    expect(runtime.send('terminal truth lost turn', 'msg-terminal')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (runtime as unknown as { _currentActivityGenerationLocallyCancelled: boolean })._currentActivityGenerationLocallyCancelled = true;
+    mock.fireError('sess-1', sdkTurnLostError());
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getStatus()).toBe('error');
+    expect(runtime.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/automatic replay was not safe/i);
+
+    const freshProvider = makeMockProvider();
+    const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_test_brain');
+    await fresh.initialize(defaultConfig);
+    fresh.send('budget exhausted lost turn', 'msg-budget');
+    await waitForProviderSendCount(freshProvider.provider, 1);
+    (fresh as unknown as { _sdkTurnLostRecoveryAttempts: Map<string, number> })
+      ._sdkTurnLostRecoveryAttempts
+      .set('deck_test_brain:session:deck_test_brain:1:sdk_turn_lost', 2);
+
+    freshProvider.fireError('sess-1', sdkTurnLostError());
+    await flushDispatch();
+
+    expect(freshProvider.provider.send).toHaveBeenCalledTimes(1);
+    expect(fresh.getStatus()).toBe('error');
+    expect(fresh.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/automatic replay was not safe/i);
+  });
+
+  it('treats stopped-generation provider_tool_item evidence as non-blocking but keeps ordinary stale and unattributed snapshots blocking', async () => {
+    const generation = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    expect(isProviderSnapshotNonBlockingForStoppedGeneration({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+    }, generation)).toBe(true);
+    expect(isProviderSnapshotNonBlockingForStoppedGeneration({
+      status: 'stale',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+    }, generation)).toBe(false);
+    expect(isProviderSnapshotNonBlockingForStoppedGeneration({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      providerDiagnosticGeneration: 'turn-only',
+    }, generation)).toBe(false);
+
+    expect(runtime.send('stoppable active turn', 'msg-stop-active')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+      updatedAt: Date.now(),
+    }));
+    expect(runtime.send('queued after stop', 'msg-stop-queued')).toBe('queued');
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stop',
+    }));
+    expect(runtime.pendingCount).toBe(0);
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
+  });
+
+  it('external completion settles idle even when Codex still reports provider_tool_item for the stopped generation', async () => {
+    const generation = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    expect(runtime.send('marker-backed turn with orphan provider tool', 'msg-orphan-tool')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.settleActiveDispatchFromExternalCompletion('marker-complete-but-provider-tool-stale')).toBe(true);
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
+  });
+
+  it('stop clears no-active-turn orphan provider_tool_item evidence instead of leaving the session tool_running', async () => {
+    const generation = { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 };
+    expect(runtime.send('turn whose local dispatch already settled externally', 'msg-orphan-stop')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: generation,
+      updatedAt: Date.now(),
+    }));
+    Object.assign(runtime as unknown as {
+      _activeTurn: null;
+      _sending: boolean;
+      _activeDispatchEntries: unknown[];
+      _activeDispatchId: null;
+      _activeDispatchProviderStarted: boolean;
+      _activeDispatchCancelled: boolean;
+    }, {
+      _activeTurn: null,
+      _sending: false,
+      _activeDispatchEntries: [],
+      _activeDispatchId: null,
+      _activeDispatchProviderStarted: false,
+      _activeDispatchCancelled: false,
+    });
+
+    await runtime.cancel();
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
   });
 
   it('send() merges description and runtime prompt into normalized systemText', async () => {
@@ -1966,7 +2498,7 @@ ${PREFERENCE_CONTEXT_END}`;
     // @openspec/changes/... references by themselves are now allowed —
     // they're common in user debugging prompts and must still trigger recall.
     r.send('Drive the implementation of @openspec/changes/shared-agent-context aggressively.', 'client-turn-template');
-    await flushDispatch();
+    await waitForProviderSendCount(localMock.provider, 1);
 
     expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
@@ -2051,6 +2583,95 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.getHistory().some((message) => message.content === 'queued completed')).toBe(true);
   });
 
+  it('cancel() drains queued messages when a zero-work stale provider snapshot lags behind the stopped generation', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after stale stop', 'msg-q-stale-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('runtime_dispatch');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stale stop',
+      assembledMessage: 'queued after stale stop',
+    }));
+  });
+
+  it('cancel() drains queued messages when provider explicitly reports a zero-work stale snapshot after Stop', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after explicit stale stop', 'msg-q-explicit-stale-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'stale',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: ['snapshot_stale'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now() - 60_000,
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after explicit stale stop',
+      assembledMessage: 'queued after explicit stale stop',
+    }));
+  });
+
+  it('repeated cancel() calls still drain later queued messages when old zero-work snapshots arrive across generations', async () => {
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('second after first stop', 'msg-second-after-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'second after first stop',
+      assembledMessage: 'second after first stop',
+    }));
+
+    runtime.send('third after second stop', 'msg-third-after-stop');
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 3);
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.cancel).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(3, 'sess-1', expect.objectContaining({
+      userMessage: 'third after second stop',
+      assembledMessage: 'third after second stop',
+    }));
+  });
+
   it('ignores the late CANCELLED callback from the stopped dispatch after queued work drains', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);
@@ -2068,7 +2689,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingCount).toBe(0);
   });
 
-  it('uses a late provider CANCELLED callback to release pending work blocked by a stale provider snapshot', async () => {
+  it('does not let a locally stopped turn stale provider snapshot block queued work', async () => {
     let providerActive = false;
     (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
       status: 'current',
@@ -2085,20 +2706,50 @@ ${PREFERENCE_CONTEXT_END}`;
     runtime.send('queued after stop', 'msg-q-after-provider-cancel');
     expect(runtime.pendingCount).toBe(1);
 
+    providerActive = false;
     await runtime.cancel();
-    await flushDispatch();
-
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
-    expect(runtime.pendingCount).toBe(1);
-
-    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop callback', recoverable: true });
     await waitForProviderSendCount(mock.provider, 2);
 
-    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
     expect(runtime.pendingCount).toBe(0);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       userMessage: 'queued after stop',
       assembledMessage: 'queued after stop',
+    }));
+
+    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop callback', recoverable: true });
+    await flushDispatch();
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a locally stopped turn stale provider snapshot block a later send', async () => {
+    let snapshotGeneration = 1;
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: snapshotGeneration },
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    snapshotGeneration = 0;
+    await runtime.cancel();
+
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('snapshot_stale');
+
+    runtime.send('later after stop', 'msg-later-after-stop');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'later after stop',
+      assembledMessage: 'later after stop',
     }));
   });
 
@@ -2139,6 +2790,46 @@ ${PREFERENCE_CONTEXT_END}`;
     // 'running' on the next session_list pass — resurrecting the "working" UI
     // animation after the user stopped.
     expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('cancel() with no queued messages is not resurrected by a zero-work stale provider snapshot', async () => {
+    runtime.send('only');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now(),
+    }));
+
+    await runtime.cancel();
+
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(snapshot.blockingWorkCount).toBe(0);
+    expect(snapshot.busyReasons).not.toContain('snapshot_stale');
+  });
+
+  it('cancel() with no queued messages is not resurrected by an explicit zero-work stale provider snapshot', async () => {
+    runtime.send('only');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'stale',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: ['snapshot_stale'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 0 },
+      updatedAt: Date.now() - 60_000,
+    }));
+
+    await runtime.cancel();
+
+    const snapshot = runtime.getDiagnosticSnapshot();
+    expect(runtime.getStatus()).toBe('idle');
+    expect(snapshot.blockingWorkCount).toBe(0);
+    expect(snapshot.busyReasons).not.toContain('snapshot_stale');
   });
 
   it('cancel() stops a turn before provider.send starts when context bootstrap is still running', async () => {

@@ -1,4 +1,5 @@
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
 import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
 
 const RUNNING_TIMELINE_EVENT_TYPES = new Set<TimelineEvent['type']>([
@@ -19,7 +20,15 @@ type TimelineTailEvent = Pick<TimelineEvent, 'type'> & {
   payload?: TimelineEvent['payload'] | null;
 };
 
+export function isSdkSubagentTimelineEvent(event: TimelineTailEvent): boolean {
+  if (event.type !== 'tool.call' && event.type !== 'tool.result') return false;
+  const detail = event.payload?.detail;
+  return Boolean(detail && typeof detail === 'object' && !Array.isArray(detail)
+    && (detail as { kind?: unknown }).kind === SDK_SUBAGENT_DETAIL_KIND);
+}
+
 export function isRunningTimelineEvent(event: TimelineTailEvent): boolean {
+  if (isSdkSubagentTimelineEvent(event)) return false;
   if (event.type === 'assistant.text') {
     return event.payload?.streaming === true;
   }
@@ -38,7 +47,12 @@ function isAuthoritativeCleanIdle(event: TimelineTailEvent): boolean {
 }
 
 function hasActiveWorkThrough(events: TimelineTailEvent[], endIndex: number): boolean {
-  return reduceTimelineActivity(events.slice(0, endIndex + 1) as any).active;
+  // SDK sub-agent rows have their own lifecycle aggregator. Treating hidden
+  // wrapper tool.call events as generic open tools makes old Codex
+  // collaboration rows keep the parent chat's global "working" indicator
+  // alive forever, even after the dedicated SDK row has terminalized.
+  const activityEvents = events.slice(0, endIndex + 1).filter((event) => !isSdkSubagentTimelineEvent(event));
+  return reduceTimelineActivity(activityEvents as any).active;
 }
 
 export function isPendingUserMessageTimelineEvent(

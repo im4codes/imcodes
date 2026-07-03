@@ -12,6 +12,7 @@ import {
   RESEND_EXPIRY_MS,
   MAX_RESEND_ENTRIES,
 } from '../../src/daemon/transport-resend-queue.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
 beforeEach(() => {
   clearAllResend();
@@ -23,6 +24,43 @@ describe('transport-resend-queue', () => {
     enqueueResend('s1', { text: 'b', commandId: 'c2', queuedAt: 20 });
     expect(getResendEntries('s1').map((e) => e.commandId)).toEqual(['c1', 'c2']);
     expect(getResendCount('s1')).toBe(2);
+  });
+
+  it('fails closed when SQLite enqueue fails', () => {
+    getTransportQueueStore().close();
+
+    const result = enqueueResend('s-sqlite-fail', { text: 'a', commandId: 'c1', queuedAt: 10 });
+
+    expect(result.accepted).toBe(false);
+    expect(result.reason).toBe('sqlite_enqueue_failed');
+    expect(getResendEntries('s-sqlite-fail')).toEqual([]);
+    expect(getResendCount('s-sqlite-fail')).toBe(0);
+  });
+
+  it('preserves resend memory when SQLite already owns the same live entry', () => {
+    getTransportQueueStore().enqueue({
+      sessionName: 's-existing-live',
+      clientMessageId: 'msg-existing-live',
+      commandId: 'cmd-existing-live',
+      text: 'already stored',
+      now: Date.now(),
+    });
+
+    const result = enqueueResend('s-existing-live', {
+      text: 'already stored',
+      commandId: 'cmd-existing-live',
+      clientMessageId: 'msg-existing-live',
+      queuedAt: Date.now(),
+    });
+
+    expect(result.accepted).toBe(true);
+    expect(getResendEntries('s-existing-live')).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-existing-live',
+        commandId: 'cmd-existing-live',
+        text: 'already stored',
+      }),
+    ]);
   });
 
   it('isolates queues per session', () => {
@@ -71,17 +109,35 @@ describe('transport-resend-queue', () => {
     // Adding one more pushes the oldest out.
     const result = enqueueResend('s1', { text: 'overflow', commandId: 'c-overflow', queuedAt: 999 });
     expect(result.droppedOldest).toBe(true);
+    expect(result.dropSnapshot?.dropReason).toBe('capacity_evicted');
     expect(getResendCount('s1')).toBe(MAX_RESEND_ENTRIES);
     expect(getResendEntries('s1')[0].commandId).toBe('c-1'); // c-0 was dropped
     expect(getResendEntries('s1').at(-1)?.commandId).toBe('c-overflow');
+    const snapshot = getTransportQueueStore().readSnapshot('s1');
+    expect(snapshot.pendingMessageEntries.map((entry) => entry.clientMessageId)).not.toContain('c-0');
   });
 
   it('clearResend empties a single session, leaving others intact', () => {
     enqueueResend('a', { text: 'x', commandId: 'ca', queuedAt: 0 });
     enqueueResend('b', { text: 'y', commandId: 'cb', queuedAt: 0 });
-    clearResend('a');
+    const clearSnapshot = clearResend('a');
     expect(getResendCount('a')).toBe(0);
     expect(getResendCount('b')).toBe(1);
+    expect(clearSnapshot?.resetReason).toBe('user_clear');
+  });
+
+  it('clearResend records explicit Stop and session delete drop reasons', () => {
+    enqueueResend('stop-session', { text: 'stop me', commandId: 'cmd-stop', queuedAt: 100 });
+    const stopSnapshot = clearResend('stop-session', 'user_stopped');
+    const afterStop = getTransportQueueStore().readSnapshot('stop-session');
+    expect(stopSnapshot?.dropReason).toBe('user_stopped');
+    expect(afterStop.pendingMessageEntries).toEqual([]);
+
+    enqueueResend('delete-session', { text: 'delete me', commandId: 'cmd-delete', queuedAt: 200 });
+    const deleteSnapshot = clearResend('delete-session', 'session_removed');
+    const afterDelete = getTransportQueueStore().readSnapshot('delete-session');
+    expect(deleteSnapshot?.dropReason).toBe('session_removed');
+    expect(afterDelete.pendingMessageEntries).toEqual([]);
   });
 
   it('drainResend dispatches entries in order and empties the queue', async () => {
@@ -99,6 +155,41 @@ describe('transport-resend-queue', () => {
       { text: 'second', commandId: 'c2' },
     ]);
     expect(getResendCount('s1')).toBe(0);
+  });
+
+  it('does not finalize SQLite delivery when dispatcher queues into a live runtime', async () => {
+    enqueueResend('s-runtime-queued', {
+      text: 'queued behind active turn',
+      commandId: 'cmd-runtime-queued',
+      clientMessageId: 'msg-runtime-queued',
+      queuedAt: Date.now(),
+    });
+
+    const count = await drainResend('s-runtime-queued', () => 'queued');
+    const snapshot = getTransportQueueStore().readSnapshot('s-runtime-queued');
+
+    expect(count).toBe(1);
+    expect(getResendCount('s-runtime-queued')).toBe(0);
+    expect(snapshot.pendingMessageEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-runtime-queued',
+        commandId: 'cmd-runtime-queued',
+        status: 'handoff_inflight',
+      }),
+    ]);
+    expect(snapshot.failedMessageEntries).toEqual([]);
+  });
+
+  it('does not remove from memory or dispatch when SQLite handoff lease fails', async () => {
+    enqueueResend('s-handoff-fail', { text: 'first', commandId: 'c1', clientMessageId: 'm1', queuedAt: Date.now() });
+    getTransportQueueStore().close();
+
+    const dispatch = vi.fn();
+    const count = await drainResend('s-handoff-fail', dispatch);
+
+    expect(count).toBe(0);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(getResendEntries('s-handoff-fail').map((entry) => entry.commandId)).toEqual(['c1']);
   });
 
   it('drainResend drops expired entries without calling dispatch', async () => {

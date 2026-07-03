@@ -1450,6 +1450,16 @@ function memoryProjectOptionId(input: Pick<MemoryProjectOption, 'canonicalRepoId
     || input.displayName.trim();
 }
 
+function memoryProjectOptionMergeKeys(input: Pick<MemoryProjectOption, 'canonicalRepoId' | 'projectDir' | 'displayName'>): string[] {
+  const keys = [
+    memoryProjectOptionId(input),
+    input.canonicalRepoId?.trim(),
+    input.projectDir?.trim(),
+    input.displayName.trim(),
+  ].filter((key): key is string => Boolean(key));
+  return Array.from(new Set(keys));
+}
+
 function projectDirDisplayName(projectDir: string): string {
   const trimmed = projectDir.trim().replace(/\/+$/, '');
   const parts = trimmed.split('/');
@@ -1493,22 +1503,40 @@ function mergeMemoryProjectOption(
   target: Map<string, MemoryProjectOption>,
   option: MemoryProjectOption,
 ): void {
-  const id = memoryProjectOptionId(option);
-  const existing = target.get(id);
+  const keys = memoryProjectOptionMergeKeys(option);
+  const existingEntries = keys
+    .map((key) => [key, target.get(key)] as const)
+    .filter((entry): entry is readonly [string, MemoryProjectOption] => Boolean(entry[1]));
+  const existing = existingEntries.reduce<MemoryProjectOption | undefined>((merged, [, current]) => {
+    if (!merged) return current;
+    return {
+      ...merged,
+      ...current,
+      displayName: current.displayName || merged.displayName,
+      canonicalRepoId: current.canonicalRepoId || merged.canonicalRepoId,
+      projectDir: current.projectDir || merged.projectDir,
+      status: current.status === 'resolved' || merged.status !== 'resolved' ? current.status : merged.status,
+      lastSeenAt: Math.max(merged.lastSeenAt ?? 0, current.lastSeenAt ?? 0) || undefined,
+    };
+  }, undefined);
   if (!existing) {
+    const id = memoryProjectOptionId(option);
     target.set(id, { ...option, id });
     return;
   }
-  target.set(id, {
+
+  for (const [key] of existingEntries) target.delete(key);
+  const merged = {
     ...existing,
     ...option,
-    id,
     displayName: option.displayName || existing.displayName,
     canonicalRepoId: option.canonicalRepoId || existing.canonicalRepoId,
     projectDir: option.projectDir || existing.projectDir,
     status: option.status === 'resolved' || existing.status !== 'resolved' ? option.status : existing.status,
     lastSeenAt: Math.max(existing.lastSeenAt ?? 0, option.lastSeenAt ?? 0) || undefined,
-  });
+  };
+  const id = memoryProjectOptionId(merged);
+  target.set(id, { ...merged, id });
 }
 
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange, memoryProjectCandidates = [], activeProjectDir }: Props) {
