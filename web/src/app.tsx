@@ -3470,6 +3470,13 @@ export function App() {
           daemonOfflineGraceTimerRef.current = null;
         }
         setDaemonOnline(true);
+        // The browser-server socket can stay healthy while the daemon-server
+        // socket drops and reconnects. Any session.state events emitted during
+        // that daemon gap may be missed by this tab, so pull the authoritative
+        // daemon snapshot now. Without this, a session that became idle while
+        // the daemon WS was down can remain visually "running" until a manual
+        // refresh or unrelated session_list broadcast.
+        ws.requestSessionList();
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
         const activeName = activeSessionRef.current;

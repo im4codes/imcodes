@@ -711,6 +711,25 @@ describe('App shell', () => {
     expect(ws.connect).toHaveBeenCalled();
   }, 20_000);
 
+  it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    ws.requestSessionList.mockClear();
+    await act(async () => {
+      ws.emit({ type: 'daemon.reconnected' });
+    });
+
+    expect(ws.requestSessionList).toHaveBeenCalledTimes(1);
+  }, 20_000);
+
   it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
