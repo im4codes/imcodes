@@ -718,6 +718,7 @@
     "preview_error": "Preview unavailable",
     "preview_binary": "Binary file — preview unavailable",
     "preview_video_unsupported": "Your browser cannot play this video format.",
+    "preview_audio_unsupported": "Your browser cannot play this audio format.",
     "mkdir_failed": "Failed to create folder",
     "create_file_failed": "Failed to create file",
     "file_exists": "File already exists",
@@ -2474,5 +2475,55 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "Collapse",
     "expand": "Expand"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "Agents",
+      "delegate_to_agent": "Delegate a task to one agent"
+    },
+    "chip_label": "Delegate to {{target}}",
+    "chip_title": "Delegation target: {{target}}",
+    "warning_empty_task": "Enter a task before delegating to an agent.",
+    "warning_attachments": "Delegation does not support attachments yet. Remove attachments and describe the task in text.",
+    "warning_quotes": "Delegation does not support quoted chat excerpts yet. Remove quotes and include the needed context in the task.",
+    "warning_file_refs": "Delegation does not support @ file references yet. Paste the relevant path or context into the task.",
+    "warning_p2p_tokens": "Delegation is separate from Team/P2P controls. Remove @@ tokens or switch back to Team mode.",
+    "warning_control_command": "Delegation cannot run session control commands. Remove /stop, /model, /thinking, or /effort and describe the task instead.",
+    "error": {
+      "mixed_delegation_p2p_fields": "Delegation cannot be combined with Team/P2P controls.",
+      "invalid_delegation_target": "Choose a valid agent delegation target.",
+      "delegation_self_target": "You cannot delegate a task to the current session.",
+      "delegation_target_unavailable": "That agent is unavailable. Choose another target.",
+      "delegation_target_forbidden": "That agent is outside this project or not allowed.",
+      "delegation_target_not_reply_capable": "That target cannot reply to delegated tasks.",
+      "delegation_empty_task": "Enter a task before delegating to an agent.",
+      "delegation_unsupported_input": "Delegation does not support this input yet.",
+      "delegation_dispatch_failed": "Delegation failed before the task was sent."
+    }
+  },
+  "codex_credits": {
+    "title": "Codex reset credits",
+    "button": "Resets",
+    "loading": "Loading…",
+    "refresh": "Refresh",
+    "none": "No reset credits",
+    "item_default_title": "Rate-limit reset",
+    "expires": "expires {{date}}",
+    "reset_now": "Reset now",
+    "confirm": "Consume 1 credit? This resets your Codex rate limits.",
+    "confirm_yes": "Consume",
+    "cancel": "Cancel",
+    "consuming": "Consuming…",
+    "outcome_reset": "Rate limits reset ✓",
+    "outcome_nothing_to_reset": "Not currently rate-limited — no credit used.",
+    "outcome_already_redeemed": "Already redeemed.",
+    "outcome_no_credits": "No reset credits available.",
+    "outcome_error": "Reset failed.",
+    "error_offline": "Not connected.",
+    "error_generic": "Request failed.",
+    "error_no_codex_auth": "No Codex login found.",
+    "error_request_failed": "Request failed.",
+    "error_app_server_timeout": "Codex timed out.",
+    "error_invalid_params": "Invalid request."
   }
 }

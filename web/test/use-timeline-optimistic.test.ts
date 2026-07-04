@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, act, cleanup, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
+import i18next from 'i18next';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
 
 // Mock api.js so tests can control whether the HTTP-send fallback "succeeds"
@@ -795,6 +796,93 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBe(true);
     expect(ref.current!.events[0].payload.acked).toBe(true);
     expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('delegation accepted ack clears the optimistic pending state immediately', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delegation_ack' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delegate this', 'cmd-delegate-accepted', {
+        resendExtra: { delegateTarget: { session: 'deck_sub_w1' } },
+      });
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-delegate-accepted',
+        status: 'accepted',
+        session: 'deck_opt_delegation_ack',
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('delegated ack metadata clears pending even when the local optimistic resend metadata is absent', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delegation_ack_wire' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delegate without local metadata', 'cmd-delegate-wire');
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-delegate-wire',
+        status: 'accepted',
+        session: 'deck_opt_delegation_ack_wire',
+        delegated: true,
+        targetSession: 'deck_sub_w1',
+      } as unknown as ServerMessage);
+    });
+
+    expect(ref.current!.events[0].payload.pending).toBe(false);
+    expect(ref.current!.events[0].payload.acked).toBe(true);
+    expect(ref.current!.events[0].payload.failed).toBeFalsy();
+  });
+
+  it('maps delegation ack error codes to localized visible errors', () => {
+    const translateSpy = vi.spyOn(i18next, 't').mockImplementation((key: string, fallback?: string) => (
+      key === 'delegation.error.delegation_target_unavailable'
+        ? 'Localized unavailable target'
+        : (fallback ?? key)
+    ) as any);
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_delegation_error' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('delegate this', 'cmd-delegate-error', {
+        resendExtra: { delegateTarget: { session: 'deck_sub_w1' } },
+      });
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'command.ack',
+        commandId: 'cmd-delegate-error',
+        status: 'error',
+        session: 'deck_opt_delegation_error',
+        error: 'delegation_target_unavailable: target not found',
+      } as unknown as ServerMessage);
+    });
+
+    expect(translateSpy).toHaveBeenCalledWith(
+      'delegation.error.delegation_target_unavailable',
+      'delegation_target_unavailable: target not found',
+    );
+    expect(ref.current!.events[0].payload.failed).toBe(true);
+    expect(ref.current!.events[0].payload.failureReason).toBe('Localized unavailable target');
   });
 
   it('keeps a pending bubble visible when command.ack is delivered as a timeline event', () => {

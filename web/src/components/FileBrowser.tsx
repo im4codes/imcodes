@@ -25,7 +25,7 @@ const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { ImageLightbox } from './ImageLightbox.js';
-import { downloadAttachment, getApiBaseUrl } from '../api.js';
+import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
   getSharedChangesKey,
   subscribeSharedChanges,
@@ -249,6 +249,7 @@ export type FileBrowserPreviewState =
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
   | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
+  | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
 
 export interface FileBrowserPreviewRequest {
@@ -328,7 +329,6 @@ const VIDEO_EXTENSIONS: Record<string, string> = {
   '.mov': 'video/quicktime',
   '.webm': 'video/webm',
   '.ogv': 'video/ogg',
-  '.ogg': 'video/ogg',
   '.mkv': 'video/x-matroska',
   '.avi': 'video/x-msvideo',
 };
@@ -338,12 +338,23 @@ function getVideoType(path: string): string | null {
   return ext ? (VIDEO_EXTENSIONS[ext] ?? null) : null;
 }
 
-/** Build the HTTP URL the <video> element fetches from. Cookies authenticate
- *  the request on desktop browsers; native (iOS) callers must use a token URL
- *  instead — handled separately when we mint the stream URL. */
-function buildVideoStreamUrl(serverId: string, downloadId: string): string {
-  const baseUrl = getApiBaseUrl();
-  return `${baseUrl}/api/server/${serverId}/uploads/${encodeURIComponent(downloadId)}/download`;
+/** File extensions playable in the browser <audio> element. Mirrored from
+ *  AUDIO_MIME_BY_EXTENSION in src/daemon/file-preview-classifier.ts — keep these in sync. */
+const AUDIO_EXTENSIONS: Record<string, string> = {
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
+  '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.weba': 'audio/webm',
+};
+
+function getAudioType(path: string): string | null {
+  const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
+  return ext ? (AUDIO_EXTENSIONS[ext] ?? null) : null;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -853,8 +864,8 @@ export function FileBrowser({
         }
         previewRefreshBackoffUntilRef.current = 0;
 
-        // Video preview — daemon signals stream-mode (no inline content) and
-        // we let <video> fetch the bytes via the HTTP download endpoint.
+        // Media preview — daemon signals stream-mode (no inline content) and
+        // we let the browser media element fetch bytes via the HTTP download endpoint.
         // This avoids dragging a full 100 MB base64 payload through the
         // WebSocket and preserves browser-native streaming/seeking.
         const videoType = getVideoType(filePath);
@@ -865,8 +876,43 @@ export function FileBrowser({
           && serverId
         ) {
           const mimeType = (msg.mimeType as string | undefined) ?? videoType;
-          const streamUrl = buildVideoStreamUrl(serverId, dlId);
-          setPreview({ status: 'video', path: filePath, streamUrl, mimeType, downloadId: dlId });
+          void buildAttachmentDownloadUrl(serverId, dlId)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'video', path: filePath, streamUrl, mimeType, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+            });
+          return;
+        }
+
+        const audioType = getAudioType(filePath);
+        if (
+          audioType
+          && (msg as { previewMode?: string }).previewMode === 'stream'
+          && dlId
+          && serverId
+        ) {
+          const mimeType = (msg.mimeType as string | undefined) ?? audioType;
+          void buildAttachmentDownloadUrl(serverId, dlId)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'audio', path: filePath, streamUrl, mimeType, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+            });
           return;
         }
 
@@ -1688,7 +1734,7 @@ export function FileBrowser({
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           </button>
         )}
-        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'video' || preview.status === 'error') && serverId && preview.downloadId && (
+        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'video' || preview.status === 'audio' || preview.status === 'error') && serverId && preview.downloadId && (
           <button
             class="fb-diff-toggle"
             title={downloadError || t('upload.download_file')}
@@ -1788,6 +1834,24 @@ export function FileBrowser({
               <source src={preview.streamUrl} type={preview.mimeType} />
               {t('file_browser.preview_video_unsupported')}
             </video>
+          </div>
+        )}
+        {preview.status === 'audio' && (
+          <div class="fb-preview-audio">
+            <div class="fb-preview-audio-card">
+              <div class="fb-preview-audio-icon" aria-hidden="true">♪</div>
+              <div class="fb-preview-audio-name">{preview.path.split(/[/\\]/).pop() ?? preview.path}</div>
+              <audio
+                key={preview.streamUrl}
+                src={preview.streamUrl}
+                controls
+                preload="metadata"
+                style={{ width: '100%' }}
+              >
+                <source src={preview.streamUrl} type={preview.mimeType} />
+                {t('file_browser.preview_audio_unsupported')}
+              </audio>
+            </div>
           </div>
         )}
         {preview.status === 'ok' && isEditing && (

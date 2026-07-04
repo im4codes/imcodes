@@ -28,9 +28,20 @@ export const VIDEO_MIME_BY_EXTENSION = {
   mov: 'video/quicktime',
   webm: 'video/webm',
   ogv: 'video/ogg',
-  ogg: 'video/ogg',
   mkv: 'video/x-matroska',
   avi: 'video/x-msvideo',
+} as const;
+
+export const AUDIO_MIME_BY_EXTENSION = {
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  flac: 'audio/flac',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  weba: 'audio/webm',
 } as const;
 
 export const TEXT_MIME_BY_EXTENSION = {
@@ -70,9 +81,10 @@ export const PREVIEW_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   ...IMAGE_MIME_BY_EXTENSION,
   ...OFFICE_MIME_BY_EXTENSION,
   ...VIDEO_MIME_BY_EXTENSION,
+  ...AUDIO_MIME_BY_EXTENSION,
 };
 
-export type FilePreviewType = 'text' | 'image' | 'office' | 'video' | 'too_large';
+export type FilePreviewType = 'text' | 'image' | 'office' | 'video' | 'audio' | 'too_large';
 
 export interface FilePreviewClassification {
   previewType: FilePreviewType;
@@ -109,8 +121,9 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
   const imageMime = IMAGE_MIME_BY_EXTENSION[extension as keyof typeof IMAGE_MIME_BY_EXTENSION];
   const officeMime = OFFICE_MIME_BY_EXTENSION[extension as keyof typeof OFFICE_MIME_BY_EXTENSION];
   const videoMime = VIDEO_MIME_BY_EXTENSION[extension as keyof typeof VIDEO_MIME_BY_EXTENSION];
+  const audioMime = AUDIO_MIME_BY_EXTENSION[extension as keyof typeof AUDIO_MIME_BY_EXTENSION];
   const textMime = TEXT_MIME_BY_EXTENSION[extension as keyof typeof TEXT_MIME_BY_EXTENSION];
-  const mimeType = imageMime ?? officeMime ?? videoMime ?? textMime;
+  const mimeType = imageMime ?? officeMime ?? videoMime ?? audioMime ?? textMime;
 
   if (size > FS_READ_SIZE_LIMIT) {
     return {
@@ -134,6 +147,10 @@ export function classifyPreviewByPath(filePath: string, size: number): FilePrevi
 
   if (videoMime) {
     return { previewType: 'video', previewKind: 'video', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: videoMime, previewMode: 'stream' };
+  }
+
+  if (audioMime) {
+    return { previewType: 'audio', previewKind: 'audio', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: audioMime, previewMode: 'stream' };
   }
 
   return { previewType: 'text', previewKind: 'text', extension, size, sizeLimitBytes: FS_READ_SIZE_LIMIT, mimeType: textMime };

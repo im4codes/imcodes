@@ -31,6 +31,7 @@ export interface AckOutboxEntry {
   sessionName: string;
   status: string;             // 'accepted' | 'accepted_legacy' | 'error' | ...
   error?: string;             // populated when status === 'error'
+  extras?: Record<string, unknown>; // stable metadata replayed with command.ack
   ts: number;                 // enqueue time
   attempts: number;           // # of send attempts so far
 }
@@ -47,6 +48,7 @@ export interface AckOutboxSender {
     status: string;
     session: string;
     error?: string;
+    [key: string]: unknown;
   }): boolean;
   isConnected?: () => boolean;
 }
@@ -149,6 +151,7 @@ export class AckOutbox {
           status: entry.status,
           session: entry.sessionName,
           ...(entry.error ? { error: entry.error } : {}),
+          ...(entry.extras ?? {}),
         });
         if (!sent) {
           await this.appendRecord({ kind: 'entry', entry });

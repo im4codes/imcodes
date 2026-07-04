@@ -718,6 +718,7 @@
     "preview_error": "미리보기 불가",
     "preview_binary": "바이너리 파일 — 미리보기 불가",
     "preview_video_unsupported": "브라우저가 이 동영상 형식을 재생할 수 없습니다.",
+    "preview_audio_unsupported": "브라우저에서 이 오디오 형식을 재생할 수 없습니다.",
     "mkdir_failed": "폴더를 만들 수 없습니다",
     "create_file_failed": "파일을 만들 수 없습니다",
     "file_exists": "파일이 이미 있습니다",
@@ -2472,5 +2473,55 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "접기",
     "expand": "펼치기"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "에이전트",
+      "delegate_to_agent": "한 에이전트에게 작업 위임"
+    },
+    "chip_label": "{{target}}에게 위임",
+    "chip_title": "위임 대상: {{target}}",
+    "warning_empty_task": "에이전트에게 위임하기 전에 작업을 입력하세요.",
+    "warning_attachments": "위임은 아직 첨부 파일을 지원하지 않습니다. 첨부를 제거하고 작업을 텍스트로 설명하세요.",
+    "warning_quotes": "위임은 아직 채팅 인용을 지원하지 않습니다. 인용을 제거하고 필요한 맥락을 작업에 포함하세요.",
+    "warning_file_refs": "위임은 아직 @ 파일 참조를 지원하지 않습니다. 관련 경로나 맥락을 작업에 붙여넣으세요.",
+    "warning_p2p_tokens": "위임은 Team/P2P 컨트롤과 별개입니다. @@ 토큰을 제거하거나 Team 모드로 돌아가세요.",
+    "warning_control_command": "위임에서는 세션 제어 명령을 실행할 수 없습니다. /stop, /model, /thinking, /effort를 제거하고 작업을 설명하세요.",
+    "error": {
+      "mixed_delegation_p2p_fields": "위임은 Team/P2P 제어와 함께 사용할 수 없습니다.",
+      "invalid_delegation_target": "올바른 에이전트 위임 대상을 선택하세요.",
+      "delegation_self_target": "현재 세션에는 작업을 위임할 수 없습니다.",
+      "delegation_target_unavailable": "해당 에이전트를 사용할 수 없습니다. 다른 대상을 선택하세요.",
+      "delegation_target_forbidden": "해당 에이전트는 이 프로젝트 밖에 있거나 허용되지 않습니다.",
+      "delegation_target_not_reply_capable": "해당 대상은 위임된 작업에 답장할 수 없습니다.",
+      "delegation_empty_task": "에이전트에 위임하기 전에 작업을 입력하세요.",
+      "delegation_unsupported_input": "위임은 아직 이 입력을 지원하지 않습니다.",
+      "delegation_dispatch_failed": "작업을 보내기 전에 위임이 실패했습니다."
+    }
+  },
+  "codex_credits": {
+    "title": "Codex 리셋 크레딧",
+    "button": "리셋",
+    "loading": "불러오는 중…",
+    "refresh": "새로고침",
+    "none": "리셋 크레딧 없음",
+    "item_default_title": "사용량 제한 리셋",
+    "expires": "{{date}} 만료",
+    "reset_now": "지금 리셋",
+    "confirm": "1개 사용할까요? Codex 사용량 제한을 리셋합니다.",
+    "confirm_yes": "사용",
+    "cancel": "취소",
+    "consuming": "처리 중…",
+    "outcome_reset": "사용량 제한이 리셋되었습니다 ✓",
+    "outcome_nothing_to_reset": "현재 제한 상태가 아니어서 크레딧이 사용되지 않았습니다.",
+    "outcome_already_redeemed": "이미 사용되었습니다.",
+    "outcome_no_credits": "사용 가능한 크레딧이 없습니다.",
+    "outcome_error": "리셋에 실패했습니다.",
+    "error_offline": "연결되지 않음.",
+    "error_generic": "요청 실패.",
+    "error_no_codex_auth": "Codex 로그인을 찾을 수 없습니다.",
+    "error_request_failed": "요청 실패.",
+    "error_app_server_timeout": "Codex 시간 초과.",
+    "error_invalid_params": "잘못된 요청."
   }
 }

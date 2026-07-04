@@ -718,6 +718,7 @@
     "preview_error": "Предпросмотр недоступен",
     "preview_binary": "Двоичный файл — предпросмотр недоступен",
     "preview_video_unsupported": "Ваш браузер не поддерживает этот видеоформат.",
+    "preview_audio_unsupported": "Ваш браузер не может воспроизвести этот аудиоформат.",
     "mkdir_failed": "Не удалось создать папку",
     "create_file_failed": "Не удалось создать файл",
     "file_exists": "Файл уже существует",
@@ -2472,5 +2473,55 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "Свернуть",
     "expand": "Развернуть"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "Агенты",
+      "delegate_to_agent": "Делегировать задачу одному агенту"
+    },
+    "chip_label": "Делегировать: {{target}}",
+    "chip_title": "Цель делегирования: {{target}}",
+    "warning_empty_task": "Введите задачу перед делегированием агенту.",
+    "warning_attachments": "Делегирование пока не поддерживает вложения. Удалите вложения и опишите задачу текстом.",
+    "warning_quotes": "Делегирование пока не поддерживает цитаты из чата. Удалите цитаты и добавьте нужный контекст в задачу.",
+    "warning_file_refs": "Делегирование пока не поддерживает ссылки на файлы через @. Вставьте путь или контекст в текст задачи.",
+    "warning_p2p_tokens": "Делегирование отделено от Team/P2P. Удалите токены @@ или вернитесь в режим Team.",
+    "warning_control_command": "Делегирование не выполняет команды управления сеансом. Уберите /stop, /model, /thinking или /effort и опишите задачу.",
+    "error": {
+      "mixed_delegation_p2p_fields": "Делегирование нельзя совмещать с элементами Team/P2P.",
+      "invalid_delegation_target": "Выберите допустимого агента для делегирования.",
+      "delegation_self_target": "Нельзя делегировать задачу текущему сеансу.",
+      "delegation_target_unavailable": "Этот агент недоступен. Выберите другую цель.",
+      "delegation_target_forbidden": "Этот агент вне проекта или не разрешён.",
+      "delegation_target_not_reply_capable": "Эта цель не может отвечать на делегированные задачи.",
+      "delegation_empty_task": "Введите задачу перед делегированием агенту.",
+      "delegation_unsupported_input": "Делегирование пока не поддерживает этот ввод.",
+      "delegation_dispatch_failed": "Делегирование не удалось до отправки задачи."
+    }
+  },
+  "codex_credits": {
+    "title": "Кредиты сброса Codex",
+    "button": "Сбросы",
+    "loading": "Загрузка…",
+    "refresh": "Обновить",
+    "none": "Нет кредитов сброса",
+    "item_default_title": "Сброс лимита",
+    "expires": "истекает {{date}}",
+    "reset_now": "Сбросить сейчас",
+    "confirm": "Использовать 1 кредит? Это сбросит лимиты Codex.",
+    "confirm_yes": "Использовать",
+    "cancel": "Отмена",
+    "consuming": "Обработка…",
+    "outcome_reset": "Лимиты сброшены ✓",
+    "outcome_nothing_to_reset": "Лимит не достигнут — кредит не использован.",
+    "outcome_already_redeemed": "Уже использовано.",
+    "outcome_no_credits": "Нет доступных кредитов.",
+    "outcome_error": "Не удалось сбросить.",
+    "error_offline": "Нет подключения.",
+    "error_generic": "Ошибка запроса.",
+    "error_no_codex_auth": "Вход Codex не найден.",
+    "error_request_failed": "Ошибка запроса.",
+    "error_app_server_timeout": "Codex не ответил.",
+    "error_invalid_params": "Неверный запрос."
   }
 }

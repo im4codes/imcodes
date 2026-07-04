@@ -162,15 +162,16 @@ vi.mock('../../src/components/VoiceInput.js', () => ({
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
-  AtPicker: ({ visible, onSelectAllConfig, onSelectAgent, p2pConfig, sessions, rootSession }: {
+  AtPicker: ({ visible, onSelectAllConfig, onSelectAgent, onSelectDelegateAgent, p2pConfig, sessions, rootSession }: {
     visible: boolean;
     onSelectAllConfig?: (config: unknown, rounds: number, modeOverride: string) => void;
     onSelectAgent?: (session: string, mode: string) => void;
+    onSelectDelegateAgent?: (session: string) => void;
     p2pConfig?: { rounds?: number } | null;
     sessions?: Array<{ name: string; label?: string | null; parentSession?: string | null; isSelf?: boolean }>;
     rootSession?: string | null;
   }) => {
-    const [stage, setStage] = useState<'root' | 'agents' | { session: string }>('root');
+    const [stage, setStage] = useState<'root' | 'agents'>('root');
     if (!visible) return null;
     const visibleAgents = (sessions ?? []).filter((entry) => {
       const sameRoot = (entry.parentSession ?? entry.name) === rootSession || entry.name === rootSession;
@@ -189,20 +190,15 @@ vi.mock('../../src/components/AtPicker.js', () => ({
       return (
         <div>
           {visibleAgents.map((entry) => (
-            <button key={entry.name} onClick={() => setStage({ session: entry.name })}>
+            <button key={entry.name} onClick={() => onSelectDelegateAgent?.(entry.name)}>
               {entry.label ?? entry.name}
             </button>
           ))}
         </div>
       );
     }
-    return (
-      <div>
-        {['audit', 'discuss', 'review', 'plan', 'brainstorm'].map((mode) => (
-          <button key={mode} onClick={() => onSelectAgent?.(stage.session, mode)}>{mode}</button>
-        ))}
-      </div>
-    );
+    void onSelectAgent;
+    return null;
   },
 }));
 
@@ -4572,20 +4568,18 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('w1'));
-    fireEvent.click(screen.getByText('audit'));
-    expect(input.textContent).toBe('@@w1(audit) ');
+    expect(screen.getByText('chip_label')).toBeDefined();
+    expect(input.textContent).toBe('');
 
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
-    input.textContent = `${input.textContent}please review`;
+    input.textContent = 'please review';
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
       text: 'please review',
-      p2pAtTargets: [
-        { session: 'deck_sub_w1', mode: 'audit' },
-      ],
+      delegateTarget: { session: 'deck_sub_w1' },
     }));
 
     getSelectionSpy.mockRestore();
@@ -4613,10 +4607,10 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('Worker Alpha'));
-    fireEvent.click(screen.getByText('audit'));
 
-    // Input shows @@label plus selected mode when sub-session has a label
-    expect(input.textContent).toBe('@@Worker Alpha(audit) ');
+    // Agent delegation is shown as a separate chip, not a P2P token in the input.
+    expect(input.textContent).toBe('');
+    expect(screen.getByText('chip_label')).toBeDefined();
     getSelectionSpy.mockRestore();
   });
 
@@ -4642,9 +4636,10 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('w1'));
-    fireEvent.click(screen.getByText('discuss'));
 
-    expect(input.textContent).toBe('@@w1(discuss) ');
+    expect(input.textContent).toBe('');
+    expect(screen.queryByText('discuss')).toBeNull();
+    expect(screen.getByText('chip_label')).toBeDefined();
     getSelectionSpy.mockRestore();
   });
 
@@ -4670,7 +4665,7 @@ afterEach(() => {
     expect(screen.getByTestId('p2p-dropdown-tab-combos')).toBeDefined();
   });
 
-  it('sends p2pAtTargets in textbox order, not selection order', () => {
+  it('selecting agents from the picker sends delegateTarget instead of p2pAtTargets', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4680,7 +4675,6 @@ afterEach(() => {
         sessions={[mainSession]}
         subSessions={[
           { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
-          { sessionName: 'deck_sub_w2', type: 'gemini', label: 'w2', state: 'idle', parentSession: 'deck_my-project_brain' },
         ]}
       />,
     );
@@ -4693,28 +4687,104 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('w1'));
-    fireEvent.click(screen.getByText('audit'));
 
-    input.textContent = `${input.textContent}@`;
-    fireEvent.input(input);
-    fireEvent.click(screen.getByText('agents'));
-    fireEvent.click(screen.getByText('w2'));
-    fireEvent.click(screen.getByText('discuss'));
-
-    input.textContent = '@@w2(discuss) @@w1(audit) please review';
+    input.textContent = 'please review';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
       text: 'please review',
-      p2pAtTargets: [
-        { session: 'deck_sub_w2', mode: 'discuss' },
-        { session: 'deck_sub_w1', mode: 'audit' },
-      ],
+      delegateTarget: { session: 'deck_sub_w1' },
     }));
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent).not.toHaveProperty('p2pAtTargets');
 
     getSelectionSpy.mockRestore();
+  });
+
+  it('blocks empty delegated tasks with a delegation warning', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w1'));
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(screen.getByText('warning_empty_task')).toBeDefined();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.anything());
+  });
+
+  it('blocks legacy P2P control tokens while an agent delegation is pending', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w1'));
+    input.textContent = '@@all(audit) please review';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(screen.getByText('warning_p2p_tokens')).toBeDefined();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('send', expect.anything());
+  });
+
+  it('blocks delegated session control commands without local-canceling the origin', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_my-project_brain',
+          project: 'my-project',
+          role: 'brain',
+          label: 'brain',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w1'));
+
+    input.textContent = '/stop';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(screen.getByText('warning_control_command')).toBeDefined();
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+    expect(gatherCancelCalls(ws)).toHaveLength(0);
   });
 
   it('manual @@label(mode) text sends p2pAtTargets when exactly one target resolves', () => {
@@ -5598,17 +5668,14 @@ afterEach(() => {
       fireEvent.input(input);
       fireEvent.click(screen.getByText('agents'));
       fireEvent.click(screen.getByText('w1'));
-      fireEvent.click(screen.getByText('audit'));
-      input.textContent = `${input.textContent}please review`;
+      input.textContent = 'please review';
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
         sessionName: 'deck_my-project_brain',
         text: 'please review',
-        p2pAtTargets: [
-          { session: 'deck_sub_w1', mode: 'audit' },
-        ],
+        delegateTarget: { session: 'deck_sub_w1' },
       }));
       expect(screen.queryByText('title')).toBeNull();
 

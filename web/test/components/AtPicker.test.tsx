@@ -55,7 +55,7 @@ describe('AtPicker', () => {
       <AtPicker
         query=""
         sessions={[
-          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null },
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
           { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
           { name: 'deck_sub_worker2', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
           { name: 'deck_sub_other9', agentType: 'codex', state: 'idle', parentSession: 'deck_other_brain' },
@@ -66,6 +66,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onClose={vi.fn()}
         visible
       />,
@@ -82,7 +83,7 @@ describe('AtPicker', () => {
     expect(filesLabel.closest('div')?.getAttribute('data-hl')).toBe('true');
     expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
     expect(screen.getByText('search_project_files')).toBeDefined();
-    expect(screen.getByText('quick_discussion_with_agent')).toBeDefined();
+    expect(screen.getByText('delegate_to_agent')).toBeDefined();
   });
 
   it('does not handle picker keyboard shortcuts while IME composition is active', () => {
@@ -97,28 +98,114 @@ describe('AtPicker', () => {
     expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
   });
 
-  it('shows only same-domain agents in agents step', () => {
+  it('shows current main-session group agents and disables the current session', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
 
-    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.getByText('brain').closest('div')?.getAttribute('aria-disabled')).toBe('true');
     expect(screen.getByText('worker1')).toBeDefined();
     expect(screen.getByText('worker2')).toBeDefined();
     expect(screen.queryByText('other9')).toBeNull();
+  });
+
+  it('agents step includes SDK transport agents and keeps shell/script out', () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    const onSelectDelegateAgent = vi.fn();
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_shell', agentType: 'shell', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_transport', agentType: 'codex-sdk', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_stopped', agentType: 'gemini', state: 'stopped', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={onSelectDelegateAgent}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('agents'));
+
+    expect(screen.getByText('worker1')).toBeDefined();
+    expect(screen.getByText('brain').closest('div')?.getAttribute('aria-disabled')).toBe('true');
+    expect(screen.queryByText('shell')).toBeNull();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(onSelectDelegateAgent).toHaveBeenCalledWith('deck_sub_worker1');
+    onSelectDelegateAgent.mockClear();
+    fireEvent.click(screen.getByText('transport'));
+    expect(onSelectDelegateAgent).toHaveBeenCalledWith('deck_sub_transport');
+    expect(screen.getByText('stopped')).toBeDefined();
+    expect(screen.queryByText('All Agents')).toBeNull();
+  });
+
+  it('team step shows only combo rows and launches the selected combo', () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    const onSelectAgent = vi.fn();
+    const onSelectAllConfig = vi.fn();
+    const onLaunchTeam = vi.fn();
+    const config = {
+      sessions: {
+        'deck_sub_w1': { enabled: true, mode: 'audit' },
+        'deck_sub_w2': { enabled: true, mode: 'review' },
+      },
+      rounds: 2,
+    };
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_w2', agentType: 'gemini', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={onSelectAgent}
+        onSelectDelegateAgent={vi.fn()}
+        onSelectAllConfig={onSelectAllConfig}
+        onLaunchTeam={onLaunchTeam}
+        p2pConfig={config}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('team'));
+
+    expect(screen.queryByText((_, el) => el?.textContent?.includes('all_label') ?? false)).toBeNull();
+    expect(screen.queryByText((_, el) => el?.textContent?.includes('all_plus') ?? false)).toBeNull();
+    expect(screen.queryByText((_, el) => el?.textContent?.includes('All Agents') ?? false)).toBeNull();
+
+    fireEvent.click(screen.getByText('audit › review › plan', { selector: 'span' }));
+    expect(onLaunchTeam).toHaveBeenCalled();
+    expect(onSelectAllConfig).not.toHaveBeenCalled();
+    expect(onSelectAgent).not.toHaveBeenCalled();
   });
 
   it('Escape from agents step returns to category chooser', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
-    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('brain')).toBeDefined();
 
     fireEvent.keyDown(document, { key: 'Escape' });
 
     expect(screen.getByText('files')).toBeDefined();
     expect(screen.getByText('agents')).toBeDefined();
-    expect(screen.queryByText('brain')).toBeNull();
   });
 
   it('consumes Escape before the chat input can handle it', () => {
@@ -139,6 +226,7 @@ describe('AtPicker', () => {
           projectDir="/tmp/proj"
           onSelectFile={vi.fn()}
           onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
           onClose={vi.fn()}
           visible
         />
@@ -170,6 +258,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         p2pConfig={{
           sessions: {
             'deck_sub_w1': { enabled: true, mode: 'audit' },
@@ -207,6 +296,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         p2pConfig={{
           sessions: {
             'deck_sub_w1': { enabled: true, mode: 'audit' },
@@ -243,6 +333,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
         onClose={vi.fn()}
         visible
       />,
@@ -253,13 +344,14 @@ describe('AtPicker', () => {
     expect(screen.getByText(/← back/i)).toBeDefined();
   });
 
-  it('passes the selected mode for a single agent', () => {
+  it('delegates immediately for a single agent without showing the P2P mode chooser', () => {
     const wsClient = {
       connected: true,
       send: vi.fn(),
       onMessage: vi.fn(() => () => {}),
     };
     const onSelectAgent = vi.fn();
+    const onSelectDelegateAgent = vi.fn();
 
     render(
       <AtPicker
@@ -273,6 +365,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={onSelectAgent}
+        onSelectDelegateAgent={onSelectDelegateAgent}
         onClose={vi.fn()}
         visible
       />,
@@ -280,14 +373,15 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('worker1'));
-    fireEvent.click(screen.getByText('Discuss'));
 
-    expect(onSelectAgent).toHaveBeenCalledWith('deck_sub_worker1', 'discuss');
+    expect(onSelectDelegateAgent).toHaveBeenCalledWith('deck_sub_worker1');
+    expect(onSelectAgent).not.toHaveBeenCalled();
+    expect(screen.queryByText('Discuss')).toBeNull();
   });
 
-  it('all + custom rounds applies the selected mode override to all configured participants', () => {
+  it('team keyboard launches the highlighted combo with selected rounds', () => {
     const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
-    const onSelectAllConfig = vi.fn();
+    const onLaunchTeam = vi.fn();
 
     render(
       <AtPicker
@@ -302,120 +396,25 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
-        onSelectAllConfig={onSelectAllConfig}
-        p2pConfig={{
-          sessions: {
-            'deck_sub_w1': { enabled: true, mode: 'audit' },
-            'deck_sub_w2': { enabled: true, mode: 'review' },
-          },
-          rounds: 1,
-        }}
+        onSelectDelegateAgent={vi.fn()}
+        onLaunchTeam={onLaunchTeam}
         onClose={vi.fn()}
         visible
       />,
     );
 
-    fireEvent.click(screen.getByText('agents'));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el?.textContent === 'mode_audit'));
-    fireEvent.click(screen.getByText('3'));
-
-    expect(onSelectAllConfig).toHaveBeenCalledTimes(1);
-    const [cfg, rounds, modeOverride] = onSelectAllConfig.mock.calls[0];
-    expect(rounds).toBe(3);
-    expect(modeOverride).toBe('audit');
-    expect(cfg.sessions['deck_sub_w1'].mode).toBe('audit');
-    expect(cfg.sessions['deck_sub_w2'].mode).toBe('audit');
-  });
-
-  it('all + custom rounds preview shows the selected mode override for all participants', () => {
-    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
-
-    render(
-      <AtPicker
-        query=""
-        sessions={[
-          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
-          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain', label: 'Cron' },
-          { name: 'deck_sub_w2', agentType: 'claude-code', state: 'idle', parentSession: 'deck_proj_brain', label: 'mm0' },
-        ]}
-        rootSession="deck_proj_brain"
-        wsClient={wsClient as any}
-        projectDir="/tmp/proj"
-        onSelectFile={vi.fn()}
-        onSelectAgent={vi.fn()}
-        onSelectAllConfig={vi.fn()}
-        p2pConfig={{
-          sessions: {
-            'deck_sub_w1': { enabled: true, mode: 'review' },
-            'deck_sub_w2': { enabled: true, mode: 'discuss' },
-          },
-          rounds: 2,
-        }}
-        onClose={vi.fn()}
-        visible
-      />,
-    );
-
-    fireEvent.click(screen.getByText('agents'));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el?.textContent === 'mode_audit'));
-
-    expect(screen.getByText((_, el) => el?.textContent === 'Cron')).toBeDefined();
-    expect(screen.getByText((_, el) => el?.textContent === 'mm0')).toBeDefined();
-    expect(screen.getAllByText((_, el) => el?.textContent?.includes('· audit') ?? false).length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('all + custom rounds keyboard defaults focus to rounds, then up/down switches focus to mode', () => {
-    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
-    const onSelectAllConfig = vi.fn();
-
-    render(
-      <AtPicker
-        query=""
-        sessions={[
-          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
-          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain', label: 'Cron' },
-          { name: 'deck_sub_w2', agentType: 'claude-code', state: 'idle', parentSession: 'deck_proj_brain', label: 'mm0' },
-        ]}
-        rootSession="deck_proj_brain"
-        wsClient={wsClient as any}
-        projectDir="/tmp/proj"
-        onSelectFile={vi.fn()}
-        onSelectAgent={vi.fn()}
-        onSelectAllConfig={onSelectAllConfig}
-        p2pConfig={{
-          sessions: {
-            'deck_sub_w1': { enabled: true, mode: 'review' },
-            'deck_sub_w2': { enabled: true, mode: 'discuss' },
-          },
-          rounds: 1,
-        }}
-        onClose={vi.fn()}
-        visible
-      />,
-    );
-
-    fireEvent.click(screen.getByText('agents'));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-
-    fireEvent.keyDown(document, { key: 'ArrowRight' }); // rounds: 1 -> 2
-    fireEvent.keyDown(document, { key: 'ArrowUp' }); // focus: rounds -> mode
-    fireEvent.keyDown(document, { key: 'ArrowRight' }); // mode: config -> audit
+    fireEvent.click(screen.getByText('team'));
+    fireEvent.keyDown(document, { key: 'ArrowRight' });
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
     fireEvent.keyDown(document, { key: 'Enter' });
 
-    expect(onSelectAllConfig).toHaveBeenCalledTimes(1);
-    const [cfg, rounds, modeOverride] = onSelectAllConfig.mock.calls[0];
-    expect(rounds).toBe(2);
-    expect(modeOverride).toBe('audit');
-    expect(cfg.sessions['deck_sub_w1'].mode).toBe('audit');
-    expect(cfg.sessions['deck_sub_w2'].mode).toBe('audit');
+    expect(onLaunchTeam).toHaveBeenCalledWith('audit>review>plan', 2);
   });
 
-  it('reuses the shared combo manager to select saved custom combos', async () => {
+  it('lists saved custom combos directly in Team', async () => {
     getUserPrefMock.mockResolvedValue(JSON.stringify(['audit>discuss']));
     const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
-    const onSelectAllConfig = vi.fn();
+    const onLaunchTeam = vi.fn();
 
     render(
       <AtPicker
@@ -430,73 +429,17 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
-        onSelectAllConfig={onSelectAllConfig}
-        p2pConfig={{
-          sessions: {
-            'deck_sub_w1': { enabled: true, mode: 'review' },
-            'deck_sub_w2': { enabled: true, mode: 'review' },
-          },
-          rounds: 1,
-        }}
+        onSelectDelegateAgent={vi.fn()}
+        onLaunchTeam={onLaunchTeam}
         onClose={vi.fn()}
         visible
       />,
     );
 
     await flush();
-    fireEvent.click(screen.getByText('agents'));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-    fireEvent.click(screen.getByText('mode_audit→mode_discuss'));
+    fireEvent.click(screen.getByText('team'));
+    fireEvent.click(screen.getByText('audit › discuss'));
 
-    expect(onSelectAllConfig).toHaveBeenCalledTimes(1);
-    const [cfg, rounds, modeOverride] = onSelectAllConfig.mock.calls[0];
-    expect(rounds).toBe(1);
-    expect(modeOverride).toBe('audit>discuss');
-    expect(cfg.sessions['deck_sub_w1'].mode).toBe('audit');
-    expect(cfg.sessions['deck_sub_w2'].mode).toBe('audit');
-  });
-
-  it('keeps saved cycle rounds when selecting a saved custom combo', async () => {
-    getUserPrefMock.mockResolvedValue(JSON.stringify(['audit>discuss']));
-    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
-    const onSelectAllConfig = vi.fn();
-
-    render(
-      <AtPicker
-        query=""
-        sessions={[
-          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
-          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain', label: 'Cron' },
-          { name: 'deck_sub_w2', agentType: 'claude-code', state: 'idle', parentSession: 'deck_proj_brain', label: 'mm0' },
-        ]}
-        rootSession="deck_proj_brain"
-        wsClient={wsClient as any}
-        projectDir="/tmp/proj"
-        onSelectFile={vi.fn()}
-        onSelectAgent={vi.fn()}
-        onSelectAllConfig={onSelectAllConfig}
-        p2pConfig={{
-          sessions: {
-            'deck_sub_w1': { enabled: true, mode: 'review' },
-            'deck_sub_w2': { enabled: true, mode: 'review' },
-          },
-          rounds: 3,
-        }}
-        onClose={vi.fn()}
-        visible
-      />,
-    );
-
-    await flush();
-    fireEvent.click(screen.getByText('agents'));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-    fireEvent.click(screen.getByText('mode_audit→mode_discuss'));
-
-    expect(onSelectAllConfig).toHaveBeenCalledTimes(1);
-    const [cfg, rounds, modeOverride] = onSelectAllConfig.mock.calls[0];
-    expect(rounds).toBe(3);
-    expect(modeOverride).toBe('audit>discuss');
-    expect(cfg.sessions['deck_sub_w1'].mode).toBe('audit');
-    expect(cfg.sessions['deck_sub_w2'].mode).toBe('audit');
+    expect(onLaunchTeam).toHaveBeenCalledWith('audit>discuss', 1);
   });
 });

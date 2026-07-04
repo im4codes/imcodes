@@ -5,8 +5,7 @@ import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-sen
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_CAPS } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
-import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
-import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
+import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_ERROR_CODES,
@@ -31,7 +30,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 
 export const SEND_MCP_DISPATCH_FEATURE_FLAG = IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG;
 export const SEND_TOOL_ERROR_REASONS = {
@@ -229,13 +228,9 @@ export type SendDestroyExecutionCloneResult =
   | { status: 'ok'; idempotentReplay?: boolean }
   | { status: 'error'; reason: ExecutionCloneErrorCode | SendToolErrorReason; idempotentReplay?: boolean };
 
-export interface SendDispatchMessageOptions {
-  dispatchId: SendDispatchId;
-  messageId: SendMessageId;
-  sharedActor?: SharedActorEnvelope;
-}
+export type SendDispatchMessageOptions = SessionDispatchOptions;
 
-export type SendDispatchMessageResult = 'sent' | 'queued' | void;
+export type SendDispatchMessageResult = SessionDispatchMessageResult;
 
 export interface CronSendDispatchInput {
   fromSessionName: string;
@@ -426,7 +421,8 @@ export async function dispatchSendMessage(
   if (!fileRefs.ok) return { status: 'error', reason: fileRefs.reason, error: fileRefs.error };
 
   const dispatchId = createSendDispatchId();
-  const message = buildSendMessage(input.message, {
+  const message = buildSessionDispatchMessage({
+    message: input.message,
     files: fileRefs.files,
     replyTo: input.reply ? caller.sessionName : null,
   });
@@ -439,7 +435,7 @@ export async function dispatchSendMessage(
       await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
-        ...buildServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
+        ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
       deliveries.push({ target: target.name, messageId, status: 'delivered' });
     } catch (err) {
@@ -596,7 +592,8 @@ async function dispatchExecutionCloneSend(
   const dispatchId = createSendDispatchId();
   const messageId = createSendMessageId();
   const now = d.now();
-  const message = buildSendMessage(input.message!, {
+  const message = buildSessionDispatchMessage({
+    message: input.message!,
     files: fileRefs.files,
     replyTo: caller.sessionName, // force reply: true
   });
@@ -617,7 +614,7 @@ async function dispatchExecutionCloneSend(
     await d.dispatchMessage(cloneRecord, message, {
       dispatchId,
       messageId,
-      ...buildServerMemberSharedActorOption(caller, callerRecord, cloneRecord, messageId, now),
+      ...buildSharedServerMemberSharedActorOption(caller, callerRecord, cloneRecord, messageId, now),
     });
   } catch (err) {
     // Rollback — destroy the just-created clone before surfacing the error.
@@ -798,7 +795,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   const queued: string[] = [];
   const errors: string[] = [];
   const messages: SendMessageDelivery[] = [];
-  const message = buildSendMessage(input.message, { files: fileRefs.files, replyTo: null });
+  const message = buildSessionDispatchMessage({ message: input.message, files: fileRefs.files, replyTo: null });
   const callerRecord = d.getSession(input.from) ?? undefined;
   const now = d.now();
 
@@ -808,7 +805,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
-        ...buildServerMemberSharedActorOption(
+        ...buildSharedServerMemberSharedActorOption(
           {
             userId: input.from,
             sessionName: input.from,
@@ -1017,127 +1014,4 @@ function sanitizeFileReferences(files: string[] | undefined, projectRoot: string
     refs.push(ref);
   }
   return { ok: true, files: refs };
-}
-
-function isSubSessionRecord(sessionName: string | null | undefined, record?: SessionRecord): boolean {
-  return Boolean(
-    record?.parentSession
-    || record?.userCreated === true && (record.name.startsWith('deck_sub_') || sessionName?.startsWith('deck_sub_'))
-    || sessionName?.startsWith('deck_sub_'),
-  );
-}
-
-function shouldAttachServerMemberActor(callerName: string | null, callerRecord: SessionRecord | undefined, target: SessionRecord): boolean {
-  return isSubSessionRecord(callerName, callerRecord) || isSubSessionRecord(target.name, target);
-}
-
-function formatServerMemberActorName(callerName: string, callerRecord?: SessionRecord): string {
-  const label = callerRecord?.label?.trim();
-  if (label) return label;
-  return callerRecord?.name || callerName;
-}
-
-function buildServerMemberSharedActorOption(
-  caller: SendRuntimeCaller,
-  callerRecord: SessionRecord | undefined,
-  target: SessionRecord,
-  actionId: string,
-  now: number,
-): { sharedActor: SharedActorEnvelope } | Record<string, never> {
-  if (!caller.sessionName || !isValidImcodesSessionName(caller.sessionName)) return {};
-  if (!shouldAttachServerMemberActor(caller.sessionName, callerRecord, target)) return {};
-  const actorDisplayName = formatServerMemberActorName(caller.sessionName, callerRecord);
-  const targetSnapshot = target.name.startsWith('deck_sub_')
-    ? {
-        kind: 'subsession' as const,
-        serverId: 'local',
-        subSessionId: target.name,
-        ...(target.label ? { subSessionDisplayName: target.label } : {}),
-      }
-    : {
-        kind: 'main' as const,
-        serverId: 'local',
-        sessionName: target.name,
-      };
-  return {
-    sharedActor: {
-      actorUserId: caller.userId || caller.sessionName,
-      actorDisplayName,
-      snapshot: {
-        target: targetSnapshot,
-        effectiveRole: 'participant',
-        historyCutoffAt: 0,
-        nextCoverageRecheckAt: null,
-        coveringShareIds: [],
-        primaryShareId: null,
-        authorizedAt: now,
-      },
-      primaryShareId: null,
-      effectiveActorRole: 'server-member',
-      actionId,
-      origin: 'server-member',
-      authorizedAt: now,
-      queuedAt: now,
-    },
-  };
-}
-
-function buildSendMessage(message: string, options: { files: string[]; replyTo: string | null }): string {
-  let result = message;
-  if (options.files.length > 0) {
-    result += `\n\nReferenced files:\n${options.files.map((file) => `- ${file}`).join('\n')}`;
-  }
-  if (options.replyTo) {
-    if (!isValidImcodesSessionName(options.replyTo)) return result;
-    result += `\n\nAfter completing the above task, send your response using: imcodes send --no-reply ${JSON.stringify(options.replyTo)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
-  }
-  return result;
-}
-
-async function dispatchSessionMessage(
-  target: SessionRecord,
-  message: string,
-  options: SendDispatchMessageOptions,
-): Promise<SendDispatchMessageResult> {
-  if (target.runtimeType === 'transport') {
-    const { getTransportRuntime } = await import('../agent/session-manager.js');
-    const runtime = getTransportRuntime(target.name);
-    if (!runtime) throw new Error(`no transport runtime for session ${target.name}`);
-    const result = options.sharedActor
-      ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
-      : runtime.send(message, options.messageId);
-    if (result === 'sent') {
-      emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
-    } else if (result === 'queued') {
-      const queuePayload = buildTransportQueueSnapshotPayload(target.name, 'send_tool');
-      timelineEmitter.emit(target.name, 'session.state', {
-        state: 'queued',
-        ...queuePayload,
-      }, { source: 'daemon', confidence: 'high' });
-    }
-    return result;
-  }
-
-  const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  await sendProcessSessionMessageForAutomation(target.name, message);
-}
-
-function emitStructuredTransportUserMessage(
-  sessionName: string,
-  message: string,
-  messageId: SendMessageId,
-  sharedActor?: SharedActorEnvelope,
-): void {
-  timelineEmitter.emit(
-    sessionName,
-    'user.message',
-    {
-      text: message,
-      allowDuplicate: true,
-      commandId: messageId,
-      clientMessageId: messageId,
-      ...(sharedActor ? { sharedActor } : {}),
-    },
-    { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
-  );
 }

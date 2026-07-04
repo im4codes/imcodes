@@ -128,7 +128,7 @@ describe('file preview read worker', () => {
     });
   });
 
-  it('snapshots text, base64 image, video metadata, too-large, and binary responses', async () => {
+  it('snapshots text, base64 image, stream media metadata, too-large, and binary responses', async () => {
     const text = await handlePreviewReadWorkerRequest(snapshotRequest('/real/file.txt'), deps());
     expect(text).toMatchObject({ phase: 'snapshot', kind: 'success', payload: { mode: 'text', content: 'hello world' } });
 
@@ -144,6 +144,11 @@ describe('file preview read worker', () => {
     videoReq.classification = classifyFile({ realPath: videoReq.realPath, size: 11, mtimeMs: 1000 });
     const video = await handlePreviewReadWorkerRequest(videoReq, deps());
     expect(video).toMatchObject({ payload: { mode: 'stream', previewMode: 'stream', mimeType: 'video/mp4', size: 11 } });
+
+    const audioReq = snapshotRequest('/real/voice.mp3');
+    audioReq.classification = classifyFile({ realPath: audioReq.realPath, size: 12, mtimeMs: 1000 });
+    const audio = await handlePreviewReadWorkerRequest(audioReq, deps());
+    expect(audio).toMatchObject({ payload: { mode: 'stream', previewMode: 'stream', mimeType: 'audio/mpeg', size: 11 } });
 
     const hugeReq = snapshotRequest('/real/huge.txt');
     hugeReq.classification = { ...hugeReq.classification, previewKind: 'too_large', previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE };

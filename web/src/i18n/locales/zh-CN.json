@@ -718,6 +718,7 @@
     "preview_error": "预览不可用",
     "preview_binary": "二进制文件 — 无法预览",
     "preview_video_unsupported": "您的浏览器不支持此视频格式。",
+    "preview_audio_unsupported": "你的浏览器无法播放此音频格式。",
     "mkdir_failed": "创建文件夹失败",
     "create_file_failed": "创建文件失败",
     "file_exists": "文件已存在",
@@ -2474,5 +2475,55 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "折叠",
     "expand": "展开"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "智能体",
+      "delegate_to_agent": "将任务委派给一个智能体"
+    },
+    "chip_label": "委派给 {{target}}",
+    "chip_title": "委派目标：{{target}}",
+    "warning_empty_task": "请先输入要委派给智能体的任务。",
+    "warning_attachments": "委派暂不支持附件。请移除附件，并用文字描述任务。",
+    "warning_quotes": "委派暂不支持引用聊天片段。请移除引用，并把所需上下文写入任务。",
+    "warning_file_refs": "委派暂不支持 @ 文件引用。请将相关路径或上下文粘贴到任务中。",
+    "warning_p2p_tokens": "委派与 Team/P2P 控制分开。请移除 @@ 标记，或切回 Team 模式。",
+    "warning_control_command": "委派不能执行会话控制命令。请移除 /stop、/model、/thinking 或 /effort，并改为描述任务。",
+    "error": {
+      "mixed_delegation_p2p_fields": "委派不能与团队/P2P 控制混用。",
+      "invalid_delegation_target": "请选择有效的智能体委派目标。",
+      "delegation_self_target": "不能把任务委派给当前会话。",
+      "delegation_target_unavailable": "该智能体不可用，请选择其他目标。",
+      "delegation_target_forbidden": "该智能体不在此项目内或不允许使用。",
+      "delegation_target_not_reply_capable": "该目标无法回复委派任务。",
+      "delegation_empty_task": "委派给智能体前请先输入任务。",
+      "delegation_unsupported_input": "委派暂不支持此输入。",
+      "delegation_dispatch_failed": "任务发送前委派失败。"
+    }
+  },
+  "codex_credits": {
+    "title": "Codex 额度重置券",
+    "button": "重置券",
+    "loading": "加载中…",
+    "refresh": "刷新",
+    "none": "没有重置券",
+    "item_default_title": "额度重置",
+    "expires": "{{date}} 到期",
+    "reset_now": "立即重置",
+    "confirm": "消耗 1 张券?将重置你的 Codex 额度限制。",
+    "confirm_yes": "消耗",
+    "cancel": "取消",
+    "consuming": "处理中…",
+    "outcome_reset": "额度已重置 ✓",
+    "outcome_nothing_to_reset": "当前未被限流,未消耗额度券。",
+    "outcome_already_redeemed": "已兑换过。",
+    "outcome_no_credits": "没有可用的重置券。",
+    "outcome_error": "重置失败。",
+    "error_offline": "未连接。",
+    "error_generic": "请求失败。",
+    "error_no_codex_auth": "未找到 Codex 登录。",
+    "error_request_failed": "请求失败。",
+    "error_app_server_timeout": "Codex 超时。",
+    "error_invalid_params": "请求无效。"
   }
 }

@@ -455,6 +455,8 @@ export function SessionPane({
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={session.agentType}
+          wsClient={ws}
+          connected={connected}
           modelOverride={resolveEffectiveSessionModel(session, effectiveDetectedModel, lastUsage?.model)}
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}

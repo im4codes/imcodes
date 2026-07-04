@@ -320,6 +320,106 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('recovers a dropped terminal: a stream that idles while still streaming fires a latest-window catch-up', async () => {
+    // Root-cause regression for "前台停留弱网不自动同步" / "press stop but the cancel
+    // doesn't show until refresh": a foreground tab can silently miss the terminal
+    // timeline.event (streaming:false final / cancel / idle) while the socket looks
+    // alive. When the stream idles but is still streaming, recover in
+    // ~STREAMING_IDLE_PERSIST_MS instead of waiting for the 45s watchdog.
+    const sessionName = `deck_stream_stall_recover_${Date.now()}`;
+    const serverId = `srv-stream-stall-${Date.now()}`;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => { handler = next; return () => { handler = null; }; },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-stall'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-stall'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h('div', { 'data-testid': 'probe' }, events.map((e) => String(e.payload.text ?? '')).join('|'));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    // Let the mount bootstrap / blank-self-heal backfills settle, then isolate.
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    fetchSpy.mockClear();
+
+    // A streaming assistant.text arrives — but its terminal (streaming:false) is dropped.
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `${sessionName}-turn`,
+          sessionId: sessionName,
+          ts: 5000, epoch: 1, seq: 1, source: 'daemon', confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'partial streamed answer', streaming: true },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    // Stream goes idle (STREAMING_IDLE_PERSIST_MS = 2000ms) with no terminal.
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+
+    await waitFor(() => { expect(fetchSpy).toHaveBeenCalled(); });
+    const options = fetchSpy.mock.calls.at(-1)![2];
+    // Latest-window catch-up: no lower bound so the dropped terminal is fetched.
+    expect((options as { afterTs?: number }).afterTs).toBeUndefined();
+    expect(options).toEqual(expect.objectContaining({ limit: 300 }));
+  });
+
+  it('does NOT fire the stall recovery when the terminal (streaming:false) arrives before the idle window', async () => {
+    const sessionName = `deck_stream_no_stall_${Date.now()}`;
+    const serverId = `srv-stream-nostall-${Date.now()}`;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => { handler = next; return () => { handler = null; }; },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-nostall'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-nostall'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h('div', { 'data-testid': 'probe' }, events.map((e) => String(e.payload.text ?? '')).join('|'));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    fetchSpy.mockClear();
+
+    const base = {
+      eventId: `${sessionName}-turn`, sessionId: sessionName,
+      ts: 5000, epoch: 1, seq: 1, source: 'daemon' as const, confidence: 'high' as const,
+      type: 'assistant.text' as const,
+    };
+    await act(async () => {
+      handler?.({ type: TIMELINE_MESSAGES.EVENT, event: { ...base, payload: { text: 'partial', streaming: true } } } as unknown as ServerMessage);
+    });
+    // Terminal arrives promptly (same eventId, streaming:false) — clears the idle-persist id.
+    await act(async () => {
+      handler?.({ type: TIMELINE_MESSAGES.EVENT, event: { ...base, payload: { text: 'partial done', streaming: false } } } as unknown as ServerMessage);
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+    // No stall recovery — the terminal was received, so the stream is not stuck.
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('uses only history content events for tail afterTs so session.state cannot advance the cursor past missing content', () => {
     const sessionName = `deck_tail_cursor_content_${Date.now()}`;
     const afterTs = __getTimelineHistoryAfterTsForTests([

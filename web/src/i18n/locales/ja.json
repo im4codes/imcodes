@@ -718,6 +718,7 @@
     "preview_error": "プレビュー不可",
     "preview_binary": "バイナリファイル — プレビュー不可",
     "preview_video_unsupported": "お使いのブラウザはこの動画形式を再生できません。",
+    "preview_audio_unsupported": "お使いのブラウザはこの音声形式を再生できません。",
     "mkdir_failed": "フォルダを作成できませんでした",
     "create_file_failed": "ファイルを作成できませんでした",
     "file_exists": "ファイルはすでに存在します",
@@ -2472,5 +2473,55 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "折りたたむ",
     "expand": "展開"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "エージェント",
+      "delegate_to_agent": "1つのエージェントにタスクを委任"
+    },
+    "chip_label": "{{target}} に委任",
+    "chip_title": "委任先: {{target}}",
+    "warning_empty_task": "エージェントに委任する前にタスクを入力してください。",
+    "warning_attachments": "委任はまだ添付ファイルに対応していません。添付を削除し、タスクをテキストで説明してください。",
+    "warning_quotes": "委任はまだチャット引用に対応していません。引用を削除し、必要なコンテキストをタスクに含めてください。",
+    "warning_file_refs": "委任はまだ @ ファイル参照に対応していません。関連するパスまたはコンテキストをタスクに貼り付けてください。",
+    "warning_p2p_tokens": "委任は Team/P2P コントロールとは別です。@@ トークンを削除するか Team モードに戻してください。",
+    "warning_control_command": "委任ではセッション制御コマンドを実行できません。/stop、/model、/thinking、/effort を削除して、タスク内容を記述してください。",
+    "error": {
+      "mixed_delegation_p2p_fields": "委任はチーム/P2Pコントロールと併用できません。",
+      "invalid_delegation_target": "有効な委任先エージェントを選択してください。",
+      "delegation_self_target": "現在のセッションにはタスクを委任できません。",
+      "delegation_target_unavailable": "そのエージェントは利用できません。別の委任先を選択してください。",
+      "delegation_target_forbidden": "そのエージェントはこのプロジェクト外、または許可されていません。",
+      "delegation_target_not_reply_capable": "その委任先は委任タスクに返信できません。",
+      "delegation_empty_task": "エージェントに委任する前にタスクを入力してください。",
+      "delegation_unsupported_input": "委任はこの入力にまだ対応していません。",
+      "delegation_dispatch_failed": "タスク送信前に委任が失敗しました。"
+    }
+  },
+  "codex_credits": {
+    "title": "Codex リセットクレジット",
+    "button": "リセット",
+    "loading": "読み込み中…",
+    "refresh": "更新",
+    "none": "リセットクレジットなし",
+    "item_default_title": "レート制限リセット",
+    "expires": "{{date}} に期限切れ",
+    "reset_now": "今すぐリセット",
+    "confirm": "1 枚使いますか?Codex のレート制限をリセットします。",
+    "confirm_yes": "使う",
+    "cancel": "キャンセル",
+    "consuming": "処理中…",
+    "outcome_reset": "レート制限をリセットしました ✓",
+    "outcome_nothing_to_reset": "現在は制限中ではないため、クレジットは消費されません。",
+    "outcome_already_redeemed": "すでに引き換え済みです。",
+    "outcome_no_credits": "利用可能なクレジットがありません。",
+    "outcome_error": "リセットに失敗しました。",
+    "error_offline": "未接続です。",
+    "error_generic": "リクエストに失敗しました。",
+    "error_no_codex_auth": "Codex のログインが見つかりません。",
+    "error_request_failed": "リクエストに失敗しました。",
+    "error_app_server_timeout": "Codex がタイムアウトしました。",
+    "error_invalid_params": "無効なリクエストです。"
   }
 }

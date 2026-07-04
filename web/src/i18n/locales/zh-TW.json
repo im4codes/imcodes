@@ -718,6 +718,7 @@
     "preview_error": "預覽不可用",
     "preview_binary": "二進位檔案 — 無法預覽",
     "preview_video_unsupported": "您的瀏覽器不支援此影片格式。",
+    "preview_audio_unsupported": "你的瀏覽器無法播放此音訊格式。",
     "mkdir_failed": "建立資料夾失敗",
     "create_file_failed": "建立檔案失敗",
     "file_exists": "檔案已存在",
@@ -2474,5 +2475,55 @@
     "progress": "{{done}}/{{total}}",
     "collapse": "收合",
     "expand": "展開"
+  },
+  "delegation": {
+    "picker": {
+      "agents": "智能體",
+      "delegate_to_agent": "將任務委派給一個智能體"
+    },
+    "chip_label": "委派給 {{target}}",
+    "chip_title": "委派目標：{{target}}",
+    "warning_empty_task": "請先輸入要委派給智能體的任務。",
+    "warning_attachments": "委派暫不支援附件。請移除附件，並用文字描述任務。",
+    "warning_quotes": "委派暫不支援引用聊天片段。請移除引用，並把所需上下文寫入任務。",
+    "warning_file_refs": "委派暫不支援 @ 檔案引用。請將相關路徑或上下文貼到任務中。",
+    "warning_p2p_tokens": "委派與 Team/P2P 控制分開。請移除 @@ 標記，或切回 Team 模式。",
+    "warning_control_command": "委派不能執行工作階段控制指令。請移除 /stop、/model、/thinking 或 /effort，並改為描述任務。",
+    "error": {
+      "mixed_delegation_p2p_fields": "委派不能與團隊/P2P 控制混用。",
+      "invalid_delegation_target": "請選擇有效的智慧體委派目標。",
+      "delegation_self_target": "不能把任務委派給目前工作階段。",
+      "delegation_target_unavailable": "該智慧體無法使用，請選擇其他目標。",
+      "delegation_target_forbidden": "該智慧體不在此專案內或不允許使用。",
+      "delegation_target_not_reply_capable": "該目標無法回覆委派任務。",
+      "delegation_empty_task": "委派給智慧體前請先輸入任務。",
+      "delegation_unsupported_input": "委派暫不支援此輸入。",
+      "delegation_dispatch_failed": "任務送出前委派失敗。"
+    }
+  },
+  "codex_credits": {
+    "title": "Codex 額度重置券",
+    "button": "重置券",
+    "loading": "載入中…",
+    "refresh": "重新整理",
+    "none": "沒有重置券",
+    "item_default_title": "額度重置",
+    "expires": "{{date}} 到期",
+    "reset_now": "立即重置",
+    "confirm": "消耗 1 張券?將重置你的 Codex 額度限制。",
+    "confirm_yes": "消耗",
+    "cancel": "取消",
+    "consuming": "處理中…",
+    "outcome_reset": "額度已重置 ✓",
+    "outcome_nothing_to_reset": "目前未被限流,未消耗額度券。",
+    "outcome_already_redeemed": "已兌換過。",
+    "outcome_no_credits": "沒有可用的重置券。",
+    "outcome_error": "重置失敗。",
+    "error_offline": "未連線。",
+    "error_generic": "請求失敗。",
+    "error_no_codex_auth": "找不到 Codex 登入。",
+    "error_request_failed": "請求失敗。",
+    "error_app_server_timeout": "Codex 逾時。",
+    "error_invalid_params": "請求無效。"
   }
 }

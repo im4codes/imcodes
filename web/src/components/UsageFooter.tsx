@@ -14,6 +14,8 @@ import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
+import { CodexResetCredits } from './CodexResetCredits.js';
+import type { WsClient } from '../ws-client.js';
 
 interface Props {
   usage: UsageData;
@@ -51,6 +53,9 @@ interface Props {
   runExecutionClonesDisabled?: boolean;
   runExecutionClonesTitle?: string;
   runExecutionClonesCount?: number;
+  /** WS client — enables the Codex reset-credits affordance (codex sessions). */
+  wsClient?: WsClient | null;
+  connected?: boolean;
 }
 
 const fmt = (n: number) =>
@@ -58,7 +63,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, wsClient, connected }: Props) {
   const { t } = useTranslation();
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
@@ -239,6 +244,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const providerQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
+  // Reset credits are a codex-account feature (accrued via ChatGPT auth).
+  const isCodexSession = agentType === 'codex' || agentType === 'codex-sdk';
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {hasContextInfo && (
@@ -248,26 +255,33 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
         </div>
       )}
-      {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
-        <div class="session-usage-codex-quota">
-          {providerQuotaLines.map((line) => (
-            <div class="session-usage-codex-line">{line}</div>
-          ))}
-          {showWeeklyAuthPrompt && (
-            <button
-              type="button"
-              class="session-usage-codex-line session-usage-weekly-authorize"
-              title={t('session.weekly_quota_authorize_hint')}
-              onClick={() => {
-                // Explicit consent before reading the local Claude token — not
-                // a one-click toggle.
-                if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
-                  void weeklyQuotaPref.save(true);
-                }
-              }}
-            >
-              {t('session.weekly_quota_authorize')}
-            </button>
+      {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt || isCodexSession) && (
+        <div class="session-usage-codex-row">
+          {isCodexSession && wsClient && (
+            <CodexResetCredits wsClient={wsClient} connected={connected !== false} />
+          )}
+          {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
+            <div class="session-usage-codex-quota">
+              {providerQuotaLines.map((line) => (
+                <div class="session-usage-codex-line">{line}</div>
+              ))}
+              {showWeeklyAuthPrompt && (
+                <button
+                  type="button"
+                  class="session-usage-codex-line session-usage-weekly-authorize"
+                  title={t('session.weekly_quota_authorize_hint')}
+                  onClick={() => {
+                    // Explicit consent before reading the local Claude token — not
+                    // a one-click toggle.
+                    if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
+                      void weeklyQuotaPref.save(true);
+                    }
+                  }}
+                >
+                  {t('session.weekly_quota_authorize')}
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}

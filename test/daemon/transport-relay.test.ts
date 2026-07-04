@@ -808,26 +808,57 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.code).toBe('PROVIDER_ERROR');
     });
 
-    it('renders CANCELLED as a visible cancellation notice without session error state', async () => {
+    it('preserves partial streamed content on CANCELLED and persists it (no truncation on Esc/stop)', async () => {
       const { provider, fireDelta, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
       fireDelta('sess-cancelled', makeDelta({ messageId: 'msg-cancelled', delta: 'partial before stop' }));
       emitMock.mockClear();
+      appendMock.mockClear();
 
       fireError('sess-cancelled', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
       await Promise.resolve();
 
+      // The accumulated streamed text must be preserved (with a cancel marker),
+      // NOT replaced by only the cancel notice — that was the "suddenly loses a
+      // big chunk" bug when pressing Esc/stop mid-stream.
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall).toBeDefined();
       expect(textCall![0]).toBe('sess-cancelled');
+      expect(textCall![2]).toMatchObject({
+        text: 'partial before stop\n\n⚠️ Turn cancelled',
+        streaming: false,
+        memoryExcluded: true,
+      });
+      // A clean cancel must NOT emit a session error state.
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+      // The partial must be persisted (落盘) so it survives refresh/reconnect.
+      const appended = appendMock.mock.calls.find(c => c[1]?.type === 'assistant.text');
+      expect(appended?.[1]).toMatchObject({
+        type: 'assistant.text',
+        sessionId: 'sess-cancelled',
+        text: 'partial before stop\n\n⚠️ Turn cancelled',
+      });
+    });
+
+    it('CANCELLED with no streamed content shows only the cancel notice and does not persist', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cancel-empty', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'Cancelled', recoverable: true });
+      await Promise.resolve();
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall![2]).toMatchObject({
         text: '⚠️ Turn cancelled: Cancelled',
         streaming: false,
         memoryExcluded: true,
       });
+      // Nothing streamed → nothing to persist.
+      expect(appendMock.mock.calls.some(c => c[1]?.type === 'assistant.text')).toBe(false);
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
-      expect(appendMock).not.toHaveBeenCalled();
     });
 
     it('recognizes typed sdk_turn_lost with a machine-readable helper, not message parsing', () => {

@@ -489,15 +489,33 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     }
 
     if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
+      // Preserve the partial streamed content up to the stop point and persist it.
+      // Previously this replaced the in-place streaming event (same eventId) with
+      // ONLY the cancel notice, so pressing Esc/Stop mid-stream made the visible
+      // assistant text "suddenly lose a big chunk" and the partial never hit disk.
+      // Mirror the error branch below: keep `tracked.text` + a terminal marker, and
+      // append the transport event so the partial survives refresh/reconnect (落盘).
+      const cancelledText = tracked?.text
+        ? `${tracked.text}\n\n⚠️ Turn cancelled`
+        : `⚠️ Turn cancelled: ${error.message}`;
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⚠️ Turn cancelled: ${error.message}`,
+        text: cancelledText,
         streaming: false,
+        // Cancelled output is deliberately interrupted — keep it out of memory,
+        // but still display + persist it. (Display/replay are unaffected by this flag.)
         memoryExcluded: true,
       }, {
         source: 'daemon',
         confidence: 'high',
         ...(tracked ? { eventId: tracked.eventId } : {}),
       });
+      if (tracked?.text) {
+        void appendTransportEvent(sessionName, {
+          type: 'assistant.text',
+          sessionId: sessionName,
+          text: cancelledText,
+        });
+      }
       return;
     }
 

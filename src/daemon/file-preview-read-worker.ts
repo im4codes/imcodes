@@ -186,7 +186,7 @@ async function handleSnapshot(
     };
   }
 
-  if (classification.previewKind === 'video' && mimeType) {
+  if ((classification.previewKind === 'video' || classification.previewKind === 'audio') && mimeType) {
     const endStats = await deps.stat(message.realPath);
     return {
       ...baseResult(message),
