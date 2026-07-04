@@ -44,14 +44,14 @@ function event(type: TimelineEvent['type'], text: string, patch: Partial<Timelin
 }
 
 describe('daemon delegation dispatch helper', () => {
-  it('resolves only same-project exact reply-capable process targets', () => {
+  it('resolves only same-project exact reply-capable agent targets', () => {
     const all = [session('deck_proj_brain'), session('deck_proj_w1'), session('deck_other_w1', { projectName: 'other' })];
     expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_proj_w1', allSessions: all }).ok).toBe(true);
     expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_proj_brain', allSessions: all })).toMatchObject({ ok: false, error: 'delegation_self_target' });
     expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_other_w1', allSessions: all })).toMatchObject({ ok: false, error: 'delegation_target_forbidden' });
     expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'codex', allSessions: all })).toMatchObject({ ok: false, error: 'delegation_target_unavailable' });
     expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_proj_w2', allSessions: [...all, session('deck_proj_w2', { agentType: 'shell' })] })).toMatchObject({ ok: false, error: 'delegation_target_not_reply_capable' });
-    expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_proj_w3', allSessions: [...all, session('deck_proj_w3', { runtimeType: 'transport', agentType: 'codex-sdk' })] })).toMatchObject({ ok: false, error: 'delegation_target_not_reply_capable' });
+    expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_proj_w3', allSessions: [...all, session('deck_proj_w3', { runtimeType: 'transport', agentType: 'codex-sdk' })] })).toMatchObject({ ok: true, target: expect.objectContaining({ name: 'deck_proj_w3' }) });
     expect(resolveExactDelegationTarget({ caller: { userId: 'web', sessionName: 'deck_proj_brain', projectName: 'proj' }, targetSession: 'deck_proj_w4', allSessions: [...all, session('deck_proj_w4', { executionCloneMetadata: { kind: EXECUTION_CLONE_KIND } as any })] })).toMatchObject({ ok: false, error: 'delegation_target_forbidden' });
   });
 

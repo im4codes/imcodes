@@ -55,7 +55,7 @@ describe('AtPicker', () => {
       <AtPicker
         query=""
         sessions={[
-          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null },
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
           { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
           { name: 'deck_sub_worker2', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
           { name: 'deck_sub_other9', agentType: 'codex', state: 'idle', parentSession: 'deck_other_brain' },
@@ -98,19 +98,21 @@ describe('AtPicker', () => {
     expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
   });
 
-  it('shows only same-domain agents in agents step', () => {
+  it('shows current main-session group agents and disables the current session', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
 
-    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.getByText('brain').closest('div')?.getAttribute('aria-disabled')).toBe('true');
     expect(screen.getByText('worker1')).toBeDefined();
     expect(screen.getByText('worker2')).toBeDefined();
     expect(screen.queryByText('other9')).toBeNull();
   });
 
-  it('agents step shows only individual non-self reply-capable delegation targets', () => {
+  it('agents step includes SDK transport agents and keeps shell/script out', () => {
     const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    const onSelectDelegateAgent = vi.fn();
 
     render(
       <AtPicker
@@ -127,7 +129,7 @@ describe('AtPicker', () => {
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
         onSelectAgent={vi.fn()}
-        onSelectDelegateAgent={vi.fn()}
+        onSelectDelegateAgent={onSelectDelegateAgent}
         onClose={vi.fn()}
         visible
       />,
@@ -136,10 +138,14 @@ describe('AtPicker', () => {
     fireEvent.click(screen.getByText('agents'));
 
     expect(screen.getByText('worker1')).toBeDefined();
-    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('brain').closest('div')?.getAttribute('aria-disabled')).toBe('true');
     expect(screen.queryByText('shell')).toBeNull();
-    expect(screen.queryByText('transport')).toBeNull();
-    expect(screen.queryByText('stopped')).toBeNull();
+    fireEvent.keyDown(document, { key: 'Enter' });
+    expect(onSelectDelegateAgent).toHaveBeenCalledWith('deck_sub_worker1');
+    onSelectDelegateAgent.mockClear();
+    fireEvent.click(screen.getByText('transport'));
+    expect(onSelectDelegateAgent).toHaveBeenCalledWith('deck_sub_transport');
+    expect(screen.getByText('stopped')).toBeDefined();
     expect(screen.queryByText('All Agents')).toBeNull();
   });
 
@@ -194,13 +200,12 @@ describe('AtPicker', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
-    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.getByText('brain')).toBeDefined();
 
     fireEvent.keyDown(document, { key: 'Escape' });
 
     expect(screen.getByText('files')).toBeDefined();
     expect(screen.getByText('agents')).toBeDefined();
-    expect(screen.queryByText('brain')).toBeNull();
   });
 
   it('consumes Escape before the chat input can handle it', () => {

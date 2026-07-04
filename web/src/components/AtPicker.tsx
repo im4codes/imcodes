@@ -16,7 +16,6 @@ import {
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
-import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 
 interface SessionEntry {
   name: string;
@@ -27,6 +26,15 @@ interface SessionEntry {
   parentSession?: string | null;
   isSelf?: boolean;
 }
+
+type PickerAgent = {
+  session: string;
+  shortName: string;
+  agentType: string;
+  busy: boolean;
+  isSelf: boolean;
+  disabled?: boolean;
+};
 
 interface AtPickerProps {
   query: string;
@@ -244,8 +252,8 @@ export function AtPicker({
   }, [sessionLookup]);
 
   // Deduplicate same-project sessions for Team/P2P rows. Team behavior keeps
-  // the broader P2P-eligible set; the Agents category further narrows to
-  // daemon reply-capable, non-self delegation targets below.
+  // its existing P2P-eligible set; the Agents category builds its own
+  // main-session group list below.
   const agents = useMemo(() => {
     const seen = new Map<string, SessionEntry>();
     for (const s of sessions) {
@@ -274,17 +282,34 @@ export function AtPicker({
       .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()));
   }, [sessions, query, rootSession]);
 
-  const delegateAgents = useMemo(() => (
-    agents.filter((a) => (
-      !a.isSelf
-      && isDelegationReplyCapableAgentType(a.agentType)
-      && a.session !== rootSession
-    ))
-      .filter((a) => {
-        const source = sessions.find((s) => s.name === a.session);
-        return source?.state !== 'stopped' && source?.state !== 'error';
+  const delegateAgents = useMemo<PickerAgent[]>(() => {
+    const seen = new Map<string, SessionEntry>();
+    for (const s of sessions) {
+      if (s.agentType === 'shell' || s.agentType === 'script') continue;
+      if (rootSession && s.name !== rootSession && s.parentSession !== rootSession) continue;
+      const existing = seen.get(s.name);
+      if (!existing) {
+        seen.set(s.name, s);
+      } else if (s.isSelf && !existing.isSelf) {
+        seen.set(s.name, s);
+      }
+    }
+    return [...seen.values()]
+      .map((s) => {
+        const shortName = s.label || s.name.split('_').pop() || s.name;
+        const isSelf = !!s.isSelf;
+        return {
+          session: s.name,
+          shortName,
+          agentType: s.agentType,
+          busy: s.state !== 'idle',
+          isSelf,
+          disabled: isSelf,
+        };
       })
-  ), [agents, rootSession, sessions]);
+      .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()))
+      .sort((a, b) => Number(!!a.disabled) - Number(!!b.disabled));
+  }, [sessions, query, rootSession]);
 
   // Debounced file search — only when in files category
   useEffect(() => {
@@ -512,7 +537,7 @@ export function AtPicker({
           if (f) onSelectFile(f.path);
         } else {
           const a = delegateAgents[highlightIdx];
-          if (a) onSelectDelegateAgent(a.session);
+          if (a && !a.disabled) onSelectDelegateAgent(a.session);
         }
       }
     },
@@ -856,12 +881,19 @@ export function AtPicker({
       {/* Individual delegation agents only. */}
       {delegateAgents.map((a, idx) => {
         const hl = idx === highlightIdx;
+        const disabled = !!a.disabled;
         return (
           <div
             key={a.session}
             data-hl={hl ? 'true' : undefined}
-            style={hl ? itemHighlightStyle : itemStyle}
-            onClick={() => onSelectDelegateAgent(a.session)}
+            aria-disabled={disabled ? 'true' : undefined}
+            style={{
+              ...(hl ? itemHighlightStyle : itemStyle),
+              ...(disabled ? { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 } : {}),
+            }}
+            onClick={() => {
+              if (!disabled) onSelectDelegateAgent(a.session);
+            }}
             onMouseEnter={() => setHighlightIdx(idx)}
           >
             <span style={{ fontWeight: 500 }}>{a.shortName}</span>

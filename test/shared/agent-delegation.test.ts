@@ -6,6 +6,7 @@ import {
   AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_TARGET_FIELD,
+  DELEGATION_REPLY_CAPABLE_AGENT_TYPES,
   DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES,
   DELEGATION_EMPTY_TASK,
   DELEGATION_SELF_TARGET,
@@ -118,12 +119,26 @@ describe('agent delegation shared contract', () => {
     expect(findMixedAgentDelegationP2pFields({ text: 'normal', p2pFutureFlag: true })).toEqual([]);
   });
 
-  it('exports reply-capable process target predicate and rejects transport-only agent types', () => {
-    expect(DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES).toEqual(['claude-code', 'codex', 'gemini', 'opencode']);
-    for (const agentType of DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES) {
+  it('exports reply-capable agent target predicate and rejects non-agent types', () => {
+    expect(DELEGATION_REPLY_CAPABLE_AGENT_TYPES).toEqual([
+      'claude-code-sdk',
+      'claude-code',
+      'codex-sdk',
+      'codex',
+      'copilot-sdk',
+      'cursor-headless',
+      'opencode',
+      'gemini-sdk',
+      'gemini',
+      'qwen',
+      'openclaw',
+      'kimi-sdk',
+    ]);
+    expect(DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES).toBe(DELEGATION_REPLY_CAPABLE_AGENT_TYPES);
+    for (const agentType of DELEGATION_REPLY_CAPABLE_AGENT_TYPES) {
       expect(isDelegationReplyCapableAgentType(agentType)).toBe(true);
     }
-    for (const agentType of ['codex-sdk', 'claude-code-sdk', 'shell', 'script', 'unknown', undefined, null]) {
+    for (const agentType of ['shell', 'script', 'unknown', undefined, null]) {
       expect(isDelegationReplyCapableAgentType(agentType as string | undefined | null)).toBe(false);
     }
   });

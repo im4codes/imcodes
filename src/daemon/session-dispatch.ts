@@ -215,7 +215,6 @@ export function resolveExactDelegationTarget(input: { caller: SessionDispatchRun
   if (!callerProject || targetProject !== callerProject) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_FORBIDDEN, detail: 'target outside caller project' };
   if (target.state === 'stopped' || target.state === 'error') return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_UNAVAILABLE, detail: `target state ${target.state}` };
   if (target.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_FORBIDDEN, detail: 'execution clone target' };
-  if (target.runtimeType === 'transport') return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_NOT_REPLY_CAPABLE, detail: 'transport target not enabled for delegation' };
   if (!isDelegationReplyCapableAgentType(target.agentType)) return { ok: false, error: AGENT_DELEGATION_ERROR_CODES.DELEGATION_TARGET_NOT_REPLY_CAPABLE, detail: `agent type ${target.agentType}` };
   return { ok: true, target };
 }

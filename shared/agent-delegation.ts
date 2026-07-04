@@ -36,12 +36,30 @@ export const AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER = '[delegation-context-tr
 
 export type DelegationContextStatus = 'ok' | 'truncated' | 'omitted';
 
-export const DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES = ['claude-code', 'codex', 'gemini', 'opencode'] as const;
-export type DelegationReplyCapableProcessAgentType = typeof DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES[number];
+export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
+  'claude-code-sdk',
+  'claude-code',
+  'codex-sdk',
+  'codex',
+  'copilot-sdk',
+  'cursor-headless',
+  'opencode',
+  'gemini-sdk',
+  'gemini',
+  'qwen',
+  'openclaw',
+  'kimi-sdk',
+] as const;
+export type DelegationReplyCapableAgentType = typeof DELEGATION_REPLY_CAPABLE_AGENT_TYPES[number];
 
-export function isDelegationReplyCapableAgentType(agentType: string | null | undefined): agentType is DelegationReplyCapableProcessAgentType {
+// Back-compat export: older imports used the "PROCESS" name before SDK
+// transport sessions became valid delegation targets.
+export const DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES = DELEGATION_REPLY_CAPABLE_AGENT_TYPES;
+export type DelegationReplyCapableProcessAgentType = DelegationReplyCapableAgentType;
+
+export function isDelegationReplyCapableAgentType(agentType: string | null | undefined): agentType is DelegationReplyCapableAgentType {
   return typeof agentType === 'string'
-    && (DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES as readonly string[]).includes(agentType);
+    && (DELEGATION_REPLY_CAPABLE_AGENT_TYPES as readonly string[]).includes(agentType);
 }
 
 export const AGENT_DELEGATION_FORBIDDEN_COMMAND_FIELDS = [
