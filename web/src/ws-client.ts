@@ -17,6 +17,7 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
+import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import type { ShareTarget } from './tab-sharing-ui.js';
 import {
@@ -182,6 +183,8 @@ export type ServerMessage =
   | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
   | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; requestId?: string; ok: boolean; error?: string }
   | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
+  | { type: typeof CODEX_RESET_CREDITS_MSG.LIST_RESPONSE; requestId?: string; ok: boolean; credits?: CodexResetCredit[]; availableCount?: number; error?: string }
+  | { type: typeof CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE; requestId?: string; ok: boolean; outcome?: CodexConsumeOutcome; error?: string }
   | SessionGroupCloneEvent
   | FsGitDiffResponse
   | FsWriteResponse
@@ -881,6 +884,18 @@ export class WsClient {
     if (!wasDesired && !wasSent) return;
     if (!this._connected) return;
     if (wasSent) this.sendTransportUnsubscribe(sessionId);
+  }
+
+  /** Request the codex account's rate-limit reset-credit list. */
+  listCodexResetCredits(requestId: string): void {
+    if (!requestId) return;
+    this.send({ type: CODEX_RESET_CREDITS_MSG.LIST, requestId });
+  }
+
+  /** Consume one codex reset credit. `idempotencyKey` should be a fresh UUID. */
+  consumeCodexResetCredit(requestId: string, idempotencyKey: string): void {
+    if (!requestId || !idempotencyKey) return;
+    this.send({ type: CODEX_RESET_CREDITS_MSG.CONSUME, requestId, idempotencyKey });
   }
 
   /** Respond to a transport approval request. */

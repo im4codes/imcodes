@@ -940,6 +940,8 @@ export function SubSessionWindow({
           sessionName={sub.sessionName}
           sessionState={liveSessionState}
           agentType={sessionInfo?.agentType}
+          wsClient={ws}
+          connected={connected}
           modelOverride={resolveEffectiveSessionModel(sessionInfo, effectiveDetectedModel, lastUsage?.model)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}

@@ -2498,5 +2498,29 @@
       "delegation_unsupported_input": "위임은 아직 이 입력을 지원하지 않습니다.",
       "delegation_dispatch_failed": "작업을 보내기 전에 위임이 실패했습니다."
     }
+  },
+  "codex_credits": {
+    "title": "Codex 리셋 크레딧",
+    "button": "리셋",
+    "loading": "불러오는 중…",
+    "none": "리셋 크레딧 없음",
+    "item_default_title": "사용량 제한 리셋",
+    "expires": "{{date}} 만료",
+    "reset_now": "지금 리셋",
+    "confirm": "1개 사용할까요? Codex 사용량 제한을 리셋합니다.",
+    "confirm_yes": "사용",
+    "cancel": "취소",
+    "consuming": "처리 중…",
+    "outcome_reset": "사용량 제한이 리셋되었습니다 ✓",
+    "outcome_nothing_to_reset": "현재 제한 상태가 아니어서 크레딧이 사용되지 않았습니다.",
+    "outcome_already_redeemed": "이미 사용되었습니다.",
+    "outcome_no_credits": "사용 가능한 크레딧이 없습니다.",
+    "outcome_error": "리셋에 실패했습니다.",
+    "error_offline": "연결되지 않음.",
+    "error_generic": "요청 실패.",
+    "error_no_codex_auth": "Codex 로그인을 찾을 수 없습니다.",
+    "error_request_failed": "요청 실패.",
+    "error_app_server_timeout": "Codex 시간 초과.",
+    "error_invalid_params": "잘못된 요청."
   }
 }

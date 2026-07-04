@@ -2498,5 +2498,29 @@
       "delegation_unsupported_input": "委任はこの入力にまだ対応していません。",
       "delegation_dispatch_failed": "タスク送信前に委任が失敗しました。"
     }
+  },
+  "codex_credits": {
+    "title": "Codex リセットクレジット",
+    "button": "リセット",
+    "loading": "読み込み中…",
+    "none": "リセットクレジットなし",
+    "item_default_title": "レート制限リセット",
+    "expires": "{{date}} に期限切れ",
+    "reset_now": "今すぐリセット",
+    "confirm": "1 枚使いますか?Codex のレート制限をリセットします。",
+    "confirm_yes": "使う",
+    "cancel": "キャンセル",
+    "consuming": "処理中…",
+    "outcome_reset": "レート制限をリセットしました ✓",
+    "outcome_nothing_to_reset": "現在は制限中ではないため、クレジットは消費されません。",
+    "outcome_already_redeemed": "すでに引き換え済みです。",
+    "outcome_no_credits": "利用可能なクレジットがありません。",
+    "outcome_error": "リセットに失敗しました。",
+    "error_offline": "未接続です。",
+    "error_generic": "リクエストに失敗しました。",
+    "error_no_codex_auth": "Codex のログインが見つかりません。",
+    "error_request_failed": "リクエストに失敗しました。",
+    "error_app_server_timeout": "Codex がタイムアウトしました。",
+    "error_invalid_params": "無効なリクエストです。"
   }
 }

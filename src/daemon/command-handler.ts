@@ -89,6 +89,8 @@ import {
 import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
+import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
+import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import {
   getEnabledP2pMemberNames,
@@ -1469,6 +1471,12 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       // weekly (7d) quota. Off by default; gates the /api/oauth/usage pull.
       setClaudeUsageQuotaOptIn(cmd.enabled === true);
       break;
+    case CODEX_RESET_CREDITS_MSG.LIST:
+      void handleCodexResetCreditsList(cmd, serverLink);
+      break;
+    case CODEX_RESET_CREDITS_MSG.CONSUME:
+      void handleCodexResetCreditsConsume(cmd, serverLink);
+      break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
       break;
@@ -1817,6 +1825,25 @@ async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: Ser
       });
     }
   }
+}
+
+async function handleCodexResetCreditsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const result = await fetchCodexResetCredits();
+  if (!requestId) return;
+  serverLink?.send(result.ok
+    ? { type: CODEX_RESET_CREDITS_MSG.LIST_RESPONSE, requestId, ok: true, ...result.list }
+    : { type: CODEX_RESET_CREDITS_MSG.LIST_RESPONSE, requestId, ok: false, error: result.error });
+}
+
+async function handleCodexResetCreditsConsume(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const idempotencyKey = typeof cmd.idempotencyKey === 'string' ? cmd.idempotencyKey : '';
+  const result = await consumeCodexResetCredit(idempotencyKey);
+  if (!requestId) return;
+  serverLink?.send(result.ok
+    ? { type: CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE, requestId, ok: true, outcome: result.outcome }
+    : { type: CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE, requestId, ok: false, error: result.error });
 }
 
 async function handleInbound(cmd: Record<string, unknown>): Promise<void> {

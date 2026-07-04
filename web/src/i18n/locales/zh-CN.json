@@ -2500,5 +2500,29 @@
       "delegation_unsupported_input": "委派暂不支持此输入。",
       "delegation_dispatch_failed": "任务发送前委派失败。"
     }
+  },
+  "codex_credits": {
+    "title": "Codex 额度重置券",
+    "button": "重置券",
+    "loading": "加载中…",
+    "none": "没有重置券",
+    "item_default_title": "额度重置",
+    "expires": "{{date}} 到期",
+    "reset_now": "立即重置",
+    "confirm": "消耗 1 张券?将重置你的 Codex 额度限制。",
+    "confirm_yes": "消耗",
+    "cancel": "取消",
+    "consuming": "处理中…",
+    "outcome_reset": "额度已重置 ✓",
+    "outcome_nothing_to_reset": "当前未被限流,未消耗额度券。",
+    "outcome_already_redeemed": "已兑换过。",
+    "outcome_no_credits": "没有可用的重置券。",
+    "outcome_error": "重置失败。",
+    "error_offline": "未连接。",
+    "error_generic": "请求失败。",
+    "error_no_codex_auth": "未找到 Codex 登录。",
+    "error_request_failed": "请求失败。",
+    "error_app_server_timeout": "Codex 超时。",
+    "error_invalid_params": "请求无效。"
   }
 }

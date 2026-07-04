@@ -2499,5 +2499,29 @@
       "delegation_unsupported_input": "La delegación aún no admite esta entrada.",
       "delegation_dispatch_failed": "La delegación falló antes de enviar la tarea."
     }
+  },
+  "codex_credits": {
+    "title": "Créditos de reinicio de Codex",
+    "button": "Reinicios",
+    "loading": "Cargando…",
+    "none": "Sin créditos de reinicio",
+    "item_default_title": "Reinicio de límite",
+    "expires": "caduca {{date}}",
+    "reset_now": "Reiniciar ahora",
+    "confirm": "¿Usar 1 crédito? Reinicia tus límites de Codex.",
+    "confirm_yes": "Usar",
+    "cancel": "Cancelar",
+    "consuming": "Procesando…",
+    "outcome_reset": "Límites reiniciados ✓",
+    "outcome_nothing_to_reset": "Sin límite activo: no se usó ningún crédito.",
+    "outcome_already_redeemed": "Ya canjeado.",
+    "outcome_no_credits": "No hay créditos disponibles.",
+    "outcome_error": "Error al reiniciar.",
+    "error_offline": "Sin conexión.",
+    "error_generic": "Error de solicitud.",
+    "error_no_codex_auth": "No se encontró sesión de Codex.",
+    "error_request_failed": "Error de solicitud.",
+    "error_app_server_timeout": "Codex agotó el tiempo.",
+    "error_invalid_params": "Solicitud no válida."
   }
 }

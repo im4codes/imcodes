@@ -95,6 +95,8 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           sessionName={sessionName}
           sessionState={liveSessionState}
           agentType={liveSub.type}
+          wsClient={ctx.ws}
+          connected={ctx.connected}
           modelOverride={modelDisplay ?? undefined}
           planLabel={liveSub.planLabel}
           quotaLabel={liveSub.quotaLabel}

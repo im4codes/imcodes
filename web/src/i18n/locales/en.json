@@ -2500,5 +2500,29 @@
       "delegation_unsupported_input": "Delegation does not support this input yet.",
       "delegation_dispatch_failed": "Delegation failed before the task was sent."
     }
+  },
+  "codex_credits": {
+    "title": "Codex reset credits",
+    "button": "Resets",
+    "loading": "Loading…",
+    "none": "No reset credits",
+    "item_default_title": "Rate-limit reset",
+    "expires": "expires {{date}}",
+    "reset_now": "Reset now",
+    "confirm": "Consume 1 credit? This resets your Codex rate limits.",
+    "confirm_yes": "Consume",
+    "cancel": "Cancel",
+    "consuming": "Consuming…",
+    "outcome_reset": "Rate limits reset ✓",
+    "outcome_nothing_to_reset": "Not currently rate-limited — no credit used.",
+    "outcome_already_redeemed": "Already redeemed.",
+    "outcome_no_credits": "No reset credits available.",
+    "outcome_error": "Reset failed.",
+    "error_offline": "Not connected.",
+    "error_generic": "Request failed.",
+    "error_no_codex_auth": "No Codex login found.",
+    "error_request_failed": "Request failed.",
+    "error_app_server_timeout": "Codex timed out.",
+    "error_invalid_params": "Invalid request."
   }
 }

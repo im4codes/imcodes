@@ -99,8 +99,21 @@ function buildQuotaDisplay(snapshot: RateLimitSnapshot | null | undefined): Pick
   };
 }
 
-async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | undefined> {
-  return await new Promise<RateLimitSnapshot | undefined>((resolve) => {
+/**
+ * Generic codex `app-server` JSON-RPC caller: spawn `codex app-server`, perform
+ * the `initialize` (id=1) → `initialized` handshake, invoke `method` (id=2) with
+ * optional params, and resolve with `pickResult(response)` for the id=2 reply.
+ * Resolves `undefined` on timeout, spawn/stdin error, close-before-reply, or
+ * when `pickResult` returns `undefined`. Codex owns token load/refresh, so we
+ * never touch the OAuth token here. Shared by every app-server read/write so the
+ * handshake + lifecycle guards live in exactly one place.
+ */
+export async function callCodexAppServerMethod<T>(
+  method: string,
+  params: Record<string, unknown> | undefined,
+  pickResult: (msg: Record<string, any>) => T | undefined,
+): Promise<T | undefined> {
+  return await new Promise<T | undefined>((resolve) => {
     const child = spawn('codex', ['app-server'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: process.env,
@@ -115,7 +128,7 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
       void killProcessTree(child);
     };
 
-    const finish = (value: RateLimitSnapshot | undefined) => {
+    const finish = (value: T | undefined) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
@@ -148,11 +161,11 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
           if (msg.id === 1 && msg.result && !initialized) {
             initialized = true;
             safeWriteStdin(JSON.stringify({ method: 'initialized' }) + '\n');
-            safeWriteStdin(JSON.stringify({ method: 'account/rateLimits/read', id: requestId }) + '\n');
+            safeWriteStdin(JSON.stringify({ method, id: requestId, ...(params ? { params } : {}) }) + '\n');
             continue;
           }
-          if (msg.id === requestId && msg.result?.rateLimits) {
-            finish(msg.result.rateLimits as RateLimitSnapshot);
+          if (msg.id === requestId) {
+            finish(pickResult(msg));
             return;
           }
         } catch {
@@ -180,6 +193,14 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
       },
     }) + '\n');
   });
+}
+
+async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | undefined> {
+  return callCodexAppServerMethod(
+    'account/rateLimits/read',
+    undefined,
+    (msg) => (msg.result?.rateLimits as RateLimitSnapshot | undefined),
+  );
 }
 
 async function readCodexModelsViaAppServer(): Promise<CodexModelInfo[] | undefined> {

@@ -1705,4 +1705,34 @@ describe('WsClient', () => {
       expect(() => client.sendUrgent({ type: 'session.stop', sessionName: 's' })).toThrow(/not connected/i);
     });
   });
+
+  describe('codex reset credits', () => {
+    it('sends codex.reset_credits.list with the requestId', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.listCodexResetCredits('req-1');
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toEqual({
+        type: 'codex.reset_credits.list',
+        requestId: 'req-1',
+      });
+    });
+
+    it('sends codex.reset_credits.consume with requestId + idempotencyKey', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.consumeCodexResetCredit('req-2', 'idem-abc');
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toEqual({
+        type: 'codex.reset_credits.consume',
+        requestId: 'req-2',
+        idempotencyKey: 'idem-abc',
+      });
+    });
+
+    it('does not send consume without an idempotencyKey', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.consumeCodexResetCredit('req-3', '');
+      expect(lastWs!.send).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -2498,5 +2498,29 @@
       "delegation_unsupported_input": "Делегирование пока не поддерживает этот ввод.",
       "delegation_dispatch_failed": "Делегирование не удалось до отправки задачи."
     }
+  },
+  "codex_credits": {
+    "title": "Кредиты сброса Codex",
+    "button": "Сбросы",
+    "loading": "Загрузка…",
+    "none": "Нет кредитов сброса",
+    "item_default_title": "Сброс лимита",
+    "expires": "истекает {{date}}",
+    "reset_now": "Сбросить сейчас",
+    "confirm": "Использовать 1 кредит? Это сбросит лимиты Codex.",
+    "confirm_yes": "Использовать",
+    "cancel": "Отмена",
+    "consuming": "Обработка…",
+    "outcome_reset": "Лимиты сброшены ✓",
+    "outcome_nothing_to_reset": "Лимит не достигнут — кредит не использован.",
+    "outcome_already_redeemed": "Уже использовано.",
+    "outcome_no_credits": "Нет доступных кредитов.",
+    "outcome_error": "Не удалось сбросить.",
+    "error_offline": "Нет подключения.",
+    "error_generic": "Ошибка запроса.",
+    "error_no_codex_auth": "Вход Codex не найден.",
+    "error_request_failed": "Ошибка запроса.",
+    "error_app_server_timeout": "Codex не ответил.",
+    "error_invalid_params": "Неверный запрос."
   }
 }

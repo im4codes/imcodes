@@ -2500,5 +2500,29 @@
       "delegation_unsupported_input": "委派暫不支援此輸入。",
       "delegation_dispatch_failed": "任務送出前委派失敗。"
     }
+  },
+  "codex_credits": {
+    "title": "Codex 額度重置券",
+    "button": "重置券",
+    "loading": "載入中…",
+    "none": "沒有重置券",
+    "item_default_title": "額度重置",
+    "expires": "{{date}} 到期",
+    "reset_now": "立即重置",
+    "confirm": "消耗 1 張券?將重置你的 Codex 額度限制。",
+    "confirm_yes": "消耗",
+    "cancel": "取消",
+    "consuming": "處理中…",
+    "outcome_reset": "額度已重置 ✓",
+    "outcome_nothing_to_reset": "目前未被限流,未消耗額度券。",
+    "outcome_already_redeemed": "已兌換過。",
+    "outcome_no_credits": "沒有可用的重置券。",
+    "outcome_error": "重置失敗。",
+    "error_offline": "未連線。",
+    "error_generic": "請求失敗。",
+    "error_no_codex_auth": "找不到 Codex 登入。",
+    "error_request_failed": "請求失敗。",
+    "error_app_server_timeout": "Codex 逾時。",
+    "error_invalid_params": "請求無效。"
   }
 }
