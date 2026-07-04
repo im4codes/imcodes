@@ -2631,7 +2631,7 @@ export function useTimeline(
   const streamingIdlePersistIdsRef = useRef(new Set<string>());
   const streamingIdlePersistKeyRef = useRef<string | null>(null);
   const streamingIdlePersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const flushStreamingIdlePersist = useCallback(() => {
+  const flushStreamingIdlePersist = useCallback((fromIdleTimer = false) => {
     if (streamingIdlePersistTimerRef.current) {
       clearTimeout(streamingIdlePersistTimerRef.current);
       streamingIdlePersistTimerRef.current = null;
@@ -2644,11 +2644,34 @@ export function useTimeline(
     const cached = getCachedEvents(key) ?? eventsRef.current;
     const byId = new Map(cached.map((event) => [event.eventId, event]));
     const toPersist: TimelineEvent[] = [];
+    let hasStuckStream = false;
     for (const id of ids) {
       const event = byId.get(id);
-      if (event) toPersist.push(event); // whatever the latest is (streaming or final)
+      if (!event) continue;
+      toPersist.push(event); // whatever the latest is (streaming or final)
+      // A terminal (streaming:false) event deletes its id from this set on arrival
+      // (appendRealtimeEvent). So a STILL-streaming event here means the stream
+      // went quiet WITHOUT a terminal — the final / cancel / idle was likely dropped.
+      if (event.payload?.streaming === true) hasStuckStream = true;
     }
     if (toPersist.length > 0) persistTimelineEventsIncludingStreaming(key, toPersist);
+
+    // Root-cause recovery for the acknowledged "前台停留弱网不自动同步" gap: a
+    // foreground tab can silently miss the terminal timeline.event (streaming:false
+    // final / cancel notice / session.state idle) while the socket still LOOKS alive
+    // (ping/pong healthy → no reconnect signal), leaving the turn stuck "streaming"
+    // until the 45s foreground watchdog. Desktop feels this because a focused tab
+    // gets no app-lifecycle resume backfill (mobile self-heals via those). When the
+    // stream idled but is still streaming, the terminal was almost certainly
+    // dropped: fire one immediate latest-window catch-up so it reconciles in
+    // ~STREAMING_IDLE_PERSIST_MS instead of ~45s. Only from the idle timer (not a
+    // session-switch / unmount flush) and only for the still-current, active/visible
+    // session; the HTTP backfill is a pure eventId-dedup merge, so a rare
+    // slightly-late terminal just no-ops.
+    if (fromIdleTimer && hasStuckStream && key === cacheKeyRef.current
+      && (isActiveSessionRef.current || isVisibleRef.current)) {
+      fireHttpBackfillRef.current(0, { phase: 'refresh', visible: false, force: true, mode: 'manualLatestWindow' });
+    }
   }, []);
   const scheduleStreamingIdlePersist = useCallback((eventId: string) => {
     const key = cacheKeyRef.current;
@@ -2660,7 +2683,7 @@ export function useTimeline(
     streamingIdlePersistKeyRef.current = key;
     streamingIdlePersistIdsRef.current.add(eventId);
     if (streamingIdlePersistTimerRef.current) clearTimeout(streamingIdlePersistTimerRef.current);
-    streamingIdlePersistTimerRef.current = setTimeout(flushStreamingIdlePersist, STREAMING_IDLE_PERSIST_MS);
+    streamingIdlePersistTimerRef.current = setTimeout(() => flushStreamingIdlePersist(true), STREAMING_IDLE_PERSIST_MS);
   }, [flushStreamingIdlePersist]);
 
   const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
