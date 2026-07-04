@@ -72,6 +72,7 @@ vi.mock('../../src/thinking-utils.js', () => ({
 const addOptimisticUserMessageSpy = vi.fn();
 const markOptimisticFailedSpy = vi.fn();
 const retryOptimisticMessageSpy = vi.fn();
+const loadOlderEventsSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
@@ -83,6 +84,10 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
     addOptimisticUserMessage: addOptimisticUserMessageSpy,
     markOptimisticFailed: markOptimisticFailedSpy,
     retryOptimisticMessage: retryOptimisticMessageSpy,
+    // Older-history pagination — must be forwarded to ChatView so scroll-to-top loads history.
+    loadingOlder: false,
+    hasOlderHistory: true,
+    loadOlderEvents: loadOlderEventsSpy,
   }),
 }));
 
@@ -332,6 +337,39 @@ describe('SubSessionWindow metadata wiring', () => {
       const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
       expect(props.events).toEqual(timelineEventsMock);
       expect(props.events[0].payload).toMatchObject({ text: 'window partial stream', streaming: true });
+    });
+  });
+
+  it('forwards older-history pagination (onLoadOlder / hasOlderHistory / loadingOlder) to the ChatView', async () => {
+    // Regression: the sub-session window never forwarded these, so ChatView's
+    // scroll-to-top loader no-op'd and older history could not be loaded in a
+    // sub-session (it worked in the main SessionPane, which does forward them).
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          state: 'running',
+        } as any)}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+      expect(props.onLoadOlder).toBe(loadOlderEventsSpy);
+      expect(props.hasOlderHistory).toBe(true);
+      expect(props.loadingOlder).toBe(false);
     });
   });
 

@@ -270,6 +270,9 @@ export function SubSessionWindow({
     markOptimisticFailed,
     retryOptimisticMessage,
     forceRefresh: timelineForceRefresh,
+    loadingOlder,
+    hasOlderHistory,
+    loadOlderEvents,
   } = useTimeline(sub.sessionName, ws, serverId, {
     isActiveSession: active,
     // Window mounted = visible; participate in resume broadcast even when
@@ -912,6 +915,9 @@ export function SubSessionWindow({
             loading={false}
             refreshing={refreshing}
             historyStatus={historyStatus}
+            loadingOlder={loadingOlder}
+            hasOlderHistory={hasOlderHistory}
+            onLoadOlder={loadOlderEvents}
             sessionId={sub.sessionName}
             onForceSync={timelineForceRefresh}
             onScrollBottomFn={onChatScrollBottomFn}
