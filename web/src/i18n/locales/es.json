@@ -2504,6 +2504,7 @@
     "title": "Créditos de reinicio de Codex",
     "button": "Reinicios",
     "loading": "Cargando…",
+    "refresh": "Actualizar",
     "none": "Sin créditos de reinicio",
     "item_default_title": "Reinicio de límite",
     "expires": "caduca {{date}}",

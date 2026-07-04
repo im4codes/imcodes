@@ -2503,6 +2503,7 @@
     "title": "Кредиты сброса Codex",
     "button": "Сбросы",
     "loading": "Загрузка…",
+    "refresh": "Обновить",
     "none": "Нет кредитов сброса",
     "item_default_title": "Сброс лимита",
     "expires": "истекает {{date}}",

@@ -2503,6 +2503,7 @@
     "title": "Codex 리셋 크레딧",
     "button": "리셋",
     "loading": "불러오는 중…",
+    "refresh": "새로고침",
     "none": "리셋 크레딧 없음",
     "item_default_title": "사용량 제한 리셋",
     "expires": "{{date}} 만료",

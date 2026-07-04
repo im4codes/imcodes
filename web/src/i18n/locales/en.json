@@ -2505,6 +2505,7 @@
     "title": "Codex reset credits",
     "button": "Resets",
     "loading": "Loading…",
+    "refresh": "Refresh",
     "none": "No reset credits",
     "item_default_title": "Rate-limit reset",
     "expires": "expires {{date}}",

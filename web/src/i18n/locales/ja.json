@@ -2503,6 +2503,7 @@
     "title": "Codex リセットクレジット",
     "button": "リセット",
     "loading": "読み込み中…",
+    "refresh": "更新",
     "none": "リセットクレジットなし",
     "item_default_title": "レート制限リセット",
     "expires": "{{date}} に期限切れ",

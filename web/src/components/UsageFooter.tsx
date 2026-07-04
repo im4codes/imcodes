@@ -256,28 +256,32 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         </div>
       )}
       {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt || isCodexSession) && (
-        <div class="session-usage-codex-quota">
-          {providerQuotaLines.map((line) => (
-            <div class="session-usage-codex-line">{line}</div>
-          ))}
+        <div class="session-usage-codex-row">
           {isCodexSession && wsClient && (
             <CodexResetCredits wsClient={wsClient} connected={connected !== false} />
           )}
-          {showWeeklyAuthPrompt && (
-            <button
-              type="button"
-              class="session-usage-codex-line session-usage-weekly-authorize"
-              title={t('session.weekly_quota_authorize_hint')}
-              onClick={() => {
-                // Explicit consent before reading the local Claude token — not
-                // a one-click toggle.
-                if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
-                  void weeklyQuotaPref.save(true);
-                }
-              }}
-            >
-              {t('session.weekly_quota_authorize')}
-            </button>
+          {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
+            <div class="session-usage-codex-quota">
+              {providerQuotaLines.map((line) => (
+                <div class="session-usage-codex-line">{line}</div>
+              ))}
+              {showWeeklyAuthPrompt && (
+                <button
+                  type="button"
+                  class="session-usage-codex-line session-usage-weekly-authorize"
+                  title={t('session.weekly_quota_authorize_hint')}
+                  onClick={() => {
+                    // Explicit consent before reading the local Claude token — not
+                    // a one-click toggle.
+                    if (typeof window !== 'undefined' && window.confirm(t('session.weekly_quota_confirm'))) {
+                      void weeklyQuotaPref.save(true);
+                    }
+                  }}
+                >
+                  {t('session.weekly_quota_authorize')}
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}

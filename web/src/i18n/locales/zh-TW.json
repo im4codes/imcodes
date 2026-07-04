@@ -2505,6 +2505,7 @@
     "title": "Codex 額度重置券",
     "button": "重置券",
     "loading": "載入中…",
+    "refresh": "重新整理",
     "none": "沒有重置券",
     "item_default_title": "額度重置",
     "expires": "{{date}} 到期",

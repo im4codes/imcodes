@@ -15,6 +15,9 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 
+const PANEL_WIDTH = 260;
+const PANEL_MARGIN = 8;
+
 function newRequestId(): string {
   const rand = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Math.random()}`;
   return `codex-credits-${rand}`;
@@ -45,8 +48,25 @@ export function CodexResetCredits({ wsClient, connected }: { wsClient: WsClient 
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [consuming, setConsuming] = useState(false);
   const [outcome, setOutcome] = useState<CodexConsumeOutcome | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; maxWidth: number; maxHeight: number } | null>(null);
   const listReqRef = useRef<string>('');
   const consumeReqRef = useRef<string>('');
+
+  const updatePanelPosition = useCallback(() => {
+    if (typeof window === 'undefined') return;
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const maxWidth = Math.max(120, window.innerWidth - PANEL_MARGIN * 2);
+    const width = Math.min(PANEL_WIDTH, maxWidth);
+    const desiredLeft = rect.left + (rect.width / 2) - (width / 2);
+    const maxLeft = Math.max(PANEL_MARGIN, window.innerWidth - width - PANEL_MARGIN);
+    const left = Math.min(Math.max(PANEL_MARGIN, desiredLeft), maxLeft);
+    const bottom = Math.max(PANEL_MARGIN, window.innerHeight - rect.top + 4);
+    const maxHeight = Math.max(120, rect.top - PANEL_MARGIN - 4);
+    setPanelPosition({ left, bottom, maxWidth: width, maxHeight });
+  }, []);
 
   const requestList = useCallback(() => {
     if (!wsClient || !connected) { setError('offline'); return; }
@@ -90,10 +110,29 @@ export function CodexResetCredits({ wsClient, connected }: { wsClient: WsClient 
   const toggle = useCallback(() => {
     setOpen((prev) => {
       const next = !prev;
-      if (next) { setOutcome(null); setConfirmId(null); requestList(); }
+      if (next) {
+        setOutcome(null);
+        setConfirmId(null);
+        updatePanelPosition();
+        requestList();
+      }
       return next;
     });
-  }, [requestList]);
+  }, [requestList, updatePanelPosition]);
+
+  useEffect(() => {
+    if (!open) {
+      setPanelPosition(null);
+      return;
+    }
+    updatePanelPosition();
+    window.addEventListener('resize', updatePanelPosition);
+    window.addEventListener('scroll', updatePanelPosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePanelPosition);
+      window.removeEventListener('scroll', updatePanelPosition, true);
+    };
+  }, [open, updatePanelPosition]);
 
   const doConsume = useCallback((creditId: string) => {
     if (!wsClient || !connected) { setError('offline'); return; }
@@ -110,16 +149,13 @@ export function CodexResetCredits({ wsClient, connected }: { wsClient: WsClient 
     : null;
 
   return (
-    <div class="codex-credits" style={{ position: 'relative', display: 'inline-block' }}>
+    <div class="codex-credits">
       <button
+        ref={triggerRef}
         type="button"
         class="codex-credits-trigger"
         onClick={toggle}
         title={t('codex_credits.title')}
-        style={{
-          background: 'none', border: 'none', cursor: 'pointer', color: '#a78bfa',
-          fontSize: 10, padding: '0 2px',
-        }}
       >
         🎟 {t('codex_credits.button')}
         {availableCount != null ? ` (${availableCount})` : ''}
@@ -128,12 +164,25 @@ export function CodexResetCredits({ wsClient, connected }: { wsClient: WsClient 
         <div
           class="codex-credits-panel"
           style={{
-            position: 'absolute', bottom: '100%', left: 0, marginBottom: 4, zIndex: 50,
-            minWidth: 240, maxWidth: 320, background: '#1f2937', border: '1px solid #374151',
-            borderRadius: 6, padding: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.4)', fontSize: 11,
+            left: panelPosition ? `${panelPosition.left}px` : `${PANEL_MARGIN}px`,
+            bottom: panelPosition ? `${panelPosition.bottom}px` : `${PANEL_MARGIN}px`,
+            maxWidth: panelPosition ? `${panelPosition.maxWidth}px` : `calc(100vw - ${PANEL_MARGIN * 2}px)`,
+            maxHeight: panelPosition ? `${panelPosition.maxHeight}px` : `calc(100vh - ${PANEL_MARGIN * 2}px)`,
           }}
         >
-          <div style={{ fontWeight: 600, marginBottom: 6, color: '#e5e7eb' }}>{t('codex_credits.title')}</div>
+          <div class="codex-credits-panel-header">
+            <div class="codex-credits-panel-title">{t('codex_credits.title')}</div>
+            <button
+              type="button"
+              class="codex-credits-refresh"
+              onClick={requestList}
+              disabled={loading || consuming || !connected}
+              title={t('codex_credits.refresh')}
+              aria-label={t('codex_credits.refresh')}
+            >
+              ↻
+            </button>
+          </div>
           {loading && <div style={{ color: '#9ca3af' }}>{t('codex_credits.loading')}</div>}
           {!loading && error && <div style={{ color: '#f87171' }}>{t(`codex_credits.error_${error}`, { defaultValue: t('codex_credits.error_generic') })}</div>}
           {!loading && !error && credits && credits.length === 0 && (
