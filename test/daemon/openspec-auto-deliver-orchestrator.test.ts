@@ -1415,7 +1415,11 @@ exec "${realGit}" "$@"
     }
 
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'needs_human',
+      2500,
+    );
     expect(terminal?.projection.status).toBe('needs_human');
     expect(String((terminal?.projection as { terminalReason?: string })?.terminalReason ?? ''))
       .toContain('implementation_marker_reminders_exhausted');
@@ -2293,6 +2297,7 @@ exec "${realGit}" "$@"
     );
     expect(await writeLatestImplementationMarker()).toBe(true);
     transportSendMock.mockClear();
+    serverLinkMock.send.mockClear();
     getTransportRuntimeMock.mockImplementation(() => ({
       providerSessionId: null,
       send: transportSendMock,
