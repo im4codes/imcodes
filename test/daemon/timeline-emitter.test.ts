@@ -338,6 +338,23 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     expect(received.filter((p) => p.state === 'running')).toHaveLength(1);
   });
 
+  it('T2e: visible activity after idle allows the following idle to reach the UI', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => {
+      if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>);
+    });
+
+    emitter.emit('session-auto-tail', 'session.state', { state: 'idle' });
+    emitter.emit('session-auto-tail', 'assistant.text', { text: 'auto-continue tail', streaming: false });
+    emitter.emit('session-auto-tail', 'session.state', { state: 'idle' });
+    emitter.emit('session-tool-tail', 'session.state', { state: 'idle' });
+    emitter.emit('session-tool-tail', 'tool.result', { output: 'done' });
+    emitter.emit('session-tool-tail', 'session.state', { state: 'idle' });
+
+    expect(received.filter((p) => p.state === 'idle')).toHaveLength(4);
+  });
+
   it('T2b: any session.state event carrying an `error` field bypasses dedup so failure updates always reach the UI', () => {
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
