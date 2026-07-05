@@ -131,6 +131,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.approval.allow') return 'Allow';
       if (key === 'session.approval.deny') return 'Deny';
       if (key === 'session.approval.tool') return `${String(opts?.tool ?? 'tool')} wants approval`;
+      if (key === 'session.approval.scope') return `${String(opts?.provider ?? 'provider')} generation ${String(opts?.generation ?? '?')} tool ${String(opts?.toolUseId ?? 'tool')}`;
+      if (key === 'session.approval.input') return `Input: ${String(opts?.input ?? '')}`;
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
       const parts = key.split('.');
@@ -4349,6 +4351,10 @@ afterEach(() => {
           requestId: 'approval-1',
           description: 'Allow file write',
           tool: 'shell',
+          provider: 'qoder-sdk',
+          providerGeneration: 3,
+          providerToolUseId: 'tool-approve',
+          inputPreview: '{"command":"pwd"}',
         });
       }
     });
@@ -4356,6 +4362,9 @@ afterEach(() => {
     await waitFor(() => {
       expect(screen.getByText('Approval required')).toBeDefined();
       expect(screen.getByText('shell wants approval')).toBeDefined();
+      expect(screen.getByText('Allow file write')).toBeDefined();
+      expect(screen.getByText('qoder-sdk generation 3 tool tool-approve')).toBeDefined();
+      expect(screen.getByText('Input: {"command":"pwd"}')).toBeDefined();
     });
 
     fireEvent.click(screen.getByRole('button', { name: /^Allow$/ }));

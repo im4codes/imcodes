@@ -196,6 +196,14 @@ export type TransportEvent =
       description: string;
       /** Tool name that triggered the approval request, if available. */
       tool?: string;
+      /** Provider that originated this approval request, if provider-scoped. */
+      provider?: string;
+      /** Provider turn generation that originated this request. */
+      providerGeneration?: number;
+      /** Provider-native tool use identifier used to validate approval routing. */
+      providerToolUseId?: string;
+      /** Bounded, redacted preview of provider-native tool input. */
+      inputPreview?: string;
     }
   | {
       /** Browser-originated approval response broadcast back to transport subscribers. */

@@ -218,6 +218,7 @@ interface AutoDeliverRun {
     markerPath: string;
     spec: P2pExecutionMarkerSpec;
     retryCount: number;
+    createdAt: number;
     /** Unchecked-task count at the previous reminder; lets the reminder loop
      *  reset retryCount when the implementation makes progress between idles. */
     lastUncheckedCount?: number;
@@ -324,6 +325,8 @@ const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === '
 // this interval so a fast-flapping idle cannot spam the agent.
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS = process.env.NODE_ENV === 'test' ? 40 : 30_000;
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS = process.env.NODE_ENV === 'test' ? 20 : 1_000;
+const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS = process.env.NODE_ENV === 'test' ? 250 : 5_000;
+const OPENSPEC_AUTO_DELIVER_QUEUED_PROMPT_STALE_MS = process.env.NODE_ENV === 'test' ? 40 : 20_000;
 const OPENSPEC_AUTO_DELIVER_AWAITING_DISPATCH_IDLE_RECHECK_MS = process.env.NODE_ENV === 'test' ? 40 : 250;
 const OPENSPEC_AUTO_DELIVER_PROMPT_IDLE_ADVANCE_POLL_MS = process.env.NODE_ENV === 'test' ? 40 : 1_000;
 const OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS = process.env.NODE_ENV === 'test' ? 50 : 1_000;
@@ -547,7 +550,7 @@ function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
     if (!current.activeAcceptanceAudit || !current.activeCommandId || current.status !== current.activeAcceptanceAudit.stage) return;
-    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+    void advanceAfterPostRepairAcceptanceAuditIdle(current, { allowResultFileRepairPrompt: false }).catch((error) => {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_result_file_poll_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
@@ -824,7 +827,11 @@ function isTransportRuntimeBusyForIdleAdvance(run: AutoDeliverRun): boolean {
     || status === 'permission';
   const busy = inProgress || sending || activeDispatchCount > 0 || pendingCount > 0;
   if (busy && pendingCount > 0 && (inProgress || sending || activeDispatchCount > 0)) {
-    snapshot.cancelStaleActiveTurnWithPending?.({ reason, nowMs });
+    snapshot.cancelStaleActiveTurnWithPending?.({
+      reason,
+      nowMs,
+      staleMs: OPENSPEC_AUTO_DELIVER_QUEUED_PROMPT_STALE_MS,
+    });
   }
   return busy;
 }
@@ -975,6 +982,7 @@ async function buildImplementationMarkerContract(
       nonce: randomUUID(),
     },
     retryCount: 0,
+    createdAt: Date.now(),
   };
 }
 
@@ -1475,7 +1483,8 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
     await handleFailedImplementationMarker(run, markerState.reason);
     return;
   }
-  if (!isTransportRuntimeBusyForIdleAdvance(run)) {
+  const markerAgeMs = Date.now() - run.activeImplementationMarker.createdAt;
+  if (!isTransportRuntimeBusyForIdleAdvance(run) || markerAgeMs >= OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS) {
     const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
     if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
       send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
@@ -3432,13 +3441,21 @@ async function advanceAfterSpecRepairIdle(run: AutoDeliverRun): Promise<void> {
   await dispatchPostRepairAcceptanceAuditPrompt(run);
 }
 
-async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): Promise<void> {
+async function advanceAfterPostRepairAcceptanceAuditIdle(
+  run: AutoDeliverRun,
+  options: { allowResultFileRepairPrompt?: boolean } = {},
+): Promise<void> {
   if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   if (enforceElapsedLimit(run)) return;
+  const allowResultFileRepairPrompt = options.allowResultFileRepairPrompt ?? true;
   const active = run.activeAcceptanceAudit;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
   const verdict = await consumeAuditResultFile(run, metadata, { requireRepairCompletion: true });
   if (!verdict) {
+    if (!allowResultFileRepairPrompt) {
+      schedulePostRepairAcceptanceResultFilePoll(run);
+      return;
+    }
     if (isTransportRuntimeBusyForIdleAdvance(run)) {
       schedulePostRepairAcceptanceResultFilePoll(run);
       return;

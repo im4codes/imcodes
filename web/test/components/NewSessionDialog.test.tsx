@@ -105,9 +105,10 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 8)).toEqual([
+    expect(options.slice(0, 9)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
+      'qoder-sdk',
       'copilot-sdk',
       'cursor-headless',
       'gemini-sdk',
@@ -115,7 +116,7 @@ describe('NewSessionDialog', () => {
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(8)).toEqual([
+    expect(options.slice(9)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -355,6 +356,29 @@ describe('NewSessionDialog', () => {
     fireEvent.input(select, { target: { value: select.value } });
 
     await waitFor(() => expect(screen.getByText('agent_flavor_cli')).toBeDefined());
+  });
+
+  it('selects qoder-sdk without showing proof-gated model or thinking controls', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'qoder-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/qoder-app' } });
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(select, { target: { value: 'qoder-sdk' } });
+
+    await waitFor(() => expect(screen.getByText('agent_flavor_sdk')).toBeDefined());
+    expect(screen.queryByText('thinking')).toBeNull();
+    expect(screen.queryByText('model')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.not.objectContaining({
+      thinking: expect.anything(),
+      requestedModel: expect.anything(),
+    }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'qoder-sdk',
+    }));
   });
 
   it('shows the qwen provider-specific hint when qwen is selected', async () => {

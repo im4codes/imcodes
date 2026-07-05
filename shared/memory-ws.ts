@@ -71,6 +71,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
   KIMI_SDK: 'kimi-sdk',
   COPILOT_SDK: 'copilot-sdk',
   CODEX_SDK: 'codex-sdk',
+  QODER_SDK: 'qoder-sdk',
   CURSOR_HEADLESS: 'cursor-headless',
   QWEN: 'qwen',
 } as const;
@@ -81,6 +82,7 @@ export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
   MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
   MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
+  MEMORY_MCP_PROVIDER_ID.QODER_SDK,
   MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
   MEMORY_MCP_PROVIDER_ID.QWEN,
 ] as const;
@@ -132,6 +134,8 @@ export const MEMORY_MCP_DEGRADED_REASON = {
   LOCAL_CONTEXT_STORE_UNAVAILABLE: 'local_context_store_unavailable',
   SEMANTIC_EMBEDDING_UNAVAILABLE: 'embedding_unavailable',
   STATUS_NOT_REPORTED: 'status_not_reported',
+  QODER_IDENTITY_MISSING: 'qoder_identity_missing',
+  QODER_MCP_STATUS_UNPROVEN: 'qoder_mcp_status_unproven',
 } as const;
 
 export type MemoryMcpDegradedReason =

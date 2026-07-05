@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -89,6 +89,28 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-1'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
+  const MockQoderSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'qoder-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: false,
+      multiTurn: true,
+      attachments: false,
+      reasoningEffort: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-qoder'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
   const MockCursorHeadlessProvider = vi.fn().mockImplementation(() => ({
     id: 'cursor-headless',
     connectionMode: 'local-sdk',
@@ -153,7 +175,7 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-kimi'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider };
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -170,6 +192,10 @@ vi.mock('../../src/agent/providers/claude-code-sdk.js', () => ({
 
 vi.mock('../../src/agent/providers/codex-sdk.js', () => ({
   CodexSdkProvider: MockCodexSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/qoder-sdk.js', () => ({
+  QoderSdkProvider: MockQoderSdkProvider,
 }));
 
 vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
@@ -248,6 +274,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('codex-sdk');
   });
 
+  it('returns qoder-sdk after connectProvider()', async () => {
+    await connectProvider('qoder-sdk', CONFIG);
+    const provider = getProvider('qoder-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('qoder-sdk');
+  });
+
   it('returns cursor-headless after connectProvider()', async () => {
     await connectProvider('cursor-headless', CONFIG);
     const provider = getProvider('cursor-headless');
@@ -297,6 +330,12 @@ describe('connectProvider', () => {
   it('instantiates CodexSdkProvider and calls connect()', async () => {
     await connectProvider('codex-sdk', CONFIG);
     expect(MockCodexSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates QoderSdkProvider and calls connect()', async () => {
+    await connectProvider('qoder-sdk', CONFIG);
+    expect(MockQoderSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

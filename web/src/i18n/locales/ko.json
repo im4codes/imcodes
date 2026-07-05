@@ -519,6 +519,7 @@
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
       "codex_sdk": "Codex SDK",
+      "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
@@ -652,7 +653,9 @@
       "pending": "승인이 필요합니다",
       "allow": "허용",
       "deny": "거부",
-      "tool": "{{tool}} 승인 필요"
+      "tool": "{{tool}} 승인 필요",
+      "scope": "{{provider}} 세대 {{generation}} · 도구 {{toolUseId}}",
+      "input": "입력: {{input}}"
     },
     "workingDirPlaceholder": "~/projects/myapp",
     "execution": {
@@ -2197,7 +2200,7 @@
       "mcpSummaryLine4": "Cron tools는 reminders, recurring checks, delegated reviews, follow-ups용 scheduled structured sends를 생성, 조회, 업데이트, 삭제할 수 있습니다.",
       "mcpSummaryLine5": "이 화면은 provider readiness, degraded setup reasons, feature gates, recent redacted tool calls를 보여줍니다. MCP report가 없으면 tools가 healthy하다고 가정하지 않고 명확히 표시합니다.",
       "mcpProviderStatusTitle": "Provider MCP 상태",
-      "mcpProviderStatusDescription": "11개 도구 stdio MCP MVP를 위해 6개의 관리형 provider를 추적합니다.",
+      "mcpProviderStatusDescription": "11개 도구 stdio MCP MVP를 위해 8개의 관리형 provider를 추적합니다.",
       "mcpToolGatesTitle": "도구군 게이트",
       "mcpToolGatesDescription": "Memory, Send, Cron 도구는 기본 기능 게이트와 MCP kill-switch를 모두 통과해야 합니다.",
       "mcpRecentCallsTitle": "최근 마스킹된 MCP 호출",
@@ -2220,6 +2223,7 @@
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
+      "mcpProviderQoderSdk": "Qoder SDK",
       "mcpProviderCursorHeadless": "Cursor headless",
       "mcpProviderQwen": "Qwen",
       "mcpProviderUnknown": "{{provider}}",

@@ -695,6 +695,65 @@ exec "${realGit}" "$@"
     expect(String(sendDuringIdleMock.mock.calls[0]?.[0] ?? '')).toContain('Implementation prompt: 1/');
   });
 
+  it('queues a marker reminder and stale recovery when implementation stays busy without writing the marker', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    let queuedReminder = false;
+    const cancelStaleActiveTurnWithPending = vi.fn(() => false);
+    const sendMock = vi.fn((text: string, commandId?: string) => {
+      if (text.includes('OpenSpec Auto Deliver implementation is not complete yet')) {
+        queuedReminder = true;
+        return 'queued' as const;
+      }
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      send: sendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: queuedReminder ? 1 : 0,
+        activeDispatchCount: 1,
+      }),
+      get pendingEntries() {
+        return queuedReminder
+          ? [{ clientMessageId: 'queued-marker', text: 'marker reminder' }]
+          : [];
+      },
+      cancelStaleActiveTurnWithPending,
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-busy-missing-marker-requeues',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    const reminderStart = Date.now();
+    while (sendMock.mock.calls.length < 2 && Date.now() - reminderStart < 2500) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(String(sendMock.mock.calls[1]?.[0] ?? '')).toContain('Reason: implementation_marker_missing');
+
+    const start = Date.now();
+    while (cancelStaleActiveTurnWithPending.mock.calls.length === 0 && Date.now() - start < 1000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(cancelStaleActiveTurnWithPending).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'openspec-auto-deliver-implementation_task_loop',
+      staleMs: 40,
+    }));
+  });
+
   it('keeps queued Auto Deliver prompts out of the committed timeline until transport drain', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     let queuedRuntime: {
@@ -1270,7 +1329,11 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      2500,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -1513,7 +1576,11 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      2500,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.moduleScores).toHaveLength(OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.length);
     expect(terminal?.projection.auditBeforeRepair).toBeUndefined();
@@ -2625,7 +2692,11 @@ exec "${realGit}" "$@"
       }),
     }));
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      2500,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });

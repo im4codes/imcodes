@@ -1019,6 +1019,7 @@ export async function relaunchSessionWithSettings(
     // local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
+    && targetAgentType !== 'qoder-sdk'
     && targetAgentType !== 'copilot-sdk'
     && targetAgentType !== 'cursor-headless'
     && targetAgentType !== 'kimi-sdk'
@@ -2071,9 +2072,11 @@ export async function restoreTransportSessions(
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const freshAfterInterruptedCodexRestore = shouldStartFreshCodexThreadAfterInterruptedRestore(s);
-      const freshOnRestore = freshAfterCancel || freshAfterInterruptedCodexRestore;
+      const freshQoderRestore = s.providerId === 'qoder-sdk';
+      const freshOnRestore = freshAfterCancel || freshAfterInterruptedCodexRestore || freshQoderRestore;
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
+        || s.providerId === 'qoder-sdk'
         || s.providerId === 'cursor-headless'
         || s.providerId === 'copilot-sdk'
         || s.providerId === 'kimi-sdk';
@@ -2093,6 +2096,13 @@ export async function restoreTransportSessions(
           previousCodexSessionId: s.codexSessionId,
           previousProviderSessionId: s.providerSessionId,
         }, 'Codex SDK restore found interrupted running session; starting fresh thread');
+      }
+      if (freshQoderRestore) {
+        logger.info({
+          session: s.name,
+          providerId: s.providerId,
+          previousProviderSessionId: s.providerSessionId,
+        }, 'Qoder SDK durable resume is unproven; restoring with a fresh provider route');
       }
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
@@ -2185,6 +2195,9 @@ export async function restoreTransportSessions(
         updatedAt: Date.now(),
         ...(freshAfterInterruptedCodexRestore
           ? { codexSessionId: undefined, startupMemoryInjected: undefined, recentInjectionHistory: undefined }
+          : {}),
+        ...(freshQoderRestore
+          ? { providerResumeId: undefined }
           : {}),
         ...((freshOnRestore || s.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
@@ -2499,6 +2512,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
       existing,
     );
+  } else if (agentType === 'qoder-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    effectiveSkipCreate = false;
+    transportResumeId = undefined;
   } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;

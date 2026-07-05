@@ -35,6 +35,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'qoder-sdk',
+    icon: 'Q',
+    fallbackLabel: 'Qoder SDK',
+    labelKey: 'session.agentType.qoder_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'copilot-sdk',
     icon: '🐙',
     fallbackLabel: 'Copilot',

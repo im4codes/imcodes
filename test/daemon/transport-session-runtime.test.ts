@@ -1832,10 +1832,22 @@ describe('TransportSessionRuntime', () => {
       id: 'approval-1',
       description: 'Allow file write',
       tool: 'shell',
+      provider: 'qoder-sdk',
+      providerGeneration: 7,
+      providerToolUseId: 'tool-approval',
+      inputPreview: '{"command":"pwd"}',
     });
 
     expect(approvalEvents).toEqual([
-      { id: 'approval-1', description: 'Allow file write', tool: 'shell' },
+      {
+        id: 'approval-1',
+        description: 'Allow file write',
+        tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 7,
+        providerToolUseId: 'tool-approval',
+        inputPreview: '{"command":"pwd"}',
+      },
     ]);
   });
 

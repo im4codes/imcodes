@@ -118,6 +118,7 @@ function labelForBackend(t: (key: string, params?: Record<string, unknown>) => s
   return t({
     'claude-code-sdk': 'session.agentType.claude_code_sdk',
     'codex-sdk': 'session.agentType.codex_sdk',
+    'qoder-sdk': 'session.agentType.qoder_sdk',
     qwen: 'session.agentType.qwen',
     openclaw: 'session.agentType.openclaw',
     'copilot-sdk': 'session.agentType.copilot_sdk',
@@ -773,6 +774,7 @@ export function SessionSettingsDialog({
       case 'claude-code-sdk': return t('session.agentType.claude_code_sdk');
       case 'claude-code': return t('session.agentType.claude_code_cli');
       case 'codex-sdk': return t('session.agentType.codex_sdk');
+      case 'qoder-sdk': return t('session.agentType.qoder_sdk');
       case 'codex': return t('session.agentType.codex_cli');
       case 'qwen': return t('session.agentType.qwen');
       case 'openclaw': return t('session.agentType.openclaw');

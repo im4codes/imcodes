@@ -1656,6 +1656,10 @@ describe('transport-relay (timeline-emitter based)', () => {
         id: 'approval-1',
         description: 'Allow file write',
         tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 2,
+        providerToolUseId: 'tool-1',
+        inputPreview: '{"command":"pwd"}',
       });
       await Promise.resolve();
 
@@ -1665,10 +1669,15 @@ describe('transport-relay (timeline-emitter based)', () => {
         requestId: 'approval-1',
         description: 'Allow file write',
         tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 2,
+        providerToolUseId: 'tool-1',
+        inputPreview: '{"command":"pwd"}',
       }));
       expect(appendMock).toHaveBeenCalledWith('sess-approval', expect.objectContaining({
         type: TRANSPORT_EVENT.CHAT_APPROVAL,
         requestId: 'approval-1',
+        providerToolUseId: 'tool-1',
       }));
     });
   });

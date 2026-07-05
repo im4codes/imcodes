@@ -19,6 +19,10 @@ describe('isTransportAgent()', () => {
     expect(isTransportAgent('qwen')).toBe(true);
   });
 
+  it('returns true for qoder-sdk', () => {
+    expect(isTransportAgent('qoder-sdk')).toBe(true);
+  });
+
   it('returns false for claude-code', () => {
     expect(isTransportAgent('claude-code')).toBe(false);
   });
@@ -87,6 +91,10 @@ describe('TRANSPORT_AGENTS set', () => {
 
   it('contains qwen', () => {
     expect(TRANSPORT_AGENTS.has('qwen')).toBe(true);
+  });
+
+  it('contains qoder-sdk', () => {
+    expect(TRANSPORT_AGENTS.has('qoder-sdk')).toBe(true);
   });
 
   it('has at least 1 entry', () => {
@@ -162,5 +170,10 @@ describe('detectStatus() with transport agentType', () => {
   it('does not throw for any qwen input', () => {
     expect(() => detectStatus(['partial json'], 'qwen' as AgentType)).not.toThrow();
     expect(() => detectStatus(['{"type":"assistant"}'], 'qwen' as AgentType)).not.toThrow();
+  });
+
+  it('does not throw for any qoder-sdk input', () => {
+    expect(() => detectStatus(['partial json'], 'qoder-sdk' as AgentType)).not.toThrow();
+    expect(() => detectStatus(['{"type":"assistant"}'], 'qoder-sdk' as AgentType)).not.toThrow();
   });
 });

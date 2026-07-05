@@ -2,6 +2,7 @@ export const SESSION_AGENT_TYPES = [
   'claude-code-sdk',
   'claude-code',
   'codex-sdk',
+  'qoder-sdk',
   'codex',
   'copilot-sdk',
   'cursor-headless',
@@ -22,6 +23,7 @@ export const CODEX_FAMILY = ['codex-sdk', 'codex'] as const;
 export const TRANSPORT_SESSION_AGENT_TYPES = [
   'claude-code-sdk',
   'codex-sdk',
+  'qoder-sdk',
   'copilot-sdk',
   'cursor-headless',
   'gemini-sdk',

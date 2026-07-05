@@ -519,6 +519,7 @@
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
       "codex_sdk": "Codex SDK",
+      "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
@@ -652,7 +653,9 @@
       "pending": "需要核准",
       "allow": "允許",
       "deny": "拒絕",
-      "tool": "{{tool}} 需要核准"
+      "tool": "{{tool}} 需要核准",
+      "scope": "{{provider}} 第 {{generation}} 輪 · 工具 {{toolUseId}}",
+      "input": "輸入：{{input}}"
     },
     "workingDirPlaceholder": "~/projects/myapp",
     "execution": {
@@ -2199,7 +2202,7 @@
       "mcpSummaryLine4": "Cron 工具可建立、列出、更新和刪除定時結構化發送任務，用於提醒、週期檢查、委託 review 和 follow-up。",
       "mcpSummaryLine5": "此視圖顯示 provider 就緒狀態、降級原因、功能閘門和最近脫敏工具呼叫；如果尚無 MCP 狀態回報，會明確顯示未回報，而不會假設工具健康。",
       "mcpProviderStatusTitle": "Provider MCP 狀態",
-      "mcpProviderStatusDescription": "十一工具 stdio MCP MVP 會追蹤六個託管 provider。",
+      "mcpProviderStatusDescription": "十一工具 stdio MCP MVP 會追蹤八個託管 provider。",
       "mcpToolGatesTitle": "工具族閘門",
       "mcpToolGatesDescription": "記憶、Send 和 Cron 工具必須同時通過底層功能閘門和 MCP kill-switch。",
       "mcpRecentCallsTitle": "最近脫敏 MCP 呼叫",
@@ -2222,6 +2225,7 @@
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
+      "mcpProviderQoderSdk": "Qoder SDK",
       "mcpProviderCursorHeadless": "Cursor headless",
       "mcpProviderQwen": "Qwen",
       "mcpProviderUnknown": "{{provider}}",

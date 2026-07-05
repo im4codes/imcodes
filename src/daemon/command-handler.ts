@@ -3878,6 +3878,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
+      if (record?.agentType === 'qoder-sdk' && modelMatch) {
+        const nextModel = modelMatch[1];
+        const errMsg = `Qoder model switching is proof-gated in IM.codes v1: ${nextModel}`;
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: `⚠️ ${errMsg}`,
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+        return;
+      }
       if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
@@ -3902,6 +3915,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        return;
+      }
+      if (record?.agentType === 'qoder-sdk' && effortMatch) {
+        const nextEffort = effortMatch[1];
+        const errMsg = `Qoder thinking/effort controls are proof-gated in IM.codes v1: ${nextEffort}`;
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: `⚠️ ${errMsg}`,
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
         return;
       }
       if (supportsEffort(record?.agentType) && effortMatch) {

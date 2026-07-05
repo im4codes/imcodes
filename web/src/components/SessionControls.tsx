@@ -673,6 +673,10 @@ type PendingTransportApproval = {
   requestId: string;
   description: string;
   tool?: string;
+  provider?: string;
+  providerGeneration?: number;
+  providerToolUseId?: string;
+  inputPreview?: string;
 };
 
 /** Compute the launch-time capability gate from the live WS client + saved
@@ -1179,6 +1183,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           requestId: msg.requestId,
           description: msg.description,
           ...(msg.tool ? { tool: msg.tool } : {}),
+          ...(msg.provider ? { provider: msg.provider } : {}),
+          ...(typeof msg.providerGeneration === 'number' ? { providerGeneration: msg.providerGeneration } : {}),
+          ...(msg.providerToolUseId ? { providerToolUseId: msg.providerToolUseId } : {}),
+          ...(msg.inputPreview ? { inputPreview: msg.inputPreview } : {}),
         });
         return;
       }
@@ -4355,6 +4363,25 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 ? t('session.approval.tool', { tool: pendingTransportApproval.tool })
                 : pendingTransportApproval.description}
             </div>
+            {pendingTransportApproval.tool && pendingTransportApproval.description && (
+              <div style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2 }}>
+                {pendingTransportApproval.description}
+              </div>
+            )}
+            {pendingTransportApproval.provider && typeof pendingTransportApproval.providerGeneration === 'number' && pendingTransportApproval.providerToolUseId && (
+              <div style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2 }}>
+                {t('session.approval.scope', {
+                  provider: pendingTransportApproval.provider,
+                  generation: pendingTransportApproval.providerGeneration,
+                  toolUseId: pendingTransportApproval.providerToolUseId,
+                })}
+              </div>
+            )}
+            {pendingTransportApproval.inputPreview && (
+              <div style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                {t('session.approval.input', { input: pendingTransportApproval.inputPreview })}
+              </div>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
             <button

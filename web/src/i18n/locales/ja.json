@@ -519,6 +519,7 @@
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
       "codex_sdk": "Codex SDK",
+      "qoder_sdk": "Qoder SDK",
       "claude_code_cli": "Claude Code CLI",
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
@@ -652,7 +653,9 @@
       "pending": "承認が必要",
       "allow": "許可",
       "deny": "拒否",
-      "tool": "{{tool}} の承認が必要"
+      "tool": "{{tool}} の承認が必要",
+      "scope": "{{provider}} 世代 {{generation}} · ツール {{toolUseId}}",
+      "input": "入力: {{input}}"
     },
     "workingDirPlaceholder": "~/projects/myapp",
     "execution": {
@@ -2197,7 +2200,7 @@
       "mcpSummaryLine4": "Cron tools は reminders、recurring checks、delegated reviews、follow-ups 用の scheduled structured sends を作成、一覧、更新、削除できます。",
       "mcpSummaryLine5": "このビューは provider readiness、degraded setup reasons、feature gates、recent redacted tool calls を表示します。MCP report が未着なら、tools が healthy だと仮定せず明示します。",
       "mcpProviderStatusTitle": "プロバイダー MCP 状態",
-      "mcpProviderStatusDescription": "11 ツール stdio MCP MVP 用に 6 つの管理対象プロバイダーを追跡します。",
+      "mcpProviderStatusDescription": "11 ツール stdio MCP MVP 用に 8 つの管理対象プロバイダーを追跡します。",
       "mcpToolGatesTitle": "ツールファミリーのゲート",
       "mcpToolGatesDescription": "Memory、Send、Cron は基礎機能ゲートと MCP kill-switch の両方を通過する必要があります。",
       "mcpRecentCallsTitle": "最近の秘匿済み MCP 呼び出し",
@@ -2220,6 +2223,7 @@
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
+      "mcpProviderQoderSdk": "Qoder SDK",
       "mcpProviderCursorHeadless": "Cursor headless",
       "mcpProviderQwen": "Qwen",
       "mcpProviderUnknown": "{{provider}}",

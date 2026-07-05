@@ -830,6 +830,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       requestId: request.id,
       description: request.description,
       ...(request.tool ? { tool: request.tool } : {}),
+      ...(request.provider ? { provider: request.provider } : {}),
+      ...(typeof request.providerGeneration === 'number' ? { providerGeneration: request.providerGeneration } : {}),
+      ...(request.providerToolUseId ? { providerToolUseId: request.providerToolUseId } : {}),
+      ...(request.inputPreview ? { inputPreview: request.inputPreview } : {}),
     } as const;
     sendToServer?.(payload);
     void appendTransportEvent(sessionName, payload);

@@ -74,6 +74,7 @@ type AgentType =
   | "claude-code-sdk"
   | "codex"
   | "codex-sdk"
+  | "qoder-sdk"
   | "copilot-sdk"
   | "cursor-headless"
   | "opencode"
@@ -486,7 +487,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "kimi-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "kimi-sdk"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
