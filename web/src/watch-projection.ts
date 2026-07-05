@@ -632,13 +632,17 @@ export class WatchProjectionStore {
       if (state !== 'idle' && eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
       if (state === 'idle') {
         const expectedGeneration = this.activityGenerationBySession.get(event.sessionId);
-        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)) {
+        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)
+          || isAuthoritativeCleanIdlePayload(event.payload)) {
           this.openToolCountBySession.delete(event.sessionId);
           this.openToolKeysBySession.delete(event.sessionId);
           if (eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
         } else {
           this.openToolCountBySession.delete(event.sessionId);
         }
+      }
+      if (state) {
+        changed = this.updateSessionState(event.sessionId, state) || changed;
       }
     }
     if (isRunningTimelineEvent(event)) {

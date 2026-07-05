@@ -198,6 +198,12 @@ function resolveBackfillTimeoutMs(opts?: { phase?: 'bootstrap' | 'refresh'; visi
   if (opts?.visible) return RECOVERY_BACKFILL_TIMEOUT_MS;
   return SILENT_BACKFILL_TIMEOUT_MS;
 }
+
+function isTerminalTailIdleReconcileCandidate(event: TimelineEvent): boolean {
+  if (event.type === 'tool.result') return true;
+  return event.type === 'assistant.text' && event.payload?.streaming !== true;
+}
+
 /** Foreground staleness watchdog. A session the user is looking at can silently
  *  miss a CONTENT `timeline.event` while the pipe still looks alive (no error,
  *  no reconnect, no focus tick) — the "前台停留弱网不自动同步" complaint. When no
@@ -402,6 +408,7 @@ const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // that only ever produced streaming events (no final non-streaming one) durable
 // in IDB, so a later page refresh restores it — not only the localStorage mat.
 const STREAMING_IDLE_PERSIST_MS = 2000;
+const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
 // Snapshot tail size matches MAX_MEMORY_EVENTS (300) so the synchronous
 // first-paint seed approaches the same coverage as the IDB-restored cache.
 // The previous 50-event cap meant 5/6 of a 300-event session disappeared
@@ -2933,6 +2940,39 @@ export function useTimeline(
   // mount effect to re-run on every render.
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
+
+  const terminalTailIdleReconcileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const terminalTailIdleReconcileKeyRef = useRef<string | null>(null);
+  const clearTerminalTailIdleReconcile = useCallback(() => {
+    if (terminalTailIdleReconcileTimerRef.current) {
+      clearTimeout(terminalTailIdleReconcileTimerRef.current);
+      terminalTailIdleReconcileTimerRef.current = null;
+    }
+    terminalTailIdleReconcileKeyRef.current = null;
+  }, []);
+  const scheduleTerminalTailIdleReconcile = useCallback((terminalEvent: TimelineEvent) => {
+    const key = cacheKeyRef.current;
+    if (!key) return;
+    clearTerminalTailIdleReconcile();
+    terminalTailIdleReconcileKeyRef.current = key;
+    terminalTailIdleReconcileTimerRef.current = setTimeout(() => {
+      terminalTailIdleReconcileTimerRef.current = null;
+      if (terminalTailIdleReconcileKeyRef.current !== key || cacheKeyRef.current !== key) return;
+      terminalTailIdleReconcileKeyRef.current = null;
+      const sessionStateAfterTerminal = eventsRef.current.some((event) => (
+        event.type === 'session.state'
+        && event.ts >= terminalEvent.ts
+      ));
+      if (sessionStateAfterTerminal) return;
+      fireHttpBackfillRef.current(0, {
+        phase: 'refresh',
+        visible: false,
+        force: true,
+        mode: 'manualLatestWindow',
+      });
+    }, TERMINAL_TAIL_IDLE_RECONCILE_MS);
+  }, [clearTerminalTailIdleReconcile]);
+
   // Explicit user-triggered sync (chat ↻ button). visible:true lights the
   // refreshing overlay so the user sees the catch-up; force:true bypasses the
   // active-session gate so it works on a visible-but-not-focused sub-session;
@@ -3349,6 +3389,11 @@ export function useTimeline(
         } else {
           idbPutEvents([event]);
         }
+        if (event.type === 'session.state') {
+          clearTerminalTailIdleReconcile();
+        } else if (isTerminalTailIdleReconcileCandidate(event)) {
+          scheduleTerminalTailIdleReconcile(event);
+        }
       }
 
       // ── History response (full load from daemon file store) ──
@@ -3702,7 +3747,7 @@ export function useTimeline(
 
     const unsub = ws.onMessage(handler);
     return unsub;
-  }, [applyTimelineTransportQueueEvidence, applyTransportQueueEvidence, beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [applyTimelineTransportQueueEvidence, applyTransportQueueEvidence, beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, clearTerminalTailIdleReconcile, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, scheduleTerminalTailIdleReconcile, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {
     if (loading || refreshing || httpRefreshing || loadingOlder) return;
@@ -3713,10 +3758,11 @@ export function useTimeline(
     return () => {
       clearForwardHistoryTimeout();
       clearHttpBackfillTimer();
+      clearTerminalTailIdleReconcile();
       reconnectRefreshInFlightRef.current = false;
       httpBackfillInFlightRef.current = createHttpBackfillCountState();
     };
-  }, [clearForwardHistoryTimeout, clearHttpBackfillTimer, sessionId]);
+  }, [clearForwardHistoryTimeout, clearHttpBackfillTimer, clearTerminalTailIdleReconcile, sessionId]);
 
   // Clear outstanding optimistic timers on unmount / session change so that a
   // dismissed chat window can't fire a delayed markOptimisticFailed into an

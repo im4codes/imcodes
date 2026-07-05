@@ -598,6 +598,57 @@ describe('watch projection store', () => {
     expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
   });
 
+  it('returns to idle from an authoritative session.state idle timeline event', () => {
+    const { store } = makeSnapshotStore(3_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'codex-sdk', state: 'running' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'running',
+      sessionId: 'deck_proj_brain',
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: {
+        state: 'running',
+        activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 4 },
+      },
+    });
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+
+    store.handleTimelineEvent({
+      eventId: 'idle',
+      sessionId: 'deck_proj_brain',
+      ts: 101,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: {
+        state: 'idle',
+        authoritative: true,
+        activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 5 },
+        blockingWorkCount: 0,
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        pendingCount: 0,
+        pendingVersion: 8,
+        decisionReason: 'activity_reconciler_clear',
+        clearInputs: [{ source: 'transport-runtime', reason: 'clear', count: 0 }],
+      },
+    });
+
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+  });
+
   it('does not let legacy idle close a keyed open watch tool call before its result', () => {
     const { store } = makeSnapshotStore(3_000);
     store.updateFromSessionList(
