@@ -80,6 +80,7 @@ type MsgHandler = (msg: ServerMessage) => void;
 
 function makeWs() {
   return {
+    connected: true,
     fsWriteFile: vi.fn(() => 'req-' + Math.random().toString(36).slice(2, 8)),
   };
 }
@@ -320,6 +321,66 @@ describe('FileEditor', () => {
   });
 
   describe('timeout timer cleanup', () => {
+    it('does not enter saving when websocket is disconnected', () => {
+      const ws = makeWs();
+      ws.connected = false;
+      const { onMessage } = makeOnMessage();
+      render(
+        <FileEditor
+          ws={ws as any}
+          path="/file.txt"
+          content="c"
+          currentContent="edited"
+          mtime={1000}
+          isDirty={true}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+          onMessage={onMessage}
+        />
+      );
+
+      fireEvent.click(screen.getByText('fileBrowser.save'));
+
+      expect(ws.fsWriteFile).not.toHaveBeenCalled();
+      expect(screen.getByText('fileBrowser.saveTimeout')).toBeTruthy();
+      expect(screen.getByText('fileBrowser.save')).toBeTruthy();
+    });
+
+    it('clears saving when websocket disconnects while a write is pending', () => {
+      const ws = makeWs();
+      ws.fsWriteFile.mockReturnValue('req-disconnect');
+      const { onMessage, dispatch } = makeOnMessage();
+      render(
+        <FileEditor
+          ws={ws as any}
+          path="/file.txt"
+          content="c"
+          currentContent="edited"
+          mtime={1000}
+          isDirty={true}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+          onMessage={onMessage}
+        />
+      );
+
+      fireEvent.click(screen.getByText('fileBrowser.save'));
+      expect(screen.getByText('fileBrowser.saving')).toBeTruthy();
+
+      act(() => {
+        dispatch({
+          type: 'session.event',
+          event: 'disconnected',
+          session: '',
+          state: 'disconnected',
+          reason: 'socket_closed',
+        } as any);
+      });
+
+      expect(screen.getByText('fileBrowser.saveTimeout')).toBeTruthy();
+      expect(screen.getByText('fileBrowser.save')).toBeTruthy();
+    });
+
     it('clears timeout on successful response (no spurious timeout)', () => {
       vi.useFakeTimers();
       const ws = makeWs();
