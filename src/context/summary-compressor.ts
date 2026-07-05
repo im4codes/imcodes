@@ -43,6 +43,9 @@ export interface CompressionInput {
   previousSummaryMaxTokens?: number;
   extraRedactPatterns?: RegExp[];
   pinnedNotes?: string[];
+  watchdogSessionName?: string;
+  watchdogTrigger?: string;
+  watchdogEventCount?: number;
 }
 
 export interface CompressionResult {
@@ -471,6 +474,78 @@ export interface CompressionQueueState {
   idle: boolean;
 }
 
+export interface ActiveCompressionRun {
+  runId: string;
+  sessionName: string;
+  startedAt: number;
+  mode: CompressionMode;
+  trigger?: string;
+  eventCount: number;
+}
+
+export interface CompressionWatchRun extends ActiveCompressionRun {
+  finishedAt?: number;
+}
+
+const activeCompressionRuns = new Map<string, ActiveCompressionRun>();
+const compressionWatchRuns = new Map<string, CompressionWatchRun>();
+
+function beginActiveCompressionRun(input: CompressionInput): ActiveCompressionRun | null {
+  const sessionName = input.watchdogSessionName?.trim();
+  if (!sessionName) return null;
+  const run: ActiveCompressionRun = {
+    runId: randomUUID(),
+    sessionName,
+    startedAt: Date.now(),
+    mode: input.mode ?? 'auto',
+    ...(input.watchdogTrigger ? { trigger: input.watchdogTrigger } : {}),
+    eventCount: input.watchdogEventCount ?? input.events.length,
+  };
+  activeCompressionRuns.set(run.runId, run);
+  compressionWatchRuns.set(run.runId, { ...run });
+  return run;
+}
+
+function finishActiveCompressionRun(run: ActiveCompressionRun | null): void {
+  if (!run) return;
+  activeCompressionRuns.delete(run.runId);
+  const watchRun = compressionWatchRuns.get(run.runId);
+  if (watchRun) compressionWatchRuns.set(run.runId, { ...watchRun, finishedAt: Date.now() });
+}
+
+export function getActiveCompressionRuns(): ActiveCompressionRun[] {
+  return [...activeCompressionRuns.values()].map((run) => ({ ...run }));
+}
+
+export function getStaleSessionCompressionRun(
+  sessionName: string,
+  nowMs = Date.now(),
+  staleMs = 4 * 60_000,
+): CompressionWatchRun | null {
+  let staleRun: CompressionWatchRun | null = null;
+  for (const [runId, run] of compressionWatchRuns.entries()) {
+    if (run.finishedAt && nowMs - run.startedAt > 30 * 60_000) {
+      compressionWatchRuns.delete(runId);
+      continue;
+    }
+    if (run.sessionName !== sessionName) continue;
+    if (nowMs - run.startedAt < staleMs) continue;
+    if (!staleRun || run.startedAt < staleRun.startedAt) staleRun = run;
+  }
+  return staleRun ? { ...staleRun } : null;
+}
+
+export function resolveSessionCompressionWatchRuns(sessionName: string): void {
+  for (const [runId, run] of compressionWatchRuns.entries()) {
+    if (run.sessionName === sessionName) compressionWatchRuns.delete(runId);
+  }
+}
+
+export function resetActiveCompressionRunsForTests(): void {
+  activeCompressionRuns.clear();
+  compressionWatchRuns.clear();
+}
+
 export function getCompressionQueueState(): CompressionQueueState {
   return {
     active: activeCompressionCount > 0,
@@ -511,7 +586,7 @@ export async function awaitCompressionIdle(timeoutMs: number): Promise<{ idle: b
   }
 }
 
-function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
+function enqueueExclusive<T>(job: () => Promise<T>, inputForActiveRun: CompressionInput): Promise<T> {
   const prev = compressionChain;
   let release!: () => void;
   queuedCompressionCount += 1;
@@ -522,9 +597,12 @@ function enqueueExclusive<T>(job: () => Promise<T>): Promise<T> {
   }).then(async () => {
     queuedCompressionCount = Math.max(0, queuedCompressionCount - 1);
     activeCompressionCount += 1;
+    let activeRun: ActiveCompressionRun | null = null;
     try {
+      activeRun = beginActiveCompressionRun(inputForActiveRun);
       return await job();
     } finally {
+      finishActiveCompressionRun(activeRun);
       activeCompressionCount = Math.max(0, activeCompressionCount - 1);
       release();
     }
@@ -539,7 +617,7 @@ export async function compressWithSdk(input: CompressionInput): Promise<Compress
     incrementCounter('mem.compression.admission_closed', { reason });
     throw new CompressionAdmissionClosedError(reason);
   }
-  return enqueueExclusive(() => compressWithSdkInner(input));
+  return enqueueExclusive(() => compressWithSdkInner(input), input);
 }
 
 

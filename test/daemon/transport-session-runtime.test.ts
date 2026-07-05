@@ -3341,6 +3341,29 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(resentPayload.userMessage).toBe('queued-after-stale-active');
   });
 
+  it('send() starts stale active-turn recovery when a new message queues behind silent work', async () => {
+    runtime.send('first', 'cmd-first');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const internal = runtime as unknown as {
+      _lastActivityAt: number;
+      _lastProviderOutputAt: number;
+    };
+    const staleAt = Date.now() - 301_000;
+    internal._lastActivityAt = staleAt;
+    internal._lastProviderOutputAt = staleAt;
+
+    expect(runtime.send('queued-after-memory-compression-stall', 'cmd-after-stall')).toBe('queued');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.sending).toBe(true);
+    expect(runtime.getDiagnosticSnapshot().stalePendingRecoveryActive).toBe(false);
+    const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(resentPayload.userMessage).toBe('queued-after-memory-compression-stall');
+  });
+
   it('recoverSilentActiveTurn settles a phantom active turn with NO queued work to idle', async () => {
     // Regression: a provider that started a turn but went silent and never sent
     // a completion (Codex phantom) leaves the session "working" forever EVEN WITH
@@ -3360,9 +3383,10 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.recoverSilentActiveTurn({ nowMs: 5_000, staleMs: 10_000 })).toBe(false);
     expect(runtime.getStatus()).not.toBe('idle');
     expect(runtime.recoverSilentActiveTurn({ nowMs: 61_000, staleMs: 60_000 })).toBe(false);
-    // Truly stale (provider silent past the long last-resort threshold) + empty
-    // queue → settle to idle.
-    expect(runtime.recoverSilentActiveTurn({ nowMs: 31 * 60_000, staleMs: 10_000 })).toBe(true);
+    // Truly stale (provider silent past the last-resort no-tool threshold) +
+    // empty queue → settle to idle. This covers memory-compression/finalize
+    // misses where no queued prompt exists to trigger queue-visible recovery.
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 1_000 + 5 * 60_000 + 1, staleMs: 10_000 })).toBe(true);
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
     expect(runtime.activeDispatchEntries).toEqual([]);

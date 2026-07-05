@@ -358,6 +358,11 @@ export class MaterializationCoordinator {
         previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
         extraRedactPatterns: memoryConfig.extraRedactPatterns,
         pinnedNotes,
+        ...(target.sessionName ? {
+          watchdogSessionName: target.sessionName,
+          watchdogTrigger: trigger,
+          watchdogEventCount: events.length,
+        } : {}),
       });
     } catch (error) {
       if (error instanceof CompressionAdmissionClosedError) {

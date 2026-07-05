@@ -59,6 +59,7 @@ import {
 } from '../../shared/worker-session-snapshot.js';
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -1444,12 +1445,12 @@ export async function shutdown(exitCode = 0): Promise<void> {
 
 const HEALTH_POLL_MS = 30_000;
 // Last-resort recovery for a transport turn that has gone silent (no provider
-// output) long enough to look like a stuck PHANTOM. This must be conservative:
-// Codex/Claude can legitimately spend several minutes thinking or running a
-// quiet command with no deltas, and a 60s health-poll threshold falsely cancels
-// real turns. Queue-stuck flows have their own targeted recovery path; this
-// empty-queue spinner recovery should only fire after a very long silence.
-const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 30 * 60_000;
+// output) long enough to look like a stuck PHANTOM. This must stay above normal
+// long-thinking latency, but not so high that a memory-compression/app-server
+// finalize miss leaves the UI "working" for a whole operator session. Active
+// tool calls still use the runtime's longer tool-aware floor.
+const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 5 * 60_000;
+const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 4 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
 const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
@@ -1458,6 +1459,7 @@ const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
  */
 const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
+const memoryCompressionAutoContinuedRunIds = new Set<string>();
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
@@ -1571,6 +1573,9 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       await checkSessionHealth(s);
+      await recoverMemoryCompressionStalledSession(s.name).catch((err) => {
+        logger.warn({ err, sessionName: s.name }, 'memory compression auto-continue watchdog failed');
+      });
       // Safety net: settle a phantom (silent-but-"active") transport turn to
       // idle — and drain any queued work — so the session can't stay "working"
       // forever. Fires whether or not anything is queued.
@@ -1606,6 +1611,78 @@ function startHealthPoller(): void {
       logger.warn({ err }, 'Execution-clone sweep error');
     }
   }, HEALTH_POLL_MS);
+}
+
+export async function recoverMemoryCompressionStalledSession(
+  sessionName: string,
+  nowMs = Date.now(),
+): Promise<boolean> {
+  const run = getStaleSessionCompressionRun(
+    sessionName,
+    nowMs,
+    MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS,
+  );
+  if (!run) return false;
+  if (memoryCompressionAutoContinuedRunIds.has(run.runId)) return false;
+
+  const runtime = getTransportRuntime(sessionName);
+  if (!runtime) return false;
+  const diagnostic = runtime.getDiagnosticSnapshot(nowMs);
+  if (diagnostic.activeToolCount > 0) return false;
+  const active = diagnostic.sending
+    || diagnostic.activeDispatchCount > 0
+    || diagnostic.blockingWorkCount > 0
+    || diagnostic.status === 'thinking'
+    || diagnostic.status === 'streaming'
+    || diagnostic.status === 'tool_running'
+    || diagnostic.status === 'permission';
+  if (!active) {
+    resolveSessionCompressionWatchRuns(sessionName);
+    return false;
+  }
+
+  memoryCompressionAutoContinuedRunIds.add(run.runId);
+  const commandId = `auto-memory-compression-continue:${run.runId}`;
+  logger.warn(
+    {
+      sessionName,
+      runId: run.runId,
+      trigger: run.trigger,
+      eventCount: run.eventCount,
+      ageMs: Math.max(0, nowMs - run.startedAt),
+      diagnostic,
+    },
+    'memory compression watchdog stopping stale active turn and sending continue',
+  );
+  timelineEmitter.emit(
+    sessionName,
+    'assistant.text',
+    {
+      text: '⚠️ Memory compression watchdog stopped a stale turn after 4 minutes and sent `continue`.',
+      streaming: false,
+      automation: true,
+      memoryExcluded: true,
+    },
+    { source: 'daemon', confidence: 'high' },
+  );
+
+  timelineEmitter.emit(
+    sessionName,
+    'user.message',
+    {
+      text: 'continue',
+      clientMessageId: commandId,
+      allowDuplicate: true,
+    },
+    { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
+  );
+  const sendResult = runtime.send('continue', commandId, undefined, undefined, {
+    queuePlacement: 'front',
+    timelineCommitted: true,
+  });
+  if (sendResult === 'queued') await runtime.cancel();
+  resolveSessionCompressionWatchRuns(sessionName);
+  return true;
 }
 
 function startCodexQuotaPoller(serverLink: ServerLink | null): void {

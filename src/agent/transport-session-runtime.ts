@@ -194,7 +194,7 @@ const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
 })();
 const TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS ?? '', 10);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 30 * 60_000;
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 5 * 60_000;
 })();
 
 function isRecoverableProviderBusyError(error: ProviderError): boolean {
@@ -1519,6 +1519,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }
       this._pendingVersion++;
+      this.cancelStaleActiveTurnWithPending({ reason: 'queued-send-after-stale-active-turn' });
       return 'queued';
     }
 

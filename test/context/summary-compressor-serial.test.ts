@@ -78,13 +78,16 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     queryMock.mockReset();
     if (originalCompressionTimeout === undefined) delete process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
     else process.env.IMCODES_COMPRESSION_TIMEOUT_MS = originalCompressionTimeout;
-    const { resumeAcceptingCompression } = await import('../../src/context/summary-compressor.js');
+    const { resetActiveCompressionRunsForTests, resumeAcceptingCompression } = await import('../../src/context/summary-compressor.js');
+    resetActiveCompressionRunsForTests();
     resumeAcceptingCompression();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (originalCompressionTimeout === undefined) delete process.env.IMCODES_COMPRESSION_TIMEOUT_MS;
     else process.env.IMCODES_COMPRESSION_TIMEOUT_MS = originalCompressionTimeout;
+    const { resetActiveCompressionRunsForTests } = await import('../../src/context/summary-compressor.js');
+    resetActiveCompressionRunsForTests();
   });
 
   it('uses an extended configurable compression timeout for slow MiniMax/Qwen-style providers', async () => {
@@ -143,6 +146,63 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
         active -= 1;
       }
     }
+  });
+
+  it('tracks session-bound active compression runs for stale-turn watchdogs and clears them on completion', async () => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    queryMock.mockImplementation(async function* () {
+      await released;
+      yield {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'SUMMARY' }],
+        },
+      };
+    });
+
+    const {
+      compressWithSdk,
+      getActiveCompressionRuns,
+      getStaleSessionCompressionRun,
+      resolveSessionCompressionWatchRuns,
+    } = await import('../../src/context/summary-compressor.js');
+
+    const runPromise = compressWithSdk({
+      ...makeInput('watchdog'),
+      watchdogSessionName: 'deck_test_brain',
+      watchdogTrigger: 'test-trigger',
+      watchdogEventCount: 7,
+    });
+
+    for (let i = 0; i < 20 && getActiveCompressionRuns().length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const [run] = getActiveCompressionRuns();
+    expect(run).toEqual(expect.objectContaining({
+      sessionName: 'deck_test_brain',
+      trigger: 'test-trigger',
+      eventCount: 7,
+      mode: 'auto',
+    }));
+    expect(run).toBeDefined();
+    expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 239_999, 240_000)).toBeNull();
+    expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 240_001, 240_000)).toEqual(expect.objectContaining({
+      runId: run?.runId,
+      sessionName: 'deck_test_brain',
+    }));
+
+    release();
+    await runPromise;
+    expect(getActiveCompressionRuns()).toEqual([]);
+    expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 240_001, 240_000)).toEqual(expect.objectContaining({
+      runId: run?.runId,
+      sessionName: 'deck_test_brain',
+      finishedAt: expect.any(Number),
+    }));
+    resolveSessionCompressionWatchRuns('deck_test_brain');
+    expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 240_001, 240_000)).toBeNull();
   });
 
   it('releases the lane even when the current call throws, so the queue does not stall', async () => {
