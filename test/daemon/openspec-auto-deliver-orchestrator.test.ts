@@ -69,6 +69,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 import {
   clearOpenSpecAutoDeliverRunsForTests,
   dropOpenSpecAutoDeliverImplementationMarkerForTests,
+  getOpenSpecAutoDeliverRun,
   getOpenSpecAutoDeliverTransitionTarget,
   handleOpenSpecAutoDeliverDaemonRestartCleanup,
   handleOpenSpecAutoDeliverCommand,
@@ -668,6 +669,12 @@ exec "${realGit}" "$@"
     getTransportRuntimeMock.mockImplementation(() => ({
       send: sendDuringIdleMock,
       settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+      }),
     }));
 
     await handleOpenSpecAutoDeliverCommand({
@@ -781,6 +788,65 @@ exec "${realGit}" "$@"
     } finally {
       timelineSpy.mockRestore();
     }
+  });
+
+  it('forces a marker reminder when idle arrives after a queued implementation prompt loses its dispatch echo', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    let queuedRuntime: {
+      providerSessionId: string;
+      pendingEntries: Array<{ clientMessageId: string; text: string }>;
+      send: ReturnType<typeof vi.fn>;
+      settleActiveDispatchFromExternalCompletion: ReturnType<typeof vi.fn>;
+    };
+    queuedRuntime = {
+      providerSessionId: 'provider-demo',
+      pendingEntries: [],
+      send: vi.fn((text: string, commandId?: string) => {
+        queuedRuntime.pendingEntries = [{ clientMessageId: commandId ?? 'queued-command', text }];
+        return 'queued' as const;
+      }),
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+    };
+    getTransportRuntimeMock.mockImplementation(() => queuedRuntime);
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-idle-missing-marker-after-lost-echo',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    const projection = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      2500,
+    );
+    expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
+    const run = getOpenSpecAutoDeliverRun(String(projection.projection?.runId ?? ''));
+    expect(run?.activeCommandId).toContain(':implementation:');
+    expect(run?.activeImplementationPromptAwaitingDispatch).toBe(true);
+
+    // Simulate the transport/runtime having drained or dropped the queued prompt
+    // without the timeline user.message echo that normally clears the awaiting
+    // dispatch flag. A real idle after this point must not require manual
+    // `continue`; it should force the marker reminder path.
+    queuedRuntime.pendingEntries = [];
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const start = Date.now();
+    while (queuedRuntime.send.mock.calls.length < 2 && Date.now() - start < 2500) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (queuedRuntime.send.mock.calls.length < 2) {
+      throw new Error(`marker reminder missing; awaiting=${String(run?.activeImplementationPromptAwaitingDispatch)} active=${String(run?.activeCommandId)} last=${String(run?.latestMessage)} sends=${queuedRuntime.send.mock.calls.length}`);
+    }
+    expect(queuedRuntime.send).toHaveBeenCalledTimes(2);
+    const markerReminder = String(queuedRuntime.send.mock.calls[1]?.[0] ?? '');
+    expect(markerReminder).toContain('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.');
+    expect(markerReminder).toContain('Reason: implementation_marker_missing');
+    expect(markerReminder).toContain('Implementation completion marker (required):');
+    expect(markerReminder).toContain('write this exact JSON marker to:');
   });
 
   it('records only final implementation assistant text as evidence before the audit prompt', async () => {
@@ -1533,6 +1599,35 @@ exec "${realGit}" "$@"
       .map((call) => call[0])
       .find((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
     expect(projection?.projection.activeP2pRunId).toBe('p2p-1');
+  });
+
+  it('advances spec repair to final acceptance when the repair idle event is missed', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-spec-repair-idle-miss',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'spec_audit_repair',
+      2500,
+    );
+    const discussion = await completeLatestDiscussion('completed', '# spec audit discussion\n\nRepair artifacts before final scoring.');
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver spec-artifact repair context for @openspec/changes/demo-change')
+      && text.includes(`Spec audit discussion file: ${discussion.contextFilePath}`),
+      2500,
+    );
+    expect(repairPrompt).toContain('Repair only the OpenSpec artifacts under this change');
+
+    const acceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final specification acceptance audit for @openspec/changes/demo-change'),
+      2500,
+    );
+    expect(acceptancePrompt).toContain('Write exactly one raw JSON object to the authoritative result file path above.');
   });
 
   it('builds Team audit prompts from canonical OpenSpec templates and final acceptance prompts with authoritative metadata', async () => {
@@ -2514,6 +2609,25 @@ exec "${realGit}" "$@"
     );
     expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
     expect(transportSendCount((text) => text.includes('OpenSpec Auto Deliver needs the final implementation acceptance audit authoritative result file'))).toBe(1);
+  });
+
+  it('consumes a valid final acceptance result file even while the transport runtime still reports busy', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-valid-result-file-while-runtime-busy');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+    getTransportRuntimeMock.mockImplementation(() => ({
+      send: transportSendMock,
+      settleActiveDispatchFromExternalCompletion: transportSettleExternalMock,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+      }),
+    }));
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
   it('requests authoritative result file repair for verdict payload format errors', async () => {
