@@ -152,7 +152,7 @@ import {
   nextTransportQueueVersion,
   removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { shouldUseIosMacTextScale } from './native-platform.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
@@ -4088,6 +4088,7 @@ export function App() {
       s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
     ));
     wsRef.current.sendSessionCommand('stop', { project });
+    requestActiveTimelineRefreshAfterUserAction();
   }, [pinnedTabs, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {

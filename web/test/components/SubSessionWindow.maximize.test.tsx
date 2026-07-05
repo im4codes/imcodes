@@ -43,6 +43,7 @@ vi.mock('../../src/thinking-utils.js', () => ({
 }));
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: () => ({
     events: [],
     refreshing: false,

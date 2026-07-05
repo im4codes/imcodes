@@ -75,6 +75,7 @@ const retryOptimisticMessageSpy = vi.fn();
 const loadOlderEventsSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: () => ({
     events: timelineEventsMock,
     refreshing: false,

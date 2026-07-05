@@ -334,6 +334,25 @@ export function requestActiveTimelineRefresh(options?: { resetCooldowns?: boolea
   window.setTimeout(fireLater, 32);
 }
 
+const USER_ACTION_TIMELINE_REFRESH_DELAYS_MS = [600, 1800] as const;
+
+/**
+ * User actions (send / stop / cancel) often cause the daemon to persist a
+ * timeline event shortly after the command is accepted. If the live WS
+ * subscription is half-stale, waiting for a tab focus/switch is the only thing
+ * that currently triggers the HTTP catch-up. Fire a small, bounded active
+ * refresh burst instead: immediate + two delayed retries. Each delayed retry
+ * clears the activation cooldown so an early empty catch-up cannot suppress the
+ * later one that lands after the daemon has written the event.
+ */
+export function requestActiveTimelineRefreshAfterUserAction(): void {
+  if (typeof window === 'undefined') return;
+  requestActiveTimelineRefresh({ resetCooldowns: true });
+  for (const delayMs of USER_ACTION_TIMELINE_REFRESH_DELAYS_MS) {
+    window.setTimeout(() => requestActiveTimelineRefresh({ resetCooldowns: true }), delayMs);
+  }
+}
+
 // On every visibility transition we record when the document went hidden;
 // on the return-to-visible side we clear the mount cooldown and emit a
 // refresh request so the mounted timeline for the active session can

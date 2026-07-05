@@ -52,6 +52,7 @@ vi.mock('../../src/components/SessionControls.js', () => ({
   ),
 }));
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: (...args: any[]) => {
     useTimelineMock(...args);
     return {

@@ -14,7 +14,7 @@ import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
-import { useTimeline } from '../hooks/useTimeline.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -349,6 +349,7 @@ export function SubSessionWindow({
         ...(resendExtra ?? {}),
         commandId: newCommandId,
       });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch {
       return;
     }
@@ -547,6 +548,7 @@ export function SubSessionWindow({
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
+      requestActiveTimelineRefreshAfterUserAction();
       addOptimisticUserMessage(text, commandId);
       scrollToBottom();
     } catch {

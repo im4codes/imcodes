@@ -25,6 +25,7 @@ import {
 } from './OpenSpecAutoDeliver.js';
 import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
 import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
+import { requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
 import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
 import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
@@ -2750,15 +2751,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
         console.warn('session.cancel HTTP fallback failed', fallbackErr);
       });
+      requestActiveTimelineRefreshAfterUserAction();
       return commandId;
     }
     try {
       ws.sendSessionCommandUrgent('cancel', payload);
+      requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       if (!serverId) throw err;
       void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
         console.warn('session.cancel HTTP fallback failed', fallbackErr);
       });
+      requestActiveTimelineRefreshAfterUserAction();
     }
     return commandId;
   }, [activeSession, makeCommandId, serverId, ws]);
@@ -2883,13 +2887,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws) {
       if (!serverId) return null;
       void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
+      requestActiveTimelineRefreshAfterUserAction();
       return commandId;
     }
     try {
       ws.sendSessionCommand('send', payload);
+      requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       if (!serverId) throw err;
       void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
+      requestActiveTimelineRefreshAfterUserAction();
     }
     return commandId;
   }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
@@ -3501,6 +3508,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       onStopProject
         ? onStopProject(activeSession.project)
         : ws.sendSessionCommand('stop', { project: activeSession.project });
+      requestActiveTimelineRefreshAfterUserAction();
     } else {
       // Main session restart/new: 1-click confirmation
       if (confirm !== action) { startConfirm(action, 1); return; }

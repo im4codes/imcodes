@@ -12,7 +12,7 @@ import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
-import { useTimeline } from '../hooks/useTimeline.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
@@ -218,6 +218,7 @@ export function SessionPane({
         ...(resendExtra ?? {}),
         commandId: newCommandId,
       });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch {
       return;
     }
@@ -375,6 +376,7 @@ export function SessionPane({
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       ws.sendSessionCommand('send', { sessionName, text, commandId });
+      requestActiveTimelineRefreshAfterUserAction();
       if (hasChatTimeline) {
         addOptimisticUserMessage(text, commandId);
         scrollToBottom();

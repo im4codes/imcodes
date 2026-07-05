@@ -226,6 +226,7 @@ vi.mock('../src/watch-projection.js', () => ({
 vi.mock('../src/hooks/useTimeline.js', () => ({
   ingestTimelineEventForCache: vi.fn(),
   requestActiveTimelineRefresh: vi.fn(),
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
 }));
 
 vi.mock('../src/components/ErrorBoundary.js', () => ({
