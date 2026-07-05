@@ -4555,7 +4555,7 @@ afterEach(() => {
     getSelectionSpy.mockRestore();
   });
 
-  it('does not send immediately after selecting agent and mode; sends a direct message after further editing when only one target is present', () => {
+  it('does not send immediately after selecting agent and mode; sends an orchestration prompt to the current session after further editing', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4587,9 +4587,15 @@ afterEach(() => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
-      text: 'please review',
-      delegateTarget: { session: 'deck_sub_w1' },
+      text: expect.stringContaining('You are the current session orchestrator for an agent delegation.'),
     }));
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).toContain('Exact delegate target session: deck_sub_w1');
+    expect(sent.text).toContain('User task to delegate:\nplease review');
+    expect(sent.text).toContain('organize the relevant current-session context yourself');
+    expect(sent.text).toContain('Do not send the raw user task by itself.');
+    expect(sent.text).toContain('imcodes send --no-reply "deck_sub_w1"');
+    expect(sent).not.toHaveProperty('delegateTarget');
 
     getSelectionSpy.mockRestore();
   });
@@ -4674,7 +4680,7 @@ afterEach(() => {
     expect(screen.getByTestId('p2p-dropdown-tab-combos')).toBeDefined();
   });
 
-  it('selecting agents from the picker sends delegateTarget instead of p2pAtTargets', () => {
+  it('selecting agents from the picker asks the current session to orchestrate delegation instead of direct target dispatch', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4701,12 +4707,15 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
-      sessionName: 'deck_my-project_brain',
-      text: 'please review',
-      delegateTarget: { session: 'deck_sub_w1' },
-    }));
     const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent).toMatchObject({
+      sessionName: 'deck_my-project_brain',
+    });
+    expect(sent.text).toContain('You are the current session orchestrator for an agent delegation.');
+    expect(sent.text).toContain('Selected delegate: w1 (deck_sub_w1)');
+    expect(sent.text).toContain('User task to delegate:\nplease review');
+    expect(sent).toHaveProperty('text');
+    expect(sent).not.toHaveProperty('delegateTarget');
     expect(sent).not.toHaveProperty('p2pAtTargets');
 
     getSelectionSpy.mockRestore();
@@ -5681,11 +5690,11 @@ afterEach(() => {
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
-        sessionName: 'deck_my-project_brain',
-        text: 'please review',
-        delegateTarget: { session: 'deck_sub_w1' },
-      }));
+      const sent = gatherSendCalls(ws).at(-1)!;
+      expect(sent).toMatchObject({ sessionName: 'deck_my-project_brain' });
+      expect(sent.text).toContain('Exact delegate target session: deck_sub_w1');
+      expect(sent.text).toContain('User task to delegate:\nplease review');
+      expect(sent).not.toHaveProperty('delegateTarget');
       expect(screen.queryByText('title')).toBeNull();
 
       getSelectionSpy.mockRestore();

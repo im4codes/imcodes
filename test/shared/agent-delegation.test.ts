@@ -16,6 +16,7 @@ import {
   DELEGATION_UNSUPPORTED_INPUT,
   INVALID_DELEGATION_TARGET,
   MIXED_DELEGATION_P2P_FIELDS,
+  buildAgentDelegationOrchestrationPrompt,
   buildAgentDelegationReplyInstruction,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
@@ -182,6 +183,20 @@ describe('agent delegation shared contract', () => {
     expect(instruction).toContain('imcodes send --no-reply "deck_repo_brain"');
     expect(instruction).toContain('Task: <brief summary of the request>\\nResult: <your response>');
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
+  });
+
+  it('builds a current-session orchestration prompt for UI-picked single-agent delegation', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      targetLabel: 'Worker One',
+      task: 'review the queue sync bug',
+    });
+    expect(prompt).toContain('current session orchestrator');
+    expect(prompt).toContain('Worker One (deck_repo_w1)');
+    expect(prompt).toContain('review the queue sync bug');
+    expect(prompt).toContain('organize the relevant current-session context yourself');
+    expect(prompt).toContain('Do not send the raw user task by itself.');
+    expect(prompt).toContain('imcodes send --no-reply "deck_repo_w1"');
   });
 
   it('detects and strips historical reply/delegation/imcodes-send/P2P control instructions from context', () => {

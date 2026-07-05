@@ -180,6 +180,37 @@ export function buildAgentDelegationReplyInstruction(replyToSession: string): st
   return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send --no-reply ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
 }
 
+export interface AgentDelegationOrchestrationPromptInput {
+  targetSession: string;
+  targetLabel?: string | null;
+  task: string;
+}
+
+export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOrchestrationPromptInput): string {
+  const targetSession = input.targetSession.trim();
+  const targetLabel = input.targetLabel?.trim();
+  const task = input.task.trim();
+  const displayTarget = targetLabel && targetLabel !== targetSession
+    ? `${targetLabel} (${targetSession})`
+    : targetSession;
+  return [
+    'You are the current session orchestrator for an agent delegation.',
+    '',
+    `Selected delegate: ${displayTarget}`,
+    `Exact delegate target session: ${targetSession}`,
+    '',
+    'User task to delegate:',
+    task,
+    '',
+    'Before contacting the delegate, organize the relevant current-session context yourself: summarize the goal, constraints, repo paths, recent decisions, current state, and acceptance criteria the delegate needs. Do not send the raw user task by itself.',
+    '',
+    'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above. Prefer the available send_message tool when present; otherwise use:',
+    `imcodes send --no-reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
+    '',
+    'Keep this session responsible for orchestration and final judgment. Do not implement the delegated task yourself unless implementation is needed only to prepare or verify the delegation brief.',
+  ].join('\n');
+}
+
 export function isAgentDelegationForwardedPayloadText(text: string): boolean {
   return text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
     || text.includes(AGENT_DELEGATION_CONTEXT_HEADER)

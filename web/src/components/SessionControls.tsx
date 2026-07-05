@@ -83,7 +83,7 @@ import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/sessio
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
-  AGENT_DELEGATION_TARGET_FIELD,
+  buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
 } from '@shared/agent-delegation.js';
 
@@ -631,6 +631,11 @@ interface PendingDelegateTarget {
 interface PendingSendPayload {
   text: string;
   extra: Record<string, unknown>;
+  delegation?: {
+    targetSession: string;
+    targetLabel: string;
+    task: string;
+  };
 }
 
 interface BuildSendPayloadOptions {
@@ -2605,8 +2610,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ? [...normalizedOptions.syntheticAtTargets]
       : [...pendingAtTargetsRef.current];
 
+    let delegation: PendingSendPayload['delegation'];
     if (pendingDelegateTarget && !normalizedOptions.syntheticAtTargets) {
-      extra[AGENT_DELEGATION_TARGET_FIELD] = { session: pendingDelegateTarget.session };
+      const task = text.trim();
+      delegation = {
+        targetSession: pendingDelegateTarget.session,
+        targetLabel: pendingDelegateTarget.label,
+        task,
+      };
+      text = buildAgentDelegationOrchestrationPrompt({
+        targetSession: pendingDelegateTarget.session,
+        targetLabel: pendingDelegateTarget.label,
+        task,
+      });
     } else if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
       const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
@@ -2690,7 +2706,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
-    return { text, extra };
+    return { text, extra, ...(delegation ? { delegation } : {}) };
   }, [activeSession, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
@@ -2901,7 +2917,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
-    const isDelegationSend = Boolean(payload.extra[AGENT_DELEGATION_TARGET_FIELD]);
+    const isDelegationSend = Boolean(payload.delegation);
     const clearComposerState = () => {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -2957,7 +2973,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       return;
     }
-    quickData.recordHistory(payload.text, activeSession.name);
+    quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     const commandId = makeCommandId();
     let localFailure: string | undefined;
     try {
@@ -3071,8 +3087,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [comboSkipPref, rememberComboSendChoice]);
 
   const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
-    const text = payload.text.trim();
-    if (payload.extra[AGENT_DELEGATION_TARGET_FIELD]) {
+    const text = (payload.delegation?.task ?? payload.text).trim();
+    if (payload.delegation) {
       if (!text) return t('delegation.warning_empty_task');
       if (isDelegationUnsupportedControlText(text)) return t('delegation.warning_control_command');
       if (attachments.length > 0) return t('delegation.warning_attachments');
