@@ -1173,7 +1173,10 @@ exec "${realGit}" "$@"
     expect(acceptancePrompt).toContain('cap implementation and risk at 7 and cap tests at 6');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
+      8000,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -1509,7 +1512,10 @@ exec "${realGit}" "$@"
     await git(['commit', '-m', commitMessage]);
     await git(['push']);
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 8000);
+    const terminal = await waitForSend(
+      (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
+      8000,
+    );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n')).toContain('Auto commit/push verified by daemon');
 
