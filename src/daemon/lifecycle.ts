@@ -60,6 +60,8 @@ import {
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
+import { normalizeActivityGeneration } from '../../shared/session-activity-types.js';
+import type { TransportRuntimeDiagnosticSnapshot } from '../agent/transport-session-runtime.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -1450,7 +1452,8 @@ const HEALTH_POLL_MS = 30_000;
 // finalize miss leaves the UI "working" for a whole operator session. Active
 // tool calls still use the runtime's longer tool-aware floor.
 const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 5 * 60_000;
-const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 4 * 60_000;
+const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
+const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
 const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
@@ -1460,6 +1463,7 @@ const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
 const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 const memoryCompressionAutoContinuedRunIds = new Set<string>();
+const codexAutoContinuedActivityGenerations = new Set<string>();
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
@@ -1573,9 +1577,17 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       await checkSessionHealth(s);
-      await recoverMemoryCompressionStalledSession(s.name).catch((err) => {
+      let memoryCompressionRecovered = false;
+      try {
+        memoryCompressionRecovered = await recoverMemoryCompressionStalledSession(s.name);
+      } catch (err) {
         logger.warn({ err, sessionName: s.name }, 'memory compression auto-continue watchdog failed');
-      });
+      }
+      if (!memoryCompressionRecovered) {
+        await recoverCodexStalledSession(s).catch((err) => {
+          logger.warn({ err, sessionName: s.name }, 'codex stale-turn auto-continue watchdog failed');
+        });
+      }
       // Safety net: settle a phantom (silent-but-"active") transport turn to
       // idle — and drain any queued work — so the session can't stay "working"
       // forever. Fires whether or not anything is queued.
@@ -1613,6 +1625,91 @@ function startHealthPoller(): void {
   }, HEALTH_POLL_MS);
 }
 
+
+function isTransportDiagnosticActive(diagnostic: TransportRuntimeDiagnosticSnapshot): boolean {
+  return diagnostic.sending
+    || diagnostic.activeDispatchCount > 0
+    || diagnostic.blockingWorkCount > 0
+    || diagnostic.status === 'thinking'
+    || diagnostic.status === 'streaming'
+    || diagnostic.status === 'tool_running'
+    || diagnostic.status === 'permission';
+}
+
+function isCodexTransportSession(s: Pick<SessionRecord, 'agentType' | 'providerId'>): boolean {
+  return s.agentType === 'codex-sdk' || s.providerId === 'codex-sdk';
+}
+
+function rememberCodexAutoContinuedGeneration(generationKey: string): void {
+  codexAutoContinuedActivityGenerations.add(generationKey);
+  while (codexAutoContinuedActivityGenerations.size > 512) {
+    const oldest = codexAutoContinuedActivityGenerations.values().next().value;
+    if (oldest === undefined) break;
+    codexAutoContinuedActivityGenerations.delete(oldest);
+  }
+}
+
+export async function recoverCodexStalledSession(
+  s: Pick<SessionRecord, 'name' | 'agentType' | 'providerId'>,
+  nowMs = Date.now(),
+): Promise<boolean> {
+  if (!isCodexTransportSession(s)) return false;
+  const runtime = getTransportRuntime(s.name);
+  if (!runtime) return false;
+  const diagnostic = runtime.getDiagnosticSnapshot(nowMs);
+  if (!isTransportDiagnosticActive(diagnostic)) return false;
+  // Do not kill a legitimate long-running provider tool. This watchdog is for
+  // Codex turns that have made no visible progress, not for shell/test/build
+  // tools that can be quiet while doing real work.
+  if (diagnostic.activeToolCount > 0) return false;
+  if (diagnostic.lastActivityAgeMs < CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS) return false;
+
+  const generationKey = normalizeActivityGeneration(diagnostic.activityGeneration)
+    ?? `${s.name}:unknown:${diagnostic.pendingVersion}`;
+  if (codexAutoContinuedActivityGenerations.has(generationKey)) return false;
+  rememberCodexAutoContinuedGeneration(generationKey);
+
+  const commandId = `auto-codex-stale-continue:${generationKey}`;
+  logger.warn(
+    {
+      sessionName: s.name,
+      generationKey,
+      ageMs: diagnostic.lastActivityAgeMs,
+      staleMs: CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS,
+      diagnostic,
+    },
+    'codex watchdog stopping stale active turn and sending continue',
+  );
+  timelineEmitter.emit(
+    s.name,
+    'assistant.text',
+    {
+      text: '⚠️ Codex watchdog stopped a stale turn after 12 minutes with no activity and sent `continue`.',
+      streaming: false,
+      automation: true,
+      memoryExcluded: true,
+    },
+    { source: 'daemon', confidence: 'high' },
+  );
+
+  timelineEmitter.emit(
+    s.name,
+    'user.message',
+    {
+      text: 'continue',
+      clientMessageId: commandId,
+      allowDuplicate: true,
+    },
+    { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
+  );
+  const sendResult = runtime.send('continue', commandId, undefined, undefined, {
+    queuePlacement: 'front',
+    timelineCommitted: true,
+  });
+  if (sendResult === 'queued') await runtime.cancel();
+  return true;
+}
+
 export async function recoverMemoryCompressionStalledSession(
   sessionName: string,
   nowMs = Date.now(),
@@ -1629,14 +1726,7 @@ export async function recoverMemoryCompressionStalledSession(
   if (!runtime) return false;
   const diagnostic = runtime.getDiagnosticSnapshot(nowMs);
   if (diagnostic.activeToolCount > 0) return false;
-  const active = diagnostic.sending
-    || diagnostic.activeDispatchCount > 0
-    || diagnostic.blockingWorkCount > 0
-    || diagnostic.status === 'thinking'
-    || diagnostic.status === 'streaming'
-    || diagnostic.status === 'tool_running'
-    || diagnostic.status === 'permission';
-  if (!active) {
+  if (!isTransportDiagnosticActive(diagnostic)) {
     resolveSessionCompressionWatchRuns(sessionName);
     return false;
   }
@@ -1658,7 +1748,7 @@ export async function recoverMemoryCompressionStalledSession(
     sessionName,
     'assistant.text',
     {
-      text: '⚠️ Memory compression watchdog stopped a stale turn after 4 minutes and sent `continue`.',
+      text: '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
       streaming: false,
       automation: true,
       memoryExcluded: true,

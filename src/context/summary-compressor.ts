@@ -524,8 +524,8 @@ export function getStaleSessionCompressionRun(
 ): CompressionWatchRun | null {
   let staleRun: CompressionWatchRun | null = null;
   for (const [runId, run] of compressionWatchRuns.entries()) {
-    if (run.finishedAt && nowMs - run.startedAt > 30 * 60_000) {
-      compressionWatchRuns.delete(runId);
+    if (run.finishedAt) {
+      if (nowMs - run.startedAt > 30 * 60_000) compressionWatchRuns.delete(runId);
       continue;
     }
     if (run.sessionName !== sessionName) continue;

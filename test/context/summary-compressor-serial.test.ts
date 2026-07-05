@@ -196,11 +196,7 @@ describe('summary-compressor — concurrent compressWithSdk calls serialize', ()
     release();
     await runPromise;
     expect(getActiveCompressionRuns()).toEqual([]);
-    expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 240_001, 240_000)).toEqual(expect.objectContaining({
-      runId: run?.runId,
-      sessionName: 'deck_test_brain',
-      finishedAt: expect.any(Number),
-    }));
+    expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 240_001, 240_000)).toBeNull();
     resolveSessionCompressionWatchRuns('deck_test_brain');
     expect(getStaleSessionCompressionRun('deck_test_brain', run!.startedAt + 240_001, 240_000)).toBeNull();
   });
