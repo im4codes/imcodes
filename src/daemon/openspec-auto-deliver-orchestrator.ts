@@ -1483,7 +1483,9 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
     await handleFailedImplementationMarker(run, markerState.reason);
     return;
   }
-  const markerAgeMs = Date.now() - run.activeImplementationMarker.createdAt;
+  const activeMarker = run.activeImplementationMarker;
+  if (!activeMarker) return;
+  const markerAgeMs = Date.now() - activeMarker.createdAt;
   if (!isTransportRuntimeBusyForIdleAdvance(run) || markerAgeMs >= OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS) {
     const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
     if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {

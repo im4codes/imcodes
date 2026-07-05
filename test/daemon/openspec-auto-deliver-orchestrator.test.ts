@@ -1881,7 +1881,18 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      2500,
+    );
+    const failedTerminal = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+        && msg.projection?.status === 'failed',
+      );
+    expect(failedTerminal).toBeUndefined();
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.finalAfterRepair).toMatchObject({
       phase: 'final_after_repair',
