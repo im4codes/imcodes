@@ -285,6 +285,8 @@ type LocalQueuedTransportEntry = {
   text: string;
   status?: 'sending' | 'queued' | 'failed';
   sharedActor?: SharedActorEnvelope;
+  /** Queue version visible when this local optimistic entry was created. */
+  queuedAfterVersion?: number;
 };
 
 function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
@@ -1492,6 +1494,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries((prev) => {
         if (!prev) return null;
         const remaining = prev.filter((entry) => !incomingIds.has(entry.clientMessageId));
+        if (remaining.length === prev.length) return prev;
         return remaining.length > 0 ? remaining : null;
       });
     } else if ((incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) || emptySnapshotAdvanced) {
@@ -1499,6 +1502,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (!prev) return null;
         if (emptySnapshotAdvanced) return null;
         const remaining = prev.filter((entry) => !previousIds.has(entry.clientMessageId));
+        if (remaining.length === prev.length) return prev;
+        return remaining.length > 0 ? remaining : null;
+      });
+    }
+    if (incomingQueuedTransportEntries.length === 0 && incomingQueuedTransportVersion !== undefined) {
+      // Race guard: a fast daemon drain can advance the authoritative empty
+      // queue before Preact commits the local optimistic entry. Re-check local
+      // entries against the version they were created after so an already-
+      // drained optimistic card cannot linger in the frontend queue, while a
+      // new send created after the current empty baseline is preserved.
+      setOptimisticQueuedEntries((prev) => {
+        if (!prev) return null;
+        const remaining = prev.filter((entry) => (
+          entry.queuedAfterVersion === undefined
+          || incomingQueuedTransportVersion <= entry.queuedAfterVersion
+        ));
+        if (remaining.length === prev.length) return prev;
         return remaining.length > 0 ? remaining : null;
       });
     }
@@ -1506,7 +1526,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
     lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
     lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
-  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion]);
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion, optimisticQueuedEntries]);
 
   useEffect(() => {
     if (!ws || !activeSession) return;
@@ -3001,6 +3021,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           clientMessageId: commandId,
           text: payload.text,
           status: localFailure || failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+          queuedAfterVersion: incomingQueuedTransportVersion,
         }];
       });
     }
@@ -3025,7 +3046,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -3082,10 +3103,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         clientMessageId: commandId,
         text: entry.text,
         status: failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+        queuedAfterVersion: incomingQueuedTransportVersion,
       });
       return next;
     });
-  }, [sendSessionMessage]);
+  }, [incomingQueuedTransportVersion, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;

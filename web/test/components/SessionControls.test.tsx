@@ -3515,6 +3515,72 @@ afterEach(() => {
     expect(screen.queryByText('sent while browser was offline')).toBeNull();
   });
 
+  it('keeps a new local queue entry when the empty daemon baseline has not advanced', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 7,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'new send after empty baseline';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(screen.getByText('new send after empty baseline')).toBeDefined();
+  });
+
+  it('clears a local queued entry when an empty daemon baseline advances after the send', async () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 7,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'fast drained local send';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('fast drained local send')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 8,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryByText('fast drained local send')).toBeNull());
+  });
+
   it('does not clear an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
     const ws = makeWs();
     render(
