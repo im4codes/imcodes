@@ -90,6 +90,7 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
+import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import {
@@ -1840,6 +1841,10 @@ async function handleCodexResetCreditsConsume(cmd: Record<string, unknown>, serv
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const idempotencyKey = typeof cmd.idempotencyKey === 'string' ? cmd.idempotencyKey : '';
   const result = await consumeCodexResetCredit(idempotencyKey);
+  if (result.ok) {
+    void refreshCodexQuotaMetadataForSessions('codex_reset_credit_consume')
+      .catch((err) => logger.warn({ err }, 'codex reset-credit quota refresh failed'));
+  }
   if (!requestId) return;
   serverLink?.send(result.ok
     ? { type: CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE, requestId, ok: true, outcome: result.outcome }
