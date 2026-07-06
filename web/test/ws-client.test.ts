@@ -6,6 +6,8 @@ import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
+import { FS_WRITE_MAX_BYTES } from '@shared/fs-write-limits.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -1703,6 +1705,30 @@ describe('WsClient', () => {
     it('sendUrgent() STILL throws when disconnected (preserves HTTP fallback)', () => {
       const client = new WsClient('http://localhost:8787', 'srv-1');
       expect(() => client.sendUrgent({ type: 'session.stop', sessionName: 's' })).toThrow(/not connected/i);
+    });
+  });
+
+  describe('fs.write payload limits', () => {
+    it('allows daemon-sized file saves above the default small message cap', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const content = 'x'.repeat(70_000);
+
+      const requestId = client.fsWriteFile('/tmp/big.txt', content);
+
+      expect(requestId).toBeTruthy();
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      const sent = JSON.parse(lastWs!.send.mock.calls[0]![0] as string);
+      expect(sent).toMatchObject({ type: 'fs.write', path: '/tmp/big.txt', content });
+    });
+
+    it('fails before sending when content exceeds the daemon file-save limit', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const content = 'x'.repeat(FS_WRITE_MAX_BYTES + 1);
+
+      expect(() => client.fsWriteFile('/tmp/too-big.txt', content)).toThrow(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+      expect(lastWs!.send).not.toHaveBeenCalled();
     });
   });
 

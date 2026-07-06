@@ -74,6 +74,11 @@ function getLanguageExtension(path: string) {
   }
 }
 
+function isFileTooLargeSaveError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE || message.includes('Message too large');
+}
+
 export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
@@ -153,7 +158,15 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
     }
     setSaveStatus('saving');
     setSaveError(null);
-    const requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
+    let requestId: string;
+    try {
+      requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
+    } catch (error) {
+      setSaveStatus('error');
+      setSaveError(isFileTooLargeSaveError(error) ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
+      resetSavingAfterDelay('error');
+      return;
+    }
     pendingWriteRef.current.set(requestId, path);
     const tid = setTimeout(() => {
       if (pendingWriteRef.current.has(requestId)) {

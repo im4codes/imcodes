@@ -925,6 +925,7 @@ import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
@@ -9341,7 +9342,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const resolved = nodePath.resolve(expanded);
 
   // Size check first (cheap, before any I/O)
-  if (Buffer.byteLength(content, 'utf-8') > 1_048_576) {
+  if (Buffer.byteLength(content, 'utf-8') > FS_WRITE_MAX_BYTES) {
     try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }); } catch { /* ignore */ }
     return;
   }

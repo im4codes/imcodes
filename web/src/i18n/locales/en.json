@@ -1784,7 +1784,7 @@
     "conflictCancel": "Cancel",
     "saveSuccess": "Saved",
     "saveError": "Save failed",
-    "fileTooLarge": "File too large to save (> 1 MB)",
+    "fileTooLarge": "File too large to save (> 5 MB)",
     "saveTimeout": "Save timed out — please reload file",
     "copyPath": "Copy path",
     "copied": "Copied!",

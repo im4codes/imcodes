@@ -39,6 +39,7 @@ const mockWriteFile = vi.mocked(fsp.writeFile);
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
 import * as sessionStore from '../../src/store/session-store.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_ERROR } from '../../src/shared/transport/fs.js';
 
@@ -96,9 +97,33 @@ describe('fs.write handler', () => {
     });
   });
 
-  it('returns file_too_large when content exceeds 1MB', async () => {
+  it('writes content above 1MB when it is within the 5MB save limit', async () => {
+    const allowedPath = path.join(homedir(), 'medium-file.txt');
+    const mediumContent = 'x'.repeat(1_048_577);
+
+    mockStat
+      .mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
+      .mockResolvedValueOnce({ mtimeMs: 2000 } as fsp.Stats);
+    mockRealpath
+      .mockResolvedValueOnce(homedir() as unknown as string)
+      .mockResolvedValueOnce(allowedPath as unknown as string);
+    mockLstat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockWriteFile.mockResolvedValueOnce(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: allowedPath, content: mediumContent, requestId: 'req-medium' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).toHaveBeenCalledWith(allowedPath, mediumContent, { encoding: 'utf-8', flag: 'wx' });
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-medium',
+      status: 'ok',
+    });
+  });
+
+  it('returns file_too_large when content exceeds 5MB', async () => {
     const allowedPath = path.join(homedir(), 'big-file.txt');
-    const largeContent = 'x'.repeat(1_048_577); // > 1MB
+    const largeContent = 'x'.repeat(FS_WRITE_MAX_BYTES + 1);
 
     handleWebCommand({ type: 'fs.write', path: allowedPath, content: largeContent, requestId: 'req-toolarge' }, mockServerLink as any);
     await flushAsync();
@@ -113,10 +138,11 @@ describe('fs.write handler', () => {
 
   it('uses Buffer.byteLength for size check (not string.length)', async () => {
     // A string of CJK characters: each is 3 bytes in UTF-8
-    // 349526 chars × 3 bytes = 1048578 bytes > 1MB
+    // This is under 5MB by character count but over 5MB by UTF-8 bytes.
     const allowedPath = path.join(homedir(), 'cjk-file.txt');
-    const cjkContent = '中'.repeat(349526);
-    expect(Buffer.byteLength(cjkContent, 'utf-8')).toBeGreaterThan(1_048_576);
+    const cjkContent = '中'.repeat(Math.floor(FS_WRITE_MAX_BYTES / 3) + 1);
+    expect(cjkContent.length).toBeLessThanOrEqual(FS_WRITE_MAX_BYTES);
+    expect(Buffer.byteLength(cjkContent, 'utf-8')).toBeGreaterThan(FS_WRITE_MAX_BYTES);
 
     handleWebCommand({ type: 'fs.write', path: allowedPath, content: cjkContent, requestId: 'req-cjk-toolarge' }, mockServerLink as any);
     await flushAsync();

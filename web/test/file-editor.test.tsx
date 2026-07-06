@@ -321,6 +321,34 @@ describe('FileEditor', () => {
   });
 
   describe('timeout timer cleanup', () => {
+    it('clears saving when fsWriteFile throws synchronously', () => {
+      const ws = makeWs();
+      ws.fsWriteFile.mockImplementation(() => {
+        throw new Error('Message too large');
+      });
+      const { onMessage } = makeOnMessage();
+      render(
+        <FileEditor
+          ws={ws as any}
+          path="/file.txt"
+          content="c"
+          currentContent="edited"
+          mtime={1000}
+          isDirty={true}
+          onClose={vi.fn()}
+          onSaved={vi.fn()}
+          onMessage={onMessage}
+        />
+      );
+
+      fireEvent.click(screen.getByText('fileBrowser.save'));
+
+      expect(ws.fsWriteFile).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('fileBrowser.fileTooLarge')).toBeTruthy();
+      expect(screen.getByText('fileBrowser.save')).toBeTruthy();
+      expect(screen.queryByText('fileBrowser.saving')).toBeNull();
+    });
+
     it('does not enter saving when websocket is disconnected', () => {
       const ws = makeWs();
       ws.connected = false;

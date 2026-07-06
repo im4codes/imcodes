@@ -1,0 +1,2 @@
+export const FS_WRITE_MAX_BYTES = 5 * 1024 * 1024;
+export const FS_WRITE_OUTBOUND_WS_MAX_BYTES = FS_WRITE_MAX_BYTES * 2 + 64 * 1024;

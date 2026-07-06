@@ -16,6 +16,8 @@ import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
+import { FS_WRITE_MAX_BYTES, FS_WRITE_OUTBOUND_WS_MAX_BYTES } from '@shared/fs-write-limits.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -292,6 +294,7 @@ const WS_TICKET_TIMEOUT_MS = 30_000;
 const WS_OPEN_TIMEOUT_MS = 15_000;
 const RESUME_FORCE_STALE_PONG_MS = 30_000;
 const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES = 60_000;
 /** If we received a pong within this window, treat the socket as already
  *  proven alive and skip the resume probe. This eliminates UI churn (and the
  *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
@@ -326,6 +329,16 @@ function compactP2pWorkflowRequestScope(scope: P2pWorkflowRequestScope | null | 
   if (scope?.projectDir?.trim()) compacted.projectDir = scope.projectDir.trim();
   if (scope?.cwd?.trim()) compacted.cwd = scope.cwd.trim();
   return compacted;
+}
+
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
+function maxOutboundMessageBytes(msg: object): number {
+  return (msg as { type?: unknown }).type === 'fs.write'
+    ? FS_WRITE_OUTBOUND_WS_MAX_BYTES
+    : DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES;
 }
 
 export class WsClient {
@@ -509,7 +522,7 @@ export class WsClient {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
-    if (json.length > 60_000) {
+    if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
       throw new Error('Message too large');
     }
     return json;
@@ -575,7 +588,7 @@ export class WsClient {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
-    if (json.length > 60_000) {
+    if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
       throw new Error('Message too large');
     }
     this.ws.send(json);
@@ -1299,6 +1312,9 @@ export class WsClient {
   fsWriteFile(path: string, content: string, expectedMtime?: number): string;
   fsWriteFile(path: string, content: string, options?: FsWriteOptions): string;
   fsWriteFile(path: string, content: string, expectedMtimeOrOptions?: number | FsWriteOptions): string {
+    if (utf8ByteLength(content) > FS_WRITE_MAX_BYTES) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
     const requestId = crypto.randomUUID();
     const options = typeof expectedMtimeOrOptions === 'object' ? expectedMtimeOrOptions : undefined;
     const expectedMtime = typeof expectedMtimeOrOptions === 'number' ? expectedMtimeOrOptions : options?.expectedMtime;
