@@ -450,7 +450,6 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         this._lastProviderOutputAt = this._lastActivityAt;
-        this._activeDispatchHasSideEffectEvidence = true;
         if (this._activeDispatchCancelled) return;
         // A delta with no active turn is a late/stray callback from an
         // already-settled turn (provider callbacks are not dispatch-id scoped).
@@ -1899,7 +1898,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private makeSdkTurnLostFailure(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): ProviderError {
     return {
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-      message: 'Codex SDK turn was lost and automatic replay was not safe. Please review the session and resend if appropriate.',
+      message: 'Codex SDK turn ended before completion. Please continue or resend if appropriate.',
       recoverable: false,
       details: {
         reason: SDK_TURN_LOST_RECOVERY_REASON,
@@ -1947,6 +1946,36 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.setStatus('error');
   }
 
+  private settleSdkTurnLostWithoutReplay(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): void {
+    const existingAttempt = this._sdkTurnLostRecoveryAttempt;
+    if (existingAttempt) existingAttempt.status = 'failed';
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: metadata.classifier,
+        replayDecision,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport runtime sdk turn lost after side effects; preserving emitted output and settling without replay',
+    );
+    this.closeOpenTools('errored', 'provider_error');
+    this._sending = false;
+    this._activeTurn?.resolve();
+    this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchHasSideEffectEvidence = false;
+    this._sdkTurnLostRecoveryAttempt = null;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+    this._activeDispatchEntries = [];
+    if (!this._drainPending()) this.setStatus('idle');
+  }
+
   private handleSdkTurnLostRecovery(error: ProviderError): boolean {
     const unscopedMetadata = readSdkTurnLostRecoveryMetadata(error);
     if (!unscopedMetadata) return false;
@@ -1966,6 +1995,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
       return true;
     }
+    if (metadata.replayDecision === 'unsafe_side_effect') {
+      this.settleSdkTurnLostWithoutReplay(metadata, metadata.replayDecision);
+      return true;
+    }
     if (metadata.replayDecision !== 'pending' && metadata.replayDecision !== 'safe_replay') {
       this.failSdkTurnLostRecovery(metadata, metadata.replayDecision);
       return true;
@@ -1975,7 +2008,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return true;
     }
     if (this._activeDispatchHasSideEffectEvidence || this._openTools.size > 0) {
-      this.failSdkTurnLostRecovery(metadata, 'unsafe_side_effect');
+      this.settleSdkTurnLostWithoutReplay(metadata, 'unsafe_side_effect');
       return true;
     }
     if (!this.consumeSdkTurnLostRecoveryBudget(metadata)) {

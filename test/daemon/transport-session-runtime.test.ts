@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import { PROVIDER_ERROR_CODES, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -1564,14 +1564,51 @@ describe('TransportSessionRuntime', () => {
     expect((recoveredCalls[0]?.[2] as Record<string, unknown>).correlationId).toBe('corr-1');
   });
 
-  it.each([
-    ['assistant output', (_r: TransportSessionRuntime, m: ReturnType<typeof makeMockProvider>) => m.fireDelta('sess-1'), sdkTurnLostError()],
-    ['provider tool call', (_r: TransportSessionRuntime, m: ReturnType<typeof makeMockProvider>) => m.fireTool('sess-1', { id: 'tool-1', name: 'Bash', status: 'running' }), sdkTurnLostError()],
-    ['ambiguous heartbeat evidence', () => undefined, sdkTurnLostError({ replayDecision: 'unsafe_ambiguous' })],
-  ])('denies unsafe sdk_turn_lost replay after %s', async (_name, makeUnsafe, error) => {
+  it('allows sdk_turn_lost replay after assistant output only', async () => {
+    expect(runtime.send('lost after text delta', 'msg-delta')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireDelta('sess-1');
+
+    mock.fireError('sess-1', sdkTurnLostError());
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'lost after text delta',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    }));
+  });
+
+  it('settles sdk_turn_lost after provider side effects without replaying or entering hard error', async () => {
     expect(runtime.send('unsafe lost turn', 'msg-unsafe')).toBe('sent');
     await waitForProviderSendCount(mock.provider, 1);
-    makeUnsafe(runtime, mock);
+    expect(runtime.send('queued after unsafe', 'msg-after-unsafe')).toBe('queued');
+    mock.fireTool('sess-1', { id: 'tool-1', name: 'Bash', status: 'running' });
+
+    mock.fireError('sess-1', sdkTurnLostError());
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after unsafe',
+    }));
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.activeDispatchEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-after-unsafe']);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    const recoveryStatusCalls = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain' && call[1] === 'agent.status')
+      .map((call) => call[2] as Record<string, unknown>)
+      .filter((payload) => payload.status === SDK_TURN_LOST_RECOVERY_STATUS);
+    expect(recoveryStatusCalls).toEqual([]);
+    expect(timelineEmitterEmitMock.mock.calls.some((call) => call[1] === 'session.state' && (call[2] as { state?: string }).state === 'error')).toBe(false);
+  });
+
+  it.each([
+    ['ambiguous heartbeat evidence', sdkTurnLostError({ replayDecision: 'unsafe_ambiguous' })],
+  ])('denies unsafe sdk_turn_lost replay after %s', async (_name, error) => {
+    expect(runtime.send('unsafe lost turn', 'msg-unsafe')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
 
     mock.fireError('sess-1', error);
     await flushDispatch();
@@ -1594,7 +1631,7 @@ describe('TransportSessionRuntime', () => {
     await flushDispatch();
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
     expect(runtime.getStatus()).toBe('error');
-    expect(runtime.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/automatic replay was not safe/i);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/ended before completion/i);
 
     const freshProvider = makeMockProvider();
     const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_test_brain');
@@ -1610,7 +1647,7 @@ describe('TransportSessionRuntime', () => {
 
     expect(freshProvider.provider.send).toHaveBeenCalledTimes(1);
     expect(fresh.getStatus()).toBe('error');
-    expect(fresh.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/automatic replay was not safe/i);
+    expect(fresh.getDiagnosticSnapshot().lastProviderError?.message).toMatch(/ended before completion/i);
   });
 
   it('treats stopped-generation provider_tool_item evidence as non-blocking but keeps ordinary stale and unattributed snapshots blocking', async () => {

@@ -78,7 +78,7 @@ const SDK_TURN_LOST_RECOVERY_PHASE_LABELS: Record<SdkTurnLostRecoveryPhase, stri
   [SDK_TURN_LOST_RECOVERY_PHASES.DETECTED]: 'Detected lost Codex SDK turn',
   [SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING]: 'Recovering lost Codex SDK turn',
   [SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED]: 'Recovered lost Codex SDK turn',
-  [SDK_TURN_LOST_RECOVERY_PHASES.FAILED]: 'Lost Codex SDK turn recovery needs user action',
+  [SDK_TURN_LOST_RECOVERY_PHASES.FAILED]: 'Codex turn ended before completion',
 };
 
 function sdkTurnLostRecoveryPhaseFromMetadata(
