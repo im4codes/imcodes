@@ -22,6 +22,7 @@ import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { SharedContextManagementPanel } from './SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
@@ -51,9 +52,16 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
+  const timelineSessionState = useMemo(() => getTailSessionState(events), [events]);
   const liveSessionState = useMemo(
-    () => getTailSessionState(events) ?? liveSub?.state ?? null,
-    [events, liveSub?.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: liveSub?.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, liveSub?.state, timelineSessionState],
   );
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 

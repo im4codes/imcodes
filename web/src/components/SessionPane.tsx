@@ -16,6 +16,7 @@ import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hoo
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
@@ -251,9 +252,16 @@ export function SessionPane({
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
+  const timelineSessionState = useMemo(() => getTailSessionState(timelineEvents), [timelineEvents]);
   const liveSessionState = useMemo(
-    () => getTailSessionState(timelineEvents) ?? session.state ?? null,
-    [timelineEvents, session.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: session.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.state, timelineSessionState],
   );
   // shell / script sessions have no agent state, no token usage, no quota —
   // suppress the footer entirely so they don't see misleading "Agent

@@ -566,10 +566,11 @@ describe('SubSessionWindow metadata wiring', () => {
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
   });
 
-  it('prefers timeline tail running state over stale outer idle state for footer status', async () => {
+  it('uses authoritative outer idle when stale timeline running has no active work', async () => {
     timelineEventsMock = [
       { type: 'session.state', payload: { state: 'running' } },
-      { type: 'tool.result', payload: { ok: true } },
+      { type: 'assistant.text', payload: { text: 'done', streaming: false } },
+      { type: 'usage.update', payload: { inputTokens: 1, outputTokens: 1 } },
     ];
 
     const sub = makeSubSession({
@@ -597,7 +598,7 @@ describe('SubSessionWindow metadata wiring', () => {
 
     await waitFor(() => {
       const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
-      expect(footer?.dataset.state).toBe('running');
+      expect(footer?.dataset.state).toBe('idle');
     });
   });
 

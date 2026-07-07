@@ -6,6 +6,7 @@ import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } fr
 import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
@@ -291,9 +292,16 @@ export function SubSessionWindow({
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
+  const timelineSessionState = useMemo(() => getTailSessionState(events), [events]);
   const liveSessionState = useMemo(
-    () => getTailSessionState(events) ?? sub.state ?? null,
-    [events, sub.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: sub.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.state, timelineSessionState],
   );
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own
