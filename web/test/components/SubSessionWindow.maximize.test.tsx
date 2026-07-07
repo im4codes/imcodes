@@ -39,6 +39,7 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => false,
+  getTailSessionStateInfo: () => ({ state: null, ts: null }),
   getTailSessionState: () => null,
 }));
 
