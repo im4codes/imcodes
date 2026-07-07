@@ -13,7 +13,7 @@ import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
@@ -252,7 +252,9 @@ export function SessionPane({
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
-  const timelineSessionState = useMemo(() => getTailSessionState(timelineEvents), [timelineEvents]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(timelineEvents), [timelineEvents]);
+  const timelineLastEventTs = timelineEvents.at(-1)?.ts ?? null;
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
       timelineState: timelineSessionState,
@@ -260,8 +262,10 @@ export function SessionPane({
       activeThinking: !!activeThinkingTs,
       activeToolCall,
       activeTransportTurn: activeTimelineTurn,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
     }),
-    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.state, timelineSessionState],
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   // shell / script sessions have no agent state, no token usage, no quota —
   // suppress the footer entirely so they don't see misleading "Agent

@@ -31,6 +31,32 @@ describe('session-live-status', () => {
     })).toBe('idle');
   });
 
+  it('keeps fresh timeline running over a not-yet-caught-up idle snapshot', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+      timelineStateTs: 1_000,
+      timelineLastEventTs: 55_000,
+      now: 60_000,
+    })).toBe('running');
+  });
+
+  it('lets idle win once timeline running has gone stale without active evidence', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+      timelineStateTs: 1_000,
+      timelineLastEventTs: 30_000,
+      now: 100_001,
+    })).toBe('idle');
+  });
+
   it('keeps timeline running when active work evidence is still present', () => {
     expect(resolveTimelineBackedSessionState({
       timelineState: 'running',

@@ -4,7 +4,7 @@
  */
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { formatLabel } from '../format-label.js';
@@ -292,7 +292,9 @@ export function SubSessionWindow({
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
-  const timelineSessionState = useMemo(() => getTailSessionState(events), [events]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
+  const timelineLastEventTs = events.at(-1)?.ts ?? null;
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
       timelineState: timelineSessionState,
@@ -300,8 +302,10 @@ export function SubSessionWindow({
       activeThinking: !!activeThinkingTs,
       activeToolCall,
       activeTransportTurn: activeTimelineTurn,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
     }),
-    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.state, timelineSessionState],
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own

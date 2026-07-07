@@ -68,9 +68,22 @@ export interface ResolveTimelineBackedSessionStateInput {
   activeThinking?: boolean;
   activeToolCall?: boolean;
   activeTransportTurn?: boolean;
+  timelineStateTs?: number | null;
+  timelineLastEventTs?: number | null;
+  now?: number;
 }
 
 const NON_RUNNING_AUTHORITATIVE_STATES = new Set(['idle', 'stopped', 'stopping', 'error']);
+const TIMELINE_RUNNING_STALE_MS = 60_000;
+
+function isFreshTimelineRunningEvidence(input: ResolveTimelineBackedSessionStateInput): boolean {
+  const now = typeof input.now === 'number' && Number.isFinite(input.now) ? input.now : Date.now();
+  const candidates = [input.timelineLastEventTs, input.timelineStateTs]
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  if (candidates.length === 0) return false;
+  const latestTs = Math.max(...candidates);
+  return now - latestTs <= TIMELINE_RUNNING_STALE_MS;
+}
 
 /**
  * Timeline state is a low-latency hint, but the session store is the daemon's
@@ -91,7 +104,7 @@ export function resolveTimelineBackedSessionState(input: ResolveTimelineBackedSe
     && input.activeToolCall !== true
     && input.activeTransportTurn !== true
   ) {
-    return sessionState;
+    return isFreshTimelineRunningEvidence(input) ? timelineState : sessionState;
   }
   return timelineState ?? sessionState ?? null;
 }

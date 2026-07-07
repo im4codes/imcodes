@@ -72,6 +72,14 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => activeToolCallMock,
+  getTailSessionStateInfo: (events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>) => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'session.state') {
+        return { state: String(events[i].payload?.state ?? ''), ts: events[i].ts ?? null };
+      }
+    }
+    return { state: null, ts: null };
+  },
   getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');

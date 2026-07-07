@@ -14,7 +14,7 @@ import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { UsageFooter } from './UsageFooter.js';
 import { extractLatestUsage } from '../usage-data.js';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
@@ -52,7 +52,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
-  const timelineSessionState = useMemo(() => getTailSessionState(events), [events]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
+  const timelineLastEventTs = events.at(-1)?.ts ?? null;
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
       timelineState: timelineSessionState,
@@ -60,8 +62,10 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
       activeThinking: !!activeThinkingTs,
       activeToolCall,
       activeTransportTurn: activeTimelineTurn,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
     }),
-    [activeThinkingTs, activeTimelineTurn, activeToolCall, liveSub?.state, timelineSessionState],
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, liveSub?.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 
