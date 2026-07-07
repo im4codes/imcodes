@@ -95,6 +95,8 @@ function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null;
 interface Props {
   ws: WsClient | null;
   activeSession: SessionInfo | null;
+  /** React-owned browser/server WS state. Prefer this over ws.connected, which can change without a render. */
+  connected?: boolean;
   inputRef?: RefObject<HTMLDivElement>;
   /** Called after each shortcut/action button click — use to restore focus to xterm on desktop. */
   onAfterAction?: () => void;
@@ -825,7 +827,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1179,7 +1181,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, [activeSession?.name, effectiveRuntimeType]);
 
-  const connected = !!ws?.connected;
+  const connected = connectedProp ?? !!ws?.connected;
 
   useEffect(() => {
     if (!ws) return;

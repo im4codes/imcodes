@@ -493,6 +493,7 @@ export function SessionPane({
       {isActive && (
         <SessionControls
           ws={ws}
+          connected={connected}
           activeSession={controlsSession}
           inputRef={inputRef}
           onAfterAction={onAfterAction}

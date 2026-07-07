@@ -140,7 +140,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
-      isActiveSession: !!isFocused,
+      // Open cards are active timeline consumers even when not focused. Keeping
+      // only the focused card active let open sub-session previews miss history
+      // retry/replay until the user clicked or switched windows.
+      isActiveSession: !!(isOpen || isFocused),
       // Keep the live timeline hook attached even while preview hydration is
       // delayed. Without this, sub-session cards miss the typewriter phase and
       // only jump to cached/final text when the timer flips `timelineHydrated`.
@@ -451,6 +454,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
             {quickData ? (
               <SessionControls
                 ws={ws}
+                connected={connected}
                 activeSession={sessionInfo}
                 quickData={quickData}
                 compact

@@ -707,6 +707,21 @@ afterEach(() => {
     expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
   });
 
+
+  it('uses the parent connected prop instead of a stale ws.connected getter', () => {
+    const ws = makeWs() as any;
+    ws.connected = false;
+    render(
+      <SessionControls
+        ws={ws}
+        connected={true}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste or drag upload');
+  });
+
   it('hides the send button on mobile and shows the embedded voice button when empty', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);

@@ -274,9 +274,10 @@ export function SubSessionWindow({
     hasOlderHistory,
     loadOlderEvents,
   } = useTimeline(sub.sessionName, ws, serverId, {
-    isActiveSession: active,
-    // Window mounted = visible; participate in resume broadcast even when
-    // minimized/inactive so timeline stays fresh on focus / online / probe.
+    // Any mounted sub-session window is user-visible work, even when it is not
+    // the focused/topmost one. Keep its active history/replay/retry path armed
+    // so timeline gaps do not wait for a focus/window switch to backfill.
+    isActiveSession: true,
     isVisible: true,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
@@ -977,6 +978,7 @@ export function SubSessionWindow({
       {/* Full SessionControls — with sub-session action overrides */}
       <SessionControls
         ws={ws}
+        connected={connected}
         activeSession={sessionInfo}
         inputRef={inputRef}
         quickData={quickData}

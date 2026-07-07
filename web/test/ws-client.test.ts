@@ -646,6 +646,39 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+
+  it('recovers a foreground probe when any current-socket message arrives', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    socket.send.mockClear();
+    handler.mockClear();
+
+    client.probeConnection();
+    expect(client.connected).toBe(false);
+
+    socket.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
+
+    expect(client.connected).toBe(true);
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.event',
+      event: 'connected',
+      reason: 'probe_recovered',
+    }));
+
+    socket.send.mockClear();
+    client.requestSessionList();
+    expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('get_sessions'));
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('send() is a safe no-op when not connected (does not throw)', () => {
     // Fire-and-forget transport must never throw to React effects/listeners —
     // an uncaught throw crashes the ChatView via the ErrorBoundary.

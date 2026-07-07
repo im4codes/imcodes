@@ -1208,6 +1208,38 @@ export class WsClient {
     }
   }
 
+  /**
+   * Any frame received on the current OPEN socket proves the browser/server path
+   * is alive. Probe recovery used to wait only for an explicit `pong`; if that
+   * pong was delayed/dropped while daemon-originated frames (session_list,
+   * timeline.event, transport deltas) kept arriving, `_connected` stayed false
+   * and all foreground refresh sends became silent no-ops until the user
+   * switched windows. Treat inbound traffic as liveness so active pages recover
+   * immediately without needing a focus/visibility nudge.
+   */
+  private markSocketAliveFromInboundFrame(): void {
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
+    if (this._pongTimer) {
+      clearTimeout(this._pongTimer);
+      this._pongTimer = null;
+    }
+    if (this._resumeProbeTimer) {
+      clearTimeout(this._resumeProbeTimer);
+      this._resumeProbeTimer = null;
+    }
+    if (this._connected) return;
+    this._connected = true;
+    this.flushSubscriptionDiffAfterProbeRecovery();
+    this.dispatch({
+      type: 'session.event',
+      event: 'connected',
+      session: '',
+      state: 'connected',
+      reason: 'probe_recovered',
+    });
+  }
+
   private handleDaemonHelloMessage(msg: ServerMessage): void {
     if (msg.type !== P2P_WORKFLOW_MSG.DAEMON_HELLO) return;
     const daemonId = typeof msg.daemonId === 'string' ? msg.daemonId.trim() : '';
@@ -1612,6 +1644,7 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       // Binary frame: raw PTY data
       if (ev.data instanceof ArrayBuffer) {
+        this.markSocketAliveFromInboundFrame();
         this.handleRawFrame(ev.data);
         return;
       }
@@ -1619,36 +1652,16 @@ export class WsClient {
       try {
         const msg = JSON.parse(ev.data as string) as ServerMessage;
         if (msg.type === 'pong') {
-          this._missedHeartbeatPongs = 0;
-          this._resumeProbeMisses = 0;
           this._lastPongAt = Date.now();
           if (this._pingSentAt !== null) {
             this._pingLatency = Date.now() - this._pingSentAt;
             this._pingSentAt = null;
             this._onLatency?.(this._pingLatency);
           }
-          // Clear the dead-socket watchdog — we just proved the socket is alive.
-          if (this._pongTimer) {
-            clearTimeout(this._pongTimer);
-            this._pongTimer = null;
-          }
-          if (this._resumeProbeTimer) {
-            clearTimeout(this._resumeProbeTimer);
-            this._resumeProbeTimer = null;
-            if (!this._connected) {
-              this._connected = true;
-              this.flushSubscriptionDiffAfterProbeRecovery();
-              this.dispatch({
-                type: 'session.event',
-                event: 'connected',
-                session: '',
-                state: 'connected',
-                reason: 'probe_recovered',
-              });
-            }
-          }
+          this.markSocketAliveFromInboundFrame();
           return;
         }
+        this.markSocketAliveFromInboundFrame();
         if (msg.type === 'terminal.stream_reset') {
           this.handleStreamReset(msg.session);
           this.dispatch(msg); // Let TerminalView know to reset terminal state
