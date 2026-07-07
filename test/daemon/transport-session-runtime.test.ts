@@ -3811,6 +3811,8 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(systemText).toMatch(/Exact session name: deck_identity_brain/);
     expect(systemText).toMatch(/Display label: Identity Brain/);
     expect(systemText).toMatch(/imcodes send/);
+    expect(systemText).toMatch(/full absolute filesystem path/);
+    expect(systemText).toMatch(/not a bare filename or relative path/);
 
     // Generated Image Reporting must NOT be in the per-turn assembly
     // payload — it now lives in Codex SDK baseInstructions tail.

@@ -2270,6 +2270,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       // on follow-up turns when the cached system text is rebuilt from
       // a slash-only tail. The 300-char user-authored cap stays in
       // force on `description` / `systemPrompt`; identity is peer-level.
+      // Shared runtime guidance (memory/progress/file-path) is suppressed
+      // for raw slash controls so the provider receives the control text
+      // exactly, without unrelated system context.
       // Generated Image Reporting is now appended in Codex SDK's own
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
@@ -2281,6 +2284,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         suppressMcpMemorySearchGuidance: isSlashControl,
         suppressAgentProgressGuidance: isSlashControl,
+        suppressFilePathReportingGuidance: isSlashControl,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,
