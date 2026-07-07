@@ -74,24 +74,15 @@ export interface ResolveTimelineBackedSessionStateInput {
 }
 
 const NON_RUNNING_AUTHORITATIVE_STATES = new Set(['idle', 'stopped', 'stopping', 'error']);
-const TIMELINE_RUNNING_STALE_MS = 60_000;
-
-function isFreshTimelineRunningEvidence(input: ResolveTimelineBackedSessionStateInput): boolean {
-  const now = typeof input.now === 'number' && Number.isFinite(input.now) ? input.now : Date.now();
-  const candidates = [input.timelineLastEventTs, input.timelineStateTs]
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
-  if (candidates.length === 0) return false;
-  const latestTs = Math.max(...candidates);
-  return now - latestTs <= TIMELINE_RUNNING_STALE_MS;
-}
 
 /**
  * Timeline state is a low-latency hint, but the session store is the daemon's
  * authoritative snapshot. If the frontend misses a later `session.state: idle`
  * event, a stale earlier `running` in the timeline must not pin the footer/input
  * as "working" forever. Let timeline running win only while it still has active
- * evidence (streaming/thinking/open tool/active transport turn); otherwise a
- * non-running authoritative session snapshot wins.
+ * evidence (streaming/thinking/open tool/active transport turn). Fresh but
+ * inactive tail events such as final assistant.text or usage.update must not
+ * revive an old running state over an authoritative idle snapshot.
  */
 export function resolveTimelineBackedSessionState(input: ResolveTimelineBackedSessionStateInput): string | null {
   const timelineState = input.timelineState ?? null;
@@ -104,7 +95,7 @@ export function resolveTimelineBackedSessionState(input: ResolveTimelineBackedSe
     && input.activeToolCall !== true
     && input.activeTransportTurn !== true
   ) {
-    return isFreshTimelineRunningEvidence(input) ? timelineState : sessionState;
+    return sessionState;
   }
   return timelineState ?? sessionState ?? null;
 }

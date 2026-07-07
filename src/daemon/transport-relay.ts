@@ -96,18 +96,26 @@ export function emitSdkTurnLostRecoveryPhase(
 ): boolean {
   const metadata = sanitizeSdkTurnLostRecoveryMetadata(input);
   if (!metadata) return false;
-  const explicitSession = metadata.sessionName ?? metadata.localSessionKey;
-  if (explicitSession && explicitSession !== sessionName) {
+  if (expectedProviderSessionId && metadata.providerSessionId && metadata.providerSessionId !== expectedProviderSessionId) {
+    logger.warn(
+      { sessionName, providerSid: expectedProviderSessionId, recoveryProviderSessionId: metadata.providerSessionId },
+      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting provider session metadata',
+    );
+    return false;
+  }
+  const providerSessionMatches = !!expectedProviderSessionId
+    && metadata.providerSessionId === expectedProviderSessionId;
+  if (metadata.sessionName && metadata.sessionName !== sessionName) {
     logger.warn(
       { sessionName, recoverySessionName: metadata.sessionName, recoveryLocalSessionKey: metadata.localSessionKey },
       'transport-relay: dropped sdk_turn_lost recovery phase with conflicting session metadata',
     );
     return false;
   }
-  if (expectedProviderSessionId && metadata.providerSessionId && metadata.providerSessionId !== expectedProviderSessionId) {
+  if (!metadata.sessionName && metadata.localSessionKey !== sessionName && !providerSessionMatches) {
     logger.warn(
-      { sessionName, providerSid: expectedProviderSessionId, recoveryProviderSessionId: metadata.providerSessionId },
-      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting provider session metadata',
+      { sessionName, recoverySessionName: metadata.sessionName, recoveryLocalSessionKey: metadata.localSessionKey },
+      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting session metadata',
     );
     return false;
   }

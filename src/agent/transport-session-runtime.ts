@@ -1948,9 +1948,16 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private handleSdkTurnLostRecovery(error: ProviderError): boolean {
-    const metadata = readSdkTurnLostRecoveryMetadata(error);
-    if (!metadata) return false;
-    if (metadata.localSessionKey !== this.sessionKey) return true;
+    const unscopedMetadata = readSdkTurnLostRecoveryMetadata(error);
+    if (!unscopedMetadata) return false;
+    const metadata = readSdkTurnLostRecoveryMetadata(error, {
+      expectedSessionName: this.sessionKey,
+      expectedProviderSessionId: this._providerSessionId ?? undefined,
+    }) ?? unscopedMetadata;
+    const belongsToRuntime = metadata.sessionName === this.sessionKey
+      || metadata.localSessionKey === this.sessionKey
+      || (!!this._providerSessionId && metadata.providerSessionId === this._providerSessionId);
+    if (!belongsToRuntime) return true;
     if (this._currentActivityGenerationLocallyCancelled || this._activeDispatchCancelled) {
       this.failSdkTurnLostRecovery(metadata, 'unsafe_terminal');
       return true;

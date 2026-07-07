@@ -293,7 +293,7 @@ export function SubSessionWindow({
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
-  const timelineLastEventTs = events.at(-1)?.ts ?? null;
+  const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
   const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({

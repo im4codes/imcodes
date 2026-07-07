@@ -31,7 +31,7 @@ describe('session-live-status', () => {
     })).toBe('idle');
   });
 
-  it('keeps fresh timeline running over a not-yet-caught-up idle snapshot', () => {
+  it('lets authoritative idle override fresh but inactive timeline running evidence', () => {
     expect(resolveTimelineBackedSessionState({
       timelineState: 'running',
       sessionState: 'idle',
@@ -41,7 +41,7 @@ describe('session-live-status', () => {
       timelineStateTs: 1_000,
       timelineLastEventTs: 55_000,
       now: 60_000,
-    })).toBe('running');
+    })).toBe('idle');
   });
 
   it('lets idle win once timeline running has gone stale without active evidence', () => {

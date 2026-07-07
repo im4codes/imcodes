@@ -149,24 +149,29 @@ function makeSearchResult(items: MemorySearchResultItem[]): MemorySearchResult {
 
 function sdkTurnLostError(options: {
   sessionKey?: string;
+  sessionName?: string | null;
+  localSessionKey?: string;
+  providerSessionId?: string;
   generation?: ActivityGeneration;
   classifier?: SdkTurnLostClassifier;
   replayDecision?: SdkTurnLostReplayDecision;
 } = {}): ProviderError {
+  const sessionKey = options.sessionKey ?? 'deck_test_brain';
   return {
     code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
     message: 'lost turn',
     recoverable: true,
     details: {
       reason: SDK_TURN_LOST_RECOVERY_REASON,
-      localSessionKey: options.sessionKey ?? 'deck_test_brain',
+      localSessionKey: options.localSessionKey ?? sessionKey,
+      ...(options.sessionName !== null ? { sessionName: options.sessionName ?? sessionKey } : {}),
       providerId: 'codex',
-      providerSessionId: 'sess-1',
+      providerSessionId: options.providerSessionId ?? 'sess-1',
       codexThreadId: 'thread-1',
       codexTurnId: 'turn-1',
       activityGeneration: options.generation ?? {
         scope: 'session',
-        sessionName: options.sessionKey ?? 'deck_test_brain',
+        sessionName: sessionKey,
         generation: 1,
       },
       heartbeatFailureCount: 1,
@@ -1487,6 +1492,47 @@ describe('TransportSessionRuntime', () => {
       userMessage: 'lost before callback',
       activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
     }));
+  });
+
+  it('accepts Codex sdk_turn_lost metadata keyed by provider route id when sessionName matches runtime', async () => {
+    expect(runtime.send('lost route-keyed turn', 'msg-route-keyed')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    mock.fireError('sess-1', sdkTurnLostError({
+      localSessionKey: 'codex-provider-route-id',
+      sessionKey: 'deck_test_brain',
+      providerSessionId: 'sess-1',
+    }));
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'lost route-keyed turn',
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    }));
+    expect(runtime.activeDispatchEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-route-keyed']);
+    const phaseCalls = timelineEmitterEmitMock.mock.calls
+      .filter((call) => call[0] === 'deck_test_brain' && call[1] === 'agent.status')
+      .map((call) => (call[2] as Record<string, unknown>).phase);
+    expect(phaseCalls).toEqual(expect.arrayContaining(['detected', 'recovering']));
+  });
+
+  it('ignores sdk_turn_lost metadata for another runtime without recording a generic provider error', async () => {
+    expect(runtime.send('active turn', 'msg-active-other-runtime')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    mock.fireError('sess-1', sdkTurnLostError({
+      localSessionKey: 'other-session',
+      sessionName: 'other-session',
+      providerSessionId: 'other-provider-session',
+    }));
+    await sleep(25);
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.getDiagnosticSnapshot().lastProviderError).toBeUndefined();
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.activeDispatchEntries.map((entry) => entry.clientMessageId)).toEqual(['msg-active-other-runtime']);
   });
 
   it('emits recovered only after replacement dispatch is accepted and produces post-acceptance strong activity', async () => {
