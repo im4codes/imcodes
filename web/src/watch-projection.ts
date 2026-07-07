@@ -185,7 +185,11 @@ const STATE_PRIORITY: Record<WatchSessionState, number> = {
 function normalizeState(state: string): WatchSessionState {
   const lower = state.toLowerCase();
   if (lower === 'working' || lower === 'running' || lower === 'queued' || lower === 'busy') return 'working';
-  if (lower === 'idle' || lower === 'waiting') return 'idle';
+  // `started` is a neutral lifecycle notification (session/runtime launched),
+  // not a terminal stop and not turn activity. Mapping it to `stopped` makes
+  // watch/list projections flap while the main UI still has historical
+  // timeline content; keep it idle until a real running/queued event arrives.
+  if (lower === 'idle' || lower === 'waiting' || lower === 'started') return 'idle';
   if (lower === 'error' || lower === 'failed') return 'error';
   return 'stopped';
 }

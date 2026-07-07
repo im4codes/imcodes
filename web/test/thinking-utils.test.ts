@@ -143,4 +143,15 @@ describe('getTailSessionState', () => {
       { type: 'tool.call', payload: { toolCallId: 'agent-1', tool: 'Codex Sub-agent', detail: sdkDetail } },
     ] as any)).toBe('idle');
   });
+
+  it('ignores neutral started notifications when deriving the active tail state', () => {
+    expect(getTailSessionState([
+      { type: 'session.state', ts: 1, payload: authoritativeIdlePayload },
+      { type: 'session.state', ts: 2, payload: { state: 'started' } },
+    ] as any)).toBe('idle');
+
+    expect(getTailSessionState([
+      { type: 'session.state', ts: 2, payload: { state: 'started' } },
+    ] as any)).toBe(null);
+  });
 });

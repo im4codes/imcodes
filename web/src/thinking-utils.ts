@@ -95,6 +95,14 @@ export function getTailSessionStateInfo(
     if (e.type !== 'session.state') continue;
     const state = e.payload?.state;
     const ts = typeof e.ts === 'number' && Number.isFinite(e.ts) ? e.ts : null;
+    // `started` is a lifecycle notification emitted when a daemon/session
+    // runtime is launched/restored. It is not evidence that a turn is active.
+    // Treating it as the latest live state makes the footer/controls disagree
+    // with the authoritative session snapshot after daemon restart: old
+    // history remains in the timeline, while a fresh `started` tail event is
+    // neither idle nor running. Skip it and keep looking for the last
+    // authoritative working/idle/error state.
+    if (state === 'started') continue;
     if (state === 'idle' && reduceTimelineActivity(events.slice(0, i + 1)).active) return { state: 'running', ts };
     return { state: typeof state === 'string' && state ? state : null, ts };
   }

@@ -141,6 +141,18 @@ describe('watch projection store', () => {
     expect(store.getSnapshot().sessions[0]?.state).toBe('working');
   });
 
+  it('treats started lifecycle notifications as idle rather than stopped', () => {
+    const { store } = makeSnapshotStore(2_550);
+    store.updateFromSessionList({ id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' }, [
+      { name: 'deck_proj_brain', project: 'Proj', role: 'brain', agentType: 'codex', state: 'started' },
+    ]);
+
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+
+    store.updateSessionState('deck_proj_brain', 'started');
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+  });
+
   it('does not treat legacy pendingCount or text-only queue fields as watch working evidence', () => {
     const { store } = makeSnapshotStore(2_600);
     store.updateFromSessionList(
