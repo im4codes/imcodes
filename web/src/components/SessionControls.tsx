@@ -2046,6 +2046,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerMultiline(false);
       return;
     }
+    // Skip the reflow while an IME is composing: reading scrollHeight to flip the
+    // multiline class realigns the composer box, which displaces the caret on
+    // every compositionupdate / candidate-bar toggle (a major "focus jumps"
+    // cause when typing CJK). The `input` event fired after `compositionend`
+    // (imeComposingRef already false) runs the deferred final sync.
+    if (imeComposingRef.current) return;
     const root = divRef.current;
     if (!root) return;
     const computed = window.getComputedStyle(root);
@@ -4894,6 +4900,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           {isMobileLayout && (mobileComposerMultiline || mobileComposerExpanded) && (
             <button
               class="btn btn-input-expand btn-input-expand-floating"
+              // Prevent the button from stealing focus / blurring the composer
+              // (same trick as the picker items below) so expanding/collapsing
+              // keeps the caret in place instead of the deferred focus() landing
+              // it at a default position — a "focus jumps" source on mobile.
+              onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 setMobileComposerExpanded((prev) => !prev);
                 setTimeout(() => divRef.current?.focus(), 0);

@@ -1267,7 +1267,15 @@ html.native-ios-mac .chat-dl-btn {
   .session-ctx-bar { width: 44px; }
   .controls-composer-mobile-expanded {
     position: fixed;
-    inset: calc(var(--sat, 0px) + 8px) 8px 8px;
+    /* Anchor the bottom to the VISUAL viewport: `--vvh` shrinks when the soft
+       keyboard opens, so the box ends at the keyboard top instead of behind it.
+       iOS Safari keeps `position: fixed` boxes against the full LAYOUT viewport,
+       so a literal `bottom` inset would draw the lower third (incl. the caret)
+       under the overlay keyboard. Falls back to 100dvh without visualViewport. */
+    top: calc(var(--sat, 0px) + 8px);
+    left: 8px;
+    right: 8px;
+    height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 16px);
     z-index: 4100;
     background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(8,13,22,0.98));
     border: 1px solid rgba(34,211,238,0.28);
