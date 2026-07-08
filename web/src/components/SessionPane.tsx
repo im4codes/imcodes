@@ -213,6 +213,10 @@ export function SessionPane({
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
+      // Retry replays the ORIGINAL send verbatim: `resendExtra` already carries
+      // the alias A′ map resolved when the user first composed it, so we must
+      // NOT re-resolve here (Cx1-2/Cx1-3) — re-resolving against the current
+      // list could change or leak values.
       ws.sendSessionCommand('send', {
         sessionName,
         text,
@@ -388,6 +392,8 @@ export function SessionPane({
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      // Alias A′ opt-out (Cx1-2): this is a generated memory-summary sync, not a
+      // human-composed message, so it deliberately carries no resolvedAliases.
       ws.sendSessionCommand('send', { sessionName, text, commandId });
       requestActiveTimelineRefreshAfterUserAction();
       if (hasChatTimeline) {

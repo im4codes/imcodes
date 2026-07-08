@@ -1147,7 +1147,17 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.send('second', 'msg-queued-2', undefined, preferencePreamble)).toBe('queued');
 
     expect(runtime.pendingMessages).toEqual(['second']);
+    // RV-B: the PUBLIC projection (diagnostics / status / UI) keeps only the
+    // user-visible text; the secret per-turn `messagePreamble` is NOT exposed.
     expect(runtime.pendingEntries).toEqual([
+      {
+        clientMessageId: 'msg-queued-2',
+        text: 'second',
+      },
+    ]);
+    expect(runtime.pendingEntries[0]).not.toHaveProperty('messagePreamble');
+    // The internal resend view still carries the preamble (delivery/preservation).
+    expect(runtime.pendingEntriesForResend).toEqual([
       {
         clientMessageId: 'msg-queued-2',
         text: 'second',
@@ -3838,5 +3848,127 @@ ${PREFERENCE_CONTEXT_END}`;
     const systemText = String(sent.systemText ?? '');
     expect(systemText).toMatch(/Exact session name: deck_unlabeled_brain/);
     expect(systemText).toMatch(/Display label: deck_unlabeled_brain/);
+  });
+
+  // ── Alias quick-insert (A′) providerText split ────────────────────────────
+  // Contract: `send(..., { providerText })` delivers `providerText` to the
+  // provider (and runtime history) while the ORIGINAL `message` remains the
+  // timeline copy (onDrain entry.text / pendingEntries.text). Must hold for the
+  // direct-send path, the busy→queued→drain path, AND the SQLite-rehydrated path.
+  describe('alias expansion (A′) — providerText routing', () => {
+    const ORIGINAL = 'deploy ;;(prod-host) now';
+    const EXPANDED =
+      'The ;;(name) markers below expand to values.\n;;(prod-host): prod.example.com\n\ndeploy ;;(prod-host) now';
+
+    it('direct send: provider + history get providerText; timeline copy stays the marker text', async () => {
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
+      expect(runtime.send(ORIGINAL, 'alias-direct-1', undefined, undefined, { providerText: EXPANDED })).toBe('sent');
+      await flushDispatch();
+      // Provider receives the expanded agent-bound copy.
+      expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: EXPANDED,
+        assembledMessage: expect.stringContaining(EXPANDED),
+      }));
+      // The marker text must NEVER be what the provider ran.
+      const sent = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+      expect(String(sent.userMessage)).not.toBe(ORIGINAL);
+      // Runtime history (replayed to the provider on later turns) carries the expanded copy.
+      expect(runtime.getHistory().some((m) => m.role === 'user' && m.content === EXPANDED)).toBe(true);
+      expect(runtime.getHistory().some((m) => m.role === 'user' && m.content === ORIGINAL)).toBe(false);
+    });
+
+    it('busy → queued → drain: onDrain timeline entry keeps the marker text, provider still gets the expanded text', async () => {
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
+      expect(runtime.send(ORIGINAL, 'alias-queued-1', undefined, undefined, { providerText: EXPANDED })).toBe('queued');
+      // RV-B: the PUBLIC queue projection (diagnostics / status / UI) keeps the
+      // ORIGINAL marker text and must NOT expose the expanded `providerText`.
+      expect(runtime.pendingEntries).toEqual([{ clientMessageId: 'alias-queued-1', text: ORIGINAL }]);
+      expect(runtime.pendingEntries[0]).not.toHaveProperty('providerText');
+      // The internal resend view still carries full material (preservation only).
+      expect(runtime.pendingEntriesForResend).toEqual([
+        { clientMessageId: 'alias-queued-1', text: ORIGINAL, providerText: EXPANDED },
+      ]);
+
+      // Free the active turn so the queued entry drains.
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+
+      // The deferred timeline emit (onDrain) uses the ORIGINAL marker text …
+      const drained = onDrainEntries.flat().find((e) => e.clientMessageId === 'alias-queued-1');
+      expect(drained?.text).toBe(ORIGINAL);
+      // … while the provider got the expanded agent-bound copy.
+      expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({
+        userMessage: EXPANDED,
+      }));
+    });
+
+    it('SQLite rehydrate after restart: providerText survives; provider gets expanded, timeline entry stays the marker', async () => {
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send(ORIGINAL, 'alias-rehydrate-1', undefined, undefined, { providerText: EXPANDED })).toBe('queued');
+
+      // Simulate a daemon restart: fresh runtime, same session, SQLite authority intact.
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+      await restarted.initialize(defaultConfig);
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      restarted.onDrain = (entries) => { onDrainEntries.push(entries); };
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      // RV-B: the rehydrated entry still delivers the expanded copy to the
+      // provider (asserted below), but the PUBLIC projection hides `providerText`.
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: 'alias-rehydrate-1', text: ORIGINAL },
+      ]);
+      expect(restarted.pendingEntries[0]).not.toHaveProperty('providerText');
+      // Full material survives internally for delivery / resend preservation.
+      expect(restarted.pendingEntriesForResend).toEqual([
+        { clientMessageId: 'alias-rehydrate-1', text: ORIGINAL, providerText: EXPANDED },
+      ]);
+
+      expect(restarted.drainPendingIfIdle('test')).toBe(true);
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect(restartMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: EXPANDED,
+      }));
+      const drained = onDrainEntries.flat().find((e) => e.clientMessageId === 'alias-rehydrate-1');
+      expect(drained?.text).toBe(ORIGINAL);
+    });
+
+    it('no providerText (common no-alias path) is byte-identical: provider runs the message text itself', async () => {
+      expect(runtime.send('plain message, no markers', 'noalias-1')).toBe('sent');
+      await flushDispatch();
+      expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: 'plain message, no markers',
+      }));
+      // No stray providerText is attached to the queue entry projection.
+      expect(runtime.getHistory().some((m) => m.role === 'user' && m.content === 'plain message, no markers')).toBe(true);
+    });
+
+    it('editing a queued entry drops any stale providerText (edited text is delivered verbatim)', async () => {
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send(ORIGINAL, 'alias-edit-1', undefined, undefined, { providerText: EXPANDED });
+      // Public projection hides providerText; internal resend view still has it.
+      expect(runtime.pendingEntries[0]).toEqual({ clientMessageId: 'alias-edit-1', text: ORIGINAL });
+      expect(runtime.pendingEntriesForResend[0]).toEqual({ clientMessageId: 'alias-edit-1', text: ORIGINAL, providerText: EXPANDED });
+
+      expect(runtime.editPendingMessage('alias-edit-1', 'edited plain text')).toBe(true);
+      // providerText cleared → the edited text is now both timeline and provider copy,
+      // in the public projection AND the internal resend view (no stale secret).
+      expect(runtime.pendingEntries[0]).toEqual({ clientMessageId: 'alias-edit-1', text: 'edited plain text' });
+      expect(runtime.pendingEntriesForResend[0]).toEqual({ clientMessageId: 'alias-edit-1', text: 'edited plain text' });
+
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+      expect(mock.provider.send).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({
+        userMessage: 'edited plain text',
+      }));
+    });
   });
 });

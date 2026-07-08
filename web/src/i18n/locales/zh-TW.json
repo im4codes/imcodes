@@ -1,4 +1,37 @@
 {
+  "alias": {
+    "feature_label": "別名",
+    "category": "別名",
+    "category_desc": "插入已儲存的別名標記",
+    "tab": "別名",
+    "field_name": "別名",
+    "field_value": "內容",
+    "field_description": "說明",
+    "add": "新增別名",
+    "edit": "編輯別名",
+    "delete": "刪除別名",
+    "delete_confirm": "確定刪除此別名？",
+    "save": "儲存",
+    "cancel": "取消",
+    "insert": "插入",
+    "empty": "尚無別名",
+    "empty_hint": "新增別名後，可用 ;;(名稱) 標記快速插入其內容。",
+    "no_results": "沒有符合的別名",
+    "search_placeholder": "搜尋別名",
+    "name_placeholder": "例如 deploy",
+    "value_placeholder": "此別名展開後的文字",
+    "description_placeholder": "選填備註（僅供搜尋）",
+    "error": {
+      "invalid_alias_name": "別名不合法。只能使用字母、數字、點、底線或連字號（最多 20 個字元）。",
+      "alias_value_invalid": "內容不合法。不能為空，且最多 500 個字元。",
+      "alias_description_invalid": "說明過長（最多 200 個字元）。",
+      "alias_not_found": "此別名已不存在。",
+      "alias_unresolved_failclosed": "此別名無法解析，已阻止傳送。",
+      "alias_tags_invalid": "標籤無效。最多 10 個標籤，每個不超過 30 個字元，且不能包含控制字元。",
+      "list_unavailable": "別名仍在載入或載入失敗，請稍後重試。",
+      "generic": "發生錯誤，請重試。"
+    }
+  },
   "common": {
     "cancel": "取消",
     "confirm": "確認",

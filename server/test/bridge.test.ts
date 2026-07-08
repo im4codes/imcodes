@@ -949,6 +949,50 @@ describe('WsBridge', () => {
     });
   });
 
+  // ── PP4: alias value secrecy on the browser→daemon session.send relay ───────
+  //
+  // The browser attaches an out-of-band `resolvedAliases` (alias name → alias
+  // plaintext, i.e. user secrets) map to a session.send. The bridge MUST forward
+  // that payload to the daemon INTACT (agent expansion depends on it) while never
+  // letting an alias value reach a server log/metric/diagnostic.
+  describe('alias resolvedAliases relay secrecy (PP4)', () => {
+    it('forwards resolvedAliases to the daemon intact but never logs the alias value', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      const secretValue = 'ssh secret-host';
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: 'deck_proj_brain',
+        commandId: 'send-1',
+        text: 'deploy now ;;(prod)',
+        resolvedAliases: { prod: secretValue },
+      }));
+      await flushAsync();
+
+      // (a) daemon received the payload with the alias value intact.
+      const forwarded = daemonWs.sentStrings.find((s) => s.includes('"type":"session.send"'));
+      expect(forwarded).toBeDefined();
+      const parsed = JSON.parse(forwarded!) as { resolvedAliases?: Record<string, string> };
+      expect(parsed.resolvedAliases).toEqual({ prod: secretValue });
+
+      // (b) the alias value never appears in ANY server log line.
+      const allLogs = [...logSpy.mock.calls, ...errSpy.mock.calls]
+        .map((call) => String(call[0]))
+        .join('\n');
+      expect(allLogs).not.toContain(secretValue);
+    });
+  });
+
   // ── Helpers shared by subscription / binary tests ─────────────────────────
 
   async function setupAuth() {

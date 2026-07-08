@@ -4,6 +4,15 @@ import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
 import { createSharedResource, type SharedResource } from '../stores/shared-resource.js';
 import { FileBrowser } from './file-browser-lazy.js';
+import { useAliases } from '../hooks/useAliases.js';
+import { AliasApiError } from '../api/aliases.js';
+import {
+  validateAliasName,
+  validateAliasValue,
+  validateAliasDescription,
+  validateAliasTags,
+  type AliasReason,
+} from '@shared/alias-types.js';
 import type { WsClient } from '../ws-client.js';
 import type { JSX, RefObject } from 'preact';
 
@@ -407,6 +416,8 @@ interface Props {
   ws?: WsClient | null;
   sessionCwd?: string;
   onAppendPaths?: (paths: string[]) => void;
+  /** Insert a `;;(name)` alias marker into the composer (never the value). */
+  onInsertAlias?: (name: string) => void;
   anchorRef?: RefObject<HTMLElement>;
 }
 
@@ -414,7 +425,7 @@ const HISTORY_PAGE_SIZE = 10;
 const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
-type QpTab = 'quick' | 'files';
+type QpTab = 'quick' | 'files' | 'alias';
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -432,7 +443,7 @@ export function QuickInputPanel({
   data, loaded,
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
-  ws, sessionCwd, onAppendPaths, anchorRef,
+  ws, sessionCwd, onAppendPaths, onInsertAlias, anchorRef,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -447,6 +458,22 @@ export function QuickInputPanel({
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
   const [insertedPaths, setInsertedPaths] = useState<string[]>([]);
   const [layoutTick, setLayoutTick] = useState(0);
+
+  // ── Alias tab state ──
+  // Server-authoritative alias data (create/remove invalidate the shared
+  // resource so every alias surface updates without a reload). We do NOT reuse
+  // the quick-data debounced storage path here — aliases persist immediately.
+  const [aliasSearch, setAliasSearch] = useState('');
+  const { aliases: allAliases, filtered: filteredAliases, create: createAlias, remove: removeAlias } = useAliases(aliasSearch);
+  // Alias editor: `null` = closed; `{ original: null }` = creating a new one;
+  // `{ original: name }` = editing that alias by its original name.
+  // `tags` is carried through the form (not yet user-editable) so that editing
+  // an existing alias PRESERVES its tags instead of the upsert clearing them,
+  // and so any tags we send are validated with the shared validator (Cx1-6).
+  const [aliasForm, setAliasForm] = useState<{ original: string | null; name: string; value: string; description: string; tags: string[] } | null>(null);
+  const [aliasError, setAliasError] = useState<AliasReason | 'generic' | null>(null);
+  const [aliasSaving, setAliasSaving] = useState(false);
+  const aliasNameInputRef = useRef<HTMLInputElement>(null);
 
   // Reset page when scope or session changes
   useEffect(() => { setHistoryPage(0); }, [historyScope, sessionName]);
@@ -486,6 +513,9 @@ export function QuickInputPanel({
   useEffect(() => {
     if (editingItem) setTimeout(() => editInputRef.current?.focus(), 50);
   }, [editingItem]);
+  useEffect(() => {
+    if (aliasForm) setTimeout(() => aliasNameInputRef.current?.focus(), 50);
+  }, [aliasForm]);
 
   const panelStyle = useMemo(() => {
     if (!open) return undefined; // skip computation when closed
@@ -586,21 +616,92 @@ export function QuickInputPanel({
     if (e.key === 'Escape') { setEditingItem(null); setEditValue(''); }
   };
 
+  // ── Alias tab handlers ──
+  const openAliasCreate = () => {
+    setAliasError(null);
+    setAliasForm({ original: null, name: '', value: '', description: '', tags: [] });
+  };
+  const openAliasEdit = (name: string) => {
+    const entry = allAliases.find((a) => a.name === name);
+    if (!entry) return;
+    setAliasError(null);
+    setAliasForm({ original: entry.name, name: entry.name, value: entry.value, description: entry.description ?? '', tags: entry.tags ?? [] });
+  };
+  const closeAliasForm = () => {
+    setAliasForm(null);
+    setAliasError(null);
+    setAliasSaving(false);
+  };
+
+  const commitAlias = async () => {
+    if (!aliasForm || aliasSaving) return;
+    const name = aliasForm.name.trim();
+    const value = aliasForm.value;
+    const description = aliasForm.description.trim();
+    const tags = aliasForm.tags;
+    // Client-side validation with the shared validators gives instant, localized
+    // feedback via the same reason codes the server enforces (server remains
+    // authoritative — its AliasApiError reason overrides on any mismatch).
+    const nameErr = validateAliasName(name);
+    if (nameErr) { setAliasError(nameErr); return; }
+    const valueErr = validateAliasValue(value);
+    if (valueErr) { setAliasError(valueErr); return; }
+    const descErr = validateAliasDescription(description || undefined);
+    if (descErr) { setAliasError(descErr); return; }
+    // Validate any tags we are about to send (Cx1-6). Tags are not yet
+    // user-editable in this form, but an edited alias carries its existing tags
+    // through, and the server rejects invalid ones — surface `alias_tags_invalid`.
+    const tagsErr = validateAliasTags(tags.length > 0 ? tags : undefined);
+    if (tagsErr) { setAliasError(tagsErr); return; }
+
+    setAliasSaving(true);
+    setAliasError(null);
+    try {
+      // Rename = upsert new name + delete the old record (name is the key).
+      await createAlias({ name, value, ...(description ? { description } : {}), ...(tags.length > 0 ? { tags } : {}) });
+      if (aliasForm.original && aliasForm.original !== name) {
+        await removeAlias(aliasForm.original);
+      }
+      closeAliasForm();
+    } catch (err) {
+      setAliasSaving(false);
+      const reason = err instanceof AliasApiError ? err.reason : null;
+      setAliasError(reason ?? 'generic');
+    }
+  };
+
+  const deleteAliasEntry = async (name: string) => {
+    if (!confirm(t('alias.delete_confirm'))) return;
+    try {
+      await removeAlias(name);
+    } catch {
+      // Removal failures are non-fatal for the UI; surface a generic notice.
+      setAliasError('generic');
+    }
+  };
+
+  const aliasErrorText = aliasError
+    ? (aliasError === 'generic' ? t('alias.error.generic') : t(`alias.error.${aliasError}`))
+    : null;
+
   const panel = (
     <>
       <div class="qp-backdrop" onClick={onClose} />
       <div class="qp" ref={panelRef} style={panelStyle}>
-        {/* Tab bar — shown when Files feature is available */}
-        {ws && (
-          <div class="qp-tabs">
-            <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
-              ⚡ {t('quick_input.tab_quick')}
-            </button>
+        {/* Tab bar — Quick + Alias always; Files only when a ws is available. */}
+        <div class="qp-tabs">
+          <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
+            ⚡ {t('quick_input.tab_quick')}
+          </button>
+          {ws && (
             <button class={`qp-tab${activeTab === 'files' ? ' active' : ''}`} onClick={() => setActiveTab('files')}>
               📁 {t('quick_input.tab_files')}
             </button>
-          </div>
-        )}
+          )}
+          <button class={`qp-tab${activeTab === 'alias' ? ' active' : ''}`} onClick={() => setActiveTab('alias')}>
+            🔖 {t('alias.tab')}
+          </button>
+        </div>
 
         {/* Files tab */}
         {activeTab === 'files' && ws && (
@@ -622,6 +723,68 @@ export function QuickInputPanel({
             }}
           />
         )}
+
+        {/* Alias tab — browse + create/edit/delete user aliases. Selecting one
+            inserts its `;;(name)` marker (never the value). */}
+        {activeTab === 'alias' && <>
+          <div class="qp-add-row">
+            <input
+              class="qp-add-input"
+              value={aliasSearch}
+              onInput={(e) => setAliasSearch((e.target as HTMLInputElement).value)}
+              placeholder={t('alias.search_placeholder')}
+            />
+            <button class="qp-add-confirm" title={t('alias.add')} onClick={openAliasCreate}>＋</button>
+          </div>
+
+          {aliasForm && (
+            <div class="qp-alias-form">
+              <input
+                ref={aliasNameInputRef}
+                class="qp-add-input"
+                value={aliasForm.name}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, name: (e.target as HTMLInputElement).value } : f)}
+                placeholder={t('alias.name_placeholder')}
+              />
+              <textarea
+                class="qp-add-input qp-alias-value"
+                value={aliasForm.value}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, value: (e.target as HTMLTextAreaElement).value } : f)}
+                placeholder={t('alias.value_placeholder')}
+                rows={3}
+              />
+              <input
+                class="qp-add-input"
+                value={aliasForm.description}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, description: (e.target as HTMLInputElement).value } : f)}
+                placeholder={t('alias.description_placeholder')}
+              />
+              {aliasErrorText && <div class="qp-alias-error" role="alert">{aliasErrorText}</div>}
+              <div class="qp-alias-form-actions">
+                <button class="qp-toolbar-btn" disabled={aliasSaving} onClick={() => { void commitAlias(); }}>{t('alias.save')}</button>
+                <button class="qp-toolbar-btn" onClick={closeAliasForm}>{t('alias.cancel')}</button>
+              </div>
+            </div>
+          )}
+
+          <div class="qp-list">
+            {filteredAliases.length === 0 ? (
+              <div class="qp-history-empty">
+                {aliasSearch ? t('alias.no_results') : t('alias.empty')}
+              </div>
+            ) : (
+              <div class="qp-pills">
+                {filteredAliases.map((a) => (
+                  <span key={a.name} class="qp-pill qp-pill-custom" title={a.description || a.name}>
+                    <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
+                    <button class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
+                    <button class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </>}
 
         {/* Quick tab content */}
         {activeTab === 'quick' && <>

@@ -13,6 +13,7 @@ import {
 } from '@shared/p2p-modes.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
+import { useAliases } from '../hooks/useAliases.js';
 
 interface SessionEntry {
   name: string;
@@ -42,16 +43,21 @@ interface AtPickerProps {
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
   onSelectDelegateAgent: (session: string) => void;
+  /** Insert the `;;(name)` marker for the chosen alias (never the value). */
+  onSelectAlias?: (name: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
   p2pConfig?: P2pSavedConfig | null;
   onClose: () => void;
-  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team') => void;
+  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases') => void;
   visible: boolean;
 }
 
-type Category = 'choose' | 'files' | 'agents' | 'team';
+type Category = 'choose' | 'files' | 'agents' | 'team' | 'aliases';
+
+/** Number of rows in the category chooser (files, team, agents, aliases). */
+const CHOOSER_ROW_COUNT = 4;
 
 const DEBOUNCE_MS = 200;
 
@@ -152,6 +158,7 @@ export function AtPicker({
   projectDir,
   onSelectFile,
   onSelectDelegateAgent,
+  onSelectAlias,
   onLaunchTeam,
   onClose,
   onStageChange,
@@ -159,6 +166,9 @@ export function AtPicker({
 }: AtPickerProps) {
   const { t } = useTranslation();
   const [category, setCategory] = useState<Category>('choose');
+  // Alias list is filtered by the same inline query (name + description) the
+  // rest of the picker uses. Selecting one inserts its `;;(name)` marker only.
+  const { filtered: aliasResults } = useAliases(category === 'aliases' ? query : undefined);
   const [fileResults, setFileResults] = useState<Array<{ path: string; basename: string; dir: string }>>([]);
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [teamRoundsIdx, setTeamRoundsIdx] = useState(0);
@@ -280,12 +290,28 @@ export function AtPicker({
       // Category chooser
       if (category === 'choose') {
         if (e.key === 'Escape') { consumeEscapeKey(e); onClose(); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % 3); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h + 2) % 3); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % CHOOSER_ROW_COUNT); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h + CHOOSER_ROW_COUNT - 1) % CHOOSER_ROW_COUNT); return; }
         if (e.key === 'Enter') {
           e.preventDefault(); e.stopPropagation();
           if (highlightIdx === 1) { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }
+          else if (highlightIdx === 3) { setCategory('aliases'); setHighlightIdx(0); }
           else { setCategory(highlightIdx === 0 ? 'files' : 'agents'); setHighlightIdx(0); }
+          return;
+        }
+        return;
+      }
+
+      // Aliases: ↑↓ move, Enter/Tab insert the highlighted marker.
+      if (category === 'aliases') {
+        const count = aliasResults.length;
+        if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(3); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h - 1 + count) % count); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h + 1) % count); return; }
+        if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
+          e.preventDefault(); e.stopPropagation();
+          const a = aliasResults[highlightIdx];
+          if (a) onSelectAlias?.(a.name);
           return;
         }
         return;
@@ -337,7 +363,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, delegateAgents, teamRoundsIdx, teamComboOptions, onClose, onSelectFile, onSelectDelegateAgent, onLaunchTeam],
+    [visible, category, highlightIdx, fileResults, delegateAgents, aliasResults, teamRoundsIdx, teamComboOptions, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onLaunchTeam],
   );
 
   useEffect(() => {
@@ -389,6 +415,48 @@ export function AtPicker({
           <span style={{ fontWeight: 500 }}>{t('delegation.picker.agents')}</span>
           <span style={dimStyle}>{t('delegation.picker.delegate_to_agent')}</span>
         </div>
+        <div
+          data-hl={highlightIdx === 3 ? 'true' : undefined}
+          style={highlightIdx === 3 ? categoryHighlightStyle : categoryStyle}
+          onClick={() => { setCategory('aliases'); setHighlightIdx(0); }}
+          onMouseEnter={() => setHighlightIdx(3)}
+        >
+          <span style={{ fontSize: 16 }}>🔖</span>
+          <span style={{ fontWeight: 500 }}>{t('alias.category')}</span>
+          <span style={dimStyle}>{t('alias.category_desc')}</span>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Aliases list ──
+  if (category === 'aliases') {
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(3); }}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>
+          {t('alias.category')} {query ? `— "${query}"` : ''}
+        </div>
+        {aliasResults.length === 0 && (
+          <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
+            {query ? t('alias.no_results') : t('alias.empty')}
+          </div>
+        )}
+        {aliasResults.map((a, idx) => {
+          const hl = idx === highlightIdx;
+          return (
+            <div
+              key={a.name}
+              data-hl={hl ? 'true' : undefined}
+              style={hl ? itemHighlightStyle : itemStyle}
+              onClick={() => onSelectAlias?.(a.name)}
+              onMouseEnter={() => setHighlightIdx(idx)}
+            >
+              <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{a.name}</span>
+              {a.description ? <span style={dimStyle}>{a.description}</span> : null}
+            </div>
+          );
+        })}
       </div>
     );
   }

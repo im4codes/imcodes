@@ -5,6 +5,10 @@
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
+import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
+import { ALIAS_REASONS } from '../../shared/alias-types.js';
+import type { AliasSendAudit, SendAliasResolution } from '../../shared/alias-types.js';
+import { buildAliasSendAudit } from './alias-audit.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -2916,6 +2920,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
     : undefined;
+  // Alias quick-insert (A′): the sender's web client resolves `;;(name)` markers
+  // to values at compose time and ships the map out-of-band. Agent-originated /
+  // non-web sends omit it → treated as `{}` → markers stay unresolved (per-mode
+  // handling). Only human-composed sends expand. Never logged (values redacted).
+  const resolvedAliases: SendAliasResolution = cmd.resolvedAliases && typeof cmd.resolvedAliases === 'object' && !Array.isArray(cmd.resolvedAliases)
+    ? cmd.resolvedAliases as SendAliasResolution
+    : {};
 
   if (!sessionName || typeof text !== 'string') {
     logger.warn('session.send: missing sessionName or text');
@@ -3521,6 +3532,75 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     incrementCounter(event.counter, { sendOrigin: event.sendOrigin });
   }
   const displayText = preferenceIngest.providerText;
+  // Alias quick-insert expansion (A′) — pure/synchronous, computed ONCE here and
+  // reused by every dispatch branch below. The timeline ALWAYS uses `displayText`
+  // (original `;;(name)` markers); only the agent-bound copy is expanded:
+  //   - legend (LLM / all transport agents): always delivers; markers kept in body
+  //     with a prepended directive + `;;(name): value` legend lines.
+  //   - inline (shell/script, process-only): substitutes values in place, and
+  //     FAILS CLOSED when any marker is unresolved (no `;;(...)` reaches a shell).
+  // `aliasProviderText` is set only when the agent-bound text actually differs, so
+  // the no-alias path stays byte-identical. Values are never logged.
+  const aliasMode = aliasExpansionModeFor(record.agentType ?? '');
+  const aliasExpansion = expandForAgent(displayText, resolvedAliases, aliasMode);
+  // ── Alias fail-closed guard (A′, CRITICAL) ─────────────────────────────────
+  // `deliver === false` ONLY for a raw executor (inline mode: shell/script, or an
+  // unknown agent type that defaults to inline) with an UNRESOLVED `;;(name)`
+  // marker. A raw executor consumes its text LITERALLY, so a literal `;;(name)`
+  // must never reach it — on ANY dispatch path. This guard runs BEFORE every
+  // enqueue/send below (transport no-runtime enqueue, transport runtime.send,
+  // AND the process/tmux path), so the original marker text is never handed to a
+  // shell/script agent regardless of runtime state. It runs AFTER the receipt ack
+  // (line ~3099) and AFTER the `/stop` short-circuit, so the compose spinner has
+  // already cleared; we then surface a terminal error ack + a non-blocking
+  // diagnostic. Values are NEVER included in any emitted event.
+  if (!aliasExpansion.deliver) {
+    // Human-facing echo: the user still sees exactly what they tried to send,
+    // markers intact (spec 8.5). Same emit shape as the ordinary transport path
+    // (threads `commandId` so the web reconciles its optimistic bubble).
+    emitTransportUserMessage(displayText);
+    const markerList = aliasExpansion.unresolved.map((n) => `;;(${n})`).join(', ');
+    timelineEmitter.emit(
+      sessionName,
+      'assistant.text',
+      {
+        text: `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+        streaming: false,
+        memoryExcluded: true,
+      },
+      { source: 'daemon', confidence: 'high' },
+    );
+    // Terminal error ack (dual-ack pattern): the prior `accepted` receipt ack is
+    // non-terminal on the web, so this `error` ack flips the bubble to failed and
+    // offers retry. Emit both the timeline event and the reliable/outbox ack, as
+    // every other error path in handleSend does. `reason` carries the machine code
+    // (never a value) so the client can localize.
+    timelineEmitter.emit(sessionName, 'command.ack', {
+      commandId: effectiveId,
+      status: 'error',
+      error: ALIAS_REASONS.UNRESOLVED_FAILCLOSED,
+      reason: ALIAS_REASONS.UNRESOLVED_FAILCLOSED,
+    });
+    emitCommandAckReliable(serverLink, {
+      commandId: effectiveId,
+      sessionName,
+      status: 'error',
+      error: ALIAS_REASONS.UNRESOLVED_FAILCLOSED,
+      reason: ALIAS_REASONS.UNRESOLVED_FAILCLOSED,
+    });
+    return;
+  }
+  const aliasProviderText = aliasExpansion.text !== displayText
+    ? aliasExpansion.text
+    : undefined;
+  // RV-C audit anchor: on the DELIVER path, the timeline shows only `;;(name)`
+  // markers while the agent receives the expanded value. Attach a non-displayed
+  // anchor (referenced names + a SHA-256 over their resolved values — NEVER the
+  // plaintext) to the human-facing `user.message` so "what did `;;(name)`
+  // actually deliver" is auditable. `undefined` when no marker resolved, so the
+  // no-alias path stays byte-identical. Values are never logged or emitted.
+  const aliasAudit: AliasSendAudit | undefined = buildAliasSendAudit(displayText, resolvedAliases);
+  const aliasAuditExtra: Record<string, unknown> = aliasAudit ? { aliasAudit } : {};
   const preferenceMessagePreamble = await loadPreferenceProviderContext({
     enabled: preferenceFeatureEnabled,
     userId: preferenceUserId,
@@ -3562,6 +3642,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     );
     const enqueueResult = enqueueResend(sessionName, {
       text: displayText,
+      ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
@@ -3648,6 +3729,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     );
     const enqueueResultMissingSid = enqueueResend(sessionName, {
       text: displayText,
+      ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       ...(preferenceMessagePreamble ? { messagePreamble: preferenceMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
       commandId: effectiveId,
@@ -3995,15 +4077,24 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
-      const sharedMetadata = sharedActor ? { sharedActor } : undefined;
+      // Timeline text is ALWAYS `displayText` (markers intact). `providerText`
+      // (the expanded agent-bound copy) rides the send metadata and only exists
+      // when alias expansion actually changed the text — otherwise the metadata
+      // shape stays exactly as before (byte-identical no-alias path).
+      const sendMetadata = (sharedActor || aliasProviderText)
+        ? {
+            ...(sharedActor ? { sharedActor } : {}),
+            ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+          }
+        : undefined;
       const result = preferenceMessagePreamble
-        ? (sharedMetadata
+        ? (sendMetadata
             ? transportRuntime.send(
               displayText,
               effectiveId,
               attachments.length > 0 ? attachments : undefined,
               preferenceMessagePreamble,
-              sharedMetadata,
+              sendMetadata,
             )
             : transportRuntime.send(
               displayText,
@@ -4012,11 +4103,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               preferenceMessagePreamble,
             ))
         : (attachments.length > 0
-            ? (sharedMetadata
-                ? transportRuntime.send(displayText, effectiveId, attachments, undefined, sharedMetadata)
+            ? (sendMetadata
+                ? transportRuntime.send(displayText, effectiveId, attachments, undefined, sendMetadata)
                 : transportRuntime.send(displayText, effectiveId, attachments))
-            : (sharedMetadata
-                ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sharedMetadata)
+            : (sendMetadata
+                ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sendMetadata)
                 : transportRuntime.send(displayText, effectiveId)));
       if (shouldTrackSupervisionTaskRun) {
         if (result === 'queued') {
@@ -4032,6 +4123,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             {
               clientMessageId: effectiveId,
               ...(attachments.length > 0 ? { attachments } : {}),
+              ...aliasAuditExtra,
             },
             transportUserEventId(effectiveId),
           );
@@ -4065,12 +4157,20 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
+  // NOTE: the alias fail-closed guard is enforced EARLIER — immediately after
+  // `aliasExpansion` is computed (~line 3547) — so it protects every dispatch
+  // path (transport enqueue, transport runtime.send, and this process/tmux path)
+  // uniformly. By the time control reaches here, `aliasExpansion.deliver` is
+  // guaranteed true. Do not re-add a guard here.
+
   // Preserve raw @file references for normal sends. Stable preferences are
   // session context, not per-turn recall: for tmux/process agents inject them
   // once per provider conversation, and reset the gate on clear/compact.
+  // The agent-bound copy is the expanded text (`aliasExpansion.text`); the
+  // human-facing timeline still shows the original markers via `displayText`.
   const finalText = prepareProcessPreferenceProviderText({
     sessionName,
-    providerText: displayText,
+    providerText: aliasExpansion.text,
     preferenceContext: preferenceMessagePreamble,
   });
 
@@ -4129,6 +4229,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       isLegacy,
       ackAlreadySent: receiptAcked,
       serverLink,
+      ...(aliasAudit ? { aliasAudit } : {}),
     });
   } catch (err) {
     logger.error({ sessionName, err }, 'session.send failed');
@@ -4176,6 +4277,8 @@ async function sendProcessSessionMessage(
     isLegacy?: boolean;
     ackAlreadySent?: boolean;
     serverLink?: Pick<ServerLink, 'send'>;
+    /** RV-C non-displayed audit anchor for an alias-bearing send (no plaintext). */
+    aliasAudit?: AliasSendAudit;
   },
 ): Promise<void> {
   // ── Step 1: Confirm receipt to the user IMMEDIATELY ─────────────────────────
@@ -4186,6 +4289,9 @@ async function sendProcessSessionMessage(
   const payload: Record<string, unknown> = { text: options?.originalText ?? finalText };
   if (attachments.length > 0) payload.attachments = attachments;
   if (options?.commandId) payload.commandId = options.commandId;
+  // RV-C: attach the alias audit anchor to the human-facing user.message. It
+  // carries only referenced names + a hash of resolved values, never plaintext.
+  if (options?.aliasAudit) payload.aliasAudit = options.aliasAudit;
   const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
   if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';

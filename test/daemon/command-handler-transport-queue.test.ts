@@ -37,6 +37,8 @@ import {
 } from '../../shared/preference-ingest.js';
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { ALIAS_LEGEND_DIRECTIVE, buildAliasLegendLine } from '../../shared/alias-types.js';
+import { buildAliasSendAudit } from '../../src/daemon/alias-audit.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
@@ -732,6 +734,69 @@ describe('handleWebCommand transport queue behavior', () => {
     ));
     expect(queuedUserMessages).toHaveLength(0);
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
+  });
+
+  // ── Alias quick-insert (A′) — transport dispatch wiring ───────────────────
+  it('12.5 transport LLM (legend): send() gets providerText legend while the timeline user.message keeps the marker', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ping ;;(host) now',
+      commandId: 'cmd-alias-transport',
+      resolvedAliases: { host: 'prod.example.com' },
+    }, serverLink as any);
+    await flushAsync();
+
+    // The provider-bound copy rides `providerText` in the send metadata (5th arg);
+    // the FIRST positional arg (timeline text / queue entry text) stays the marker.
+    expect(send).toHaveBeenCalledTimes(1);
+    const [sentText, sentCommandId, , , metadata] = send.mock.calls[0];
+    expect(sentText).toBe('ping ;;(host) now');
+    expect(sentCommandId).toBe('cmd-alias-transport');
+    const providerText = String((metadata as { providerText?: string })?.providerText ?? '');
+    expect(providerText).toContain(ALIAS_LEGEND_DIRECTIVE);
+    expect(providerText).toContain(buildAliasLegendLine('host', 'prod.example.com'));
+    expect(providerText).toContain('ping ;;(host) now');
+
+    // Human-facing timeline user.message carries the ORIGINAL marker text, never the value.
+    const userMsg = emitMock.mock.calls.find(
+      ([session, type, payload]) => session === 'deck_transport_brain'
+        && type === 'user.message'
+        && (payload as { commandId?: string } | undefined)?.commandId === 'cmd-alias-transport',
+    );
+    expect(userMsg?.[2]).toMatchObject({ text: 'ping ;;(host) now' });
+    expect(JSON.stringify(userMsg?.[2] ?? '')).not.toContain('prod.example.com');
+    // RV-C: the user.message carries a non-displayed audit anchor recording the
+    // referenced names + a hash of resolved values — never the plaintext value.
+    const expectedAudit = buildAliasSendAudit('ping ;;(host) now', { host: 'prod.example.com' });
+    expect(expectedAudit).toBeDefined();
+    expect((userMsg?.[2] as { aliasAudit?: unknown }).aliasAudit).toEqual(expectedAudit);
+    const audit = (userMsg?.[2] as { aliasAudit?: { names: string[]; resolvedHash: string } }).aliasAudit;
+    expect(audit?.names).toEqual(['host']);
+    expect(audit?.resolvedHash).toMatch(/^[0-9a-f]{64}$/);
+    // The hash is not the plaintext value in any form.
+    expect(audit?.resolvedHash).not.toContain('prod.example.com');
+  });
+
+  it('no resolvedAliases (agent-originated send): send() metadata carries no providerText', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ping ;;(host) now', // marker present but no resolution map → left literal
+      commandId: 'cmd-alias-noneresolved',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    // No markers resolved ⇒ legend adds nothing ⇒ providerText is NOT attached
+    // (byte-identical no-alias path: 5th arg stays undefined).
+    expect(send).toHaveBeenCalledWith('ping ;;(host) now', 'cmd-alias-noneresolved');
   });
 
   it('re-acks a bridge-retried session.send for an already-owned commandId (recovers a lost ack, no stuck spinner)', async () => {

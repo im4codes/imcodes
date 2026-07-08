@@ -138,6 +138,65 @@ describe('TransportQueueStore', () => {
     expect(snapshot.pendingMessageVersion).toBe(2);
   });
 
+  it('RV-B clear-on-delivery: an alias providerText is gone from private material once delivered', () => {
+    const EXPANDED = 'expanded alias secret value';
+    store.enqueue({
+      sessionName: 'deck',
+      clientMessageId: 'msg-alias',
+      text: 'ping ;;(host) now',
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-alias',
+        text: 'ping ;;(host) now',
+        providerText: EXPANDED,
+      }),
+      now: 100,
+    });
+    // While queued, the expanded value lives in private material (delivery needs it)…
+    expect(store.readPrivateDispatchMaterial('deck', 'msg-alias')).toContain(EXPANDED);
+
+    const result = store.finalizeSentBatch('deck', ['msg-alias'], 'frame-alias', 200);
+
+    // … but the moment it is delivered, the private material (and the value) is DELETED.
+    expect(store.readPrivateDispatchMaterial('deck', 'msg-alias')).toBeUndefined();
+    // The delivered snapshot / diagnostics view never carries the expanded value.
+    expect(JSON.stringify(result.snapshot)).not.toContain(EXPANDED);
+    expect(result.snapshot.pendingMessageEntries).toEqual([]);
+  });
+
+  it('RV-B clear-on-edit: editing a queued alias entry strips the stale providerText from private material', () => {
+    const EXPANDED = 'stale expanded alias value';
+    store.enqueue({
+      sessionName: 'deck',
+      clientMessageId: 'msg-edit',
+      text: 'ping ;;(host) now',
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-edit',
+        text: 'ping ;;(host) now',
+        providerText: EXPANDED,
+        messagePreamble: 'per-turn preamble',
+      }),
+      now: 100,
+    });
+    expect(store.readPrivateDispatchMaterial('deck', 'msg-edit')).toContain(EXPANDED);
+
+    const snapshot = store.edit('deck', 'msg-edit', 'edited plain text', 200);
+
+    // The entry text is updated…
+    expect(snapshot.pendingMessageEntries.map((e) => [e.clientMessageId, e.text])).toEqual([
+      ['msg-edit', 'edited plain text'],
+    ]);
+    // … and the private material forgot the stale expanded value + preamble, but
+    // still holds the new verbatim text (so rehydrate delivers the edited text).
+    const material = store.readPrivateDispatchMaterial('deck', 'msg-edit');
+    expect(material).toBeDefined();
+    expect(material).not.toContain(EXPANDED);
+    expect(material).not.toContain('per-turn preamble');
+    const parsed = JSON.parse(material as string) as Record<string, unknown>;
+    expect(parsed.providerText).toBeUndefined();
+    expect(parsed.messagePreamble).toBeUndefined();
+    expect(parsed.text).toBe('edited plain text');
+  });
+
   it('finalizes a sent batch with one shared delivery frame and one fact per message', () => {
     store.enqueue({ sessionName: 'deck', clientMessageId: 'msg-1', text: 'one', now: 100 });
     store.enqueue({ sessionName: 'deck', clientMessageId: 'msg-2', text: 'two', now: 101 });

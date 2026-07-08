@@ -48,6 +48,8 @@ import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, l
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
+import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
+import { aliasMcpList, aliasMcpResolve, type AliasMcpClientOptions } from './alias-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
@@ -979,6 +981,93 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
       title: name,
       description: contract.description,
       inputSchema: schemas[name],
+    }, async (args: unknown) => toolResult(await handlers[name](args)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alias read-only MCP tools (resolve_alias / list_aliases).
+//
+// Aliases are a separate, precise, server-stored, USER-SCOPED reference store,
+// deliberately distinct from memory: memory is fuzzy/recall-ranked; an alias
+// resolves to an exact value the user typed. v1 exposes ONLY read tools to
+// agents — there is intentionally NO save_alias/delete_alias tool. Writes are
+// user-only through the web app. Both tools read the server (source of truth)
+// scoped to the daemon's bound owner user via the existing daemon→server auth.
+// ---------------------------------------------------------------------------
+
+/** Injectable deps for the alias read tools (tests bypass the network here). */
+export interface AliasMcpToolDeps {
+  aliasClientOptions?: AliasMcpClientOptions;
+  resolveAlias?: typeof aliasMcpResolve;
+  listAliases?: typeof aliasMcpList;
+}
+
+const ALIAS_MCP_TOOL_NAME_LIST: readonly AliasMcpToolName[] = [
+  ALIAS_MCP_TOOLS.RESOLVE,
+  ALIAS_MCP_TOOLS.LIST,
+] as const;
+
+const ALIAS_MCP_TOOL_DESCRIPTIONS: Readonly<Record<AliasMcpToolName, string>> = {
+  [ALIAS_MCP_TOOLS.RESOLVE]:
+    'Resolve one alias name to its current exact value from the user\'s precise, server-stored alias store (distinct from memory: an alias is the user\'s own literal text, not a recall-ranked memory). Read-only and user-scoped to the bound owner. Returns found:false with alias_not_found for an unknown name — it never errors on a missing name. Aliases are created/edited/deleted only by the user in the web app; there is no write tool.',
+  [ALIAS_MCP_TOOLS.LIST]:
+    'List the bound owner user\'s alias METADATA ONLY (name, optional description, tags, timestamps) from the precise, server-stored alias store, which is separate from memory search/recall. It deliberately does NOT return alias values — use resolve_alias with a single name to get that name\'s current value. Read-only and user-scoped. Use it to discover which alias names exist. Aliases are managed (created/edited/deleted) by the user only through the web app; agents cannot write them.',
+} as const;
+
+const aliasSchemas: Record<AliasMcpToolName, z.ZodTypeAny> = {
+  [ALIAS_MCP_TOOLS.RESOLVE]: z.object({
+    name: z.string().describe('Exact alias name to resolve (NFC, case-sensitive). Returns the current value, or a not-found result for an unknown name.'),
+  }),
+  [ALIAS_MCP_TOOLS.LIST]: z.object({}),
+};
+
+export function createAliasMcpToolHandlers(
+  _caller: McpRuntimeCaller,
+  deps: AliasMcpToolDeps = {},
+): Record<AliasMcpToolName, MemoryMcpToolHandler> {
+  const resolveAlias = deps.resolveAlias ?? aliasMcpResolve;
+  const listAliases = deps.listAliases ?? aliasMcpList;
+  const options = deps.aliasClientOptions ?? {};
+
+  const handlers: Record<AliasMcpToolName, MemoryMcpToolHandler> = {
+    [ALIAS_MCP_TOOLS.RESOLVE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['name']);
+      const name = stringArg(args, 'name');
+      if (!name) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'name is required');
+      // `resolveAlias` returns a not-found result (never throws) for missing names.
+      return await resolveAlias(name, options) as unknown as ToolResult;
+    },
+    [ALIAS_MCP_TOOLS.LIST]: async () => {
+      const result = await listAliases(options);
+      if (result.status !== 'ok') return result as unknown as ToolResult;
+      // METADATA-ONLY: never expose alias `value` in a bulk listing — a single
+      // list_aliases call would otherwise dump every plaintext value into the
+      // agent's context/memory. `resolve_alias` is the only value path.
+      return { status: 'ok', aliases: result.aliases.map(toAliasMetadata) } as unknown as ToolResult;
+    },
+  };
+
+  const wrapped = {} as Record<AliasMcpToolName, MemoryMcpToolHandler>;
+  for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
+    wrapped[name] = async (input?: unknown) => {
+      try {
+        return await handlers[name](input);
+      } catch (err) {
+        return sanitizeCaughtError(err);
+      }
+    };
+  }
+  return wrapped;
+}
+
+export function registerAliasMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: AliasMcpToolDeps = {}): void {
+  const handlers = createAliasMcpToolHandlers(caller, deps);
+  for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
+    server.registerTool(name, {
+      title: name,
+      description: ALIAS_MCP_TOOL_DESCRIPTIONS[name],
+      inputSchema: aliasSchemas[name],
     }, async (args: unknown) => toolResult(await handlers[name](args)));
   }
 }

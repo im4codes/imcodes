@@ -8,7 +8,7 @@ import {
   parseMcpRuntimeCallerFromEnv,
   type McpRuntimeCaller,
 } from './memory-mcp-caller.js';
-import { registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
+import { registerAliasMcpTools, registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
@@ -25,6 +25,10 @@ export function createMemoryMcpServer(caller: McpRuntimeCaller, toolDeps: Memory
     version: '0.1.0',
   });
   registerMemoryMcpTools(server, caller, toolDeps);
+  // Read-only alias tools (resolve_alias / list_aliases) share the same MCP
+  // server surface but are NOT part of the memory tool set (kept off
+  // MEMORY_MCP_TOOL_NAME_LIST / the memory schema firewall). No write tools.
+  registerAliasMcpTools(server, caller);
   return server;
 }
 

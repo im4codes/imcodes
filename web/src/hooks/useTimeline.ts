@@ -2101,6 +2101,10 @@ export function useTimeline(
       markOptimisticFailed(commandId, localizedAckFailureReason(reasonStr));
       return;
     }
+    // Auto-retry replays the ORIGINAL send verbatim: `eventExtra` (from the
+    // failed event's `_resendExtra`) already carries the alias A′ map resolved
+    // when the user first composed the message, so this path never re-resolves
+    // markers (Cx1-2/Cx1-3) — it just re-sends the stashed extra.
     const resendExtra = eventExtra;
     // Snapshot for subsequent retries in this chain.
     autoRetryPayloadsRef.current.set(commandId, { text, extra: resendExtra });

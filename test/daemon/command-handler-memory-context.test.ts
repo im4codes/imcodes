@@ -290,6 +290,11 @@ import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-fe
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
 import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js';
+import { ALIAS_REASONS, ALIAS_LEGEND_DIRECTIVE, buildAliasLegendLine } from '../../shared/alias-types.js';
+import { getResendEntries, clearResend } from '../../src/daemon/transport-resend-queue.js';
+// Resolves to the vi.fn() from the ../../src/agent/tmux.js mock above — lets the
+// fail-closed tests assert the raw `sendKeys` variant is never called with `;;(`.
+import { sendKeys as tmuxSendKeysMock } from '../../src/agent/tmux.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const originalFeatureEnv = {
@@ -1679,5 +1684,284 @@ describe('handleWebCommand memory context timeline', () => {
         items: [],
       }),
     );
+  });
+
+  // ── Alias quick-insert (A′) — process/tmux dispatch wiring ────────────────
+  // The human-facing `user.message` ALWAYS carries the ORIGINAL `;;(name)`
+  // markers; only the agent-bound tmux input is expanded. Inline mode (shell /
+  // script) substitutes values in place and FAILS CLOSED on an unresolved
+  // marker; legend mode (LLM process agents) keeps markers + prepends a legend.
+  describe('alias quick-insert (A′) — process/tmux wiring', () => {
+    const emptyRecall = {
+      items: [] as unknown[],
+      stats: {
+        totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0,
+        projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0,
+      },
+    };
+    const shellSession = (agentType: 'shell' | 'script' = 'shell') => ({
+      name: 'deck_process_brain',
+      projectName: 'codedeck',
+      role: 'brain',
+      agentType,
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/worktrees/codedeck',
+    });
+    const lastKeysText = () => {
+      const call = sendKeysDelayedEnterMock.mock.calls.at(-1);
+      return call ? String(call[1]) : undefined;
+    };
+    const userMessageEmit = (commandId: string) => emitMock.mock.calls.find(
+      ([session, type, payload]) => session === 'deck_process_brain'
+        && type === 'user.message'
+        && (payload as { commandId?: string } | undefined)?.commandId === commandId,
+    );
+
+    it('12.5 shell inline: substituted value reaches the agent; timeline keeps the marker', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('shell'));
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'echo ;;(greeting)',
+        commandId: 'cmd-alias-inline-shell',
+        resolvedAliases: { greeting: 'hello world' },
+      }, serverLink as any);
+      await flushAsync();
+
+      // Agent-bound tmux input has the value substituted in place — no marker.
+      expect(lastKeysText()).toBe('echo hello world');
+      expect(lastKeysText()).not.toContain(';;(');
+      // Human-facing timeline keeps the ORIGINAL marker text.
+      expect(userMessageEmit('cmd-alias-inline-shell')?.[2]).toMatchObject({ text: 'echo ;;(greeting)' });
+    });
+
+    it('12.5 script inline: multiple markers substituted; timeline unchanged', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('script'));
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'deploy ;;(host) as ;;(user)',
+        commandId: 'cmd-alias-inline-script',
+        resolvedAliases: { host: 'prod.example.com', user: 'deployer' },
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(lastKeysText()).toBe('deploy prod.example.com as deployer');
+      expect(userMessageEmit('cmd-alias-inline-script')?.[2]).toMatchObject({ text: 'deploy ;;(host) as ;;(user)' });
+    });
+
+    it('12.5 LLM (legend): claude-code process agent keeps markers in body + prepends the legend directive', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue({ ...shellSession('shell'), agentType: 'claude-code' });
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'ping ;;(host) please',
+        commandId: 'cmd-alias-legend',
+        resolvedAliases: { host: 'prod.example.com' },
+      }, serverLink as any);
+      await flushAsync();
+
+      const delivered = lastKeysText() ?? '';
+      // Directive + legend line present, and the original marker is STILL in the body.
+      expect(delivered).toContain(ALIAS_LEGEND_DIRECTIVE);
+      expect(delivered).toContain(buildAliasLegendLine('host', 'prod.example.com'));
+      expect(delivered).toContain('ping ;;(host) please');
+      // Timeline keeps the original.
+      expect(userMessageEmit('cmd-alias-legend')?.[2]).toMatchObject({ text: 'ping ;;(host) please' });
+    });
+
+    it('12.6 shell unresolved marker: command NOT delivered, diagnostic emitted, no literal ;; reaches the agent', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('shell'));
+      sendKeysDelayedEnterMock.mockClear();
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'rm -rf ;;(target)',
+        commandId: 'cmd-alias-failclosed',
+        resolvedAliases: {}, // marker unresolved → fail closed
+      }, serverLink as any);
+      await flushAsync();
+
+      // Nothing at all was handed to the shell — the literal ;;(target) never runs.
+      expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+      // Original message still shows on the timeline (the user typed it).
+      expect(userMessageEmit('cmd-alias-failclosed')?.[2]).toMatchObject({ text: 'rm -rf ;;(target)' });
+      // A non-blocking diagnostic names the unresolved marker + reason.
+      const diag = emitMock.mock.calls.find(
+        ([session, type, payload]) => session === 'deck_process_brain'
+          && type === 'assistant.text'
+          && String((payload as { text?: string } | undefined)?.text ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+      );
+      expect(diag).toBeDefined();
+      expect(diag?.[2]).toMatchObject({ memoryExcluded: true });
+      expect(String(diag?.[2]?.text)).toContain('target');
+    });
+
+    it('12.6 NL (legend) unresolved marker: stays literal AND is delivered to the agent', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue({ ...shellSession('shell'), agentType: 'claude-code' });
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'summarize ;;(missing) for me',
+        commandId: 'cmd-alias-legend-unresolved',
+        resolvedAliases: {}, // unresolved
+      }, serverLink as any);
+      await flushAsync();
+
+      // Legend agents always deliver; the unresolved marker stays literal in the body.
+      const delivered = lastKeysText() ?? '';
+      expect(delivered).toContain('summarize ;;(missing) for me');
+      // No legend directive is prepended when there is nothing resolved to explain.
+      expect(delivered).not.toContain(ALIAS_LEGEND_DIRECTIVE);
+      expect(userMessageEmit('cmd-alias-legend-unresolved')?.[2]).toMatchObject({ text: 'summarize ;;(missing) for me' });
+    });
+
+    it('12.8 fail-closed diagnostic contains the marker name + reason but NEVER the value', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      getSessionMock.mockReturnValue(shellSession('shell'));
+      sendKeysDelayedEnterMock.mockClear();
+
+      const SECRET = 'super-secret-token-abc123';
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        // 'token' IS resolved (to a secret), but 'other' is NOT → whole inline
+        // send fails closed. The diagnostic must never leak the resolved value.
+        text: 'use ;;(token) and ;;(other)',
+        commandId: 'cmd-alias-noleak',
+        resolvedAliases: { token: SECRET },
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+      const diag = emitMock.mock.calls.find(
+        ([session, type, payload]) => session === 'deck_process_brain'
+          && type === 'assistant.text'
+          && String((payload as { text?: string } | undefined)?.text ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+      );
+      expect(diag).toBeDefined();
+      const diagText = String(diag?.[2]?.text ?? '');
+      expect(diagText).toContain('other'); // unresolved name is fine
+      expect(diagText).toContain(ALIAS_REASONS.UNRESOLVED_FAILCLOSED);
+      // The resolved value must NEVER appear in any emitted diagnostic.
+      expect(diagText).not.toContain(SECRET);
+      for (const call of emitMock.mock.calls) {
+        expect(JSON.stringify(call[2] ?? '')).not.toContain(SECRET);
+      }
+    });
+
+    // ── Real-dispatch fail-closed integration (the bug that shipped: the pure
+    //    function was tested, but real dispatch to a shell/script never was). ──
+    // Timeline `command.ack` error emissions captured by emitMock.
+    const failClosedTimelineAcks = () => emitMock.mock.calls.filter(
+      ([session, type, payload]) => session === 'deck_process_brain'
+        && type === 'command.ack'
+        && (payload as { status?: string } | undefined)?.status === 'error'
+        && String((payload as { error?: string } | undefined)?.error ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+    );
+    // Reliable ack (outbox → serverLink.send) carries type 'command.ack' + reason.
+    const failClosedWireAcks = () => (serverLink.send as any).mock.calls.filter(
+      ([msg]: [Record<string, unknown>]) => msg?.type === 'command.ack'
+        && msg?.status === 'error'
+        && String(msg?.error ?? '').includes(ALIAS_REASONS.UNRESOLVED_FAILCLOSED),
+    );
+    // Any tmux write (either variant) that carries a literal `;;(` — must be none.
+    const anyLiteralMarkerSent = () => {
+      const delayed = sendKeysDelayedEnterMock.mock.calls.some((c) => String(c[1] ?? '').includes(';;('));
+      const raw = (tmuxSendKeysMock as any).mock.calls.some((c: unknown[]) => String(c[1] ?? '').includes(';;('));
+      return delayed || raw;
+    };
+
+    for (const agentType of ['shell', 'script'] as const) {
+      it(`12.9 REAL dispatch (${agentType}): unresolved marker never reaches tmux; command.ack error emitted`, async () => {
+        searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+        getSessionMock.mockReturnValue(shellSession(agentType));
+        sendKeysDelayedEnterMock.mockClear();
+        (tmuxSendKeysMock as any).mockClear();
+        (serverLink.send as any).mockClear();
+
+        handleWebCommand({
+          type: 'session.send',
+          session: 'deck_process_brain',
+          text: `deploy ;;(missingHost) now`,
+          commandId: `cmd-failclosed-${agentType}`,
+          resolvedAliases: {}, // unresolved → fail closed
+        }, serverLink as any);
+        await flushAsync();
+
+        // NOTHING with a literal `;;(` reached the shell/script via EITHER tmux fn.
+        expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+        expect(tmuxSendKeysMock).not.toHaveBeenCalled();
+        expect(anyLiteralMarkerSent()).toBe(false);
+        // A terminal command.ack error was emitted on BOTH channels with the code.
+        expect(failClosedTimelineAcks().length).toBeGreaterThanOrEqual(1);
+        expect(failClosedWireAcks().length).toBeGreaterThanOrEqual(1);
+        // The reliable ack also carries the machine reason (never a value).
+        const wireAck = failClosedWireAcks()[0]?.[0] as Record<string, unknown>;
+        expect(wireAck?.reason).toBe(ALIAS_REASONS.UNRESOLVED_FAILCLOSED);
+        // Human-facing echo still shows the original marker text.
+        expect(userMessageEmit(`cmd-failclosed-${agentType}`)?.[2]).toMatchObject({
+          text: 'deploy ;;(missingHost) now',
+        });
+      });
+    }
+
+    it('12.10 REAL dispatch (transport, no runtime): guard fires BEFORE enqueue — no literal ;;( queued', async () => {
+      searchLocalMemorySemanticMock.mockResolvedValue(emptyRecall);
+      // A session flagged transport (runtimeType='transport') whose agentType is
+      // unknown → alias mode defaults to `inline`, so an unresolved marker fails
+      // closed. No transport runtime is registered, so WITHOUT the early guard the
+      // message would fall into the no-runtime enqueueResend branch carrying the
+      // literal `;;(`. The guard must short-circuit BEFORE that enqueue.
+      const transportInlineSession = {
+        name: 'deck_process_brain',
+        projectName: 'codedeck',
+        role: 'brain',
+        agentType: 'brand-new-inline-agent', // unknown → aliasExpansionModeFor → inline
+        runtimeType: 'transport',
+        providerId: 'unknown',
+        state: 'idle',
+        projectDir: '/worktrees/codedeck',
+      };
+      getSessionMock.mockReturnValue(transportInlineSession);
+      getTransportRuntimeMock.mockReturnValue(undefined); // no runtime → would enqueue
+      clearResend('deck_process_brain');
+      (serverLink.send as any).mockClear();
+
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'run ;;(nope) please',
+        commandId: 'cmd-failclosed-transport',
+        resolvedAliases: {}, // unresolved
+      }, serverLink as any);
+      await flushAsync();
+
+      // The real resend queue is untouched — nothing (least of all a literal
+      // `;;(`) was enqueued for redelivery.
+      const queued = getResendEntries('deck_process_brain');
+      expect(queued.length).toBe(0);
+      for (const entry of queued) {
+        expect(entry.text).not.toContain(';;(');
+        expect(entry.providerText ?? '').not.toContain(';;(');
+      }
+      // Terminal command.ack error surfaced (reliable channel).
+      expect(failClosedWireAcks().length).toBeGreaterThanOrEqual(1);
+      // Human echo preserved.
+      expect(userMessageEmit('cmd-failclosed-transport')?.[2]).toMatchObject({
+        text: 'run ;;(nope) please',
+      });
+    });
   });
 });

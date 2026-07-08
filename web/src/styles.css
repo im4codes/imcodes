@@ -1594,6 +1594,11 @@ html.native-ios-mac .chat-dl-btn {
 .qp-add-confirm:hover { background: #2563eb; }
 .qp-add-cancel { padding: 4px 6px; background: none; border: none; color: #64748b; font-size: 13px; cursor: pointer; }
 .qp-add-cancel:hover { color: #f87171; }
+/* Alias tab editor */
+.qp-alias-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #334155; flex-shrink: 0; }
+.qp-alias-value { resize: vertical; min-height: 48px; line-height: 1.4; }
+.qp-alias-error { color: #f87171; font-size: 11px; line-height: 1.35; }
+.qp-alias-form-actions { display: flex; gap: 6px; }
 .qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
 .qp-section-header { padding: 6px 10px 3px; font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: 0; text-transform: uppercase; position: sticky; top: 0; background: linear-gradient(180deg, #111827, #0f172a); z-index: 1; border-bottom: 1px solid rgba(125,211,252,0.08); }
 .qp-history-empty { padding: 6px 10px 8px; font-size: 11px; color: #475569; font-style: italic; }

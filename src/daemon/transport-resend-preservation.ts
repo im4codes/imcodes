@@ -19,6 +19,7 @@ function preserveEntries(
     if (seenCommandIds.has(entry.clientMessageId)) continue;
     enqueueResend(sessionName, {
       text: entry.text,
+      ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
       ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
       commandId: entry.clientMessageId,
       clientMessageId: entry.clientMessageId,
