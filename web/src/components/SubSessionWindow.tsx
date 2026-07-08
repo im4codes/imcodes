@@ -1032,6 +1032,7 @@ export function SubSessionWindow({
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
+        activeTransportTurn={activeTimelineTurn}
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}

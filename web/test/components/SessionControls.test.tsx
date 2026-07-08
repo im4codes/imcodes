@@ -794,7 +794,7 @@ afterEach(() => {
     expect(menuBtn).toBeDefined();
   });
 
-  it('only shows the scan sweep while the session is running', () => {
+  it('only shows the scan sweep while the session is visually running', () => {
     const idleView = render(
       <SessionControls
         ws={makeWs() as any}

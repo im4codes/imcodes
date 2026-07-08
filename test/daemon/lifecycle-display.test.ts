@@ -13,7 +13,11 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 
 const { timelineStore } = await import('../../src/daemon/timeline-store.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
-const { getLastAssistantText, resolvePushDisplayContext } = await import('../../src/daemon/lifecycle.js');
+const {
+  getLastAssistantText,
+  resolvePushDisplayContext,
+  shouldRunGenericSilentActiveTurnRecovery,
+} = await import('../../src/daemon/lifecycle.js');
 
 const readByTypesPreferred = vi.mocked(timelineStore.readByTypesPreferred);
 
@@ -94,5 +98,12 @@ describe('daemon lifecycle push display helpers', () => {
     readByTypesPreferred.mockRejectedValueOnce(new Error('timeline unavailable'));
 
     await expect(getLastAssistantText('deck_alpha_brain')).resolves.toBeUndefined();
+  });
+
+  it('lets Codex and continue watchdog recovery own silent active-turn recovery', () => {
+    expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'codex-sdk' })).toBe(false);
+    expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'claude-code-sdk', providerId: 'codex-sdk' })).toBe(false);
+    expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'claude-code-sdk' })).toBe(true);
+    expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'claude-code-sdk' }, true)).toBe(false);
   });
 });

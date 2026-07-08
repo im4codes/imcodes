@@ -295,7 +295,7 @@ describe('UsageFooter', () => {
     expect(onSync).toHaveBeenCalledTimes(1);
   });
 
-  it('prioritizes active thinking over stale idle state and renders running states inline', () => {
+  it('keeps the robot idle when only stale thinking remains, and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter
         usage={{
@@ -310,12 +310,11 @@ describe('UsageFooter', () => {
       />,
     );
 
-    const staleIdleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    const staleIdleStatus = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
     expectRobotAvatar(staleIdleStatus);
-    expect(staleIdleStatus?.textContent).toContain('💭');
-    expect(staleIdleStatus?.getAttribute('aria-label')).toContain('thinking');
-    expect(container.querySelector('.session-live-status-inline.thinking .session-live-status-emoji.thought')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+    expect(staleIdleStatus?.textContent).toContain('💤');
+    expect(staleIdleStatus?.getAttribute('aria-label')).toBe('Agent idle — waiting for input');
+    expect(container.querySelector('.session-live-status-inline.thinking')).toBeNull();
 
     rerender(
       <UsageFooter
@@ -358,7 +357,7 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
   });
 
-  it('keeps live transport turns running even when the session snapshot is stale idle', () => {
+  it('keeps the robot idle when only stale transport-turn evidence remains', () => {
     const { container } = render(
       <UsageFooter
         usage={{
@@ -373,11 +372,11 @@ describe('UsageFooter', () => {
       />,
     );
 
-    const runningStatus = container.querySelector('.session-live-status-inline.running') as HTMLSpanElement | null;
-    expectRobotAvatar(runningStatus);
-    expect(runningStatus?.textContent).toContain('⚙️');
-    expect(runningStatus?.textContent).toContain('Agent working...');
-    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+    const idleStatus = container.querySelector('.session-live-status-inline.idle') as HTMLSpanElement | null;
+    expectRobotAvatar(idleStatus);
+    expect(idleStatus?.textContent).toContain('💤');
+    expect(idleStatus?.getAttribute('aria-label')).toBe('Agent idle — waiting for input');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
   });
 
   it('keeps the robot running from authoritative session state even when timeline tail has settled', () => {
@@ -462,9 +461,9 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-inline.waiting .session-live-status-emoji.wait')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Checking whether the task is complete...');
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.waiting')).toBeNull();
+    expect(container.querySelector('.session-live-status-text')).toBeNull();
   });
 
   it('shows a result indicator when idle has a supervised outcome status', () => {

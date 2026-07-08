@@ -10,6 +10,7 @@ describe('session-live-status', () => {
   it('treats authoritative running state as busy even when timeline tail is settled', () => {
     const status = deriveSessionLiveStatus({ sessionState: 'running', activeTransportTurn: false });
     expect(status.mode).toBe('running');
+    expect(status.visualMode).toBe('running');
     expect(status.busy).toBe(true);
     expect(status.sweep).toBe(true);
     expect(isRunningSessionState('running')).toBe(true);
@@ -18,6 +19,26 @@ describe('session-live-status', () => {
   it('prioritizes live tool and thinking signals over idle snapshots', () => {
     expect(deriveSessionLiveStatus({ sessionState: 'idle', activeToolCall: true }).mode).toBe('tool');
     expect(deriveSessionLiveStatus({ sessionState: 'idle', activeThinking: true }).mode).toBe('thinking');
+  });
+
+  it('keeps scan sweep tied to authoritative visual state, not stale tail activity', () => {
+    for (const input of [
+      { sessionState: 'idle', activeThinking: true },
+      { sessionState: 'idle', activeToolCall: true },
+      { sessionState: 'idle', activeTransportTurn: true },
+    ]) {
+      const status = deriveSessionLiveStatus(input);
+      expect(status.busy).toBe(true);
+      expect(status.sweep).toBe(false);
+      expect(status.visualMode).toBe('idle');
+    }
+
+    expect(deriveSessionLiveStatus({ sessionState: 'running' }).sweep).toBe(true);
+    expect(deriveSessionLiveStatus({ sessionState: 'running' }).visualMode).toBe('running');
+    expect(deriveSessionLiveStatus({ sessionState: 'stopping' }).sweep).toBe(true);
+    expect(deriveSessionLiveStatus({ sessionState: 'stopping' }).visualMode).toBe('stopping');
+    expect(deriveSessionLiveStatus({ sessionState: 'idle' }).sweep).toBe(false);
+    expect(deriveSessionLiveStatus({ sessionState: 'idle' }).visualMode).toBe('idle');
   });
 
 

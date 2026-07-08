@@ -1583,19 +1583,23 @@ function startHealthPoller(): void {
       } catch (err) {
         logger.warn({ err, sessionName: s.name }, 'memory compression auto-continue watchdog failed');
       }
+      let codexRecovered = false;
       if (!memoryCompressionRecovered) {
-        await recoverCodexStalledSession(s).catch((err) => {
+        codexRecovered = await recoverCodexStalledSession(s).catch((err) => {
           logger.warn({ err, sessionName: s.name }, 'codex stale-turn auto-continue watchdog failed');
+          return false;
         });
       }
       // Safety net: settle a phantom (silent-but-"active") transport turn to
       // idle — and drain any queued work — so the session can't stay "working"
       // forever. Fires whether or not anything is queued.
       try {
-        getTransportRuntime(s.name)?.recoverSilentActiveTurn({
-          reason: 'health-poll-stale-active-turn',
-          staleMs: TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS,
-        });
+        if (shouldRunGenericSilentActiveTurnRecovery(s, memoryCompressionRecovered || codexRecovered)) {
+          getTransportRuntime(s.name)?.recoverSilentActiveTurn({
+            reason: 'health-poll-stale-active-turn',
+            staleMs: TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS,
+          });
+        }
       } catch (err) {
         logger.warn({ err, sessionName: s.name }, 'transport stale-active-turn recovery sweep error');
       }
@@ -1638,6 +1642,18 @@ function isTransportDiagnosticActive(diagnostic: TransportRuntimeDiagnosticSnaps
 
 function isCodexTransportSession(s: Pick<SessionRecord, 'agentType' | 'providerId'>): boolean {
   return s.agentType === 'codex-sdk' || s.providerId === 'codex-sdk';
+}
+
+export function shouldRunGenericSilentActiveTurnRecovery(
+  s: Pick<SessionRecord, 'agentType' | 'providerId'>,
+  recoveredByContinueWatchdog = false,
+): boolean {
+  if (recoveredByContinueWatchdog) return false;
+  // Codex silent-turn recovery is owned by recoverCodexStalledSession(), which
+  // stops the stale turn and sends a front-of-queue `continue`. The generic
+  // settle-only recovery runs earlier and would otherwise swallow the stale turn
+  // before the Codex continuation branch can fire.
+  return !isCodexTransportSession(s);
 }
 
 function rememberCodexAutoContinuedGeneration(generationKey: string): void {
