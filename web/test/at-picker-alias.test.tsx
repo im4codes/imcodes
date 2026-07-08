@@ -10,6 +10,18 @@ import { render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AliasEntry } from '@shared/alias-types.js';
 
+// The CI web unit/components setup (test/setup-jsdom-storage.ts) does not shim
+// jsdom's missing Element.scrollIntoView / document.execCommand (only the base
+// vitest.config.ts setup does). The inline picker scrolls its highlighted row
+// and the caret-preserving insert uses execCommand, so shim both as no-ops here
+// (same as test/setup.ts) so those paths don't throw under the lean CI setup.
+if (typeof Element !== 'undefined' && typeof Element.prototype.scrollIntoView !== 'function') {
+  Object.defineProperty(Element.prototype, 'scrollIntoView', { value: () => {}, writable: true, configurable: true });
+}
+if (typeof document !== 'undefined' && typeof (document as { execCommand?: unknown }).execCommand !== 'function') {
+  Object.defineProperty(document, 'execCommand', { value: () => false, writable: true, configurable: true });
+}
+
 // t() returns the key so assertions stay language-agnostic.
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k, i18n: { language: 'en', changeLanguage: vi.fn() } }),
