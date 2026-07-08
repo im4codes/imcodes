@@ -1567,6 +1567,64 @@ describe('queue visibility e2e — queued messages must stay visible until turn 
     expect(captured[0].transportPendingMessageVersion).toBe(3);
   });
 
+  it('removes queued entries from top-level queue delivery facts without waiting for focus resync', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'transport.queue.delivery',
+      sessionName: 'deck_sub_eq1',
+      clientMessageId: 'q1',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageVersion: 2,
+      deliveryFrameId: 'frame-1',
+      deliveryFrameVersion: 1,
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+
+    act(() => send({
+      type: 'transport.queue.delivery',
+      sessionName: 'deck_sub_eq1',
+      clientMessageId: 'q2',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageVersion: 3,
+      deliveryFrameId: 'frame-2',
+      deliveryFrameVersion: 1,
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].state).toBe('running');
+    expect(captured[0].transportPendingMessageVersion).toBe(3);
+  });
+
+  it('clears queued entries from top-level queue reset without waiting for window switch sync', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'transport.queue.reset',
+      sessionName: 'deck_sub_eq1',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageVersion: 2,
+      resetReason: 'user_clear',
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+  });
+
   it('full lifecycle: queue → running → idle clears', async () => {
     const { ws, send } = createMockWs();
     await setupSession(ws, send);

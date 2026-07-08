@@ -13,6 +13,7 @@ import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
+  buildTransportQueueEventPatch,
   buildTransportPendingSyncPatch,
   extractTransportPendingVersion,
   nextTransportQueueVersion,
@@ -21,7 +22,8 @@ import {
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
-import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
+import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
+import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -238,6 +240,32 @@ export function useSubSessions(
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
+      const applyStructuredQueueEvent = (queueEvent: QueueEvent) => {
+        const subSessionName = queueEvent.sessionName;
+        if (!subSessionName || !subSessionName.startsWith('deck_sub_')) return false;
+        setSubSessions((prev) => {
+          const idx = prev.findIndex((s) => s.sessionName === subSessionName);
+          if (idx === -1) return prev;
+          const existing = prev[idx];
+          const transportPendingPatch = buildTransportQueueEventPatch(existing, queueEvent, subSessionName);
+          if (Object.keys(transportPendingPatch).length === 0) return prev;
+          const next = [...prev];
+          next[idx] = {
+            ...existing,
+            ...(queueEvent.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE
+              && existing.state === 'queued'
+              && (transportPendingPatch.transportPendingMessageEntries?.length ?? existing.transportPendingMessageEntries?.length ?? 0) === 0
+              ? { state: 'running' as const }
+              : {}),
+            ...transportPendingPatch,
+          };
+          return next;
+        });
+        return true;
+      };
+
+      if (isValidTransportQueueWireEvent(msg) && applyStructuredQueueEvent(msg)) return;
+
       let sessionName: string | undefined;
       let state: string | undefined;
 
@@ -382,6 +410,7 @@ export function useSubSessions(
 
       if (msg.type === 'timeline.event') {
         const ev = msg.event;
+        if (isValidTransportQueueWireEvent(ev.payload) && applyStructuredQueueEvent(ev.payload)) return;
         if (ev.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
           const subSessionName = ev.sessionId;
           if (!subSessionName || !subSessionName.startsWith('deck_sub_')) return;
