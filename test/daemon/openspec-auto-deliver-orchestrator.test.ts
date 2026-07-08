@@ -83,6 +83,19 @@ let projectDir: string;
 let extraTempDirs: string[];
 const execFileAsync = promisify(execFile);
 
+// This suite drives the REAL auto-deliver orchestrator: child-process openspec
+// validation, git init/commit/push, and file I/O. It runs inside the full
+// `test:unit` daemon suite, so on a loaded/contended CI runner an awaited
+// websocket/transport send can legitimately arrive several seconds late — which
+// flaked the previous tight 1000/2500ms send-observation deadlines (macOS +
+// Node 24 while Node 22 + Windows passed the same commit). Use one generous
+// deadline for every send wait and raise the per-test timeout to match. The
+// sends are in-process mocks, so a correct send is still observed within a poll
+// cycle on a fast machine; the ceiling only prevents spurious "send was not
+// observed" throws under contention.
+const SEND_WAIT_MS = 15_000;
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 60_000 });
+
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
   await mkdir(join(root, 'specs', 'demo'), { recursive: true });
@@ -91,7 +104,7 @@ async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): 
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
-async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = 5000): Promise<Record<string, unknown>> {
+async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     const found = serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
@@ -101,7 +114,7 @@ async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean,
   throw new Error('Expected websocket send was not observed');
 }
 
-async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = 5000): Promise<string> {
+async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = SEND_WAIT_MS): Promise<string> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
@@ -115,7 +128,7 @@ function transportSendCount(predicate: (text: string) => boolean): number {
   return transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).filter(predicate).length;
 }
 
-async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = 5000): Promise<void> {
+async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     if (transportSendCount(predicate) >= count) return;
@@ -124,7 +137,7 @@ async function waitForTransportSendCount(predicate: (text: string) => boolean, c
   throw new Error('Expected transport send count was not observed');
 }
 
-async function waitForP2pStartCount(count: number, maxMs = 2500): Promise<void> {
+async function waitForP2pStartCount(count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     if (startP2pRunMock.mock.calls.length >= count) return;
@@ -139,7 +152,7 @@ function implementationReminderCount(): number {
     .length;
 }
 
-async function waitForImplementationReminderCount(n: number, maxMs = 2500): Promise<void> {
+async function waitForImplementationReminderCount(n: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     if (implementationReminderCount() >= n) return;
@@ -1505,7 +1518,7 @@ exec "${realGit}" "$@"
       repairs_applied: [{ files: ['src/feature.ts'], reason: 'Implemented the product change.' }],
     });
     await emitDeckDemoIdle();
-    const prompt = await waitForTransportSend((text) => text === 'commit&push', 2500);
+    const prompt = await waitForTransportSend((text) => text === 'commit&push', SEND_WAIT_MS);
     expect(prompt).toBe('commit&push');
     const commitMessage = 'Implement delivered feature';
     await git(['add', '--', 'src/feature.ts']);
@@ -2084,7 +2097,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(terminal?.projection.implementationAuditRound).toEqual({ current: 1, total: 1 });
@@ -2168,7 +2181,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('spec_audit_blocked');
     expect(terminal?.projection.latestVerdict).toBe('BLOCKED');
@@ -2234,7 +2247,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
     expect(terminal?.projection.auditBeforeRepair).toBeUndefined();
@@ -2294,7 +2307,7 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.finalAfterRepair).toMatchObject({
       phase: 'final_after_repair',
@@ -2655,7 +2668,7 @@ exec "${realGit}" "$@"
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2748,7 +2761,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2775,7 +2788,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2825,7 +2838,7 @@ exec "${realGit}" "$@"
 
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'spec_audit_repair');
     await completeSpecAuditDiscussionToImplementation();
-    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', 2500);
+    await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_task_loop', SEND_WAIT_MS);
     await emitDeckDemoIdle();
     await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION && msg.projection?.stage === 'implementation_audit_repair');
 
@@ -2841,11 +2854,11 @@ exec "${realGit}" "$@"
       2500,
     );
     await emitDeckDemoIdle();
-    const firstRepairPrompt = await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    const firstRepairPrompt = await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), SEND_WAIT_MS);
     const origin = parseAutoDeliverMetadataBlock(firstRepairPrompt);
     expect(firstRepairPrompt).toContain('Repair prompt attempt: 1/');
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, SEND_WAIT_MS);
     const secondRepairPrompt = transportSendMock.mock.calls
       .map((call) => String(call[0] ?? ''))
       .filter((text) => text.includes('Problem: missing_authoritative_json'))
@@ -2861,7 +2874,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2899,7 +2912,7 @@ exec "${realGit}" "$@"
       pendingMessageEntries: [],
       pendingMessageVersion: 1,
     });
-    const repairPrompt = await waitForTransportSend(missingPrompt, 2500);
+    const repairPrompt = await waitForTransportSend(missingPrompt, SEND_WAIT_MS);
     expect(repairPrompt).toContain('Repair prompt attempt: 1/');
 
     runtimeStatus = 'thinking';
@@ -2922,7 +2935,7 @@ exec "${realGit}" "$@"
       pendingMessageVersion: 2,
     });
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -2935,7 +2948,7 @@ exec "${realGit}" "$@"
     });
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('implementation_audit_blocked');
     expect(terminal?.projection.latestVerdict).toBe('BLOCKED');
@@ -2960,7 +2973,7 @@ exec "${realGit}" "$@"
     let terminal = await waitForSend((msg) => (
       msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && (msg.projection as { terminalReason?: unknown } | undefined)?.terminalReason === 'audit_metadata_mismatch'
-    ), 2500);
+    ), SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_metadata_mismatch');
     expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();
@@ -2984,16 +2997,16 @@ exec "${realGit}" "$@"
     const missingPrompt = await startFinalAcceptanceAuditPrompt('req-multiple-json');
     const missingOrigin = parseAutoDeliverMetadataBlock(missingPrompt);
     await emitDeckDemoIdle();
-    await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), 2500);
+    await waitForTransportSend((text) => text.includes('Problem: missing_authoritative_json'), SEND_WAIT_MS);
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, SEND_WAIT_MS);
     expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
     await writeFile(String(missingOrigin.authoritativeResultPath), JSON.stringify(auditPayload({
       auto_deliver: missingOrigin,
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
     clearOpenSpecAutoDeliverRunsForTests();
@@ -3004,16 +3017,16 @@ exec "${realGit}" "$@"
     const malformedOrigin = parseAutoDeliverMetadataBlock(malformedPrompt);
     await writeFile(String(malformedOrigin.authoritativeResultPath), '{not json', 'utf8');
     await emitDeckDemoIdle();
-    await waitForTransportSend((text) => text.includes('Problem: malformed_authoritative_json'), 2500);
+    await waitForTransportSend((text) => text.includes('Problem: malformed_authoritative_json'), SEND_WAIT_MS);
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: malformed_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: malformed_authoritative_json'), 2, SEND_WAIT_MS);
     expect(serverLinkMock.send.mock.calls.some((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toBe(false);
     await writeFile(String(malformedOrigin.authoritativeResultPath), JSON.stringify(auditPayload({
       auto_deliver: malformedOrigin,
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   }, 10_000);
 
@@ -3067,7 +3080,7 @@ exec "${realGit}" "$@"
     );
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('invalid_authoritative_result_path');
     expect(transportSendMock.mock.calls.some((call) => String(call[0] ?? '').includes('Problem: invalid_authoritative_result_path'))).toBe(false);
@@ -3090,7 +3103,7 @@ exec "${realGit}" "$@"
       2500,
     );
     await emitDeckDemoIdle();
-    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, 2500);
+    await waitForTransportSendCount((text) => text.includes('Problem: missing_authoritative_json'), 2, SEND_WAIT_MS);
     expect(serverLinkMock.send.mock.calls.some((call) =>
       call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
       && call[0]?.projection?.status === 'needs_human',
@@ -3100,7 +3113,7 @@ exec "${realGit}" "$@"
       repair_completion: repairCompletion(),
     }), null, 2), 'utf8');
     await emitDeckDemoIdle();
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -3123,7 +3136,7 @@ exec "${realGit}" "$@"
     await writeFile(String(origin.authoritativeResultPath), resultJson, 'utf8');
     await emitDeckDemoIdle();
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
   });
 
@@ -3143,7 +3156,7 @@ exec "${realGit}" "$@"
     p2pRun.error = 'dispatch_failed: tmux send-keys failed: can\'t find pane: deck_demo_brain';
     await completeLatestAudit('failed');
 
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_p2p_failed');
     expect(terminal?.projection.evidence?.some((entry: { summary?: string }) => entry.summary?.includes('dispatch_failed'))).toBe(true);
@@ -3617,7 +3630,7 @@ exec "${realGit}" "$@"
     );
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitSessionIdle('deck_sub_worker');
-    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', 2500);
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
     await handleOpenSpecAutoDeliverCommand({
