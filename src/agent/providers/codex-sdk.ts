@@ -670,6 +670,11 @@ interface HeartbeatThreadSummary {
   rawTurnCount: number;
 }
 
+interface CodexRolloutTaskCompleteEvidence {
+  turnId: string;
+  lastAgentMessage?: string;
+}
+
 interface CodexActiveTurnLease {
   id: string;
   attemptId: number;
@@ -1154,6 +1159,17 @@ function readAgentMessageText(value: unknown): string | undefined {
     if (typeof text === 'string') parts.push(text);
   }
   return parts.length > 0 ? parts.join('') : undefined;
+}
+
+function readRolloutTaskCompleteMessage(payload: Record<string, any>): string | undefined {
+  for (const key of ['last_agent_message', 'lastAgentMessage', 'result', 'message']) {
+    const value = payload[key];
+    const text = typeof value === 'string'
+      ? value
+      : readAgentMessageText(value);
+    if (typeof text === 'string' && text.trim()) return text;
+  }
+  return undefined;
 }
 
 function readTurnCompletedAgentMessage(turn: Record<string, any>): { id: string; text: string } | undefined {
@@ -4016,8 +4032,8 @@ export class CodexSdkProvider implements TransportProvider {
    * stream has been silent past CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS while
    * the heartbeat cannot prove the turn terminal. Reads the thread's rollout
    * tail; a recorded `task_complete` for the running turn settles it as
-   * completed (the final agent_message text already reached the runtime via
-   * deltas before the app-server went zombie).
+   * completed. When the app-server missed the final delta too, the rollout's
+   * `last_agent_message` is the durable source of truth for the final text.
    */
   private maybeConfirmTaskCompleteFromRollout(
     sessionId: string,
@@ -4052,8 +4068,8 @@ export class CodexSdkProvider implements TransportProvider {
     const lease = state?.activeTurnLease;
     if (!state || !lease || lease.id !== leaseId || lease.attemptId !== attemptId) return;
     if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
-    const confirmed = await this.rolloutTailReportsTaskComplete(state, turnId);
-    if (!confirmed) return;
+    const evidence = await this.rolloutTailReportsTaskComplete(state, turnId);
+    if (!evidence) return;
     // Re-validate after the await — the turn may have settled or rolled over
     // through the normal paths while the file read was in flight.
     const latestState = this.sessions.get(sessionId);
@@ -4061,6 +4077,10 @@ export class CodexSdkProvider implements TransportProvider {
     if (!latestState || !latestLease || latestLease.id !== leaseId || latestLease.attemptId !== attemptId) return;
     if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
     if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
+    if (evidence.lastAgentMessage && latestState.currentText !== evidence.lastAgentMessage) {
+      latestState.currentMessageId = `${turnId}:rollout-task-complete`;
+      latestState.currentText = evidence.lastAgentMessage;
+    }
     logger.warn({
       provider: this.id,
       sessionId,
@@ -4072,22 +4092,22 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   /** Reads the tail of the thread's rollout file looking for a `task_complete` event for `turnId`. */
-  private async rolloutTailReportsTaskComplete(state: CodexSdkSessionState, turnId: string): Promise<boolean> {
-    if (!state.threadId) return false;
+  private async rolloutTailReportsTaskComplete(state: CodexSdkSessionState, turnId: string): Promise<CodexRolloutTaskCompleteEvidence | null> {
+    if (!state.threadId) return null;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
     const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
-    if (!rolloutPath) return false;
+    if (!rolloutPath) return null;
     state.rawChecklistRolloutPath = rolloutPath;
     let fh: Awaited<ReturnType<typeof open>> | null = null;
     try {
       fh = await open(rolloutPath, 'r');
       const { size } = await fh.stat();
       const start = Math.max(0, size - CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES);
-      if (start >= size) return false;
+      if (start >= size) return null;
       const buffer = Buffer.allocUnsafe(size - start);
       const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
-      if (bytesRead <= 0) return false;
+      if (bytesRead <= 0) return null;
       const text = buffer.subarray(0, bytesRead).toString('utf8');
       for (const line of text.split('\n')) {
         const trimmed = line.trim();
@@ -4098,15 +4118,21 @@ export class CodexSdkProvider implements TransportProvider {
           const payload = isRecord(record.payload) ? record.payload : record;
           if (payload.type !== 'task_complete') continue;
           const completedTurnId = meaningfulString(payload.turn_id) ?? meaningfulString(payload.turnId);
-          if (completedTurnId === turnId) return true;
+          if (completedTurnId === turnId) {
+            const lastAgentMessage = readRolloutTaskCompleteMessage(payload);
+            return {
+              turnId,
+              ...(lastAgentMessage ? { lastAgentMessage } : {}),
+            };
+          }
         } catch {
           // Partial first line of the tail window or non-JSON noise — skip.
         }
       }
-      return false;
+      return null;
     } catch (err) {
       logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, turnId, err }, 'Codex rollout task_complete tail read failed');
-      return false;
+      return null;
     } finally {
       if (fh) await fh.close().catch(() => {});
     }

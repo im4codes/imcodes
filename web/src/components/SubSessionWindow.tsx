@@ -4,8 +4,9 @@
  */
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
@@ -14,7 +15,7 @@ import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
-import { useTimeline } from '../hooks/useTimeline.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -274,9 +275,10 @@ export function SubSessionWindow({
     hasOlderHistory,
     loadOlderEvents,
   } = useTimeline(sub.sessionName, ws, serverId, {
-    isActiveSession: active,
-    // Window mounted = visible; participate in resume broadcast even when
-    // minimized/inactive so timeline stays fresh on focus / online / probe.
+    // Any mounted sub-session window is user-visible work, even when it is not
+    // the focused/topmost one. Keep its active history/replay/retry path armed
+    // so timeline gaps do not wait for a focus/window switch to backfill.
+    isActiveSession: true,
     isVisible: true,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
@@ -290,9 +292,20 @@ export function SubSessionWindow({
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
+  const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
-    () => getTailSessionState(events) ?? sub.state ?? null,
-    [events, sub.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: sub.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own
@@ -349,6 +362,7 @@ export function SubSessionWindow({
         ...(resendExtra ?? {}),
         commandId: newCommandId,
       });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch {
       return;
     }
@@ -547,6 +561,7 @@ export function SubSessionWindow({
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
+      requestActiveTimelineRefreshAfterUserAction();
       addOptimisticUserMessage(text, commandId);
       scrollToBottom();
     } catch {
@@ -975,6 +990,7 @@ export function SubSessionWindow({
       {/* Full SessionControls — with sub-session action overrides */}
       <SessionControls
         ws={ws}
+        connected={connected}
         activeSession={sessionInfo}
         inputRef={inputRef}
         quickData={quickData}

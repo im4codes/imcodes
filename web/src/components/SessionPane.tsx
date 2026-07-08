@@ -12,10 +12,11 @@ import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
-import { useTimeline } from '../hooks/useTimeline.js';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
@@ -218,6 +219,7 @@ export function SessionPane({
         ...(resendExtra ?? {}),
         commandId: newCommandId,
       });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch {
       return;
     }
@@ -250,9 +252,21 @@ export function SessionPane({
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(timelineEvents), [timelineEvents]);
+  const timelineLastEventTs =
+    timelineEvents.length > 0 ? (timelineEvents[timelineEvents.length - 1]?.ts ?? null) : null;
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
-    () => getTailSessionState(timelineEvents) ?? session.state ?? null,
-    [timelineEvents, session.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: session.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   // shell / script sessions have no agent state, no token usage, no quota —
   // suppress the footer entirely so they don't see misleading "Agent
@@ -375,6 +389,7 @@ export function SessionPane({
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       ws.sendSessionCommand('send', { sessionName, text, commandId });
+      requestActiveTimelineRefreshAfterUserAction();
       if (hasChatTimeline) {
         addOptimisticUserMessage(text, commandId);
         scrollToBottom();
@@ -491,6 +506,7 @@ export function SessionPane({
       {isActive && (
         <SessionControls
           ws={ws}
+          connected={connected}
           activeSession={controlsSession}
           inputRef={inputRef}
           onAfterAction={onAfterAction}

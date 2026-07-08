@@ -226,6 +226,7 @@ vi.mock('../src/watch-projection.js', () => ({
 vi.mock('../src/hooks/useTimeline.js', () => ({
   ingestTimelineEventForCache: vi.fn(),
   requestActiveTimelineRefresh: vi.fn(),
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
 }));
 
 vi.mock('../src/components/ErrorBoundary.js', () => ({
@@ -709,6 +710,25 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+  }, 20_000);
+
+  it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('session-tabs')).toBeTruthy();
+    const ws = await getActiveWsClient();
+
+    ws.requestSessionList.mockClear();
+    await act(async () => {
+      ws.emit({ type: 'daemon.reconnected' });
+    });
+
+    expect(ws.requestSessionList).toHaveBeenCalledTimes(1);
   }, 20_000);
 
   it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {

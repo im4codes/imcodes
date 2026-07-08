@@ -104,6 +104,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { CodexSdkProvider } = await import('./providers/codex-sdk.js');
       return new CodexSdkProvider();
     }
+    case 'qoder-sdk': {
+      const { QoderSdkProvider } = await import('./providers/qoder-sdk.js');
+      return new QoderSdkProvider();
+    }
     case 'cursor-headless': {
       const { CursorHeadlessProvider } = await import('./providers/cursor-headless.js');
       return new CursorHeadlessProvider();

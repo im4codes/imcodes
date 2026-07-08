@@ -78,7 +78,7 @@ const SDK_TURN_LOST_RECOVERY_PHASE_LABELS: Record<SdkTurnLostRecoveryPhase, stri
   [SDK_TURN_LOST_RECOVERY_PHASES.DETECTED]: 'Detected lost Codex SDK turn',
   [SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING]: 'Recovering lost Codex SDK turn',
   [SDK_TURN_LOST_RECOVERY_PHASES.RECOVERED]: 'Recovered lost Codex SDK turn',
-  [SDK_TURN_LOST_RECOVERY_PHASES.FAILED]: 'Lost Codex SDK turn recovery needs user action',
+  [SDK_TURN_LOST_RECOVERY_PHASES.FAILED]: 'Codex turn ended before completion',
 };
 
 function sdkTurnLostRecoveryPhaseFromMetadata(
@@ -96,18 +96,26 @@ export function emitSdkTurnLostRecoveryPhase(
 ): boolean {
   const metadata = sanitizeSdkTurnLostRecoveryMetadata(input);
   if (!metadata) return false;
-  const explicitSession = metadata.sessionName ?? metadata.localSessionKey;
-  if (explicitSession && explicitSession !== sessionName) {
+  if (expectedProviderSessionId && metadata.providerSessionId && metadata.providerSessionId !== expectedProviderSessionId) {
+    logger.warn(
+      { sessionName, providerSid: expectedProviderSessionId, recoveryProviderSessionId: metadata.providerSessionId },
+      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting provider session metadata',
+    );
+    return false;
+  }
+  const providerSessionMatches = !!expectedProviderSessionId
+    && metadata.providerSessionId === expectedProviderSessionId;
+  if (metadata.sessionName && metadata.sessionName !== sessionName) {
     logger.warn(
       { sessionName, recoverySessionName: metadata.sessionName, recoveryLocalSessionKey: metadata.localSessionKey },
       'transport-relay: dropped sdk_turn_lost recovery phase with conflicting session metadata',
     );
     return false;
   }
-  if (expectedProviderSessionId && metadata.providerSessionId && metadata.providerSessionId !== expectedProviderSessionId) {
+  if (!metadata.sessionName && metadata.localSessionKey !== sessionName && !providerSessionMatches) {
     logger.warn(
-      { sessionName, providerSid: expectedProviderSessionId, recoveryProviderSessionId: metadata.providerSessionId },
-      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting provider session metadata',
+      { sessionName, recoverySessionName: metadata.sessionName, recoveryLocalSessionKey: metadata.localSessionKey },
+      'transport-relay: dropped sdk_turn_lost recovery phase with conflicting session metadata',
     );
     return false;
   }
@@ -830,6 +838,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       requestId: request.id,
       description: request.description,
       ...(request.tool ? { tool: request.tool } : {}),
+      ...(request.provider ? { provider: request.provider } : {}),
+      ...(typeof request.providerGeneration === 'number' ? { providerGeneration: request.providerGeneration } : {}),
+      ...(request.providerToolUseId ? { providerToolUseId: request.providerToolUseId } : {}),
+      ...(request.inputPreview ? { inputPreview: request.inputPreview } : {}),
     } as const;
     sendToServer?.(payload);
     void appendTransportEvent(sessionName, payload);

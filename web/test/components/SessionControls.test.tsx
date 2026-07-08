@@ -131,6 +131,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.approval.allow') return 'Allow';
       if (key === 'session.approval.deny') return 'Deny';
       if (key === 'session.approval.tool') return `${String(opts?.tool ?? 'tool')} wants approval`;
+      if (key === 'session.approval.scope') return `${String(opts?.provider ?? 'provider')} generation ${String(opts?.generation ?? '?')} tool ${String(opts?.toolUseId ?? 'tool')}`;
+      if (key === 'session.approval.input') return `Input: ${String(opts?.input ?? '')}`;
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
       const parts = key.split('.');
@@ -703,6 +705,21 @@ afterEach(() => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+  });
+
+
+  it('uses the parent connected prop instead of a stale ws.connected getter', () => {
+    const ws = makeWs() as any;
+    ws.connected = false;
+    render(
+      <SessionControls
+        ws={ws}
+        connected={true}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste or drag upload');
   });
 
   it('hides the send button on mobile and shows the embedded voice button when empty', () => {
@@ -3513,6 +3530,72 @@ afterEach(() => {
     expect(screen.queryByText('sent while browser was offline')).toBeNull();
   });
 
+  it('keeps a new local queue entry when the empty daemon baseline has not advanced', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 7,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'new send after empty baseline';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(screen.getByText('new send after empty baseline')).toBeDefined();
+  });
+
+  it('clears a local queued entry when an empty daemon baseline advances after the send', async () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 7,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'fast drained local send';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('fast drained local send')).toBeDefined();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: [],
+          transportPendingMessageEntries: [],
+          transportPendingMessageVersion: 8,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryByText('fast drained local send')).toBeNull());
+  });
+
   it('does not clear an optimistic queue entry by text when the authoritative user.message lacks ids', () => {
     const ws = makeWs();
     render(
@@ -4349,6 +4432,10 @@ afterEach(() => {
           requestId: 'approval-1',
           description: 'Allow file write',
           tool: 'shell',
+          provider: 'qoder-sdk',
+          providerGeneration: 3,
+          providerToolUseId: 'tool-approve',
+          inputPreview: '{"command":"pwd"}',
         });
       }
     });
@@ -4356,6 +4443,9 @@ afterEach(() => {
     await waitFor(() => {
       expect(screen.getByText('Approval required')).toBeDefined();
       expect(screen.getByText('shell wants approval')).toBeDefined();
+      expect(screen.getByText('Allow file write')).toBeDefined();
+      expect(screen.getByText('qoder-sdk generation 3 tool tool-approve')).toBeDefined();
+      expect(screen.getByText('Input: {"command":"pwd"}')).toBeDefined();
     });
 
     fireEvent.click(screen.getByRole('button', { name: /^Allow$/ }));
@@ -4546,7 +4636,7 @@ afterEach(() => {
     getSelectionSpy.mockRestore();
   });
 
-  it('does not send immediately after selecting agent and mode; sends a direct message after further editing when only one target is present', () => {
+  it('does not send immediately after selecting agent and mode; sends an orchestration prompt to the current session after further editing', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4578,9 +4668,15 @@ afterEach(() => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
-      text: 'please review',
-      delegateTarget: { session: 'deck_sub_w1' },
+      text: expect.stringContaining('You are the current session orchestrator for an agent delegation.'),
     }));
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).toContain('Exact delegate target session: deck_sub_w1');
+    expect(sent.text).toContain('User task to delegate:\nplease review');
+    expect(sent.text).toContain('organize the relevant current-session context yourself');
+    expect(sent.text).toContain('Do not send the raw user task by itself.');
+    expect(sent.text).toContain('imcodes send --no-reply "deck_sub_w1"');
+    expect(sent).not.toHaveProperty('delegateTarget');
 
     getSelectionSpy.mockRestore();
   });
@@ -4665,7 +4761,7 @@ afterEach(() => {
     expect(screen.getByTestId('p2p-dropdown-tab-combos')).toBeDefined();
   });
 
-  it('selecting agents from the picker sends delegateTarget instead of p2pAtTargets', () => {
+  it('selecting agents from the picker asks the current session to orchestrate delegation instead of direct target dispatch', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4692,12 +4788,15 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
-      sessionName: 'deck_my-project_brain',
-      text: 'please review',
-      delegateTarget: { session: 'deck_sub_w1' },
-    }));
     const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent).toMatchObject({
+      sessionName: 'deck_my-project_brain',
+    });
+    expect(sent.text).toContain('You are the current session orchestrator for an agent delegation.');
+    expect(sent.text).toContain('Selected delegate: w1 (deck_sub_w1)');
+    expect(sent.text).toContain('User task to delegate:\nplease review');
+    expect(sent).toHaveProperty('text');
+    expect(sent).not.toHaveProperty('delegateTarget');
     expect(sent).not.toHaveProperty('p2pAtTargets');
 
     getSelectionSpy.mockRestore();
@@ -5672,11 +5771,11 @@ afterEach(() => {
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
-        sessionName: 'deck_my-project_brain',
-        text: 'please review',
-        delegateTarget: { session: 'deck_sub_w1' },
-      }));
+      const sent = gatherSendCalls(ws).at(-1)!;
+      expect(sent).toMatchObject({ sessionName: 'deck_my-project_brain' });
+      expect(sent.text).toContain('Exact delegate target session: deck_sub_w1');
+      expect(sent.text).toContain('User task to delegate:\nplease review');
+      expect(sent).not.toHaveProperty('delegateTarget');
       expect(screen.queryByText('title')).toBeNull();
 
       getSelectionSpy.mockRestore();

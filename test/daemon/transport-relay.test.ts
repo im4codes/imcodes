@@ -984,6 +984,47 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(emitMock.mock.calls.some(c => c[0] === sharedProviderSessionId)).toBe(false);
     });
 
+    it('accepts route-keyed recovery phases when provider session metadata matches current route', () => {
+      const emitted = relayTesting.emitSdkTurnLostRecoveryPhaseForTest(
+        'deck_cd_brain',
+        makeSdkTurnLostDetails({
+          localSessionKey: 'provider-route-id',
+          sessionName: undefined,
+          providerSessionId: 'provider-route-id',
+          correlationId: 'correlation-route-keyed',
+        }),
+        SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        'provider-route-id',
+      );
+
+      expect(emitted).toBe(true);
+      const phaseCall = emitMock.mock.calls.find(c => c[1] === 'agent.status');
+      expect(phaseCall).toBeDefined();
+      expect(phaseCall![0]).toBe('deck_cd_brain');
+      expect(phaseCall![2]).toMatchObject({
+        status: SDK_TURN_LOST_RECOVERY_STATUS,
+        phase: SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        correlationId: 'correlation-route-keyed',
+      });
+    });
+
+    it('rejects recovery phases when sessionName conflicts even if provider route matches', () => {
+      const emitted = relayTesting.emitSdkTurnLostRecoveryPhaseForTest(
+        'deck_cd_brain',
+        makeSdkTurnLostDetails({
+          localSessionKey: 'provider-route-id',
+          sessionName: 'other-session',
+          providerSessionId: 'provider-route-id',
+          correlationId: 'correlation-conflicting-session',
+        }),
+        SDK_TURN_LOST_RECOVERY_PHASES.DETECTED,
+        'provider-route-id',
+      );
+
+      expect(emitted).toBe(false);
+      expect(emitMock.mock.calls.some(c => c[1] === 'agent.status')).toBe(false);
+    });
+
     it('emits explicit recovery phase metadata for recovering/recovered/failed without generic error state', () => {
       const phases = [
         SDK_TURN_LOST_RECOVERY_PHASES.RECOVERING,
@@ -1656,6 +1697,10 @@ describe('transport-relay (timeline-emitter based)', () => {
         id: 'approval-1',
         description: 'Allow file write',
         tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 2,
+        providerToolUseId: 'tool-1',
+        inputPreview: '{"command":"pwd"}',
       });
       await Promise.resolve();
 
@@ -1665,10 +1710,15 @@ describe('transport-relay (timeline-emitter based)', () => {
         requestId: 'approval-1',
         description: 'Allow file write',
         tool: 'shell',
+        provider: 'qoder-sdk',
+        providerGeneration: 2,
+        providerToolUseId: 'tool-1',
+        inputPreview: '{"command":"pwd"}',
       }));
       expect(appendMock).toHaveBeenCalledWith('sess-approval', expect.objectContaining({
         type: TRANSPORT_EVENT.CHAT_APPROVAL,
         requestId: 'approval-1',
+        providerToolUseId: 'tool-1',
       }));
     });
   });

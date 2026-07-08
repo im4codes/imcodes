@@ -10,7 +10,7 @@ import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
 import { bestModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
-import { useTimeline } from '../hooks/useTimeline.js';
+import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { cancelSessionViaHttp } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
@@ -140,7 +140,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
-      isActiveSession: !!isFocused,
+      // Open cards are active timeline consumers even when not focused. Keeping
+      // only the focused card active let open sub-session previews miss history
+      // retry/replay until the user clicked or switched windows.
+      isActiveSession: !!(isOpen || isFocused),
       // Keep the live timeline hook attached even while preview hydration is
       // delayed. Without this, sub-session cards miss the typewriter phase and
       // only jump to cached/final text when the timer flips `timelineHydrated`.
@@ -234,6 +237,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
+      requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       console.warn('sub-session send failed; preserving draft for retry', err);
       return;
@@ -260,6 +264,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     if (ws) {
       try {
         ws.sendSessionCommandUrgent('cancel', payload);
+        requestActiveTimelineRefreshAfterUserAction();
         return;
       } catch (err) {
         wsThrown = err;
@@ -270,6 +275,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
         // eslint-disable-next-line no-console
         console.warn('handleTransportStop: WS + HTTP both failed', { wsThrown, httpErr });
       });
+      requestActiveTimelineRefreshAfterUserAction();
       return;
     }
     // No WS, no serverId → nowhere to send. Surface so it's not invisible.
@@ -448,6 +454,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
             {quickData ? (
               <SessionControls
                 ws={ws}
+                connected={connected}
                 activeSession={sessionInfo}
                 quickData={quickData}
                 compact

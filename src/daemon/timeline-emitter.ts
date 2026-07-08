@@ -119,10 +119,18 @@ export class TimelineEmitter {
       this.lastSessionState.set(sessionId, state);
     }
 
-    // When a user sends a message, reset session state tracking so the next idle
-    // after the agent responds is always emitted (even if state was already 'idle').
-    // Without this, pure-text replies (no tool_start→running) cause idle to be deduped.
-    if (type === 'user.message') {
+    // Reset same-state dedup on visible activity so the next idle is meaningful
+    // even if the previous state was already idle. Auto-continue / compact-tail
+    // paths can emit assistant/tool activity without a fresh user.message or a
+    // running transition; if we keep the old `idle` fingerprint, the final idle
+    // is swallowed and the UI can stay in a fake-working state until refresh.
+    if (
+      type === 'user.message'
+      || type === 'assistant.text'
+      || type === 'tool.call'
+      || type === 'tool.result'
+      || (type === 'agent.status' && payload.status)
+    ) {
       this.lastSessionState.delete(sessionId);
     }
 

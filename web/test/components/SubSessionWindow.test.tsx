@@ -61,6 +61,14 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => activeToolCallMock,
+  getTailSessionStateInfo: (events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>) => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'session.state') {
+        return { state: String(events[i].payload?.state ?? ''), ts: events[i].ts ?? null };
+      }
+    }
+    return { state: null, ts: null };
+  },
   getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');
@@ -75,6 +83,7 @@ const retryOptimisticMessageSpy = vi.fn();
 const loadOlderEventsSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: () => ({
     events: timelineEventsMock,
     refreshing: false,
@@ -565,10 +574,11 @@ describe('SubSessionWindow metadata wiring', () => {
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
   });
 
-  it('prefers timeline tail running state over stale outer idle state for footer status', async () => {
+  it('uses authoritative outer idle when stale timeline running has no active work', async () => {
     timelineEventsMock = [
       { type: 'session.state', payload: { state: 'running' } },
-      { type: 'tool.result', payload: { ok: true } },
+      { type: 'assistant.text', payload: { text: 'done', streaming: false } },
+      { type: 'usage.update', payload: { inputTokens: 1, outputTokens: 1 } },
     ];
 
     const sub = makeSubSession({
@@ -596,7 +606,7 @@ describe('SubSessionWindow metadata wiring', () => {
 
     await waitFor(() => {
       const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
-      expect(footer?.dataset.state).toBe('running');
+      expect(footer?.dataset.state).toBe('idle');
     });
   });
 

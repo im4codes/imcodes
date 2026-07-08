@@ -420,6 +420,86 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('recovers when the final assistant text arrives but the following idle event is dropped', async () => {
+    const sessionName = `deck_final_idle_drop_${Date.now()}`;
+    const serverId = `srv-final-idle-drop-${Date.now()}`;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+
+    const idleEvent: TimelineEvent = {
+      eventId: `${sessionName}-idle`,
+      sessionId: sessionName,
+      ts: 7000,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: {
+        state: 'idle',
+        authoritative: true,
+        activityGeneration: { scope: 'session', sessionName, generation: 1 },
+        blockingWorkCount: 0,
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        pendingCount: 0,
+        pendingVersion: 1,
+        decisionReason: 'activity_reconciler_clear',
+        clearInputs: [],
+      },
+    };
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => { handler = next; return () => { handler = null; }; },
+      sendTimelineReplayRequest: vi.fn(() => 'replay-final-idle-drop'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-final-idle-drop'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId, { isActiveSession: true });
+      return h('div', { 'data-testid': 'probe' }, events.map((e) => (
+        e.type === 'session.state' ? String(e.payload.state ?? '') : String(e.payload.text ?? '')
+      )).join('|'));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    fetchSpy.mockClear();
+    fetchSpy.mockResolvedValue({ events: [idleEvent], epoch: 1, hasMore: false, nextCursor: null });
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `${sessionName}-final`,
+          sessionId: sessionName,
+          ts: 6000,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'final answer', streaming: false },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5100); });
+
+    await waitFor(() => { expect(fetchSpy).toHaveBeenCalled(); });
+    const options = fetchSpy.mock.calls.at(-1)![2];
+    expect((options as { afterTs?: number }).afterTs).toBeUndefined();
+    expect(options).toEqual(expect.objectContaining({ limit: 300 }));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('idle');
+    });
+  });
+
   it('uses only history content events for tail afterTs so session.state cannot advance the cursor past missing content', () => {
     const sessionName = `deck_tail_cursor_content_${Date.now()}`;
     const afterTs = __getTimelineHistoryAfterTsForTests([

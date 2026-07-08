@@ -90,6 +90,7 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
+import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import {
@@ -924,6 +925,7 @@ import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
@@ -1840,6 +1842,10 @@ async function handleCodexResetCreditsConsume(cmd: Record<string, unknown>, serv
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const idempotencyKey = typeof cmd.idempotencyKey === 'string' ? cmd.idempotencyKey : '';
   const result = await consumeCodexResetCredit(idempotencyKey);
+  if (result.ok) {
+    void refreshCodexQuotaMetadataForSessions('codex_reset_credit_consume')
+      .catch((err) => logger.warn({ err }, 'codex reset-credit quota refresh failed'));
+  }
   if (!requestId) return;
   serverLink?.send(result.ok
     ? { type: CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE, requestId, ok: true, outcome: result.outcome }
@@ -3878,6 +3884,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
+      if (record?.agentType === 'qoder-sdk' && modelMatch) {
+        const nextModel = modelMatch[1];
+        const errMsg = `Qoder model switching is proof-gated in IM.codes v1: ${nextModel}`;
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: `⚠️ ${errMsg}`,
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+        return;
+      }
       if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
@@ -3902,6 +3921,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        return;
+      }
+      if (record?.agentType === 'qoder-sdk' && effortMatch) {
+        const nextEffort = effortMatch[1];
+        const errMsg = `Qoder thinking/effort controls are proof-gated in IM.codes v1: ${nextEffort}`;
+        emitTransportUserMessage(text);
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: `⚠️ ${errMsg}`,
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
         return;
       }
       if (supportsEffort(record?.agentType) && effortMatch) {
@@ -9310,7 +9342,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const resolved = nodePath.resolve(expanded);
 
   // Size check first (cheap, before any I/O)
-  if (Buffer.byteLength(content, 'utf-8') > 1_048_576) {
+  if (Buffer.byteLength(content, 'utf-8') > FS_WRITE_MAX_BYTES) {
     try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }); } catch { /* ignore */ }
     return;
   }

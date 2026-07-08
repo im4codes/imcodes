@@ -2358,6 +2358,25 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('does not auto-connect qoder-sdk for forced transport.list_models', async () => {
+    getProviderMock.mockReturnValue(undefined);
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'qoder-sdk', requestId: 'qoder-models', force: true }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'qoder-models'
+    )));
+
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'qoder-sdk',
+      requestId: 'qoder-models',
+      models: [],
+      error: expect.stringContaining('Unsupported agentType: qoder-sdk'),
+    }));
+  });
+
   it('coalesces concurrent transport.list_models requests for the same agent/provider and preserves request ids', async () => {
     let resolveModels!: (value: { models: Array<{ id: string }> }) => void;
     const listModels = vi.fn(() => new Promise((resolve) => {
@@ -3753,6 +3772,89 @@ describe('handleWebCommand transport queue behavior', () => {
       activeModel: 'claude-sonnet-4.6',
       modelDisplay: 'claude-sonnet-4.6',
     }));
+  });
+
+  it('rejects qoder-sdk /model switches without forwarding them as prompts', async () => {
+    const setAgentId = vi.fn();
+    const send = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qoder-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'performance',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-qoder',
+      setAgentId,
+      send,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model qoder-next',
+      commandId: 'cmd-model-qoder',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'command.ack',
+      expect.objectContaining({
+        commandId: 'cmd-model-qoder',
+        status: 'error',
+        error: expect.stringContaining('Qoder model switching is proof-gated'),
+      }),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      commandId: 'cmd-model-qoder',
+      status: 'error',
+      error: expect.stringContaining('Qoder model switching is proof-gated'),
+    }));
+  });
+
+  it('rejects qoder-sdk thinking controls without forwarding them as prompts', async () => {
+    const setEffort = vi.fn();
+    const send = vi.fn();
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'qoder-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-qoder',
+      setEffort,
+      send,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/thinking high',
+      commandId: 'cmd-effort-qoder',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setEffort).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'command.ack',
+      expect.objectContaining({
+        commandId: 'cmd-effort-qoder',
+        status: 'error',
+        error: expect.stringContaining('Qoder thinking/effort controls are proof-gated'),
+      }),
+    );
   });
 
   it('reports effective daemon memory feature states including server runtime override and fallback config', async () => {

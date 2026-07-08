@@ -329,6 +329,14 @@ export interface ApprovalRequest {
   description: string;
   /** Name of the tool requesting approval, if applicable. */
   tool?: string;
+  /** Provider that originated this approval request, when provider-scoped validation is available. */
+  provider?: string;
+  /** Provider turn generation that originated this request. */
+  providerGeneration?: number;
+  /** Provider-native tool use identifier used to prevent cross-request approval reuse. */
+  providerToolUseId?: string;
+  /** Bounded, redacted preview of the provider-native tool input. */
+  inputPreview?: string;
 }
 
 /** Provider-reported session metadata updates (e.g. learned resume/thread ID). */

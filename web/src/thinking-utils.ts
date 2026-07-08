@@ -82,17 +82,37 @@ export function hasActiveToolCall(events: Array<{ type: string; payload?: Record
  * This is more reliable than outer session store state for footer rendering,
  * because timeline updates can arrive before higher-level session snapshots settle.
  */
-export function getTailSessionState(
-  events: Array<{ type: string; payload?: Record<string, unknown> }>,
-): string | null {
+export interface TailSessionStateInfo {
+  state: string | null;
+  ts: number | null;
+}
+
+export function getTailSessionStateInfo(
+  events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>,
+): TailSessionStateInfo {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type !== 'session.state') continue;
     const state = e.payload?.state;
-    if (state === 'idle' && reduceTimelineActivity(events.slice(0, i + 1)).active) return 'running';
-    return typeof state === 'string' && state ? state : null;
+    const ts = typeof e.ts === 'number' && Number.isFinite(e.ts) ? e.ts : null;
+    // `started` is a lifecycle notification emitted when a daemon/session
+    // runtime is launched/restored. It is not evidence that a turn is active.
+    // Treating it as the latest live state makes the footer/controls disagree
+    // with the authoritative session snapshot after daemon restart: old
+    // history remains in the timeline, while a fresh `started` tail event is
+    // neither idle nor running. Skip it and keep looking for the last
+    // authoritative working/idle/error state.
+    if (state === 'started') continue;
+    if (state === 'idle' && reduceTimelineActivity(events.slice(0, i + 1)).active) return { state: 'running', ts };
+    return { state: typeof state === 'string' && state ? state : null, ts };
   }
-  return null;
+  return { state: null, ts: null };
+}
+
+export function getTailSessionState(
+  events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>,
+): string | null {
+  return getTailSessionStateInfo(events).state;
 }
 
 export function isRunningSessionState(sessionState: string | undefined): boolean {

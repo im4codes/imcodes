@@ -52,6 +52,7 @@ vi.mock('../../src/components/SessionControls.js', () => ({
   ),
 }));
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: (...args: any[]) => {
     useTimelineMock(...args);
     return {
@@ -71,6 +72,14 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => activeToolCallMock,
+  getTailSessionStateInfo: (events: Array<{ type: string; ts?: number; payload?: Record<string, unknown> }>) => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'session.state') {
+        return { state: String(events[i].payload?.state ?? ''), ts: events[i].ts ?? null };
+      }
+    }
+    return { state: null, ts: null };
+  },
   getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');
@@ -314,6 +323,41 @@ describe('SessionPane', () => {
     expect(chatViewSpy).toHaveBeenCalledWith(expect.objectContaining({
       sessionState: 'running',
     }));
+  });
+
+
+  it('uses authoritative outer idle when stale timeline running has no active work', () => {
+    timelineEventsMock = [
+      { eventId: 'running', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'running' } },
+      { eventId: 'done-text', sessionId: 'deck_test_brain', ts: 2, type: 'assistant.text', payload: { text: 'done', streaming: false } },
+      { eventId: 'usage', sessionId: 'deck_test_brain', ts: 3, type: 'usage.update', payload: { inputTokens: 1, outputTokens: 1 } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(chatViewSpy).toHaveBeenCalledWith(expect.objectContaining({ sessionState: 'idle' }));
+    expect(screen.getByTestId('usage-footer').getAttribute('data-state')).toBe('idle');
+    expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-session-state')).toBe('idle');
   });
 
   it('keeps active transport turn through a pending optimistic user message tail', () => {
@@ -560,10 +604,11 @@ describe('SessionPane', () => {
     expect(addOptimisticUserMessageMock).not.toHaveBeenCalled();
   });
 
-  it('prefers timeline tail running state over stale outer idle state for footer status', () => {
+  it('uses authoritative outer idle over stale timeline running for footer status', () => {
     timelineEventsMock = [
       { type: 'session.state', payload: { state: 'running' } },
-      { type: 'tool.result', payload: { ok: true } },
+      { type: 'assistant.text', payload: { text: 'done', streaming: false } },
+      { type: 'usage.update', payload: { inputTokens: 1, outputTokens: 1 } },
     ];
 
     render(
@@ -588,7 +633,7 @@ describe('SessionPane', () => {
       />,
     );
 
-    expect(screen.getByTestId('usage-footer').getAttribute('data-state')).toBe('running');
+    expect(screen.getByTestId('usage-footer').getAttribute('data-state')).toBe('idle');
   });
 
   it('keeps footer visible while a tool call is active even without usage or running state', () => {

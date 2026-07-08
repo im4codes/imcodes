@@ -2980,8 +2980,7 @@ describe('CodexSdkProvider', () => {
     // Compressed Generated Image Reporting block lives here now — every
     // semantic point present.
     expect(base).toContain('Generated images:');
-    expect(base).toContain('file path of every image you create/edit/save');
-    expect(base).toContain('repo-relative inside workspace, else absolute');
+    expect(base).toContain('absolute file path of every image you create/edit/save');
     expect(base).toContain('If no path returned, say so');
     expect(base).toContain('app/site/docs');
     codexRuntimeConfigMock.reset();
@@ -4604,6 +4603,7 @@ describe('CodexSdkProvider', () => {
 
       expect(completed).toHaveLength(1);
       expect(completed[0]).toMatchObject({ role: 'assistant', status: 'complete' });
+      expect(completed[0]?.content).toBe('已按完整 OpenSpec 流程处理完变更');
       // Settled from evidence — never via the destructive interrupt RPC, and
       // never surfaced as an error.
       expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);

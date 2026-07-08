@@ -27,6 +27,11 @@
  *     `thread/start` / `thread/resume`, gets picked up by Codex's
  *     prefix cache, and costs zero tokens for non-Codex providers.
  *
+ *   • `buildFilePathReportingPrompt` — appended to `sessionSystemText`
+ *     by `compileAgentContextArtifact`. Applies to ALL transport
+ *     providers because IM.codes file preview/download needs a concrete
+ *     filesystem path, not a bare filename or ambiguous relative path.
+ *
  * Lives in `shared/` because both builders are pure string composition
  * with no Node-only dependencies — the server (defense-in-depth) and
  * the web layer (effective-prompt preview UX) may both want to import
@@ -58,22 +63,29 @@ export function buildTransportImcodesIdentityPrompt(
  * always report the file path of any generated image so the user can
  * find / open / link to it.
  *
- * Compressed from 709 chars (8 lines) → 201 chars (1 line). All five
- * original semantic points are preserved:
- *   1. report file path of every image you create/edit/save
- *   2. repo-relative inside workspace, else absolute
- *   3. multiple images each get a path (implicit in "every")
- *   4. if no path is returned, say so explicitly
- *   5. if used in app/site/docs, note where it was added
+ * Compressed into one line while preserving the functional points:
+ *   1. report the absolute file path of every image you create/edit/save
+ *   2. multiple images each get a path (implicit in "every")
+ *   3. if no path is returned, say so explicitly
+ *   4. if used in app/site/docs, note where it was added
  * The original's two redundant lines ("do not only say image was
  * generated" and the closing "never finish without …") restated rule 1
  * and were dropped — the positive imperative already covers them.
  *
- * This block is daemon-injected on every transport turn and lives in
- * `sessionSystemText`. Keeping it short saves ~500 chars per turn for
- * every transport session — see p2p audit 37bfbb85-430 N-A (cap fix)
- * and the token-diet sibling work.
+ * This block is daemon-injected into Codex baseInstructions, once per
+ * thread/start|resume.
  */
 export function buildGeneratedImageReportingPrompt(): string {
-  return 'Generated images: report the file path of every image you create/edit/save (repo-relative inside workspace, else absolute). If no path returned, say so. If used in app/site/docs, also note where added.';
+  return 'Generated images: report the absolute file path of every image you create/edit/save. If no path returned, say so. If used in app/site/docs, also note where added.';
+}
+
+/**
+ * Render the File Path Reporting protocol. This is provider-neutral:
+ * any agent can create artifacts or ask IM.codes/the user to open,
+ * preview, download, or send a file. The frontend resolves those
+ * actions most reliably from absolute paths, so keep this short and
+ * daemon-injected outside user-authored prompt caps.
+ */
+export function buildFilePathReportingPrompt(): string {
+  return 'Files: when sharing, sending, opening, previewing, or linking a local file, provide its full absolute filesystem path (not a bare filename or relative path). If only repo-relative is known, resolve it against the workspace first.';
 }

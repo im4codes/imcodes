@@ -185,7 +185,11 @@ const STATE_PRIORITY: Record<WatchSessionState, number> = {
 function normalizeState(state: string): WatchSessionState {
   const lower = state.toLowerCase();
   if (lower === 'working' || lower === 'running' || lower === 'queued' || lower === 'busy') return 'working';
-  if (lower === 'idle' || lower === 'waiting') return 'idle';
+  // `started` is a neutral lifecycle notification (session/runtime launched),
+  // not a terminal stop and not turn activity. Mapping it to `stopped` makes
+  // watch/list projections flap while the main UI still has historical
+  // timeline content; keep it idle until a real running/queued event arrives.
+  if (lower === 'idle' || lower === 'waiting' || lower === 'started') return 'idle';
   if (lower === 'error' || lower === 'failed') return 'error';
   return 'stopped';
 }
@@ -632,13 +636,17 @@ export class WatchProjectionStore {
       if (state !== 'idle' && eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
       if (state === 'idle') {
         const expectedGeneration = this.activityGenerationBySession.get(event.sessionId);
-        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)) {
+        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)
+          || isAuthoritativeCleanIdlePayload(event.payload)) {
           this.openToolCountBySession.delete(event.sessionId);
           this.openToolKeysBySession.delete(event.sessionId);
           if (eventGeneration) this.activityGenerationBySession.set(event.sessionId, eventGeneration);
         } else {
           this.openToolCountBySession.delete(event.sessionId);
         }
+      }
+      if (state) {
+        changed = this.updateSessionState(event.sessionId, state) || changed;
       }
     }
     if (isRunningTimelineEvent(event)) {

@@ -39,6 +39,21 @@ describe('buildTransportResumeLaunchOpts', () => {
     }
   });
 
+  it('does not thread unproven qoder-sdk durable resume identifiers', () => {
+    const opts = buildTransportResumeLaunchOpts(rec({
+      agentType: 'qoder-sdk',
+      providerSessionId: 'route-old',
+      providerResumeId: 'resume-old',
+      codexSessionId: 'codex-old',
+      ccSessionId: 'cc-old',
+    }));
+
+    expect(opts.providerResumeId).toBeUndefined();
+    expect(opts.bindExistingKey).toBeUndefined();
+    expect(opts.codexSessionId).toBeUndefined();
+    expect(opts.ccSessionId).toBeUndefined();
+  });
+
   it('threads providerSessionId as bindExistingKey only for openclaw + qwen', () => {
     expect(buildTransportResumeLaunchOpts(rec({ agentType: 'openclaw', providerSessionId: 'key-oc' }))).toMatchObject({ bindExistingKey: 'key-oc' });
     expect(buildTransportResumeLaunchOpts(rec({ agentType: 'qwen', providerSessionId: 'key-qw' }))).toMatchObject({ bindExistingKey: 'key-qw' });

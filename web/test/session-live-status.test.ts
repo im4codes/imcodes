@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deriveSessionLiveStatus, isRunningSessionState } from '../src/session-live-status.js';
+import { deriveSessionLiveStatus, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import {
   createTransportQueueReducerState,
@@ -18,6 +18,51 @@ describe('session-live-status', () => {
   it('prioritizes live tool and thinking signals over idle snapshots', () => {
     expect(deriveSessionLiveStatus({ sessionState: 'idle', activeToolCall: true }).mode).toBe('tool');
     expect(deriveSessionLiveStatus({ sessionState: 'idle', activeThinking: true }).mode).toBe('thinking');
+  });
+
+
+  it('lets authoritative idle override stale timeline running when no active work remains', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+    })).toBe('idle');
+  });
+
+  it('lets authoritative idle override fresh but inactive timeline running evidence', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+      timelineStateTs: 1_000,
+      timelineLastEventTs: 55_000,
+      now: 60_000,
+    })).toBe('idle');
+  });
+
+  it('lets idle win once timeline running has gone stale without active evidence', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+      timelineStateTs: 1_000,
+      timelineLastEventTs: 30_000,
+      now: 100_001,
+    })).toBe('idle');
+  });
+
+  it('keeps timeline running when active work evidence is still present', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeTransportTurn: true,
+    })).toBe('running');
   });
 
   it('surfaces immediate stop feedback from optimistic and authoritative state', () => {

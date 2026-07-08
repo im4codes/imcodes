@@ -34,7 +34,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows claude-code-sdk and codex-sdk options', () => {
+  it('shows claude-code-sdk, codex-sdk, and qoder-sdk options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -49,6 +49,7 @@ describe('StartSubSessionDialog', () => {
 
     expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -74,6 +75,7 @@ describe('StartSubSessionDialog', () => {
     expect(groups).toHaveLength(2);
     expect(groups[0].textContent).toMatch(/claude_code_sdk/i);
     expect(groups[0].textContent).toMatch(/codex_sdk/i);
+    expect(groups[0].textContent).toMatch(/qoder_sdk/i);
     expect(groups[0].textContent).toMatch(/copilot_sdk/i);
     expect(groups[0].textContent).toMatch(/cursor_headless/i);
     expect(groups[1].textContent).toMatch(/claude_code_cli/i);
@@ -163,6 +165,28 @@ describe('StartSubSessionDialog', () => {
       requestedModel: 'gpt-5.5',
       thinking: 'high',
     });
+  });
+
+  it('starts qoder-sdk sub-sessions without proof-gated model or thinking extras', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qoder_sdk/i }));
+    expect(screen.queryByText('thinking')).toBeNull();
+    expect(screen.queryByText('model')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('qoder-sdk', undefined, '/tmp', undefined, undefined);
   });
 
   it('clicking the backdrop does not call onClose', () => {

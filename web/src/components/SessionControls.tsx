@@ -25,6 +25,7 @@ import {
 } from './OpenSpecAutoDeliver.js';
 import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
 import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
+import { requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
 import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
 import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
@@ -83,7 +84,7 @@ import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/sessio
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
-  AGENT_DELEGATION_TARGET_FIELD,
+  buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
 } from '@shared/agent-delegation.js';
 
@@ -94,6 +95,8 @@ function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null;
 interface Props {
   ws: WsClient | null;
   activeSession: SessionInfo | null;
+  /** React-owned browser/server WS state. Prefer this over ws.connected, which can change without a render. */
+  connected?: boolean;
   inputRef?: RefObject<HTMLDivElement>;
   /** Called after each shortcut/action button click — use to restore focus to xterm on desktop. */
   onAfterAction?: () => void;
@@ -284,6 +287,8 @@ type LocalQueuedTransportEntry = {
   text: string;
   status?: 'sending' | 'queued' | 'failed';
   sharedActor?: SharedActorEnvelope;
+  /** Queue version visible when this local optimistic entry was created. */
+  queuedAfterVersion?: number;
 };
 
 function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
@@ -631,6 +636,11 @@ interface PendingDelegateTarget {
 interface PendingSendPayload {
   text: string;
   extra: Record<string, unknown>;
+  delegation?: {
+    targetSession: string;
+    targetLabel: string;
+    task: string;
+  };
 }
 
 interface BuildSendPayloadOptions {
@@ -673,6 +683,10 @@ type PendingTransportApproval = {
   requestId: string;
   description: string;
   tool?: string;
+  provider?: string;
+  providerGeneration?: number;
+  providerToolUseId?: string;
+  inputPreview?: string;
 };
 
 /** Compute the launch-time capability gate from the live WS client + saved
@@ -813,7 +827,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1167,7 +1181,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, [activeSession?.name, effectiveRuntimeType]);
 
-  const connected = !!ws?.connected;
+  const connected = connectedProp ?? !!ws?.connected;
 
   useEffect(() => {
     if (!ws) return;
@@ -1179,6 +1193,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           requestId: msg.requestId,
           description: msg.description,
           ...(msg.tool ? { tool: msg.tool } : {}),
+          ...(msg.provider ? { provider: msg.provider } : {}),
+          ...(typeof msg.providerGeneration === 'number' ? { providerGeneration: msg.providerGeneration } : {}),
+          ...(msg.providerToolUseId ? { providerToolUseId: msg.providerToolUseId } : {}),
+          ...(msg.inputPreview ? { inputPreview: msg.inputPreview } : {}),
         });
         return;
       }
@@ -1478,6 +1496,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOptimisticQueuedEntries((prev) => {
         if (!prev) return null;
         const remaining = prev.filter((entry) => !incomingIds.has(entry.clientMessageId));
+        if (remaining.length === prev.length) return prev;
         return remaining.length > 0 ? remaining : null;
       });
     } else if ((incomingChanged && previousCount > 0 && incomingQueuedTransportEntries.length === 0) || emptySnapshotAdvanced) {
@@ -1485,6 +1504,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (!prev) return null;
         if (emptySnapshotAdvanced) return null;
         const remaining = prev.filter((entry) => !previousIds.has(entry.clientMessageId));
+        if (remaining.length === prev.length) return prev;
+        return remaining.length > 0 ? remaining : null;
+      });
+    }
+    if (incomingQueuedTransportEntries.length === 0 && incomingQueuedTransportVersion !== undefined) {
+      // Race guard: a fast daemon drain can advance the authoritative empty
+      // queue before Preact commits the local optimistic entry. Re-check local
+      // entries against the version they were created after so an already-
+      // drained optimistic card cannot linger in the frontend queue, while a
+      // new send created after the current empty baseline is preserved.
+      setOptimisticQueuedEntries((prev) => {
+        if (!prev) return null;
+        const remaining = prev.filter((entry) => (
+          entry.queuedAfterVersion === undefined
+          || incomingQueuedTransportVersion <= entry.queuedAfterVersion
+        ));
+        if (remaining.length === prev.length) return prev;
         return remaining.length > 0 ? remaining : null;
       });
     }
@@ -1492,7 +1528,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     lastIncomingQueuedTransportEntriesCountRef.current = incomingQueuedTransportEntries.length;
     lastIncomingQueuedTransportEntryIdsRef.current = new Set(incomingQueuedTransportEntries.map((entry) => entry.clientMessageId));
     lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
-  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion]);
+  }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion, optimisticQueuedEntries]);
 
   useEffect(() => {
     if (!ws || !activeSession) return;
@@ -2597,8 +2633,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ? [...normalizedOptions.syntheticAtTargets]
       : [...pendingAtTargetsRef.current];
 
+    let delegation: PendingSendPayload['delegation'];
     if (pendingDelegateTarget && !normalizedOptions.syntheticAtTargets) {
-      extra[AGENT_DELEGATION_TARGET_FIELD] = { session: pendingDelegateTarget.session };
+      const task = text.trim();
+      delegation = {
+        targetSession: pendingDelegateTarget.session,
+        targetLabel: pendingDelegateTarget.label,
+        task,
+      };
+      text = buildAgentDelegationOrchestrationPrompt({
+        targetSession: pendingDelegateTarget.session,
+        targetLabel: pendingDelegateTarget.label,
+        task,
+      });
     } else if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
       const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
@@ -2682,7 +2729,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
-    return { text, extra };
+    return { text, extra, ...(delegation ? { delegation } : {}) };
   }, [activeSession, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
@@ -2726,15 +2773,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
         console.warn('session.cancel HTTP fallback failed', fallbackErr);
       });
+      requestActiveTimelineRefreshAfterUserAction();
       return commandId;
     }
     try {
       ws.sendSessionCommandUrgent('cancel', payload);
+      requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       if (!serverId) throw err;
       void cancelSessionViaHttp(serverId, payload).catch((fallbackErr) => {
         console.warn('session.cancel HTTP fallback failed', fallbackErr);
       });
+      requestActiveTimelineRefreshAfterUserAction();
     }
     return commandId;
   }, [activeSession, makeCommandId, serverId, ws]);
@@ -2859,13 +2909,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws) {
       if (!serverId) return null;
       void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
+      requestActiveTimelineRefreshAfterUserAction();
       return commandId;
     }
     try {
       ws.sendSessionCommand('send', payload);
+      requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       if (!serverId) throw err;
       void sendSessionViaHttp(serverId, payload).catch(markSendFailed);
+      requestActiveTimelineRefreshAfterUserAction();
     }
     return commandId;
   }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
@@ -2893,7 +2946,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       || (typeof payload.extra.p2pMode === 'string' && payload.extra.p2pMode.length > 0)
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
-    const isDelegationSend = Boolean(payload.extra[AGENT_DELEGATION_TARGET_FIELD]);
+    const isDelegationSend = Boolean(payload.delegation);
     const clearComposerState = () => {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -2949,7 +3002,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       return;
     }
-    quickData.recordHistory(payload.text, activeSession.name);
+    quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     const commandId = makeCommandId();
     let localFailure: string | undefined;
     try {
@@ -2970,6 +3023,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           clientMessageId: commandId,
           text: payload.text,
           status: localFailure || failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+          queuedAfterVersion: incomingQueuedTransportVersion,
         }];
       });
     }
@@ -2994,7 +3048,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (options?.clearComposer) {
       clearComposerState();
     }
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -3051,10 +3105,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         clientMessageId: commandId,
         text: entry.text,
         status: failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
+        queuedAfterVersion: incomingQueuedTransportVersion,
       });
       return next;
     });
-  }, [sendSessionMessage]);
+  }, [incomingQueuedTransportVersion, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -3063,8 +3118,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [comboSkipPref, rememberComboSendChoice]);
 
   const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
-    const text = payload.text.trim();
-    if (payload.extra[AGENT_DELEGATION_TARGET_FIELD]) {
+    const text = (payload.delegation?.task ?? payload.text).trim();
+    if (payload.delegation) {
       if (!text) return t('delegation.warning_empty_task');
       if (isDelegationUnsupportedControlText(text)) return t('delegation.warning_control_command');
       if (attachments.length > 0) return t('delegation.warning_attachments');
@@ -3477,6 +3532,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       onStopProject
         ? onStopProject(activeSession.project)
         : ws.sendSessionCommand('stop', { project: activeSession.project });
+      requestActiveTimelineRefreshAfterUserAction();
     } else {
       // Main session restart/new: 1-click confirmation
       if (confirm !== action) { startConfirm(action, 1); return; }
@@ -4355,6 +4411,25 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 ? t('session.approval.tool', { tool: pendingTransportApproval.tool })
                 : pendingTransportApproval.description}
             </div>
+            {pendingTransportApproval.tool && pendingTransportApproval.description && (
+              <div style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2 }}>
+                {pendingTransportApproval.description}
+              </div>
+            )}
+            {pendingTransportApproval.provider && typeof pendingTransportApproval.providerGeneration === 'number' && pendingTransportApproval.providerToolUseId && (
+              <div style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2 }}>
+                {t('session.approval.scope', {
+                  provider: pendingTransportApproval.provider,
+                  generation: pendingTransportApproval.providerGeneration,
+                  toolUseId: pendingTransportApproval.providerToolUseId,
+                })}
+              </div>
+            )}
+            {pendingTransportApproval.inputPreview && (
+              <div style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', marginTop: 2, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                {t('session.approval.input', { input: pendingTransportApproval.inputPreview })}
+              </div>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
             <button

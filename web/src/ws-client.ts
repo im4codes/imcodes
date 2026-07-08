@@ -16,6 +16,8 @@ import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
+import { FS_WRITE_MAX_BYTES, FS_WRITE_OUTBOUND_WS_MAX_BYTES } from '@shared/fs-write-limits.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -133,7 +135,7 @@ export type ServerMessage =
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
-  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string; provider?: string; providerGeneration?: number; providerToolUseId?: string; inputPreview?: string }
   | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
@@ -205,7 +207,7 @@ export type ServerMessage =
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
   | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
-  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string }
+  | { type: typeof TRANSPORT_MSG.CHAT_APPROVAL; sessionId: string; requestId: string; description: string; tool?: string; provider?: string; providerGeneration?: number; providerToolUseId?: string; inputPreview?: string }
   | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: 'provider.status'; providerId: string; connected: boolean }
   | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string }
@@ -292,6 +294,7 @@ const WS_TICKET_TIMEOUT_MS = 30_000;
 const WS_OPEN_TIMEOUT_MS = 15_000;
 const RESUME_FORCE_STALE_PONG_MS = 30_000;
 const P2P_WORKFLOW_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES = 60_000;
 /** If we received a pong within this window, treat the socket as already
  *  proven alive and skip the resume probe. This eliminates UI churn (and the
  *  brief "disconnected" flash) when the user rapidly switches tabs / focuses
@@ -326,6 +329,16 @@ function compactP2pWorkflowRequestScope(scope: P2pWorkflowRequestScope | null | 
   if (scope?.projectDir?.trim()) compacted.projectDir = scope.projectDir.trim();
   if (scope?.cwd?.trim()) compacted.cwd = scope.cwd.trim();
   return compacted;
+}
+
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
+function maxOutboundMessageBytes(msg: object): number {
+  return (msg as { type?: unknown }).type === 'fs.write'
+    ? FS_WRITE_OUTBOUND_WS_MAX_BYTES
+    : DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES;
 }
 
 export class WsClient {
@@ -509,7 +522,7 @@ export class WsClient {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
-    if (json.length > 60_000) {
+    if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
       throw new Error('Message too large');
     }
     return json;
@@ -575,7 +588,7 @@ export class WsClient {
       throw new Error('WebSocket not connected');
     }
     const json = JSON.stringify(msg);
-    if (json.length > 60_000) {
+    if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
       throw new Error('Message too large');
     }
     this.ws.send(json);
@@ -1195,6 +1208,38 @@ export class WsClient {
     }
   }
 
+  /**
+   * Any frame received on the current OPEN socket proves the browser/server path
+   * is alive. Probe recovery used to wait only for an explicit `pong`; if that
+   * pong was delayed/dropped while daemon-originated frames (session_list,
+   * timeline.event, transport deltas) kept arriving, `_connected` stayed false
+   * and all foreground refresh sends became silent no-ops until the user
+   * switched windows. Treat inbound traffic as liveness so active pages recover
+   * immediately without needing a focus/visibility nudge.
+   */
+  private markSocketAliveFromInboundFrame(): void {
+    this._missedHeartbeatPongs = 0;
+    this._resumeProbeMisses = 0;
+    if (this._pongTimer) {
+      clearTimeout(this._pongTimer);
+      this._pongTimer = null;
+    }
+    if (this._resumeProbeTimer) {
+      clearTimeout(this._resumeProbeTimer);
+      this._resumeProbeTimer = null;
+    }
+    if (this._connected) return;
+    this._connected = true;
+    this.flushSubscriptionDiffAfterProbeRecovery();
+    this.dispatch({
+      type: 'session.event',
+      event: 'connected',
+      session: '',
+      state: 'connected',
+      reason: 'probe_recovered',
+    });
+  }
+
   private handleDaemonHelloMessage(msg: ServerMessage): void {
     if (msg.type !== P2P_WORKFLOW_MSG.DAEMON_HELLO) return;
     const daemonId = typeof msg.daemonId === 'string' ? msg.daemonId.trim() : '';
@@ -1299,6 +1344,9 @@ export class WsClient {
   fsWriteFile(path: string, content: string, expectedMtime?: number): string;
   fsWriteFile(path: string, content: string, options?: FsWriteOptions): string;
   fsWriteFile(path: string, content: string, expectedMtimeOrOptions?: number | FsWriteOptions): string {
+    if (utf8ByteLength(content) > FS_WRITE_MAX_BYTES) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
     const requestId = crypto.randomUUID();
     const options = typeof expectedMtimeOrOptions === 'object' ? expectedMtimeOrOptions : undefined;
     const expectedMtime = typeof expectedMtimeOrOptions === 'number' ? expectedMtimeOrOptions : options?.expectedMtime;
@@ -1596,6 +1644,7 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       // Binary frame: raw PTY data
       if (ev.data instanceof ArrayBuffer) {
+        this.markSocketAliveFromInboundFrame();
         this.handleRawFrame(ev.data);
         return;
       }
@@ -1603,36 +1652,16 @@ export class WsClient {
       try {
         const msg = JSON.parse(ev.data as string) as ServerMessage;
         if (msg.type === 'pong') {
-          this._missedHeartbeatPongs = 0;
-          this._resumeProbeMisses = 0;
           this._lastPongAt = Date.now();
           if (this._pingSentAt !== null) {
             this._pingLatency = Date.now() - this._pingSentAt;
             this._pingSentAt = null;
             this._onLatency?.(this._pingLatency);
           }
-          // Clear the dead-socket watchdog — we just proved the socket is alive.
-          if (this._pongTimer) {
-            clearTimeout(this._pongTimer);
-            this._pongTimer = null;
-          }
-          if (this._resumeProbeTimer) {
-            clearTimeout(this._resumeProbeTimer);
-            this._resumeProbeTimer = null;
-            if (!this._connected) {
-              this._connected = true;
-              this.flushSubscriptionDiffAfterProbeRecovery();
-              this.dispatch({
-                type: 'session.event',
-                event: 'connected',
-                session: '',
-                state: 'connected',
-                reason: 'probe_recovered',
-              });
-            }
-          }
+          this.markSocketAliveFromInboundFrame();
           return;
         }
+        this.markSocketAliveFromInboundFrame();
         if (msg.type === 'terminal.stream_reset') {
           this.handleStreamReset(msg.session);
           this.dispatch(msg); // Let TerminalView know to reset terminal state

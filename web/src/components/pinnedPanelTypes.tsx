@@ -14,7 +14,7 @@ import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { UsageFooter } from './UsageFooter.js';
 import { extractLatestUsage } from '../usage-data.js';
-import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
@@ -22,6 +22,7 @@ import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { SharedContextManagementPanel } from './SharedContextManagementPanel.js';
 import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
@@ -51,9 +52,20 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
+  const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
+  const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
+  const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
-    () => getTailSessionState(events) ?? liveSub?.state ?? null,
-    [events, liveSub?.state],
+    () => resolveTimelineBackedSessionState({
+      timelineState: timelineSessionState,
+      sessionState: liveSub?.state,
+      activeThinking: !!activeThinkingTs,
+      activeToolCall,
+      activeTransportTurn: activeTimelineTurn,
+      timelineStateTs: timelineSessionStateInfo.ts,
+      timelineLastEventTs,
+    }),
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, liveSub?.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 

@@ -1391,6 +1391,7 @@ const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'kimi-sdk': 'sharedContext.management.mcpProviderKimiAcp',
   'copilot-sdk': 'sharedContext.management.mcpProviderCopilotSdk',
   'codex-sdk': 'sharedContext.management.mcpProviderCodexSdk',
+  'qoder-sdk': 'sharedContext.management.mcpProviderQoderSdk',
   'cursor-headless': 'sharedContext.management.mcpProviderCursorHeadless',
   qwen: 'sharedContext.management.mcpProviderQwen',
 };

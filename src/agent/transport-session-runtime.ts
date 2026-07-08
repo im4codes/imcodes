@@ -194,7 +194,7 @@ const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
 })();
 const TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS ?? '', 10);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 30 * 60_000;
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 5 * 60_000;
 })();
 
 function isRecoverableProviderBusyError(error: ProviderError): boolean {
@@ -450,7 +450,6 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         this._lastProviderOutputAt = this._lastActivityAt;
-        this._activeDispatchHasSideEffectEvidence = true;
         if (this._activeDispatchCancelled) return;
         // A delta with no active turn is a late/stray callback from an
         // already-settled turn (provider callbacks are not dispatch-id scoped).
@@ -1519,6 +1518,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }
       this._pendingVersion++;
+      this.cancelStaleActiveTurnWithPending({ reason: 'queued-send-after-stale-active-turn' });
       return 'queued';
     }
 
@@ -1898,7 +1898,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private makeSdkTurnLostFailure(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): ProviderError {
     return {
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-      message: 'Codex SDK turn was lost and automatic replay was not safe. Please review the session and resend if appropriate.',
+      message: 'Codex SDK turn ended before completion. Please continue or resend if appropriate.',
       recoverable: false,
       details: {
         reason: SDK_TURN_LOST_RECOVERY_REASON,
@@ -1946,16 +1946,57 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.setStatus('error');
   }
 
+  private settleSdkTurnLostWithoutReplay(metadata: SdkTurnLostRecoveryMetadata, replayDecision: string): void {
+    const existingAttempt = this._sdkTurnLostRecoveryAttempt;
+    if (existingAttempt) existingAttempt.status = 'failed';
+    logger.warn(
+      {
+        sessionKey: this.sessionKey,
+        provider: this.provider.id,
+        reason: SDK_TURN_LOST_RECOVERY_REASON,
+        classifier: metadata.classifier,
+        replayDecision,
+        activeDispatchCount: this._activeDispatchEntries.length,
+        pendingCount: this._pendingMessages.length,
+      },
+      'transport runtime sdk turn lost after side effects; preserving emitted output and settling without replay',
+    );
+    this.closeOpenTools('errored', 'provider_error');
+    this._sending = false;
+    this._activeTurn?.resolve();
+    this._activeTurn = null;
+    this.clearStalePendingCancelFallbackTimer();
+    this._activeDispatchProviderStarted = false;
+    this._activeDispatchCancelled = false;
+    this._activeDispatchHasSideEffectEvidence = false;
+    this._sdkTurnLostRecoveryAttempt = null;
+    this._activeDispatchId = null;
+    this._activeDispatchStaleRecoveryStarted = false;
+    this._activeDispatchEntries = [];
+    if (!this._drainPending()) this.setStatus('idle');
+  }
+
   private handleSdkTurnLostRecovery(error: ProviderError): boolean {
-    const metadata = readSdkTurnLostRecoveryMetadata(error);
-    if (!metadata) return false;
-    if (metadata.localSessionKey !== this.sessionKey) return true;
+    const unscopedMetadata = readSdkTurnLostRecoveryMetadata(error);
+    if (!unscopedMetadata) return false;
+    const metadata = readSdkTurnLostRecoveryMetadata(error, {
+      expectedSessionName: this.sessionKey,
+      expectedProviderSessionId: this._providerSessionId ?? undefined,
+    }) ?? unscopedMetadata;
+    const belongsToRuntime = metadata.sessionName === this.sessionKey
+      || metadata.localSessionKey === this.sessionKey
+      || (!!this._providerSessionId && metadata.providerSessionId === this._providerSessionId);
+    if (!belongsToRuntime) return true;
     if (this._currentActivityGenerationLocallyCancelled || this._activeDispatchCancelled) {
       this.failSdkTurnLostRecovery(metadata, 'unsafe_terminal');
       return true;
     }
     if (!sameActivityGeneration(metadata.activityGeneration, this.currentActivityGeneration())) {
       this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
+      return true;
+    }
+    if (metadata.replayDecision === 'unsafe_side_effect') {
+      this.settleSdkTurnLostWithoutReplay(metadata, metadata.replayDecision);
       return true;
     }
     if (metadata.replayDecision !== 'pending' && metadata.replayDecision !== 'safe_replay') {
@@ -1967,7 +2008,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return true;
     }
     if (this._activeDispatchHasSideEffectEvidence || this._openTools.size > 0) {
-      this.failSdkTurnLostRecovery(metadata, 'unsafe_side_effect');
+      this.settleSdkTurnLostWithoutReplay(metadata, 'unsafe_side_effect');
       return true;
     }
     if (!this.consumeSdkTurnLostRecoveryBudget(metadata)) {
@@ -2229,6 +2270,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       // on follow-up turns when the cached system text is rebuilt from
       // a slash-only tail. The 300-char user-authored cap stays in
       // force on `description` / `systemPrompt`; identity is peer-level.
+      // Shared runtime guidance (memory/progress/file-path) is suppressed
+      // for raw slash controls so the provider receives the control text
+      // exactly, without unrelated system context.
       // Generated Image Reporting is now appended in Codex SDK's own
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
@@ -2240,6 +2284,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         suppressMcpMemorySearchGuidance: isSlashControl,
         suppressAgentProgressGuidance: isSlashControl,
+        suppressFilePathReportingGuidance: isSlashControl,
         attachments,
         namespace: this._contextNamespace,
         namespaceDiagnostics: this._contextNamespaceDiagnostics,

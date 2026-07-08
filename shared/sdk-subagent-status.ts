@@ -44,6 +44,7 @@ export const SDK_SUBAGENT_DIAGNOSTIC = {
   UNKNOWN_STATE: 'unknownState',
   STALE_WITHOUT_TERMINAL: 'staleWithoutTerminal',
   SNAPSHOT_ONLY: 'snapshotOnly',
+  QODER_LIFECYCLE_UNPROVEN: 'qoderLifecycleUnproven',
 } as const;
 
 export const SDK_SUBAGENT_TERMINAL_RETENTION_MS = 300_000;

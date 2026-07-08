@@ -77,6 +77,8 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('sourceLookup fields');
     expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
     expect(payload.systemText).toContain('At key boundaries only');
+    expect(payload.systemText).toContain('full absolute filesystem path');
+    expect(payload.systemText).toContain('not a bare filename or relative path');
   });
 
   it('adds shared system guidance for every managed SDK provider id', () => {
@@ -102,6 +104,7 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('do not invent details from summaries alone');
       expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
+      expect(payload.systemText).toContain('full absolute filesystem path');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
   });
@@ -111,6 +114,7 @@ describe('buildProviderContextPayload', () => {
       userMessage: '/compact',
       suppressMcpMemorySearchGuidance: true,
       suppressAgentProgressGuidance: true,
+      suppressFilePathReportingGuidance: true,
       namespace: { scope: 'personal', projectId: 'repo-1' },
     });
 
@@ -558,6 +562,7 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('Exact session name: deck_myapp_brain');
       expect(systemText).toContain('Display label: My App Brain');
       expect(systemText).toContain('imcodes send');
+      expect(systemText).toContain('full absolute filesystem path');
       expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     });
 

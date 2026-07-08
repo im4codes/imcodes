@@ -46,6 +46,7 @@ const retryOptimisticMessageSpy = vi.fn();
 const useTimelineSpy = vi.fn();
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: (...args: unknown[]) => {
     useTimelineSpy(...args);
     return {
@@ -133,6 +134,27 @@ describe('SubSessionCard', () => {
 
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
+      isVisible: true,
+    });
+  });
+
+
+  it('treats an open but unfocused card as an active timeline consumer', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={true}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: true,
       isVisible: true,
     });
   });
@@ -505,6 +527,27 @@ describe('SubSessionCard', () => {
     await waitFor(() => {
       const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
       expect(controls?.dataset.queued).toBe('queued send');
+    });
+  });
+
+
+  it('passes React connection state into shared session controls in compact mode', async () => {
+    const ws = { connected: false, sendSessionCommand: vi.fn(), subscribeTransportSession: vi.fn(), unsubscribeTransportSession: vi.fn() } as any;
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport' } as any)}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(sessionControlsSpy).toHaveBeenLastCalledWith(expect.objectContaining({ connected: true }));
     });
   });
 

@@ -218,6 +218,7 @@ interface AutoDeliverRun {
     markerPath: string;
     spec: P2pExecutionMarkerSpec;
     retryCount: number;
+    createdAt: number;
     /** Unchecked-task count at the previous reminder; lets the reminder loop
      *  reset retryCount when the implementation makes progress between idles. */
     lastUncheckedCount?: number;
@@ -313,6 +314,8 @@ const auditPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const auditFixRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const implementationReminderTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
@@ -322,6 +325,10 @@ const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === '
 // this interval so a fast-flapping idle cannot spam the agent.
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_REMINDER_MIN_INTERVAL_MS = process.env.NODE_ENV === 'test' ? 40 : 30_000;
 const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS = process.env.NODE_ENV === 'test' ? 20 : 1_000;
+const OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS = process.env.NODE_ENV === 'test' ? 250 : 5_000;
+const OPENSPEC_AUTO_DELIVER_QUEUED_PROMPT_STALE_MS = process.env.NODE_ENV === 'test' ? 40 : 20_000;
+const OPENSPEC_AUTO_DELIVER_AWAITING_DISPATCH_IDLE_RECHECK_MS = process.env.NODE_ENV === 'test' ? 40 : 250;
+const OPENSPEC_AUTO_DELIVER_PROMPT_IDLE_ADVANCE_POLL_MS = process.env.NODE_ENV === 'test' ? 40 : 1_000;
 const OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS = process.env.NODE_ENV === 'test' ? 50 : 1_000;
 // A transport runtime can be briefly absent while a session reconnects or its SDK
 // transport is restored (e.g. a relaunch) — it comes back on its own. Wait this
@@ -517,6 +524,18 @@ function clearImplementationMarkerPollTimer(runId: string): void {
   implementationMarkerPollTimers.delete(runId);
 }
 
+function clearImplementationAwaitingDispatchIdleTimer(runId: string): void {
+  const timer = implementationAwaitingDispatchIdleTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  implementationAwaitingDispatchIdleTimers.delete(runId);
+}
+
+function clearPromptIdleAdvanceTimer(runId: string): void {
+  const timer = promptIdleAdvanceTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  promptIdleAdvanceTimers.delete(runId);
+}
+
 function clearAcceptanceResultFilePollTimer(runId: string): void {
   const timer = acceptanceResultFilePollTimers.get(runId);
   if (timer) clearTimeout(timer);
@@ -531,11 +550,7 @@ function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
     if (!current.activeAcceptanceAudit || !current.activeCommandId || current.status !== current.activeAcceptanceAudit.stage) return;
-    if (isTransportRuntimeBusyForIdleAdvance(current)) {
-      schedulePostRepairAcceptanceResultFilePoll(current);
-      return;
-    }
-    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+    void advanceAfterPostRepairAcceptanceAuditIdle(current, { allowResultFileRepairPrompt: false }).catch((error) => {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_result_file_poll_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
@@ -552,6 +567,43 @@ function scheduleImplementationMarkerPoll(run: AutoDeliverRun): void {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_marker_poll_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS));
+}
+
+function schedulePromptIdleAdvancePoll(run: AutoDeliverRun): void {
+  clearPromptIdleAdvanceTimer(run.runId);
+  promptIdleAdvanceTimers.set(run.runId, setTimeout(() => {
+    promptIdleAdvanceTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status) || !current.activeCommandId) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      schedulePromptIdleAdvancePoll(current);
+      return;
+    }
+    if (current.status === 'spec_audit_repair' && !current.activeAcceptanceAudit) {
+      void advanceAfterSpecRepairIdle(current).catch((error) => {
+        terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'spec_repair_idle_poll_advance_failed');
+      });
+      return;
+    }
+  }, OPENSPEC_AUTO_DELIVER_PROMPT_IDLE_ADVANCE_POLL_MS));
+}
+
+function scheduleImplementationAwaitingDispatchIdleRecheck(run: AutoDeliverRun): void {
+  clearImplementationAwaitingDispatchIdleTimer(run.runId);
+  implementationAwaitingDispatchIdleTimers.set(run.runId, setTimeout(() => {
+    implementationAwaitingDispatchIdleTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (current.status !== 'implementation_task_loop' || !current.activeCommandId || !current.activeImplementationPromptAwaitingDispatch) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      scheduleImplementationAwaitingDispatchIdleRecheck(current);
+      return;
+    }
+    current.activeImplementationPromptAwaitingDispatch = false;
+    void advanceAfterImplementationIdle(current).catch((error) => {
+      terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_awaiting_dispatch_idle_recheck_failed');
+    });
+  }, OPENSPEC_AUTO_DELIVER_AWAITING_DISPATCH_IDLE_RECHECK_MS));
 }
 
 function cloneTaskStats(stats: OpenSpecAutoDeliverTaskStats): OpenSpecAutoDeliverTaskStats {
@@ -775,7 +827,11 @@ function isTransportRuntimeBusyForIdleAdvance(run: AutoDeliverRun): boolean {
     || status === 'permission';
   const busy = inProgress || sending || activeDispatchCount > 0 || pendingCount > 0;
   if (busy && pendingCount > 0 && (inProgress || sending || activeDispatchCount > 0)) {
-    snapshot.cancelStaleActiveTurnWithPending?.({ reason, nowMs });
+    snapshot.cancelStaleActiveTurnWithPending?.({
+      reason,
+      nowMs,
+      staleMs: OPENSPEC_AUTO_DELIVER_QUEUED_PROMPT_STALE_MS,
+    });
   }
   return busy;
 }
@@ -926,6 +982,7 @@ async function buildImplementationMarkerContract(
       nonce: randomUUID(),
     },
     retryCount: 0,
+    createdAt: Date.now(),
   };
 }
 
@@ -1330,6 +1387,8 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;
     scheduleImplementationMarkerPoll(run);
+  } else if (sendMode === 'queued') {
+    scheduleImplementationAwaitingDispatchIdleRecheck(run);
   }
   run.latestMessage = repairReason
     ? `implementation_repair_prompt_dispatched:${repairReason}`
@@ -1361,6 +1420,7 @@ async function advanceAfterCompletedImplementationMarker(
   recordImplementationMarkerEvidence(run, marker);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
+  clearImplementationAwaitingDispatchIdleTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, 'openspec-auto-deliver-implementation-marker-completed');
   delete run.activeCommandId;
   delete run.activeImplementationPromptAwaitingDispatch;
@@ -1385,6 +1445,7 @@ async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: str
     stale: false,
   }]);
   clearImplementationMarkerPollTimer(run.runId);
+  clearImplementationAwaitingDispatchIdleTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, `openspec-auto-deliver-implementation-marker-failed:${reason}`);
   const projection = await dispatchImplementationMarkerReminder(run, `implementation_marker_failed:${reason}`);
   if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
@@ -1420,6 +1481,16 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
   }
   if (markerState.failedByAgent) {
     await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+  const activeMarker = run.activeImplementationMarker;
+  if (!activeMarker) return;
+  const markerAgeMs = Date.now() - activeMarker.createdAt;
+  if (!isTransportRuntimeBusyForIdleAdvance(run) || markerAgeMs >= OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_MISSING_GRACE_MS) {
+    const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+    if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    }
     return;
   }
   scheduleImplementationMarkerPoll(run);
@@ -1521,6 +1592,8 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;
     scheduleImplementationMarkerPoll(run);
+  } else if (sendMode === 'queued') {
+    scheduleImplementationAwaitingDispatchIdleRecheck(run);
   }
   run.latestMessage = recovered
     ? `implementation_marker_contract_recreated:${reason}`
@@ -1594,6 +1667,7 @@ async function dispatchSpecRepairPrompt(run: AutoDeliverRun, reason: string): Pr
   const prompt = buildSpecRepairPrompt(run, reason);
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   if (sendMode === 'skipped_terminal') return buildProjection(run);
+  if (sendMode === 'sent' || sendMode === 'queued') schedulePromptIdleAdvancePoll(run);
   run.latestMessage = `spec_repair_prompt_dispatched:${reason}`;
   return broadcastProjection(run);
 }
@@ -3369,14 +3443,26 @@ async function advanceAfterSpecRepairIdle(run: AutoDeliverRun): Promise<void> {
   await dispatchPostRepairAcceptanceAuditPrompt(run);
 }
 
-async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): Promise<void> {
+async function advanceAfterPostRepairAcceptanceAuditIdle(
+  run: AutoDeliverRun,
+  options: { allowResultFileRepairPrompt?: boolean } = {},
+): Promise<void> {
   if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   if (enforceElapsedLimit(run)) return;
-  delete run.activeCommandId;
+  const allowResultFileRepairPrompt = options.allowResultFileRepairPrompt ?? true;
   const active = run.activeAcceptanceAudit;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
   const verdict = await consumeAuditResultFile(run, metadata, { requireRepairCompletion: true });
   if (!verdict) {
+    if (!allowResultFileRepairPrompt) {
+      schedulePostRepairAcceptanceResultFilePoll(run);
+      return;
+    }
+    if (isTransportRuntimeBusyForIdleAdvance(run)) {
+      schedulePostRepairAcceptanceResultFilePoll(run);
+      return;
+    }
+    delete run.activeCommandId;
     const reason = run.latestMessage ?? 'invalid_audit_result';
     if (isRetryableAuditResultError(reason)) {
       if (!canDispatchResultFileRepairPrompt(active)) {
@@ -3396,6 +3482,7 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(run: AutoDeliverRun): P
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  delete run.activeCommandId;
   run.activeAcceptanceAudit = undefined;
   await advanceAfterAuditVerdict(run, active.stage, verdict, {
     roundIndex: active.roundIndex,
@@ -3490,9 +3577,13 @@ function ensureTimelineListener(): void {
     const run = activeCandidates.find((candidate) =>
       candidate.status === 'implementation_task_loop'
       && !!candidate.activeCommandId
-      && !candidate.activeImplementationPromptAwaitingDispatch
     );
     if (!run) return;
+    if (run.activeImplementationPromptAwaitingDispatch) {
+      if (isTransportRuntimeBusyForIdleAdvance(run)) return;
+      scheduleImplementationAwaitingDispatchIdleRecheck(run);
+      return;
+    }
     if (isTransportRuntimeBusyForIdleAdvance(run)) return;
     void advanceAfterImplementationIdle(run).catch((error) => {
       terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
@@ -3830,6 +3921,10 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   implementationReminderTimers.clear();
   for (const timer of implementationMarkerPollTimers.values()) clearTimeout(timer);
   implementationMarkerPollTimers.clear();
+  for (const timer of implementationAwaitingDispatchIdleTimers.values()) clearTimeout(timer);
+  implementationAwaitingDispatchIdleTimers.clear();
+  for (const timer of promptIdleAdvanceTimers.values()) clearTimeout(timer);
+  promptIdleAdvanceTimers.clear();
   for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
   acceptanceResultFilePollTimers.clear();
   for (const run of runsById.values()) {

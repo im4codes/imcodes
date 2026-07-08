@@ -152,7 +152,7 @@ import {
   nextTransportQueueVersion,
   removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
-import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh } from './hooks/useTimeline.js';
+import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { shouldUseIosMacTextScale } from './native-platform.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
@@ -3470,6 +3470,13 @@ export function App() {
           daemonOfflineGraceTimerRef.current = null;
         }
         setDaemonOnline(true);
+        // The browser-server socket can stay healthy while the daemon-server
+        // socket drops and reconnects. Any session.state events emitted during
+        // that daemon gap may be missed by this tab, so pull the authoritative
+        // daemon snapshot now. Without this, a session that became idle while
+        // the daemon WS was down can remain visually "running" until a manual
+        // refresh or unrelated session_list broadcast.
+        ws.requestSessionList();
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
         const activeName = activeSessionRef.current;
@@ -4081,6 +4088,7 @@ export function App() {
       s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
     ));
     wsRef.current.sendSessionCommand('stop', { project });
+    requestActiveTimelineRefreshAfterUserAction();
   }, [pinnedTabs, sessions, trans]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {

@@ -39,10 +39,12 @@ vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
   hasActiveToolCall: () => false,
+  getTailSessionStateInfo: () => ({ state: null, ts: null }),
   getTailSessionState: () => null,
 }));
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
+  requestActiveTimelineRefreshAfterUserAction: vi.fn(),
   useTimeline: () => ({
     events: [],
     refreshing: false,
