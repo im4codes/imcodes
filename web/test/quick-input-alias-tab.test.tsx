@@ -89,6 +89,24 @@ describe('QuickInputPanel — 别名 tab', () => {
     expect(root().textContent).not.toContain('ssh root@host');
   });
 
+  it('refetches the server each time the alias tab is opened (picks up externally-created aliases)', async () => {
+    store = [{ name: 'deploy', value: 'x', description: '', tags: [], createdAt: '', updatedAt: '', source: 'web' }];
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().textContent).toContain('deploy'));
+
+    // An alias created ELSEWHERE (e.g. an agent via the save_alias MCP tool):
+    // the web has no realtime alias push, so it only appears on a refetch.
+    store = [...store, { name: 'from_mcp', value: 'ssh y', description: '', tags: [], createdAt: '', updatedAt: '', source: 'mcp' }];
+    expect(root().textContent).not.toContain('from_mcp');
+
+    // Re-open the alias tab (switch away and back) → refetch shows it.
+    const quickTab = Array.from(root().querySelectorAll('button')).find((b) => b.textContent?.includes('quick_input.tab_quick'));
+    fireEvent.click(quickTab!);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().textContent).toContain('from_mcp'));
+  });
+
   it('selecting an alias inserts its marker (name), not the value, then closes', async () => {
     store = [{ name: 'deploy', value: 'ssh root@host', description: '', tags: [], createdAt: '', updatedAt: '', source: 'web' }];
     const onInsertAlias = vi.fn();

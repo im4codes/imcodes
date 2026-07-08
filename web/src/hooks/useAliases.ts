@@ -96,7 +96,9 @@ export function useAliases(query?: string): UseAliasesResult {
     loading: snapshot.loading,
     error: snapshot.error,
     stale: snapshot.stale,
-    refetch: () => aliasResource.invalidate(),
+    // Stable reference (module-level resource method) so callers can safely use
+    // it in effect deps without re-running every render.
+    refetch: aliasResource.invalidate,
     create,
     remove,
   };

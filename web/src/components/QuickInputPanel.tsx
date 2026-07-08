@@ -464,7 +464,7 @@ export function QuickInputPanel({
   // resource so every alias surface updates without a reload). We do NOT reuse
   // the quick-data debounced storage path here — aliases persist immediately.
   const [aliasSearch, setAliasSearch] = useState('');
-  const { aliases: allAliases, filtered: filteredAliases, create: createAlias, remove: removeAlias } = useAliases(aliasSearch);
+  const { aliases: allAliases, filtered: filteredAliases, create: createAlias, remove: removeAlias, refetch: refetchAliases } = useAliases(aliasSearch);
   // Alias editor: `null` = closed; `{ original: null }` = creating a new one;
   // `{ original: name }` = editing that alias by its original name.
   // `tags` is carried through the form (not yet user-editable) so that editing
@@ -477,6 +477,13 @@ export function QuickInputPanel({
 
   // Reset page when scope or session changes
   useEffect(() => { setHistoryPage(0); }, [historyScope, sessionName]);
+
+  // Refetch server aliases whenever the alias tab becomes visible (or the panel
+  // opens on it), so aliases created elsewhere — e.g. by an agent via the
+  // save_alias MCP tool, or on another device — show up without a manual reload.
+  useEffect(() => {
+    if (open && activeTab === 'alias') refetchAliases();
+  }, [open, activeTab, refetchAliases]);
 
   useEffect(() => {
     if (!open || typeof window === 'undefined') return;

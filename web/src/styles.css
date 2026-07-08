@@ -1647,7 +1647,10 @@ html.native-ios-mac .chat-dl-btn {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 10001; }
-  .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - 72px)); border-radius: 12px 12px 0 0; border-bottom: none; }
+  /* Float the panel as a card that clears the home-indicator / bottom edge:
+     lift the bottom by the safe-area inset + margin ("底部留点余量") and add
+     small side margins so it no longer sits flush against the screen bottom. */
+  .qp { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 12px); left: 8px; right: 8px; width: auto; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 88px)); border-radius: 14px; }
 }
 
 /* Login */
