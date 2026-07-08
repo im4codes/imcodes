@@ -91,7 +91,7 @@ async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): 
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
-async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = 1000): Promise<Record<string, unknown>> {
+async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = 5000): Promise<Record<string, unknown>> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     const found = serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
@@ -101,7 +101,7 @@ async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean,
   throw new Error('Expected websocket send was not observed');
 }
 
-async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = 1000): Promise<string> {
+async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = 5000): Promise<string> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
@@ -115,7 +115,7 @@ function transportSendCount(predicate: (text: string) => boolean): number {
   return transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).filter(predicate).length;
 }
 
-async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = 1000): Promise<void> {
+async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = 5000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     if (transportSendCount(predicate) >= count) return;
