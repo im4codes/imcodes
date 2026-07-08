@@ -107,14 +107,17 @@ describe('memory MCP interface e2e', () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
-      // The memory MCP process hosts the memory tools PLUS the read-only alias
-      // tools (resolve_alias / list_aliases); assert the memory set and the
-      // alias tools are present (order-independent) and that no alias WRITE
-      // tool is exposed. Mirrors test/daemon/memory-mcp-server.test.ts.
+      // The memory MCP process hosts the memory tools PLUS the full alias CRUD
+      // tool set (resolve_alias / list_aliases / save_alias / delete_alias);
+      // assert the memory set and all four alias tools are present
+      // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
-      expect(listedNames).toEqual(expect.arrayContaining([ALIAS_MCP_TOOLS.RESOLVE, ALIAS_MCP_TOOLS.LIST]));
-      expect(listedNames).not.toContain('save_alias');
-      expect(listedNames).not.toContain('delete_alias');
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
 
       const saved = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,

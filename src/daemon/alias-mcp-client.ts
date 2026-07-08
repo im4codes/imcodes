@@ -1,9 +1,11 @@
-// Daemon → server read channel for the user-level alias store.
+// Daemon → server channel for the user-level alias store.
 //
 // Aliases are a precise, server-stored, USER-SCOPED reference store, distinct
-// from memory. v1 exposes only READ tools to agents (resolve_alias /
-// list_aliases); writes are user-only via the web app (`POST/DELETE
-// /api/aliases`). See openspec/changes/alias-quick-insert (design D5/D6).
+// from memory. Agents get full CRUD over MCP: read (resolve_alias /
+// list_aliases, with an optional search query) and write (save_alias upsert /
+// delete_alias). Every write goes through the SAME server-authoritative
+// validation as the web app (`GET/POST/DELETE /api/aliases`) — the agent cannot
+// bypass name/value/tags validation. See openspec/changes/alias-quick-insert.
 //
 // This reuses the existing daemon→server auth mechanism (the same
 // `Authorization: Bearer <server token>` + `X-Server-Id: <serverId>` pattern
@@ -108,6 +110,11 @@ function responseMessage(body: unknown, fallback: string): string {
 }
 
 function mapHttpFailure(status: number, body: unknown): AliasMcpFailure {
+  if (status === 400) {
+    // Server-authoritative validation rejected the write (invalid name/value/
+    // description/tags). Surface the shared reason code, never any alias value.
+    return failure(MCP_ERROR_REASONS.VALIDATION_FAILED, responseMessage(body, 'alias rejected: invalid input'));
+  }
   if (status === 401 || status === 403) {
     return failure(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, responseMessage(body, `alias request forbidden (${status})`));
   }
@@ -181,10 +188,17 @@ async function requestAliases(
  * List the bound owner user's aliases (server is source of truth, user-scoped).
  * Read-only; never mutates.
  */
-export async function aliasMcpList(options: AliasMcpClientOptions = {}): Promise<AliasListResult> {
+export async function aliasMcpList(
+  options: AliasMcpClientOptions = {},
+  query?: string,
+): Promise<AliasListResult> {
   const endpoint = await getEndpoint(options);
   if ('status' in endpoint) return endpoint;
   const params = new URLSearchParams({ limit: String(ALIAS_LIST_LIMIT_MAX) });
+  // Optional literal-substring search over name+description (server-side `?q=`,
+  // NFC-normalized + LIKE-escaped on the server). Empty/whitespace → list all.
+  const q = query != null ? nfc(query).trim() : '';
+  if (q) params.set('q', q);
   const result = await requestAliases(endpoint, `?${params.toString()}`, options);
   if (result.status !== 'ok') return result;
   return { status: 'ok', aliases: coerceAliasList(result.body) };
@@ -208,4 +222,106 @@ export async function aliasMcpResolve(name: string, options: AliasMcpClientOptio
     return { status: 'ok', found: false, name: normalized, reason: ALIAS_REASONS.NOT_FOUND };
   }
   return { status: 'ok', found: true, name: normalized, alias: match };
+}
+
+// ── Write channel (save_alias upsert / delete_alias) ────────────────────────
+
+export interface AliasUpsertInput {
+  name: string;
+  value: string;
+  description?: string;
+  tags?: string[];
+}
+
+export type AliasUpsertResult =
+  | { status: 'ok'; alias: AliasEntry }
+  | AliasMcpFailure;
+
+export type AliasDeleteResult =
+  | { status: 'ok'; deleted: true; name: string }
+  | { status: 'ok'; deleted: false; name: string; reason: typeof ALIAS_REASONS.NOT_FOUND }
+  | AliasMcpFailure;
+
+/**
+ * Low-level write request. Unlike {@link requestAliases} (read), this returns
+ * the raw HTTP status so callers can distinguish 400 (validation) / 404
+ * (not-found) from success without treating every non-2xx as a hard failure.
+ */
+async function aliasWrite(
+  endpoint: AliasServerEndpoint,
+  pathSuffix: string,
+  method: 'POST' | 'DELETE',
+  body: unknown,
+  options: AliasMcpClientOptions,
+): Promise<{ status: 'ok'; httpStatus: number; body: unknown } | AliasMcpFailure> {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${endpoint.token}`,
+      'X-Server-Id': endpoint.serverId,
+    };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const res = await fetchImpl(aliasUrl(endpoint, pathSuffix), {
+      method,
+      headers,
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: controller.signal,
+    });
+    return { status: 'ok', httpStatus: res.status, body: await parseJsonResponse(res) };
+  } catch (err) {
+    return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Create or edit (upsert, keyed on NFC name) an alias for the bound owner user.
+ * The server re-validates name/value/description/tags authoritatively; a 400 is
+ * surfaced as a `validation_failed` reason (never echoing the value back).
+ */
+export async function aliasMcpUpsert(
+  input: AliasUpsertInput,
+  options: AliasMcpClientOptions = {},
+): Promise<AliasUpsertResult> {
+  const endpoint = await getEndpoint(options);
+  if ('status' in endpoint) return endpoint;
+  const payload: Record<string, unknown> = { name: input.name, value: input.value };
+  if (input.description !== undefined) payload.description = input.description;
+  if (input.tags !== undefined) payload.tags = input.tags;
+  const res = await aliasWrite(endpoint, '', 'POST', payload, options);
+  if (res.status !== 'ok') return res;
+  if (res.httpStatus < 200 || res.httpStatus >= 300) return mapHttpFailure(res.httpStatus, res.body);
+  const alias = coerceAliasEntry(
+    res.body && typeof res.body === 'object' ? (res.body as Record<string, unknown>).alias : null,
+  );
+  if (!alias) return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, 'alias upsert returned no record');
+  return { status: 'ok', alias };
+}
+
+/**
+ * Delete an alias by name for the bound owner user. A missing name is a
+ * non-error `deleted: false` result (mirrors the read tools' not-found shape);
+ * only auth/network/validation problems are `status: 'error'`.
+ */
+export async function aliasMcpDelete(
+  name: string,
+  options: AliasMcpClientOptions = {},
+): Promise<AliasDeleteResult> {
+  const normalized = nfc(name);
+  if (validateAliasName(normalized) !== null) {
+    return failure(MCP_ERROR_REASONS.VALIDATION_FAILED, ALIAS_REASONS.INVALID_NAME);
+  }
+  const endpoint = await getEndpoint(options);
+  if ('status' in endpoint) return endpoint;
+  const res = await aliasWrite(endpoint, `/${encodeURIComponent(normalized)}`, 'DELETE', undefined, options);
+  if (res.status !== 'ok') return res;
+  if (res.httpStatus === 404) {
+    return { status: 'ok', deleted: false, name: normalized, reason: ALIAS_REASONS.NOT_FOUND };
+  }
+  if (res.httpStatus < 200 || res.httpStatus >= 300) return mapHttpFailure(res.httpStatus, res.body);
+  return { status: 'ok', deleted: true, name: normalized };
 }

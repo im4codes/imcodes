@@ -173,12 +173,14 @@ describe('memory MCP stdio server', () => {
       await client.connect(transport);
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
-      // Memory tools plus the read-only alias tools share the same server surface.
+      // Memory tools plus the full alias CRUD tool set share the same server surface.
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
-      expect(listedNames).toEqual(expect.arrayContaining([ALIAS_MCP_TOOLS.RESOLVE, ALIAS_MCP_TOOLS.LIST]));
-      // Alias writes are user-only via the web app — no MCP write tools exist.
-      expect(listedNames).not.toContain('save_alias');
-      expect(listedNames).not.toContain('delete_alias');
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
       for (const tool of listed.tools) {
         expect(tool.description).toBeTruthy();
       }
@@ -209,7 +211,12 @@ describe('memory MCP stdio server', () => {
       const listed = await client.listTools();
       const listedNames = listed.tools.map((tool) => tool.name);
       expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
-      expect(listedNames).toEqual(expect.arrayContaining([ALIAS_MCP_TOOLS.RESOLVE, ALIAS_MCP_TOOLS.LIST]));
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
     } finally {
       await client.close();
     }

@@ -90,6 +90,10 @@ aliasRoutes.post('/', async (c) => {
   const description = rawDescription != null ? nfc(rawDescription) : null;
   const tags = normalizeRequestTags(body.tags);
 
+  // Provenance: the daemon (MCP agent write) authenticates with X-Server-Id +
+  // Bearer; a browser (web app) uses the session cookie and never sends it.
+  const source = c.req.header('X-Server-Id') ? 'mcp' : 'web';
+
   const entry = await upsertAlias(c.env.DB, {
     id: randomHex(16),
     userId,
@@ -97,7 +101,7 @@ aliasRoutes.post('/', async (c) => {
     value: rawValue,
     description,
     tags,
-    source: 'web',
+    source,
   });
   return c.json({ alias: entry });
 });

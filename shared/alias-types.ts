@@ -20,12 +20,26 @@ export const ALIAS_NAME_PATTERN = /^[\p{L}\p{N}._-]{1,20}$/u;
 /** Where alias CRUD lives on the server (pod-independent; no serverId). */
 export const ALIAS_API_PATH = '/api/aliases';
 
-/** Read-only MCP tool names exposed by the daemon in v1 (no write tools). */
+/**
+ * MCP tool names exposed by the daemon for the alias store.
+ * - Read: `resolve_alias` (single value), `list_aliases` (metadata-only, optional search query).
+ * - Write: `save_alias` (create/edit = upsert), `delete_alias` (remove).
+ * Every write goes through the SAME server-authoritative validation as the web
+ * app (`POST/DELETE /api/aliases`); the agent cannot bypass it.
+ */
 export const ALIAS_MCP_TOOLS = {
   RESOLVE: 'resolve_alias',
   LIST: 'list_aliases',
+  SAVE: 'save_alias',
+  DELETE: 'delete_alias',
 } as const;
 export type AliasMcpToolName = typeof ALIAS_MCP_TOOLS[keyof typeof ALIAS_MCP_TOOLS];
+
+/** MCP tool names that MUTATE the alias store (create/edit/delete). */
+export const ALIAS_MCP_WRITE_TOOLS: readonly AliasMcpToolName[] = [
+  ALIAS_MCP_TOOLS.SAVE,
+  ALIAS_MCP_TOOLS.DELETE,
+] as const;
 
 /** Structured reason codes shared by server/daemon/web (never leak `value`). */
 export const ALIAS_REASONS = {

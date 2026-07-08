@@ -12,6 +12,8 @@ import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
+  aliasMcpUpsert,
+  aliasMcpDelete,
   type AliasServerEndpoint,
 } from '../../src/daemon/alias-mcp-client.js';
 
@@ -47,7 +49,7 @@ const OWNER_ENDPOINT: AliasServerEndpoint = {
   token: 'owner-token',
 };
 
-describe('alias MCP read tools', () => {
+describe('alias MCP tools', () => {
   describe('resolve_alias', () => {
     it('returns the current value for a known name', async () => {
       const alias = aliasEntry({ name: 'deploy', value: 'run deploy now' });
@@ -136,10 +138,87 @@ describe('alias MCP read tools', () => {
 
       expect(result).toMatchObject({ status: 'error', reason: 'identity_rejected' });
     });
+
+    it('passes an optional search query through to the client', async () => {
+      const listAliases = vi.fn<typeof aliasMcpList>(async () => ({ status: 'ok', aliases: [] }));
+      const handlers = createAliasMcpToolHandlers(caller(), { listAliases });
+      await handlers[ALIAS_MCP_TOOLS.LIST]({ query: 'dep' });
+      expect(listAliases).toHaveBeenCalledWith({}, 'dep');
+    });
+  });
+
+  describe('save_alias (create / edit upsert)', () => {
+    it('upserts via the client and returns metadata only (never echoes the value)', async () => {
+      const saved = aliasEntry({ name: 'deploy', value: 'ssh secret', description: 'prod', tags: ['ops'], source: 'mcp' });
+      const upsertAlias = vi.fn<typeof aliasMcpUpsert>(async () => ({ status: 'ok', alias: saved }));
+      const handlers = createAliasMcpToolHandlers(caller(), { upsertAlias });
+      const result = await handlers[ALIAS_MCP_TOOLS.SAVE]({ name: 'deploy', value: 'ssh secret', description: 'prod', tags: ['ops'] });
+
+      expect(upsertAlias).toHaveBeenCalledWith(
+        { name: 'deploy', value: 'ssh secret', description: 'prod', tags: ['ops'] },
+        {},
+      );
+      expect(result).toMatchObject({ status: 'ok', saved: true, alias: { name: 'deploy', description: 'prod', tags: ['ops'] } });
+      // The saved value is NEVER echoed back into the agent's context.
+      expect(result).not.toHaveProperty('alias.value');
+      expect(JSON.stringify(result)).not.toContain('ssh secret');
+    });
+
+    it('requires a name argument', async () => {
+      const upsertAlias = vi.fn<typeof aliasMcpUpsert>();
+      const handlers = createAliasMcpToolHandlers(caller(), { upsertAlias });
+      const result = await handlers[ALIAS_MCP_TOOLS.SAVE]({ value: 'x' });
+      expect(upsertAlias).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    });
+
+    it('surfaces a server-authoritative validation rejection', async () => {
+      const upsertAlias = vi.fn<typeof aliasMcpUpsert>(async () => ({
+        status: 'error', reason: 'validation_failed', message: ALIAS_REASONS.VALUE_INVALID,
+      }));
+      const handlers = createAliasMcpToolHandlers(caller(), { upsertAlias });
+      const result = await handlers[ALIAS_MCP_TOOLS.SAVE]({ name: 'deploy', value: '' });
+      expect(result).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    });
+
+    it('drops non-string tags before sending to the server', async () => {
+      const upsertAlias = vi.fn<typeof aliasMcpUpsert>(async () => ({ status: 'ok', alias: aliasEntry({ tags: ['ok'] }) }));
+      const handlers = createAliasMcpToolHandlers(caller(), { upsertAlias });
+      await handlers[ALIAS_MCP_TOOLS.SAVE]({ name: 'deploy', value: 'v', tags: ['ok', 3, null] });
+      expect(upsertAlias).toHaveBeenCalledWith(expect.objectContaining({ tags: ['ok'] }), {});
+    });
+  });
+
+  describe('delete_alias', () => {
+    it('deletes via the client and returns deleted:true', async () => {
+      const deleteAlias = vi.fn<typeof aliasMcpDelete>(async (name) => ({ status: 'ok', deleted: true, name }));
+      const handlers = createAliasMcpToolHandlers(caller(), { deleteAlias });
+      const result = await handlers[ALIAS_MCP_TOOLS.DELETE]({ name: 'deploy' });
+      expect(deleteAlias).toHaveBeenCalledWith('deploy', {});
+      expect(result).toEqual({ status: 'ok', deleted: true, name: 'deploy' });
+    });
+
+    it('returns deleted:false (not an error) for a missing name', async () => {
+      const deleteAlias = vi.fn<typeof aliasMcpDelete>(async (name) => ({
+        status: 'ok', deleted: false, name, reason: ALIAS_REASONS.NOT_FOUND,
+      }));
+      const handlers = createAliasMcpToolHandlers(caller(), { deleteAlias });
+      const result = await handlers[ALIAS_MCP_TOOLS.DELETE]({ name: 'ghost' });
+      expect((result as { status: string }).status).not.toBe('error');
+      expect(result).toMatchObject({ deleted: false, reason: ALIAS_REASONS.NOT_FOUND });
+    });
+
+    it('requires a name argument', async () => {
+      const deleteAlias = vi.fn<typeof aliasMcpDelete>();
+      const handlers = createAliasMcpToolHandlers(caller(), { deleteAlias });
+      const result = await handlers[ALIAS_MCP_TOOLS.DELETE]({});
+      expect(deleteAlias).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    });
   });
 
   describe('tool registration', () => {
-    it('registers only the read-only alias tools; no save_alias/delete_alias', async () => {
+    it('registers the full alias CRUD tool set with agent-usable descriptions', async () => {
       const server = createMemoryMcpServer(caller());
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const client = new Client({ name: 'alias-mcp-test', version: '0.1.0' });
@@ -150,17 +229,19 @@ describe('alias MCP read tools', () => {
 
         expect(names).toContain(ALIAS_MCP_TOOLS.RESOLVE);
         expect(names).toContain(ALIAS_MCP_TOOLS.LIST);
-        expect(names).not.toContain('save_alias');
-        expect(names).not.toContain('delete_alias');
+        expect(names).toContain(ALIAS_MCP_TOOLS.SAVE);
+        expect(names).toContain(ALIAS_MCP_TOOLS.DELETE);
 
-        // Descriptions must state aliases are a distinct server store with user-only writes.
-        const resolveTool = listed.tools.find((tool) => tool.name === ALIAS_MCP_TOOLS.RESOLVE);
-        expect(resolveTool?.description ?? '').toMatch(/web app/i);
-        const listTool = listed.tools.find((tool) => tool.name === ALIAS_MCP_TOOLS.LIST);
-        expect(listTool?.description ?? '').toMatch(/web app/i);
-        // list_aliases must advertise it returns metadata only and points to resolve_alias for values.
-        expect(listTool?.description ?? '').toMatch(/metadata only/i);
-        expect(listTool?.description ?? '').toMatch(/resolve_alias/);
+        const desc = (n: string) => listed.tools.find((tool) => tool.name === n)?.description ?? '';
+        // list advertises metadata-only + the search query + points to resolve_alias for values.
+        expect(desc(ALIAS_MCP_TOOLS.LIST)).toMatch(/metadata only/i);
+        expect(desc(ALIAS_MCP_TOOLS.LIST)).toMatch(/resolve_alias/);
+        expect(desc(ALIAS_MCP_TOOLS.LIST)).toMatch(/search/i);
+        // save advertises upsert/overwrite semantics + server-authoritative validation.
+        expect(desc(ALIAS_MCP_TOOLS.SAVE)).toMatch(/upsert|overwrite/i);
+        expect(desc(ALIAS_MCP_TOOLS.SAVE)).toMatch(/valid/i);
+        // delete advertises the not-found (deleted:false) non-error shape.
+        expect(desc(ALIAS_MCP_TOOLS.DELETE)).toMatch(/deleted:false|not.?found/i);
       } finally {
         await client.close();
         await server.close();
@@ -168,14 +249,19 @@ describe('alias MCP read tools', () => {
     });
   });
 
-  describe('alias-mcp-client (daemon → server read channel)', () => {
+  describe('alias-mcp-client (daemon → server channel)', () => {
     function fetchReturning(body: unknown, init: { status?: number } = {}): {
       fetchImpl: typeof fetch;
-      calls: Array<{ url: string; headers: Record<string, string> }>;
+      calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: unknown }>;
     } {
-      const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+      const calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: unknown }> = [];
       const fetchImpl = vi.fn(async (url: string, options: RequestInit) => {
-        calls.push({ url, headers: options.headers as Record<string, string> });
+        calls.push({
+          url,
+          method: options.method ?? 'GET',
+          headers: options.headers as Record<string, string>,
+          body: typeof options.body === 'string' ? JSON.parse(options.body) : undefined,
+        });
         return {
           ok: (init.status ?? 200) < 400,
           status: init.status ?? 200,
@@ -237,6 +323,72 @@ describe('alias MCP read tools', () => {
       const { fetchImpl } = fetchReturning({ error: 'forbidden' }, { status: 403 });
       const result = await aliasMcpList({ endpoint: OWNER_ENDPOINT, fetchImpl });
       expect(result).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    });
+
+    it('list passes an optional search query through as ?q=', async () => {
+      const { fetchImpl, calls } = fetchReturning({ aliases: [] });
+      await aliasMcpList({ endpoint: OWNER_ENDPOINT, fetchImpl }, 'dep');
+      expect(calls[0].url).toContain('q=dep');
+    });
+
+    it('upserts via an authenticated POST with a JSON body and returns the saved alias', async () => {
+      const saved = aliasEntry({ name: 'deploy', value: 'v', source: 'mcp' });
+      const { fetchImpl, calls } = fetchReturning({ alias: saved });
+      const result = await aliasMcpUpsert(
+        { name: 'deploy', value: 'v', description: 'd', tags: ['t'] },
+        { endpoint: OWNER_ENDPOINT, fetchImpl },
+      );
+
+      expect(result).toMatchObject({ status: 'ok', alias: { name: 'deploy', value: 'v' } });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].method).toBe('POST');
+      expect(calls[0].url).toContain('/api/aliases');
+      expect(calls[0].headers.Authorization).toBe('Bearer owner-token');
+      expect(calls[0].headers['X-Server-Id']).toBe('srv-1');
+      expect(calls[0].body).toEqual({ name: 'deploy', value: 'v', description: 'd', tags: ['t'] });
+    });
+
+    it('maps a 400 upsert rejection to validation_failed (never leaks the value)', async () => {
+      const { fetchImpl } = fetchReturning({ error: ALIAS_REASONS.VALUE_INVALID }, { status: 400 });
+      const result = await aliasMcpUpsert({ name: 'deploy', value: '' }, { endpoint: OWNER_ENDPOINT, fetchImpl });
+      expect(result).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    });
+
+    it('deletes via an authenticated DELETE to the /:name path and returns deleted:true', async () => {
+      const { fetchImpl, calls } = fetchReturning({ ok: true });
+      const result = await aliasMcpDelete('deploy', { endpoint: OWNER_ENDPOINT, fetchImpl });
+      expect(result).toEqual({ status: 'ok', deleted: true, name: 'deploy' });
+      expect(calls[0].method).toBe('DELETE');
+      expect(calls[0].url).toContain('/api/aliases/deploy');
+    });
+
+    it('delete returns deleted:false (not an error) on a 404', async () => {
+      const { fetchImpl } = fetchReturning({ error: ALIAS_REASONS.NOT_FOUND }, { status: 404 });
+      const result = await aliasMcpDelete('ghost', { endpoint: OWNER_ENDPOINT, fetchImpl });
+      expect(result).toMatchObject({ status: 'ok', deleted: false, reason: ALIAS_REASONS.NOT_FOUND });
+    });
+
+    it('read-after-write round trip: upsert then resolve returns the saved value', async () => {
+      // Tiny in-memory server keyed by NFC name: POST stores, GET lists.
+      const store = new Map<string, AliasEntry>();
+      const fetchImpl = vi.fn(async (url: string, options: RequestInit) => {
+        const method = options.method ?? 'GET';
+        if (method === 'POST') {
+          const b = JSON.parse(options.body as string) as { name: string; value: string };
+          const entry = aliasEntry({ name: b.name, value: b.value, source: 'mcp' });
+          store.set(b.name, entry);
+          return { ok: true, status: 200, json: async () => ({ alias: entry }) } as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ aliases: [...store.values()] }) } as Response;
+      }) as unknown as typeof fetch;
+
+      const opts = { endpoint: OWNER_ENDPOINT, fetchImpl };
+      const saved = await aliasMcpUpsert({ name: 'deploy', value: 'ssh prod' }, opts);
+      expect(saved).toMatchObject({ status: 'ok', alias: { name: 'deploy', source: 'mcp' } });
+
+      const resolved = await aliasMcpResolve('deploy', opts);
+      expect(resolved).toMatchObject({ status: 'ok', found: true, name: 'deploy' });
+      expect((resolved as { alias: AliasEntry }).alias.value).toBe('ssh prod');
     });
   });
 });
