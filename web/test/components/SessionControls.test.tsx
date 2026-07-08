@@ -4848,7 +4848,7 @@ afterEach(() => {
     expect(sent.text).toContain('User task to delegate:\nplease review');
     expect(sent.text).toContain('organize the relevant current-session context yourself');
     expect(sent.text).toContain('Do not send the raw user task by itself.');
-    expect(sent.text).toContain('imcodes send --no-reply "deck_sub_w1"');
+    expect(sent.text).toContain('imcodes send --reply "deck_sub_w1"');
     expect(sent).not.toHaveProperty('delegateTarget');
 
     getSelectionSpy.mockRestore();

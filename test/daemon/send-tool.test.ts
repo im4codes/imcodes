@@ -456,13 +456,14 @@ describe('send-tool', () => {
     });
   });
 
-  it('adds no-reply callback instructions when reply is requested', async () => {
+  it('adds callback instructions when reply is requested', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
     await dispatchSendMessage(caller, { target: 'deck_alpha_w1', message: 'do it', reply: true }, {
       listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' })],
       dispatchMessage,
     });
 
-    expect(dispatchMessage.mock.calls[0][1]).toContain('imcodes send --no-reply "deck_alpha_brain" "Task: <brief summary of the request>\\nResult: <your response>"');
+    expect(dispatchMessage.mock.calls[0][1]).toContain('imcodes send "deck_alpha_brain" "Task: <brief summary of the request>\\nResult: <your response>"');
+    expect(dispatchMessage.mock.calls[0][1]).not.toContain('imcodes send --no-reply');
   });
 });

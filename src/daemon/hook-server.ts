@@ -152,7 +152,7 @@ function resolveSenderRecord(from: string, allSessions: SessionRecord[]): Sessio
  * External CLI sender:
  * - There is no trustworthy sender scope, so only an exact non-stopped session
  *   name is accepted. This preserves shell-originated callback commands such as
- *   `imcodes send --no-reply "deck_proj_brain" ...` without enabling global
+ *   `imcodes send "deck_proj_brain" ...` without enabling global
  *   label/type/broadcast fan-out.
  */
 export function resolveTarget(from: string, to: string): ResolveResult {

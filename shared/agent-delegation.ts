@@ -177,7 +177,7 @@ export function isDelegationUnsupportedControlText(text: string): boolean {
 
 export function buildAgentDelegationReplyInstruction(replyToSession: string): string {
   if (!isCanonicalAgentDelegationSessionName(replyToSession)) return '';
-  return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send --no-reply ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
+  return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
 }
 
 export interface AgentDelegationOrchestrationPromptInput {
@@ -204,8 +204,10 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
     '',
     'Before contacting the delegate, organize the relevant current-session context yourself: summarize the goal, constraints, repo paths, recent decisions, current state, and acceptance criteria the delegate needs. Do not send the raw user task by itself.',
     '',
-    'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above. Prefer the available send_message tool when present; otherwise use:',
-    `imcodes send --no-reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
+    'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above, and require a reply. Prefer the available send_message tool with reply enabled when present; otherwise use:',
+    `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
+    '',
+    'If the user selected or mentioned multiple @ delegates, split the work into separate per-delegate briefs, dispatch each one independently with reply required, and track/report each delegate result separately.',
     '',
     'Keep this session responsible for orchestration and final judgment. Do not implement the delegated task yourself unless implementation is needed only to prepare or verify the delegation brief.',
   ].join('\n');
