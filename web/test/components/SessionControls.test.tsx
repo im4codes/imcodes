@@ -424,6 +424,9 @@ const makeSession = (overrides: Partial<SessionInfo> = {}): SessionInfo => ({
 const makeTransportSession = (overrides: Partial<SessionInfo> = {}): SessionInfo => makeSession({
   agentType: 'codex-sdk',
   runtimeType: 'transport',
+  queueEpoch: 'queue-epoch-1',
+  queueAuthorityId: 'queue-authority-1',
+  transportPendingMessageVersion: 0,
   ...overrides,
 });
 
@@ -3437,7 +3440,9 @@ afterEach(() => {
           confidence: 'high',
           payload: {
             state: 'running',
-            pendingMessages: [],
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 1,
             pendingMessageEntries: [],
           },
         },
@@ -3521,6 +3526,8 @@ afterEach(() => {
           confidence: 'high',
           payload: {
             state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
             pendingMessageVersion: 4,
             pendingMessageEntries: [],
           },
@@ -3566,6 +3573,8 @@ afterEach(() => {
           confidence: 'high',
           payload: {
             state: 'running',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
             pendingMessageVersion: 6,
             pendingMessageEntries: [],
           },
@@ -3574,6 +3583,83 @@ afterEach(() => {
     });
 
     expect(screen.queryByText('sub stale queued')).toBeNull();
+  });
+
+  it('applies session_list empty queue snapshots without waiting for parent props to refresh', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [{ clientMessageId: 'stale-list-1', text: 'stale list queued' }],
+          transportPendingMessageVersion: 7,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('stale list queued')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'qwen-session',
+          project: 'my-project',
+          role: 'brain',
+          agentType: 'qwen',
+          state: 'running',
+          runtimeType: 'transport',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 8,
+          transportPendingMessageVersion: 8,
+          pendingMessageEntries: [],
+          transportPendingMessageEntries: [],
+        }],
+      });
+    });
+
+    expect(screen.queryByText('stale list queued')).toBeNull();
+  });
+
+  it('applies subsession.sync empty queue snapshots without waiting for a window refresh', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_worker',
+          project: 'my-project',
+          role: 'w1',
+          state: 'running',
+          transportPendingMessageEntries: [{ clientMessageId: 'stale-sub-sync-1', text: 'stale sub sync queued' }],
+          transportPendingMessageVersion: 9,
+        })}
+        subSessionId="worker"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('stale sub sync queued')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'subsession.sync',
+        id: 'worker',
+        sessionName: 'deck_sub_worker',
+        state: 'running',
+        queueEpoch: 'queue-epoch-1',
+        queueAuthorityId: 'queue-authority-1',
+        pendingMessageVersion: 10,
+        transportPendingMessageVersion: 10,
+        pendingMessageEntries: [],
+        transportPendingMessageEntries: [],
+      });
+    });
+
+    expect(screen.queryByText('stale sub sync queued')).toBeNull();
   });
 
   it('clears a local queued entry when reconnect snapshot advances to an empty queue', () => {

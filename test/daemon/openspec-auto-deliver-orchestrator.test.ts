@@ -2957,7 +2957,10 @@ exec "${realGit}" "$@"
       },
     });
     await emitDeckDemoIdle();
-    let terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, 2500);
+    let terminal = await waitForSend((msg) => (
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && (msg.projection as { terminalReason?: unknown } | undefined)?.terminalReason === 'audit_metadata_mismatch'
+    ), 2500);
     expect(terminal?.projection.status).toBe('needs_human');
     expect(terminal?.projection.terminalReason).toBe('audit_metadata_mismatch');
     expect(getAutoDeliverP2pLock('deck_demo_brain')).toBeUndefined();

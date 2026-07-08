@@ -46,7 +46,11 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
-import { normalizeTransportPendingEntries } from '../transport-queue.js';
+import {
+  buildTransportPendingSyncPatch,
+  hasTransportPendingSyncSnapshot,
+  normalizeTransportPendingEntries,
+} from '../transport-queue.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -289,6 +293,8 @@ type LocalQueuedTransportEntry = {
   sharedActor?: SharedActorEnvelope;
   /** Queue version visible when this local optimistic entry was created. */
   queuedAfterVersion?: number;
+  /** Creation time used to break same-version realtime empty snapshot races. */
+  queuedAtMs?: number;
 };
 
 type RealtimeTransportQueueOverride = {
@@ -890,6 +896,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
+  const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
   const queuedMutationRollbackRef = useRef<Map<string, { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }>>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
@@ -1009,6 +1016,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setSettledQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
     setRealtimeQueueOverride(null);
+    lastRealtimeEmptyQueueSnapshotRef.current = null;
     setEditingQueuedMessageId(null);
     queuedMutationRollbackRef.current.clear();
     failedQueuedCommandIdsRef.current.clear();
@@ -1537,9 +1545,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // new send created after the current empty baseline is preserved.
       setOptimisticQueuedEntries((prev) => {
         if (!prev) return null;
+        const emptySnapshot = lastRealtimeEmptyQueueSnapshotRef.current;
         const remaining = prev.filter((entry) => (
           entry.queuedAfterVersion === undefined
-          || incomingQueuedTransportVersion <= entry.queuedAfterVersion
+          || incomingQueuedTransportVersion < entry.queuedAfterVersion
+          || (
+            incomingQueuedTransportVersion === entry.queuedAfterVersion
+            && (
+              !emptySnapshot
+              || emptySnapshot.sessionName !== activeSession?.name
+              || emptySnapshot.version !== incomingQueuedTransportVersion
+              || entry.queuedAtMs === undefined
+              || entry.queuedAtMs > emptySnapshot.observedAtMs
+            )
+          )
         ));
         if (remaining.length === prev.length) return prev;
         return remaining.length > 0 ? remaining : null;
@@ -1554,6 +1573,37 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!ws || !activeSession) return;
     return ws.onMessage((msg: ServerMessage) => {
+      const applyRealtimeQueueSnapshot = (payload: Record<string, unknown>, sessionName: string): boolean => {
+        if (sessionName !== activeSession.name || !hasTransportPendingSyncSnapshot(payload)) return false;
+        const patch = buildTransportPendingSyncPatch({
+          transportPendingMessageEntries: incomingQueuedTransportEntries,
+          transportPendingMessageVersion: incomingQueuedTransportVersion,
+          queueEpoch: activeSession.queueEpoch,
+          queueAuthorityId: activeSession.queueAuthorityId,
+          failedMessageEntries: activeSession.failedMessageEntries,
+        }, payload, sessionName);
+        if (Object.keys(patch).length === 0) return false;
+        const entries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
+          ...entry,
+          status: 'queued' as const,
+        }));
+        setRealtimeQueueOverride({
+          sessionName,
+          entries,
+          version: patch.transportPendingMessageVersion,
+        });
+        if (entries.length === 0) {
+          lastRealtimeEmptyQueueSnapshotRef.current = {
+            sessionName,
+            version: patch.transportPendingMessageVersion,
+            observedAtMs: Date.now(),
+          };
+          setOptimisticQueuedEntries(null);
+        } else {
+          lastRealtimeEmptyQueueSnapshotRef.current = null;
+        }
+        return true;
+      };
       const removeLocalQueuedEntry = (commandId: string, text?: string) => {
         void text;
         if (!commandId) return;
@@ -1586,6 +1636,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         });
       };
 
+      if (msg.type === 'session_list') {
+        const session = msg.sessions.find((item) => item.name === activeSession.name);
+        if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, activeSession.name);
+        return;
+      }
+      if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
+        const payload = msg as unknown as Record<string, unknown>;
+        const sessionName = typeof payload.sessionName === 'string'
+          ? payload.sessionName
+          : typeof payload.id === 'string'
+            ? `deck_sub_${payload.id}`
+            : '';
+        applyRealtimeQueueSnapshot(payload, sessionName);
+        return;
+      }
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== activeSession.name) return;
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
@@ -1658,23 +1723,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         removeLocalQueuedEntry(clientMessageId);
         rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
-        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries');
-        const snapshotVersion = typeof event.payload.pendingMessageVersion === 'number'
-          ? event.payload.pendingMessageVersion
-          : undefined;
+        const payload = event.payload as Record<string, unknown>;
+        const hasPendingSnapshot = applyRealtimeQueueSnapshot(payload, activeSession.name);
         const queuedEntries = normalizeTransportPendingEntries(
-          event.payload.pendingMessageEntries,
+          payload.pendingMessageEntries,
           undefined,
           activeSession.name,
-          { hasEntriesField: Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries') },
+          { hasEntriesField: Object.prototype.hasOwnProperty.call(payload, 'pendingMessageEntries') },
         );
-        if (hasPendingSnapshot) {
-          setRealtimeQueueOverride({
-            sessionName: activeSession.name,
-            entries: queuedEntries.map((entry) => ({ ...entry, status: 'queued' as const })),
-            version: snapshotVersion,
-          });
-        }
         if (queuedEntries.length === 0) {
           if (hasPendingSnapshot) setOptimisticQueuedEntries(null);
           return;
@@ -1687,7 +1743,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         });
       }
     });
-  }, [activeSession, incomingQueuedTransportEntries, ws]);
+  }, [activeSession, incomingQueuedTransportEntries, incomingQueuedTransportVersion, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -3047,6 +3103,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       && !isDelegationSend
       && !payload.text.trim().startsWith('/');
     if (shouldShowAsQueued) {
+      const queuedAtMs = Date.now();
       setOptimisticQueuedEntries((prev) => {
         const source = prev ?? incomingQueuedTransportEntries;
         if (source.some((entry) => entry.clientMessageId === commandId)) return source;
@@ -3055,6 +3112,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           text: payload.text,
           status: localFailure || failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
           queuedAfterVersion: incomingQueuedTransportVersion,
+          queuedAtMs,
         }];
       });
     }
@@ -3137,6 +3195,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         text: entry.text,
         status: failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
         queuedAfterVersion: incomingQueuedTransportVersion,
+        queuedAtMs: Date.now(),
       });
       return next;
     });
