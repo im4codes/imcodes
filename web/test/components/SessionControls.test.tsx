@@ -3489,6 +3489,93 @@ afterEach(() => {
     expect(screen.queryByText('stuck message')).toBeNull();
   });
 
+  it('applies a realtime empty queue snapshot even when activeSession props still carry stale queued entries', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessages: ['stale prop queued'],
+          transportPendingMessageEntries: [{ clientMessageId: 'stale-prop-1', text: 'stale prop queued' }],
+          transportPendingMessageVersion: 3,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('stale prop queued')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'state-empty-pending-live',
+          sessionId: 'qwen-session',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 2,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            pendingMessageVersion: 4,
+            pendingMessageEntries: [],
+          },
+        },
+      });
+    });
+
+    expect(screen.queryByText('stale prop queued')).toBeNull();
+  });
+
+  it('applies realtime empty queue snapshots for sub-session controls too', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_worker',
+          project: 'my-project',
+          role: 'w1',
+          agentType: 'codex-sdk',
+          state: 'running',
+          transportPendingMessages: ['sub stale queued'],
+          transportPendingMessageEntries: [{ clientMessageId: 'sub-stale-1', text: 'sub stale queued' }],
+          transportPendingMessageVersion: 5,
+        })}
+        subSessionId="worker"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('sub stale queued')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-state-empty-pending-live',
+          sessionId: 'deck_sub_worker',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 3,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'running',
+            pendingMessageVersion: 6,
+            pendingMessageEntries: [],
+          },
+        },
+      });
+    });
+
+    expect(screen.queryByText('sub stale queued')).toBeNull();
+  });
+
   it('clears a local queued entry when reconnect snapshot advances to an empty queue', () => {
     const ws = makeWs();
     const view = render(

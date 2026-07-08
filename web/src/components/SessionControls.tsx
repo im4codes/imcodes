@@ -291,6 +291,12 @@ type LocalQueuedTransportEntry = {
   queuedAfterVersion?: number;
 };
 
+type RealtimeTransportQueueOverride = {
+  sessionName: string;
+  entries: LocalQueuedTransportEntry[];
+  version?: number;
+};
+
 function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
   const serverPart = encodeURIComponent(serverId || 'local');
   const sessionPart = encodeURIComponent(sessionName);
@@ -883,6 +889,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
   const queuedMutationRollbackRef = useRef<Map<string, { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }>>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
@@ -945,7 +952,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
     && activeSessionLiveStatus.busy;
-  const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
+  const activeSessionPendingEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
         undefined,
@@ -959,9 +966,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         },
       )
     : [];
-  const incomingQueuedTransportVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
+  const activeSessionPendingVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
     ? activeSession.transportPendingMessageVersion
     : undefined;
+  const shouldUseRealtimeQueueOverride = !!activeSession?.name
+    && realtimeQueueOverride?.sessionName === activeSession.name
+    && (
+      realtimeQueueOverride.version === undefined
+      || activeSessionPendingVersion === undefined
+      || realtimeQueueOverride.version >= activeSessionPendingVersion
+    );
+  const incomingQueuedTransportEntries = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.entries
+    : activeSessionPendingEntries;
+  const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.version
+    : activeSessionPendingVersion;
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
     let merged: LocalQueuedTransportEntry[];
     if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
@@ -988,6 +1008,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     setSettledQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
+    setRealtimeQueueOverride(null);
     setEditingQueuedMessageId(null);
     queuedMutationRollbackRef.current.clear();
     failedQueuedCommandIdsRef.current.clear();
@@ -1638,12 +1659,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
         const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries');
+        const snapshotVersion = typeof event.payload.pendingMessageVersion === 'number'
+          ? event.payload.pendingMessageVersion
+          : undefined;
         const queuedEntries = normalizeTransportPendingEntries(
           event.payload.pendingMessageEntries,
           undefined,
           activeSession.name,
           { hasEntriesField: Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries') },
         );
+        if (hasPendingSnapshot) {
+          setRealtimeQueueOverride({
+            sessionName: activeSession.name,
+            entries: queuedEntries.map((entry) => ({ ...entry, status: 'queued' as const })),
+            version: snapshotVersion,
+          });
+        }
         if (queuedEntries.length === 0) {
           if (hasPendingSnapshot) setOptimisticQueuedEntries(null);
           return;
