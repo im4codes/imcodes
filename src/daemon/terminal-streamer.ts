@@ -32,6 +32,7 @@ const IDLE_THRESHOLD_MS = 5_000; // 5s without raw bytes → idle (Stop hook fir
 const MAX_RAW_BUFFER = 256 * 1024; // 256KB per-subscriber snapshot-pending buffer
 const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const MAX_REBIND_ATTEMPTS = 5;
+const BLANK_BOOTSTRAP_STALL_MS = 1_500;
 
 function shouldSuppressPaneIdInlineError(sessionName: string): boolean {
   const session = getSession(sessionName);
@@ -67,6 +68,14 @@ function isTransportSessionName(sessionName: string): boolean {
     || (typeof session?.agentType === 'string' && isTransportAgent(session.agentType));
 }
 
+function stripAnsiForBlankCheck(value: string): string {
+  return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+}
+
+function isBlankTerminalSnapshot(value: string): boolean {
+  return stripAnsiForBlankCheck(value).trim().length === 0;
+}
+
 export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
 export interface StreamSubscriber {
@@ -78,6 +87,7 @@ export interface StreamSubscriber {
   /** Send a control message (e.g. terminal.stream_reset). */
   sendControl?: (msg: { type: string; [key: string]: unknown }) => void;
   sendHistory?: (history: TerminalHistory) => void;
+  onBootstrapStalled?: (reason: 'blank_snapshot_no_raw') => void;
   onError?: (err: Error) => void;
 }
 
@@ -258,9 +268,11 @@ export class TerminalStreamer {
     }
 
     // 1. Take snapshot
+    let snapshotWasBlank = false;
     try {
       const size = await this.getSize(sessionName);
       const raw = await capturePaneVisible(sessionName);
+      snapshotWasBlank = isBlankTerminalSnapshot(raw);
       const lines = raw.split('\n').slice(0, size.rows);
       while (lines.length < size.rows) lines.push('');
 
@@ -319,8 +331,22 @@ export class TerminalStreamer {
     }
 
     // 4. Start pipe if this was the first subscriber
+    const bootstrapWatchStartedAt = Date.now();
     if (!hasPipe && this.subscribers.get(sessionName)?.has(subscriber)) {
       await this.startPipe(sessionName, 0);
+    }
+
+    if (
+      snapshotWasBlank
+      && subscriber.onBootstrapStalled
+      && this.subscribers.get(sessionName)?.has(subscriber)
+    ) {
+      setTimeout(() => {
+        if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
+        const lastRawAt = this.lastRawAt.get(sessionName) ?? 0;
+        if (lastRawAt >= bootstrapWatchStartedAt) return;
+        subscriber.onBootstrapStalled?.('blank_snapshot_no_raw');
+      }, BLANK_BOOTSTRAP_STALL_MS);
     }
   }
 

@@ -4,7 +4,7 @@
  */
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
-import { isTransportAgent } from '../agent/detect.js';
+import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -950,6 +950,9 @@ function describeTransportSendError(err: unknown): string {
 }
 
 const pendingSessionRelaunches = new Map<string, Promise<void>>();
+const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
+const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
+const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
 
 function trackPendingSessionRelaunch(sessionName: string, pending: Promise<void>): Promise<void> {
   pendingSessionRelaunches.set(sessionName, pending);
@@ -965,6 +968,19 @@ function runExclusiveSessionRelaunch(sessionName: string, factory: () => Promise
   const pending = pendingSessionRelaunches.get(sessionName);
   if (pending) return pending;
   return trackPendingSessionRelaunch(sessionName, factory());
+}
+
+function canAttemptShellBootstrapRecovery(sessionName: string): boolean {
+  const now = Date.now();
+  const cutoff = now - SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS;
+  const attempts = shellBootstrapRecoveryAttempts.get(sessionName)?.filter((ts) => ts > cutoff) ?? [];
+  if (attempts.length >= SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS) {
+    shellBootstrapRecoveryAttempts.set(sessionName, attempts);
+    return false;
+  }
+  attempts.push(now);
+  shellBootstrapRecoveryAttempts.set(sessionName, attempts);
+  return true;
 }
 
 async function waitForPendingSessionRelaunch(sessionName: string): Promise<void> {
@@ -4588,6 +4604,41 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
     },
     sendControl: (msg) => {
       try { serverLink.send(msg); } catch { /* ignore */ }
+    },
+    onBootstrapStalled: (reason) => {
+      const current = activeSubscriptions.get(session);
+      if (current?.subscriber !== subscriber) return;
+      const latestRecord = getSession(session);
+      if (latestRecord?.agentType !== 'shell' && latestRecord?.agentType !== 'script') return;
+      if (!canAttemptShellBootstrapRecovery(session)) {
+        logger.warn({ session, reason }, 'Shell terminal bootstrap recovery suppressed by restart limit');
+        return;
+      }
+      logger.warn({ session, reason, agentType: latestRecord.agentType }, 'Shell terminal bootstrap stalled — auto-restarting session');
+      void runExclusiveSessionRelaunch(session, async () => {
+        try {
+          await relaunchSessionWithSettings(latestRecord, {
+            agentType: latestRecord.agentType as AgentType,
+            projectDir: latestRecord.projectDir,
+            label: latestRecord.label ?? null,
+            description: latestRecord.description ?? null,
+          });
+          await handleGetSessions(serverLink);
+          if (session.startsWith('deck_sub_')) {
+            try {
+              await sendSubSessionSync(serverLink, session.replace(/^deck_sub_/, ''), undefined, getSubSessionSyncOptions(session));
+            } catch { /* not connected */ }
+          }
+        } catch (err) {
+          logger.error({ session, err }, 'Shell terminal bootstrap auto-restart failed');
+          const message = err instanceof Error ? err.message : String(err);
+          emitSessionInlineError(session, `Shell auto-reconnect failed: ${message}`);
+          try { serverLink.send({ type: 'session.error', project: latestRecord.projectName, message }); } catch { /* ignore */ }
+          throw err;
+        }
+      }).catch(() => {
+        // Failure already surfaced; keep command handling alive.
+      });
     },
     onError: () => {
       if (rawBatchTimer) clearTimeout(rawBatchTimer);
