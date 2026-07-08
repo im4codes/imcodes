@@ -3864,7 +3864,9 @@ ${PREFERENCE_CONTEXT_END}`;
       const onDrainEntries: PendingTransportMessage[][] = [];
       runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
       expect(runtime.send(ORIGINAL, 'alias-direct-1', undefined, undefined, { providerText: EXPANDED })).toBe('sent');
-      await flushDispatch();
+      // Poll for the async provider send (robust to CI load) instead of a fixed
+      // flushDispatch, which under-waited on slower runners and flaked.
+      await waitForProviderSendCount(mock.provider, 1);
       // Provider receives the expanded agent-bound copy.
       expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
         userMessage: EXPANDED,
@@ -3942,7 +3944,9 @@ ${PREFERENCE_CONTEXT_END}`;
 
     it('no providerText (common no-alias path) is byte-identical: provider runs the message text itself', async () => {
       expect(runtime.send('plain message, no markers', 'noalias-1')).toBe('sent');
-      await flushDispatch();
+      // Poll for the async provider send (robust to CI load) instead of a fixed
+      // flushDispatch, which under-waited on slower runners and flaked.
+      await waitForProviderSendCount(mock.provider, 1);
       expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
         userMessage: 'plain message, no markers',
       }));
