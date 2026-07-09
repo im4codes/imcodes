@@ -1669,6 +1669,8 @@
     "empty": "No messages yet"
   },
   "sidebar": {
+    "daemon_upgrading": "Upgrading…",
+    "daemon_upgrading_to": "Upgrading to v{{version}}…",
     "collapse": "Collapse sidebar",
     "expand": "Expand sidebar",
     "noSessions": "No sessions",

@@ -141,6 +141,9 @@ html.native-ios-mac .chat-dl-btn {
 .server-ctx-item-danger:hover { background: #7f1d1d40; }
 .sidebar-stats { padding: 8px 16px; border-top: 1px solid rgba(34,211,238,0.16); background: rgba(8,13,22,0.34); font-size: 11px; }
 .sidebar-stats-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+/* "Daemon upgrading…" badge shown next to the version during an auto-upgrade. */
+.daemon-upgrading-badge { display: inline-flex; align-items: center; gap: 4px; color: #fbbf24; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.daemon-upgrading-spinner { display: inline-block; animation: spin 1.1s linear infinite; }
 
 /* Session tabs */
 .tab-bar { display: flex; align-items: stretch; gap: 2px; padding: 4px 8px 0; background: linear-gradient(180deg, #0a1220 0%, #080d16 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 6px 20px rgba(0,0,0,0.28); overflow-x: auto; flex-shrink: 0; scrollbar-width: none; min-height: 42px; position: relative; }

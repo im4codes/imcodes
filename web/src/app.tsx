@@ -251,6 +251,11 @@ type AppUpdateNotice = {
 const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
 const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
 const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
+// Safety ceiling for the "daemon upgrading…" badge: an npm install + restart
+// normally completes in well under a minute, but a slow network / retry storm
+// can drag on. If the daemon never reconnects (failed install), clear the badge
+// after this so it doesn't stick forever. Reconnect/online clears it sooner.
+const DAEMON_UPGRADING_MAX_MS = 5 * 60 * 1_000;
 const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
 
 function readOpenSpecAutoRunbarCompactPreference(): boolean {
@@ -571,6 +576,23 @@ export function App() {
   useEffect(() => {
     if (!selectedServerId) return;
     watchProjectionStore.beginServerSwitch(selectedServerId);
+  }, [selectedServerId]);
+
+  // The "daemon upgrading…" badge is not server-scoped state, so drop it when
+  // the selected server changes (its target belonged to the previous device),
+  // and on unmount, so a stale badge never lingers.
+  useEffect(() => {
+    setDaemonUpgrading(null);
+    if (daemonUpgradingTimerRef.current) {
+      clearTimeout(daemonUpgradingTimerRef.current);
+      daemonUpgradingTimerRef.current = null;
+    }
+    return () => {
+      if (daemonUpgradingTimerRef.current) {
+        clearTimeout(daemonUpgradingTimerRef.current);
+        daemonUpgradingTimerRef.current = null;
+      }
+    };
   }, [selectedServerId]);
 
   useEffect(() => {
@@ -1161,6 +1183,12 @@ export function App() {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [daemonOnline, setDaemonOnline] = useState(false);
+  // Set when the daemon announces it just spawned its upgrade script
+  // (DAEMON_MSG.UPGRADING), so the version badge shows "upgrading…" through the
+  // restart/disconnect instead of a bare offline flash. Cleared on the next
+  // reconnect/online, or by a safety timeout if the upgrade never lands.
+  const [daemonUpgrading, setDaemonUpgrading] = useState<{ targetVersion: string } | null>(null);
+  const daemonUpgradingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Debounce the "Daemon Offline" badge. The server broadcasts
@@ -3391,12 +3419,32 @@ export function App() {
           setServers((prev) => markServerOffline(prev, selectedServerId));
         }, RECONNECT_GRACE_MS);
       }
+      if (msg.type === DAEMON_MSG.UPGRADING) {
+        // Daemon spawned its upgrade script and is about to restart — show an
+        // "upgrading…" badge next to the version through the disconnect instead
+        // of a bare offline flash. Cleared on the next online/reconnect below
+        // (new version), or by the safety timeout if the upgrade never lands.
+        const targetVersion = typeof msg.targetVersion === 'string' ? msg.targetVersion : '';
+        setDaemonUpgrading({ targetVersion });
+        if (daemonUpgradingTimerRef.current) clearTimeout(daemonUpgradingTimerRef.current);
+        daemonUpgradingTimerRef.current = setTimeout(() => {
+          daemonUpgradingTimerRef.current = null;
+          setDaemonUpgrading(null);
+        }, DAEMON_UPGRADING_MAX_MS);
+      }
       if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
         void checkForAppUpdate();
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
         }
+        // The (possibly upgraded) daemon is back — clear the upgrading badge so
+        // the freshly-reported version shows plainly.
+        if (daemonUpgradingTimerRef.current) {
+          clearTimeout(daemonUpgradingTimerRef.current);
+          daemonUpgradingTimerRef.current = null;
+        }
+        setDaemonUpgrading(null);
         setDaemonOnline(true);
         setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
@@ -4734,6 +4782,19 @@ export function App() {
                 <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonVersionForDisplay}`}>
                   Daemon v{formatDaemonVersionShort(daemonVersionForDisplay)}
                 </span>
+                {daemonUpgrading && (
+                  <span
+                    class="daemon-upgrading-badge"
+                    title={daemonUpgrading.targetVersion
+                      ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
+                      : trans('sidebar.daemon_upgrading')}
+                  >
+                    <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
+                    {daemonUpgrading.targetVersion
+                      ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
+                      : trans('sidebar.daemon_upgrading')}
+                  </span>
+                )}
               </div>
             )}
             {daemonStats && (
@@ -5381,6 +5442,19 @@ export function App() {
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
                     {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
                   </span>
+                  {daemonUpgrading && (
+                    <span
+                      class="daemon-upgrading-badge"
+                      title={daemonUpgrading.targetVersion
+                        ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
+                        : trans('sidebar.daemon_upgrading')}
+                    >
+                      <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
+                      {daemonUpgrading.targetVersion
+                        ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
+                        : trans('sidebar.daemon_upgrading')}
+                    </span>
+                  )}
                   <button
                     style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
                     onClick={async () => {

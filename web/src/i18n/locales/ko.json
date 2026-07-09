@@ -1667,6 +1667,8 @@
     "empty": "아직 메시지가 없습니다"
   },
   "sidebar": {
+    "daemon_upgrading": "업그레이드 중…",
+    "daemon_upgrading_to": "v{{version}}로 업그레이드 중…",
     "collapse": "사이드바 접기",
     "expand": "사이드바 펼치기",
     "noSessions": "세션 없음",

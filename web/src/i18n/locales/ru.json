@@ -1667,6 +1667,8 @@
     "empty": "Сообщений пока нет"
   },
   "sidebar": {
+    "daemon_upgrading": "Обновление…",
+    "daemon_upgrading_to": "Обновление до v{{version}}…",
     "collapse": "Свернуть боковую панель",
     "expand": "Развернуть боковую панель",
     "noSessions": "Нет сессий",

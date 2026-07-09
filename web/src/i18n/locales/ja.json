@@ -1667,6 +1667,8 @@
     "empty": "まだメッセージはありません"
   },
   "sidebar": {
+    "daemon_upgrading": "アップグレード中…",
+    "daemon_upgrading_to": "v{{version}} にアップグレード中…",
     "collapse": "サイドバーを折りたたむ",
     "expand": "サイドバーを展開する",
     "noSessions": "セッションがありません",

@@ -1669,6 +1669,8 @@
     "empty": "尚無訊息"
   },
   "sidebar": {
+    "daemon_upgrading": "升級中…",
+    "daemon_upgrading_to": "正在升級到 v{{version}}…",
     "collapse": "收起側邊欄",
     "expand": "展開側邊欄",
     "noSessions": "暫無工作階段",

@@ -1668,6 +1668,8 @@
     "empty": "Sin mensajes aún"
   },
   "sidebar": {
+    "daemon_upgrading": "Actualizando…",
+    "daemon_upgrading_to": "Actualizando a v{{version}}…",
     "collapse": "Contraer barra lateral",
     "expand": "Expandir barra lateral",
     "noSessions": "Sin sesiones",
