@@ -198,4 +198,22 @@ describe('QuickInputPanel — 别名 tab', () => {
       expect(root().textContent).not.toContain('deploy');
     });
   });
+
+  it('editing keeps focus in the field being typed (does not jump back to name)', async () => {
+    store = [{ name: 'deploy', value: 'x', description: '', tags: [], createdAt: '', updatedAt: '', source: 'web' }];
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().textContent).toContain('deploy'));
+    const editBtn = Array.from(root().querySelectorAll('button')).find((b) => b.getAttribute('title') === 'alias.edit');
+    fireEvent.click(editBtn!);
+    // Let the initial "focus name on open" timer fire.
+    await new Promise((r) => setTimeout(r, 80));
+    const valueInput = root().querySelector('textarea[placeholder="alias.value_placeholder"]') as HTMLTextAreaElement;
+    valueInput.focus();
+    fireEvent.input(valueInput, { target: { value: 'edited value' } });
+    // Wait past the (previously buggy) 50ms re-focus timer.
+    await new Promise((r) => setTimeout(r, 80));
+    // Focus must remain on the value field — not stolen back to the name input.
+    expect(document.activeElement).toBe(valueInput);
+  });
 });

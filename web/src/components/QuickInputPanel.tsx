@@ -520,9 +520,17 @@ export function QuickInputPanel({
   useEffect(() => {
     if (editingItem) setTimeout(() => editInputRef.current?.focus(), 50);
   }, [editingItem]);
+  // Focus the name input only when a form is (re)opened — NOT on every keystroke.
+  // `aliasForm` is a fresh object on each field edit, so depending on it re-ran
+  // this effect and stole focus back to `name` while typing value/desc/tags.
+  // Key on the form IDENTITY instead (`original`; `undefined` = no form open),
+  // which is stable across edits within the same form.
+  const aliasFormId = aliasForm ? aliasForm.original : undefined;
   useEffect(() => {
-    if (aliasForm) setTimeout(() => aliasNameInputRef.current?.focus(), 50);
-  }, [aliasForm]);
+    if (aliasFormId === undefined) return;
+    const t = setTimeout(() => aliasNameInputRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, [aliasFormId]);
 
   const panelStyle = useMemo(() => {
     if (!open) return undefined; // skip computation when closed
