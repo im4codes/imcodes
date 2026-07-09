@@ -437,7 +437,23 @@ async function main() {
     // npm-prefix installs (see sharpRepair() doc).  Skip post-install,
     // we'll nest-install sharp ourselves below.
     // --registry pins the same source the daemon's pre-flight probe used.
-    ['install', '-g', '--ignore-scripts', ...(REGISTRY ? ['--registry', REGISTRY] : []), PKG_SPEC],
+    // --fetch-retries / --fetch-timeout: `npm install -g` removes the old
+    // install's files before completing the new one, so a SINGLE transient
+    // network drop (ECONNRESET) mid-download aborts the install and leaves
+    // BOTH the old and new versions broken — imcodes.cmd + node_modules gone —
+    // which permanently bricks the daemon (workers can't spawn, watchdog can't
+    // relaunch the missing shim). Observed on a flaky-network Windows host that
+    // "kept dying after every upgrade". Retrying the network fetches turns a
+    // transient blip into a slow-but-successful upgrade instead of a brick.
+    [
+      'install', '-g', '--ignore-scripts',
+      '--fetch-retries', '4',
+      '--fetch-retry-mintimeout', '10000',
+      '--fetch-retry-maxtimeout', '120000',
+      '--fetch-timeout', '300000',
+      ...(REGISTRY ? ['--registry', REGISTRY] : []),
+      PKG_SPEC,
+    ],
     {
       env, stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
       timeout: NPM_INSTALL_TIMEOUT_MS,
