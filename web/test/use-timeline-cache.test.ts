@@ -1570,6 +1570,41 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('bootstrap self-heals a memory-only IndexedDB on open (no manual force-refresh needed)', async () => {
+    // Regression: on window open the pane showed EMPTY chat and only a manual
+    // ↻ (强制刷新) brought local history back. Root cause: a transient
+    // IndexedDB open failure strands `sharedDb` in memory-only mode; the ↻
+    // path (reloadLocalTimeline) calls resetAndReopen() to recover, but the
+    // bootstrap read did not — so it read empty and painted blank. In jsdom
+    // there is no IndexedDB, so sharedDb is memory-only: the exact degraded
+    // state. The bootstrap must now perform the same resetAndReopen() recovery.
+    const resetSpy = vi.spyOn(TimelineDB.prototype, 'resetAndReopen');
+    try {
+      const sessionName = `deck_membanky_${Date.now()}`;
+      const ws: WsClient = {
+        connected: true,
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest: vi.fn(() => 'h-1'),
+        sendTimelinePageRequest: vi.fn(() => 'p-1'),
+        supportsTimelineProtocolRevision: vi.fn(() => true),
+      } as unknown as WsClient;
+
+      function Probe() {
+        // Cold session: no module cache, no localStorage snapshot → bootstrap
+        // falls through to the IndexedDB read path (path 3).
+        useTimeline(sessionName, ws, 'srv');
+        return h('div', { 'data-testid': 'p' });
+      }
+      render(h(Probe));
+
+      await waitFor(() => {
+        expect(resetSpy).toHaveBeenCalled();
+      });
+    } finally {
+      resetSpy.mockRestore();
+    }
+  });
+
   it('keeps scroll-top older loading enabled after forward history reports hasMore false', async () => {
     const sessionName = `deck_forward_hasmore_false_${Date.now()}`;
     let handler: ((msg: ServerMessage) => void) | null = null;
