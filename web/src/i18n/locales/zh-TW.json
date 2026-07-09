@@ -1305,6 +1305,7 @@
       "terminal_reason": "結束原因",
       "task_stats": "任務狀態",
       "scores": "评分",
+      "score_overview": "評分總覽",
       "final_scores": "最終驗收評分",
       "final_spec_score": "最終 Spec",
       "final_impl_score": "最終實作",

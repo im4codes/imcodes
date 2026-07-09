@@ -1093,6 +1093,20 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(2, 6, 23, 0.28);
   color: #dbeafe;
 }
+.openspec-auto-hero-message span {
+  display: inline;
+  margin-right: 6px;
+  color: #93c5fd;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.openspec-auto-hero-message strong {
+  color: #dbeafe;
+  font-size: 11px;
+  font-weight: 700;
+}
 
 .openspec-auto-detail-grid {
   display: grid;

@@ -1305,6 +1305,7 @@
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
       "scores": "Scores",
+      "score_overview": "Score overview",
       "final_scores": "Final acceptance scores",
       "final_spec_score": "Final Spec",
       "final_impl_score": "Final Impl",

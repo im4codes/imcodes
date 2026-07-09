@@ -1303,6 +1303,7 @@
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
       "scores": "Scores",
+      "score_overview": "점수 개요",
       "final_scores": "Final acceptance scores",
       "final_spec_score": "최종 Spec",
       "final_impl_score": "최종 구현",

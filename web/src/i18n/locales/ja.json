@@ -1303,6 +1303,7 @@
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
       "scores": "Scores",
+      "score_overview": "スコア概要",
       "final_scores": "Final acceptance scores",
       "final_spec_score": "最終 Spec",
       "final_impl_score": "最終実装",

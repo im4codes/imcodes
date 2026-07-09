@@ -917,7 +917,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
         <div class="openspec-auto-hero" data-testid="openspec-auto-hero">
           <div class="openspec-auto-hero-top">
             <div>
-              <span>{t('openspec.auto.final_scores')}</span>
+              <span>{t('openspec.auto.score_overview', { defaultValue: 'Score overview' })}</span>
               <strong>{t(statusKey(status), status)} · {t(stageKey(stage), stage)}</strong>
             </div>
             <div class="openspec-auto-hero-chips">
@@ -953,7 +953,12 @@ export function OpenSpecAutoDeliverDetailsPanel({
               />
             </div>
           )}
-          {latestMessage && <div class="openspec-auto-hero-message">{latestMessage}</div>}
+          {latestMessage && (
+            <div class="openspec-auto-hero-message">
+              <span>{t('openspec.auto.latest_message')}</span>
+              <strong>{latestMessage}</strong>
+            </div>
+          )}
         </div>
         <div class="openspec-auto-detail-grid">
           <DetailRow label={t('openspec.auto.preset_label')} value={projection.presetId} />
@@ -967,7 +972,6 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId ? comboModeLabel(projection.selectedTeamComboId, t) : undefined} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
-          <DetailRow label={t('openspec.auto.latest_message')} value={latestMessage} />
           {projection.visibility === 'conflict' && (
             <DetailRow label={t('openspec.auto.conflict_summary')} value={translateAutoDeliverReason(projection.conflictReason, t)} />
           )}

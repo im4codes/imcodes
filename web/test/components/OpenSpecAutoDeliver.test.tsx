@@ -37,6 +37,7 @@ vi.mock('react-i18next', () => ({
         'openspec.auto.audit_results': 'Audit results',
         'openspec.auto.audit_results_empty': 'No audit rounds',
         'openspec.auto.scores': 'Scores',
+        'openspec.auto.score_overview': 'Score overview',
         'openspec.auto.final_scores': 'Final acceptance scores',
         'openspec.auto.final_spec_score': 'Final Spec',
         'openspec.auto.final_impl_score': 'Final Impl',
