@@ -115,6 +115,29 @@ describe('TimelineEmitter — seq counter', () => {
     expect(events[0]?.payload.text).toBe('final');
     expect(events[0]?.payload.streaming).toBe(false);
   });
+
+  it('anchors a stable-eventId event to its first-seen ts so a late terminal update keeps timeline order', () => {
+    // Streaming assistant text starts at ts=100.
+    const first = emitter.emit('session-anchor', 'assistant.text', { text: 'partial', streaming: true }, { eventId: 'transport:session-anchor:msg-1', ts: 100 });
+    expect(first.ts).toBe(100);
+    // User presses Stop and immediately sends a new message that lands at ts=150.
+    emitter.emit('session-anchor', 'user.message', { text: 'next question' }, { ts: 150 });
+    // The stop-settle "⚠️ Turn cancelled" only arrives (delayed) at ts=200. It
+    // reuses the assistant eventId and MUST NOT be stamped 200 — otherwise it
+    // sorts after the ts=150 user message and their order flips in the UI.
+    const cancelled = emitter.emit('session-anchor', 'assistant.text', { text: 'partial\n\n⚠️ Turn cancelled', streaming: false }, { eventId: 'transport:session-anchor:msg-1', ts: 200 });
+    expect(cancelled.ts).toBe(100); // anchored to first-seen, NOT bumped to 200
+
+    // Display order is by ts (then seq): the cancelled assistant (100) sorts
+    // BEFORE the user message (150), matching what the user expects.
+    const { events } = emitter.replay('session-anchor', 0);
+    const byTs = [...events].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
+    const assistantIdx = byTs.findIndex((e) => e.type === 'assistant.text');
+    const userIdx = byTs.findIndex((e) => e.type === 'user.message');
+    expect(assistantIdx).toBeLessThan(userIdx);
+    expect(byTs[assistantIdx]?.ts).toBe(100);
+    expect(String(byTs[assistantIdx]?.payload.text)).toContain('Turn cancelled');
+  });
 });
 
 describe('TimelineEmitter — ring buffer', () => {
