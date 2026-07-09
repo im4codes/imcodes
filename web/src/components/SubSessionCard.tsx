@@ -20,6 +20,7 @@ import { SessionControls } from './SessionControls.js';
 import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
@@ -174,19 +175,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
 
-  // Shell/script cards render a live xterm preview. Keep them in raw mode only
-  // while the card is mounted; cleanup releases the stream entirely because
-  // shell/script sessions have no passive terminal history to replay.
-  useEffect(() => {
-    if (!isShell || !ws || !connected) return;
-    if (typeof ws.holdTerminalRaw === 'function') {
-      return ws.holdTerminalRaw(sub.sessionName);
-    }
-    try { ws.subscribeTerminal(sub.sessionName, true); } catch { /* ignore */ }
-    return () => {
-      try { ws.unsubscribeTerminal(sub.sessionName); } catch { /* ignore */ }
-    };
-  }, [connected, isShell, sub.sessionName, ws]);
+  // Shell/script cards render a live xterm preview. Keep the raw stream held for
+  // the card's lifetime (focus-independent) — see useTerminalRawHold. Shell has
+  // no passive terminal history, so the hold is the only thing keeping it live.
+  useTerminalRawHold(ws, connected, isShell, sub.sessionName);
 
   // ── Retry failed send ─────────────────────────────────────────────────────
   // Same contract as SessionPane / SubSessionWindow. Shell/script sub-sessions

@@ -17,6 +17,7 @@ import { extractLatestUsage } from '../usage-data.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 import { SharedContextManagementPanel } from './SharedContextManagementPanel.js';
@@ -46,6 +47,13 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   });
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
+  // A pinned shell/script panel exists precisely to observe live output, but it
+  // issues no terminal subscription of its own. Hold the raw PTY stream for the
+  // panel's lifetime (focus-independent) so it keeps updating. Must run before
+  // the `!liveSub` early return below to keep hook order stable.
+  const isShell = liveSub?.type === 'shell' || liveSub?.type === 'script';
+  useTerminalRawHold(ctx.ws, ctx.connected, isShell, sessionName);
+
   // Derive usage/thinking state from timeline events (same as SubSessionWindow)
   const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
@@ -73,7 +81,6 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
     return <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>;
   }
 
-  const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
   const modelDisplay = resolveEffectiveSessionModel(liveSub);
   const compactQuotaText = liveSub.type === 'codex' || liveSub.type === 'codex-sdk'
