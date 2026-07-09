@@ -9,6 +9,7 @@ import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
+import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
 
@@ -574,8 +575,10 @@ authRoutes.delete('/user/me', async (c) => {
   await db.execute('DELETE FROM push_tokens WHERE user_id = $1', [userId]);
   // 6. Push subscriptions
   await db.execute('DELETE FROM push_subscriptions WHERE user_id = $1', [userId]);
+  // 7. Server-side usage analytics facts
+  await deleteTokenUsageFactsForUser(db, userId);
 
-  // 7. Get server IDs for cascade deleting server-scoped data
+  // 8. Get server IDs for cascade deleting server-scoped data
   const serverRows = await db.query<{ id: string }>('SELECT id FROM servers WHERE user_id = $1', [userId]);
   const serverIds = serverRows.map((r) => r.id);
 
@@ -595,13 +598,13 @@ authRoutes.delete('/user/me', async (c) => {
     }
   }
 
-  // 8. Platform bots
+  // 9. Platform bots
   await db.execute('DELETE FROM platform_bots WHERE user_id = $1', [userId]);
-  // 9. Servers
+  // 10. Servers
   await db.execute('DELETE FROM servers WHERE user_id = $1', [userId]);
-  // 10. Pending binds
+  // 11. Pending binds
   await db.execute('DELETE FROM pending_binds WHERE user_id = $1', [userId]);
-  // 11. Platform identities
+  // 12. Platform identities
   await db.execute('DELETE FROM platform_identities WHERE user_id = $1', [userId]);
   // 12. User preferences
   await db.execute('DELETE FROM user_preferences WHERE user_id = $1', [userId]);

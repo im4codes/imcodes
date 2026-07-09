@@ -17,10 +17,15 @@ function counterKey(name: string, labels?: MetricLabels): string {
 }
 
 export function incrementCounter(name: string, labels?: MetricLabels): void {
+  addCounter(name, 1, labels);
+}
+
+export function addCounter(name: string, amount: number, labels?: MetricLabels): void {
   if (!name) return;
+  if (!Number.isFinite(amount) || amount <= 0) return;
   const key = counterKey(name, labels);
   if (!counters.has(key) && counters.size >= MAX_COUNTERS) return;
-  counters.set(key, (counters.get(key) ?? 0) + 1);
+  counters.set(key, (counters.get(key) ?? 0) + amount);
 }
 
 export function getCounter(name: string, labels?: MetricLabels): number {

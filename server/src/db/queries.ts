@@ -6,6 +6,7 @@ import type {
   ShareTarget,
 } from '../../../shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
+import { deleteTokenUsageFactsForServer } from './token-usage-queries.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -489,6 +490,7 @@ export async function updateServerToken(db: Database, id: string, userId: string
 }
 
 export async function deleteServer(db: Database, id: string, userId: string): Promise<boolean> {
+  await deleteTokenUsageFactsForServer(db, id);
   await db.execute('DELETE FROM channel_bindings WHERE server_id = $1', [id]);
   await db.execute('DELETE FROM sessions WHERE server_id = $1', [id]);
   const result = await db.execute('DELETE FROM servers WHERE id = $1 AND user_id = $2', [id, userId]);

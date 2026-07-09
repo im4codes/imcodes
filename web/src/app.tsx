@@ -189,6 +189,7 @@ import {
 
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
+const UsageSummaryPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/UsageSummaryPage.js')).then((m) => ({ default: m.UsageSummaryPage })));
 
 function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffix: string): void {
   const parts: string[] = [];
@@ -1580,6 +1581,7 @@ export function App() {
 
   // ── Settings / Admin ────────────────────────────────────────────────────────
   const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const [showUsageSummaryPage, setShowUsageSummaryPage] = useState(false);
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
@@ -4843,7 +4845,7 @@ export function App() {
         ) : !selectedServerId ? (
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
-              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onServersLoaded={setServers} />
+              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onOpenUsageSummary={() => setShowUsageSummaryPage(true)} onServersLoaded={setServers} />
             </Suspense>
           </div>
         ) : (
@@ -5622,6 +5624,14 @@ export function App() {
               setUserHasPassword(next.hasPassword);
             }}
           />
+        </div>
+      )}
+
+      {showUsageSummaryPage && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>{trans('common.loading')}</div>}>
+            <UsageSummaryPage onBack={() => setShowUsageSummaryPage(false)} />
+          </Suspense>
         </div>
       )}
 

@@ -436,6 +436,9 @@ describe('transport-relay (timeline-emitter based)', () => {
         cacheTokens: 5,
         model: 'qwen3-coder-plus',
       });
+      expect(usageCall![3]).toMatchObject({
+        eventId: 'transport:sess-1:msg-usage:usage',
+      });
     });
 
     it('emits Codex SDK current-window context usage instead of cumulative billing usage', () => {
@@ -473,7 +476,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(Number(usageCall![2].inputTokens) + Number(usageCall![2].cacheTokens)).toBe(12_000);
     });
 
-    it('emits provider usage updates even when they arrive outside message completion', () => {
+    it('emits provider usage updates as streaming-only events outside message completion', () => {
       const { provider, fireUsage } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -495,6 +498,10 @@ describe('transport-relay (timeline-emitter based)', () => {
         model: 'gpt-5.5',
         contextWindow: 258_400,
         contextWindowSource: 'provider',
+        streaming: true,
+      });
+      expect(usageCall![3]).toMatchObject({
+        eventId: 'transport:sess-1:usage:usage',
       });
     });
 
@@ -664,6 +671,32 @@ describe('transport-relay (timeline-emitter based)', () => {
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall![3].eventId).toBe(deltaEventId);
       expect(textCall![3].eventId).toBe('transport:sess-1:msg-4');
+    });
+
+    it('uses the assistant final event id as the final usage id base after partial usage updates', () => {
+      const { provider, fireDelta, fireUsage, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-final-usage', delta: 'hi' }));
+      fireUsage('sess-1', {
+        model: 'gpt-5.5',
+        usage: { input_tokens: 10, output_tokens: 1 },
+      });
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-final-usage',
+        metadata: {
+          model: 'gpt-5.5',
+          usage: { input_tokens: 10, output_tokens: 2 },
+        },
+      }));
+
+      const usageCalls = emitMock.mock.calls.filter(c => c[1] === 'usage.update');
+      expect(usageCalls).toHaveLength(2);
+      expect(usageCalls[0][2]).toMatchObject({ streaming: true, outputTokens: 1 });
+      expect(usageCalls[0][3]).toMatchObject({ eventId: 'transport:sess-1:msg-final-usage:usage' });
+      expect(usageCalls[1][2]).toMatchObject({ outputTokens: 2 });
+      expect(usageCalls[1][2].streaming).toBeUndefined();
+      expect(usageCalls[1][3]).toMatchObject({ eventId: 'transport:sess-1:msg-final-usage:usage' });
     });
 
     it('emits final completion immediately even when a throttled delta is pending', () => {

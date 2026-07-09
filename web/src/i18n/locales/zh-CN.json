@@ -58,6 +58,46 @@
     "hide": "隐藏",
     "this_feature": "此功能"
   },
+  "usageSummary": {
+    "title": "Usage",
+    "back": "Back",
+    "from": "From",
+    "to": "To",
+    "server": "Server",
+    "provider": "Provider",
+    "model": "Model",
+    "session": "Session",
+    "kind": "Kind",
+    "anyKind": "Any",
+    "mainSession": "Main session",
+    "subSession": "Sub-session",
+    "parent": "Parent",
+    "order": "Order",
+    "desc": "High to low",
+    "asc": "Low to high",
+    "apply": "Apply",
+    "clear": "Clear",
+    "error": "Usage data could not be loaded.",
+    "empty": "No usage for these filters.",
+    "noRows": "No rows",
+    "totalTokens": "Total tokens",
+    "facts": "Facts",
+    "cost": "Cost",
+    "byDate": "By date",
+    "byServer": "By server",
+    "byProviderModel": "By provider and model",
+    "byMainSession": "Main sessions",
+    "bySubSession": "Sub-sessions",
+    "byParentSession": "Parent sessions",
+    "bySessionModelDate": "Session, model, and date",
+    "unknown": "Unknown",
+    "partialMetadata": "Partial metadata",
+    "costCompleteness": {
+      "known": "Known cost",
+      "unknown": "Unknown cost",
+      "partial": "Partial cost"
+    }
+  },
   "share": {
     "menu": {
       "shareTab": "共享"

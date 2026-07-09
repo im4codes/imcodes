@@ -40,6 +40,7 @@ import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
+import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
@@ -174,6 +175,7 @@ export function buildApp(env: Env) {
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
   app.route('/api', tabSharingRoutes);
+  app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
   // string by the ingress for pod routing; the projection-owner resolver
   // ignores serverId entirely (cloud-only PG lookup).
