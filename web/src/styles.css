@@ -1668,8 +1668,13 @@ html.native-ios-mac .chat-dl-btn {
   .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 10001; }
   /* Float the panel as a card that clears the home-indicator / bottom edge:
      lift the bottom by the safe-area inset + margin ("底部留点余量") and add
-     small side margins so it no longer sits flush against the screen bottom. */
-  .qp { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 12px); left: 8px; right: 8px; width: auto; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 88px)); border-radius: 14px; }
+     small side margins so it no longer sits flush against the screen bottom.
+     --kbh (soft-keyboard height, set in app.tsx) lifts the bottom ABOVE the
+     on-screen keyboard so the alias name/value inputs aren't covered while
+     editing on mobile; it's 0 when the keyboard is closed (behaviour preserved).
+     max-height stays keyed off --vvh (the visual-viewport height, which already
+     excludes the keyboard) so the taller-anchored card still fits above it. */
+  .qp { position: fixed; bottom: calc(var(--kbh, 0px) + env(safe-area-inset-bottom, 0px) + 12px); left: 8px; right: 8px; width: auto; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 88px)); border-radius: 14px; }
 }
 
 /* Login */

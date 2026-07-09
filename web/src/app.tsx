@@ -638,6 +638,7 @@ export function App() {
   useEffect(() => {
     if (shouldUseIosMacTextScale()) {
       document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.style.removeProperty('--kbh');
       document.documentElement.classList.remove('kb-open', 'input-focused');
       return;
     }
@@ -651,6 +652,16 @@ export function App() {
       // Detect keyboard open: viewport shrink + optional input-focus fallback.
       // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
       const shrink = window.innerHeight - vv.height;
+      // Expose the soft-keyboard height so position:fixed overlays anchored to the
+      // LAYOUT viewport (e.g. the QuickInputPanel alias editor, `.qp`) can lift
+      // their bottom ABOVE the keyboard. The main composer stays visible because
+      // `.layout` shrinks via --vvh, but a fixed panel is NOT inside that shrunk
+      // box, so without --kbh its lower half — and the focused alias input — sits
+      // behind the keyboard. Subtract offsetTop for the iOS case where the visual
+      // viewport is pushed down rather than purely shortened.
+      document.documentElement.style.setProperty(
+        '--kbh', `${Math.max(0, shrink - (vv.offsetTop || 0))}px`,
+      );
       const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
       hadKeyboardOpen = state.hadKeyboardOpen;
       const { kbOpen, hideInputUi } = state;
