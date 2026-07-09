@@ -744,6 +744,8 @@ export function QuickInputPanel({
             <button class="qp-add-confirm" title={t('alias.add')} onClick={openAliasCreate}>＋</button>
           </div>
 
+          <div class="qp-alias-hint">{t('alias.usage_hint')}</div>
+
           {aliasForm && (
             <div class="qp-alias-form">
               <input

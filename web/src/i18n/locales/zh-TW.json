@@ -16,6 +16,7 @@
     "insert": "插入",
     "empty": "尚無別名",
     "empty_hint": "新增別名後，可用 ;;(名稱) 標記快速插入其內容。",
+    "usage_hint": "點別名把 ;;(名稱) 標記插入輸入框——傳送給 agent 時會展開為內容，訊息仍保留標記。提示：輸入框輸入 ; 可快速補全。",
     "no_results": "沒有符合的別名",
     "search_placeholder": "搜尋別名",
     "name_placeholder": "例如 deploy",

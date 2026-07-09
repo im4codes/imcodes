@@ -16,6 +16,7 @@
     "insert": "Insert",
     "empty": "No aliases yet",
     "empty_hint": "Add an alias to quickly insert its value with a ;;(name) marker.",
+    "usage_hint": "Tap an alias to insert its ;;(name) marker — it expands to the value when sent to the agent, while the message keeps the marker. Tip: type ; in the composer to autocomplete.",
     "no_results": "No aliases match your search",
     "search_placeholder": "Search aliases",
     "name_placeholder": "e.g. deploy",

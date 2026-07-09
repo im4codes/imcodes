@@ -1603,6 +1603,7 @@ html.native-ios-mac .chat-dl-btn {
 .qp-add-cancel { padding: 4px 6px; background: none; border: none; color: #64748b; font-size: 13px; cursor: pointer; }
 .qp-add-cancel:hover { color: #f87171; }
 /* Alias tab editor */
+.qp-alias-hint { font-size: 11px; line-height: 1.45; color: #64748b; padding: 5px 10px 8px; border-bottom: 1px solid #1e293b; flex-shrink: 0; }
 .qp-alias-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .qp-alias-value { resize: vertical; min-height: 48px; line-height: 1.4; }
 .qp-alias-error { color: #f87171; font-size: 11px; line-height: 1.35; }

@@ -16,6 +16,7 @@
     "insert": "插入",
     "empty": "暂无别名",
     "empty_hint": "添加别名后，可用 ;;(名称) 标记快速插入其内容。",
+    "usage_hint": "点别名把 ;;(名称) 标记插入输入框——发送给 agent 时会展开为内容，消息里仍保留标记。提示：输入框输入 ; 可快捷补全。",
     "no_results": "没有匹配的别名",
     "search_placeholder": "搜索别名",
     "name_placeholder": "例如 deploy",

@@ -167,6 +167,12 @@ describe('SessionControls — inline ; autocomplete', () => {
     expect(container.querySelector('.controls-alias-picker')).toBeNull();
   });
 
+  it('opens on a bare ; at a word boundary (before any name char is typed)', async () => {
+    const { container, editor } = renderControls();
+    typeInto(editor, ';');
+    await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
+  });
+
   it('is suppressed during IME composition (compositionstart active)', async () => {
     const { container, editor } = renderControls();
     // The composer attaches composition listeners via addEventListener, so
@@ -180,6 +186,22 @@ describe('SessionControls — inline ; autocomplete', () => {
     // After composition ends, a fresh input opens it.
     editor.dispatchEvent(new Event('compositionend', { bubbles: true }));
     typeInto(editor, ';dep');
+    await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
+  });
+
+  it('re-evaluates the ; trigger after IME compositionend so a CJK query registers', async () => {
+    const { container, editor } = renderControls();
+    // CJK IME: the composed text is committed while isComposing is still true
+    // (input suppressed), then compositionend fires with no further input. The
+    // compositionend handler must re-evaluate so `;服务` registers (previously
+    // it only worked after a plain edit like deleting a char).
+    editor.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+    typeInto(editor, ';服务');
+    await new Promise((r) => setTimeout(r, 20));
+    // Suppressed during composition — not open yet.
+    expect(container.querySelector('.controls-alias-picker')).toBeNull();
+    // compositionend alone (no further typing) must open + evaluate the picker.
+    editor.dispatchEvent(new Event('compositionend', { bubbles: true }));
     await waitFor(() => expect(container.querySelector('.controls-alias-picker')).toBeTruthy());
   });
 
@@ -223,14 +245,17 @@ describe('SessionControls — inline ; autocomplete', () => {
 });
 
 describe('matchInlineAliasTrigger (unit)', () => {
-  it('matches a word-boundary ; + name chars', () => {
+  it('matches a word-boundary ; + optional name chars (bare ; too)', () => {
     expect(matchInlineAliasTrigger(';dep')).toBe('dep');
     expect(matchInlineAliasTrigger('hi ;deploy')).toBe('deploy');
     expect(matchInlineAliasTrigger('win服务器'.replace(/.*/, ';win服务器'))).toBe('win服务器');
+    // A bare ; at a word boundary opens the picker with an empty query (all aliases).
+    expect(matchInlineAliasTrigger(';')).toBe('');
+    expect(matchInlineAliasTrigger('hello ;')).toBe('');
   });
-  it('does not match without a boundary, a bare ;, or a marker prefix', () => {
+  it('does not match without a boundary or on a marker prefix', () => {
     expect(matchInlineAliasTrigger('abc;dep')).toBeNull(); // glued to a word
-    expect(matchInlineAliasTrigger('hello ;')).toBeNull(); // no name char yet
+    expect(matchInlineAliasTrigger('abc;')).toBeNull();    // bare ; glued to a word (no boundary)
     expect(matchInlineAliasTrigger('a ;;x')).toBeNull();   // ;; marker prefix
     expect(matchInlineAliasTrigger(';bad:name')).toBeNull(); // ':' not a name char at tail
   });

@@ -427,14 +427,15 @@ function setComposerElementText(root: HTMLElement, text: string): void {
 
 /**
  * Inline `;` alias-autocomplete trigger. Matches a single `;` that sits at a
- * word boundary (start of text or after whitespace) and is immediately
- * followed by at least one valid alias-name character, capturing the typed
- * query at the end of the composer text. The single-char class mirrors
- * `ALIAS_NAME_PATTERN` (`\p{L}\p{N}._-`). A double `;;` (a marker prefix) is
- * excluded so re-editing an inserted `;;(name)` marker does not re-open the
- * picker. Returns the query (may be non-empty) or `null` when not triggered.
+ * word boundary (start of text or after whitespace) and is followed by ZERO or
+ * more valid alias-name characters, capturing the typed query at the end of the
+ * composer text. Zero chars means a bare `;` (at a word boundary) opens the
+ * picker with the full alias list; each further char filters it. The char class
+ * mirrors `ALIAS_NAME_PATTERN` (`\p{L}\p{N}._-`). A double `;;` (a marker
+ * prefix) is excluded so re-editing an inserted `;;(name)` marker does not
+ * re-open the picker. Returns the query (possibly empty) or `null` if not triggered.
  */
-const ALIAS_INLINE_TRIGGER_RE = /(?:^|\s);([\p{L}\p{N}._-]{1,20})$/u;
+const ALIAS_INLINE_TRIGGER_RE = /(?:^|\s);([\p{L}\p{N}._-]{0,20})$/u;
 export function matchInlineAliasTrigger(text: string): string | null {
   const m = ALIAS_INLINE_TRIGGER_RE.exec(text);
   if (!m) return null;
@@ -1192,6 +1193,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const handleCompositionEnd = () => {
       imeComposingRef.current = false;
       markImeActivity();
+      // Re-run onInput now that composition committed. On many mobile IMEs the
+      // input event carrying the composed text fires WHILE isComposing is still
+      // true (so the inline `;` alias + `@` triggers were suppressed) and no
+      // input fires after compositionend — so a CJK query like `;服务` never
+      // registers (while a plain edit like deleting a char does). Dispatching a
+      // synthetic input re-evaluates the final committed text. Same pattern the
+      // pending-prefill effect uses.
+      el.dispatchEvent(new Event('input', { bubbles: true }));
     };
     el.addEventListener('compositionstart', handleCompositionStart);
     el.addEventListener('compositionupdate', markImeActivity);

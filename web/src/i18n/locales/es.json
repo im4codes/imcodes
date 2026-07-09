@@ -16,6 +16,7 @@
     "insert": "Insertar",
     "empty": "Aún no hay alias",
     "empty_hint": "Añade un alias para insertar su valor rápidamente con un marcador ;;(nombre).",
+    "usage_hint": "Toca un alias para insertar su marcador ;;(nombre): se expande al valor al enviarlo al agente, y el mensaje conserva el marcador. Consejo: escribe ; en el editor para autocompletar.",
     "no_results": "Ningún alias coincide con tu búsqueda",
     "search_placeholder": "Buscar alias",
     "name_placeholder": "p. ej. deploy",
