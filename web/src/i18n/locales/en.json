@@ -22,6 +22,7 @@
     "name_placeholder": "e.g. deploy",
     "value_placeholder": "The text this alias expands to",
     "description_placeholder": "Optional note (search only)",
+    "tags_placeholder": "Tags (space-separated, optional)",
     "error": {
       "invalid_alias_name": "Invalid alias name. Use letters, numbers, dot, underscore, or hyphen (max 20 characters).",
       "alias_value_invalid": "Invalid value. It must not be empty and can be at most 500 characters.",

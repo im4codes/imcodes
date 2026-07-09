@@ -22,6 +22,7 @@
     "name_placeholder": "p. ej. deploy",
     "value_placeholder": "El texto al que se expande este alias",
     "description_placeholder": "Nota opcional (solo para búsqueda)",
+    "tags_placeholder": "Etiquetas (separadas por espacios, opcional)",
     "error": {
       "invalid_alias_name": "Nombre de alias no válido. Usa letras, números, punto, guion bajo o guion (máx. 20 caracteres).",
       "alias_value_invalid": "Valor no válido. No puede estar vacío y admite como máximo 500 caracteres.",

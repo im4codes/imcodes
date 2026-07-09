@@ -22,6 +22,7 @@
     "name_placeholder": "例: deploy",
     "value_placeholder": "このエイリアスが展開されるテキスト",
     "description_placeholder": "任意のメモ（検索用のみ）",
+    "tags_placeholder": "タグ（スペース区切り、任意）",
     "error": {
       "invalid_alias_name": "エイリアス名が無効です。英字・数字・ピリオド・アンダースコア・ハイフンを使用してください（最大 20 文字）。",
       "alias_value_invalid": "内容が無効です。空にはできず、最大 500 文字です。",

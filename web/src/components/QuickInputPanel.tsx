@@ -470,7 +470,7 @@ export function QuickInputPanel({
   // `tags` is carried through the form (not yet user-editable) so that editing
   // an existing alias PRESERVES its tags instead of the upsert clearing them,
   // and so any tags we send are validated with the shared validator (Cx1-6).
-  const [aliasForm, setAliasForm] = useState<{ original: string | null; name: string; value: string; description: string; tags: string[] } | null>(null);
+  const [aliasForm, setAliasForm] = useState<{ original: string | null; name: string; value: string; description: string; tags: string } | null>(null);
   const [aliasError, setAliasError] = useState<AliasReason | 'generic' | null>(null);
   const [aliasSaving, setAliasSaving] = useState(false);
   const aliasNameInputRef = useRef<HTMLInputElement>(null);
@@ -626,13 +626,13 @@ export function QuickInputPanel({
   // ── Alias tab handlers ──
   const openAliasCreate = () => {
     setAliasError(null);
-    setAliasForm({ original: null, name: '', value: '', description: '', tags: [] });
+    setAliasForm({ original: null, name: '', value: '', description: '', tags: '' });
   };
   const openAliasEdit = (name: string) => {
     const entry = allAliases.find((a) => a.name === name);
     if (!entry) return;
     setAliasError(null);
-    setAliasForm({ original: entry.name, name: entry.name, value: entry.value, description: entry.description ?? '', tags: entry.tags ?? [] });
+    setAliasForm({ original: entry.name, name: entry.name, value: entry.value, description: entry.description ?? '', tags: (entry.tags ?? []).join(' ') });
   };
   const closeAliasForm = () => {
     setAliasForm(null);
@@ -645,7 +645,10 @@ export function QuickInputPanel({
     const name = aliasForm.name.trim();
     const value = aliasForm.value;
     const description = aliasForm.description.trim();
-    const tags = aliasForm.tags;
+    // Tags are entered as a free-text, space-separated string; split into the
+    // wire array (whitespace-collapsed, empties dropped). The server + shared
+    // validateAliasTags remain authoritative on count/length/control chars.
+    const tags = aliasForm.tags.trim().split(/\s+/).filter(Boolean);
     // Client-side validation with the shared validators gives instant, localized
     // feedback via the same reason codes the server enforces (server remains
     // authoritative — its AliasApiError reason overrides on any mismatch).
@@ -655,9 +658,8 @@ export function QuickInputPanel({
     if (valueErr) { setAliasError(valueErr); return; }
     const descErr = validateAliasDescription(description || undefined);
     if (descErr) { setAliasError(descErr); return; }
-    // Validate any tags we are about to send (Cx1-6). Tags are not yet
-    // user-editable in this form, but an edited alias carries its existing tags
-    // through, and the server rejects invalid ones — surface `alias_tags_invalid`.
+    // Validate the space-separated tags before sending (Cx1-6); the server is
+    // authoritative and also rejects invalid ones — surface `alias_tags_invalid`.
     const tagsErr = validateAliasTags(tags.length > 0 ? tags : undefined);
     if (tagsErr) { setAliasError(tagsErr); return; }
 
@@ -768,6 +770,12 @@ export function QuickInputPanel({
                 onInput={(e) => setAliasForm((f) => f ? { ...f, description: (e.target as HTMLInputElement).value } : f)}
                 placeholder={t('alias.description_placeholder')}
               />
+              <input
+                class="qp-add-input"
+                value={aliasForm.tags}
+                onInput={(e) => setAliasForm((f) => f ? { ...f, tags: (e.target as HTMLInputElement).value } : f)}
+                placeholder={t('alias.tags_placeholder')}
+              />
               {aliasErrorText && <div class="qp-alias-error" role="alert">{aliasErrorText}</div>}
               <div class="qp-alias-form-actions">
                 <button class="qp-toolbar-btn" disabled={aliasSaving} onClick={() => { void commitAlias(); }}>{t('alias.save')}</button>
@@ -782,10 +790,21 @@ export function QuickInputPanel({
                 {aliasSearch ? t('alias.no_results') : t('alias.empty')}
               </div>
             ) : (
-              <div class="qp-pills">
+              <div class="qp-alias-items">
                 {filteredAliases.map((a) => (
-                  <span key={a.name} class="qp-pill qp-pill-custom" title={a.description || a.name}>
+                  <span key={a.name} class="qp-pill qp-pill-custom qp-alias-item" title={a.description || a.name}>
                     <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
+                    {/* Desktop list view: truncated value + description + tags.
+                        Hidden on mobile (CSS), where the row collapses to a pill. */}
+                    <span class="qp-alias-item-meta">
+                      <span class="qp-alias-item-value">{a.value}</span>
+                      {a.description ? <span class="qp-alias-item-desc">{a.description}</span> : null}
+                      {a.tags && a.tags.length > 0 ? (
+                        <span class="qp-alias-item-tags">
+                          {a.tags.map((tg) => <span key={tg} class="qp-alias-tag">{tg}</span>)}
+                        </span>
+                      ) : null}
+                    </span>
                     <button class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
                     <button class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
                   </span>

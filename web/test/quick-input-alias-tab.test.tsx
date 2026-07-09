@@ -80,13 +80,31 @@ function aliasTabButton(): HTMLButtonElement {
 afterEach(() => { cleanup(); vi.clearAllMocks(); __resetAliasesForTests(); store = []; });
 
 describe('QuickInputPanel — 别名 tab', () => {
-  it('renders an alias tab and lists existing aliases', async () => {
-    store = [{ name: 'deploy', value: 'ssh root@host', description: 'ship', tags: [], createdAt: '', updatedAt: '', source: 'web' }];
+  it('renders an alias tab and lists aliases with value + desc + tags (desktop list)', async () => {
+    store = [{ name: 'deploy', value: 'ssh root@host', description: 'ship', tags: ['ops', 'prod'], createdAt: '', updatedAt: '', source: 'web' }];
     render(<QuickInputPanel {...baseProps()} />);
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().textContent).toContain('deploy'));
-    // Value must never render in the panel list.
-    expect(root().textContent).not.toContain('ssh root@host');
+    // The user's OWN management list shows the (truncated) value + description +
+    // tags. This is the user's own surface — the MCP list_aliases tool stays
+    // metadata-only for agents, but the web owner can see their own value.
+    expect(root().textContent).toContain('ssh root@host');
+    expect(root().textContent).toContain('ship');
+    expect(root().textContent).toContain('ops');
+    expect(root().textContent).toContain('prod');
+  });
+
+  it('creates an alias with space-separated tags (whitespace collapsed)', async () => {
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().textContent).toContain('alias.empty'));
+    const addBtn = Array.from(root().querySelectorAll('button')).find((b) => b.getAttribute('title') === 'alias.add');
+    fireEvent.click(addBtn!);
+    fireEvent.input(root().querySelector('input[placeholder="alias.name_placeholder"]') as HTMLInputElement, { target: { value: 'box' } });
+    fireEvent.input(root().querySelector('textarea[placeholder="alias.value_placeholder"]') as HTMLTextAreaElement, { target: { value: 'v' } });
+    fireEvent.input(root().querySelector('input[placeholder="alias.tags_placeholder"]') as HTMLInputElement, { target: { value: '  server   ssh  ' } });
+    fireEvent.click(Array.from(root().querySelectorAll('button')).find((b) => b.textContent === 'alias.save')!);
+    await waitFor(() => expect(upsertAlias).toHaveBeenCalledWith(expect.objectContaining({ name: 'box', tags: ['server', 'ssh'] })));
   });
 
   it('refetches the server each time the alias tab is opened (picks up externally-created aliases)', async () => {

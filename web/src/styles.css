@@ -1608,6 +1608,24 @@ html.native-ios-mac .chat-dl-btn {
 .qp-alias-value { resize: vertical; min-height: 48px; line-height: 1.4; }
 .qp-alias-error { color: #f87171; font-size: 11px; line-height: 1.35; }
 .qp-alias-form-actions { display: flex; gap: 6px; }
+/* Alias list: a detail LIST on desktop (name + truncated value + desc + tags),
+   collapsing to compact name-only pills on mobile. */
+.qp-alias-items { display: flex; }
+@media (min-width: 641px) {
+  .qp-alias-items { flex-direction: column; gap: 2px; padding: 4px 6px 8px; }
+  .qp-alias-item { width: 100%; box-sizing: border-box; background: none; border: none; border-radius: 6px; padding: 4px 8px; gap: 8px; align-items: center; }
+  .qp-alias-item:hover { background: rgba(148,163,184,0.08); }
+  .qp-alias-item .qp-pill-text { flex: 0 0 auto; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qp-alias-item-meta { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 10px; overflow: hidden; }
+  .qp-alias-item-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #93c5fd; }
+  .qp-alias-item-desc { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #64748b; }
+  .qp-alias-item-tags { flex: 0 0 auto; display: inline-flex; gap: 3px; align-self: center; }
+  .qp-alias-tag { font-size: 9px; line-height: 1.7; color: #67e8f9; background: rgba(34,211,238,0.12); border-radius: 4px; padding: 0 5px; }
+}
+@media (max-width: 640px) {
+  .qp-alias-items { flex-direction: row; flex-wrap: wrap; gap: 5px; padding: 5px 10px 8px; }
+  .qp-alias-item-meta { display: none; }
+}
 .qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
 .qp-section-header { padding: 6px 10px 3px; font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: 0; text-transform: uppercase; position: sticky; top: 0; background: linear-gradient(180deg, #111827, #0f172a); z-index: 1; border-bottom: 1px solid rgba(125,211,252,0.08); }
 .qp-history-empty { padding: 6px 10px 8px; font-size: 11px; color: #475569; font-style: italic; }

@@ -22,6 +22,7 @@
     "name_placeholder": "예: deploy",
     "value_placeholder": "이 별칭이 확장되는 텍스트",
     "description_placeholder": "선택 메모 (검색 전용)",
+    "tags_placeholder": "태그 (공백으로 구분, 선택)",
     "error": {
       "invalid_alias_name": "별칭 이름이 잘못되었습니다. 문자, 숫자, 마침표, 밑줄, 하이픈을 사용하세요(최대 20자).",
       "alias_value_invalid": "내용이 잘못되었습니다. 비워 둘 수 없으며 최대 500자입니다.",
