@@ -356,6 +356,9 @@ export function SubSessionWindow({
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
+      // Retry replays the ORIGINAL send verbatim: `resendExtra` already carries
+      // the alias A′ map resolved when the user first composed it, so we do NOT
+      // re-resolve here (Cx1-2/Cx1-3).
       ws.sendSessionCommand('send', {
         sessionName: sub.sessionName,
         text,
@@ -532,6 +535,13 @@ export function SubSessionWindow({
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     setExecutionClonesBusy(true);
     try {
+      // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
+      // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
+      // dispatched through the delegation path, not the direct human
+      // handleSend path, so — like memory-summary sync / P2P / agent
+      // send_message — it deliberately carries NO resolvedAliases. A `;;(name)`
+      // typed here reaches the (LLM) clone literally. See design.md
+      // "Send-surface coverage → Scope boundary".
       ws.sendExecutionClones({
         sessionName: sub.sessionName,
         text,
@@ -560,6 +570,8 @@ export function SubSessionWindow({
       if (!text) return;
       const commandId = globalThis.crypto?.randomUUID?.()
         ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      // Alias A′ opt-out (Cx1-2): generated memory-summary sync, not a
+      // human-composed message, so it deliberately carries no resolvedAliases.
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
       requestActiveTimelineRefreshAfterUserAction();
       addOptimisticUserMessage(text, commandId);
@@ -1032,6 +1044,7 @@ export function SubSessionWindow({
         onTransportConfigSaved={onTransportConfigSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
+        activeTransportTurn={activeTimelineTurn}
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}

@@ -180,7 +180,7 @@ describe('agent delegation shared contract', () => {
   it('builds marked best-effort reply instructions', () => {
     const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain');
     expect(instruction).toContain(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER);
-    expect(instruction).toContain('imcodes send --no-reply "deck_repo_brain"');
+    expect(instruction).toContain('imcodes send "deck_repo_brain"');
     expect(instruction).toContain('Task: <brief summary of the request>\\nResult: <your response>');
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
   });
@@ -196,7 +196,11 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('review the queue sync bug');
     expect(prompt).toContain('organize the relevant current-session context yourself');
     expect(prompt).toContain('Do not send the raw user task by itself.');
-    expect(prompt).toContain('imcodes send --no-reply "deck_repo_w1"');
+    expect(prompt).toContain('imcodes send --reply "deck_repo_w1"');
+    expect(prompt).not.toContain('imcodes send --no-reply "deck_repo_w1"');
+    expect(prompt).toContain('multiple @ delegates');
+    expect(prompt).toContain('separate per-delegate briefs');
+    expect(prompt).toContain('each delegate result separately');
   });
 
   it('detects and strips historical reply/delegation/imcodes-send/P2P control instructions from context', () => {

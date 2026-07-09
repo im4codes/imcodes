@@ -351,4 +351,50 @@ describe('TerminalStreamer — snapshot behavior', () => {
       expect.any(Object),
     );
   });
+
+  it('signals bootstrap stall when the first active terminal subscribe sees a blank snapshot and no raw bytes', async () => {
+    const stalled = vi.fn();
+    mockCapture.mockResolvedValue('\n\n\n');
+
+    streamer.subscribe({
+      sessionName: 'blank-bootstrap-session',
+      send: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    expect(stalled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(stalled).toHaveBeenCalledWith('blank_snapshot_no_raw');
+  });
+
+  it('does not signal bootstrap stall when raw bytes arrive after a blank snapshot', async () => {
+    const stalled = vi.fn();
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event)!.push(cb);
+      }),
+      destroy: vi.fn(),
+    };
+    mockStartPipe.mockResolvedValue({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+    mockCapture.mockResolvedValue('\x1b[0m   \n');
+
+    streamer.subscribe({
+      sessionName: 'raw-recovers-bootstrap-session',
+      send: () => {},
+      sendRaw: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    listeners.get('data')?.forEach((cb) => cb(Buffer.from('$ ')));
+
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(stalled).not.toHaveBeenCalled();
+  });
 });

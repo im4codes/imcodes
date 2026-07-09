@@ -48,6 +48,14 @@ import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, l
 import { cronMcpCreate, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
+import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
+import {
+  aliasMcpList,
+  aliasMcpResolve,
+  aliasMcpUpsert,
+  aliasMcpDelete,
+  type AliasMcpClientOptions,
+} from './alias-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
 export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
@@ -979,6 +987,150 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
       title: name,
       description: contract.description,
       inputSchema: schemas[name],
+    }, async (args: unknown) => toolResult(await handlers[name](args)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alias MCP tools — full CRUD (resolve_alias / list_aliases / save_alias /
+// delete_alias).
+//
+// Aliases are a separate, precise, server-stored, USER-SCOPED reference store,
+// deliberately distinct from memory: memory is fuzzy/recall-ranked; an alias
+// resolves to an exact value the user typed. Agents can READ (resolve one value
+// / list metadata + search) and WRITE (save = create/edit upsert, delete). The
+// server (source of truth, scoped to the daemon's bound owner user via the
+// existing daemon→server auth) validates every write authoritatively with the
+// SAME shared validators as the web app — the agent cannot bypass them. The web
+// app remains the human CRUD surface; these tools give agents parity.
+// ---------------------------------------------------------------------------
+
+/** Injectable deps for the alias read tools (tests bypass the network here). */
+export interface AliasMcpToolDeps {
+  aliasClientOptions?: AliasMcpClientOptions;
+  resolveAlias?: typeof aliasMcpResolve;
+  listAliases?: typeof aliasMcpList;
+  upsertAlias?: typeof aliasMcpUpsert;
+  deleteAlias?: typeof aliasMcpDelete;
+}
+
+const ALIAS_MCP_TOOL_NAME_LIST: readonly AliasMcpToolName[] = [
+  ALIAS_MCP_TOOLS.RESOLVE,
+  ALIAS_MCP_TOOLS.LIST,
+  ALIAS_MCP_TOOLS.SAVE,
+  ALIAS_MCP_TOOLS.DELETE,
+] as const;
+
+const ALIAS_MCP_TOOL_DESCRIPTIONS: Readonly<Record<AliasMcpToolName, string>> = {
+  [ALIAS_MCP_TOOLS.RESOLVE]:
+    'Resolve one alias name to its current exact value from the user\'s precise, server-stored alias store (distinct from memory: an alias is the user\'s own literal text, not a recall-ranked memory). Read-only and user-scoped to the bound owner. Returns found:false with alias_not_found for an unknown name — it never errors on a missing name. To create or edit use save_alias; to remove use delete_alias; to discover/search names use list_aliases.',
+  [ALIAS_MCP_TOOLS.LIST]:
+    'List the bound owner user\'s alias METADATA ONLY (name, optional description, tags, timestamps) from the precise, server-stored alias store (separate from memory search/recall). Pass an optional `query` to search by literal substring over name+description; omit it to list all. It deliberately does NOT return alias values — use resolve_alias to get one name\'s current value. User-scoped. Use it to discover which alias names exist before resolve_alias / save_alias / delete_alias.',
+  [ALIAS_MCP_TOOLS.SAVE]:
+    'Create or edit (upsert) one alias for the bound owner user: name -> exact value, plus optional description and tags. Keyed on the NFC name, so saving an existing name OVERWRITES its value/description/tags. The server validates authoritatively (name: letters/digits/._- up to 20 code points; value: non-empty, up to 500 code points, no NUL; description up to 200; tags: up to 10 items, up to 30 chars each, no control characters) and rejects invalid input with a reason code. The value is used verbatim when the user later inserts the alias as a ;;(name) marker, so avoid control/ANSI characters. Returns the saved alias metadata; it never echoes the value back.',
+  [ALIAS_MCP_TOOLS.DELETE]:
+    'Delete one alias by name for the bound owner user. Returns deleted:true on success, or deleted:false with alias_not_found when no such name exists (that is not an error). User-scoped — only the bound owner\'s aliases are affected.',
+} as const;
+
+const aliasSchemas: Record<AliasMcpToolName, z.ZodTypeAny> = {
+  [ALIAS_MCP_TOOLS.RESOLVE]: z.object({
+    name: z.string().describe('Exact alias name to resolve (NFC, case-sensitive). Returns the current value, or a not-found result for an unknown name.'),
+  }),
+  [ALIAS_MCP_TOOLS.LIST]: z.object({
+    query: z.string().optional().describe('Optional literal substring to search over alias name + description (NFC). Omit to list all.'),
+  }),
+  [ALIAS_MCP_TOOLS.SAVE]: z.object({
+    name: z.string().describe('Alias name (NFC, case-sensitive; letters/digits/._- up to 20 code points). Saving an existing name overwrites it.'),
+    value: z.string().describe('Exact value the alias resolves to (non-empty, up to 500 code points, no NUL). Used verbatim when inserted as a ;;(name) marker.'),
+    description: z.string().optional().describe('Optional human-readable description (up to 200 code points).'),
+    tags: z.array(z.string()).optional().describe('Optional tags (up to 10, each up to 30 chars, no control characters).'),
+  }),
+  [ALIAS_MCP_TOOLS.DELETE]: z.object({
+    name: z.string().describe('Exact alias name to delete (NFC, case-sensitive). A missing name returns deleted:false, not an error.'),
+  }),
+};
+
+export function createAliasMcpToolHandlers(
+  _caller: McpRuntimeCaller,
+  deps: AliasMcpToolDeps = {},
+): Record<AliasMcpToolName, MemoryMcpToolHandler> {
+  const resolveAlias = deps.resolveAlias ?? aliasMcpResolve;
+  const listAliases = deps.listAliases ?? aliasMcpList;
+  const upsertAlias = deps.upsertAlias ?? aliasMcpUpsert;
+  const deleteAlias = deps.deleteAlias ?? aliasMcpDelete;
+  const options = deps.aliasClientOptions ?? {};
+
+  const handlers: Record<AliasMcpToolName, MemoryMcpToolHandler> = {
+    [ALIAS_MCP_TOOLS.RESOLVE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['name']);
+      const name = stringArg(args, 'name');
+      if (!name) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'name is required');
+      // `resolveAlias` returns a not-found result (never throws) for missing names.
+      return await resolveAlias(name, options) as unknown as ToolResult;
+    },
+    [ALIAS_MCP_TOOLS.LIST]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['query']);
+      const query = stringArg(args, 'query');
+      const result = await listAliases(options, query);
+      if (result.status !== 'ok') return result as unknown as ToolResult;
+      // METADATA-ONLY: never expose alias `value` in a bulk listing — a single
+      // list_aliases call would otherwise dump every plaintext value into the
+      // agent's context/memory. `resolve_alias` is the only value path.
+      return { status: 'ok', aliases: result.aliases.map(toAliasMetadata) } as unknown as ToolResult;
+    },
+    [ALIAS_MCP_TOOLS.SAVE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['name', 'value', 'description', 'tags']);
+      const name = stringArg(args, 'name');
+      if (!name) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'name is required');
+      const description = stringArg(args, 'description');
+      const rawTags = (args as Record<string, unknown>).tags;
+      const tags = Array.isArray(rawTags)
+        ? rawTags.filter((t): t is string => typeof t === 'string')
+        : undefined;
+      // The server re-validates name/value/description/tags authoritatively and
+      // rejects invalid input; we never pre-trust the agent-supplied value.
+      const result = await upsertAlias(
+        {
+          name,
+          value: stringArg(args, 'value') ?? '',
+          ...(description !== undefined ? { description } : {}),
+          ...(tags !== undefined ? { tags } : {}),
+        },
+        options,
+      );
+      if (result.status !== 'ok') return result as unknown as ToolResult;
+      // Return metadata of the saved record — never re-echo the value the agent set.
+      return { status: 'ok', saved: true, alias: toAliasMetadata(result.alias) } as unknown as ToolResult;
+    },
+    [ALIAS_MCP_TOOLS.DELETE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['name']);
+      const name = stringArg(args, 'name');
+      if (!name) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'name is required');
+      // `deleteAlias` returns deleted:false (not an error) for a missing name.
+      return await deleteAlias(name, options) as unknown as ToolResult;
+    },
+  };
+
+  const wrapped = {} as Record<AliasMcpToolName, MemoryMcpToolHandler>;
+  for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
+    wrapped[name] = async (input?: unknown) => {
+      try {
+        return await handlers[name](input);
+      } catch (err) {
+        return sanitizeCaughtError(err);
+      }
+    };
+  }
+  return wrapped;
+}
+
+export function registerAliasMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: AliasMcpToolDeps = {}): void {
+  const handlers = createAliasMcpToolHandlers(caller, deps);
+  for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
+    server.registerTool(name, {
+      title: name,
+      description: ALIAS_MCP_TOOL_DESCRIPTIONS[name],
+      inputSchema: aliasSchemas[name],
     }, async (args: unknown) => toolResult(await handlers[name](args)));
   }
 }

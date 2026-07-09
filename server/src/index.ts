@@ -38,6 +38,8 @@ import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
 import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
+import { aliasRoutes } from './routes/aliases.js';
+import { ALIAS_API_PATH } from '../../shared/alias-types.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
@@ -185,6 +187,9 @@ export function buildApp(env: Env) {
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
   app.route('/api/preferences', preferencesRoutes);
+  // User-level alias store: flat, pod-independent (no serverId). Mounted under
+  // /api/* so it inherits the global CORS + CSRF middleware.
+  app.route(ALIAS_API_PATH, aliasRoutes);
   app.route('/api/embedding', embeddingRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
   app.route('/api/admin', adminRoutes);

@@ -197,7 +197,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const inlineQuotaText = displayQuotaLabel;
-  const liveStatusMode = liveStatus.mode;
+  const liveStatusMode = liveStatus.visualMode;
   const liveStatusText = useMemo(() => {
     if (isAgentless || !liveStatusMode) return null;
     if (liveStatusMode === 'error') {
@@ -217,7 +217,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         })
         : t('session.state_stop_requested');
     }
-    if (liveStatus.busy) {
+    if (liveStatusMode === 'result') return statusText || t('session.state_idle');
+    if (liveStatus.sweep) {
       if (activeToolCall) return statusText || t('session.state_running');
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       if (liveStatus.activityDetail) {
@@ -228,9 +229,8 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       }
       return t('session.state_running');
     }
-    if (statusText) return statusText;
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.busy, liveStatus.errorDetail, liveStatusMode, now, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'stopping' || liveStatusMode === 'cancelled' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK

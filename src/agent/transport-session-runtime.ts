@@ -76,6 +76,13 @@ export interface PendingTransportMessage {
   clientMessageId: string;
   /** User-visible task text, without daemon-rendered memory/context preambles. */
   text: string;
+  /**
+   * Agent-bound text after alias expansion (A′). When set it is what the provider
+   * receives (and what enters runtime history); `text` stays the ORIGINAL marker
+   * text used for every human-facing timeline `user.message`. Absent ⇒ no alias
+   * expansion happened and `text` is delivered verbatim.
+   */
+  providerText?: string;
   /** Provider-visible per-turn context rendered through the shared context preamble path. */
   messagePreamble?: string;
   attachments?: TransportAttachment[];
@@ -109,11 +116,24 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   const publicEntry: PendingTransportMessage = { ...entry };
   delete publicEntry.timelineCommitted;
   delete publicEntry.historyCommitted;
+  // RV-B: the expanded alias value (`providerText`) and the per-turn
+  // `messagePreamble` are secret agent-bound material. The public projection
+  // feeds diagnostics / status snapshots / UI / the onDrain callback — none of
+  // which must ever expose them. The `*ForResend` getters intentionally keep
+  // full material for internal resend preservation only.
+  delete publicEntry.providerText;
+  delete publicEntry.messagePreamble;
   return publicEntry;
 }
 
 export interface TransportSendMetadata {
   sharedActor?: SharedActorEnvelope;
+  /**
+   * Agent-bound text after alias expansion (A′). When present the provider (and
+   * runtime history) receive this text while the timeline keeps the ORIGINAL
+   * `message`. Absent ⇒ `message` is delivered verbatim.
+   */
+  providerText?: string;
   /**
    * Where to place this message when a provider turn is already active.
    * `front` is reserved for out-of-band dialog answers (ask.answer):
@@ -896,6 +916,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (materialJson) {
           const material = JSON.parse(materialJson) as {
             text?: unknown;
+            providerText?: unknown;
             messagePreamble?: unknown;
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
@@ -906,6 +927,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             entry = {
               clientMessageId,
               text: material.text,
+              ...(typeof material.providerText === 'string' ? { providerText: material.providerText } : {}),
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
@@ -1483,6 +1505,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     const entry: PendingTransportMessage = {
       clientMessageId: clientMessageId ?? randomUUID(),
       text: message,
+      // Only carry providerText when it actually differs — keeps the common
+      // (no-alias) path byte-identical and avoids persisting redundant material.
+      ...(metadata?.providerText != null && metadata.providerText !== message
+        ? { providerText: metadata.providerText }
+        : {}),
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
@@ -1507,6 +1534,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           privateMaterialJson: JSON.stringify({
             clientMessageId: entry.clientMessageId,
             text: entry.text,
+            ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
             ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
             ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
@@ -1564,6 +1592,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
+    // The edit is fresh user text with no attached alias resolution — drop any
+    // stale expansion so the edited text is delivered to the provider verbatim.
+    entry.providerText = undefined;
     entry.messagePreamble = undefined;
     try {
       getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText);
@@ -2191,6 +2222,15 @@ export class TransportSessionRuntime implements SessionRuntime {
     }]).map((entry) => ({ ...entry }));
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
+    // Alias expansion (A′): the provider (and runtime history) receive the
+    // agent-bound `providerText` while `message` — the ORIGINAL marker text —
+    // still drives every human-facing timeline projection and all control-command
+    // detection below (`/compact`, `/model`, `isTransportSlashControl`, …). When no
+    // entry carries `providerText` this is byte-identical to `message`.
+    const providerMessage = this._activeDispatchEntries
+      .map((entry) => entry.providerText ?? entry.text)
+      .join('\n\n');
+
     let resolve!: () => void;
     let reject!: (err: ProviderError) => void;
     const promise = new Promise<void>((res, rej) => {
@@ -2207,7 +2247,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         sessionId: this._providerSessionId!,
         kind: 'text',
         role: 'user',
-        content: historyEntries.map((entry) => entry.text).join('\n\n'),
+        content: historyEntries.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
         timestamp: Date.now(),
         status: 'complete',
       });
@@ -2277,7 +2317,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
-        userMessage: message,
+        userMessage: providerMessage,
         activityGeneration: this.currentActivityGeneration(),
         messagePreamble,
         description: isSlashControl ? undefined : this._description,

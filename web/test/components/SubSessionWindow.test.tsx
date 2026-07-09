@@ -1267,6 +1267,36 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
+  it('passes active timeline turn state into sub-session controls', async () => {
+    timelineEventsMock = [{
+      eventId: 'sub-running-state',
+      type: 'session.state',
+      ts: 10,
+      payload: { state: 'running' },
+    }];
+    const sub = makeSubSession({ type: 'claude-code-sdk', runtimeType: 'transport' as any, state: 'idle' } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    const controlsProps = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(controlsProps?.activeTransportTurn).toBe(true);
+  });
+
   it('keeps a new optimistic bubble visible when retrying a failed transport window send', async () => {
     // Also a regression: the failed optimistic bubble in a sub-session had no
     // retry button because onResendFailed was never threaded through to

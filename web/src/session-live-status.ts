@@ -35,6 +35,7 @@ export interface SessionLiveStatusInput {
 
 export interface SessionLiveStatus {
   mode: SessionLiveStatusMode | null;
+  visualMode: SessionLiveStatusMode | null;
   busy: boolean;
   sweep: boolean;
   controlFeedback: 'stop_requested' | 'compact_requested' | 'cancelled' | null;
@@ -119,6 +120,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   if (isAgentless) {
     return {
       mode: null,
+      visualMode: null,
       busy: false,
       sweep: false,
       controlFeedback: null,
@@ -160,10 +162,19 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
     mode = 'idle';
   }
 
+  const sweep = running || stopping;
+  const visualMode = sweep
+    || mode === 'error'
+    || mode === 'cancelled'
+    || mode === 'result'
+    ? mode
+    : 'idle';
+
   return {
     mode,
+    visualMode,
     busy,
-    sweep: running || stopping,
+    sweep,
     controlFeedback,
     errorDetail,
     activityDetail,

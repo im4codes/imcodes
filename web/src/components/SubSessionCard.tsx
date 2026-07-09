@@ -28,6 +28,9 @@ import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { useAliases } from '../hooks/useAliases.js';
+import { buildAliasSendExtra } from '../util/alias-send.js';
+import { parseAliasMarkers } from '@shared/alias-types.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -120,6 +123,11 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
 
 export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
   const { t } = useTranslation();
+  // Shared alias data so the compact card's plain-text composer resolves
+  // `;;(name)` markers the same way the main SessionControls composer does
+  // (audit finding Cx1-2). The value map rides out-of-band in `extra`; markers
+  // in the text are never expanded client-side.
+  const { aliases: aliasAll, loaded: aliasLoaded, error: aliasError } = useAliases();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const [timelineHydrated, setTimelineHydrated] = useState(() => isOpen || isFocused === true);
@@ -202,6 +210,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     const newCommandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
+      // Retry replays the ORIGINAL send verbatim: `resendExtra` already carries
+      // the alias A′ map from the first compose, so we do NOT re-resolve here.
       ws.sendSessionCommand('send', {
         sessionName: sub.sessionName,
         text,
@@ -233,19 +243,34 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const handleCardSend = useCallback(() => {
     const text = cardInputRef.current?.value?.trim();
     if (!text || !ws || !connected) return;
+    // Fail-safe (Cx1-4): don't send literal markers with an empty/stale map.
+    // Keep the draft so the user can retry once the alias list settles.
+    if (parseAliasMarkers(text).length > 0 && (!aliasLoaded || aliasError != null)) {
+      console.warn('sub-session send blocked: alias list not loaded; preserving draft');
+      return;
+    }
+    const aliasExtra = buildAliasSendExtra(text, aliasAll);
     const commandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, ...aliasExtra, commandId });
       requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       console.warn('sub-session send failed; preserving draft for retry', err);
       return;
     }
-    addOptimisticUserMessage?.(text, commandId);
+    // Preserve the resolved map on the optimistic bubble so a later retry
+    // re-sends it (parity with SessionControls' `resendExtra`). Only pass opts
+    // when there's actually a map to stash so the marker-free path stays
+    // byte-identical to before.
+    if (Object.keys(aliasExtra).length > 0) {
+      addOptimisticUserMessage?.(text, commandId, { resendExtra: aliasExtra });
+    } else {
+      addOptimisticUserMessage?.(text, commandId);
+    }
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [addOptimisticUserMessage, ws, connected, sub.sessionName, forceFollowLatest]);
+  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in

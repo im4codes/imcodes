@@ -98,7 +98,7 @@ describe('daemon delegation dispatch helper', () => {
     expect(context.text).not.toContain('memory should skip');
   });
 
-  it('dispatches accepted delegation with clean task, context, and reply instruction without waiting for reply', async () => {
+  it('dispatches accepted delegation with clean task, context, and required reply instruction', async () => {
     const target = session('deck_proj_w1');
     const dispatched: string[] = [];
     const result = await dispatchDelegatedSessionSend({
@@ -115,7 +115,8 @@ describe('daemon delegation dispatch helper', () => {
     expect(dispatched).toHaveLength(1);
     expect(dispatched[0]).toContain('please do it');
     expect(dispatched[0]).toContain('prior context');
-    expect(dispatched[0]).toContain('imcodes send --no-reply');
+    expect(dispatched[0]).toContain('imcodes send "deck_proj_brain"');
+    expect(dispatched[0]).not.toContain('imcodes send --no-reply');
     expect(dispatched[0]).toContain('deck_proj_brain');
   });
 
@@ -148,6 +149,7 @@ describe('daemon delegation dispatch helper', () => {
     });
     expect(result).toMatchObject({ status: 'accepted', contextStatus: 'truncated' });
     expect(sent[0]).toContain(AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER);
-    expect(sent[0]).toContain('imcodes send --no-reply');
+    expect(sent[0]).toContain('imcodes send "deck_proj_brain"');
+    expect(sent[0]).not.toContain('imcodes send --no-reply');
   });
 });

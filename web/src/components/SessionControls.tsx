@@ -14,6 +14,10 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { useAliases } from '../hooks/useAliases.js';
+import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
+import { buildAliasSendExtra } from '../util/alias-send.js';
+import { parseAliasMarkers } from '@shared/alias-types.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
@@ -46,7 +50,11 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE } from '@shared/transport-queue-types.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
-import { normalizeTransportPendingEntries } from '../transport-queue.js';
+import {
+  buildTransportPendingSyncPatch,
+  hasTransportPendingSyncSnapshot,
+  normalizeTransportPendingEntries,
+} from '../transport-queue.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
@@ -289,6 +297,14 @@ type LocalQueuedTransportEntry = {
   sharedActor?: SharedActorEnvelope;
   /** Queue version visible when this local optimistic entry was created. */
   queuedAfterVersion?: number;
+  /** Creation time used to break same-version realtime empty snapshot races. */
+  queuedAtMs?: number;
+};
+
+type RealtimeTransportQueueOverride = {
+  sessionName: string;
+  entries: LocalQueuedTransportEntry[];
+  version?: number;
 };
 
 function transportQueueHiddenStorageKey(serverId: string | undefined, sessionName: string): string {
@@ -408,6 +424,80 @@ function readComposerElementText(root: HTMLElement): string {
 function setComposerElementText(root: HTMLElement, text: string): void {
   root.textContent = text.replace(/\r\n?/g, '\n');
 }
+
+/**
+ * Inline `;` alias-autocomplete trigger. Matches a single `;` that sits at a
+ * word boundary (start of text or after whitespace) and is followed by ZERO or
+ * more valid alias-name characters, capturing the typed query at the end of the
+ * composer text. Zero chars means a bare `;` (at a word boundary) opens the
+ * picker with the full alias list; each further char filters it. The char class
+ * mirrors `ALIAS_NAME_PATTERN` (`\p{L}\p{N}._-`). A double `;;` (a marker
+ * prefix) is excluded so re-editing an inserted `;;(name)` marker does not
+ * re-open the picker. Returns the query (possibly empty) or `null` if not triggered.
+ */
+const ALIAS_INLINE_TRIGGER_RE = /(?:^|\s);([\p{L}\p{N}._-]{0,20})$/u;
+export function matchInlineAliasTrigger(text: string): string | null {
+  const m = ALIAS_INLINE_TRIGGER_RE.exec(text);
+  if (!m) return null;
+  // Reject when the char just before the matched `;` is itself a `;` (i.e. the
+  // user is inside a `;;(...)` marker prefix). The lead boundary already blocks
+  // most cases, but `a;;x` would otherwise match on the second `;`.
+  const semiIdx = text.length - 1 - m[1].length;
+  if (semiIdx > 0 && text[semiIdx - 1] === ';') return null;
+  return m[1];
+}
+
+// Inline `;` alias dropdown styles — mirror the AtPicker dropdown look so the
+// two inline autocompletes feel identical.
+const aliasPickerContainerStyle: Record<string, string | number> = {
+  position: 'absolute',
+  bottom: '100%',
+  left: 0,
+  right: 0,
+  maxHeight: 280,
+  overflowY: 'auto',
+  background: '#1e293b',
+  border: '1px solid #334155',
+  borderRadius: 8,
+  boxShadow: '0 -4px 12px rgba(0,0,0,0.4)',
+  zIndex: 50,
+  padding: '4px 0',
+};
+const aliasPickerGroupLabelStyle: Record<string, string | number> = {
+  padding: '4px 10px 2px',
+  fontSize: 10,
+  fontWeight: 600,
+  color: '#64748b',
+  textTransform: 'uppercase',
+  letterSpacing: '0.05em',
+};
+const aliasPickerItemStyle: Record<string, string | number> = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 6,
+  padding: '5px 10px',
+  cursor: 'pointer',
+  fontSize: 13,
+  color: '#e2e8f0',
+  whiteSpace: 'nowrap',
+};
+const aliasPickerItemHighlightStyle: Record<string, string | number> = {
+  ...aliasPickerItemStyle,
+  background: '#334155',
+};
+const aliasPickerDimStyle: Record<string, string | number> = {
+  color: '#64748b',
+  fontSize: 11,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  marginLeft: 4,
+};
+const aliasPickerEmptyStyle: Record<string, string | number> = {
+  ...aliasPickerItemStyle,
+  color: '#64748b',
+  justifyContent: 'center',
+  cursor: 'default',
+};
 
 function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
   if (!raw) return [];
@@ -835,10 +925,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
-  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team'>('choose');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases'>('choose');
   const atJustClosedRef = useRef(false);
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
+  // Inline `;` alias autocomplete — mirrors the `@` picker's inline trigger.
+  const [aliasPickerOpen, setAliasPickerOpen] = useState(false);
+  const [aliasQuery, setAliasQuery] = useState('');
+  const [aliasHighlightIdx, setAliasHighlightIdx] = useState(0);
+  const aliasJustClosedRef = useRef(false);
+  // Set for the input event immediately following a paste so pasted text ending
+  // in `;name` never opens the inline alias picker (paste must not trigger).
+  const aliasPasteSuppressRef = useRef(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [thinkingOpen, setThinkingOpen] = useState(false);
@@ -883,6 +981,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
+  const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
   const queuedMutationRollbackRef = useRef<Map<string, { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }>>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
@@ -945,7 +1045,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const transportSendShouldQueue = effectiveRuntimeType === 'transport'
     && !!activeSession
     && activeSessionLiveStatus.busy;
-  const incomingQueuedTransportEntries = effectiveRuntimeType === 'transport'
+  const activeSessionPendingEntries = effectiveRuntimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession?.transportPendingMessageEntries,
         undefined,
@@ -959,9 +1059,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         },
       )
     : [];
-  const incomingQueuedTransportVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
+  const activeSessionPendingVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
     ? activeSession.transportPendingMessageVersion
     : undefined;
+  const shouldUseRealtimeQueueOverride = !!activeSession?.name
+    && realtimeQueueOverride?.sessionName === activeSession.name
+    && (
+      realtimeQueueOverride.version === undefined
+      || activeSessionPendingVersion === undefined
+      || realtimeQueueOverride.version >= activeSessionPendingVersion
+    );
+  const incomingQueuedTransportEntries = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.entries
+    : activeSessionPendingEntries;
+  const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.version
+    : activeSessionPendingVersion;
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
     let merged: LocalQueuedTransportEntry[];
     if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
@@ -988,6 +1101,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     setSettledQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
+    setRealtimeQueueOverride(null);
+    lastRealtimeEmptyQueueSnapshotRef.current = null;
     setEditingQueuedMessageId(null);
     queuedMutationRollbackRef.current.clear();
     failedQueuedCommandIdsRef.current.clear();
@@ -1023,6 +1138,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   ), [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
+  // Shared alias data — feeds compose-time resolution (A′) on send and the
+  // inline `;` autocomplete. `aliasFiltered` is the name+description filtered
+  // view for the current inline query; `aliasAll` is the full list used to
+  // resolve markers into the out-of-band `resolvedAliases` map at send time.
+  const {
+    aliases: aliasAll,
+    filtered: aliasFiltered,
+    loaded: aliasLoaded,
+    error: aliasError,
+    refetch: refetchAliases,
+  } = useAliases(aliasQuery);
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
@@ -1067,6 +1193,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const handleCompositionEnd = () => {
       imeComposingRef.current = false;
       markImeActivity();
+      // Re-run onInput now that composition committed. On many mobile IMEs the
+      // input event carrying the composed text fires WHILE isComposing is still
+      // true (so the inline `;` alias + `@` triggers were suppressed) and no
+      // input fires after compositionend — so a CJK query like `;服务` never
+      // registers (while a plain edit like deleting a char does). Dispatching a
+      // synthetic input re-evaluates the final committed text. Same pattern the
+      // pending-prefill effect uses.
+      el.dispatchEvent(new Event('input', { bubbles: true }));
     };
     el.addEventListener('compositionstart', handleCompositionStart);
     el.addEventListener('compositionupdate', markImeActivity);
@@ -1516,9 +1650,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // new send created after the current empty baseline is preserved.
       setOptimisticQueuedEntries((prev) => {
         if (!prev) return null;
+        const emptySnapshot = lastRealtimeEmptyQueueSnapshotRef.current;
         const remaining = prev.filter((entry) => (
           entry.queuedAfterVersion === undefined
-          || incomingQueuedTransportVersion <= entry.queuedAfterVersion
+          || incomingQueuedTransportVersion < entry.queuedAfterVersion
+          || (
+            incomingQueuedTransportVersion === entry.queuedAfterVersion
+            && (
+              !emptySnapshot
+              || emptySnapshot.sessionName !== activeSession?.name
+              || emptySnapshot.version !== incomingQueuedTransportVersion
+              || entry.queuedAtMs === undefined
+              || entry.queuedAtMs > emptySnapshot.observedAtMs
+            )
+          )
         ));
         if (remaining.length === prev.length) return prev;
         return remaining.length > 0 ? remaining : null;
@@ -1533,6 +1678,37 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!ws || !activeSession) return;
     return ws.onMessage((msg: ServerMessage) => {
+      const applyRealtimeQueueSnapshot = (payload: Record<string, unknown>, sessionName: string): boolean => {
+        if (sessionName !== activeSession.name || !hasTransportPendingSyncSnapshot(payload)) return false;
+        const patch = buildTransportPendingSyncPatch({
+          transportPendingMessageEntries: incomingQueuedTransportEntries,
+          transportPendingMessageVersion: incomingQueuedTransportVersion,
+          queueEpoch: activeSession.queueEpoch,
+          queueAuthorityId: activeSession.queueAuthorityId,
+          failedMessageEntries: activeSession.failedMessageEntries,
+        }, payload, sessionName);
+        if (Object.keys(patch).length === 0) return false;
+        const entries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
+          ...entry,
+          status: 'queued' as const,
+        }));
+        setRealtimeQueueOverride({
+          sessionName,
+          entries,
+          version: patch.transportPendingMessageVersion,
+        });
+        if (entries.length === 0) {
+          lastRealtimeEmptyQueueSnapshotRef.current = {
+            sessionName,
+            version: patch.transportPendingMessageVersion,
+            observedAtMs: Date.now(),
+          };
+          setOptimisticQueuedEntries(null);
+        } else {
+          lastRealtimeEmptyQueueSnapshotRef.current = null;
+        }
+        return true;
+      };
       const removeLocalQueuedEntry = (commandId: string, text?: string) => {
         void text;
         if (!commandId) return;
@@ -1565,6 +1741,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         });
       };
 
+      if (msg.type === 'session_list') {
+        const session = msg.sessions.find((item) => item.name === activeSession.name);
+        if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, activeSession.name);
+        return;
+      }
+      if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
+        const payload = msg as unknown as Record<string, unknown>;
+        const sessionName = typeof payload.sessionName === 'string'
+          ? payload.sessionName
+          : typeof payload.id === 'string'
+            ? `deck_sub_${payload.id}`
+            : '';
+        applyRealtimeQueueSnapshot(payload, sessionName);
+        return;
+      }
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== activeSession.name) return;
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
@@ -1637,12 +1828,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         removeLocalQueuedEntry(clientMessageId);
         rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
-        const hasPendingSnapshot = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries');
+        const payload = event.payload as Record<string, unknown>;
+        const hasPendingSnapshot = applyRealtimeQueueSnapshot(payload, activeSession.name);
         const queuedEntries = normalizeTransportPendingEntries(
-          event.payload.pendingMessageEntries,
+          payload.pendingMessageEntries,
           undefined,
           activeSession.name,
-          { hasEntriesField: Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessageEntries') },
+          { hasEntriesField: Object.prototype.hasOwnProperty.call(payload, 'pendingMessageEntries') },
         );
         if (queuedEntries.length === 0) {
           if (hasPendingSnapshot) setOptimisticQueuedEntries(null);
@@ -1656,7 +1848,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         });
       }
     });
-  }, [activeSession, incomingQueuedTransportEntries, ws]);
+  }, [activeSession, incomingQueuedTransportEntries, incomingQueuedTransportVersion, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1863,6 +2055,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerMultiline(false);
       return;
     }
+    // Skip the reflow while an IME is composing: reading scrollHeight to flip the
+    // multiline class realigns the composer box, which displaces the caret on
+    // every compositionupdate / candidate-bar toggle (a major "focus jumps"
+    // cause when typing CJK). The `input` event fired after `compositionend`
+    // (imeComposingRef already false) runs the deferred final sync.
+    if (imeComposingRef.current) return;
     const root = divRef.current;
     if (!root) return;
     const computed = window.getComputedStyle(root);
@@ -1910,6 +2108,40 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     publishComposerText(nextText);
     syncMobileComposerMetrics();
   };
+
+  /**
+   * Insert a `;;(name)` alias marker at the caret via the shared, value-secret
+   * helper (never the resolved value; never sends). When the inline `;query`
+   * fragment is still present at the end of the composer (the inline `;`
+   * autocomplete path), it is stripped first so we don't leave a stray `;dep`
+   * before the inserted marker. Used by both the inline picker and the
+   * `@别名` category.
+   */
+  const insertAliasMarker = useCallback((name: string) => {
+    const el = divRef.current;
+    if (el) {
+      const current = readComposerElementText(el);
+      // Strip a trailing inline `;query` fragment (the inline `;` autocomplete
+      // path), keeping any boundary whitespace that preceded the `;`. When no
+      // such fragment is present (the `@别名` path), the text is unchanged.
+      const stripped = current.replace(/(^|\s);[\p{L}\p{N}._-]{0,20}$/u, (_m, lead: string) => lead);
+      setComposerElementText(el, stripped);
+      try {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      } catch { /* jsdom lacks Selection API */ }
+      el.focus();
+    }
+    insertAliasMarkerAtCaret(name);
+    const nextText = el ? readComposerElementText(el) : '';
+    setHasText(!!nextText.trim());
+    publishComposerText(nextText);
+    syncMobileComposerMetrics();
+  }, [publishComposerText, syncMobileComposerMetrics]);
 
   const toComposerReference = useCallback((path: string) => {
     const cwd = activeSession?.projectDir;
@@ -2615,6 +2847,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const normalizedOptions: BuildSendPayloadOptions =
       typeof options === 'string' ? { modeOverride: options } : (options ?? {});
     let text = getText();
+    // Capture the user's OWN composed body BEFORE any synthetic @-prefix,
+    // delegation/P2P rewrite, quote block, or attachment refs are concatenated.
+    // Alias markers (A′) resolve against THIS body only — a `;;(secret)` buried
+    // in a quoted historical message or attachment path must never pull the
+    // current user's alias value into resolvedAliases (audit finding Cx1-3).
+    const composerBody = text;
     if (normalizedOptions.syntheticAtTargets && normalizedOptions.syntheticAtTargets.length > 0) {
       const syntheticPrefix = normalizedOptions.syntheticAtTargets.map((target) => target.label).join(' ');
       text = text ? `${syntheticPrefix} ${text}` : syntheticPrefix;
@@ -2729,8 +2967,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const refs = attachments.map((a) => `#${a.seq}:(${a.path})`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
+    // Compose-time alias resolution (A′). Resolve ONLY against the user's own
+    // composed body (`composerBody`) — NOT the concatenated `text` that now also
+    // carries quotes / attachment refs / synthetic prefixes — so a `;;(secret)`
+    // inside quoted history or an attachment path can't leak the current user's
+    // alias value (Cx1-3). The final `text` keeps its markers as-is; the map
+    // rides in `extra` so it reaches the daemon via BOTH the WS send and the
+    // HTTP fallback (see sendSessionMessage), but never the composer or the
+    // optimistic/timeline user bubble. Attached only when a marker actually
+    // resolved, so ordinary sends stay byte-identical.
+    //
+    // Fail-safe (Cx1-4): if the body references markers but the alias list is
+    // not successfully loaded (still loading or errored), do NOT send a stale/
+    // empty map — that would silently deliver literal markers. Block with a
+    // recoverable inline warning and kick off a refetch instead.
+    if (parseAliasMarkers(composerBody).length > 0 && (!aliasLoaded || aliasError != null)) {
+      showSendWarning(t('alias.error.list_unavailable'));
+      refetchAliases();
+      return null;
+    }
+    Object.assign(extra, buildAliasSendExtra(composerBody, aliasAll));
     return { text, extra, ...(delegation ? { delegation } : {}) };
-  }, [activeSession, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, rootSession, sessions, subSessions]);
+  }, [activeSession, aliasAll, aliasError, aliasLoaded, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, refetchAliases, rootSession, sessions, showSendWarning, subSessions, t]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -2754,8 +3012,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       extra.p2pLocale = i18n?.language ?? 'en';
     }
 
+    // Compose-time alias resolution (A′) — same contract + fail-safe as
+    // buildSendPayload. `cleanText` is the user's body with @-targets stripped;
+    // there are no quotes/attachments on this path, so it IS the composed body.
+    if (parseAliasMarkers(cleanText).length > 0 && (!aliasLoaded || aliasError != null)) {
+      showSendWarning(t('alias.error.list_unavailable'));
+      refetchAliases();
+      return null;
+    }
+    Object.assign(extra, buildAliasSendExtra(cleanText, aliasAll));
     return { text: cleanText, extra };
-  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions]);
+  }, [activeSession, aliasAll, aliasError, aliasLoaded, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, refetchAliases, sessions, showSendWarning, subSessions, t]);
 
   const makeCommandId = useCallback(() => (
     globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -2812,6 +3079,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [cancelActiveTransportTurn, showStopFeedback]);
 
   const escapeKeyboardOwnerOpen = atPickerOpen
+    || aliasPickerOpen
     || quickOpen
     || modelOpen
     || autoOpen
@@ -2962,6 +3230,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       atSelectionLockRef.current = false;
       atSelectionSnapshotRef.current = '';
+      setAliasPickerOpen(false);
+      setAliasQuery('');
       histIdxRef.current = -1;
       draftRef.current = '';
       if (draftKey) sessionStorage.removeItem(draftKey);
@@ -3016,6 +3286,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       && !isDelegationSend
       && !payload.text.trim().startsWith('/');
     if (shouldShowAsQueued) {
+      const queuedAtMs = Date.now();
       setOptimisticQueuedEntries((prev) => {
         const source = prev ?? incomingQueuedTransportEntries;
         if (source.some((entry) => entry.clientMessageId === commandId)) return source;
@@ -3024,6 +3295,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           text: payload.text,
           status: localFailure || failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
           queuedAfterVersion: incomingQueuedTransportVersion,
+          queuedAtMs,
         }];
       });
     }
@@ -3106,6 +3378,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         text: entry.text,
         status: failedQueuedCommandIdsRef.current.has(commandId) ? 'failed' : 'sending',
         queuedAfterVersion: incomingQueuedTransportVersion,
+        queuedAtMs: Date.now(),
       });
       return next;
     });
@@ -3265,7 +3538,51 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
+    // When the inline `;` alias picker is open, it owns Enter/Tab/Arrow/Escape.
+    // Enter/Tab on a highlighted row inserts the marker; with no results Enter
+    // still falls through to normal send (the picker only claims Enter when it
+    // can accept something). With the picker CLOSED, none of this runs and
+    // Enter reaches the normal send path below.
+    if (aliasPickerOpen) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (aliasFiltered.length > 0) setAliasHighlightIdx((h) => (h + 1) % aliasFiltered.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (aliasFiltered.length > 0) setAliasHighlightIdx((h) => (h - 1 + aliasFiltered.length) % aliasFiltered.length);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setAliasPickerOpen(false);
+        setAliasQuery('');
+        return;
+      }
+      if ((e.key === 'Tab' || e.key === 'Enter') && aliasFiltered.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        const chosen = aliasFiltered[Math.min(aliasHighlightIdx, aliasFiltered.length - 1)];
+        setAliasPickerOpen(false);
+        setAliasQuery('');
+        aliasJustClosedRef.current = true;
+        setTimeout(() => { aliasJustClosedRef.current = false; }, 150);
+        if (chosen) insertAliasMarker(chosen.name);
+        return;
+      }
+    }
+
     if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
+      return;
+    }
+
+    // Block Enter right after the alias picker closes (the same Enter that
+    // accepted a row must not also send).
+    if (e.key === 'Enter' && aliasJustClosedRef.current) {
+      e.preventDefault();
+      aliasJustClosedRef.current = false;
       return;
     }
 
@@ -3476,6 +3793,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       })();
       return;
     }
+    // `execCommand('insertText')` fires a native `input` event; flag it so the
+    // inline `;` alias trigger is skipped for this paste-driven input (paste
+    // must never open the alias picker).
+    aliasPasteSuppressRef.current = true;
     document.execCommand('insertText', false, text);
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
@@ -4588,6 +4909,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           {isMobileLayout && (mobileComposerMultiline || mobileComposerExpanded) && (
             <button
               class="btn btn-input-expand btn-input-expand-floating"
+              // Prevent the button from stealing focus / blurring the composer
+              // (same trick as the picker items below) so expanding/collapsing
+              // keeps the caret in place instead of the deferred focus() landing
+              // it at a default position — a "focus jumps" source on mobile.
+              onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 setMobileComposerExpanded((prev) => !prev);
                 setTimeout(() => divRef.current?.focus(), 0);
@@ -4627,6 +4953,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ws={ws}
             sessionCwd={activeSession?.projectDir}
             onAppendPaths={appendToInput}
+            onInsertAlias={insertAliasMarker}
             anchorRef={quickWrapRef}
           />
         </div>
@@ -4772,11 +5099,70 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               handleDirectComboSelect(modeKey, rounds);
             }}
+            onSelectAlias={(name) => {
+              // @别名 → strip the trailing `@query` fragment, then insert the
+              // `;;(name)` marker via the shared value-secret helper.
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              if (divRef.current) setComposerElementText(divRef.current, before);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              insertAliasMarker(name);
+            }}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
             visible={true}
           />
+        )}
+
+        {/* Inline `;` alias autocomplete dropdown. Mirrors the @ picker's
+            positioning; owns Enter/Tab/Arrow/Escape via handleKeyDown while open. */}
+        {aliasPickerOpen && activeSession && (
+          <div class="controls-alias-picker" role="listbox" aria-label={t('alias.category')} style={aliasPickerContainerStyle}>
+            <div style={aliasPickerGroupLabelStyle}>
+              {t('alias.category')} {aliasQuery ? `— "${aliasQuery}"` : ''}
+            </div>
+            {aliasFiltered.length === 0 && (
+              <div style={aliasPickerEmptyStyle}>
+                {aliasQuery ? t('alias.no_results') : t('alias.empty')}
+              </div>
+            )}
+            {aliasFiltered.map((a, idx) => {
+              const hl = idx === Math.min(aliasHighlightIdx, aliasFiltered.length - 1);
+              return (
+                <div
+                  key={a.name}
+                  role="option"
+                  aria-selected={hl ? 'true' : 'false'}
+                  data-alias-name={a.name}
+                  data-hl={hl ? 'true' : undefined}
+                  style={hl ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
+                  // Use mousedown so selecting doesn't blur the composer first.
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setAliasPickerOpen(false);
+                    setAliasQuery('');
+                    insertAliasMarker(a.name);
+                  }}
+                  onMouseEnter={() => setAliasHighlightIdx(idx)}
+                >
+                  <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{a.name}</span>
+                  {a.description ? <span style={aliasPickerDimStyle}>{a.description}</span> : null}
+                </div>
+              );
+            })}
+          </div>
         )}
 
         {/*
@@ -4861,6 +5247,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   setAtPickerStage('choose');
                   setAtQuery('');
                 }
+              }
+
+              // Inline `;` alias autocomplete. Independent of the @ trigger.
+              // Suppressed during IME composition and on the input event that
+              // immediately follows a paste (both must not open the picker).
+              const pasteSuppressed = aliasPasteSuppressRef.current;
+              aliasPasteSuppressRef.current = false;
+              const aliasTrigger = (imeComposingRef.current || pasteSuppressed)
+                ? null
+                : matchInlineAliasTrigger(text);
+              if (aliasTrigger !== null && !doubleAt) {
+                setAliasQuery(aliasTrigger);
+                setAliasHighlightIdx(0);
+                setAliasPickerOpen(true);
+              } else if (aliasPickerOpen) {
+                setAliasPickerOpen(false);
+                setAliasQuery('');
               }
             }}
             onKeyDown={handleKeyDown}

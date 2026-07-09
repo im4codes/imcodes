@@ -66,6 +66,7 @@ export function buildQueueProjectionEntry(entry: QueueStoredEntry): QueueProject
 export function containsProhibitedQueueProjectionField(value: unknown): boolean {
   const prohibited = new Set([
     'messagePreamble',
+    'providerText',
     'daemonPath',
     'rawProviderPayload',
     'providerPayload',

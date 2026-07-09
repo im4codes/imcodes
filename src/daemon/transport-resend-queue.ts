@@ -36,8 +36,13 @@ export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
 export const MAX_RESEND_ENTRIES = 10;
 
 export interface ResendEntry {
-  /** User-visible task text — will be passed to runtime.send() as userMessage. */
+  /** User-visible task text — the ORIGINAL marker text used for the timeline. */
   text: string;
+  /**
+   * Agent-bound text after alias expansion (A′). When set it is delivered to the
+   * provider (via runtime.send metadata) while `text` stays the timeline copy.
+   */
+  providerText?: string;
   /** Provider-visible context to pass through TransportSessionRuntime messagePreamble. */
   messagePreamble?: string;
   /** Original clientMessageId so command.ack correlation survives the resend. */
@@ -94,6 +99,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
       privateMaterialJson: JSON.stringify({
         clientMessageId: normalizedEntry.clientMessageId,
         text: normalizedEntry.text,
+        ...(normalizedEntry.providerText != null ? { providerText: normalizedEntry.providerText } : {}),
         ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
         ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
         ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),

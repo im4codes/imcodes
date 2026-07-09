@@ -338,6 +338,13 @@ export class TransportQueueStore {
       this.db.prepare(`
         UPDATE queue_entries SET text = ?, updated_at = ? WHERE session_name = ? AND client_message_id = ?
       `).run(text, now, sessionName, clientMessageId);
+      // RV-B (clear-on-edit): an edit is fresh verbatim user text with no
+      // attached alias resolution — the runtime drops the in-memory
+      // `providerText`/`messagePreamble`. Rewrite the persisted private material
+      // to the new text and STRIP the now-stale expanded alias value + preamble,
+      // so a restart before re-delivery cannot rehydrate the old secret (and
+      // cannot deliver the old expansion with the new text).
+      this.rewritePrivateMaterialTextStrippingSecrets(sessionName, clientMessageId, text, now);
       const version = this.bumpVersion(sessionName, now);
       this.db.exec('COMMIT');
       return this.readSnapshot(sessionName, 'edit', version);
@@ -345,6 +352,44 @@ export class TransportQueueStore {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * RV-B helper: when a queued entry's text is edited, its private dispatch
+   * material must forget the previous alias expansion. Load the existing
+   * material row (if any), replace its `text`, and delete the secret
+   * `providerText`/`messagePreamble` keys, then persist it back. No-op when no
+   * material row exists. Must run inside the caller's transaction.
+   */
+  private rewritePrivateMaterialTextStrippingSecrets(
+    sessionName: string,
+    clientMessageId: string,
+    text: string,
+    now: number,
+  ): void {
+    const row = this.db.prepare(`
+      SELECT material_json AS materialJson
+      FROM queue_private_material
+      WHERE session_name = ? AND client_message_id = ?
+    `).get(sessionName, clientMessageId) as { materialJson?: string } | undefined;
+    const existingJson = readString(row?.materialJson);
+    if (!existingJson) return;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(existingJson) as Record<string, unknown>;
+    } catch {
+      // Corrupt material for an edited entry is safest dropped: the projection
+      // `text` is lossless, so rehydrate falls back to it (never a stale secret).
+      this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, clientMessageId);
+      return;
+    }
+    delete parsed.providerText;
+    delete parsed.messagePreamble;
+    parsed.text = text;
+    this.db.prepare(`
+      INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at)
+      VALUES (?, ?, ?, ?)
+    `).run(sessionName, clientMessageId, JSON.stringify(parsed), now);
   }
 
   markHandoffInFlight(sessionNameInput: string, clientMessageIds: string[], leaseMs = 60_000, now = Date.now()): HandoffTransportQueueEntry[] {

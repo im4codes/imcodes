@@ -3,7 +3,7 @@ import {
   createTransportQueueReducerState,
   reduceTransportQueueEvent,
 } from '../../shared/transport-queue-reducer.js';
-import type { QueueProjectionEntry } from '../../shared/transport-queue-types.js';
+import type { QueueEvent, QueueProjectionEntry } from '../../shared/transport-queue-types.js';
 
 export interface TransportPendingMessageEntry {
   clientMessageId: string;
@@ -278,6 +278,27 @@ function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['
   }));
 }
 
+function fromQueueProjectionEntries(entries: QueueProjectionEntry[]): TransportPendingMessageEntry[] {
+  return entries.map((entry) => ({
+    clientMessageId: entry.clientMessageId,
+    text: entry.text,
+    ...(entry.sharedActor ? { sharedActor: entry.sharedActor as SharedActorEnvelope } : {}),
+  }));
+}
+
+function buildTransportQueueReducerBaseline(
+  existing: TransportPendingQueueSyncState,
+  scopeKey: string,
+) {
+  const baseline = createTransportQueueReducerState(scopeKey);
+  baseline.queueEpoch = existing.queueEpoch ?? undefined;
+  baseline.queueAuthorityId = existing.queueAuthorityId ?? undefined;
+  baseline.pendingMessageVersion = existing.transportPendingMessageVersion ?? undefined;
+  baseline.pendingMessageEntries = toQueueProjectionEntries(existing.transportPendingMessageEntries, 'queued');
+  baseline.failedMessageEntries = toQueueProjectionEntries(existing.failedMessageEntries, 'failed');
+  return baseline;
+}
+
 export function buildTransportPendingSyncPatch(
   existing: TransportPendingQueueSyncState,
   value: Record<string, unknown>,
@@ -291,15 +312,10 @@ export function buildTransportPendingSyncPatch(
   const queueEpoch = typeof value.queueEpoch === 'string' ? value.queueEpoch : undefined;
   const queueAuthorityId = typeof value.queueAuthorityId === 'string' ? value.queueAuthorityId : undefined;
   if (!queueEpoch || !queueAuthorityId || incomingVersion === undefined) return {};
-  const baseline = createTransportQueueReducerState();
-  baseline.queueEpoch = existing.queueEpoch ?? undefined;
-  baseline.queueAuthorityId = existing.queueAuthorityId ?? undefined;
-  baseline.pendingMessageVersion = existing.transportPendingMessageVersion ?? undefined;
-  baseline.pendingMessageEntries = toQueueProjectionEntries(existing.transportPendingMessageEntries, 'queued');
-  baseline.failedMessageEntries = toQueueProjectionEntries(existing.failedMessageEntries, 'failed');
+  const baseline = buildTransportQueueReducerBaseline(existing, scopeKey);
   const next = reduceTransportQueueEvent(baseline, {
     type: 'transport.queue.snapshot',
-    sessionName: '',
+    sessionName: scopeKey,
     queueEpoch,
     queueAuthorityId,
     pendingMessageVersion: incomingVersion,
@@ -314,13 +330,28 @@ export function buildTransportPendingSyncPatch(
     queueAuthorityId,
     transportPendingMessageVersion: next.pendingMessageVersion,
     transportPendingMessages: next.pendingMessageEntries.map((entry) => entry.text),
-    transportPendingMessageEntries: next.pendingMessageEntries.map((entry) => ({
-      clientMessageId: entry.clientMessageId,
-      text: entry.text,
-    })),
-    failedMessageEntries: next.failedMessageEntries.map((entry) => ({
-      clientMessageId: entry.clientMessageId,
-      text: entry.text,
-    })),
+    transportPendingMessageEntries: fromQueueProjectionEntries(next.pendingMessageEntries),
+    failedMessageEntries: fromQueueProjectionEntries(next.failedMessageEntries),
+  };
+}
+
+export function buildTransportQueueEventPatch(
+  existing: TransportPendingQueueSyncState,
+  event: QueueEvent,
+  scopeKey: string,
+): TransportPendingQueueSyncPatch {
+  if (event.sessionName && event.sessionName !== scopeKey) return {};
+  if (event.type === 'transport.queue.receipt') return {};
+  const baseline = buildTransportQueueReducerBaseline(existing, scopeKey);
+  const next = reduceTransportQueueEvent(baseline, event);
+  if (next === baseline || next.degradedEvidence.length > baseline.degradedEvidence.length) return {};
+  if (next.queueEpoch === undefined || next.queueAuthorityId === undefined || next.pendingMessageVersion === undefined) return {};
+  return {
+    queueEpoch: next.queueEpoch,
+    queueAuthorityId: next.queueAuthorityId,
+    transportPendingMessageVersion: next.pendingMessageVersion,
+    transportPendingMessages: next.pendingMessageEntries.map((entry) => entry.text),
+    transportPendingMessageEntries: fromQueueProjectionEntries(next.pendingMessageEntries),
+    failedMessageEntries: fromQueueProjectionEntries(next.failedMessageEntries),
   };
 }

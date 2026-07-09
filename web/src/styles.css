@@ -1267,7 +1267,15 @@ html.native-ios-mac .chat-dl-btn {
   .session-ctx-bar { width: 44px; }
   .controls-composer-mobile-expanded {
     position: fixed;
-    inset: calc(var(--sat, 0px) + 8px) 8px 8px;
+    /* Anchor the bottom to the VISUAL viewport: `--vvh` shrinks when the soft
+       keyboard opens, so the box ends at the keyboard top instead of behind it.
+       iOS Safari keeps `position: fixed` boxes against the full LAYOUT viewport,
+       so a literal `bottom` inset would draw the lower third (incl. the caret)
+       under the overlay keyboard. Falls back to 100dvh without visualViewport. */
+    top: calc(var(--sat, 0px) + 8px);
+    left: 8px;
+    right: 8px;
+    height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 16px);
     z-index: 4100;
     background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(8,13,22,0.98));
     border: 1px solid rgba(34,211,238,0.28);
@@ -1594,6 +1602,30 @@ html.native-ios-mac .chat-dl-btn {
 .qp-add-confirm:hover { background: #2563eb; }
 .qp-add-cancel { padding: 4px 6px; background: none; border: none; color: #64748b; font-size: 13px; cursor: pointer; }
 .qp-add-cancel:hover { color: #f87171; }
+/* Alias tab editor */
+.qp-alias-hint { font-size: 11px; line-height: 1.45; color: #64748b; padding: 5px 10px 8px; border-bottom: 1px solid #1e293b; flex-shrink: 0; }
+.qp-alias-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #334155; flex-shrink: 0; }
+.qp-alias-value { resize: vertical; min-height: 48px; line-height: 1.4; }
+.qp-alias-error { color: #f87171; font-size: 11px; line-height: 1.35; }
+.qp-alias-form-actions { display: flex; gap: 6px; }
+/* Alias list: a detail LIST on desktop (name + truncated value + desc + tags),
+   collapsing to compact name-only pills on mobile. */
+.qp-alias-items { display: flex; }
+@media (min-width: 641px) {
+  .qp-alias-items { flex-direction: column; gap: 2px; padding: 4px 6px 8px; }
+  .qp-alias-item { width: 100%; box-sizing: border-box; background: none; border: none; border-radius: 6px; padding: 4px 8px; gap: 8px; align-items: center; }
+  .qp-alias-item:hover { background: rgba(148,163,184,0.08); }
+  .qp-alias-item .qp-pill-text { flex: 0 0 auto; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qp-alias-item-meta { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 10px; overflow: hidden; }
+  .qp-alias-item-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #93c5fd; }
+  .qp-alias-item-desc { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #64748b; }
+  .qp-alias-item-tags { flex: 0 0 auto; display: inline-flex; gap: 3px; align-self: center; }
+  .qp-alias-tag { font-size: 9px; line-height: 1.7; color: #67e8f9; background: rgba(34,211,238,0.12); border-radius: 4px; padding: 0 5px; }
+}
+@media (max-width: 640px) {
+  .qp-alias-items { flex-direction: row; flex-wrap: wrap; gap: 5px; padding: 5px 10px 8px; }
+  .qp-alias-item-meta { display: none; }
+}
 .qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
 .qp-section-header { padding: 6px 10px 3px; font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: 0; text-transform: uppercase; position: sticky; top: 0; background: linear-gradient(180deg, #111827, #0f172a); z-index: 1; border-bottom: 1px solid rgba(125,211,252,0.08); }
 .qp-history-empty { padding: 6px 10px 8px; font-size: 11px; color: #475569; font-style: italic; }
@@ -1634,7 +1666,10 @@ html.native-ios-mac .chat-dl-btn {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 10001; }
-  .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - 72px)); border-radius: 12px 12px 0 0; border-bottom: none; }
+  /* Float the panel as a card that clears the home-indicator / bottom edge:
+     lift the bottom by the safe-area inset + margin ("底部留点余量") and add
+     small side margins so it no longer sits flush against the screen bottom. */
+  .qp { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0px) + 12px); left: 8px; right: 8px; width: auto; max-height: min(82vh, calc(var(--vvh, 100dvh) - var(--sat, 0px) - env(safe-area-inset-bottom, 0px) - 88px)); border-radius: 14px; }
 }
 
 /* Login */

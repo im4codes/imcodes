@@ -10,6 +10,7 @@ import {
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
+import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
@@ -105,7 +106,18 @@ describe('memory MCP interface e2e', () => {
   it('runs the real stdio server, exposes the registered shared tools, and persists runtime-derived preference provenance', async () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
-      expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+      const listedNames = listed.tools.map((tool) => tool.name);
+      // The memory MCP process hosts the memory tools PLUS the full alias CRUD
+      // tool set (resolve_alias / list_aliases / save_alias / delete_alias);
+      // assert the memory set and all four alias tools are present
+      // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
+      expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
 
       const saved = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,

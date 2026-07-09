@@ -8,6 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { MEMORY_MCP_TOOL_NAME_LIST } from '../../shared/memory-mcp-contracts.js';
+import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { createMemoryMcpServerFromEnv, mergeDefaultToolDeps } from '../../src/daemon/memory-mcp-server.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 
@@ -171,7 +172,15 @@ describe('memory MCP stdio server', () => {
     try {
       await client.connect(transport);
       const listed = await client.listTools();
-      expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+      const listedNames = listed.tools.map((tool) => tool.name);
+      // Memory tools plus the full alias CRUD tool set share the same server surface.
+      expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
       for (const tool of listed.tools) {
         expect(tool.description).toBeTruthy();
       }
@@ -200,7 +209,14 @@ describe('memory MCP stdio server', () => {
     try {
       await client.connect(transport);
       const listed = await client.listTools();
-      expect(listed.tools.map((tool) => tool.name)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+      const listedNames = listed.tools.map((tool) => tool.name);
+      expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
+      expect(listedNames).toEqual(expect.arrayContaining([
+        ALIAS_MCP_TOOLS.RESOLVE,
+        ALIAS_MCP_TOOLS.LIST,
+        ALIAS_MCP_TOOLS.SAVE,
+        ALIAS_MCP_TOOLS.DELETE,
+      ]));
     } finally {
       await client.close();
     }

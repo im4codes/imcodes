@@ -75,4 +75,61 @@ describe('server logger redaction', () => {
     expect(payload.err.code).toBe('ECONNREFUSED');    // enumerable own prop carried through
     expect(payload.op).toBe('session.persist');       // sibling context intact
   });
+
+  // PP4: alias `resolvedAliases` values are value-secrecy scoped — they may reach
+  // the daemon in the raw session.send payload, but must NEVER appear in a server
+  // log. The whole field (names AND values) is scrubbed to `[REDACTED]` at every
+  // nesting depth, BEFORE the shared key/value redactObject runs.
+  it('redacts a top-level resolvedAliases field (both alias names and their values)', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    logger.info(
+      { type: 'session.send', commandId: 'c1', resolvedAliases: { prod: 'ssh secret-host', db: 'psql://u:pw@h' } },
+      'relaying send',
+    );
+
+    const raw = spy.mock.calls[0]![0] as string;
+    // No alias VALUE reaches the sink.
+    expect(raw).not.toContain('ssh secret-host');
+    expect(raw).not.toContain('psql://u:pw@h');
+    // No alias NAME reaches the sink either (the whole map is redacted).
+    expect(raw).not.toContain('prod');
+    // The field is present but scrubbed; sibling context stays intact.
+    const payload = JSON.parse(raw) as { resolvedAliases: unknown; type: string; commandId: string };
+    expect(payload.resolvedAliases).toBe('[REDACTED]');
+    expect(payload.type).toBe('session.send');
+    expect(payload.commandId).toBe('c1');
+  });
+
+  it('redacts a nested/deeply-nested resolvedAliases field', () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    logger.info(
+      { outer: { inner: { resolvedAliases: { deploy: 'ssh root@host && restart' } }, ok: 'visible' } },
+      'nested send meta',
+    );
+
+    const raw = spy.mock.calls[0]![0] as string;
+    expect(raw).not.toContain('ssh root@host && restart');
+    expect(raw).not.toContain('deploy');
+    const payload = JSON.parse(raw) as { outer: { inner: { resolvedAliases: unknown }; ok: string } };
+    expect(payload.outer.inner.resolvedAliases).toBe('[REDACTED]');
+    expect(payload.outer.ok).toBe('visible'); // unrelated fields untouched
+  });
+
+  it('redacts a resolvedAliases field nested inside an array element', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    logger.warn(
+      { items: [{ resolvedAliases: { k: 'super-secret-value' }, id: 1 }, 'plain'] },
+      'array send meta',
+    );
+
+    const raw = spy.mock.calls[0]![0] as string;
+    expect(raw).not.toContain('super-secret-value');
+    const payload = JSON.parse(raw) as { items: [{ resolvedAliases: unknown; id: number }, string] };
+    expect(payload.items[0].resolvedAliases).toBe('[REDACTED]');
+    expect(payload.items[0].id).toBe(1);       // sibling field intact
+    expect(payload.items[1]).toBe('plain');    // other elements intact
+  });
 });

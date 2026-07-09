@@ -1353,51 +1353,31 @@ async function drainTransportResendQueueIntoRuntime(
       sessionName,
       (entry) => {
         const attachments = entry.attachments ?? [];
-        const sharedMetadata = entry.sharedActor ? { sharedActor: entry.sharedActor } : undefined;
+        // Single metadata object for every send shape below. `providerText`
+        // (alias-expanded agent-bound copy, A′) rides here so the provider gets
+        // the expanded text while `entry.text` stays the timeline copy; the
+        // committed flags and sharedActor are threaded exactly as before.
+        const resendMetadata = {
+          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+          ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+          ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+          ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+        };
         const result = entry.messagePreamble
-          ? (sharedMetadata
-              ? runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-                {
-                  ...sharedMetadata,
-                  ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                  ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                },
-              )
-              : runtime.send(
-                entry.text,
-                entry.commandId,
-                attachments.length > 0 ? attachments : undefined,
-                entry.messagePreamble,
-                {
-                  ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                  ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                },
-              ))
-          : (attachments.length > 0
-              ? (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, attachments, undefined, {
-                    ...sharedMetadata,
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  })
-                  : runtime.send(entry.text, entry.commandId, attachments, undefined, {
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  }))
-              : (sharedMetadata
-                  ? runtime.send(entry.text, entry.commandId, undefined, undefined, {
-                    ...sharedMetadata,
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  })
-                  : runtime.send(entry.text, entry.commandId, undefined, undefined, {
-                    ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-                    ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-                  })));
+          ? runtime.send(
+              entry.text,
+              entry.commandId,
+              attachments.length > 0 ? attachments : undefined,
+              entry.messagePreamble,
+              resendMetadata,
+            )
+          : runtime.send(
+              entry.text,
+              entry.commandId,
+              attachments.length > 0 ? attachments : undefined,
+              undefined,
+              resendMetadata,
+            );
         if (result === 'sent' && !entry.timelineCommitted) {
           const clientMessageId = entry.clientMessageId;
           if (!clientMessageId) {
