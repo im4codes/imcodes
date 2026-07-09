@@ -643,9 +643,11 @@ describe('SubSessionWindow metadata wiring', () => {
 });
 
 describe('SubSessionWindow terminal subscription raw mode', () => {
+  const releaseHold = vi.fn();
   const ws = {
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
+    holdTerminalRaw: vi.fn(() => releaseHold),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
   } as any;
@@ -992,7 +994,10 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
-  it('keeps shell windows unsubscribed while inactive and raw-subscribes only while active', async () => {
+  it('holds the shell window raw stream for its whole lifetime, regardless of focus', async () => {
+    // Regression: an open shell window that lost focus used to unsubscribe and
+    // freeze. It must now keep the raw PTY stream HELD the whole time it is open
+    // (users pin one to the side to observe), via the ref-counted holdTerminalRaw.
     const sub = makeSubSession();
 
     const view = render(
@@ -1012,8 +1017,16 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       />,
     );
 
+    // Held immediately even though inactive; shell no longer uses the focus-gated
+    // base subscribe, and the hold is not released while mounted.
+    await waitFor(() => {
+      expect(ws.holdTerminalRaw).toHaveBeenCalledWith(sub.sessionName);
+    });
+    expect(ws.holdTerminalRaw).toHaveBeenCalledTimes(1);
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
+    expect(releaseHold).not.toHaveBeenCalled();
 
+    // Toggling focus must NOT re-hold or release — the hold is focus-independent.
     view.rerender(
       <SubSessionWindow
         sub={sub}
@@ -1030,11 +1043,6 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
         onFocus={vi.fn()}
       />,
     );
-
-    await waitFor(() => {
-      expect(ws.subscribeTerminal).toHaveBeenCalledWith(sub.sessionName, true);
-    });
-
     view.rerender(
       <SubSessionWindow
         sub={sub}
@@ -1051,9 +1059,14 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
         onFocus={vi.fn()}
       />,
     );
+    expect(ws.holdTerminalRaw).toHaveBeenCalledTimes(1);
+    expect(releaseHold).not.toHaveBeenCalled();
 
+    // Closing the window releases the hold (server stops streaming when the last
+    // holder unmounts).
+    view.unmount();
     await waitFor(() => {
-      expect(ws.unsubscribeTerminal).toHaveBeenCalledWith(sub.sessionName);
+      expect(releaseHold).toHaveBeenCalledTimes(1);
     });
   });
 
