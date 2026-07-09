@@ -89,6 +89,7 @@ import {
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import {
@@ -1187,7 +1188,7 @@ export function App() {
   // (DAEMON_MSG.UPGRADING), so the version badge shows "upgrading…" through the
   // restart/disconnect instead of a bare offline flash. Cleared on the next
   // reconnect/online, or by a safety timeout if the upgrade never lands.
-  const [daemonUpgrading, setDaemonUpgrading] = useState<{ targetVersion: string } | null>(null);
+  const [daemonUpgrading, setDaemonUpgrading] = useState<DaemonUpgradingState>(null);
   const daemonUpgradingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -3419,18 +3420,30 @@ export function App() {
           setServers((prev) => markServerOffline(prev, selectedServerId));
         }, RECONNECT_GRACE_MS);
       }
-      if (msg.type === DAEMON_MSG.UPGRADING) {
-        // Daemon spawned its upgrade script and is about to restart — show an
-        // "upgrading…" badge next to the version through the disconnect instead
-        // of a bare offline flash. Cleared on the next online/reconnect below
-        // (new version), or by the safety timeout if the upgrade never lands.
-        const targetVersion = typeof msg.targetVersion === 'string' ? msg.targetVersion : '';
-        setDaemonUpgrading({ targetVersion });
-        if (daemonUpgradingTimerRef.current) clearTimeout(daemonUpgradingTimerRef.current);
-        daemonUpgradingTimerRef.current = setTimeout(() => {
-          daemonUpgradingTimerRef.current = null;
-          setDaemonUpgrading(null);
-        }, DAEMON_UPGRADING_MAX_MS);
+      {
+        // Daemon-upgrade badge lifecycle (pure reducer): UPGRADING begins it
+        // (so the version shows "upgrading…" through the restart instead of a
+        // bare offline flash); ONLINE/RECONNECTED — the possibly-upgraded daemon
+        // is back — clears it; anything else leaves it untouched (undefined).
+        const upgradingNext = nextDaemonUpgradingState(
+          msg.type,
+          (msg as { targetVersion?: unknown }).targetVersion,
+        );
+        if (upgradingNext !== undefined) {
+          setDaemonUpgrading(upgradingNext);
+          if (daemonUpgradingTimerRef.current) {
+            clearTimeout(daemonUpgradingTimerRef.current);
+            daemonUpgradingTimerRef.current = null;
+          }
+          if (upgradingNext) {
+            // Safety auto-clear: if the daemon never reconnects (failed install)
+            // don't strand the badge forever. Reconnect/online clears it sooner.
+            daemonUpgradingTimerRef.current = setTimeout(() => {
+              daemonUpgradingTimerRef.current = null;
+              setDaemonUpgrading(null);
+            }, DAEMON_UPGRADING_MAX_MS);
+          }
+        }
       }
       if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
         void checkForAppUpdate();
@@ -3438,13 +3451,8 @@ export function App() {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
         }
-        // The (possibly upgraded) daemon is back — clear the upgrading badge so
-        // the freshly-reported version shows plainly.
-        if (daemonUpgradingTimerRef.current) {
-          clearTimeout(daemonUpgradingTimerRef.current);
-          daemonUpgradingTimerRef.current = null;
-        }
-        setDaemonUpgrading(null);
+        // (The upgrading badge is cleared by the reducer block above, which also
+        // handles ONLINE/RECONNECTED.)
         setDaemonOnline(true);
         setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
@@ -4783,16 +4791,9 @@ export function App() {
                   Daemon v{formatDaemonVersionShort(daemonVersionForDisplay)}
                 </span>
                 {daemonUpgrading && (
-                  <span
-                    class="daemon-upgrading-badge"
-                    title={daemonUpgrading.targetVersion
-                      ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
-                      : trans('sidebar.daemon_upgrading')}
-                  >
+                  <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
                     <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
-                    {daemonUpgrading.targetVersion
-                      ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
-                      : trans('sidebar.daemon_upgrading')}
+                    {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
                   </span>
                 )}
               </div>
@@ -5443,16 +5444,9 @@ export function App() {
                     {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
                   </span>
                   {daemonUpgrading && (
-                    <span
-                      class="daemon-upgrading-badge"
-                      title={daemonUpgrading.targetVersion
-                        ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
-                        : trans('sidebar.daemon_upgrading')}
-                    >
+                    <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
                       <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
-                      {daemonUpgrading.targetVersion
-                        ? trans('sidebar.daemon_upgrading_to', { version: formatDaemonVersionShort(daemonUpgrading.targetVersion) })
-                        : trans('sidebar.daemon_upgrading')}
+                      {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
                     </span>
                   )}
                   <button
