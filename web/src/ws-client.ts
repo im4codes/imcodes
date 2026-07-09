@@ -139,6 +139,7 @@ export type ServerMessage =
   | { type: typeof TRANSPORT_MSG.APPROVAL_RESPONSE; sessionId: string; requestId: string; approved: boolean }
   | { type: typeof DAEMON_MSG.RECONNECTED }
   | { type: typeof DAEMON_MSG.DISCONNECTED }
+  | { type: typeof DAEMON_MSG.UPGRADING; targetVersion?: string; fromVersion?: string }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'auto_deliver_active'; activeRunIds?: string[] }
   | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'transport_busy'; activeSessionNames?: string[]; blockedSessions?: TransportUpgradeBlockedSession[] }

@@ -16,6 +16,7 @@ import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
+import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -470,22 +471,25 @@ export function SubSessionWindow({
     }
   }, [viewMode, ws, connected, active, sub.sessionName]);
 
-  // Re-subscribe terminal on mount so the server sends a fresh snapshot.
-  // SubSessionWindow unmounts on minimize, so without this the remounted
-  // TerminalView would start empty (no snapshot, only incremental data).
+  // Shell/script window: hold the raw PTY stream for the window's ENTIRE
+  // lifetime — NOT just while focused. An open sub-session window is always
+  // on-screen (position:fixed); users often keep one at the side to observe, so
+  // it must keep updating regardless of focus. (Previously this bailed with
+  // `if (isShell && !active) return` and unsubscribed on focus loss, which froze
+  // an open-but-unfocused shell window.) Ref-counted hold — see useTerminalRawHold.
+  useTerminalRawHold(ws, connected, isShell && !isTransport, sub.sessionName);
+
+  // Non-shell window: subscribe raw only while focused (full-fidelity view); when
+  // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
+  // Re-subscribe on mount so the server sends a fresh snapshot (the window
+  // unmounts on minimize, so a remount would otherwise start empty).
   useEffect(() => {
-    if (!ws || !connected || isTransport) return;
-    if (isShell && !active) return;
+    if (!ws || !connected || isTransport || isShell) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
-    if (!raw) {
-      return;
-    }
+    if (!raw) return;
     return () => {
-      try {
-        if (isShell) ws.unsubscribeTerminal(sub.sessionName);
-        else ws.subscribeTerminal(sub.sessionName, false);
-      } catch { /* ignore */ }
+      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
   }, [ws, connected, sub.sessionName, active, isTransport, isShell]);
 
@@ -928,7 +932,7 @@ export function SubSessionWindow({
             sessionName={sub.sessionName}
             ws={ws}
             connected={connected}
-            active={active && viewMode === 'terminal'}
+            active={(isShell || active) && viewMode === 'terminal'}
             onDiff={(apply) => onDiff(sub.sessionName, apply)}
             onHistory={(apply) => onHistory(sub.sessionName, apply)}
             onFitFn={(fn) => { termFitFnRef.current = fn; }}

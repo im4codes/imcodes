@@ -72,6 +72,18 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     expect(installSection).toContain('NPM_INSTALL_TIMEOUT_MS');
   });
 
+  it('passes npm fetch-retries so a transient network drop does not brick the install', () => {
+    // `npm install -g` removes the old install before completing the new one,
+    // so a single ECONNRESET mid-download leaves BOTH gone and permanently
+    // bricks the daemon (missing imcodes.cmd → watchdog can't relaunch).
+    // The upgrade install MUST retry network fetches.
+    const runnerSrc = readFileSync(RUNNER_SRC, 'utf8');
+    const startIdx = runnerSrc.indexOf("'install', '-g'");
+    const installSection = runnerSrc.slice(startIdx, runnerSrc.indexOf('NPM_INSTALL_TIMEOUT_MS', startIdx));
+    expect(installSection).toContain('--fetch-retries');
+    expect(installSection).toContain('--fetch-timeout');
+  });
+
   it('logs spawn .error and .signal verbosely so timeouts are visible', () => {
     // Old code only looked at result.status; a SIGKILL'd timeout has
     // status=null + signal=SIGKILL and slipped through as a generic

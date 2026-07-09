@@ -89,6 +89,7 @@ import {
 } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import {
@@ -251,6 +252,11 @@ type AppUpdateNotice = {
 const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
 const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
 const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
+// Safety ceiling for the "daemon upgrading…" badge: an npm install + restart
+// normally completes in well under a minute, but a slow network / retry storm
+// can drag on. If the daemon never reconnects (failed install), clear the badge
+// after this so it doesn't stick forever. Reconnect/online clears it sooner.
+const DAEMON_UPGRADING_MAX_MS = 5 * 60 * 1_000;
 const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
 
 function readOpenSpecAutoRunbarCompactPreference(): boolean {
@@ -573,6 +579,23 @@ export function App() {
     watchProjectionStore.beginServerSwitch(selectedServerId);
   }, [selectedServerId]);
 
+  // The "daemon upgrading…" badge is not server-scoped state, so drop it when
+  // the selected server changes (its target belonged to the previous device),
+  // and on unmount, so a stale badge never lingers.
+  useEffect(() => {
+    setDaemonUpgrading(null);
+    if (daemonUpgradingTimerRef.current) {
+      clearTimeout(daemonUpgradingTimerRef.current);
+      daemonUpgradingTimerRef.current = null;
+    }
+    return () => {
+      if (daemonUpgradingTimerRef.current) {
+        clearTimeout(daemonUpgradingTimerRef.current);
+        daemonUpgradingTimerRef.current = null;
+      }
+    };
+  }, [selectedServerId]);
+
   useEffect(() => {
     selectedServerIdRef.current = selectedServerId;
     if (selectedServerId) {
@@ -638,6 +661,7 @@ export function App() {
   useEffect(() => {
     if (shouldUseIosMacTextScale()) {
       document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.style.removeProperty('--kbh');
       document.documentElement.classList.remove('kb-open', 'input-focused');
       return;
     }
@@ -651,6 +675,16 @@ export function App() {
       // Detect keyboard open: viewport shrink + optional input-focus fallback.
       // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
       const shrink = window.innerHeight - vv.height;
+      // Expose the soft-keyboard height so position:fixed overlays anchored to the
+      // LAYOUT viewport (e.g. the QuickInputPanel alias editor, `.qp`) can lift
+      // their bottom ABOVE the keyboard. The main composer stays visible because
+      // `.layout` shrinks via --vvh, but a fixed panel is NOT inside that shrunk
+      // box, so without --kbh its lower half — and the focused alias input — sits
+      // behind the keyboard. Subtract offsetTop for the iOS case where the visual
+      // viewport is pushed down rather than purely shortened.
+      document.documentElement.style.setProperty(
+        '--kbh', `${Math.max(0, shrink - (vv.offsetTop || 0))}px`,
+      );
       const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
       hadKeyboardOpen = state.hadKeyboardOpen;
       const { kbOpen, hideInputUi } = state;
@@ -1150,6 +1184,12 @@ export function App() {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [daemonOnline, setDaemonOnline] = useState(false);
+  // Set when the daemon announces it just spawned its upgrade script
+  // (DAEMON_MSG.UPGRADING), so the version badge shows "upgrading…" through the
+  // restart/disconnect instead of a bare offline flash. Cleared on the next
+  // reconnect/online, or by a safety timeout if the upgrade never lands.
+  const [daemonUpgrading, setDaemonUpgrading] = useState<DaemonUpgradingState>(null);
+  const daemonUpgradingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Debounce the "Daemon Offline" badge. The server broadcasts
@@ -3380,12 +3420,39 @@ export function App() {
           setServers((prev) => markServerOffline(prev, selectedServerId));
         }, RECONNECT_GRACE_MS);
       }
+      {
+        // Daemon-upgrade badge lifecycle (pure reducer): UPGRADING begins it
+        // (so the version shows "upgrading…" through the restart instead of a
+        // bare offline flash); ONLINE/RECONNECTED — the possibly-upgraded daemon
+        // is back — clears it; anything else leaves it untouched (undefined).
+        const upgradingNext = nextDaemonUpgradingState(
+          msg.type,
+          (msg as { targetVersion?: unknown }).targetVersion,
+        );
+        if (upgradingNext !== undefined) {
+          setDaemonUpgrading(upgradingNext);
+          if (daemonUpgradingTimerRef.current) {
+            clearTimeout(daemonUpgradingTimerRef.current);
+            daemonUpgradingTimerRef.current = null;
+          }
+          if (upgradingNext) {
+            // Safety auto-clear: if the daemon never reconnects (failed install)
+            // don't strand the badge forever. Reconnect/online clears it sooner.
+            daemonUpgradingTimerRef.current = setTimeout(() => {
+              daemonUpgradingTimerRef.current = null;
+              setDaemonUpgrading(null);
+            }, DAEMON_UPGRADING_MAX_MS);
+          }
+        }
+      }
       if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
         void checkForAppUpdate();
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
         }
+        // (The upgrading badge is cleared by the reducer block above, which also
+        // handles ONLINE/RECONNECTED.)
         setDaemonOnline(true);
         setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
@@ -4723,6 +4790,12 @@ export function App() {
                 <span style={{ color: '#94a3b8' }} title={`Daemon v${daemonVersionForDisplay}`}>
                   Daemon v{formatDaemonVersionShort(daemonVersionForDisplay)}
                 </span>
+                {daemonUpgrading && (
+                  <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
+                    <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
+                    {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
+                  </span>
+                )}
               </div>
             )}
             {daemonStats && (
@@ -5370,6 +5443,12 @@ export function App() {
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
                     {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
                   </span>
+                  {daemonUpgrading && (
+                    <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>
+                      <span class="daemon-upgrading-spinner" aria-hidden="true">⟳</span>
+                      {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
+                    </span>
+                  )}
                   <button
                     style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
                     onClick={async () => {

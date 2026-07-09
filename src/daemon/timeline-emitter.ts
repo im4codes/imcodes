@@ -194,7 +194,18 @@ export class TimelineEmitter {
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;
     this.seqMap.set(sessionId, seq);
 
-    const ts = opts?.ts ?? Date.now();
+    let ts = opts?.ts ?? Date.now();
+    // Anchor a stable-eventId event to its FIRST-seen ts. Streaming assistant
+    // text and its terminal update (⚠️ Turn cancelled / completion / error)
+    // share one eventId; without this, a late terminal update — e.g. a delayed
+    // stop-settle — is stamped with "now" and sinks below whatever the user
+    // sent right after pressing Stop, flipping their order in the timeline
+    // (both live via preferTimelineEvent and on reload from the persisted ts).
+    const stableEventId = opts?.eventId;
+    if (stableEventId != null) {
+      const prior = this.buffer.get(sessionId)?.find((e) => e.eventId === stableEventId);
+      if (prior && prior.ts < ts) ts = prior.ts;
+    }
     let eventId: string;
     if (opts?.eventId) {
       eventId = opts.eventId;

@@ -68,6 +68,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       RECONNECTED: 'daemon.reconnected',
       DISCONNECTED: 'daemon.disconnected',
       UPGRADE_BLOCKED: 'daemon.upgrade_blocked',
+      UPGRADING: 'daemon.upgrading',
     });
 
     expect(DAEMON_COMMAND_TYPES).toEqual({

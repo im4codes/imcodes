@@ -1848,10 +1848,36 @@ export function useTimeline(
       // never mistaken for "no history". `ensureOpen` is awaited inside the
       // read methods. See run 016f9b5b-c8f (split-key + fail-safe).
       const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-      const { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(
+      let { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(
         db, cacheKey!, rawSessionIdForFallback, MAX_MEMORY_EVENTS,
       );
       if (cancelled) return;
+      // Race-proof local recovery: `getRecentEvents` returns [] BOTH for a
+      // genuine cold start AND when IndexedDB failed to open (blocked by another
+      // tab's versionchange right after a schema bump, private-mode, a
+      // quota/backoff blip) → the shared DB degraded to memory-only and on-disk
+      // history is simply UNREADABLE. That indistinguishable empty is the "open
+      // the chat and it's blank; ↻ instantly shows local" bug. Checking
+      // `memoryOnly` HERE (after the read) — not before — is what makes this
+      // race-proof: by now `ensureOpen()` has settled, so `memoryOnly` reliably
+      // reflects a failed open even when the open failed DURING this very read
+      // (in-flight at load() start). Recover exactly like the ↻ button
+      // (resetAndReopen forces a fresh open past the now-cleared blocker/backoff)
+      // and re-read once before falling through to the daemon. Guarded by
+      // memoryOnly so a healthy connection never pays the shared-singleton reset.
+      if (stored.length === 0 && sharedDb.memoryOnly) {
+        try {
+          await sharedDb.resetAndReopen();
+          if (cancelled) return;
+          const retry = await readLocalTimelineMerged(
+            db, cacheKey!, rawSessionIdForFallback, MAX_MEMORY_EVENTS,
+          );
+          if (cancelled) return;
+          stored = retry.stored;
+          cursor = retry.cursor;
+          rawAlreadyRead = retry.rawAlreadyRead;
+        } catch { /* keep empty; daemon fallback below fills in */ }
+      }
       if (cursor) {
         epochRef.current = cursor.epoch;
         seqRef.current = cursor.seq;

@@ -1642,6 +1642,16 @@ describe('P2P orchestrator — parallel rounds', () => {
       setTimeout(() => notifySessionIdle(session), 5);
     });
 
+    // Regression: a required initiator hop that never writes its marker must
+    // time out ONCE (hopTimeoutMs), not twice (an earlier bug doubled it). This
+    // can only be observed via wall-clock, so use a LARGE hop timeout: fixed
+    // scheduling/polling overhead on a loaded CI runner (observed up to ~0.5s,
+    // occasionally more) must stay well below the 1×/2× gap. At 2s the correct
+    // (1×) run lands near ~2s+overhead and the doubled (2×) bug near ~4s;
+    // asserting < 1.7× (3.4s) leaves wide margin on both sides and is
+    // contention-proof. The old 220ms/420ms bound flaked because fixed overhead
+    // alone (~0.5s) already exceeded the 200ms 1×/2× gap.
+    const hopTimeoutMs = 2000;
     const startedAt = Date.now();
     const run = await startP2pRun(
       'deck_proj_brain',
@@ -1652,13 +1662,16 @@ describe('P2P orchestrator — parallel rounds', () => {
       1,
       undefined,
       undefined,
-      220,
+      hopTimeoutMs,
     );
 
-    const done = await waitForStatus(run.id, ['completed'], 3000);
+    // Cap comfortably above the doubled-timeout (buggy) duration so even a
+    // regression still completes and is measured here, instead of tripping
+    // this wait and masking the real assertion below.
+    const done = await waitForStatus(run.id, ['completed'], 9000);
     const elapsedMs = Date.now() - startedAt;
     expect(done.skippedHops).toContain('deck_proj_brain');
-    expect(elapsedMs).toBeLessThan(420);
+    expect(elapsedMs).toBeLessThan(hopTimeoutMs * 1.7);
   });
 
   it('uses isolated cross-project hop copies and copies completed artifacts back to the main project hop file', async () => {

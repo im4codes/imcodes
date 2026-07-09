@@ -6954,6 +6954,20 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     }, UPGRADE_MEMORY_FREEZE_TTL_MS);
     timer.unref?.();
   };
+  // Announce "upgrading" to the server (→ browsers) the moment the detached
+  // upgrade script is spawned, before this process is killed & restarted, so the
+  // UI shows an "upgrading…" badge next to the daemon version instead of a bare
+  // disconnect. Best-effort: the WS may be mid-teardown. The browser clears this
+  // state on the next reconnect (new version) or a safety timeout.
+  const announceUpgrading = () => {
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADING,
+        targetVersion: targetVersion ?? 'latest',
+        fromVersion: DAEMON_VERSION,
+      });
+    } catch { /* best-effort — the socket may already be closing */ }
+  };
 
   try {
     const postFreezeMasterCompactions = getInflightMasterCompactionCount();
@@ -7080,6 +7094,7 @@ launchctl load -w "${plist}"`;
 
     logger.info({ log: logFile, runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     upgradeScriptSpawned = true;
+    announceUpgrading();
     scheduleUpgradeMemoryFreezeRelease();
     return;
   } else {
@@ -7776,6 +7791,7 @@ schedule_self_cleanup
 
   logger.info({ log: logFile }, 'daemon.upgrade: upgrade script spawned, will restart in ~3 s');
   upgradeScriptSpawned = true;
+  announceUpgrading();
   scheduleUpgradeMemoryFreezeRelease();
   } finally {
     if (!upgradeScriptSpawned) {
