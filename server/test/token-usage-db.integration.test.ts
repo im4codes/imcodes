@@ -15,15 +15,6 @@ import {
   getTokenUsageSummary,
   ingestServerTokenUsageFacts,
 } from '../src/db/token-usage-queries.js';
-import {
-  recordTurnUsage,
-  resetContextStoreForTests,
-  selectTurnUsageSyncBatch,
-} from '../../src/store/context-store.js';
-import {
-  cleanupIsolatedSharedContextDb,
-  createIsolatedSharedContextDb,
-} from '../../test/util/shared-context-db.js';
 import type { UsageFact } from '../../shared/usage-analytics.js';
 
 let db: Database;
@@ -508,61 +499,63 @@ describe('server token usage storage', () => {
     }
   });
 
-  it('syncs a daemon-local usage row through server ingest into server summaries', async () => {
+  it('ingests a daemon-shaped usage fact into server summaries', async () => {
+    // Server-side ingest/summary for a fact shaped exactly as the daemon emits
+    // one (sub-session, complete metadata, provider/model, cost → micros). The
+    // DAEMON-side production of that fact — recordTurnUsage → selectTurnUsageSyncBatch
+    // → UsageFact — is covered by test/store/turn-usage.test.ts and
+    // test/daemon/usage-sync-worker.test.ts. This server integration test must
+    // NOT import daemon runtime (../../src/store/context-store.js) to drive it:
+    // that pulled `pino` (a daemon-only dep) into the server-only CI job and made
+    // the whole file fail to load ("0 test"). See CLAUDE.md — never import across
+    // project boundaries with ../../src paths.
     const { userId, serverId } = await seedOwnerServer('usage-daemon-sync');
-    const tempDir = await createIsolatedSharedContextDb('server-usage-daemon-sync');
-    try {
-      recordTurnUsage({
+    const daemonFact = fact({
+      usageFactId: 'daemon-event-1',
+      createdAtMs: Date.UTC(2026, 6, 9, 10, 0),
+      sessionName: 'deck_daemon_brain',
+      sessionKind: 'sub',
+      parentSessionName: 'deck_parent_brain',
+      metadataCompleteness: 'complete',
+      agentType: 'codex-sdk',
+      provider: 'openai',
+      model: 'gpt-5',
+      inputTokens: 11,
+      cacheTokens: 3,
+      outputTokens: 7,
+      totalTokens: 21,
+      contextWindow: 200000,
+      costUsdMicros: 123,
+      sourceEventId: 'daemon-event-1',
+    });
+    await ingestServerTokenUsageFacts(db, {
+      serverId,
+      userId,
+      facts: [daemonFact],
+      now: Date.UTC(2026, 6, 10, 0, 0),
+    });
+
+    const summary = await getTokenUsageSummary(db, userId, { serverId });
+    expect(summary.accountTotal).toMatchObject({
+      factCount: 1,
+      inputTokens: 11,
+      cacheTokens: 3,
+      outputTokens: 7,
+      totalTokens: 21,
+      costUsdMicros: 123,
+    });
+    expect(summary.bySubSession).toEqual([
+      expect.objectContaining({
         sessionName: 'deck_daemon_brain',
-        sessionKind: 'sub',
         parentSessionName: 'deck_parent_brain',
-        metadataCompleteness: 'complete',
-        agentType: 'codex-sdk',
+      }),
+    ]);
+    expect(summary.byProviderModel).toEqual([
+      expect.objectContaining({
         provider: 'openai',
         model: 'gpt-5',
-        inputTokens: 11,
-        cacheTokens: 3,
-        outputTokens: 7,
-        contextWindow: 200000,
-        costUsd: 0.000123,
-        eventId: 'daemon-event-1',
-        createdAt: Date.UTC(2026, 6, 9, 10, 0),
-      });
-
-      const batch = selectTurnUsageSyncBatch({ limit: 10, now: Date.UTC(2026, 6, 10, 0, 0) });
-      expect(batch).toHaveLength(1);
-      await ingestServerTokenUsageFacts(db, {
-        serverId,
-        userId,
-        facts: batch.map((item) => item.fact),
-        now: Date.UTC(2026, 6, 10, 0, 0),
-      });
-
-      const summary = await getTokenUsageSummary(db, userId, { serverId });
-      expect(summary.accountTotal).toMatchObject({
-        factCount: 1,
-        inputTokens: 11,
-        cacheTokens: 3,
-        outputTokens: 7,
         totalTokens: 21,
-        costUsdMicros: 123,
-      });
-      expect(summary.bySubSession).toEqual([
-        expect.objectContaining({
-          sessionName: 'deck_daemon_brain',
-          parentSessionName: 'deck_parent_brain',
-        }),
-      ]);
-      expect(summary.byProviderModel).toEqual([
-        expect.objectContaining({
-          provider: 'openai',
-          model: 'gpt-5',
-          totalTokens: 21,
-        }),
-      ]);
-    } finally {
-      resetContextStoreForTests();
-      await cleanupIsolatedSharedContextDb(tempDir);
-    }
+      }),
+    ]);
   });
 });
