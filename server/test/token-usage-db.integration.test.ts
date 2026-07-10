@@ -584,36 +584,40 @@ describe('server token usage storage', () => {
     expect(summary.bySubSession.map((r) => r.sessionName).sort()).toEqual(['deck_g_w1', 'deck_g_w2']);
   });
 
-  it('groupSession + serverId scopes to ONE server (no cross-machine duplicate main rows)', async () => {
-    // Regression: the same main session name existing on multiple servers merged
-    // into duplicate "Main session" rows because the panel fetch was not
-    // server-scoped. With serverId, only that server's group is returned — one
-    // main + its subs.
+  it('groupSession aggregates a group ACROSS servers (full total; client merges per-server rows)', async () => {
+    // The same main session name runs on several machines. The panel is
+    // intentionally cross-server (scoping to one server hid whole months of
+    // data), so groupSession must include every server's rows for the group —
+    // giving the full total. The server returns the main once PER server; the
+    // client merges those by session name (mergeUsageRowsBySession) for display.
     const userId = unique('multi-user');
     await createUser(db, userId);
     const serverA = unique('multi-srvA');
     const serverB = unique('multi-srvB');
     await createServer(db, serverA, userId, 'machine A', unique('hash'));
     await createServer(db, serverB, userId, 'machine B', unique('hash'));
-    const now = Date.UTC(2026, 6, 10, 0, 0);
 
+    const now = Date.UTC(2026, 6, 10, 0, 0);
     await ingestServerTokenUsageFacts(db, {
       serverId: serverA, userId, now, facts: [
-        fact({ usageFactId: 'a-main', sessionName: 'deck_cd_brain', sessionKind: 'main', parentSessionName: null, inputTokens: 10, cacheTokens: 0, outputTokens: 0 }),
-        fact({ usageFactId: 'a-w1', sessionName: 'deck_cd_w1', sessionKind: 'sub', parentSessionName: 'deck_cd_brain', inputTokens: 5, cacheTokens: 0, outputTokens: 0 }),
+        fact({ usageFactId: 'a-main', sessionName: 'deck_cd_brain', sessionKind: 'main', parentSessionName: null, createdAtMs: Date.UTC(2026, 6, 5, 0, 0), inputTokens: 10, cacheTokens: 0, outputTokens: 0 }),
+        fact({ usageFactId: 'a-w1', sessionName: 'deck_cd_w1', sessionKind: 'sub', parentSessionName: 'deck_cd_brain', createdAtMs: Date.UTC(2026, 6, 5, 0, 0), inputTokens: 5, cacheTokens: 0, outputTokens: 0 }),
       ],
     });
+    // Another day's usage on a DIFFERENT machine — must NOT be hidden.
     await ingestServerTokenUsageFacts(db, {
       serverId: serverB, userId, now, facts: [
-        fact({ usageFactId: 'b-main', sessionName: 'deck_cd_brain', sessionKind: 'main', parentSessionName: null, inputTokens: 999, cacheTokens: 0, outputTokens: 0 }),
+        fact({ usageFactId: 'b-main', sessionName: 'deck_cd_brain', sessionKind: 'main', parentSessionName: null, createdAtMs: Date.UTC(2026, 6, 8, 0, 0), inputTokens: 999, cacheTokens: 0, outputTokens: 0 }),
       ],
     });
 
-    const summary = await getTokenUsageSummary(db, userId, { serverId: serverA, groupSession: 'deck_cd_brain' });
-    // Exactly one main (server A's), not two; server B's 999 is excluded.
-    expect(summary.byMainSession).toHaveLength(1);
-    expect(summary.byMainSession[0].totalTokens).toBe(10);
+    const summary = await getTokenUsageSummary(db, userId, { groupSession: 'deck_cd_brain' });
+    expect(summary.accountTotal.totalTokens).toBe(1014); // 10 + 5 + 999, across both machines
+    // The main appears once per server (client merges these by session name).
+    expect(summary.byMainSession).toHaveLength(2);
+    expect(summary.byMainSession.every((r) => r.sessionName === 'deck_cd_brain')).toBe(true);
     expect(summary.bySubSession.map((r) => r.sessionName)).toEqual(['deck_cd_w1']);
-    expect(summary.accountTotal.totalTokens).toBe(15);
+    // Both machines' days are present (neither server's data is dropped).
+    expect(summary.byDate.map((r) => r.date).sort()).toEqual(['2026-07-05', '2026-07-08']);
   });
 });

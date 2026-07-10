@@ -5,7 +5,7 @@ import {
   type UsageSummaryResponse,
   type UsageSummaryRow,
 } from '@shared/usage-analytics.js';
-import { computeSessionGroup, deriveFacetOptions, bucketRowsByWeek, mondayOfWeekUtc } from '../src/util/usage-group.js';
+import { computeSessionGroup, deriveFacetOptions, bucketRowsByWeek, mondayOfWeekUtc, mergeUsageRowsBySession } from '../src/util/usage-group.js';
 
 function row(over: Partial<UsageSummaryRow>): UsageSummaryRow {
   return { ...createEmptyUsageSummaryRow(over.key ?? 'k'), ...over };
@@ -87,6 +87,32 @@ describe('deriveFacetOptions', () => {
 
   it('returns empty lists for null input', () => {
     expect(deriveFacetOptions(null)).toEqual({ servers: [], providers: [], models: [], sessions: [] });
+  });
+});
+
+describe('mergeUsageRowsBySession', () => {
+  it('merges the same session name across servers and sorts by tokens desc', () => {
+    const merged = mergeUsageRowsBySession([
+      // deck_cd_brain appears once per server → must collapse to one row.
+      row({ sessionName: 'deck_cd_brain', sessionKind: 'main', totalTokens: 10, costUsdMicros: 100 }),
+      row({ sessionName: 'deck_cd_brain', sessionKind: 'main', totalTokens: 999, costUsdMicros: null }),
+      row({ sessionName: 'deck_cd_w1', sessionKind: 'sub', totalTokens: 5, costUsdMicros: 5 }),
+    ]);
+    expect(merged).toHaveLength(2);
+    // sorted desc: merged brain (1009) before w1 (5)
+    expect(merged[0]).toMatchObject({ sessionName: 'deck_cd_brain', kind: 'main' });
+    expect(merged[0].totals.totalTokens).toBe(1009);
+    expect(merged[0].totals.costUsdMicros).toBe(100); // 100 + null → 100
+    expect(merged[1]).toMatchObject({ sessionName: 'deck_cd_w1', kind: 'sub' });
+    expect(merged[1].totals.totalTokens).toBe(5);
+  });
+
+  it('treats a session as main if any occurrence is main', () => {
+    const merged = mergeUsageRowsBySession([
+      row({ sessionName: 'x', sessionKind: 'sub', totalTokens: 1 }),
+      row({ sessionName: 'x', sessionKind: 'main', totalTokens: 1 }),
+    ]);
+    expect(merged[0].kind).toBe('main');
   });
 });
 

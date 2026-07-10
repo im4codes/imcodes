@@ -90,6 +90,27 @@ export function emptyUsageTotals(): UsageTotals {
   return { factCount: 0, inputTokens: 0, cacheTokens: 0, outputTokens: 0, totalTokens: 0, costUsdMicros: null };
 }
 
+/**
+ * Merge per-session rows by session name, summing across servers. The same
+ * logical session (same name) can appear once PER server in the server response;
+ * this collapses those into one row so a group's member list shows each session
+ * once with its full cross-machine total. Sorted by total tokens desc.
+ */
+export function mergeUsageRowsBySession(rows: UsageSummaryRow[]): { sessionName: string; kind: 'main' | 'sub'; totals: UsageTotals }[] {
+  const byName = new Map<string, { kind: 'main' | 'sub'; totals: UsageTotals[] }>();
+  for (const r of rows) {
+    const name = r.sessionName ?? r.key;
+    const entry = byName.get(name) ?? { kind: 'sub' as 'main' | 'sub', totals: [] };
+    // A session is "main" unless every occurrence is a sub.
+    if (r.sessionKind !== 'sub') entry.kind = 'main';
+    entry.totals.push(rowToTotals(r));
+    byName.set(name, entry);
+  }
+  return Array.from(byName.entries())
+    .map(([sessionName, e]) => ({ sessionName, kind: e.kind, totals: sumUsageTotals(e.totals) }))
+    .sort((a, b) => b.totals.totalTokens - a.totals.totalTokens);
+}
+
 /** UTC Monday (YYYY-MM-DD) of the ISO week containing `dateStr` (a YYYY-MM-DD). */
 export function mondayOfWeekUtc(dateStr: string): string {
   const d = new Date(`${dateStr}T00:00:00Z`);

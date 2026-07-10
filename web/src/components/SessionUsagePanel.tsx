@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { fetchUsageSummary, type UsageSummaryResponse, type UsageSummaryRow } from '../api/usage-summary.js';
+import { fetchUsageSummary, type UsageSummaryResponse } from '../api/usage-summary.js';
 import { formatUsageNumber, formatUsageCost } from '../util/usage-format.js';
-import { bucketRowsByWeek } from '../util/usage-group.js';
+import { bucketRowsByWeek, mergeUsageRowsBySession } from '../util/usage-group.js';
 import { watchProjectionStore } from '../watch-projection.js';
 
 interface Props {
@@ -14,7 +14,7 @@ interface Props {
 type Period = '7d' | '30d' | 'all';
 type Breakdown = 'day' | 'week';
 
-interface SessionMeta { title: string; badge: string; parent?: string; isSub: boolean; serverId: string; }
+interface SessionMeta { title: string; badge: string; parent?: string; isSub: boolean; }
 
 /**
  * Compact, in-session usage panel opened from the session footer. Scoped
@@ -36,10 +36,6 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
   // user's friendly names instead of raw session ids.
   const meta = useMemo(() => buildSessionMeta(), []);
   const root = useMemo(() => resolveGroupRoot(meta, targetSessionName), [meta, targetSessionName]);
-  // Scope to the CURRENT server so the same session name on another machine
-  // isn't merged in (that produced duplicate "Main session" rows). Falls back to
-  // account-wide when the session isn't in the live snapshot.
-  const serverId = meta.get(root)?.serverId ?? meta.get(targetSessionName)?.serverId;
   const range = useMemo(() => periodRange(period), [period]);
   const label = (name: string): string => meta.get(name)?.title || shortName(name);
 
@@ -47,17 +43,21 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchUsageSummary({ groupSession: root, serverId, from: range.from, to: range.to, limit: 500 })
+    // Cross-server on purpose: a session can run on several machines and the
+    // group's usage lives under one name across all of them. Duplicate per-server
+    // rows are merged client-side (mergeUsageRowsBySession) so the member list
+    // stays clean without hiding any machine's (e.g. this month's) data.
+    fetchUsageSummary({ groupSession: root, from: range.from, to: range.to, limit: 500 })
       .then((res) => { if (!cancelled) setData(res); })
       .catch(() => { if (!cancelled) setError(t('sessionUsage.error')); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [root, serverId, range.from, range.to, t]);
+  }, [root, range.from, range.to, t]);
 
-  const members = useMemo(() => {
-    if (!data) return [] as UsageSummaryRow[];
-    return [...data.byMainSession, ...data.bySubSession];
-  }, [data]);
+  const members = useMemo(
+    () => (data ? mergeUsageRowsBySession([...data.byMainSession, ...data.bySubSession]) : []),
+    [data],
+  );
   const byWeek = useMemo(() => (data ? bucketRowsByWeek(data.byDate) : []), [data]);
   const unknown = t('usageSummary.unknown');
   const total = data?.accountTotal;
@@ -131,10 +131,10 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
             <div style={sectionTitleStyle}>{t('sessionUsage.members')}</div>
             <RowList
               rows={members.map((m) => ({
-                label: label(m.sessionName ?? m.key),
-                sub: m.sessionKind === 'sub' ? t('usageSummary.subSession') : t('usageSummary.mainSession'),
-                tokens: m.totalTokens,
-                cost: m.costUsdMicros,
+                label: label(m.sessionName),
+                sub: m.kind === 'sub' ? t('usageSummary.subSession') : t('usageSummary.mainSession'),
+                tokens: m.totals.totalTokens,
+                cost: m.totals.costUsdMicros,
                 highlight: m.sessionName === targetSessionName,
               }))}
               unknown={unknown}
@@ -219,7 +219,6 @@ function buildSessionMeta(): Map<string, SessionMeta> {
         badge: s.agentBadge,
         parent: s.parentSessionName,
         isSub: s.isSubSession,
-        serverId: s.serverId,
       });
     }
   } catch { /* snapshot unavailable — fall back to shortName */ }
