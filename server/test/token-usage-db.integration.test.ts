@@ -583,4 +583,37 @@ describe('server token usage storage', () => {
     expect(summary.byMainSession.map((r) => r.sessionName)).toEqual(['deck_g_brain']);
     expect(summary.bySubSession.map((r) => r.sessionName).sort()).toEqual(['deck_g_w1', 'deck_g_w2']);
   });
+
+  it('groupSession + serverId scopes to ONE server (no cross-machine duplicate main rows)', async () => {
+    // Regression: the same main session name existing on multiple servers merged
+    // into duplicate "Main session" rows because the panel fetch was not
+    // server-scoped. With serverId, only that server's group is returned — one
+    // main + its subs.
+    const userId = unique('multi-user');
+    await createUser(db, userId);
+    const serverA = unique('multi-srvA');
+    const serverB = unique('multi-srvB');
+    await createServer(db, serverA, userId, 'machine A', unique('hash'));
+    await createServer(db, serverB, userId, 'machine B', unique('hash'));
+    const now = Date.UTC(2026, 6, 10, 0, 0);
+
+    await ingestServerTokenUsageFacts(db, {
+      serverId: serverA, userId, now, facts: [
+        fact({ usageFactId: 'a-main', sessionName: 'deck_cd_brain', sessionKind: 'main', parentSessionName: null, inputTokens: 10, cacheTokens: 0, outputTokens: 0 }),
+        fact({ usageFactId: 'a-w1', sessionName: 'deck_cd_w1', sessionKind: 'sub', parentSessionName: 'deck_cd_brain', inputTokens: 5, cacheTokens: 0, outputTokens: 0 }),
+      ],
+    });
+    await ingestServerTokenUsageFacts(db, {
+      serverId: serverB, userId, now, facts: [
+        fact({ usageFactId: 'b-main', sessionName: 'deck_cd_brain', sessionKind: 'main', parentSessionName: null, inputTokens: 999, cacheTokens: 0, outputTokens: 0 }),
+      ],
+    });
+
+    const summary = await getTokenUsageSummary(db, userId, { serverId: serverA, groupSession: 'deck_cd_brain' });
+    // Exactly one main (server A's), not two; server B's 999 is excluded.
+    expect(summary.byMainSession).toHaveLength(1);
+    expect(summary.byMainSession[0].totalTokens).toBe(10);
+    expect(summary.bySubSession.map((r) => r.sessionName)).toEqual(['deck_cd_w1']);
+    expect(summary.accountTotal.totalTokens).toBe(15);
+  });
 });

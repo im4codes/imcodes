@@ -14,7 +14,7 @@ interface Props {
 type Period = '7d' | '30d' | 'all';
 type Breakdown = 'day' | 'week';
 
-interface SessionMeta { title: string; badge: string; parent?: string; isSub: boolean; }
+interface SessionMeta { title: string; badge: string; parent?: string; isSub: boolean; serverId: string; }
 
 /**
  * Compact, in-session usage panel opened from the session footer. Scoped
@@ -36,6 +36,10 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
   // user's friendly names instead of raw session ids.
   const meta = useMemo(() => buildSessionMeta(), []);
   const root = useMemo(() => resolveGroupRoot(meta, targetSessionName), [meta, targetSessionName]);
+  // Scope to the CURRENT server so the same session name on another machine
+  // isn't merged in (that produced duplicate "Main session" rows). Falls back to
+  // account-wide when the session isn't in the live snapshot.
+  const serverId = meta.get(root)?.serverId ?? meta.get(targetSessionName)?.serverId;
   const range = useMemo(() => periodRange(period), [period]);
   const label = (name: string): string => meta.get(name)?.title || shortName(name);
 
@@ -43,12 +47,12 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchUsageSummary({ groupSession: root, from: range.from, to: range.to, limit: 500 })
+    fetchUsageSummary({ groupSession: root, serverId, from: range.from, to: range.to, limit: 500 })
       .then((res) => { if (!cancelled) setData(res); })
       .catch(() => { if (!cancelled) setError(t('sessionUsage.error')); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [root, range.from, range.to, t]);
+  }, [root, serverId, range.from, range.to, t]);
 
   const members = useMemo(() => {
     if (!data) return [] as UsageSummaryRow[];
@@ -118,7 +122,7 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
             <RowList
               rows={breakdown === 'day'
                 ? data!.byDate.map((r) => ({ label: r.date ?? r.key, tokens: r.totalTokens, cost: r.costUsdMicros }))
-                : byWeek.map((w) => ({ label: t('sessionUsage.weekOf', { date: w.key }), tokens: w.totals.totalTokens, cost: w.totals.costUsdMicros }))}
+                : byWeek.map((w) => ({ label: weekRangeLabel(w.key), tokens: w.totals.totalTokens, cost: w.totals.costUsdMicros }))}
               unknown={unknown}
               emptyLabel={t('sessionUsage.empty')}
             />
@@ -215,6 +219,7 @@ function buildSessionMeta(): Map<string, SessionMeta> {
         badge: s.agentBadge,
         parent: s.parentSessionName,
         isSub: s.isSubSession,
+        serverId: s.serverId,
       });
     }
   } catch { /* snapshot unavailable — fall back to shortName */ }
@@ -239,6 +244,13 @@ export function periodRange(period: Period): { from?: string; to?: string } {
 
 function toDateInput(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/** A week shown as its Monday→Sunday date range (unambiguous, unlike "当周"). */
+function weekRangeLabel(mondayStr: string): string {
+  const d = new Date(`${mondayStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 6);
+  return `${mondayStr} → ${d.toISOString().slice(0, 10)}`;
 }
 
 /** Fallback compact label when a session isn't in the snapshot: strip deck_{proj}_. */
