@@ -2155,7 +2155,10 @@ export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number
     FROM context_turn_usage u
     LEFT JOIN context_turn_usage_sync s ON s.turn_usage_rowid = u.id
     WHERE s.turn_usage_rowid IS NULL
-    ORDER BY u.id ASC
+    -- Newest-first: create sync metadata for the most RECENT unsynced turns
+    -- first, so the current period reaches the server promptly and the older
+    -- backlog fills in behind it (was ASC → recent data starved for hours).
+    ORDER BY u.id DESC
     LIMIT ?
   `).all(Math.max(1, Math.min(5000, Math.trunc(limit)))) as Array<{ id: number }>;
   let backfilled = 0;
@@ -2204,7 +2207,12 @@ export function selectTurnUsageSyncBatch(input: { limit?: number; now?: number; 
       FROM context_turn_usage_sync
       WHERE sync_status IN ('pending', 'retryable_failed')
         AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
-      ORDER BY created_at_ms ASC, turn_usage_rowid ASC
+      -- Newest-first so live/recent turns upload immediately and never starve
+      -- behind a large historical backlog. Idempotent: only 'pending'/
+      -- 'retryable_failed' are ever selected — 'accepted' (and other terminal
+      -- statuses) are excluded, so a synced row is never re-sent; the server
+      -- additionally dedupes by (server_id, usage_fact_id).
+      ORDER BY created_at_ms DESC, turn_usage_rowid DESC
       LIMIT ?
     `).all(now, limit) as Array<{ turn_usage_rowid: number }>;
     for (const row of rows) {

@@ -294,6 +294,30 @@ describe('turn usage server sync metadata', () => {
     expect(JSON.stringify(diagnostics)).not.toContain('prompt');
   });
 
+  it('selects the NEWEST unsynced turns first so recent data never starves behind a backlog', () => {
+    const t = 1_700_000_000_000;
+    recordTurnUsage({ sessionName: 'old', createdAt: t, inputTokens: 1, outputTokens: 1, eventId: 'old' });
+    recordTurnUsage({ sessionName: 'mid', createdAt: t + 86_400_000, inputTokens: 1, outputTokens: 1, eventId: 'mid' });
+    recordTurnUsage({ sessionName: 'new', createdAt: t + 2 * 86_400_000, inputTokens: 1, outputTokens: 1, eventId: 'new' });
+    // A batch smaller than the backlog must pick the two most recent, not the oldest.
+    const batch = selectTurnUsageSyncBatch({ limit: 2, now: t + 10 * 86_400_000 });
+    expect(batch.map((row) => row.fact.sessionName)).toEqual(['new', 'mid']);
+  });
+
+  it('never re-selects an already-accepted turn (idempotent — no duplicate re-sync)', () => {
+    recordTurnUsage({ sessionName: 'a', model: 'm', inputTokens: 1, outputTokens: 1, eventId: 'a' });
+    recordTurnUsage({ sessionName: 'b', model: 'm', inputTokens: 1, outputTokens: 1, eventId: 'b' });
+    const first = selectTurnUsageSyncBatch({ limit: 10, now: 100 });
+    expect(first).toHaveLength(2);
+    recordTurnUsageSyncResults({
+      now: 200,
+      results: first.map((row) => ({ usageFactId: row.usageFactId, status: 'accepted' })),
+    });
+    // 'accepted' is terminal: neither a fresh select nor a re-backfill re-sends it.
+    expect(backfillTurnUsageSyncMetadata()).toEqual({ backfilled: 0 });
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 300 })).toHaveLength(0);
+  });
+
   it('protects pending and retryable facts from prune while pruning accepted rows', () => {
     const now = 1_700_000_000_000;
     recordTurnUsage({
