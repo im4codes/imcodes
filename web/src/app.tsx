@@ -1487,6 +1487,13 @@ export function App() {
     if (stackRef.current!.bringToFront(id)) bumpStack();
   }, []);
 
+  const focusFilePreviewWindow = useCallback(() => {
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.filePreview, {
+      kind: DESKTOP_WINDOW_KINDS.filePreview,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow, selectedServerId]);
+
   /** Remove a window (and its children). Bumps only if anything was actually removed. */
   const removeDesktopWindow = useCallback((id: string) => {
     if (stackRef.current!.removeWindow(id)) {
@@ -2615,17 +2622,22 @@ export function App() {
   }, [setPinnedPanels]);
 
   const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
-    runVersionSensitiveAction(trans('picker.files'), () => {
-      const cached = previewFileCache[request.path];
-      const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
-      setPreviewFileRequest({
-        ...request,
-        preview: request.preview ?? cached?.preview,
-        preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
-        previewViewMode,
-      });
+    const featureLabel = trans('picker.files');
+    if (appUpdateRequiredRef.current) {
+      showAppUpdateBlocker(featureLabel);
+      return;
+    }
+    focusFilePreviewWindow();
+    const cached = previewFileCache[request.path];
+    const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
+    setPreviewFileRequest({
+      ...request,
+      preview: request.preview ?? cached?.preview,
+      preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
+      previewViewMode,
     });
-  }, [previewFileCache, runVersionSensitiveAction, trans]);
+    void checkForAppUpdate({ blocking: true, featureLabel });
+  }, [checkForAppUpdate, focusFilePreviewWindow, previewFileCache, showAppUpdateBlocker, trans]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
     setPreviewFileCache((prev) => updateFilePreviewCache(prev, update));
