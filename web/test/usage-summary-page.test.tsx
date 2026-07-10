@@ -67,7 +67,9 @@ describe('UsageSummaryPage', () => {
 
     expect(await screen.findByText('usageSummary.totalTokens')).toBeDefined();
     expect(screen.getAllByText('72').length).toBeGreaterThan(0);
-    expect(screen.getByText('srv-1')).toBeDefined();
+    // srv-1 now appears both as a filter dropdown <option> and the "By server"
+    // row, so assert on presence rather than uniqueness.
+    expect(screen.getAllByText('srv-1').length).toBeGreaterThan(0);
     expect(screen.getByText('openai / gpt-5')).toBeDefined();
     expect(screen.getByText('usageSummary.unknown / usageSummary.unknown')).toBeDefined();
     expect(screen.getByText('deck_alpha_brain · usageSummary.mainSession')).toBeDefined();
