@@ -2511,104 +2511,138 @@ describe('CodexSdkProvider', () => {
     expect(provider.getSessionDiagnostics('route-idle-not-completion')).toMatchObject({ runningTurnId: null });
   });
 
-  it('settles a turn from thread-idle when the app-server sends no turn/completed (debounced)', async () => {
-    const provider = createCodexProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-settles', cwd: '/tmp/project' });
+  it('settles a turn from rollout task_complete when the app-server sends only idle/completed hints', async () => {
+    vi.useFakeTimers();
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-idle-rollout-settles-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-idle-settles', cwd: '/tmp/project' });
 
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
 
-    await provider.send('route-idle-settles', 'hello');
-    await waitForCondition(
-      () => provider.getSessionDiagnostics('route-idle-settles')?.runningTurnId === 'turn-1',
-    );
+      await provider.send('route-idle-settles', 'hello');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-idle-settles')?.runningTurnId === 'turn-1',
+      );
 
-    const child = childProcessMock.children[0];
-    // The agent produces its message, then the thread goes idle — but the current
-    // Codex app-server emits NO `turn/completed`. With NOTHING following the idle,
-    // the debounced idle-settle must complete the turn so it can never get stuck
-    // "working" with the queue blocked (the phantom-active-turn regression).
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
-    });
-    childProcessMock.enqueueThreadReadResult({
-      thread: { id: 'thread-1', status: 'idle' },
-      turns: [{ id: 'turn-1', status: 'completed', current: false }],
-    });
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+      const child = childProcessMock.children[0];
+      // The app-server reports the thread idle/completed, but that signal alone
+      // is not terminal proof. The provider may only settle once Codex core's
+      // durable rollout records task_complete for the same turn.
+      child.emits({
+        method: 'item/completed',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done' } },
+      });
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done' },
+        },
+      ]);
+      childProcessMock.enqueueThreadReadResult({
+        thread: { id: 'thread-1', status: 'idle' },
+        turns: [{ id: 'turn-1', status: 'completed', current: false }],
+      });
+      child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
-    await waitForCondition(() => completed.length === 1);
-    expect(completed).toEqual(['Done']);
-    expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      expect(completed).toEqual(['Done']);
+      expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
-  it('defers thread-idle fallback while a Codex commandExecution item is active', async () => {
-    const provider = createCodexProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-idle-active-command', cwd: '/tmp/project' });
+  it('defers idle/rollout completion while a Codex commandExecution item is active', async () => {
+    vi.useFakeTimers();
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-idle-active-command-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-idle-active-command', cwd: '/tmp/project' });
 
-    const completed: string[] = [];
-    provider.onComplete((_sid, msg) => completed.push(msg.content));
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
 
-    await provider.send('route-idle-active-command', 'run a long command');
-    await waitForCondition(
-      () => provider.getSessionDiagnostics('route-idle-active-command')?.runningTurnId === 'turn-1',
-    );
+      await provider.send('route-idle-active-command', 'run a long command');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-idle-active-command')?.runningTurnId === 'turn-1',
+      );
 
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/started',
-      params: {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        item: {
-          id: 'cmd-1',
-          type: 'commandExecution',
-          command: 'sleep 120',
-          status: 'inProgress',
-          processId: 45580,
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            id: 'cmd-1',
+            type: 'commandExecution',
+            command: 'sleep 120',
+            status: 'inProgress',
+            processId: 45580,
+          },
         },
-      },
-    });
-    await waitForCondition(
-      () => provider.getSessionDiagnostics('route-idle-active-command')?.activeItemCount === 1,
-    );
+      });
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-idle-active-command')?.activeItemCount === 1,
+      );
 
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
-    await new Promise((resolve) => setTimeout(resolve, 1700));
+      child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+      for (let i = 0; i < 80; i++) await vi.advanceTimersByTimeAsync(100);
 
-    expect(completed).toEqual([]);
-    expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
-      runningTurnId: 'turn-1',
-      activeItemCount: 1,
-      deferredIdleSettleTurnId: 'turn-1',
-    });
+      expect(completed).toEqual([]);
+      expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
+        runningTurnId: 'turn-1',
+        activeItemCount: 1,
+        deferredIdleSettleTurnId: 'turn-1',
+      });
 
-    child.emits({
-      method: 'item/completed',
-      params: {
-        threadId: 'thread-1',
-        turnId: 'turn-1',
-        item: {
-          id: 'cmd-1',
-          type: 'commandExecution',
-          command: 'sleep 120',
-          status: 'completed',
-          processId: 45580,
-          exitCode: 0,
-          durationMs: 120000,
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done after command' },
         },
-      },
-    });
+      ]);
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            id: 'cmd-1',
+            type: 'commandExecution',
+            command: 'sleep 120',
+            status: 'completed',
+            processId: 45580,
+            exitCode: 0,
+            durationMs: 120000,
+          },
+        },
+      });
 
-    await waitForCondition(() => completed.length === 1);
-    expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
-      runningTurnId: null,
-      activeItemCount: 0,
-      deferredIdleSettleTurnId: null,
-    });
+      for (let i = 0; i < 80 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      expect(completed).toEqual(['Done after command']);
+      expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
+        runningTurnId: null,
+        activeItemCount: 0,
+        deferredIdleSettleTurnId: null,
+      });
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('terminalizes active Codex commandExecution items on turn/completed', async () => {
@@ -4251,68 +4285,85 @@ describe('CodexSdkProvider', () => {
     }));
   });
 
-  it('terminalizes a WebSearch started event when thread-idle settles a turn without turn/completed', async () => {
-    const provider = createCodexProvider();
-    await provider.connect({ binaryPath: 'codex' });
-    await provider.createSession({ sessionKey: 'route-websearch-start-only-idle-settle', cwd: '/tmp/project' });
+  it('terminalizes a WebSearch started event when rollout settles a turn without turn/completed', async () => {
+    vi.useFakeTimers();
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-websearch-rollout-settle-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-websearch-start-only-idle-settle', cwd: '/tmp/project' });
 
-    const tools: Array<Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'input' | 'terminalStatus' | 'terminalReason' | 'terminalSynthetic' | 'terminalSource' | 'terminalDecisionReason' | 'terminalIdempotencyKey' | 'turnId' | 'lifecycleItemKind'>> = [];
-    const completed: string[] = [];
-    provider.onToolCall((_, tool) => tools.push({
-      id: tool.id,
-      name: tool.name,
-      status: tool.status,
-      input: tool.input,
-      terminalStatus: tool.terminalStatus,
-      terminalReason: tool.terminalReason,
-      terminalSynthetic: tool.terminalSynthetic,
-      terminalSource: tool.terminalSource,
-      terminalDecisionReason: tool.terminalDecisionReason,
-      terminalIdempotencyKey: tool.terminalIdempotencyKey,
-      turnId: tool.turnId,
-      lifecycleItemKind: tool.lifecycleItemKind,
-    }));
-    provider.onComplete((_, message) => completed.push(message.content));
+      const tools: Array<Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'input' | 'terminalStatus' | 'terminalReason' | 'terminalSynthetic' | 'terminalSource' | 'terminalDecisionReason' | 'terminalIdempotencyKey' | 'turnId' | 'lifecycleItemKind'>> = [];
+      const completed: string[] = [];
+      provider.onToolCall((_, tool) => tools.push({
+        id: tool.id,
+        name: tool.name,
+        status: tool.status,
+        input: tool.input,
+        terminalStatus: tool.terminalStatus,
+        terminalReason: tool.terminalReason,
+        terminalSynthetic: tool.terminalSynthetic,
+        terminalSource: tool.terminalSource,
+        terminalDecisionReason: tool.terminalDecisionReason,
+        terminalIdempotencyKey: tool.terminalIdempotencyKey,
+        turnId: tool.turnId,
+        lifecycleItemKind: tool.lifecycleItemKind,
+      }));
+      provider.onComplete((_, message) => completed.push(message.content));
 
-    await provider.send('route-websearch-start-only-idle-settle', 'search');
-    await waitForCondition(
-      () => provider.getSessionDiagnostics('route-websearch-start-only-idle-settle')?.runningTurnId === 'turn-1',
-    );
-    const child = childProcessMock.children[0];
-    child.emits({
-      method: 'item/started',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-idle-only', type: 'webSearch', action: { type: 'other' } } },
-    });
-    await waitForCondition(() => tools.length === 1);
-    child.emits({
-      method: 'item/completed',
-      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
-    });
-    childProcessMock.enqueueThreadReadResult({
-      thread: { id: 'thread-1', status: 'idle' },
-      turns: [{ id: 'turn-1', status: 'completed', current: false }],
-    });
-    child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
+      await provider.send('route-websearch-start-only-idle-settle', 'search');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-websearch-start-only-idle-settle')?.runningTurnId === 'turn-1',
+      );
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'item/started',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-idle-only', type: 'webSearch', action: { type: 'other' } } },
+      });
+      await waitForCondition(() => tools.length === 1);
+      child.emits({
+        method: 'item/completed',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'Done.' } },
+      });
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done.' },
+        },
+      ]);
+      childProcessMock.enqueueThreadReadResult({
+        thread: { id: 'thread-1', status: 'idle' },
+        turns: [{ id: 'turn-1', status: 'completed', current: false }],
+      });
+      child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
-    await waitForCondition(() => completed.length === 1 && tools.length === 2);
-    expect(completed).toEqual(['Done.']);
-    expect(tools).toEqual([
-      expect.objectContaining({ id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
-      expect.objectContaining({
-        id: 'ws-idle-only',
-        name: 'WebSearch',
-        status: 'complete',
-        input: { query: '(other)' },
-        terminalStatus: 'succeeded',
-        terminalReason: 'thread_idle_settle',
-        terminalSynthetic: true,
-        terminalSource: 'daemon_synthetic',
-        terminalDecisionReason: 'thread_idle_settle',
-        turnId: 'turn-1',
-        lifecycleItemKind: 'web_search',
-      }),
-    ]);
-    expect(tools[1]?.terminalIdempotencyKey).toContain('ws-idle-only:succeeded:thread_idle_settle');
+      for (let i = 0; i < 200 && !(completed.length === 1 && tools.length === 2); i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      expect(completed).toEqual(['Done.']);
+      expect(tools).toEqual([
+        expect.objectContaining({ id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
+        expect.objectContaining({
+          id: 'ws-idle-only',
+          name: 'WebSearch',
+          status: 'complete',
+          input: { query: '(other)' },
+          terminalStatus: 'succeeded',
+          terminalReason: 'rollout_task_complete',
+          terminalSynthetic: true,
+          terminalSource: 'app_server_jsonrpc',
+          terminalDecisionReason: 'rollout_task_complete',
+          turnId: 'turn-1',
+          lifecycleItemKind: 'web_search',
+        }),
+      ]);
+      expect(tools[1]?.terminalIdempotencyKey).toContain('ws-idle-only:succeeded:rollout_task_complete');
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
   });
 
   it('surfaces Codex todo_list completed items as update_plan tool calls', async () => {
@@ -4660,6 +4711,122 @@ describe('CodexSdkProvider', () => {
       expect(completed).toHaveLength(0);
       const diagnostics = provider.getSessionDiagnostics('route-zombie-other')!;
       expect(diagnostics.heartbeatLeaseActive).toBe(true);
+      await provider.disconnect();
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('does not mark the turn complete from a thread/read completed hint without rollout task_complete', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-thread-read-false-idle-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-thread-read-false-idle', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+
+      await provider.send('route-thread-read-false-idle', 'keep working');
+      const child = childProcessMock.children[0];
+      childProcessMock.enqueueThreadReadResult({
+        thread: { id: 'thread-1', status: 'idle' },
+        turns: [{ id: 'turn-1', status: 'completed', current: false }],
+      });
+
+      // Regression (deck_cd_brain false idle): the app-server can answer
+      // thread/read as completed while the Codex rollout has not recorded
+      // task_complete and later output still arrives. This hint must not move
+      // the runtime/frontend to idle by itself.
+      await vi.advanceTimersByTimeAsync(55_100);
+      await advanceFakeTimersUntil(() => child.requests.some((req) => req.method === 'thread/read'));
+      for (let i = 0; i < 60; i++) await vi.advanceTimersByTimeAsync(100);
+
+      expect(completed).toHaveLength(0);
+      expect(provider.getSessionDiagnostics('route-thread-read-false-idle')).toMatchObject({
+        runningTurnId: 'turn-1',
+        heartbeatLeaseActive: true,
+      });
+
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-1',
+            last_agent_message: 'now the durable final answer exists',
+          },
+        },
+      ]);
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(1);
+      expect(completed[0]?.content).toBe('now the durable final answer exists');
+      expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+      await provider.disconnect();
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('settles from rollout task_complete even if the heartbeat lease disappeared but the turn is still active locally', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-zombie-no-lease-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-zombie-no-lease', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+      const errors: Array<{ code: string }> = [];
+      provider.onError((_sid, error) => errors.push({ code: error.code }));
+
+      await provider.send('route-zombie-no-lease', 'finish and report');
+      const child = childProcessMock.children[0];
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-1',
+            last_agent_message: 'durable rollout final answer',
+          },
+        },
+      ]);
+
+      const internal = provider as unknown as { sessions: Map<string, { activeTurnLease?: unknown; runningTurnId?: string }> };
+      const state = internal.sessions.get('route-zombie-no-lease');
+      expect(state?.runningTurnId).toBe('turn-1');
+      // Mirrors the field failure: UI/runtime still has a current turn, but
+      // the provider heartbeat/notification lease is no longer usable. The
+      // rollout poll must keep running and use Codex core's durable completion
+      // evidence instead of leaving the runtime active until stop+continue.
+      state!.activeTurnLease = undefined;
+
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(1);
+      expect(completed[0]?.content).toBe('durable rollout final answer');
+      expect(errors).toEqual([]);
+      expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(false);
+      expect(provider.getSessionDiagnostics('route-zombie-no-lease')).toMatchObject({
+        runningTurnId: null,
+        heartbeatLeaseActive: false,
+      });
       await provider.disconnect();
     } finally {
       randomSpy.mockRestore();
