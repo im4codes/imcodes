@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { ApiKeyManager } from '../components/ApiKeyManager.js';
 import { ServerList } from '../components/ServerList.js';
 import { GettingStarted } from '../components/GettingStarted.js';
@@ -10,6 +11,7 @@ import { apiFetch } from '../api.js';
 interface Props {
   onSelectServer: (serverId: string, serverName: string) => void;
   onLogout: () => void;
+  onOpenUsageSummary: () => void;
   onServersLoaded?: (servers: ServerInfo[]) => void;
 }
 
@@ -29,7 +31,8 @@ interface KeyInfo {
   revokedAt: number | null;
 }
 
-export function DashboardPage({ onSelectServer, onLogout, onServersLoaded }: Props) {
+export function DashboardPage({ onSelectServer, onLogout, onOpenUsageSummary, onServersLoaded }: Props) {
+  const { t } = useTranslation();
   const [servers, setServers] = useState<ServerInfo[]>([]);
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -59,6 +62,7 @@ export function DashboardPage({ onSelectServer, onLogout, onServersLoaded }: Pro
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
         <h1 style={{ margin: 0, fontSize: 24 }}>IM.codes</h1>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button class="btn btn-secondary" style={{ fontSize: 12 }} onClick={onOpenUsageSummary}>{t('usageSummary.title')}</button>
           <LanguageSwitcher />
           <button class="btn btn-secondary" style={{ fontSize: 12 }} onClick={onLogout}>Log Out</button>
         </div>

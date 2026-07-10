@@ -458,7 +458,11 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
     const usagePayload = normalizeUsageUpdatePayload(sessionName, usage, model);
     if (usagePayload) {
-      timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'usage.update', usagePayload, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `${stableEventId}:usage`,
+      });
     }
 
     // TransportSessionRuntime owns lifecycle state transitions. Emitting idle here
@@ -821,7 +825,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
     if (usagePayload) {
-      timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
+      const tracked = inFlightMessages.get(sessionName);
+      const usageEventId = `${tracked?.eventId ?? `transport:${sessionName}:usage`}:usage`;
+      timelineEmitter.emit(sessionName, 'usage.update', {
+        ...usagePayload,
+        streaming: true,
+      }, { source: 'daemon', confidence: 'high', eventId: usageEventId });
     }
   });
 

@@ -52,6 +52,7 @@ import { isTransportAgent } from '../agent/detect.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { createWorkerSessionSyncRetrier, type WorkerSessionSyncRetrier, type WorkerSessionSyncRetryOutcome } from './worker-session-sync-retrier.js';
+import { createUsageSyncWorker, type UsageSyncWorker } from './usage-sync-worker.js';
 import {
   WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT,
   WORKER_SESSION_SYNC_STATUS,
@@ -1106,6 +1107,7 @@ export async function startup(): Promise<DaemonContext> {
   startHealthPoller();
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
+  startUsageSyncWorker(workerUrl, serverId, token);
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
   startEventLoopDelayMonitor();
@@ -1420,6 +1422,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
+    usageSyncWorker?.stop();
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
@@ -1466,6 +1469,7 @@ const memoryCompressionAutoContinuedRunIds = new Set<string>();
 const codexAutoContinuedActivityGenerations = new Set<string>();
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
+let usageSyncWorker: UsageSyncWorker | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
 let gcTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
@@ -1813,6 +1817,26 @@ function startContextReplicationPoller(workerUrl: string | undefined, serverId: 
       logger.warn({ err }, 'Processed-context replication failed');
     });
   }, CONTEXT_REPLICATION_POLL_MS);
+}
+
+function startUsageSyncWorker(workerUrl: string | undefined, serverId: string, token: string): void {
+  if (!workerUrl || !serverId || !token) return;
+  usageSyncWorker?.stop();
+  usageSyncWorker = createUsageSyncWorker({
+    workerUrl,
+    serverId,
+    token,
+    credentialsProvider: async () => {
+      const credentials = await loadCredentials();
+      if (!credentials?.workerUrl || !credentials.serverId || !credentials.token) return null;
+      return {
+        workerUrl: credentials.workerUrl,
+        serverId: credentials.serverId,
+        token: credentials.token,
+      };
+    },
+  });
+  usageSyncWorker.start();
 }
 
 function startContextMaterializationPoller(liveContextIngestion: LiveContextIngestion): void {

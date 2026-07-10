@@ -78,6 +78,11 @@ export const CONTEXT_STORE_L1_OPS = [
   'countProjectionsMissingEmbedding',
   'summarizeCompressionRuns',
   'summarizeTurnUsage',
+  'getOrCreateUsageAuthorityId',
+  'ensureTurnUsageSyncMetadata',
+  'backfillTurnUsageSyncMetadata',
+  'selectTurnUsageSyncBatch',
+  'getTurnUsageSyncDiagnostics',
   // writes / mutations
   'recordContextEvent',
   'enqueueContextJob',
@@ -103,6 +108,8 @@ export const CONTEXT_STORE_L1_OPS = [
   'saveProjectionEmbedding',
   'recordCompressionRun',
   'recordTurnUsage',
+  'recordTurnUsageSyncResults',
+  'recordTurnUsageSyncRequestFailure',
   'recordMemoryHits',
   'pruneLocalMemory',
   'pruneArchiveIfDue',
@@ -204,6 +211,7 @@ export const CONTEXT_STORE_LOW_PRIORITY_OPS = [
   'pruneArchiveIfDue',
   'pruneCompressionRuns',
   'pruneTurnUsage',
+  'backfillTurnUsageSyncMetadata',
   'backfillNamespacesAndObservations',
   'repairObservationStore',
 ] as const;

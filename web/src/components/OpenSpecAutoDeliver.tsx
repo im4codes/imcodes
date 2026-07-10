@@ -10,6 +10,7 @@ import {
   isOpenSpecAutoDeliverActiveProjection,
   isOpenSpecAutoDeliverTerminalStatus,
   materializedPresetLimits,
+  type OpenSpecAutoDeliverModuleScore,
   type OpenSpecAutoDeliverPresetId,
   type OpenSpecAutoDeliverProjection,
 } from '../openspec-auto-deliver.js';
@@ -79,7 +80,7 @@ const OVERALL_PROGRESS_PHASES = [
 ] as const;
 const OVERALL_PROGRESS_TOTAL = OVERALL_PROGRESS_PHASES.length + 1;
 const DETAILS_SIZE_STORAGE_KEY = 'rcc_openspec_auto_deliver_details_size';
-const DETAILS_DEFAULT_SIZE = { width: 720, height: 760 };
+const DETAILS_DEFAULT_SIZE = { width: 920, height: 780 };
 const DETAILS_MIN_SIZE = { width: 420, height: 360 };
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
@@ -740,6 +741,67 @@ export function OpenSpecAutoDeliverRunBar({
   );
 }
 
+
+type AutoDeliverScoreItem = Pick<OpenSpecAutoDeliverModuleScore, 'module' | 'score' | 'maxScore' | 'max_score' | 'summary'>;
+
+function scoreMax(score?: AutoDeliverScoreItem | null): number {
+  const max = score?.maxScore ?? score?.max_score ?? 10;
+  return Number.isFinite(max) && max > 0 ? max : 10;
+}
+
+function scoreText(score?: AutoDeliverScoreItem | null): string {
+  if (!score) return '—';
+  return `${score.score}/${scoreMax(score)}`;
+}
+
+function scoreRating(score?: AutoDeliverScoreItem | null): number {
+  if (!score) return 0;
+  const max = scoreMax(score);
+  return Math.max(0, Math.min(5, Math.round((score.score / max) * 5)));
+}
+
+function findScoreByModule(scores: AutoDeliverScoreItem[], candidates: string[]): AutoDeliverScoreItem | null {
+  const normalizedCandidates = candidates.map((candidate) => candidate.toLowerCase());
+  return scores.find((score) => {
+    const moduleId = typeof score.module === 'string' ? score.module.toLowerCase() : '';
+    return normalizedCandidates.some((candidate) => moduleId === candidate || moduleId.includes(candidate));
+  }) ?? null;
+}
+
+function StarScore({ score }: { score?: AutoDeliverScoreItem | null }) {
+  const rating = scoreRating(score);
+  return (
+    <div class="openspec-auto-hero-stars" aria-label={score ? scoreText(score) : undefined}>
+      {[0, 1, 2, 3, 4].map((index) => (
+        <span class={index < rating ? 'is-active' : ''} key={index}>★</span>
+      ))}
+    </div>
+  );
+}
+
+function HeroScoreCard({
+  label,
+  score,
+  tone,
+  pendingLabel,
+}: {
+  label: string;
+  score?: AutoDeliverScoreItem | null;
+  tone: 'spec' | 'impl';
+  pendingLabel: string;
+}) {
+  return (
+    <div class={`openspec-auto-hero-score openspec-auto-hero-score-${tone}${score ? '' : ' openspec-auto-hero-score-pending'}`}>
+      <span class="openspec-auto-hero-score-label">{label}</span>
+      <div class="openspec-auto-hero-score-main">
+        <strong>{scoreText(score)}</strong>
+        <StarScore score={score} />
+      </div>
+      <small>{score?.summary || pendingLabel}</small>
+    </div>
+  );
+}
+
 function DetailRow({ label, value }: { label: string; value?: string | number | null }) {
   if (value === null || value === undefined || value === '') return null;
   return (
@@ -755,7 +817,7 @@ function ScoreGrid({
   t,
   keyPrefix,
 }: {
-  scores: Array<{ module?: string; score: number; maxScore?: number; max_score?: number; summary?: string }>;
+  scores: AutoDeliverScoreItem[];
   t: TranslationFn;
   keyPrefix: string;
 }) {
@@ -798,6 +860,9 @@ export function OpenSpecAutoDeliverDetailsPanel({
   ), [projection?.auditBeforeRepair, projection?.finalAfterRepair, projection?.moduleScores]);
   const preRepairScoreItems = useMemo(() => projection?.auditBeforeRepair?.moduleScores ?? [], [projection?.auditBeforeRepair]);
   const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
+  const progress = projection ? computeOpenSpecAutoDeliverProgress(projection) : null;
+  const finalSpecScore = useMemo(() => findScoreByModule(finalScoreItems, ['spec']), [finalScoreItems]);
+  const finalImplementationScore = useMemo(() => findScoreByModule(finalScoreItems, ['implementation', 'impl', 'code']), [finalScoreItems]);
   const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
   const repairingFromAudit = stage === 'implementation_task_loop'
     && projection?.recentFinding?.startsWith('implementation_repair_prompt_dispatched:');
@@ -849,10 +914,53 @@ export function OpenSpecAutoDeliverDetailsPanel({
             </button>
           )}
         </div>
+        <div class="openspec-auto-hero" data-testid="openspec-auto-hero">
+          <div class="openspec-auto-hero-top">
+            <div>
+              <span>{t('openspec.auto.score_overview', { defaultValue: 'Score overview' })}</span>
+              <strong>{t(statusKey(status), status)} · {t(stageKey(stage), stage)}</strong>
+            </div>
+            <div class="openspec-auto-hero-chips">
+              <span>{t('openspec.auto.elapsed')} {elapsed}</span>
+              {projection.presetId && <span>{projection.presetId}</span>}
+            </div>
+          </div>
+          <div class="openspec-auto-hero-scores">
+            <HeroScoreCard
+              label={t('openspec.auto.final_spec_score', { defaultValue: t('openspec.auto.score_module.spec', { defaultValue: 'Spec' }) })}
+              score={finalSpecScore}
+              tone="spec"
+              pendingLabel={t('openspec.auto.score_pending', { defaultValue: 'Pending final audit' })}
+            />
+            <HeroScoreCard
+              label={t('openspec.auto.final_impl_score', { defaultValue: t('openspec.auto.score_module.implementation', { defaultValue: 'Implementation' }) })}
+              score={finalImplementationScore}
+              tone="impl"
+              pendingLabel={t('openspec.auto.score_pending', { defaultValue: 'Pending final audit' })}
+            />
+          </div>
+          {progress && (
+            <div class="openspec-auto-hero-progress">
+              <ProgressLine
+                label={t('openspec.auto.overall_progress')}
+                value={`${t('openspec.auto.progress_count', { current: progress.overall.current, total: progress.overall.total })} · ${t('openspec.auto.progress_percent', { percent: progress.overall.percent })}`}
+                percent={progress.overall.percent}
+              />
+              <ProgressLine
+                label={t('openspec.auto.current_stage_progress')}
+                value={`${t('openspec.auto.progress_count', { current: progress.currentStage.current, total: progress.currentStage.total })} · ${t('openspec.auto.progress_percent', { percent: progress.currentStage.percent })}`}
+                percent={progress.currentStage.percent}
+              />
+            </div>
+          )}
+          {latestMessage && (
+            <div class="openspec-auto-hero-message">
+              <span>{t('openspec.auto.latest_message')}</span>
+              <strong>{latestMessage}</strong>
+            </div>
+          )}
+        </div>
         <div class="openspec-auto-detail-grid">
-          <DetailRow label={t('openspec.auto.status_label')} value={t(statusKey(status), status)} />
-          <DetailRow label={t('openspec.auto.stage_label')} value={t(stageKey(stage), stage)} />
-          <DetailRow label={t('openspec.auto.elapsed')} value={elapsed} />
           <DetailRow label={t('openspec.auto.preset_label')} value={projection.presetId} />
           <DetailRow label={t('openspec.auto.owning_session')} value={projection.owningMainSessionName} />
           <DetailRow label={t('openspec.auto.launched_from')} value={projection.launchedFromSessionName} />
@@ -864,7 +972,6 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId ? comboModeLabel(projection.selectedTeamComboId, t) : undefined} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
           <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
-          <DetailRow label={t('openspec.auto.latest_message')} value={latestMessage} />
           {projection.visibility === 'conflict' && (
             <DetailRow label={t('openspec.auto.conflict_summary')} value={translateAutoDeliverReason(projection.conflictReason, t)} />
           )}

@@ -13,6 +13,7 @@ import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { recordTurnUsage } from '../store/context-store.js';
+import { getSession } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { recordTimelineEmit } from './latency-tracer.js';
 import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
@@ -291,11 +292,17 @@ export class TimelineEmitter {
       if (type === 'usage.update') {
         const usageStart = performance.now();
         try {
+          const sessionRecord = getSession(sessionId);
+          const parentSessionName = sessionRecord?.parentSession ?? null;
           recordTurnUsage({
             createdAt: ts,
             sessionName: sessionId,
             agentType: typeof payload.agentType === 'string' ? payload.agentType : null,
+            provider: typeof payload.provider === 'string' ? payload.provider : null,
             model: typeof payload.model === 'string' ? payload.model : null,
+            sessionKind: parentSessionName ? 'sub' : 'main',
+            parentSessionName,
+            metadataCompleteness: parentSessionName || !sessionId.startsWith('deck_sub_') ? 'complete' : 'partial',
             inputTokens: typeof payload.inputTokens === 'number' ? payload.inputTokens : 0,
             cacheTokens: typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0,
             outputTokens: typeof payload.outputTokens === 'number' ? payload.outputTokens : 0,

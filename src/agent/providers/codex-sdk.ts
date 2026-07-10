@@ -82,11 +82,10 @@ const COMPACT_START_ACCEPT_TIMEOUT_MS = 15_000;
 const COMPACT_NO_SIGNAL_SETTLE_MS = 5_000;
 const COMPACT_HARD_TIMEOUT_MS = 120_000;
 const TERMINATED_TURN_CACHE_LIMIT = 200;
-// Debounce before settling a turn purely from a thread-idle status (current
-// Codex app-server sometimes ends a turn without an explicit `turn/completed`).
-// Long enough that a transient mid-turn idle is cancelled by the activity that
-// follows it; short enough that a genuinely finished turn is never stuck.
-const CODEX_IDLE_SETTLE_DEBOUNCE_MS = 1_500;
+// `thread/status` and `thread/read` idle/completed states are app-server
+// liveness hints, not terminal proof. Healthy turns should end via explicit
+// `turn/completed`; app-server zombies may be settled only from Codex core's
+// durable rollout `task_complete` evidence.
 const TERMINATED_COMPACT_TURN_CACHE_LIMIT = 80;
 const CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS = 50_000;
 const CODEX_TURN_HEARTBEAT_INTERVAL_MS = 20_000;
@@ -762,11 +761,9 @@ interface CodexSdkSessionState {
   completedCompactTurnIds: Set<string>;
   terminatedTurnIds: Set<string>;
   terminatedCompactTurnIds: Set<string>;
-  // Debounced turn-end settle, armed when the thread reports idle and cancelled
-  // by any subsequent turn activity. Current Codex sometimes ends a turn with
-  // only a thread-idle status (no `turn/completed`); this fires that completion
-  // once the thread has been quiet for CODEX_IDLE_SETTLE_DEBOUNCE_MS, while a
-  // transient mid-turn idle is cancelled by the activity that follows it.
+  // App-server idle/completed hints are only deferred until active provider
+  // tools close; final turn completion still requires explicit `turn/completed`
+  // or rollout `task_complete` evidence for the current turn.
   idleSettleTimer?: ReturnType<typeof setTimeout>;
   idleSettleTurnId?: string;
   deferredIdleSettleTurnId?: string;
@@ -3008,13 +3005,28 @@ export class CodexSdkProvider implements TransportProvider {
       state.rolloutSettlePollTimer = null;
       if (!this.sessions.has(sessionId)) return;
       const lease = state.activeTurnLease;
-      if (!lease || !this.isHeartbeatLeaseActive(sessionId, state, lease)) {
+      const turnId = state.runningTurnId ?? lease?.turnId;
+      if (
+        !turnId
+        || state.cancelled
+        || state.runningCompact
+        || state.turnStartInFlight
+        || this.isClosedCodexTurn(state, turnId)
+      ) {
         this.clearRolloutSettlePoll(state);
         return;
       }
       // No-ops until the turn has been silent past the gate, so healthy,
       // actively-streaming turns never touch the file; only zombies settle here.
-      this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, Date.now());
+      if (lease && this.isHeartbeatLeaseActive(sessionId, state, lease)) {
+        this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, Date.now());
+      } else {
+        // If the SDK notification/heartbeat path wedges but the runtime still
+        // has a current turn id, Codex core's rollout file is still the durable
+        // authority. Keep polling it so a recorded task_complete clears the
+        // underlying provider state instead of only letting the UI pretend idle.
+        this.maybeConfirmCurrentTurnTaskCompleteFromRollout(sessionId, state, turnId);
+      }
       state.rolloutSettlePollTimer = setTimeout(tick, CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS);
       state.rolloutSettlePollTimer.unref?.();
     };
@@ -3338,15 +3350,11 @@ export class CodexSdkProvider implements TransportProvider {
           this.completeCompact(sessionId, state, readParamTurnId(params));
           return;
         }
-        // Authoritative turn-end signal for the current Codex app-server: it
-        // reports the thread going idle when a turn finishes but does NOT always
-        // emit an explicit `turn/completed` (confirmed via DIAG logs: turns
-        // started, did their work, but no `turn/completed` ever arrived → the
-        // runtime stayed "working" forever and the queued message could not
-        // drain until a manual STOP). So settle the active normal turn on
-        // thread-idle. The `completedTurnIds` dedup makes this coexist safely
-        // with a later `turn/completed` for the same turn — whichever arrives
-        // first settles it; the other is dropped by the dedup gate.
+        // App-server thread-idle is not terminal proof. Field logs show both
+        // directions: some finished turns never deliver `turn/completed`, while
+        // other turns report idle/completed before Codex core keeps producing
+        // output. Treat idle as a prompt to consult heartbeat/rollout evidence,
+        // not as permission to complete the turn directly.
         if (
           state.runningTurnId
           && !state.cancelled
@@ -3366,7 +3374,8 @@ export class CodexSdkProvider implements TransportProvider {
             void this.runHeartbeat(sessionId, lease.id, lease.attemptId);
             return;
           }
-          this.armIdleSettleTimer(sessionId, state, state.runningTurnId);
+          this.maybeConfirmCurrentTurnTaskCompleteFromRollout(sessionId, state, state.runningTurnId);
+          this.armRolloutSettlePoll(sessionId, state);
           return;
         }
       }
@@ -3718,7 +3727,6 @@ export class CodexSdkProvider implements TransportProvider {
   private clearActiveTurnLease(state: CodexSdkSessionState): void {
     const lease = state.activeTurnLease;
     if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
-    this.clearRolloutSettlePoll(state);
     state.activeTurnLease = undefined;
   }
 
@@ -3999,11 +4007,15 @@ export class CodexSdkProvider implements TransportProvider {
       return;
     }
     if (classification.outcome === 'terminal') {
-      this.clearActiveTurnLease(state);
       if (classification.status === 'completed') {
-        void this.completeTurn(sessionId, state, classification.turnId, 'thread_idle_settle');
+        // `thread/read` / thread-idle can be a false terminal signal from the
+        // app-server while Codex core keeps producing output. Do not complete
+        // from it directly. Treat it as a hint to consult the durable rollout;
+        // only rollout task_complete or explicit turn/completed may end a turn.
+        this.maybeConfirmTaskCompleteFromRollout(sessionId, state, lease, summary.requestEndedAtMs);
         return;
       }
+      this.clearActiveTurnLease(state);
       this.rememberTerminatedActiveTurn(state, classification.turnId);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
@@ -4048,7 +4060,7 @@ export class CodexSdkProvider implements TransportProvider {
     const silenceMs = nowMs - Math.max(lease.lastStrongActivityAtMs, lease.lastWeakActivityAtMs ?? 0);
     if (silenceMs < CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS) return;
     state.rolloutTaskCompleteCheckInFlight = true;
-    void this.confirmTaskCompleteFromRollout(sessionId, lease.id, lease.attemptId, turnId)
+    void this.confirmTaskCompleteFromRollout(sessionId, turnId, { leaseId: lease.id, attemptId: lease.attemptId })
       .catch((err) => {
         logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout task_complete cross-check failed');
       })
@@ -4058,25 +4070,56 @@ export class CodexSdkProvider implements TransportProvider {
       });
   }
 
+  private maybeConfirmCurrentTurnTaskCompleteFromRollout(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId: string,
+  ): void {
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    if (!state.threadId) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    void this.confirmTaskCompleteFromRollout(sessionId, turnId)
+      .catch((err) => {
+        logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout task_complete current-turn cross-check failed');
+      })
+      .finally(() => {
+        const latest = this.sessions.get(sessionId);
+        if (latest) latest.rolloutTaskCompleteCheckInFlight = false;
+      });
+  }
+
   private async confirmTaskCompleteFromRollout(
     sessionId: string,
-    leaseId: string,
-    attemptId: number,
     turnId: string,
+    leaseGuard?: { leaseId: string; attemptId: number },
   ): Promise<void> {
     const state = this.sessions.get(sessionId);
     const lease = state?.activeTurnLease;
-    if (!state || !lease || lease.id !== leaseId || lease.attemptId !== attemptId) return;
-    if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    if (!state) return;
+    if (leaseGuard) {
+      if (!lease || lease.id !== leaseGuard.leaseId || lease.attemptId !== leaseGuard.attemptId) return;
+      if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
+    } else {
+      if (state.cancelled || state.runningCompact || state.turnStartInFlight) return;
+      if (state.runningTurnId !== turnId) return;
+      if (this.isClosedCodexTurn(state, turnId)) return;
+    }
     const evidence = await this.rolloutTailReportsTaskComplete(state, turnId);
     if (!evidence) return;
     // Re-validate after the await — the turn may have settled or rolled over
     // through the normal paths while the file read was in flight.
     const latestState = this.sessions.get(sessionId);
     const latestLease = latestState?.activeTurnLease;
-    if (!latestState || !latestLease || latestLease.id !== leaseId || latestLease.attemptId !== attemptId) return;
-    if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
-    if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
+    if (!latestState) return;
+    if (leaseGuard) {
+      if (!latestLease || latestLease.id !== leaseGuard.leaseId || latestLease.attemptId !== leaseGuard.attemptId) return;
+      if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
+      if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
+    } else {
+      if (latestState.cancelled || latestState.runningCompact || latestState.turnStartInFlight) return;
+      if (latestState.runningTurnId !== turnId) return;
+      if (this.isClosedCodexTurn(latestState, turnId)) return;
+    }
     if (evidence.lastAgentMessage && latestState.currentText !== evidence.lastAgentMessage) {
       latestState.currentMessageId = `${turnId}:rollout-task-complete`;
       latestState.currentText = evidence.lastAgentMessage;
@@ -4182,7 +4225,7 @@ export class CodexSdkProvider implements TransportProvider {
     ));
   }
 
-  /** Cancel a pending debounced thread-idle settle (turn activity resumed). */
+  /** Clear pending idle hints when fresh activity or an explicit terminal event arrives. */
   private clearIdleSettleTimer(state: CodexSdkSessionState): void {
     if (state.idleSettleTimer) {
       clearTimeout(state.idleSettleTimer);
@@ -4196,31 +4239,6 @@ export class CodexSdkProvider implements TransportProvider {
     return state.activeToolItemIds.size > 0;
   }
 
-  /** Arm the debounced thread-idle settle for `turnId`. If no turn activity
-   *  arrives before the debounce elapses, the turn is completed (handles the
-   *  current Codex app-server ending a turn with only a thread-idle status). */
-  private armIdleSettleTimer(sessionId: string, state: CodexSdkSessionState, turnId: string): void {
-    this.clearIdleSettleTimer(state);
-    state.idleSettleTurnId = turnId;
-    state.idleSettleTimer = setTimeout(() => {
-      state.idleSettleTimer = undefined;
-      state.idleSettleTurnId = undefined;
-      if (
-        (!state.runningTurnId || state.runningTurnId === turnId)
-        && !state.cancelled
-        && !state.turnStartInFlight
-        && !this.isClosedCodexTurn(state, turnId)
-      ) {
-        if (this.hasActiveToolItems(state)) {
-          state.deferredIdleSettleTurnId = turnId;
-          return;
-        }
-        void this.completeTurn(sessionId, state, turnId, 'thread_idle_settle');
-      }
-    }, CODEX_IDLE_SETTLE_DEBOUNCE_MS);
-    state.idleSettleTimer.unref?.();
-  }
-
   private maybeArmDeferredIdleSettle(sessionId: string, state: CodexSdkSessionState): void {
     const turnId = state.deferredIdleSettleTurnId;
     if (!turnId || this.hasActiveToolItems(state)) return;
@@ -4230,7 +4248,8 @@ export class CodexSdkProvider implements TransportProvider {
       && !state.turnStartInFlight
       && !this.isClosedCodexTurn(state, turnId)
     ) {
-      this.armIdleSettleTimer(sessionId, state, turnId);
+      this.maybeConfirmCurrentTurnTaskCompleteFromRollout(sessionId, state, turnId);
+      this.armRolloutSettlePoll(sessionId, state);
       return;
     }
     state.deferredIdleSettleTurnId = undefined;

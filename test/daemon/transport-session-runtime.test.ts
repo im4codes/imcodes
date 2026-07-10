@@ -3434,7 +3434,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(resentPayload.userMessage).toBe('queued-after-stale-active');
   });
 
-  it('send() starts stale active-turn recovery when a new message queues behind silent work', async () => {
+  it('send() only queues behind silent work; watchdog/control paths own stale active-turn recovery', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
 
@@ -3447,8 +3447,13 @@ ${PREFERENCE_CONTEXT_END}`;
     internal._lastProviderOutputAt = staleAt;
 
     expect(runtime.send('queued-after-memory-compression-stall', 'cmd-after-stall')).toBe('queued');
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).not.toHaveBeenCalled();
+    expect(runtime.pendingCount).toBe(1);
 
+    expect(runtime.cancelStaleActiveTurnWithPending({
+      reason: 'explicit-watchdog-recovery',
+    })).toBe(true);
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
     await waitForProviderSendCount(mock.provider, 2);
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);

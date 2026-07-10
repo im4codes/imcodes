@@ -708,6 +708,82 @@ exec "${realGit}" "$@"
     expect(String(sendDuringIdleMock.mock.calls[0]?.[0] ?? '')).toContain('Implementation prompt: 1/');
   });
 
+  it('preempts a busy no-tool transport turn before sending an Auto Deliver prompt', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const settleBeforeSend = vi.fn(() => true);
+    const sendAfterSettle = vi.fn((text: string, commandId?: string) => {
+      transportSendMock(text, commandId);
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      send: sendAfterSettle,
+      settleActiveDispatchFromExternalCompletion: settleBeforeSend,
+      getDiagnosticSnapshot: () => ({
+        status: 'streaming',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+        activeToolCount: 0,
+      }),
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-pre-send-control-preempts-busy-no-tool-turn',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      SEND_WAIT_MS,
+    );
+    expect(settleBeforeSend).toHaveBeenCalledWith('openspec-auto-deliver-pre-send:implementation_task_loop');
+    expect(sendAfterSettle).toHaveBeenCalledTimes(1);
+    expect(settleBeforeSend.mock.invocationCallOrder[0]).toBeLessThan(sendAfterSettle.mock.invocationCallOrder[0]);
+    expect(String(sendAfterSettle.mock.calls[0]?.[0] ?? '')).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change');
+  });
+
+  it('does not preempt a busy transport turn while an active tool is running', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const settleBeforeSend = vi.fn(() => true);
+    const sendWithoutSettle = vi.fn((text: string, commandId?: string) => {
+      transportSendMock(text, commandId);
+      return 'sent' as const;
+    });
+    getTransportRuntimeMock.mockImplementation(() => ({
+      providerSessionId: 'provider-demo',
+      send: sendWithoutSettle,
+      settleActiveDispatchFromExternalCompletion: settleBeforeSend,
+      getDiagnosticSnapshot: () => ({
+        status: 'tool_running',
+        sending: true,
+        pendingCount: 0,
+        activeDispatchCount: 1,
+        activeToolCount: 1,
+      }),
+    }));
+
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-pre-send-control-preserves-active-tool',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_task_loop',
+      SEND_WAIT_MS,
+    );
+    expect(settleBeforeSend).not.toHaveBeenCalled();
+    expect(sendWithoutSettle).toHaveBeenCalledTimes(1);
+  });
+
   it('queues a marker reminder and stale recovery when implementation stays busy without writing the marker', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     let queuedReminder = false;

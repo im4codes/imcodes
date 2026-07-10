@@ -189,6 +189,7 @@ import {
 
 const DashboardPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DashboardPage.js')).then((m) => ({ default: m.DashboardPage })));
 const DiscussionsPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/DiscussionsPage.js')).then((m) => ({ default: m.DiscussionsPage })));
+const UsageSummaryPage = lazy(() => lazyImportWithAppUpdateNotice(() => import('./pages/UsageSummaryPage.js')).then((m) => ({ default: m.UsageSummaryPage })));
 
 function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffix: string): void {
   const parts: string[] = [];
@@ -1486,6 +1487,13 @@ export function App() {
     if (stackRef.current!.bringToFront(id)) bumpStack();
   }, []);
 
+  const focusFilePreviewWindow = useCallback(() => {
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.filePreview, {
+      kind: DESKTOP_WINDOW_KINDS.filePreview,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
+  }, [ensureDesktopWindow, selectedServerId]);
+
   /** Remove a window (and its children). Bumps only if anything was actually removed. */
   const removeDesktopWindow = useCallback((id: string) => {
     if (stackRef.current!.removeWindow(id)) {
@@ -1580,6 +1588,7 @@ export function App() {
 
   // ── Settings / Admin ────────────────────────────────────────────────────────
   const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const [showUsageSummaryPage, setShowUsageSummaryPage] = useState(false);
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
@@ -2613,17 +2622,22 @@ export function App() {
   }, [setPinnedPanels]);
 
   const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
-    runVersionSensitiveAction(trans('picker.files'), () => {
-      const cached = previewFileCache[request.path];
-      const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
-      setPreviewFileRequest({
-        ...request,
-        preview: request.preview ?? cached?.preview,
-        preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
-        previewViewMode,
-      });
+    const featureLabel = trans('picker.files');
+    if (appUpdateRequiredRef.current) {
+      showAppUpdateBlocker(featureLabel);
+      return;
+    }
+    focusFilePreviewWindow();
+    const cached = previewFileCache[request.path];
+    const previewViewMode = normalizePreviewViewMode(request.previewViewMode ?? cached?.previewViewMode);
+    setPreviewFileRequest({
+      ...request,
+      preview: request.preview ?? cached?.preview,
+      preferDiff: previewViewMode === 'diff' ? (request.preferDiff ?? cached?.preferDiff) : false,
+      previewViewMode,
     });
-  }, [previewFileCache, runVersionSensitiveAction, trans]);
+    void checkForAppUpdate({ blocking: true, featureLabel });
+  }, [checkForAppUpdate, focusFilePreviewWindow, previewFileCache, showAppUpdateBlocker, trans]);
 
   const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
     setPreviewFileCache((prev) => updateFilePreviewCache(prev, update));
@@ -4843,7 +4857,7 @@ export function App() {
         ) : !selectedServerId ? (
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
             <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>Loading...</div>}>
-              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onServersLoaded={setServers} />
+              <DashboardPage onSelectServer={handleSelectServer} onLogout={handleLogout} onOpenUsageSummary={() => setShowUsageSummaryPage(true)} onServersLoaded={setServers} />
             </Suspense>
           </div>
         ) : (
@@ -5622,6 +5636,14 @@ export function App() {
               setUserHasPassword(next.hasPassword);
             }}
           />
+        </div>
+      )}
+
+      {showUsageSummaryPage && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+          <Suspense fallback={<div style={{ textAlign: 'center', padding: 48, color: '#64748b' }}>{trans('common.loading')}</div>}>
+            <UsageSummaryPage onBack={() => setShowUsageSummaryPage(false)} />
+          </Suspense>
         </div>
       )}
 

@@ -61,6 +61,20 @@ import {
 } from '../../shared/memory-observation.js';
 import { isMemoryOrigin, requireExplicitMemoryOrigin, type MemoryOrigin } from '../../shared/memory-origin.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import {
+  USAGE_ANALYTICS_SCHEMA_VERSION,
+  USAGE_FACT_STATUSES,
+  USAGE_SYNC_STATUSES,
+  computeTotalTokens,
+  createCanonicalUsagePayloadHash,
+  normalizeCostUsdMicros,
+  type UsageFact,
+  type UsageFactStatus,
+  type UsageMetadataCompleteness,
+  type UsagePrivacySafeDiagnostics,
+  type UsageSessionKind,
+  type UsageSyncStatus,
+} from '../../shared/usage-analytics.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -107,6 +121,7 @@ export const CONTEXT_META_SENTINELS = [
   'migration_namespace_observation_backfilled',
   'last_observation_repair_at',
   'migration_namespace_filter_columns_backfilled',
+  'usage_authority_id',
 ] as const;
 
 export function tryAlter(database: DatabaseSyncInstance, sql: string): boolean {
@@ -570,6 +585,40 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_turn_usage(session_name, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_turn_usage_agent_model_created
       ON context_turn_usage(agent_type, model, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS context_turn_usage_sync (
+      turn_usage_rowid      INTEGER PRIMARY KEY REFERENCES context_turn_usage(id) ON DELETE CASCADE,
+      usage_authority_id    TEXT    NOT NULL,
+      usage_fact_id         TEXT    NOT NULL,
+      payload_hash          TEXT    NOT NULL,
+      sync_status           TEXT    NOT NULL,
+      retry_count           INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at_ms    INTEGER,
+      last_attempt_at_ms    INTEGER,
+      synced_at_ms          INTEGER,
+      last_error_reason     TEXT,
+      terminal_reason       TEXT,
+      metadata_completeness TEXT    NOT NULL,
+      created_at_ms         INTEGER NOT NULL,
+      updated_at_ms         INTEGER NOT NULL,
+      CHECK (sync_status IN (
+        'pending',
+        'retryable_failed',
+        'in_flight',
+        'accepted',
+        'duplicate',
+        'conflict_terminal',
+        'invalid_terminal',
+        'too_old_terminal',
+        'clock_skew_terminal',
+        'local_pruned_unsynced'
+      )),
+      CHECK (metadata_completeness IN ('complete', 'partial'))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_usage_sync_fact
+      ON context_turn_usage_sync(usage_authority_id, usage_fact_id);
+    CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_attempt
+      ON context_turn_usage_sync(sync_status, next_attempt_at_ms, created_at_ms);
   `);
   // Round-2 audit (0699ea64-3e6 finding A1): every daemon restart re-emits
   // historical `usage.update` events from JSONL replay (gemini-watcher's
@@ -578,6 +627,11 @@ function ensureDb(): DatabaseSyncInstance {
   // every restart. Partial index excludes legacy rows (event_id IS NULL) so
   // the migration is idempotent on existing databases.
   tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN event_id TEXT');
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN provider TEXT');
+  tryAlter(db, "ALTER TABLE context_turn_usage ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'main'");
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN parent_session_name TEXT');
+  tryAlter(db, "ALTER TABLE context_turn_usage ADD COLUMN metadata_completeness TEXT NOT NULL DEFAULT 'partial'");
+  tryAlter(db, 'ALTER TABLE context_turn_usage ADD COLUMN cost_usd_micros INTEGER');
   db.exec(
     'CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_usage_event ON context_turn_usage(session_name, event_id) WHERE event_id IS NOT NULL'
   );
@@ -1801,7 +1855,11 @@ export interface TurnUsageRecord {
    *  because some emitters (e.g. usage.update from `command-handler.ts`
    *  on model switch) only know `model`. */
   agentType?: string | null;
+  provider?: string | null;
   model?: string | null;
+  sessionKind?: UsageSessionKind;
+  parentSessionName?: string | null;
+  metadataCompleteness?: UsageMetadataCompleteness;
   inputTokens?: number;
   cacheTokens?: number;
   outputTokens?: number;
@@ -1817,6 +1875,505 @@ export interface TurnUsageRecord {
   eventId?: string | null;
 }
 
+export interface TurnUsageSyncRecord {
+  turnUsageRowid: number;
+  usageAuthorityId: string;
+  usageFactId: string;
+  payloadHash: string;
+  syncStatus: UsageSyncStatus;
+  retryCount: number;
+  nextAttemptAtMs: number | null;
+  lastAttemptAtMs: number | null;
+  syncedAtMs: number | null;
+  lastErrorReason: string | null;
+  terminalReason: string | null;
+  metadataCompleteness: UsageMetadataCompleteness;
+  createdAtMs: number;
+  updatedAtMs: number;
+  fact: UsageFact;
+}
+
+export interface TurnUsageSyncResultInput {
+  usageFactId: string;
+  status: UsageFactStatus;
+  reason?: string | null;
+}
+
+export interface TurnUsageSyncRequestFailureInput {
+  usageFactIds: string[];
+  retryable: boolean;
+  reason: string;
+  nextAttemptAtMs?: number | null;
+  now?: number;
+}
+
+const USAGE_AUTHORITY_META_KEY = 'usage_authority_id';
+const TERMINAL_USAGE_SYNC_STATUSES = new Set<UsageSyncStatus>([
+  'accepted',
+  'duplicate',
+  'conflict_terminal',
+  'invalid_terminal',
+  'too_old_terminal',
+  'clock_skew_terminal',
+  'local_pruned_unsynced',
+]);
+const PROTECTED_USAGE_SYNC_STATUSES = new Set<UsageSyncStatus>([
+  'pending',
+  'retryable_failed',
+  'in_flight',
+]);
+export const DEFAULT_USAGE_SYNC_IN_FLIGHT_LEASE_MS = 5 * 60 * 1000;
+
+export function getOrCreateUsageAuthorityId(): string {
+  const database = ensureDb();
+  const existing = internalGetContextMeta(database, USAGE_AUTHORITY_META_KEY);
+  if (existing) return existing;
+  const id = `usage-authority-${randomUUID()}`;
+  internalSetContextMeta(database, USAGE_AUTHORITY_META_KEY, id);
+  return id;
+}
+
+function getOrCreateUsageAuthorityIdForDb(database: DatabaseSyncInstance, now = Date.now()): string {
+  const existing = internalGetContextMeta(database, USAGE_AUTHORITY_META_KEY);
+  if (existing) return existing;
+  const id = `usage-authority-${randomUUID()}`;
+  internalSetContextMeta(database, USAGE_AUTHORITY_META_KEY, id, now);
+  return id;
+}
+
+function buildUsageFactFromRow(row: {
+  id: number;
+  created_at: number;
+  session_name: string;
+  session_kind: string | null;
+  parent_session_name: string | null;
+  metadata_completeness: string | null;
+  provider: string | null;
+  agent_type: string | null;
+  model: string | null;
+  input_tokens: number;
+  cache_tokens: number;
+  output_tokens: number;
+  context_window: number | null;
+  cost_usd_micros: number | null;
+  event_id: string | null;
+}, usageAuthorityId: string): UsageFact {
+  const inputTokens = Math.max(0, Math.trunc(row.input_tokens ?? 0));
+  const cacheTokens = Math.max(0, Math.trunc(row.cache_tokens ?? 0));
+  const outputTokens = Math.max(0, Math.trunc(row.output_tokens ?? 0));
+  const sessionKind: UsageSessionKind = row.session_kind === 'sub' ? 'sub' : 'main';
+  const metadataCompleteness: UsageMetadataCompleteness = row.metadata_completeness === 'complete' ? 'complete' : 'partial';
+  return {
+    usageFactId: `usage:${usageAuthorityId}:${row.id}`,
+    createdAtMs: row.created_at,
+    sessionName: row.session_name,
+    sessionKind,
+    parentSessionName: row.parent_session_name ?? null,
+    metadataCompleteness,
+    provider: row.provider ?? null,
+    agentType: row.agent_type ?? null,
+    model: row.model ?? null,
+    inputTokens,
+    cacheTokens,
+    outputTokens,
+    totalTokens: computeTotalTokens(inputTokens, cacheTokens, outputTokens),
+    contextWindow: row.context_window ?? null,
+    costUsdMicros: row.cost_usd_micros ?? null,
+    sourceEventId: row.event_id ?? null,
+  };
+}
+
+function readTurnUsageRow(database: DatabaseSyncInstance, rowid: number): Parameters<typeof buildUsageFactFromRow>[0] | null {
+  return database.prepare(`
+    SELECT
+      id,
+      created_at,
+      session_name,
+      session_kind,
+      parent_session_name,
+      metadata_completeness,
+      provider,
+      agent_type,
+      model,
+      input_tokens,
+      cache_tokens,
+      output_tokens,
+      context_window,
+      cost_usd_micros,
+      event_id
+    FROM context_turn_usage
+    WHERE id = ?
+  `).get(rowid) as Parameters<typeof buildUsageFactFromRow>[0] | undefined ?? null;
+}
+
+function ensureTurnUsageSyncMetadataForDb(database: DatabaseSyncInstance, rowid: number, now = Date.now()): TurnUsageSyncRecord | null {
+  const row = readTurnUsageRow(database, rowid);
+  if (!row) return null;
+  const usageAuthorityId = getOrCreateUsageAuthorityIdForDb(database, now);
+  const fact = buildUsageFactFromRow(row, usageAuthorityId);
+  const payloadHash = createCanonicalUsagePayloadHash(fact);
+  database.prepare(`
+    INSERT INTO context_turn_usage_sync (
+      turn_usage_rowid,
+      usage_authority_id,
+      usage_fact_id,
+      payload_hash,
+      sync_status,
+      retry_count,
+      next_attempt_at_ms,
+      metadata_completeness,
+      created_at_ms,
+      updated_at_ms
+    ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, ?)
+    ON CONFLICT(turn_usage_rowid) DO UPDATE SET
+      usage_authority_id = excluded.usage_authority_id,
+      usage_fact_id = excluded.usage_fact_id,
+      payload_hash = excluded.payload_hash,
+      metadata_completeness = excluded.metadata_completeness,
+      updated_at_ms = excluded.updated_at_ms,
+      -- If the fact's payload changed (a turn's usage was revised), re-open it
+      -- for sync so the new value uploads. Unchanged payload → keep the current
+      -- status (a synced/'accepted' row stays terminal → idempotent, no re-send).
+      -- usage_fact_id is stable per row, so the server updates the same fact.
+      sync_status = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN 'pending' ELSE context_turn_usage_sync.sync_status END,
+      retry_count = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN 0 ELSE context_turn_usage_sync.retry_count END,
+      next_attempt_at_ms = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN NULL ELSE context_turn_usage_sync.next_attempt_at_ms END
+  `).run(
+    rowid,
+    usageAuthorityId,
+    fact.usageFactId,
+    payloadHash,
+    fact.metadataCompleteness,
+    fact.createdAtMs,
+    now,
+  );
+  return readTurnUsageSyncRecordForDb(database, rowid);
+}
+
+export function ensureTurnUsageSyncMetadata(rowid: number): TurnUsageSyncRecord | null {
+  return ensureTurnUsageSyncMetadataForDb(ensureDb(), rowid);
+}
+
+function readTurnUsageSyncRecordForDb(database: DatabaseSyncInstance, rowid: number): TurnUsageSyncRecord | null {
+  const row = database.prepare(`
+    SELECT
+      s.turn_usage_rowid,
+      s.usage_authority_id,
+      s.usage_fact_id,
+      s.payload_hash,
+      s.sync_status,
+      s.retry_count,
+      s.next_attempt_at_ms,
+      s.last_attempt_at_ms,
+      s.synced_at_ms,
+      s.last_error_reason,
+      s.terminal_reason,
+      s.metadata_completeness,
+      s.created_at_ms,
+      s.updated_at_ms,
+      u.id,
+      u.created_at,
+      u.session_name,
+      u.session_kind,
+      u.parent_session_name,
+      u.provider,
+      u.agent_type,
+      u.model,
+      u.input_tokens,
+      u.cache_tokens,
+      u.output_tokens,
+      u.context_window,
+      u.cost_usd_micros,
+      u.event_id
+    FROM context_turn_usage_sync s
+    JOIN context_turn_usage u ON u.id = s.turn_usage_rowid
+    WHERE s.turn_usage_rowid = ?
+  `).get(rowid) as {
+    turn_usage_rowid: number;
+    usage_authority_id: string;
+    usage_fact_id: string;
+    payload_hash: string;
+    sync_status: UsageSyncStatus;
+    retry_count: number;
+    next_attempt_at_ms: number | null;
+    last_attempt_at_ms: number | null;
+    synced_at_ms: number | null;
+    last_error_reason: string | null;
+    terminal_reason: string | null;
+    metadata_completeness: UsageMetadataCompleteness;
+    created_at_ms: number;
+    updated_at_ms: number;
+    id: number;
+    created_at: number;
+    session_name: string;
+    session_kind: string | null;
+    parent_session_name: string | null;
+    provider: string | null;
+    agent_type: string | null;
+    model: string | null;
+    input_tokens: number;
+    cache_tokens: number;
+    output_tokens: number;
+    context_window: number | null;
+    cost_usd_micros: number | null;
+    event_id: string | null;
+  } | undefined;
+  if (!row) return null;
+  const fact = buildUsageFactFromRow({
+    id: row.id,
+    created_at: row.created_at,
+    session_name: row.session_name,
+    session_kind: row.session_kind,
+    parent_session_name: row.parent_session_name,
+    metadata_completeness: row.metadata_completeness,
+    provider: row.provider,
+    agent_type: row.agent_type,
+    model: row.model,
+    input_tokens: row.input_tokens,
+    cache_tokens: row.cache_tokens,
+    output_tokens: row.output_tokens,
+    context_window: row.context_window,
+    cost_usd_micros: row.cost_usd_micros,
+    event_id: row.event_id,
+  }, row.usage_authority_id);
+  return {
+    turnUsageRowid: row.turn_usage_rowid,
+    usageAuthorityId: row.usage_authority_id,
+    usageFactId: row.usage_fact_id,
+    payloadHash: row.payload_hash,
+    syncStatus: row.sync_status,
+    retryCount: row.retry_count,
+    nextAttemptAtMs: row.next_attempt_at_ms,
+    lastAttemptAtMs: row.last_attempt_at_ms,
+    syncedAtMs: row.synced_at_ms,
+    lastErrorReason: row.last_error_reason,
+    terminalReason: row.terminal_reason,
+    metadataCompleteness: row.metadata_completeness,
+    createdAtMs: row.created_at_ms,
+    updatedAtMs: row.updated_at_ms,
+    fact,
+  };
+}
+
+export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number } {
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT u.id
+    FROM context_turn_usage u
+    LEFT JOIN context_turn_usage_sync s ON s.turn_usage_rowid = u.id
+    WHERE s.turn_usage_rowid IS NULL
+    -- Newest-first: create sync metadata for the most RECENT unsynced turns
+    -- first, so the current period reaches the server promptly and the older
+    -- backlog fills in behind it (was ASC → recent data starved for hours).
+    ORDER BY u.id DESC
+    LIMIT ?
+  `).all(Math.max(1, Math.min(5000, Math.trunc(limit)))) as Array<{ id: number }>;
+  let backfilled = 0;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const row of rows) {
+      if (ensureTurnUsageSyncMetadataForDb(database, row.id)) {
+        backfilled += 1;
+      }
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return { backfilled };
+}
+
+export function recoverStaleTurnUsageSyncInFlight(input: { now?: number; leaseMs?: number } = {}): { recovered: number } {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const leaseMs = Math.max(1, Math.trunc(input.leaseMs ?? DEFAULT_USAGE_SYNC_IN_FLIGHT_LEASE_MS));
+  const staleBefore = now - leaseMs;
+  const result = database.prepare(`
+    UPDATE context_turn_usage_sync
+    SET sync_status = 'retryable_failed',
+        next_attempt_at_ms = NULL,
+        last_error_reason = 'in_flight_stale',
+        updated_at_ms = ?
+    WHERE sync_status = 'in_flight'
+      AND COALESCE(last_attempt_at_ms, updated_at_ms, created_at_ms) <= ?
+  `).run(now, staleBefore) as { changes?: number };
+  return { recovered: result.changes ?? 0 };
+}
+
+export function selectTurnUsageSyncBatch(input: { limit?: number; now?: number; inFlightLeaseMs?: number } = {}): TurnUsageSyncRecord[] {
+  const database = ensureDb();
+  const limit = Math.max(1, Math.min(500, Math.trunc(input.limit ?? 100)));
+  const now = input.now ?? Date.now();
+  backfillTurnUsageSyncMetadata(limit);
+  recoverStaleTurnUsageSyncInFlight({ now, leaseMs: input.inFlightLeaseMs });
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const rows = database.prepare(`
+      SELECT turn_usage_rowid
+      FROM context_turn_usage_sync
+      WHERE sync_status IN ('pending', 'retryable_failed')
+        AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+      -- Newest-first so live/recent turns upload immediately and never starve
+      -- behind a large historical backlog. Idempotent: only 'pending'/
+      -- 'retryable_failed' are ever selected — 'accepted' (and other terminal
+      -- statuses) are excluded, so a synced row is never re-sent; the server
+      -- additionally dedupes by (server_id, usage_fact_id).
+      ORDER BY created_at_ms DESC, turn_usage_rowid DESC
+      LIMIT ?
+    `).all(now, limit) as Array<{ turn_usage_rowid: number }>;
+    for (const row of rows) {
+      database.prepare(`
+        UPDATE context_turn_usage_sync
+        SET sync_status = 'in_flight',
+            last_attempt_at_ms = ?,
+            updated_at_ms = ?
+        WHERE turn_usage_rowid = ?
+      `).run(now, now, row.turn_usage_rowid);
+    }
+    database.exec('COMMIT');
+    return rows
+      .map((row) => readTurnUsageSyncRecordForDb(database, row.turn_usage_rowid))
+      .filter((row): row is TurnUsageSyncRecord => row !== null);
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+export function recordTurnUsageSyncResults(input: { results: TurnUsageSyncResultInput[]; now?: number }): { updated: number } {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  let updated = 0;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const result of input.results) {
+      const mapped = mapUsageFactStatusToSyncStatus(result.status);
+      const runResult = database.prepare(`
+        UPDATE context_turn_usage_sync
+        SET sync_status = ?,
+            synced_at_ms = CASE WHEN ? IN ('accepted', 'duplicate') THEN ? ELSE synced_at_ms END,
+            terminal_reason = CASE WHEN ? NOT IN ('accepted', 'duplicate') THEN ? ELSE terminal_reason END,
+            last_error_reason = ?,
+            updated_at_ms = ?
+        WHERE usage_fact_id = ?
+      `).run(
+        mapped,
+        mapped,
+        now,
+        mapped,
+        result.reason ?? result.status,
+        result.reason ?? null,
+        now,
+        result.usageFactId,
+      ) as { changes?: number };
+      updated += runResult.changes ?? 0;
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return { updated };
+}
+
+export function recordTurnUsageSyncRequestFailure(input: TurnUsageSyncRequestFailureInput): { updated: number } {
+  const database = ensureDb();
+  const now = input.now ?? Date.now();
+  const status: UsageSyncStatus = input.retryable ? 'retryable_failed' : 'invalid_terminal';
+  let updated = 0;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    for (const usageFactId of input.usageFactIds) {
+      const result = database.prepare(`
+        UPDATE context_turn_usage_sync
+        SET sync_status = ?,
+            retry_count = CASE WHEN ? = 'retryable_failed' THEN retry_count + 1 ELSE retry_count END,
+            next_attempt_at_ms = ?,
+            last_error_reason = ?,
+            terminal_reason = CASE WHEN ? = 'retryable_failed' THEN terminal_reason ELSE ? END,
+            updated_at_ms = ?
+        WHERE usage_fact_id = ?
+      `).run(
+        status,
+        status,
+        input.retryable ? input.nextAttemptAtMs ?? now + 60_000 : null,
+        input.reason,
+        status,
+        input.reason,
+        now,
+        usageFactId,
+      ) as { changes?: number };
+      updated += result.changes ?? 0;
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return { updated };
+}
+
+export function getTurnUsageSyncDiagnostics(now = Date.now()): UsagePrivacySafeDiagnostics {
+  const database = ensureDb();
+  const counts = database.prepare(`
+    SELECT sync_status, count(*) AS count
+    FROM context_turn_usage_sync
+    GROUP BY sync_status
+  `).all() as Array<{ sync_status: UsageSyncStatus; count: number }>;
+  const byStatus = new Map(counts.map((row) => [row.sync_status, row.count]));
+  const lagRow = database.prepare(`
+    SELECT min(created_at_ms) AS oldest
+    FROM context_turn_usage_sync
+    WHERE sync_status IN ('pending', 'retryable_failed', 'in_flight')
+  `).get() as { oldest: number | null } | undefined;
+  const lastSuccessRow = database.prepare(`
+    SELECT max(synced_at_ms) AS last_success
+    FROM context_turn_usage_sync
+    WHERE sync_status IN ('accepted', 'duplicate')
+  `).get() as { last_success: number | null } | undefined;
+  const lastErrorRow = database.prepare(`
+    SELECT last_error_reason
+    FROM context_turn_usage_sync
+    WHERE last_error_reason IS NOT NULL
+    ORDER BY updated_at_ms DESC
+    LIMIT 1
+  `).get() as { last_error_reason: string | null } | undefined;
+  return {
+    pendingCount: (byStatus.get('pending') ?? 0) + (byStatus.get('in_flight') ?? 0),
+    retryCount: byStatus.get('retryable_failed') ?? 0,
+    syncLagMs: typeof lagRow?.oldest === 'number' ? Math.max(0, now - lagRow.oldest) : 0,
+    lastSuccessAtMs: lastSuccessRow?.last_success ?? undefined,
+    acceptedCount: byStatus.get('accepted') ?? 0,
+    duplicateCount: byStatus.get('duplicate') ?? 0,
+    conflictCount: byStatus.get('conflict_terminal') ?? 0,
+    invalidCount: (byStatus.get('invalid_terminal') ?? 0) + (byStatus.get('local_pruned_unsynced') ?? 0),
+    tooOldCount: byStatus.get('too_old_terminal') ?? 0,
+    clockSkewCount: byStatus.get('clock_skew_terminal') ?? 0,
+    lastErrorReason: lastErrorRow?.last_error_reason ?? undefined,
+  };
+}
+
+function mapUsageFactStatusToSyncStatus(status: UsageFactStatus): UsageSyncStatus {
+  switch (status) {
+    case 'accepted':
+      return 'accepted';
+    case 'duplicate':
+      return 'duplicate';
+    case 'conflict':
+      return 'conflict_terminal';
+    case 'invalid':
+      return 'invalid_terminal';
+    case 'too_old':
+      return 'too_old_terminal';
+    case 'clock_skew_too_far':
+      return 'clock_skew_terminal';
+  }
+}
+
 export function recordTurnUsage(input: TurnUsageRecord): void {
   // Skip rows that carry no token information at all — pure model-switch
   // events fire `usage.update` with only `{ model, contextWindow }` and would
@@ -1829,13 +2386,39 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
   }
   try {
     const database = ensureDb();
+    const createdAt = input.createdAt ?? Date.now();
+    const costUsdMicros = normalizeCostUsdMicros(input.costUsd ?? null);
+    const sessionKind = input.sessionKind ?? 'main';
+    const parentSessionName = input.parentSessionName ?? null;
+    const metadataCompleteness = input.metadataCompleteness ?? (sessionKind === 'sub' && !parentSessionName ? 'partial' : 'complete');
+    // Upsert on (session_name, event_id): a turn's FINAL usage can be re-emitted
+    // with corrected/grown numbers (same eventId). Overwriting the mutable
+    // fields — but NOT created_at — keeps the row current so the change re-syncs
+    // (see ensureTurnUsageSyncMetadataForDb, which re-opens sync on a hash
+    // change). A pure replay (identical values on restart) yields the same
+    // payload hash and is therefore a no-op / idempotent. Rows without an
+    // event_id don't match the partial unique index, so they always insert.
     database.prepare(`
-      INSERT OR IGNORE INTO context_turn_usage (
+      INSERT INTO context_turn_usage (
         created_at, session_name, agent_type, model,
-        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
+        provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_name, event_id) WHERE event_id IS NOT NULL DO UPDATE SET
+        agent_type = excluded.agent_type,
+        model = excluded.model,
+        input_tokens = excluded.input_tokens,
+        cache_tokens = excluded.cache_tokens,
+        output_tokens = excluded.output_tokens,
+        context_window = excluded.context_window,
+        cost_usd = excluded.cost_usd,
+        provider = excluded.provider,
+        session_kind = excluded.session_kind,
+        parent_session_name = excluded.parent_session_name,
+        metadata_completeness = excluded.metadata_completeness,
+        cost_usd_micros = excluded.cost_usd_micros
     `).run(
-      input.createdAt ?? Date.now(),
+      createdAt,
       input.sessionName,
       input.agentType ?? null,
       input.model ?? null,
@@ -1845,7 +2428,27 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
       input.contextWindow ?? null,
       input.costUsd ?? null,
       input.eventId ?? null,
+      input.provider ?? null,
+      sessionKind,
+      parentSessionName,
+      metadataCompleteness,
+      costUsdMicros,
     );
+    let rowid: number | null = null;
+    if (input.eventId) {
+      const existing = database.prepare(
+        'SELECT id FROM context_turn_usage WHERE session_name = ? AND event_id = ?',
+      ).get(input.sessionName, input.eventId) as { id: number } | undefined;
+      rowid = existing?.id ?? null;
+    } else {
+      const latest = database.prepare(
+        'SELECT id FROM context_turn_usage WHERE session_name = ? ORDER BY id DESC LIMIT 1',
+      ).get(input.sessionName) as { id: number } | undefined;
+      rowid = latest?.id ?? null;
+    }
+    if (rowid != null) {
+      ensureTurnUsageSyncMetadataForDb(database, rowid);
+    }
   } catch (err) {
     // Never break the timeline emitter — log + counter only.
     incrementCounter('mem.turn_usage.record_failed', {});
@@ -1923,7 +2526,24 @@ export function pruneTurnUsage(retentionDays: number, now = Date.now()): { delet
   const database = ensureDb();
   const cutoff = now - retentionDays * 86_400_000;
   const result = database.prepare(
-    'DELETE FROM context_turn_usage WHERE created_at < ?',
+    `DELETE FROM context_turn_usage
+     WHERE created_at < ?
+       AND (
+         id NOT IN (SELECT turn_usage_rowid FROM context_turn_usage_sync)
+         OR id IN (
+           SELECT turn_usage_rowid
+           FROM context_turn_usage_sync
+           WHERE sync_status IN (
+             'accepted',
+             'duplicate',
+             'conflict_terminal',
+             'invalid_terminal',
+             'too_old_terminal',
+             'clock_skew_terminal',
+             'local_pruned_unsynced'
+           )
+         )
+       )`,
   ).run(cutoff) as { changes?: number };
   internalSetContextMeta(database, 'last_turn_usage_sweep_at', String(now), now);
   return { deleted: result.changes ?? 0 };

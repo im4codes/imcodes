@@ -1546,7 +1546,6 @@ export class TransportSessionRuntime implements SessionRuntime {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }
       this._pendingVersion++;
-      this.cancelStaleActiveTurnWithPending({ reason: 'queued-send-after-stale-active-turn' });
       return 'queued';
     }
 

@@ -15,6 +15,7 @@ import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import { CodexResetCredits } from './CodexResetCredits.js';
+import { SessionUsagePanel } from './SessionUsagePanel.js';
 import type { WsClient } from '../ws-client.js';
 
 interface Props {
@@ -65,6 +66,8 @@ const fmt = (n: number) =>
 
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, wsClient, connected }: Props) {
   const { t } = useTranslation();
+  const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
+
   // Wrench pill: tri-state toggle for "show developer details in chat timeline".
   // Sourced from usePref → SharedResource, so this UsageFooter and ChatView
   // share one GET / one listener / one cache entry per tab.
@@ -248,6 +251,9 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const isCodexSession = agentType === 'codex' || agentType === 'codex-sdk';
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
+      {sessionUsageOpen && (
+        <SessionUsagePanel targetSessionName={sessionName} onClose={() => setSessionUsageOpen(false)} />
+      )}
       {hasContextInfo && (
         <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
@@ -323,6 +329,15 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
               ) : null}
             </button>
           )}
+          <button
+            type="button"
+            class="shortcut-btn shortcut-btn-icon shortcut-btn-session-usage"
+            title={t('sessionUsage.open')}
+            aria-label={t('sessionUsage.open')}
+            onClick={() => setSessionUsageOpen(true)}
+          >
+            📊
+          </button>
           {onSyncMemorySummaries && (
             <button
               type="button"

@@ -58,6 +58,56 @@
     "hide": "Скрыть",
     "this_feature": "Эта функция"
   },
+  "usageSummary": {
+    "title": "Usage",
+    "back": "Back",
+    "from": "From",
+    "to": "To",
+    "server": "Server",
+    "provider": "Provider",
+    "model": "Model",
+    "session": "Session",
+    "kind": "Kind",
+    "anyKind": "Any",
+    "mainSession": "Main session",
+    "subSession": "Sub-session",
+    "parent": "Parent",
+    "order": "Order",
+    "desc": "High to low",
+    "asc": "Low to high",
+    "apply": "Apply",
+    "clear": "Clear",
+    "error": "Usage data could not be loaded.",
+    "empty": "No usage for these filters.",
+    "noRows": "No rows",
+    "totalTokens": "Total tokens",
+    "facts": "Facts",
+    "cost": "Cost",
+    "byDate": "By date",
+    "byServer": "By server",
+    "byProviderModel": "By provider and model",
+    "byMainSession": "Main sessions",
+    "bySubSession": "Sub-sessions",
+    "byParentSession": "Parent sessions",
+    "bySessionModelDate": "Session, model, and date",
+    "unknown": "Unknown",
+    "partialMetadata": "Partial metadata",
+    "costCompleteness": {
+      "known": "Known cost",
+      "unknown": "Unknown cost",
+      "partial": "Partial cost"
+    },
+    "allServers": "Все серверы",
+    "allProviders": "Все провайдеры",
+    "allModels": "Все модели",
+    "allSessions": "Все сессии",
+    "preset": {
+      "today": "Сегодня",
+      "last7": "7 дней",
+      "last30": "30 дней",
+      "allTime": "Всё время"
+    }
+  },
   "share": {
     "menu": {
       "shareTab": "Поделиться"
@@ -1303,10 +1353,14 @@
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
       "scores": "Scores",
+      "score_overview": "Обзор оценок",
       "final_scores": "Final acceptance scores",
+      "final_spec_score": "Final Spec",
+      "final_impl_score": "Final Impl",
       "pre_repair_scores": "Pre-repair audit scores",
       "score_snapshot_meta": "Round {{round}} · {{reason}}",
       "scores_empty": "Оценок пока нет",
+      "score_pending": "Ожидает финального аудита",
       "scores_pending_repair_rescore": "These scores are from the previous implementation audit. Auto Deliver is repairing those findings now and will rescore after implementation finishes.",
       "audit_results": "Результаты раундов аудита",
       "audit_results_empty": "Завершенных раундов аудита пока нет",
@@ -2564,5 +2618,27 @@
     "error_request_failed": "Ошибка запроса.",
     "error_app_server_timeout": "Codex не ответил.",
     "error_invalid_params": "Неверный запрос."
+  },
+  "sessionUsage": {
+    "title": "Использование сессии",
+    "group": "Вся группа",
+    "switchLabel": "Сессия",
+    "input": "Ввод",
+    "cache": "Кэш",
+    "output": "Вывод",
+    "error": "Не удалось загрузить",
+    "empty": "Пока нет данных",
+    "close": "Закрыть",
+    "open": "Использование этой сессии",
+    "period": {
+      "7d": "7д",
+      "30d": "30д",
+      "all": "Всё"
+    },
+    "byDay": "По дням",
+    "byWeek": "По неделям",
+    "weekOf": "Неделя {{date}}",
+    "members": "По сессиям",
+    "rangeAll": "Всё время"
   }
 }

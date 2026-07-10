@@ -58,6 +58,56 @@
     "hide": "隱藏",
     "this_feature": "此功能"
   },
+  "usageSummary": {
+    "title": "Usage",
+    "back": "Back",
+    "from": "From",
+    "to": "To",
+    "server": "Server",
+    "provider": "Provider",
+    "model": "Model",
+    "session": "Session",
+    "kind": "Kind",
+    "anyKind": "Any",
+    "mainSession": "Main session",
+    "subSession": "Sub-session",
+    "parent": "Parent",
+    "order": "Order",
+    "desc": "High to low",
+    "asc": "Low to high",
+    "apply": "Apply",
+    "clear": "Clear",
+    "error": "Usage data could not be loaded.",
+    "empty": "No usage for these filters.",
+    "noRows": "No rows",
+    "totalTokens": "Total tokens",
+    "facts": "Facts",
+    "cost": "Cost",
+    "byDate": "By date",
+    "byServer": "By server",
+    "byProviderModel": "By provider and model",
+    "byMainSession": "Main sessions",
+    "bySubSession": "Sub-sessions",
+    "byParentSession": "Parent sessions",
+    "bySessionModelDate": "Session, model, and date",
+    "unknown": "Unknown",
+    "partialMetadata": "Partial metadata",
+    "costCompleteness": {
+      "known": "Known cost",
+      "unknown": "Unknown cost",
+      "partial": "Partial cost"
+    },
+    "allServers": "全部伺服器",
+    "allProviders": "全部供應商",
+    "allModels": "全部模型",
+    "allSessions": "全部工作階段",
+    "preset": {
+      "today": "今天",
+      "last7": "近 7 天",
+      "last30": "近 30 天",
+      "allTime": "全部"
+    }
+  },
   "share": {
     "menu": {
       "shareTab": "分享"
@@ -1305,10 +1355,14 @@
       "terminal_reason": "結束原因",
       "task_stats": "任務狀態",
       "scores": "评分",
+      "score_overview": "評分總覽",
       "final_scores": "最終驗收評分",
+      "final_spec_score": "最終 Spec",
+      "final_impl_score": "最終實作",
       "pre_repair_scores": "修復前審計評分",
       "score_snapshot_meta": "第 {{round}} 輪 · {{reason}}",
       "scores_empty": "暂无评分",
+      "score_pending": "等待最終審計",
       "scores_pending_repair_rescore": "這些分數來自上一輪實作審計。Auto Deliver 正在根據審計結論執行修復，修復完成後會重新審計並刷新評分。",
       "audit_results": "審計輪次結果",
       "audit_results_empty": "暫無已完成審計輪次",
@@ -2566,5 +2620,27 @@
     "error_request_failed": "請求失敗。",
     "error_app_server_timeout": "Codex 逾時。",
     "error_invalid_params": "請求無效。"
+  },
+  "sessionUsage": {
+    "title": "工作階段用量",
+    "group": "整組合計",
+    "switchLabel": "工作階段",
+    "input": "輸入",
+    "cache": "快取",
+    "output": "輸出",
+    "error": "載入用量失敗",
+    "empty": "尚無用量",
+    "close": "關閉",
+    "open": "查看本工作階段用量",
+    "period": {
+      "7d": "7天",
+      "30d": "30天",
+      "all": "全部"
+    },
+    "byDay": "按日",
+    "byWeek": "按週",
+    "weekOf": "{{date}} 當週",
+    "members": "按工作階段",
+    "rangeAll": "全部時間"
   }
 }

@@ -58,6 +58,56 @@
     "hide": "隐藏",
     "this_feature": "此功能"
   },
+  "usageSummary": {
+    "title": "Usage",
+    "back": "Back",
+    "from": "From",
+    "to": "To",
+    "server": "Server",
+    "provider": "Provider",
+    "model": "Model",
+    "session": "Session",
+    "kind": "Kind",
+    "anyKind": "Any",
+    "mainSession": "Main session",
+    "subSession": "Sub-session",
+    "parent": "Parent",
+    "order": "Order",
+    "desc": "High to low",
+    "asc": "Low to high",
+    "apply": "Apply",
+    "clear": "Clear",
+    "error": "Usage data could not be loaded.",
+    "empty": "No usage for these filters.",
+    "noRows": "No rows",
+    "totalTokens": "Total tokens",
+    "facts": "Facts",
+    "cost": "Cost",
+    "byDate": "By date",
+    "byServer": "By server",
+    "byProviderModel": "By provider and model",
+    "byMainSession": "Main sessions",
+    "bySubSession": "Sub-sessions",
+    "byParentSession": "Parent sessions",
+    "bySessionModelDate": "Session, model, and date",
+    "unknown": "Unknown",
+    "partialMetadata": "Partial metadata",
+    "costCompleteness": {
+      "known": "Known cost",
+      "unknown": "Unknown cost",
+      "partial": "Partial cost"
+    },
+    "allServers": "全部服务器",
+    "allProviders": "全部提供方",
+    "allModels": "全部模型",
+    "allSessions": "全部会话",
+    "preset": {
+      "today": "今天",
+      "last7": "近 7 天",
+      "last30": "近 30 天",
+      "allTime": "全部"
+    }
+  },
   "share": {
     "menu": {
       "shareTab": "共享"
@@ -1305,10 +1355,14 @@
       "terminal_reason": "结束原因",
       "task_stats": "任务状态",
       "scores": "评分",
+      "score_overview": "评分总览",
       "final_scores": "最终验收评分",
+      "final_spec_score": "最终 Spec",
+      "final_impl_score": "最终实现",
       "pre_repair_scores": "修复前审计评分",
       "score_snapshot_meta": "第 {{round}} 轮 · {{reason}}",
       "scores_empty": "暂无评分",
+      "score_pending": "等待最终审计",
       "scores_pending_repair_rescore": "这些分数来自上一轮实现审计。Auto Deliver 正在根据审计结论执行修复，修复完成后会重新审计并刷新评分。",
       "audit_results": "审计轮次结果",
       "audit_results_empty": "暂无已完成审计轮次",
@@ -2566,5 +2620,27 @@
     "error_request_failed": "请求失败。",
     "error_app_server_timeout": "Codex 超时。",
     "error_invalid_params": "请求无效。"
+  },
+  "sessionUsage": {
+    "title": "会话用量",
+    "group": "整组合计",
+    "switchLabel": "会话",
+    "input": "输入",
+    "cache": "缓存",
+    "output": "输出",
+    "error": "加载用量失败",
+    "empty": "暂无用量",
+    "close": "关闭",
+    "open": "查看本会话用量",
+    "period": {
+      "7d": "7天",
+      "30d": "30天",
+      "all": "全部"
+    },
+    "byDay": "按日",
+    "byWeek": "按周",
+    "weekOf": "{{date}} 当周",
+    "members": "按会话",
+    "rangeAll": "全部时间"
   }
 }

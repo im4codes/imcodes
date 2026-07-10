@@ -58,6 +58,56 @@
     "hide": "Hide",
     "this_feature": "This feature"
   },
+  "usageSummary": {
+    "title": "Usage",
+    "back": "Back",
+    "from": "From",
+    "to": "To",
+    "server": "Server",
+    "provider": "Provider",
+    "model": "Model",
+    "session": "Session",
+    "kind": "Kind",
+    "anyKind": "Any",
+    "mainSession": "Main session",
+    "subSession": "Sub-session",
+    "parent": "Parent",
+    "order": "Order",
+    "desc": "High to low",
+    "asc": "Low to high",
+    "apply": "Apply",
+    "clear": "Clear",
+    "error": "Usage data could not be loaded.",
+    "empty": "No usage for these filters.",
+    "noRows": "No rows",
+    "totalTokens": "Total tokens",
+    "facts": "Facts",
+    "cost": "Cost",
+    "byDate": "By date",
+    "byServer": "By server",
+    "byProviderModel": "By provider and model",
+    "byMainSession": "Main sessions",
+    "bySubSession": "Sub-sessions",
+    "byParentSession": "Parent sessions",
+    "bySessionModelDate": "Session, model, and date",
+    "unknown": "Unknown",
+    "partialMetadata": "Partial metadata",
+    "costCompleteness": {
+      "known": "Known cost",
+      "unknown": "Unknown cost",
+      "partial": "Partial cost"
+    },
+    "allServers": "All servers",
+    "allProviders": "All providers",
+    "allModels": "All models",
+    "allSessions": "All sessions",
+    "preset": {
+      "today": "Today",
+      "last7": "Last 7 days",
+      "last30": "Last 30 days",
+      "allTime": "All time"
+    }
+  },
   "share": {
     "menu": {
       "shareTab": "Share"
@@ -1305,10 +1355,14 @@
       "terminal_reason": "Terminal reason",
       "task_stats": "Task status",
       "scores": "Scores",
+      "score_overview": "Score overview",
       "final_scores": "Final acceptance scores",
+      "final_spec_score": "Final Spec",
+      "final_impl_score": "Final Impl",
       "pre_repair_scores": "Pre-repair audit scores",
       "score_snapshot_meta": "Round {{round}} · {{reason}}",
       "scores_empty": "No scores yet",
+      "score_pending": "Pending final audit",
       "scores_pending_repair_rescore": "These scores are from the previous implementation audit. Auto Deliver is repairing those findings now and will rescore after implementation finishes.",
       "audit_results": "Audit round results",
       "audit_results_empty": "No audit rounds have completed yet",
@@ -2566,5 +2620,27 @@
     "error_request_failed": "Request failed.",
     "error_app_server_timeout": "Codex timed out.",
     "error_invalid_params": "Invalid request."
+  },
+  "sessionUsage": {
+    "title": "Session usage",
+    "group": "Whole group",
+    "switchLabel": "Session",
+    "input": "In",
+    "cache": "Cache",
+    "output": "Out",
+    "error": "Failed to load usage",
+    "empty": "No usage yet",
+    "close": "Close",
+    "open": "View this session’s usage",
+    "period": {
+      "7d": "7d",
+      "30d": "30d",
+      "all": "All"
+    },
+    "byDay": "By day",
+    "byWeek": "By week",
+    "weekOf": "Week of {{date}}",
+    "members": "By session",
+    "rangeAll": "All time"
   }
 }
