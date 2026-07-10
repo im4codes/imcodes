@@ -2030,7 +2030,17 @@ function ensureTurnUsageSyncMetadataForDb(database: DatabaseSyncInstance, rowid:
       usage_fact_id = excluded.usage_fact_id,
       payload_hash = excluded.payload_hash,
       metadata_completeness = excluded.metadata_completeness,
-      updated_at_ms = excluded.updated_at_ms
+      updated_at_ms = excluded.updated_at_ms,
+      -- If the fact's payload changed (a turn's usage was revised), re-open it
+      -- for sync so the new value uploads. Unchanged payload → keep the current
+      -- status (a synced/'accepted' row stays terminal → idempotent, no re-send).
+      -- usage_fact_id is stable per row, so the server updates the same fact.
+      sync_status = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN 'pending' ELSE context_turn_usage_sync.sync_status END,
+      retry_count = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN 0 ELSE context_turn_usage_sync.retry_count END,
+      next_attempt_at_ms = CASE WHEN context_turn_usage_sync.payload_hash <> excluded.payload_hash
+        THEN NULL ELSE context_turn_usage_sync.next_attempt_at_ms END
   `).run(
     rowid,
     usageAuthorityId,
@@ -2381,12 +2391,32 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
     const sessionKind = input.sessionKind ?? 'main';
     const parentSessionName = input.parentSessionName ?? null;
     const metadataCompleteness = input.metadataCompleteness ?? (sessionKind === 'sub' && !parentSessionName ? 'partial' : 'complete');
+    // Upsert on (session_name, event_id): a turn's FINAL usage can be re-emitted
+    // with corrected/grown numbers (same eventId). Overwriting the mutable
+    // fields — but NOT created_at — keeps the row current so the change re-syncs
+    // (see ensureTurnUsageSyncMetadataForDb, which re-opens sync on a hash
+    // change). A pure replay (identical values on restart) yields the same
+    // payload hash and is therefore a no-op / idempotent. Rows without an
+    // event_id don't match the partial unique index, so they always insert.
     database.prepare(`
-      INSERT OR IGNORE INTO context_turn_usage (
+      INSERT INTO context_turn_usage (
         created_at, session_name, agent_type, model,
         input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
         provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_name, event_id) WHERE event_id IS NOT NULL DO UPDATE SET
+        agent_type = excluded.agent_type,
+        model = excluded.model,
+        input_tokens = excluded.input_tokens,
+        cache_tokens = excluded.cache_tokens,
+        output_tokens = excluded.output_tokens,
+        context_window = excluded.context_window,
+        cost_usd = excluded.cost_usd,
+        provider = excluded.provider,
+        session_kind = excluded.session_kind,
+        parent_session_name = excluded.parent_session_name,
+        metadata_completeness = excluded.metadata_completeness,
+        cost_usd_micros = excluded.cost_usd_micros
     `).run(
       createdAt,
       input.sessionName,

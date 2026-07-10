@@ -69,7 +69,9 @@ export async function ingestServerTokenUsageFacts(
       const payloadHash = createCanonicalUsagePayloadHash(fact);
       const existing = await findExistingUsageFact(tx, params.serverId, fact.usageFactId);
       if (existing) {
-        results.push(classifyExistingUsageFact(fact.usageFactId, payloadHash, existing.payload_hash));
+        results.push(await reconcileExistingUsageFact(tx, {
+          serverId: params.serverId, fact, payloadHash, existingPayloadHash: existing.payload_hash, receivedAtMs: now,
+        }));
         continue;
       }
       if (fact.createdAtMs < now - importWindowMs) {
@@ -157,9 +159,48 @@ async function insertServerTokenUsageFactIdempotent(
 
   const existing = await findExistingUsageFact(db, params.serverId, params.fact.usageFactId);
   if (existing) {
-    return classifyExistingUsageFact(params.fact.usageFactId, params.payloadHash, existing.payload_hash);
+    return reconcileExistingUsageFact(db, {
+      serverId: params.serverId,
+      fact: params.fact,
+      payloadHash: params.payloadHash,
+      existingPayloadHash: existing.payload_hash,
+      receivedAtMs: params.receivedAtMs,
+    });
   }
   throw new Error('usage_fact_conflict_without_existing_row');
+}
+
+/**
+ * An already-stored fact with this usage_fact_id exists. Same payload hash → a
+ * pure duplicate (no-op). Different hash → the SAME logical turn was revised
+ * (usage_fact_id is stable per source row), so UPDATE it in place — no double
+ * count — and report 'accepted' so the daemon marks it synced. created_at /
+ * usage_date are left untouched (the turn's time doesn't change).
+ */
+async function reconcileExistingUsageFact(
+  db: Database,
+  params: { serverId: string; fact: UsageFact; payloadHash: string; existingPayloadHash: string; receivedAtMs: number },
+): Promise<UsageFactResult> {
+  if (params.existingPayloadHash === params.payloadHash) {
+    return { usageFactId: params.fact.usageFactId, status: 'duplicate' };
+  }
+  const { fact } = params;
+  await db.execute(
+    `UPDATE server_token_usage_facts SET
+       payload_hash = $1, received_at_ms = $2, session_name = $3, session_kind = $4,
+       parent_session_name = $5, metadata_completeness = $6, provider = $7, agent_type = $8,
+       model = $9, input_tokens = $10, cache_tokens = $11, output_tokens = $12,
+       total_tokens = $13, context_window = $14, cost_usd_micros = $15, source_event_id = $16
+     WHERE server_id = $17 AND usage_fact_id = $18`,
+    [
+      params.payloadHash, params.receivedAtMs, fact.sessionName, fact.sessionKind,
+      fact.parentSessionName, fact.metadataCompleteness, fact.provider, fact.agentType,
+      fact.model, fact.inputTokens, fact.cacheTokens, fact.outputTokens,
+      fact.totalTokens, fact.contextWindow, fact.costUsdMicros, fact.sourceEventId,
+      params.serverId, fact.usageFactId,
+    ],
+  );
+  return { usageFactId: params.fact.usageFactId, status: 'accepted' };
 }
 
 async function findExistingUsageFact(
@@ -171,17 +212,6 @@ async function findExistingUsageFact(
     'SELECT payload_hash FROM server_token_usage_facts WHERE server_id = $1 AND usage_fact_id = $2',
     [serverId, usageFactId],
   );
-}
-
-function classifyExistingUsageFact(
-  usageFactId: string,
-  incomingPayloadHash: string,
-  existingPayloadHash: string,
-): UsageFactResult {
-  return {
-    usageFactId,
-    status: existingPayloadHash === incomingPayloadHash ? 'duplicate' : 'conflict',
-  };
 }
 
 export async function getTokenUsageSummary(

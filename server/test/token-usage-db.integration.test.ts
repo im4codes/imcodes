@@ -128,21 +128,9 @@ describe('server token usage storage', () => {
     await expect(ingestServerTokenUsageFacts(db, {
       serverId,
       userId,
-      facts: [{ ...main, outputTokens: 9, totalTokens: 21 }],
-      now,
-    })).resolves.toEqual([{ usageFactId: 'fact-main', status: 'conflict' }]);
-    await expect(ingestServerTokenUsageFacts(db, {
-      serverId,
-      userId,
       facts: [main],
       now: now + 181 * 86_400_000,
     })).resolves.toEqual([{ usageFactId: 'fact-main', status: 'duplicate' }]);
-    await expect(ingestServerTokenUsageFacts(db, {
-      serverId,
-      userId,
-      facts: [{ ...main, outputTokens: 11, totalTokens: 23 }],
-      now: now + 181 * 86_400_000,
-    })).resolves.toEqual([{ usageFactId: 'fact-main', status: 'conflict' }]);
     await expect(ingestServerTokenUsageFacts(db, {
       serverId,
       userId,
@@ -190,7 +178,7 @@ describe('server token usage storage', () => {
     expect(serverFiltered.accountTotal.totalTokens).toBe(40);
   });
 
-  it('classifies duplicate and conflicting rows within a single batch', async () => {
+  it('dedupes identical rows and updates revised rows within a single batch', async () => {
     const { userId, serverId } = await seedOwnerServer('usage-same-batch');
     const now = Date.UTC(2026, 6, 10, 0, 0);
     await expect(ingestServerTokenUsageFacts(db, {
@@ -212,14 +200,17 @@ describe('server token usage storage', () => {
       { usageFactId: 'same-batch-dupe', status: 'accepted' },
       { usageFactId: 'same-batch-dupe', status: 'duplicate' },
       { usageFactId: 'same-batch-conflict', status: 'accepted' },
-      { usageFactId: 'same-batch-conflict', status: 'conflict' },
+      // Same id, revised numbers → updated in place (not rejected as a conflict).
+      { usageFactId: 'same-batch-conflict', status: 'accepted' },
     ]);
 
     const summary = await getTokenUsageSummary(db, userId, { serverId });
     expect(summary.accountTotal.factCount).toBe(2);
+    // The revised same-batch-conflict (total 42) replaced its first value (20).
+    expect(summary.accountTotal.totalTokens).toBe(20 + 42);
   });
 
-  it('classifies concurrent duplicate and conflicting inserts without double counting', async () => {
+  it('dedupes concurrent identical inserts and updates concurrent revised inserts without double counting', async () => {
     const { userId, serverId } = await seedOwnerServer('usage-concurrent');
     const now = Date.UTC(2026, 6, 10, 0, 0);
     const duplicate = fact({ usageFactId: 'concurrent-duplicate', sourceEventId: 'evt-concurrent-dupe' });
@@ -242,10 +233,34 @@ describe('server token usage storage', () => {
         now,
       }),
     ]);
-    expect(conflictResults.flat().map((result) => result.status).sort()).toEqual(['accepted', 'conflict']);
+    // One inserts, the other finds it and updates in place — both succeed, no dup.
+    expect(conflictResults.flat().map((result) => result.status).sort()).toEqual(['accepted', 'accepted']);
 
     const summary = await getTokenUsageSummary(db, userId, { serverId });
     expect(summary.accountTotal.factCount).toBe(2);
+  });
+
+  it('re-syncs a revised fact (same id, new payload) by updating it in place — no double count', async () => {
+    const { userId, serverId } = await seedOwnerServer('usage-revise');
+    const now = Date.UTC(2026, 6, 10, 0, 0);
+    const firstPass = fact({ usageFactId: 'revise-1', sourceEventId: 'evt-revise', inputTokens: 10, cacheTokens: 0, outputTokens: 5 });
+    await expect(ingestServerTokenUsageFacts(db, { serverId, userId, facts: [firstPass], now }))
+      .resolves.toEqual([{ usageFactId: 'revise-1', status: 'accepted' }]);
+    expect((await getTokenUsageSummary(db, userId, { serverId })).accountTotal.totalTokens).toBe(15);
+
+    // Same turn re-emitted with grown numbers → updated in place, still one fact.
+    const revised = fact({ usageFactId: 'revise-1', sourceEventId: 'evt-revise', inputTokens: 10, cacheTokens: 0, outputTokens: 40 });
+    await expect(ingestServerTokenUsageFacts(db, { serverId, userId, facts: [revised], now }))
+      .resolves.toEqual([{ usageFactId: 'revise-1', status: 'accepted' }]);
+
+    const summary = await getTokenUsageSummary(db, userId, { serverId });
+    expect(summary.accountTotal.factCount).toBe(1);
+    expect(summary.accountTotal.totalTokens).toBe(50);
+
+    // Re-sending the identical revised fact is a pure duplicate (idempotent).
+    await expect(ingestServerTokenUsageFacts(db, { serverId, userId, facts: [revised], now }))
+      .resolves.toEqual([{ usageFactId: 'revise-1', status: 'duplicate' }]);
+    expect((await getTokenUsageSummary(db, userId, { serverId })).accountTotal.factCount).toBe(1);
   });
 
   it('isolates multiple owners with overlapping usage fact and session dimensions', async () => {

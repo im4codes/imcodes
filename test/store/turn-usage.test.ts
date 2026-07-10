@@ -318,6 +318,27 @@ describe('turn usage server sync metadata', () => {
     expect(selectTurnUsageSyncBatch({ limit: 10, now: 300 })).toHaveLength(0);
   });
 
+  it('re-opens sync when a turn is revised (same eventId, new value) but not on identical replay', () => {
+    recordTurnUsage({ sessionName: 'a', model: 'm', inputTokens: 1, outputTokens: 1, eventId: 'e', createdAt: 100 });
+    const first = selectTurnUsageSyncBatch({ limit: 10, now: 200 });
+    expect(first).toHaveLength(1);
+    const factId = first[0].usageFactId;
+    recordTurnUsageSyncResults({ now: 300, results: [{ usageFactId: factId, status: 'accepted' }] });
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 400 })).toHaveLength(0);
+
+    // Same turn re-emitted with grown output → row updated, sync re-opened.
+    recordTurnUsage({ sessionName: 'a', model: 'm', inputTokens: 1, outputTokens: 9, eventId: 'e', createdAt: 100 });
+    const reopened = selectTurnUsageSyncBatch({ limit: 10, now: 500 });
+    expect(reopened).toHaveLength(1);
+    expect(reopened[0].usageFactId).toBe(factId); // stable id → server updates in place
+    expect(reopened[0].fact.outputTokens).toBe(9); // carries the revised value
+
+    // Identical replay (same value) must NOT re-open (idempotent).
+    recordTurnUsageSyncResults({ now: 600, results: [{ usageFactId: factId, status: 'accepted' }] });
+    recordTurnUsage({ sessionName: 'a', model: 'm', inputTokens: 1, outputTokens: 9, eventId: 'e', createdAt: 100 });
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 700 })).toHaveLength(0);
+  });
+
   it('protects pending and retryable facts from prune while pruning accepted rows', () => {
     const now = 1_700_000_000_000;
     recordTurnUsage({
