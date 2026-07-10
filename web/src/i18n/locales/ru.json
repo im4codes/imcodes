@@ -96,6 +96,16 @@
       "known": "Known cost",
       "unknown": "Unknown cost",
       "partial": "Partial cost"
+    },
+    "allServers": "Все серверы",
+    "allProviders": "Все провайдеры",
+    "allModels": "Все модели",
+    "allSessions": "Все сессии",
+    "preset": {
+      "today": "Сегодня",
+      "last7": "7 дней",
+      "last30": "30 дней",
+      "allTime": "Всё время"
     }
   },
   "share": {
@@ -2608,5 +2618,17 @@
     "error_request_failed": "Ошибка запроса.",
     "error_app_server_timeout": "Codex не ответил.",
     "error_invalid_params": "Неверный запрос."
+  },
+  "sessionUsage": {
+    "title": "Использование сессии",
+    "group": "Вся группа",
+    "switchLabel": "Сессия",
+    "input": "Ввод",
+    "cache": "Кэш",
+    "output": "Вывод",
+    "error": "Не удалось загрузить",
+    "empty": "Пока нет данных",
+    "close": "Закрыть",
+    "open": "Использование этой сессии"
   }
 }

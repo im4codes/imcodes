@@ -96,6 +96,16 @@
       "known": "Known cost",
       "unknown": "Unknown cost",
       "partial": "Partial cost"
+    },
+    "allServers": "All servers",
+    "allProviders": "All providers",
+    "allModels": "All models",
+    "allSessions": "All sessions",
+    "preset": {
+      "today": "Today",
+      "last7": "Last 7 days",
+      "last30": "Last 30 days",
+      "allTime": "All time"
     }
   },
   "share": {
@@ -2610,5 +2620,17 @@
     "error_request_failed": "Request failed.",
     "error_app_server_timeout": "Codex timed out.",
     "error_invalid_params": "Invalid request."
+  },
+  "sessionUsage": {
+    "title": "Session usage",
+    "group": "Whole group",
+    "switchLabel": "Session",
+    "input": "In",
+    "cache": "Cache",
+    "output": "Out",
+    "error": "Failed to load usage",
+    "empty": "No usage yet",
+    "close": "Close",
+    "open": "View this session’s usage"
   }
 }

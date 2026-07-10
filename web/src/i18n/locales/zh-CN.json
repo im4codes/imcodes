@@ -96,6 +96,16 @@
       "known": "Known cost",
       "unknown": "Unknown cost",
       "partial": "Partial cost"
+    },
+    "allServers": "全部服务器",
+    "allProviders": "全部提供方",
+    "allModels": "全部模型",
+    "allSessions": "全部会话",
+    "preset": {
+      "today": "今天",
+      "last7": "近 7 天",
+      "last30": "近 30 天",
+      "allTime": "全部"
     }
   },
   "share": {
@@ -2610,5 +2620,17 @@
     "error_request_failed": "请求失败。",
     "error_app_server_timeout": "Codex 超时。",
     "error_invalid_params": "请求无效。"
+  },
+  "sessionUsage": {
+    "title": "会话用量",
+    "group": "整组合计",
+    "switchLabel": "会话",
+    "input": "输入",
+    "cache": "缓存",
+    "output": "输出",
+    "error": "加载用量失败",
+    "empty": "暂无用量",
+    "close": "关闭",
+    "open": "查看本会话用量"
   }
 }

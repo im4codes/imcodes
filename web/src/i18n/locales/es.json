@@ -96,6 +96,16 @@
       "known": "Known cost",
       "unknown": "Unknown cost",
       "partial": "Partial cost"
+    },
+    "allServers": "Todos los servidores",
+    "allProviders": "Todos los proveedores",
+    "allModels": "Todos los modelos",
+    "allSessions": "Todas las sesiones",
+    "preset": {
+      "today": "Hoy",
+      "last7": "Últimos 7 días",
+      "last30": "Últimos 30 días",
+      "allTime": "Todo"
     }
   },
   "share": {
@@ -2609,5 +2619,17 @@
     "error_request_failed": "Error de solicitud.",
     "error_app_server_timeout": "Codex agotó el tiempo.",
     "error_invalid_params": "Solicitud no válida."
+  },
+  "sessionUsage": {
+    "title": "Uso de sesión",
+    "group": "Todo el grupo",
+    "switchLabel": "Sesión",
+    "input": "Entrada",
+    "cache": "Caché",
+    "output": "Salida",
+    "error": "Error al cargar el uso",
+    "empty": "Sin uso aún",
+    "close": "Cerrar",
+    "open": "Ver el uso de esta sesión"
   }
 }

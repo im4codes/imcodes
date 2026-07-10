@@ -96,6 +96,16 @@
       "known": "Known cost",
       "unknown": "Unknown cost",
       "partial": "Partial cost"
+    },
+    "allServers": "全部伺服器",
+    "allProviders": "全部供應商",
+    "allModels": "全部模型",
+    "allSessions": "全部工作階段",
+    "preset": {
+      "today": "今天",
+      "last7": "近 7 天",
+      "last30": "近 30 天",
+      "allTime": "全部"
     }
   },
   "share": {
@@ -2610,5 +2620,17 @@
     "error_request_failed": "請求失敗。",
     "error_app_server_timeout": "Codex 逾時。",
     "error_invalid_params": "請求無效。"
+  },
+  "sessionUsage": {
+    "title": "工作階段用量",
+    "group": "整組合計",
+    "switchLabel": "工作階段",
+    "input": "輸入",
+    "cache": "快取",
+    "output": "輸出",
+    "error": "載入用量失敗",
+    "empty": "尚無用量",
+    "close": "關閉",
+    "open": "查看本工作階段用量"
   }
 }

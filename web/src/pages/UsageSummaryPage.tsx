@@ -6,6 +6,8 @@ import {
   type UsageSummaryResponse,
   type UsageSummaryRow,
 } from '../api/usage-summary.js';
+import { formatUsageNumber, formatUsageCost } from '../util/usage-format.js';
+import { deriveFacetOptions } from '../util/usage-group.js';
 
 interface Props {
   onBack: () => void;
@@ -16,6 +18,10 @@ export function UsageSummaryPage({ onBack }: Props) {
   const [query, setQuery] = useState<UsageSummaryQuery>(() => defaultQuery());
   const [draft, setDraft] = useState<UsageSummaryQuery>(() => defaultQuery());
   const [summary, setSummary] = useState<UsageSummaryResponse | null>(null);
+  // Facets = a date-only summary used purely to populate the entity dropdowns
+  // (server/provider/model/session) so they never shrink when a filter is
+  // applied — the main `summary` narrows with filters, this one doesn't.
+  const [facets, setFacets] = useState<UsageSummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,21 +42,25 @@ export function UsageSummaryPage({ onBack }: Props) {
     void load(query);
   }, [load, query]);
 
+  // Refresh the dropdown option lists whenever the date window changes (entity
+  // filters are intentionally excluded so every option stays selectable).
+  useEffect(() => {
+    let cancelled = false;
+    fetchUsageSummary({ from: query.from, to: query.to })
+      .then((res) => { if (!cancelled) setFacets(res); })
+      .catch(() => { /* dropdowns fall back to whatever the main summary carries */ });
+    return () => { cancelled = true; };
+  }, [query.from, query.to]);
+
+  const options = useMemo(() => deriveFacetOptions(facets ?? summary), [facets, summary]);
+
   const totalCost = useMemo(() => formatCost(summary?.accountTotal.costUsdMicros ?? null, t), [summary, t]);
 
   const updateDraft = (key: keyof UsageSummaryQuery, value: string) => {
     setDraft((prev) => ({ ...prev, [key]: value || undefined }));
   };
 
-  const applyFilters = () => {
-    const clean: UsageSummaryQuery = {};
-    for (const [key, value] of Object.entries(draft)) {
-      if (value !== undefined && value !== '') {
-        (clean as Record<string, unknown>)[key] = value;
-      }
-    }
-    setQuery(clean);
-  };
+  const applyFilters = () => setQuery(cleanQuery(draft));
 
   return (
     <div style={{ background: '#0a0e1a', color: '#e2e8f0', minHeight: '100%', padding: 20, overflowY: 'auto' }}>
@@ -61,13 +71,30 @@ export function UsageSummaryPage({ onBack }: Props) {
           <button class="btn" style={{ marginLeft: 'auto' }} onClick={() => void load(query)}>{t('common.refresh')}</button>
         </div>
 
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+          {DATE_PRESETS.map((preset) => (
+            <button
+              key={preset.key}
+              class="btn btn-secondary"
+              style={{ fontSize: 12, padding: '4px 10px' }}
+              onClick={() => {
+                const range = preset.range();
+                const next = { ...draft, from: range.from, to: range.to };
+                setDraft(next);
+                setQuery(cleanQuery(next));
+              }}
+            >
+              {t(`usageSummary.preset.${preset.key}`)}
+            </button>
+          ))}
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 16 }}>
           <FilterInput label={t('usageSummary.from')} type="date" value={draft.from ?? ''} onInput={(value) => updateDraft('from', value)} />
           <FilterInput label={t('usageSummary.to')} type="date" value={draft.to ?? ''} onInput={(value) => updateDraft('to', value)} />
-          <FilterInput label={t('usageSummary.server')} value={draft.serverId ?? ''} onInput={(value) => updateDraft('serverId', value)} />
-          <FilterInput label={t('usageSummary.provider')} value={draft.provider ?? ''} onInput={(value) => updateDraft('provider', value)} />
-          <FilterInput label={t('usageSummary.model')} value={draft.model ?? ''} onInput={(value) => updateDraft('model', value)} />
-          <FilterInput label={t('usageSummary.session')} value={draft.sessionName ?? ''} onInput={(value) => updateDraft('sessionName', value)} />
+          <FilterSelect label={t('usageSummary.server')} value={draft.serverId ?? ''} placeholder={t('usageSummary.allServers')} options={options.servers} onChange={(value) => updateDraft('serverId', value)} />
+          <FilterSelect label={t('usageSummary.provider')} value={draft.provider ?? ''} placeholder={t('usageSummary.allProviders')} options={options.providers} onChange={(value) => updateDraft('provider', value)} />
+          <FilterSelect label={t('usageSummary.model')} value={draft.model ?? ''} placeholder={t('usageSummary.allModels')} options={options.models} onChange={(value) => updateDraft('model', value)} />
+          <FilterSelect label={t('usageSummary.session')} value={draft.sessionName ?? ''} placeholder={t('usageSummary.allSessions')} options={options.sessions} onChange={(value) => updateDraft('sessionName', value)} />
           <label style={fieldStyle}>
             <span style={labelStyle}>{t('usageSummary.kind')}</span>
             <select
@@ -125,14 +152,56 @@ export function UsageSummaryPage({ onBack }: Props) {
 }
 
 function defaultQuery(): UsageSummaryQuery {
+  return { ...DATE_PRESETS.find((p) => p.key === 'last30')!.range(), order: 'desc' };
+}
+
+/** Drop empty/undefined values so the query string only carries real filters. */
+function cleanQuery(draft: UsageSummaryQuery): UsageSummaryQuery {
+  const clean: UsageSummaryQuery = {};
+  for (const [key, value] of Object.entries(draft)) {
+    if (value !== undefined && value !== '') {
+      (clean as Record<string, unknown>)[key] = value;
+    }
+  }
+  return clean;
+}
+
+/** Quick date-range presets. `allTime` clears both bounds (server = no date filter). */
+const DATE_PRESETS: { key: string; range: () => { from?: string; to?: string } }[] = [
+  { key: 'today', range: () => { const n = new Date(); return { from: toDateInput(n), to: toDateInput(n) }; } },
+  { key: 'last7', range: () => rangeDaysAgo(7) },
+  { key: 'last30', range: () => rangeDaysAgo(30) },
+  { key: 'allTime', range: () => ({ from: undefined, to: undefined }) },
+];
+
+function rangeDaysAgo(days: number): { from: string; to: string } {
   const now = new Date();
   const from = new Date(now);
-  from.setDate(now.getDate() - 30);
-  return {
-    from: toDateInput(from),
-    to: toDateInput(now),
-    order: 'desc',
-  };
+  from.setDate(now.getDate() - days);
+  return { from: toDateInput(from), to: toDateInput(now) };
+}
+
+function FilterSelect(props: {
+  label: string; value: string; placeholder: string; options: string[]; onChange: (value: string) => void;
+}) {
+  // If the current value isn't in the fetched options (e.g. pre-scoped from a
+  // session button, or facets still loading), include it so it stays selected.
+  const opts = props.value && !props.options.includes(props.value)
+    ? [props.value, ...props.options]
+    : props.options;
+  return (
+    <label style={fieldStyle}>
+      <span style={labelStyle}>{props.label}</span>
+      <select
+        value={props.value}
+        onInput={(event) => props.onChange((event.currentTarget as HTMLSelectElement).value)}
+        style={inputStyle}
+      >
+        <option value="">{props.placeholder}</option>
+        {opts.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+      </select>
+    </label>
+  );
 }
 
 function FilterInput(props: { label: string; value: string; type?: string; onInput: (value: string) => void }) {
@@ -202,12 +271,11 @@ function labelOrUnknown(value: string | null | undefined, t: (key: string) => st
 }
 
 function formatNumber(value: number): string {
-  return new Intl.NumberFormat().format(value);
+  return formatUsageNumber(value);
 }
 
 function formatCost(micros: number | null, t: (key: string) => string): string {
-  if (micros == null) return t('usageSummary.unknown');
-  return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 4 }).format(micros / 1_000_000);
+  return formatUsageCost(micros, t('usageSummary.unknown'));
 }
 
 function toDateInput(date: Date): string {

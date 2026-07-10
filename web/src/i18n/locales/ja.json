@@ -96,6 +96,16 @@
       "known": "Known cost",
       "unknown": "Unknown cost",
       "partial": "Partial cost"
+    },
+    "allServers": "すべてのサーバー",
+    "allProviders": "すべてのプロバイダー",
+    "allModels": "すべてのモデル",
+    "allSessions": "すべてのセッション",
+    "preset": {
+      "today": "今日",
+      "last7": "過去 7 日",
+      "last30": "過去 30 日",
+      "allTime": "全期間"
     }
   },
   "share": {
@@ -2608,5 +2618,17 @@
     "error_request_failed": "リクエストに失敗しました。",
     "error_app_server_timeout": "Codex がタイムアウトしました。",
     "error_invalid_params": "無効なリクエストです。"
+  },
+  "sessionUsage": {
+    "title": "セッション使用量",
+    "group": "グループ合計",
+    "switchLabel": "セッション",
+    "input": "入力",
+    "cache": "キャッシュ",
+    "output": "出力",
+    "error": "使用量の読み込みに失敗",
+    "empty": "まだ使用量がありません",
+    "close": "閉じる",
+    "open": "このセッションの使用量を表示"
   }
 }
