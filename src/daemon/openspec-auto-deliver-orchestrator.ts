@@ -354,6 +354,50 @@ function runtimeProviderSessionId(runtime: NonNullable<ReturnType<typeof getTran
   return runtime.providerSessionId ?? null;
 }
 
+function preemptBusyRuntimeBeforeAutoDeliverPrompt(
+  run: AutoDeliverRun,
+  runtime: NonNullable<ReturnType<typeof getTransportRuntime>>,
+): void {
+  const snapshot = runtime as typeof runtime & {
+    getStatus?: () => string;
+    getDiagnosticSnapshot?: (nowMs?: number) => {
+      status?: string;
+      sending?: boolean;
+      activeDispatchCount?: number;
+      activeToolCount?: number;
+    };
+    settleActiveDispatchFromExternalCompletion?: (reason?: string) => boolean;
+    cancelStaleActiveTurnWithPending?: (options?: { reason?: string; nowMs?: number; staleMs?: number }) => boolean;
+    sending?: boolean;
+    activeDispatchEntries?: unknown[];
+  };
+  const nowMs = Date.now();
+  const diagnostic = snapshot.getDiagnosticSnapshot?.(nowMs);
+  const status = diagnostic?.status ?? (typeof snapshot.getStatus === 'function' ? snapshot.getStatus() : undefined);
+  const sending = diagnostic?.sending ?? snapshot.sending === true;
+  const activeDispatchCount = diagnostic?.activeDispatchCount
+    ?? (Array.isArray(snapshot.activeDispatchEntries) ? snapshot.activeDispatchEntries.length : 0);
+  const activeToolCount = diagnostic?.activeToolCount ?? 0;
+  const inProgress = status === 'streaming'
+    || status === 'thinking'
+    || status === 'permission'
+    || status === 'tool_running';
+  if ((!inProgress && !sending && activeDispatchCount <= 0) || activeToolCount > 0) return;
+
+  const reason = `openspec-auto-deliver-pre-send:${run.status}`;
+  const settled = snapshot.settleActiveDispatchFromExternalCompletion?.(reason) === true;
+  const cancelled = settled
+    ? false
+    : snapshot.cancelStaleActiveTurnWithPending?.({ reason, nowMs, staleMs: 0 }) === true;
+  if (!settled && !cancelled) return;
+
+  run.evidence = mergeEvidence(run.evidence, [{
+    source: 'daemon',
+    summary: `Auto Deliver prompt preempted a stale busy transport turn before send: ${reason}.`,
+    stale: false,
+  }]);
+}
+
 function emitAutoDeliverQueuedState(sessionName: string): void {
   const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'openspec_auto_deliver');
   timelineEmitter.emit(sessionName, 'session.state', {
@@ -422,6 +466,7 @@ async function sendAutoDeliverPromptToImplementationSession(
     return queueAutoDeliverPromptForTransportResend(run, prompt, commandId, 'transport_runtime_not_initialized');
   }
   try {
+    preemptBusyRuntimeBeforeAutoDeliverPrompt(run, runtime);
     const result = runtime.send(prompt, commandId);
     if (result === 'sent') {
       timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
