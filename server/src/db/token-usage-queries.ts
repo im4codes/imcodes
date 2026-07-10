@@ -270,6 +270,12 @@ function buildSummaryWhere(userId: string, query: UsageSummaryQuery): { whereSql
   if (query.sessionName) add('session_name = ?', query.sessionName);
   if (query.sessionKind) add('session_kind = ?', query.sessionKind);
   if (query.parentSessionName) add('parent_session_name = ?', query.parentSessionName);
+  if (query.groupSession) {
+    // A main session + its sub-sessions: the main's own rows (session_name = X)
+    // plus every sub whose parent is X. Uses two positional params.
+    params.push(query.groupSession, query.groupSession);
+    clauses.push(`(session_name = $${params.length - 1} OR parent_session_name = $${params.length})`);
+  }
   if (query.provider) add('provider = ?', query.provider);
   if (query.agentType) add('agent_type = ?', query.agentType);
   if (query.model) add('model = ?', query.model);

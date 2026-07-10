@@ -89,3 +89,26 @@ export function sumUsageTotals(list: UsageTotals[]): UsageTotals {
 export function emptyUsageTotals(): UsageTotals {
   return { factCount: 0, inputTokens: 0, cacheTokens: 0, outputTokens: 0, totalTokens: 0, costUsdMicros: null };
 }
+
+/** UTC Monday (YYYY-MM-DD) of the ISO week containing `dateStr` (a YYYY-MM-DD). */
+export function mondayOfWeekUtc(dateStr: string): string {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const dow = d.getUTCDay(); // 0=Sun … 6=Sat
+  d.setUTCDate(d.getUTCDate() - (dow === 0 ? 6 : dow - 1));
+  return d.toISOString().slice(0, 10);
+}
+
+/** Bucket per-day rows into ISO weeks (keyed by the week's UTC Monday), sorted ascending. */
+export function bucketRowsByWeek(rows: UsageSummaryRow[]): { key: string; totals: UsageTotals }[] {
+  const byWeek = new Map<string, UsageTotals[]>();
+  for (const r of rows) {
+    if (!r.date) continue;
+    const wk = mondayOfWeekUtc(r.date);
+    const list = byWeek.get(wk) ?? [];
+    list.push(rowToTotals(r));
+    byWeek.set(wk, list);
+  }
+  return Array.from(byWeek.entries())
+    .map(([key, list]) => ({ key, totals: sumUsageTotals(list) }))
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+}

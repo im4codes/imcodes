@@ -2630,6 +2630,16 @@
     "error": "Error al cargar el uso",
     "empty": "Sin uso aún",
     "close": "Cerrar",
-    "open": "Ver el uso de esta sesión"
+    "open": "Ver el uso de esta sesión",
+    "period": {
+      "7d": "7d",
+      "30d": "30d",
+      "all": "Todo"
+    },
+    "byDay": "Por día",
+    "byWeek": "Por semana",
+    "weekOf": "Semana del {{date}}",
+    "members": "Por sesión",
+    "rangeAll": "Todo el tiempo"
   }
 }

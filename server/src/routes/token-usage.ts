@@ -163,6 +163,7 @@ function parseSummaryQuery(raw: Record<string, string>): { ok: true; query: Usag
   copyString('serverId');
   copyString('sessionName');
   copyString('parentSessionName');
+  copyString('groupSession');
   copyString('provider');
   copyString('agentType');
   copyString('model');

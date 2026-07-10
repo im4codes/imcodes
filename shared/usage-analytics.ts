@@ -209,6 +209,9 @@ export interface UsageSummaryQuery {
   sessionName?: string;
   sessionKind?: UsageSessionKind;
   parentSessionName?: string;
+  /** Restrict to one main session's group: its own facts OR its sub-sessions'
+   *  (session_name = X OR parent_session_name = X). */
+  groupSession?: string;
   provider?: string;
   agentType?: string;
   model?: string;

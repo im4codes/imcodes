@@ -558,4 +558,29 @@ describe('server token usage storage', () => {
       }),
     ]);
   });
+
+  it('groupSession scopes a summary to one main session plus its sub-sessions only', async () => {
+    const { userId, serverId } = await seedOwnerServer('usage-group');
+    const now = Date.UTC(2026, 6, 10, 0, 0);
+    await ingestServerTokenUsageFacts(db, {
+      serverId,
+      userId,
+      now,
+      facts: [
+        fact({ usageFactId: 'g-main', sessionName: 'deck_g_brain', sessionKind: 'main', parentSessionName: null, inputTokens: 60, cacheTokens: 10, outputTokens: 30 }),
+        fact({ usageFactId: 'g-w1', sessionName: 'deck_g_w1', sessionKind: 'sub', parentSessionName: 'deck_g_brain', inputTokens: 30, cacheTokens: 5, outputTokens: 15 }),
+        fact({ usageFactId: 'g-w2', sessionName: 'deck_g_w2', sessionKind: 'sub', parentSessionName: 'deck_g_brain', inputTokens: 12, cacheTokens: 2, outputTokens: 6 }),
+        // A DIFFERENT group — must be excluded.
+        fact({ usageFactId: 'other-main', sessionName: 'deck_other_brain', sessionKind: 'main', parentSessionName: null, inputTokens: 600, cacheTokens: 99, outputTokens: 300 }),
+        fact({ usageFactId: 'other-sub', sessionName: 'deck_other_w1', sessionKind: 'sub', parentSessionName: 'deck_other_brain', inputTokens: 1, cacheTokens: 1, outputTokens: 1 }),
+      ],
+    });
+
+    const summary = await getTokenUsageSummary(db, userId, { serverId, groupSession: 'deck_g_brain' });
+    // 100 + 50 + 20 = 170; the other group's 999 + 3 are excluded.
+    expect(summary.accountTotal.factCount).toBe(3);
+    expect(summary.accountTotal.totalTokens).toBe(170);
+    expect(summary.byMainSession.map((r) => r.sessionName)).toEqual(['deck_g_brain']);
+    expect(summary.bySubSession.map((r) => r.sessionName).sort()).toEqual(['deck_g_w1', 'deck_g_w2']);
+  });
 });

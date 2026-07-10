@@ -2631,6 +2631,16 @@
     "error": "Failed to load usage",
     "empty": "No usage yet",
     "close": "Close",
-    "open": "View this session’s usage"
+    "open": "View this session’s usage",
+    "period": {
+      "7d": "7d",
+      "30d": "30d",
+      "all": "All"
+    },
+    "byDay": "By day",
+    "byWeek": "By week",
+    "weekOf": "Week of {{date}}",
+    "members": "By session",
+    "rangeAll": "All time"
   }
 }

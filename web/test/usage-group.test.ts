@@ -5,7 +5,7 @@ import {
   type UsageSummaryResponse,
   type UsageSummaryRow,
 } from '@shared/usage-analytics.js';
-import { computeSessionGroup, deriveFacetOptions } from '../src/util/usage-group.js';
+import { computeSessionGroup, deriveFacetOptions, bucketRowsByWeek, mondayOfWeekUtc } from '../src/util/usage-group.js';
 
 function row(over: Partial<UsageSummaryRow>): UsageSummaryRow {
   return { ...createEmptyUsageSummaryRow(over.key ?? 'k'), ...over };
@@ -87,5 +87,30 @@ describe('deriveFacetOptions', () => {
 
   it('returns empty lists for null input', () => {
     expect(deriveFacetOptions(null)).toEqual({ servers: [], providers: [], models: [], sessions: [] });
+  });
+});
+
+describe('week bucketing', () => {
+  it('mondayOfWeekUtc returns the UTC Monday of the week', () => {
+    const m = mondayOfWeekUtc('2026-07-08');
+    expect(new Date(`${m}T00:00:00Z`).getUTCDay()).toBe(1); // Monday
+    expect(m <= '2026-07-08').toBe(true);
+  });
+
+  it('buckets per-day rows into 7-day weeks and sums totals (cost null-safe)', () => {
+    // 2026-07-08 and 2026-07-15 are exactly 7 days apart → guaranteed different weeks.
+    const weeks = bucketRowsByWeek([
+      row({ date: '2026-07-08', totalTokens: 10, costUsdMicros: 100 }),
+      row({ date: '2026-07-08', totalTokens: 5, costUsdMicros: null }),
+      row({ date: '2026-07-15', totalTokens: 20, costUsdMicros: 200 }),
+      row({ date: undefined, totalTokens: 999 }), // no date → ignored
+    ]);
+    expect(weeks).toHaveLength(2);
+    expect(weeks[0].totals.totalTokens).toBe(15);
+    expect(weeks[0].totals.costUsdMicros).toBe(100); // 100 + null → 100
+    expect(weeks[1].totals.totalTokens).toBe(20);
+    expect(weeks[0].key < weeks[1].key).toBe(true); // ascending
+    expect(new Date(`${weeks[0].key}T00:00:00Z`).getUTCDay()).toBe(1);
+    expect(new Date(`${weeks[1].key}T00:00:00Z`).getUTCDay()).toBe(1);
   });
 });
