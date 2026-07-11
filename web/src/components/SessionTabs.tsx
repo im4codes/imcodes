@@ -93,7 +93,10 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const [tabOrder, setTabOrder] = useSyncedPreference<string[]>(
     'tab_order',
     readLegacyOrder(),
-    500,
+    // A drag/drop is a single discrete action. Persist it immediately so a
+    // refresh right after dropping cannot cancel a pending debounce and restore
+    // the previous pinned-tab order from the server.
+    0,
   );
 
   // Drag state

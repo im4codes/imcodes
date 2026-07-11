@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { getUserPref, saveUserPref } from '../api.js';
+import { safeLocalStorageSetItem } from '../local-storage-quota.js';
 
 /** Payload format stored in both localStorage and server. */
 interface SyncPayload<T> {
@@ -24,9 +25,11 @@ function readFromLocalStorage<T>(key: string): SyncPayload<T> | null {
 }
 
 function writeToLocalStorage<T>(key: string, payload: SyncPayload<T>): void {
-  try {
-    localStorage.setItem(lsKey(key), JSON.stringify(payload));
-  } catch { /* storage full or restricted */ }
+  // Timeline/file-preview snapshots can fill the browser quota. Preferences
+  // are durable user intent, so route them through the shared quota recovery
+  // path which evicts volatile snapshots and retries instead of silently
+  // dropping the write.
+  safeLocalStorageSetItem(lsKey(key), JSON.stringify(payload));
 }
 
 /**
@@ -128,21 +131,39 @@ export function useSyncedPreference<T>(
         ? (updater as (prev: T) => T)(prev)
         : updater;
 
-      const payload: SyncPayload<T> = { v: newValue, t: Date.now() };
+      const previousLocal = readFromLocalStorage<T>(key);
+      const payload: SyncPayload<T> = {
+        v: newValue,
+        // Preserve strict last-write ordering even for two updates in the same
+        // millisecond. Equal timestamps let an older server value win on the
+        // next mount because reconciliation intentionally prefers server on a
+        // tie.
+        t: Math.max(Date.now(), (previousLocal?.t ?? 0) + 1),
+      };
 
       // Write to localStorage synchronously (survives page close).
       writeToLocalStorage(key, payload);
 
-      // Debounced server PUT.
+      // Immediate mode is used for discrete, durable actions such as a tab
+      // drop. Starting the PUT in the same event prevents page refresh/unmount
+      // from cancelling a not-yet-fired timer and leaving the server on the old
+      // order.
       if (debounceTimer.current !== null) {
         clearTimeout(debounceTimer.current);
-      }
-      debounceTimer.current = setTimeout(() => {
         debounceTimer.current = null;
+      }
+      if (debounceMs <= 0) {
         void saveUserPref(key, JSON.stringify(payload)).catch((err) => {
           console.warn(`[useSyncedPreference] failed to save pref "${key}" to server:`, err);
         });
-      }, debounceMs);
+      } else {
+        debounceTimer.current = setTimeout(() => {
+          debounceTimer.current = null;
+          void saveUserPref(key, JSON.stringify(payload)).catch((err) => {
+            console.warn(`[useSyncedPreference] failed to save pref "${key}" to server:`, err);
+          });
+        }, debounceMs);
+      }
 
       return newValue;
     });
