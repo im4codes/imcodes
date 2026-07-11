@@ -531,8 +531,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
+    const trackedAlreadyContainsError = !!tracked?.text
+      && tracked.text.toLocaleLowerCase().includes(error.message.trim().toLocaleLowerCase());
     const errorText = tracked?.text
-      ? `${tracked.text}\n\n⚠️ Error: ${error.message}`
+      ? (trackedAlreadyContainsError ? tracked.text : `${tracked.text}\n\n⚠️ Error: ${error.message}`)
       : `⚠️ Error: ${error.message}`;
 
     timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -545,10 +547,11 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       ...(tracked ? { eventId: tracked.eventId } : {}),
     });
 
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: 'error',
-      error: error.message,
-    }, { source: 'daemon', confidence: 'high' });
+    // TransportSessionRuntime is the sole lifecycle owner. It transitions
+    // recoverable failures back to idle and unrecoverable failures to error.
+    // Emitting another session.state here produced duplicate error rows and,
+    // for transient disconnects, briefly re-poisoned an otherwise usable
+    // session until the user pressed Stop.
 
     void appendTransportEvent(sessionName, {
       type: 'session.error',

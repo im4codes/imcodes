@@ -931,6 +931,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         }
       }
       if (text) {
+        if (/^API Error:\s*Connection closed mid-response/i.test(text.trim())) {
+          // Keep the diagnostic long enough to classify a following is_error
+          // result whose errors[] is absent, but do not project it as assistant
+          // output. A successful bounded continuation should be seamless.
+          state.currentText = text;
+          return;
+        }
         if (text !== state.currentText) {
           const messageId = makeMessageId(state);
           state.currentMessageId = messageId;
@@ -1000,7 +1007,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         return;
       }
       if (msg.is_error) {
-        const details = Array.isArray((msg as any).errors) ? (msg as any).errors.join('; ') : 'Claude execution failed';
+        const sdkErrors = Array.isArray((msg as any).errors)
+          ? (msg as any).errors.filter((entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+          : [];
+        // Real claude-agent-sdk failures sometimes omit errors[] and expose the
+        // only useful reason in the immediately preceding assistant diagnostic.
+        const details = sdkErrors.length > 0
+          ? sdkErrors.join('; ')
+          : (state.currentText.trim() || 'Claude execution failed');
         const connectionClosed = this.isConnectionClosedMidResponseError(details);
         state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, connectionClosed, msg);
         if (connectionClosed) {

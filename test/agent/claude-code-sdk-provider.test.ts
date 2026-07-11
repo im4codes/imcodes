@@ -527,7 +527,10 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.query
       .mockImplementationOnce(queueRun([
         { type: 'system', subtype: 'init', session_id: 'session-connection-retry', model: 'claude-sonnet-4-6' },
-        { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true, errors: [connectionError] },
+        { type: 'assistant', session_id: 'session-connection-retry', message: { content: [{ type: 'text', text: connectionError }] } },
+        // Exact production shape: the useful reason is in assistant text and
+        // the terminal result omits errors[]. Recovery must still engage.
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true },
       ], true))
       .mockImplementationOnce(queueRun([
         { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true, errors: [connectionError] },
