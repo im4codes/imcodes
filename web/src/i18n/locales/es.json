@@ -1811,6 +1811,7 @@
     "action_type": "Tipo de acción",
     "action_command": "Comando",
     "action_p2p": "Discusión Team",
+    "legacy_send": "Tarea de envío delegado heredada (solo compatibilidad)",
     "send_target": "Destinatario",
     "send_target_placeholder": "Nombre exacto de sesión, etiqueta o tipo de agente",
     "send_message": "Mensaje",

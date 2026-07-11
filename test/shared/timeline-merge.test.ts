@@ -127,4 +127,35 @@ describe('mergeTimelineEvents', () => {
     expect(merged).toHaveLength(1);
     expect(merged[0]?.payload.text).toBe('full output');
   });
+
+  it('heals a cached late-cancel event that was appended after a newer user message', () => {
+    const existing = [
+      makeEvent({
+        eventId: 'new-user',
+        seq: 14,
+        ts: 200,
+        type: 'user.message',
+        payload: { text: 'new message after stop' },
+      }),
+      makeEvent({
+        eventId: 'old-assistant',
+        seq: 1,
+        ts: 100,
+        payload: { text: 'old partial', streaming: true },
+      }),
+    ];
+    const incoming = [
+      makeEvent({
+        eventId: 'old-assistant',
+        seq: 15,
+        ts: 100,
+        payload: { text: 'old partial\n\n⚠️ Turn cancelled', streaming: false },
+      }),
+    ];
+
+    const merged = mergeTimelineEvents(existing, incoming);
+
+    expect(merged.map((event) => event.eventId)).toEqual(['old-assistant', 'new-user']);
+    expect(merged[0]?.payload.text).toContain('Turn cancelled');
+  });
 });

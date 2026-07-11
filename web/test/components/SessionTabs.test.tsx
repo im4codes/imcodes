@@ -437,6 +437,56 @@ describe('SessionTabs', () => {
     expect(screen.getByRole('tablist')).toBeDefined();
   });
 
+  it('persists a pinned tab drag immediately and restores the order after remount', async () => {
+    localStorage.removeItem('rcc_sync_tab_order');
+    const sessions = makeSessions([
+      { name: 'session_alpha', label: 'Alpha' },
+      { name: 'session_beta', label: 'Beta' },
+      { name: 'session_gamma', label: 'Gamma' },
+    ]);
+    const pinned = new Set(sessions.map((session) => session.name));
+
+    const view = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={pinned}
+      />,
+    );
+
+    const wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[2]);
+    fireEvent.dragOver(wrappers[0]);
+    fireEvent.drop(wrappers[0]);
+    fireEvent.dragEnd(wrappers[2]);
+
+    const labels = () => screen.getAllByRole('tab').map((tab) => (
+      ['Alpha', 'Beta', 'Gamma'].find((label) => tab.textContent?.includes(label))
+    ));
+    expect(labels()).toEqual(['Gamma', 'Alpha', 'Beta']);
+
+    const stored = JSON.parse(localStorage.getItem('rcc_sync_tab_order') ?? 'null') as { v: string[]; t: number };
+    expect(stored.v).toEqual(['session_gamma', 'session_alpha', 'session_beta']);
+    // No timer advance is needed: discrete tab order writes start immediately.
+    expect(saveUserPrefMock).toHaveBeenCalledWith('tab_order', JSON.stringify(stored));
+
+    view.unmount();
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={pinned}
+      />,
+    );
+    expect(labels()).toEqual(['Gamma', 'Alpha', 'Beta']);
+  });
+
   it('requires three confirmations before stopping from the tab context dialog', () => {
     const onStopProject = vi.fn();
     const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);

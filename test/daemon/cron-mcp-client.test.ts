@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   cronMcpCreate,
+  cronMcpCreateSelf,
   cronMcpDelete,
   cronMcpList,
   cronMcpUpdate,
+  cronMcpUpdateSelf,
 } from '../../src/daemon/cron-mcp-client.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 
@@ -93,6 +95,72 @@ describe('cron MCP client', () => {
     });
     expect(JSON.stringify(body.action)).not.toContain('deck_sub_forged');
     expect(JSON.stringify(body.action)).not.toContain('srv-forged');
+  });
+
+  it('creates a direct command job for the runtime-resolved current session', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-self' }));
+
+    const result = await cronMcpCreateSelf({
+      name: 'Review status',
+      cronExpr: '*/10 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_scheduler',
+      message: 'Review the latest status',
+      timezone: 'Asia/Shanghai',
+    }, { ...boundIdentity, fetchImpl });
+
+    expect(result.status).toBe('ok');
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://worker.test/api/server/srv-bound/cron');
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      name: 'Review status',
+      cronExpr: '*/10 * * * *',
+      serverId: 'srv-bound',
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_scheduler',
+      action: { type: 'command', command: 'Review the latest status', selfManaged: true },
+      timezone: 'Asia/Shanghai',
+    });
+  });
+
+  it('rejects an empty current-session message before HTTP', async () => {
+    const fetchImpl = vi.fn();
+    await expect(cronMcpCreateSelf({
+      name: 'Empty',
+      cronExpr: '*/10 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: '   ',
+    }, { ...boundIdentity, fetchImpl })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('updates a self-managed job without caller-supplied session identity', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdateSelf({
+      id: 'job-self',
+      projectName: 'proj',
+      cronExpr: '*/20 * * * *',
+      message: 'Check progress again',
+      name: 'Progress check',
+      timezone: 'Asia/Shanghai',
+    }, { ...boundIdentity, fetchImpl });
+
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://worker.test/api/server/srv-bound/cron/job-self');
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: 'Progress check',
+      cronExpr: '*/20 * * * *',
+      projectName: 'proj',
+      action: { type: 'command', command: 'Check progress again', selfManaged: true },
+      timezone: 'Asia/Shanghai',
+    });
   });
 
   it('rejects non-send create actions before HTTP', async () => {

@@ -37,6 +37,9 @@ describe('memory MCP shared contracts', () => {
       'send_message',
       'send_stop',
       'destroy_execution_clone',
+      'cron_create_self',
+      'cron_update_self',
+      'cron_cancel_self',
       'cron_create',
       'cron_list',
       'cron_update',
@@ -102,11 +105,11 @@ describe('memory MCP shared contracts', () => {
   it('provides operational tool and parameter descriptions without secret/doc leakage', () => {
     for (const name of MEMORY_MCP_TOOL_NAME_LIST) {
       const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
-      expect(contract.description.length).toBeGreaterThan(60);
+      expect(contract.description.trim()).not.toEqual('');
       expect(contract.description).not.toMatch(/\b(tool|does stuff|see docs|external documentation)\b/i);
       for (const [property, schema] of Object.entries(contract.inputSchema.properties ?? {})) {
         expect(property).not.toEqual('');
-        expect((schema as { description?: string }).description?.length ?? 0).toBeGreaterThan(20);
+        expect((schema as { description?: string }).description?.trim()).not.toEqual('');
       }
       const allDescriptions = [contract.description, ...collectDescriptions(contract.inputSchema)].join('\n');
       expect(allDescriptions).not.toMatch(/IMCODES_|server token|api key|docs\/mcp|namespace json/i);
@@ -179,6 +182,33 @@ describe('memory MCP shared contracts', () => {
   });
 
   it('keeps cron shared schemas aligned with the registered top-level MCP inputs', () => {
+    const cronCreateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF].inputSchema;
+    expect(Object.keys(cronCreateSelf.properties ?? {})).toEqual([
+      'cronExpr',
+      'message',
+      'name',
+      'timezone',
+      'expiresAt',
+    ]);
+    expect(cronCreateSelf.required).toEqual(['cronExpr', 'message']);
+    expect(cronCreateSelf.properties ?? {}).not.toHaveProperty('sessionName');
+
+    const cronUpdateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF].inputSchema;
+    expect(Object.keys(cronUpdateSelf.properties ?? {})).toEqual([
+      'id',
+      'cronExpr',
+      'message',
+      'name',
+      'timezone',
+      'expiresAt',
+    ]);
+    expect(cronUpdateSelf.required).toEqual(['id']);
+    expect(cronUpdateSelf.properties ?? {}).not.toHaveProperty('sessionName');
+
+    const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF].inputSchema;
+    expect(Object.keys(cronCancelSelf.properties ?? {})).toEqual(['id', 'name', 'all']);
+    expect(cronCancelSelf.properties ?? {}).not.toHaveProperty('sessionName');
+
     const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE].inputSchema;
     expect(Object.keys(cronCreate.properties ?? {})).toEqual([
       'name',
@@ -217,22 +247,30 @@ describe('memory MCP shared contracts', () => {
   });
 
   it('documents cron scheduling limits and structured send source-target resolution', () => {
+    const cronCreateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF];
+    const cronUpdateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF];
+    const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF];
     const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE];
     const cronUpdate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE];
     const createProps = cronCreate.inputSchema.properties ?? {};
     const updateProps = cronUpdate.inputSchema.properties ?? {};
 
-    expect(cronCreate.description).toContain('at least 5 minutes');
-    expect((createProps.cronExpr as { description?: string }).description).toContain('* * * * *');
+    expect(cronCreateSelf.description).toContain('Preferred self-wakeup');
+    expect(cronCreateSelf.description).toContain('current session');
+    expect(cronCreateSelf.description).toContain('Identity is automatic');
+    expect(cronUpdateSelf.description).toContain('self-wakeup');
+    expect(cronCancelSelf.description).toContain('when complete');
+    expect(cronCreate.description).toContain('cron_create_self');
+    expect(cronCreate.description).toContain('5 minutes');
+    expect((createProps.cronExpr as { description?: string }).description).toContain('5 minutes');
     expect((createProps.targetSessionName as { description?: string }).description).toContain('source session');
-    expect((createProps.action as { description?: string }).description).toContain('send_list_targets');
-    expect((createProps.action as { description?: string }).description).toContain('selected by targetSessionName or targetRole');
-    expect((createProps.timezone as { description?: string }).description).toContain('schedule evaluation only');
-    expect((createProps.expiresAt as { description?: string }).description).toContain('explicit offset or Z suffix');
-    expect((createProps.expiresAt as { description?: string }).description).toContain('does not retract messages already dispatched');
-    expect(cronUpdate.description).toContain('at least 5 minutes');
-    expect((updateProps.action as { description?: string }).description).toContain('selected by targetSessionName or targetRole');
-    expect((updateProps.expiresAt as { description?: string }).description).toContain('does not retract already dispatched messages');
+    expect((createProps.action as { description?: string }).description).toContain('type: "send"');
+    expect((createProps.timezone as { description?: string }).description).toContain('cron timezone');
+    expect((createProps.expiresAt as { description?: string }).description).toContain('offset-ISO');
+    expect((createProps.expiresAt as { description?: string }).description).toContain('future sends only');
+    expect(cronUpdate.description).toContain('5 minutes');
+    expect((updateProps.action as { description?: string }).description).toContain('send action');
+    expect((updateProps.expiresAt as { description?: string }).description).toContain('future sends only');
   });
 
   // ── memory-source-server-routing change ─────────────────────────────

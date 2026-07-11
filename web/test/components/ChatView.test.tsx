@@ -4,7 +4,7 @@
 import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ChatView, __clearChatLocalImagePreviewCacheForTests } from '../../src/components/ChatView.js';
+import { ChatView, __clearChatLocalImagePreviewCacheForTests, formatChatDateTime } from '../../src/components/ChatView.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -62,6 +62,30 @@ function selectText(node: Text, start: number, end: number) {
   selection?.addRange(range);
   document.dispatchEvent(new Event('selectionchange'));
 }
+
+describe('formatChatDateTime', () => {
+  const now = new Date(2026, 6, 11, 18, 0, 0).getTime();
+
+  it('shows seconds without a date for messages from today', () => {
+    const ts = new Date(2026, 6, 11, 17, 50, 9).getTime();
+    expect(formatChatDateTime(ts, now)).toBe(new Date(ts).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }));
+  });
+
+  it('adds the date for messages outside today', () => {
+    const ts = new Date(2026, 6, 10, 17, 50, 9).getTime();
+    expect(formatChatDateTime(ts, now)).toBe(new Date(ts).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }));
+  });
+});
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -2078,7 +2102,7 @@ describe('ChatView', () => {
     }
   });
 
-  it('shows date and time in the pinned last-sent banner', async () => {
+  it('shows date and time with seconds in the pinned last-sent banner', async () => {
     const originalIntersectionObserver = globalThis.IntersectionObserver;
     let observerCallback: IntersectionObserverCallback | null = null;
     class IntersectionObserverMock {
@@ -2139,7 +2163,7 @@ describe('ChatView', () => {
       expect(container.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('chat.pinned_last_sent_label');
       expect(container.querySelector('.chat-pinned-last-sent-actor')?.textContent).toBe('Ada Shared · Participant');
       const timeText = container.querySelector('.chat-pinned-last-sent-time')?.textContent ?? '';
-      expect(timeText).toBe(new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+      expect(timeText).toBe(new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }));
       expect(container.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('Pull latest code');
     } finally {
       globalThis.IntersectionObserver = originalIntersectionObserver;

@@ -3010,7 +3010,6 @@ export class CodexSdkProvider implements TransportProvider {
         !turnId
         || state.cancelled
         || state.runningCompact
-        || state.turnStartInFlight
         || this.isClosedCodexTurn(state, turnId)
       ) {
         this.clearRolloutSettlePoll(state);
@@ -3555,6 +3554,31 @@ export class CodexSdkProvider implements TransportProvider {
       if (!sessionId || !state) return;      const turn = isRecord(params.turn) ? params.turn : {};
       const status = turn.status;
       const turnId = readParamTurnId(params);
+      // STOP can be followed by a new turn before the app-server emits the old
+      // turn's interrupted notification. Some app-server versions omit the
+      // turn id on that late notification. Applying an uncorrelated
+      // `interrupted` event while the current session is NOT cancelling would
+      // terminate the new turn, clear its rollout-settle poll, and mark the new
+      // turn id closed. Codex core can then write final text + task_complete,
+      // but the provider remains working until another manual STOP flushes the
+      // cached answer. An interrupt for the current turn is always initiated by
+      // cancel(), which sets state.cancelled first; otherwise an id-less
+      // interrupt is stale and must not mutate current-turn ownership.
+      if (
+        status === 'interrupted'
+        && !turnId
+        && !state.cancelled
+        && Boolean(state.runningTurnId || state.turnStartInFlight)
+      ) {
+        logger.warn({
+          provider: this.id,
+          sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          threadId: state.threadId,
+          runningTurnId: state.runningTurnId,
+        }, 'Codex SDK ignored an uncorrelated interrupted notification while a newer turn is active');
+        return;
+      }
       this.clearIdleSettleTimer(state); // explicit turn/completed supersedes any pending idle settle
 
       const terminalForTurnStartInFlight = Boolean(state.turnStartInFlight && turnId);
@@ -3727,6 +3751,7 @@ export class CodexSdkProvider implements TransportProvider {
   private clearActiveTurnLease(state: CodexSdkSessionState): void {
     const lease = state.activeTurnLease;
     if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
+    this.clearRolloutSettlePoll(state);
     state.activeTurnLease = undefined;
   }
 
@@ -4100,7 +4125,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!lease || lease.id !== leaseGuard.leaseId || lease.attemptId !== leaseGuard.attemptId) return;
       if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
     } else {
-      if (state.cancelled || state.runningCompact || state.turnStartInFlight) return;
+      if (state.cancelled || state.runningCompact) return;
       if (state.runningTurnId !== turnId) return;
       if (this.isClosedCodexTurn(state, turnId)) return;
     }
@@ -4116,9 +4141,18 @@ export class CodexSdkProvider implements TransportProvider {
       if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
       if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
     } else {
-      if (latestState.cancelled || latestState.runningCompact || latestState.turnStartInFlight) return;
+      if (latestState.cancelled || latestState.runningCompact) return;
       if (latestState.runningTurnId !== turnId) return;
       if (this.isClosedCodexTurn(latestState, turnId)) return;
+    }
+    // A missing turn/start JSON-RPC response can leave startTurn() awaiting
+    // forever even though turn/started notifications, final output, and the
+    // core rollout task_complete all arrived. The rollout record is
+    // authoritative terminal evidence for this exact turn. Remember it while
+    // the start RPC is still pending so a very late response cannot assign the
+    // completed turn back to running state.
+    if (latestState.turnStartInFlight) {
+      latestState.terminalDuringTurnStartIds.add(turnId);
     }
     if (evidence.lastAgentMessage && latestState.currentText !== evidence.lastAgentMessage) {
       latestState.currentMessageId = `${turnId}:rollout-task-complete`;

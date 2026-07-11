@@ -1812,6 +1812,7 @@
     "action_type": "Action Type",
     "action_command": "Command",
     "action_p2p": "Team Discussion",
+    "legacy_send": "Legacy delegated-send task (kept for compatibility)",
     "send_target": "Recipient",
     "send_target_placeholder": "Exact session name, label, or agent type",
     "send_message": "Message",

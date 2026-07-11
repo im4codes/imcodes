@@ -1812,6 +1812,7 @@
     "action_type": "操作類型",
     "action_command": "指令",
     "action_p2p": "團隊 討論",
+    "legacy_send": "舊版委派傳送任務（僅相容既有任務）",
     "send_target": "接收工作階段",
     "send_target_placeholder": "接收方工作階段名、標籤或代理類型",
     "send_message": "訊息內容",

@@ -183,7 +183,7 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events[0].payload.pending).toBeFalsy();
   });
 
-  it('replaces the pending bubble in place when the authoritative user.message arrives', () => {
+  it('moves a drained message after intervening output instead of keeping its queued slot', () => {
     const ref = { current: null as HookRef };
     const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
     const { Probe } = captureHookRef(ref, handlerBox);
@@ -206,7 +206,7 @@ describe('useTimeline optimistic send flow', () => {
       } as unknown as ServerMessage);
     });
     act(() => {
-      ref.current!.addOptimisticUserMessage('keep my slot', 'cmd-in-place-success');
+      ref.current!.addOptimisticUserMessage('./scripts/restart-daemon.sh restart', 'cmd-in-place-success');
     });
     const optimisticId = ref.current!.events[1].eventId;
 
@@ -214,25 +214,43 @@ describe('useTimeline optimistic send flow', () => {
       handlerBox.fn?.({
         type: 'timeline.event',
         event: {
-          eventId: 'real-in-place-success',
+          eventId: 'assistant-cancelled-before-drain',
           sessionId: 'deck_opt_in_place_success',
-          ts: Date.now(),
+          ts: Date.now() + 10,
           epoch: 1,
           seq: 2,
           source: 'daemon',
           confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'the previous pull finished or the active turn was cancelled' },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'real-in-place-success',
+          sessionId: 'deck_opt_in_place_success',
+          ts: Date.now() + 20,
+          epoch: 1,
+          seq: 3,
+          source: 'daemon',
+          confidence: 'high',
           type: 'user.message',
-          payload: { text: 'keep my slot', commandId: 'cmd-in-place-success' },
+          payload: { text: './scripts/restart-daemon.sh restart', commandId: 'cmd-in-place-success' },
         },
       } as unknown as ServerMessage);
     });
 
     expect(ref.current!.events.map((event) => event.eventId)).toEqual([
       'assistant-before',
+      'assistant-cancelled-before-drain',
       'real-in-place-success',
     ]);
     expect(ref.current!.events.map((event) => event.eventId)).not.toContain(optimisticId);
-    expect(ref.current!.events[1].payload.pending).toBeFalsy();
+    expect(ref.current!.events[2].payload.pending).toBeFalsy();
   });
 
   it('removes a transport optimistic bubble when the daemon authoritatively queues the send', () => {

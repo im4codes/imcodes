@@ -201,8 +201,20 @@ function formatMemoryContextTimestamp(ts: number | undefined): string | null {
   return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function formatChatDateTime(ts: number): string {
-  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+export function formatChatDateTime(ts: number, now = Date.now()): string {
+  const date = new Date(ts);
+  const today = new Date(now);
+  const timeOptions: Intl.DateTimeFormatOptions = {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  };
+  const isToday = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate();
+  return isToday
+    ? date.toLocaleTimeString([], timeOptions)
+    : date.toLocaleString([], { month: 'short', day: 'numeric', ...timeOptions });
 }
 
 type MemoryContextSection =
@@ -3236,7 +3248,7 @@ const ChatEvent = memo(function ChatEvent({
             <span class="chat-tool-icon">{'>'}</span>
             <span class="chat-tool-name">{toolName}</span>
             {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
-            {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
+            {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
@@ -3264,7 +3276,7 @@ const ChatEvent = memo(function ChatEvent({
             ) : (
               <span class="chat-tool-output">done</span>
             )}
-            {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
+            {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
           </div>
           <ToolResultDetailPanel detail={detail} />
         </ToolBlockFold>
@@ -3311,7 +3323,7 @@ const ChatEvent = memo(function ChatEvent({
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
           <span>{displayLabel}</span>
           {inline
-            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>
             : <ChatTime ts={event.ts} />}
         </div>
       );
@@ -3743,7 +3755,7 @@ function UserMessageText({
 const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
   return (
     <div class="chat-bubble-time">
-      {new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+      {formatChatDateTime(ts)}
     </div>
   );
 });

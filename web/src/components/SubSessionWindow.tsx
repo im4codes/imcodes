@@ -17,6 +17,7 @@ import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
+import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -60,6 +61,8 @@ interface Props {
   connected: boolean;
   /** When false, timeline and terminal subscriptions are paused to save CPU. */
   active: boolean;
+  /** Report the trailing pending ask.question (or null) for dialog re-surface. */
+  onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   idleFlashToken?: number;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
@@ -246,7 +249,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -282,6 +285,13 @@ export function SubSessionWindow({
     isActiveSession: true,
     isVisible: true,
   });
+
+  // Re-surface a still-pending question in the dedicated dialog from history
+  // (only the focused window, to avoid multiple windows racing the app dialog).
+  useEffect(() => {
+    if (!active || !onPendingQuestion) return;
+    onPendingQuestion(sub.sessionName, findTrailingAskQuestion(events));
+  }, [active, onPendingQuestion, sub.sessionName, events]);
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
   const quickData = useQuickData();
 
@@ -1049,6 +1059,7 @@ export function SubSessionWindow({
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
         activeTransportTurn={activeTimelineTurn}
+        transportTimelineEvents={events}
         sessions={sessions}
         subSessions={subSessions}
         serverId={serverId}

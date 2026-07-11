@@ -117,6 +117,47 @@ describe('executeCronJob', () => {
     );
   });
 
+  it('injects only the self-management id and lifecycle rule into agent wake-up prompts', async () => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-progress-1',
+      jobName: 'Check implementation progress',
+      cronExpr: '*/10 * * * *',
+      timezone: 'Asia/Shanghai',
+      expiresAt: Date.parse('2026-07-12T00:00:00Z'),
+      action: { type: 'command', command: 'Inspect the current progress.', selfManaged: true },
+    }), mockServerLink);
+
+    const prompt = (sendKeys as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1">\nUse cron_update_self to change this task. When complete, call cron_cancel_self with this id; otherwise keep it scheduled.\n</imcodes-cron-control>');
+    expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
+      text: prompt,
+      allowDuplicate: true,
+    });
+  });
+
+  it.each(['shell', 'script'] as const)('does not inject MCP controls into %s commands', async (agentType) => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession({ agentType }));
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-raw-1',
+      action: { type: 'command', command: 'printf ready', selfManaged: true },
+    }), mockServerLink);
+
+    expect(sendKeys).toHaveBeenCalledWith(
+      'deck_myapp_brain',
+      'printf ready',
+      { cwd: '/home/user/myapp' },
+    );
+    expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
+      text: 'printf ready',
+      allowDuplicate: true,
+    });
+  });
+
   // 2. Command to streaming session — skips (busy)
   it('skips command when session is streaming', async () => {
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());

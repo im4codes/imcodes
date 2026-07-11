@@ -2897,6 +2897,95 @@ afterEach(() => {
     expect(screen.queryByText('legacy stale send')).toBeNull();
   });
 
+  it('clears the queued card when a drained user.message carries commandId != clientMessageId (recovery drain)', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['commit&push'],
+          transportPendingMessageEntries: [{ clientMessageId: 'cmid-1', text: 'commit&push' }],
+          transportPendingMessageVersion: 1,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('commit&push')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:cmid-1',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          // Recovery/resend drain shape: BOTH ids, commandId != clientMessageId.
+          // Settling only commandId (the regression) left the card up.
+          payload: { text: 'commit&push', commandId: 'daemon-cmd-xyz', clientMessageId: 'cmid-1', pendingMessageVersion: 2 },
+        },
+      });
+    });
+
+    expect(screen.queryByText('commit&push')).toBeNull();
+  });
+
+  it('suppresses a stale editable queue card from the materialized timeline after a live queue frame is missed', () => {
+    const ws = makeWs();
+    const activeSession = makeSession({
+      name: 'qwen-session',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'queued-before-drain', text: 'old queued text' }],
+      transportPendingMessageVersion: 8,
+    });
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={activeSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('old queued text')).toBeDefined();
+
+    // The sub-session timeline has already materialized the daemon's delivery,
+    // but the parent SessionInfo is intentionally stale and no live WS event is
+    // emitted to SessionControls. This is the production failure that left an
+    // editable card whose edit later failed with "Queued message not found".
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={activeSession}
+        quickData={makeQuickData() as any}
+        transportTimelineEvents={[{
+          eventId: 'transport-user:queued-before-drain',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 2,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            text: 'old queued text',
+            clientMessageId: 'queued-before-drain',
+            pendingMessageVersion: 9,
+          },
+        }]}
+      />,
+    );
+
+    expect(screen.queryByText('old queued text')).toBeNull();
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+  });
+
   it('treats partial queued transport entries as authoritative', () => {
     const ws = makeWs();
     render(
@@ -3583,6 +3672,98 @@ afterEach(() => {
     });
 
     expect(screen.queryByText('sub stale queued')).toBeNull();
+  });
+
+  it('keeps the sub-session queue listener mounted across parent session-state rerenders', () => {
+    const ws = makeWs();
+    const queuedEntry = { clientMessageId: 'sub-burst-1', text: 'sub burst queued' };
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_burst',
+          project: 'my-project',
+          role: 'w1',
+          agentType: 'codex-sdk',
+          state: 'stopping',
+          transportPendingMessageEntries: [queuedEntry],
+          transportPendingMessageVersion: 7,
+        })}
+        subSessionId="burst"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('sub burst queued')).toBeDefined();
+    const queueListenerRegistrationCount = () => ws.onMessage.mock.calls.filter(
+      ([handler]) => (handler as { name?: string }).name === 'handleRealtimeQueueMessage',
+    ).length;
+    expect(queueListenerRegistrationCount()).toBe(1);
+
+    // The parent queue/session projection handles the first state event before
+    // SessionControls and supplies a new SessionInfo object. This used to
+    // unsubscribe/re-subscribe the queue listener, creating a gap in which the
+    // next frames in the same daemon burst could be missed.
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_burst',
+          project: 'my-project',
+          role: 'w1',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          transportPendingMessageEntries: [queuedEntry],
+          transportPendingMessageVersion: 7,
+        })}
+        subSessionId="burst"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(queueListenerRegistrationCount()).toBe(1);
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-burst-empty-v8',
+          sessionId: 'deck_sub_burst',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 822,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'idle',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 8,
+            pendingMessageEntries: [],
+          },
+        },
+      });
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-burst-user-message',
+          sessionId: 'deck_sub_burst',
+          type: 'user.message',
+          ts: Date.now() + 1,
+          seq: 827,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            text: 'sub burst queued',
+            commandId: 'sub-burst-1',
+            clientMessageId: 'sub-burst-1',
+          },
+        },
+      });
+    });
+
+    expect(screen.queryByText('sub burst queued')).toBeNull();
+    expect(queueListenerRegistrationCount()).toBe(1);
   });
 
   it('applies session_list empty queue snapshots without waiting for parent props to refresh', () => {
@@ -6153,6 +6334,54 @@ afterEach(() => {
       sessionName: 'codex-sdk-session',
       text: '/model gpt-5.5',
     });
+  });
+
+  it('force-refreshes codex-sdk models when opening the picker', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === 'codex-sdk'
+        && call[0]?.force === true
+    ))).toBeUndefined();
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+
+    const forcedRequest = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === 'codex-sdk'
+        && call[0]?.force === true
+    ))?.[0];
+    expect(forcedRequest).toMatchObject({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      force: true,
+    });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: forcedRequest?.requestId,
+      models: [
+        { id: 'runtime-new-model', name: 'Runtime New Model' },
+      ],
+      defaultModel: 'runtime-new-model',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /runtime-new-model/i })).toBeDefined());
   });
 
   it('retries codex-sdk model discovery after websocket reconnect', async () => {

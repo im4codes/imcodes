@@ -56,7 +56,7 @@
     "@github/copilot-sdk": "^0.2.2",
     "@huggingface/transformers": "^4.1.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@openai/codex-sdk": "^0.139.0",
+    "@openai/codex-sdk": "^0.144.1",
     "@qoder-ai/qoder-agent-sdk": "1.0.11",
     "commander": "^12.1.0",
     "croner": "^10.0.1",

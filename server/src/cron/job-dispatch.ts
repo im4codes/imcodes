@@ -38,6 +38,9 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     serverId: job.server_id,
     projectName: job.project_name ?? '',
     targetRole: job.target_role ?? 'brain',
+    cronExpr: job.cron_expr,
+    timezone: job.timezone,
+    expiresAt: job.expires_at,
     ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
     action,
   };
@@ -107,6 +110,9 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         serverId: job.server_id,
         projectName: job.project_name ?? '',
         targetRole: job.target_role ?? 'brain',
+        cronExpr: job.cron_expr,
+        timezone: job.timezone,
+        expiresAt: job.expires_at,
         ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
         action,
       };

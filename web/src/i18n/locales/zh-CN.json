@@ -1812,6 +1812,7 @@
     "action_type": "操作类型",
     "action_command": "命令",
     "action_p2p": "团队 讨论",
+    "legacy_send": "旧版委托发送任务（仅兼容已有任务）",
     "send_target": "接收会话",
     "send_target_placeholder": "接收方会话名、标签或代理类型",
     "send_message": "消息内容",

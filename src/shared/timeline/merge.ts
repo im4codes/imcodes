@@ -121,5 +121,21 @@ export function mergeTimelineEvents(
   while (i < replaced.length) merged.push(replaced[i++]!);
   while (j < newEvents.length) merged.push(newEvents[j++]!);
 
-  return merged.length > maxEvents ? merged.slice(merged.length - maxEvents) : merged;
+  const bounded = merged.length > maxEvents ? merged.slice(merged.length - maxEvents) : merged;
+
+  // Older web builds appended late realtime terminal events at the tail even
+  // when their stable timestamp belonged to an earlier turn. That bad order
+  // can survive in IndexedDB and be supplied back as `existingEvents`. The
+  // two-pointer merge assumes an ordered base, so detect (cheap O(n)) and heal
+  // only those legacy/out-of-order arrays. This also makes a same-eventId final
+  // replacement move back ahead of a post-Stop user message on reconnect.
+  for (let index = 1; index < bounded.length; index += 1) {
+    const previous = bounded[index - 1]!;
+    const current = bounded[index]!;
+    if (previous.ts > current.ts || (previous.ts === current.ts && previous.seq > current.seq)) {
+      return [...bounded].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
+    }
+  }
+
+  return bounded;
 }

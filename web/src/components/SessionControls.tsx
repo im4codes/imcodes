@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks'
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, RefObject } from 'preact';
-import type { WsClient, ServerMessage } from '../ws-client.js';
+import type { WsClient, ServerMessage, TimelineEvent } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
@@ -157,6 +157,13 @@ interface Props {
   activeThinking?: boolean;
   /** True while transport timeline tail shows an in-flight turn, even if session.state has not caught up. */
   activeTransportTurn?: boolean;
+  /**
+   * Materialized timeline for the controlled session. A committed user-message
+   * or queue-delivery fact is stronger evidence than any stale queue snapshot:
+   * once either exists, that clientMessageId must never remain editable in the
+   * queue card. This also closes event-before-listener and reconnect/replay gaps.
+   */
+  transportTimelineEvents?: readonly TimelineEvent[];
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
@@ -917,7 +924,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1075,6 +1082,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
     ? realtimeQueueOverride.version
     : activeSessionPendingVersion;
+  const timelineSettledQueuedIds = useMemo(() => {
+    const ids = new Set<string>();
+    const sessionName = activeSession?.name;
+    if (!sessionName || !transportTimelineEvents) return ids;
+    for (const event of transportTimelineEvents) {
+      if (event.sessionId !== sessionName) continue;
+      if (event.type !== 'user.message' && event.type !== TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) continue;
+      const clientMessageId = typeof event.payload.clientMessageId === 'string'
+        ? event.payload.clientMessageId.trim()
+        : '';
+      if (clientMessageId) ids.add(clientMessageId);
+      if (event.type === 'user.message') {
+        const commandId = typeof event.payload.commandId === 'string'
+          ? event.payload.commandId.trim()
+          : '';
+        if (commandId) ids.add(commandId);
+      }
+    }
+    return ids;
+  }, [activeSession?.name, transportTimelineEvents]);
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
     let merged: LocalQueuedTransportEntry[];
     if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
@@ -1090,10 +1117,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     // Authoritative override: a message that reached the timeline is delivered,
     // so drop it from the queue even if a stale daemon snapshot still lists it.
-    if (settledQueuedIds.size === 0) return merged;
-    const filtered = merged.filter((entry) => !settledQueuedIds.has(entry.clientMessageId));
+    if (settledQueuedIds.size === 0 && timelineSettledQueuedIds.size === 0) return merged;
+    const filtered = merged.filter((entry) => (
+      !settledQueuedIds.has(entry.clientMessageId)
+      && !timelineSettledQueuedIds.has(entry.clientMessageId)
+    ));
     return filtered.length === merged.length ? merged : filtered;
-  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds]);
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds, timelineSettledQueuedIds]);
 
   // Settled ids and optimistic queue overlays are scoped to the active session.
   // Reset the local overlay on switch; canonical session/app state remains
@@ -1675,31 +1705,54 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
   }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion, optimisticQueuedEntries]);
 
+  // Keep the queue listener mounted for the lifetime of the session. Timeline
+  // bursts update `activeSession` in the parent before every consumer has seen
+  // the same burst; depending on the whole object here used to tear this
+  // listener down between an authoritative empty queue snapshot and the
+  // following `user.message`. The chat timeline (a separate listener) advanced,
+  // while this queue card stayed stale until the sub-session window remounted.
+  // Read mutable queue/session metadata through a ref so ordinary state merges
+  // never create a live-delivery gap.
+  const realtimeQueueStateRef = useRef({
+    activeSession,
+    incomingQueuedTransportEntries,
+    incomingQueuedTransportVersion,
+  });
+  realtimeQueueStateRef.current = {
+    activeSession,
+    incomingQueuedTransportEntries,
+    incomingQueuedTransportVersion,
+  };
+
   useEffect(() => {
-    if (!ws || !activeSession) return;
-    return ws.onMessage((msg: ServerMessage) => {
-      const applyRealtimeQueueSnapshot = (payload: Record<string, unknown>, sessionName: string): boolean => {
-        if (sessionName !== activeSession.name || !hasTransportPendingSyncSnapshot(payload)) return false;
+    const sessionName = activeSession?.name;
+    if (!ws || !sessionName) return;
+    const handleRealtimeQueueMessage = (msg: ServerMessage) => {
+      const applyRealtimeQueueSnapshot = (payload: Record<string, unknown>, snapshotSessionName: string): boolean => {
+        if (snapshotSessionName !== sessionName || !hasTransportPendingSyncSnapshot(payload)) return false;
+        const current = realtimeQueueStateRef.current;
+        const currentSession = current.activeSession;
+        if (!currentSession || currentSession.name !== sessionName) return false;
         const patch = buildTransportPendingSyncPatch({
-          transportPendingMessageEntries: incomingQueuedTransportEntries,
-          transportPendingMessageVersion: incomingQueuedTransportVersion,
-          queueEpoch: activeSession.queueEpoch,
-          queueAuthorityId: activeSession.queueAuthorityId,
-          failedMessageEntries: activeSession.failedMessageEntries,
-        }, payload, sessionName);
+          transportPendingMessageEntries: current.incomingQueuedTransportEntries,
+          transportPendingMessageVersion: current.incomingQueuedTransportVersion,
+          queueEpoch: currentSession.queueEpoch,
+          queueAuthorityId: currentSession.queueAuthorityId,
+          failedMessageEntries: currentSession.failedMessageEntries,
+        }, payload, snapshotSessionName);
         if (Object.keys(patch).length === 0) return false;
         const entries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
           ...entry,
           status: 'queued' as const,
         }));
         setRealtimeQueueOverride({
-          sessionName,
+          sessionName: snapshotSessionName,
           entries,
           version: patch.transportPendingMessageVersion,
         });
         if (entries.length === 0) {
           lastRealtimeEmptyQueueSnapshotRef.current = {
-            sessionName,
+            sessionName: snapshotSessionName,
             version: patch.transportPendingMessageVersion,
             observedAtMs: Date.now(),
           };
@@ -1742,8 +1795,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       };
 
       if (msg.type === 'session_list') {
-        const session = msg.sessions.find((item) => item.name === activeSession.name);
-        if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, activeSession.name);
+        const session = msg.sessions.find((item) => item.name === sessionName);
+        if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, sessionName);
         return;
       }
       if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
@@ -1757,12 +1810,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return;
       }
       if (msg.type === 'command.ack') {
-        if (msg.session && msg.session !== activeSession.name) return;
+        if (msg.session && msg.session !== sessionName) return;
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         if (msg.status === 'error' || msg.status === 'conflict') {
           if (rollback) {
             setOptimisticQueuedEntries((prev) => {
-              const source = prev ?? incomingQueuedTransportEntries;
+              const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
               if (rollback.type === 'edit') {
                 return source.map((entry) => (
                   entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
@@ -1783,7 +1836,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return;
       }
       if (msg.type === MSG_COMMAND_FAILED) {
-        if (msg.session && msg.session !== activeSession.name) return;
+        if (msg.session && msg.session !== sessionName) return;
         markLocalQueuedEntry(msg.commandId, 'failed');
         return;
       }
@@ -1796,7 +1849,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         // The wire validator requires sessionName on delivery facts — a frame
         // without one is malformed and must NOT default to clearing the active
         // session's optimistic entries.
-        if (!maybeQueueDelivery.sessionName || maybeQueueDelivery.sessionName !== activeSession.name) return;
+        if (!maybeQueueDelivery.sessionName || maybeQueueDelivery.sessionName !== sessionName) return;
         const clientMessageId = typeof maybeQueueDelivery.clientMessageId === 'string'
           ? maybeQueueDelivery.clientMessageId.trim()
           : '';
@@ -1806,21 +1859,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       if (msg.type !== 'timeline.event') return;
       const event = msg.event;
-      if (event.sessionId !== activeSession.name) return;
+      if (event.sessionId !== sessionName) return;
       if (event.type === 'user.message') {
-        const commandId = typeof event.payload.commandId === 'string'
-          ? event.payload.commandId
-          : typeof event.payload.clientMessageId === 'string'
-            ? event.payload.clientMessageId
-            : '';
+        const clientMessageId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId : '';
+        const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
         const deliveredText = typeof event.payload.text === 'string' ? event.payload.text : undefined;
-        removeLocalQueuedEntry(commandId, deliveredText);
-        // Record the delivered id so a stale daemon pending snapshot can't keep
-        // showing it as queued (the incoming snapshot is not under our control,
-        // unlike the optimistic set cleared above).
-        const idsToSettle = commandId ? [commandId] : [];
-        if (idsToSettle.length > 0) {
-          for (const id of idsToSettle) rememberSettledQueuedId(id);
+        // Settle/remove by BOTH ids. Queue entries — the authoritative snapshot
+        // AND the realtime override — are keyed by clientMessageId, but the
+        // recovery/resend drain path emits a user.message carrying BOTH commandId
+        // and clientMessageId where commandId != clientMessageId. Settling only
+        // commandId (the old behavior) missed the clientMessageId-keyed entries,
+        // so a message that had already drained into the timeline stayed in the
+        // queue card until the window remounted — the '不切窗口不清空' regression
+        // once stale turns began draining via the recovery path.
+        const idsToSettle = [clientMessageId, commandId].filter((v): v is string => !!v);
+        for (const id of idsToSettle) {
+          removeLocalQueuedEntry(id, deliveredText);
+          rememberSettledQueuedId(id);
         }
       } else if (event.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
         const payload = event.payload as Record<string, unknown>;
@@ -1829,11 +1884,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
         const payload = event.payload as Record<string, unknown>;
-        const hasPendingSnapshot = applyRealtimeQueueSnapshot(payload, activeSession.name);
+        const hasPendingSnapshot = applyRealtimeQueueSnapshot(payload, sessionName);
         const queuedEntries = normalizeTransportPendingEntries(
           payload.pendingMessageEntries,
           undefined,
-          activeSession.name,
+          sessionName,
           { hasEntriesField: Object.prototype.hasOwnProperty.call(payload, 'pendingMessageEntries') },
         );
         if (queuedEntries.length === 0) {
@@ -1847,8 +1902,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           return next.length > 0 ? next : null;
         });
       }
-    });
-  }, [activeSession, incomingQueuedTransportEntries, incomingQueuedTransportVersion, ws]);
+    };
+    return ws.onMessage(handleRealtimeQueueMessage);
+  }, [activeSession?.name, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -3906,6 +3962,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     onAfterAction?.();
   };
 
+  const toggleModelMenu = (options: { refreshDynamic?: boolean } = {}) => {
+    setModelOpen((open) => {
+      const next = !open;
+      if (next && options.refreshDynamic) {
+        dynamicTransportModels.refresh();
+      }
+      return next;
+    });
+  };
+
   const handleThinkingSelect = (level: TransportEffortLevel) => {
     if (!activeSession) return;
     setThinkingOpen(false);
@@ -4379,7 +4445,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
-              onClick={() => setModelOpen((o) => !o)}
+              onClick={() => toggleModelMenu({
+                refreshDynamic: activeSession?.agentType === 'codex-sdk',
+              })}
               disabled={disabled}
               title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
               style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
@@ -4434,7 +4502,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
-              onClick={() => setModelOpen((o) => !o)}
+              onClick={() => toggleModelMenu({ refreshDynamic: true })}
               disabled={disabled}
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
               style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
