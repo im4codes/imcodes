@@ -2537,6 +2537,111 @@ describe('useTimeline global cache bounds', () => {
     expect(persisted[0]?.payload).toMatchObject({ text: 'final', streaming: false });
   });
 
+  it('keeps a late cancelled old turn before the newer user message', async () => {
+    const sessionName = `deck_transport_late_cancel_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-late-cancel',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-late-cancel' },
+        events
+          .filter((event) => event.type === 'assistant.text' || event.type === 'user.message')
+          .map((event) => String(event.payload.text ?? ''))
+          .join('|'),
+      );
+    }
+
+    render(h(Probe, {}));
+
+    const oldAssistantEventId = `${sessionName}-old-assistant`;
+    await act(async () => {
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: oldAssistantEventId,
+          sessionId: sessionName,
+          ts: 100,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'old partial', streaming: true },
+        },
+      } as ServerMessage);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-late-cancel').textContent).toBe('old partial');
+    });
+
+    // More than ten intervening events reproduces the production Stop path:
+    // queue state, synthetic tool terminals, delivery, running, and memory
+    // context all arrive before the provider's delayed CANCELLED settlement.
+    await act(async () => {
+      for (let seq = 2; seq <= 13; seq += 1) {
+        handler?.({
+          type: 'timeline.event',
+          event: {
+            eventId: `${sessionName}-tool-${seq}`,
+            sessionId: sessionName,
+            ts: 100 + seq,
+            epoch: 1,
+            seq,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'tool.result',
+            payload: { toolCallId: `tool-${seq}` },
+          },
+        } as ServerMessage);
+      }
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-new-user`,
+          sessionId: sessionName,
+          ts: 200,
+          epoch: 1,
+          seq: 14,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'new message after stop', allowDuplicate: true },
+        },
+      } as ServerMessage);
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: oldAssistantEventId,
+          sessionId: sessionName,
+          ts: 100,
+          epoch: 1,
+          seq: 15,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'old partial\n\n⚠️ Turn cancelled', streaming: false, memoryExcluded: true },
+        },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-late-cancel').textContent)
+        .toBe('old partial\n\n⚠️ Turn cancelled|new message after stop');
+    });
+  });
+
   it('does not dedup confirmed user messages marked allowDuplicate', async () => {
     const sessionName = `deck_transport_dup_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;

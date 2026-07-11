@@ -2580,30 +2580,22 @@ export function useTimeline(
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
   }, [disableHistory, ws, sessionId]);
 
-  // Append or replace a single event by eventId.
-  // Same eventId → replace in place (supports streaming transport updates).
-  // New eventId → append to end.
+  // Merge one realtime event into chronological display order.
+  //
+  // A terminal assistant update can arrive after Stop has already released a
+  // queued user message. Its stable timestamp still belongs to the old turn,
+  // so blindly appending a previously unseen eventId puts the cancelled old
+  // answer below the newer user message. The old last-10 replacement shortcut
+  // had the same failure when tool/cancel events pushed the original streaming
+  // event more than ten slots back. Use the canonical full merge for both
+  // replacement and insertion so eventId reconciliation and ts ordering cannot
+  // diverge between realtime and history paths.
   const appendEvent = useCallback((event: TimelineEvent) => {
     setEvents((prev) => {
       const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       const base = removeReconciledLocalUserMessages(sharedBase, [event]);
-      // Fast path: check last few events for same-ID replacement
-      for (let i = base.length - 1; i >= Math.max(0, base.length - 10); i--) {
-        if (base[i].eventId === event.eventId) {
-          // Replace in place — enables typewriter effect for streaming events
-          const current = base[i]!;
-          const preferred = preferTimelineEvent(current, event);
-          if (preferred === current) return base;
-          const updated = [...base];
-          updated[i] = preferred;
-          if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
-          return updated;
-        }
-      }
-      const next = [...base, event];
-      const result = next.length > MAX_MEMORY_EVENTS
-        ? next.slice(next.length - MAX_MEMORY_EVENTS)
-        : next;
+      const result = mergeTimelineEvents(base, [event], MAX_MEMORY_EVENTS);
+      if (result === base) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });

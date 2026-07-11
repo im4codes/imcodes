@@ -4743,6 +4743,71 @@ describe('CodexSdkProvider', () => {
     }
   }, 60_000);
 
+  it('ignores a late id-less interrupted notification from a previous stop and still settles the newer turn', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-stale-idless-interrupt-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-stale-idless-interrupt', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      const errors: Array<{ code: string }> = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+      provider.onError((_sid, error) => errors.push({ code: error.code }));
+      await provider.send('route-stale-idless-interrupt', 'new turn after stop');
+      const child = childProcessMock.children[0];
+
+      // This terminal frame belongs to an older cancelled turn but carries no
+      // turn id. The current turn was not cancelled, so it must retain its
+      // running id, heartbeat lease, and rollout poll.
+      child.emits({
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { status: 'interrupted', error: null } },
+      });
+      expect(provider.getSessionDiagnostics('route-stale-idless-interrupt')).toMatchObject({
+        runningTurnId: 'turn-1',
+        heartbeatLeaseActive: true,
+      });
+      expect(errors).toEqual([]);
+
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'final-after-stale-interrupt', type: 'agentMessage', text: 'new turn completed normally' },
+        },
+      });
+      await writeCodexRolloutFile(codexHome, 'thread-1', [{
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: 'turn-1',
+          last_agent_message: 'new turn completed normally',
+        },
+      }]);
+
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(1);
+      expect(completed[0]?.content).toBe('new turn completed normally');
+      expect(errors).toEqual([]);
+      expect(provider.getSessionDiagnostics('route-stale-idless-interrupt')).toMatchObject({
+        runningTurnId: null,
+        heartbeatLeaseActive: false,
+      });
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('does not settle from rollout evidence when task_complete belongs to a different turn', async () => {
     vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
