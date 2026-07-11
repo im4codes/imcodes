@@ -32,6 +32,7 @@ export const TRANSPORT_SESSION_AGENT_TYPES = [
   'openclaw',
 ] as const;
 export const PROCESS_SESSION_AGENT_TYPES = ['claude-code', 'codex', 'opencode', 'gemini', 'shell', 'script'] as const;
+export const RAW_COMMAND_SESSION_AGENT_TYPES = ['shell', 'script'] as const;
 
 export function isSessionAgentType(value: string): value is SessionAgentType {
   return (SESSION_AGENT_TYPES as readonly string[]).includes(value);
@@ -47,6 +48,10 @@ export function isCodexFamily(value: string): value is typeof CODEX_FAMILY[numbe
 
 export function isTransportSessionAgentType(value: string): value is typeof TRANSPORT_SESSION_AGENT_TYPES[number] {
   return (TRANSPORT_SESSION_AGENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isRawCommandSessionAgentType(value: string): value is typeof RAW_COMMAND_SESSION_AGENT_TYPES[number] {
+  return (RAW_COMMAND_SESSION_AGENT_TYPES as readonly string[]).includes(value);
 }
 
 export function getSessionRuntimeType(value: string): 'transport' | 'process' {

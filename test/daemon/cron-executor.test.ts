@@ -117,7 +117,7 @@ describe('executeCronJob', () => {
     );
   });
 
-  it('injects self-management id, configuration, update, and cancel guidance into wake-up prompts', async () => {
+  it('injects only the self-management id and lifecycle rule into agent wake-up prompts', async () => {
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
     (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
 
@@ -131,15 +131,29 @@ describe('executeCronJob', () => {
     }), mockServerLink);
 
     const prompt = (sendKeys as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-    expect(prompt).toContain('Inspect the current progress.');
-    expect(prompt).toContain('"id": "job-progress-1"');
-    expect(prompt).toContain('"cronExpr": "*/10 * * * *"');
-    expect(prompt).toContain('"timezone": "Asia/Shanghai"');
-    expect(prompt).toContain('cron_update_self({ id: "job-progress-1"');
-    expect(prompt).toContain('cron_cancel_self({ id: "job-progress-1" })');
-    expect(prompt).toContain('before your final response');
+    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1">\nUse cron_update_self to change this task. When complete, call cron_cancel_self with this id; otherwise keep it scheduled.\n</imcodes-cron-control>');
     expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
       text: prompt,
+      allowDuplicate: true,
+    });
+  });
+
+  it.each(['shell', 'script'] as const)('does not inject MCP controls into %s commands', async (agentType) => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession({ agentType }));
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-raw-1',
+      action: { type: 'command', command: 'printf ready', selfManaged: true },
+    }), mockServerLink);
+
+    expect(sendKeys).toHaveBeenCalledWith(
+      'deck_myapp_brain',
+      'printf ready',
+      { cwd: '/home/user/myapp' },
+    );
+    expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
+      text: 'printf ready',
       allowDuplicate: true,
     });
   });
