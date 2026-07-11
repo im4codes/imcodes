@@ -3354,8 +3354,13 @@ export function useTimeline(
             const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
             // 1) Prefer commandId-based reconciliation: remove the optimistic
             //    bubble that matches this echo's commandId regardless of state.
-            //    Replace in place so retry/success preserve the original visual
-            //    position and linked memory.context cards attach to the real id.
+            //    The optimistic bubble's timestamp is when the user ENQUEUED the
+            //    message, while the authoritative event's timestamp is when the
+            //    daemon actually DRAINED it. Re-sort the real event into its
+            //    authoritative timeline position instead of replacing the old
+            //    slot. Otherwise a queued restart can appear before the pull
+            //    result it waited behind, and a drained message can appear before
+            //    the cancellation that released it.
             if (echoCommandId) {
               const optimisticId = optimisticIdsByCommandRef.current.get(echoCommandId);
               if (optimisticId) {
@@ -3364,8 +3369,8 @@ export function useTimeline(
                 clearOptimisticTimer(echoCommandId);
                 rememberSettledCommandId(echoCommandId);
                 if (idx >= 0) {
-                  const updated = [...base];
-                  updated[idx] = event;
+                  const withoutOptimistic = base.filter((_, index) => index !== idx);
+                  const updated = mergeTimelineEvents(withoutOptimistic, [event], MAX_MEMORY_EVENTS);
                   if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
                   userMessageAlreadyMerged = true;
                   return updated;
@@ -3391,8 +3396,8 @@ export function useTimeline(
                 clearOptimisticTimer(removedCommandId);
                 rememberSettledCommandId(removedCommandId);
               }
-              const updated = [...base];
-              updated[optimisticTextIdx] = event;
+              const withoutOptimistic = base.filter((_, index) => index !== optimisticTextIdx);
+              const updated = mergeTimelineEvents(withoutOptimistic, [event], MAX_MEMORY_EVENTS);
               if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
               userMessageAlreadyMerged = true;
               return updated;
