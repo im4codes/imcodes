@@ -3906,6 +3906,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     onAfterAction?.();
   };
 
+  const toggleModelMenu = (options: { refreshDynamic?: boolean } = {}) => {
+    setModelOpen((open) => {
+      const next = !open;
+      if (next && options.refreshDynamic) {
+        dynamicTransportModels.refresh();
+      }
+      return next;
+    });
+  };
+
   const handleThinkingSelect = (level: TransportEffortLevel) => {
     if (!activeSession) return;
     setThinkingOpen(false);
@@ -4379,7 +4389,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
-              onClick={() => setModelOpen((o) => !o)}
+              onClick={() => toggleModelMenu({
+                refreshDynamic: activeSession?.agentType === 'codex-sdk',
+              })}
               disabled={disabled}
               title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
               style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
@@ -4434,7 +4446,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
-              onClick={() => setModelOpen((o) => !o)}
+              onClick={() => toggleModelMenu({ refreshDynamic: true })}
               disabled={disabled}
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
               style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}

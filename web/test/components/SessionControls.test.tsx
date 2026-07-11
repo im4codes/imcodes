@@ -6155,6 +6155,54 @@ afterEach(() => {
     });
   });
 
+  it('force-refreshes codex-sdk models when opening the picker', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === 'codex-sdk'
+        && call[0]?.force === true
+    ))).toBeUndefined();
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+
+    const forcedRequest = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === 'codex-sdk'
+        && call[0]?.force === true
+    ))?.[0];
+    expect(forcedRequest).toMatchObject({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      force: true,
+    });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: forcedRequest?.requestId,
+      models: [
+        { id: 'runtime-new-model', name: 'Runtime New Model' },
+      ],
+      defaultModel: 'runtime-new-model',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /runtime-new-model/i })).toBeDefined());
+  });
+
   it('retries codex-sdk model discovery after websocket reconnect', async () => {
     const ws = makeWs();
     ws.connected = false;
