@@ -882,7 +882,7 @@ interface CronFormProps {
   onCancel: () => void;
 }
 
-const CRON_COMMAND_INLINE_CHAR_LIMIT = 1500;
+const CRON_COMMAND_INLINE_CHAR_LIMIT = 5000;
 
 function CronForm({ serverId, projectName, sessions, subSessions = [], activeSession, job, onDone, onCancel }: CronFormProps) {
   const { t } = useTranslation();

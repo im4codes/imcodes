@@ -302,7 +302,7 @@ describe('CronManager', () => {
     expect(expiresInput.value).toBe(expectedDateTimeLocalValue(expiresAt));
   });
 
-  it('blocks saving inline cron commands longer than 1500 chars and shows a file-reference hint', async () => {
+  it('allows cron commands below 5000 chars and blocks longer inline commands with a file-reference hint', async () => {
     apiFetch.mockResolvedValueOnce({ jobs: [] });
 
     render(
@@ -329,14 +329,20 @@ describe('CronManager', () => {
     fireEvent.input(cronExprInput, { target: { value: '0 9 * * *' } });
 
     const textarea = screen.getByPlaceholderText('cron.send_message_placeholder') as HTMLTextAreaElement;
-    const longCommand = '早上好主人！'.repeat(260);
+    const allowedCommand = '早上好主人！'.repeat(500);
+    fireEvent.input(textarea, { target: { value: allowedCommand } });
+
+    expect(screen.getByText('3000/5000')).toBeDefined();
+    expect(screen.queryByText(/Too long for inline entry/)).toBeNull();
+
+    const longCommand = '早上好主人！'.repeat(850);
     fireEvent.input(textarea, { target: { value: longCommand } });
 
-    expect(screen.getByText('1560/1500 · Too long for inline entry. Write it to a file and reference it with @/path/to/file.')).toBeDefined();
+    expect(screen.getByText('5100/5000 · Too long for inline entry. Write it to a file and reference it with @/path/to/file.')).toBeDefined();
 
     fireEvent.click(screen.getByText('cron.save'));
 
-    expect(screen.getByText('Command is too long (1560/1500). Write the prompt to a file and reference it directly with @/path/to/file.')).toBeDefined();
+    expect(screen.getByText('Command is too long (5100/5000). Write the prompt to a file and reference it directly with @/path/to/file.')).toBeDefined();
     expect(apiFetch).toHaveBeenCalledTimes(1);
   });
 
