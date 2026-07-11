@@ -218,8 +218,7 @@
     "answerPlaceholder": "Ваш ответ",
     "dismiss": "Закрыть",
     "answer": "Ответить",
-    "interrupt": "Прервать этим ответом",
-    "timelineBadge": "Вопрос"
+    "interrupt": "Прервать этим ответом"
   },
   "chat": {
     "delete_message": "Удалить сообщение",

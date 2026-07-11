@@ -218,8 +218,7 @@
     "answerPlaceholder": "输入你的回答",
     "dismiss": "关闭",
     "answer": "回答",
-    "interrupt": "用此回答打断",
-    "timelineBadge": "提问"
+    "interrupt": "用此回答打断"
   },
   "chat": {
     "delete_message": "删除消息",

@@ -264,37 +264,6 @@ describe('ChatView', () => {
     expect(screen.getByRole('button', { name: 'chat.user_message_collapse' })).toBeTruthy();
   });
 
-  it('renders an ask.question event as a visible timeline bubble (regression: was invisible)', () => {
-    const { container } = render(
-      <ChatView
-        events={[{
-          eventId: 'evt-ask',
-          type: 'ask.question',
-          ts: 1_700_000_000_000,
-          payload: {
-            toolUseId: 'tool-1',
-            questions: [{
-              question: 'Which value should the token bar use?',
-              header: 'Metric',
-              options: [
-                { label: 'Context snapshot', description: 'from usage.update' },
-                { label: 'Per-turn delta', description: 'diff of snapshots' },
-              ],
-            }],
-          },
-        }] as any}
-        loading={false}
-        hasOlderHistory={false}
-        sessionId="deck_ask_q"
-      />,
-    );
-    const bubble = container.querySelector('.chat-ask-question');
-    expect(bubble).toBeTruthy();
-    expect(bubble?.textContent).toContain('Which value should the token bar use?');
-    expect(bubble?.textContent).toContain('Context snapshot');
-    expect(bubble?.textContent).toContain('Per-turn delta');
-  });
-
   it('does not collapse sent user messages with ten hard lines', () => {
     const tenLineText = Array.from({ length: 10 }, (_, index) => `sent-line-${index + 1}`).join('\n');
 

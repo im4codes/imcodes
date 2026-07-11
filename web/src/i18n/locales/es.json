@@ -218,8 +218,7 @@
     "answerPlaceholder": "Tu respuesta",
     "dismiss": "Cerrar",
     "answer": "Responder",
-    "interrupt": "Interrumpir con esto",
-    "timelineBadge": "Pregunta"
+    "interrupt": "Interrumpir con esto"
   },
   "chat": {
     "delete_message": "Eliminar mensaje",

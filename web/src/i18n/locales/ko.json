@@ -218,8 +218,7 @@
     "answerPlaceholder": "답변 입력",
     "dismiss": "닫기",
     "answer": "답변",
-    "interrupt": "이 답변으로 중단",
-    "timelineBadge": "질문"
+    "interrupt": "이 답변으로 중단"
   },
   "chat": {
     "delete_message": "메시지 삭제",

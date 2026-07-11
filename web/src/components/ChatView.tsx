@@ -3220,40 +3220,6 @@ const ChatEvent = memo(function ChatEvent({
       );
     }
 
-    case 'ask.question': {
-      // The agent asked the user a question. It arrives as a live dialog + push,
-      // but it must ALSO persist as a visible timeline bubble — otherwise the
-      // user gets a notification for a message that isn't in the conversation.
-      const questions = Array.isArray(event.payload.questions)
-        ? event.payload.questions as Array<Record<string, unknown>>
-        : [];
-      if (questions.length === 0) return null;
-      return (
-        <div class="chat-event chat-ask-question" data-event-id={event.eventId}>
-          <div class="chat-ask-question-badge">{t('askQuestion.timelineBadge', 'Question')}</div>
-          {questions.map((q, qi) => {
-            const header = typeof q.header === 'string' ? q.header : '';
-            const qText = typeof q.question === 'string' ? q.question : '';
-            const options = Array.isArray(q.options) ? q.options as Array<Record<string, unknown>> : [];
-            return (
-              <div key={qi} class="chat-ask-question-item">
-                {header && <div class="chat-ask-question-header">{header}</div>}
-                {qText && <div class="chat-ask-question-text">{qText}</div>}
-                {options.length > 0 && (
-                  <ul class="chat-ask-question-options">
-                    {options.map((opt, oi) => (
-                      <li key={oi}>{typeof opt.label === 'string' ? opt.label : ''}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            );
-          })}
-          <ChatTime ts={event.ts} />
-        </div>
-      );
-    }
-
     case 'tool.call': {
       const toolName = String(event.payload.tool ?? 'tool');
       const callDetail = event.payload._callDetail ?? event.payload.detail;
