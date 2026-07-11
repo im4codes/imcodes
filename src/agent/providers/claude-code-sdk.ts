@@ -58,6 +58,8 @@ const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 const FORCE_KILL_TIMEOUT_MS = 500;
 const RESULT_COMPLETION_FALLBACK_MS = 5_000;
+const CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT = 2;
+const CONNECTION_CLOSED_CONTINUE_PROMPT = 'continue';
 const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
@@ -541,7 +543,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
     state.runtimeActivityGeneration = payload.activityGeneration;
-    await this.startQuery(sessionId, state, payload, true);
+    await this.startQuery(sessionId, state, payload, true, CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -568,6 +570,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state: ClaudeSdkSessionState,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    connectionClosedRetriesRemaining: number,
   ): Promise<void> {
     state.currentText = '';
     state.currentMessageId = null;
@@ -661,7 +664,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const q = query({ prompt, options: options as any });
     const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
-    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback, turnGeneration);
+    void this.consumeQuery(
+      sessionId,
+      state,
+      q,
+      payload,
+      allowResumeFallback,
+      turnGeneration,
+      connectionClosedRetriesRemaining,
+    );
   }
 
   private async consumeQuery(
@@ -671,6 +682,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
     turnGeneration: number,
+    connectionClosedRetriesRemaining: number,
   ): Promise<void> {
     let pendingError: ProviderError | null = null;
     try {
@@ -686,7 +698,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     } catch (err) {
       pendingError = state.cancelled
         ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true, err)
-        : this.normalizeError(err);
+        : (state.pendingError ?? this.normalizeError(err));
     } finally {
       if (state.turnGeneration === turnGeneration) {
         this.clearResultCompletionFallback(state);
@@ -701,7 +713,34 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
         state.started = false;
         logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
-        await this.startQuery(sessionId, state, payload, false);
+        await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
+        return;
+      }
+      if (
+        !pendingComplete
+        && pendingError
+        && !state.cancelled
+        && connectionClosedRetriesRemaining > 0
+        && this.isConnectionClosedMidResponseError(pendingError.message)
+      ) {
+        const attempt = CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT - connectionClosedRetriesRemaining + 1;
+        logger.warn(
+          {
+            provider: this.id,
+            sessionId,
+            resumeId: state.resumeId,
+            attempt,
+            maxAttempts: CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT,
+          },
+          'Claude SDK connection closed mid-response; continuing the same session',
+        );
+        await this.startQuery(
+          sessionId,
+          state,
+          this.makeConnectionRecoveryPayload(payload),
+          false,
+          connectionClosedRetriesRemaining - 1,
+        );
         return;
       }
       if (pendingComplete) {
@@ -962,7 +1001,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       }
       if (msg.is_error) {
         const details = Array.isArray((msg as any).errors) ? (msg as any).errors.join('; ') : 'Claude execution failed';
-        state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, false, msg);
+        const connectionClosed = this.isConnectionClosedMidResponseError(details);
+        state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, connectionClosed, msg);
+        if (connectionClosed) {
+          // Claude Code can emit a terminal error result while leaving the SDK
+          // Query iterator open forever. Interrupt + close the failed query so
+          // consumeQuery reaches its finally block and can resume the SAME
+          // conversation with a bounded `continue`. This is provider recovery,
+          // not a user cancellation, so do not set state.cancelled.
+          state.started = true;
+          void this.stopFailedQueryForConnectionRecovery(state);
+        }
         return;
       }
       state.started = true;
@@ -1893,11 +1942,59 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (/resume|session/i.test(message) && /not found|invalid|unknown/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
-    return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
+    return this.makeError(
+      PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message,
+      this.isConnectionClosedMidResponseError(message),
+      err,
+    );
   }
 
   private isMissingResumeError(message: string): boolean {
     return /no conversation found|session .* not found|unknown session|invalid session/i.test(message);
+  }
+
+  private isConnectionClosedMidResponseError(message: string): boolean {
+    return /connection closed mid-response/i.test(message);
+  }
+
+  private makeConnectionRecoveryPayload(payload: ProviderContextPayload): ProviderContextPayload {
+    return {
+      ...payload,
+      userMessage: CONNECTION_CLOSED_CONTINUE_PROMPT,
+      assembledMessage: CONNECTION_CLOSED_CONTINUE_PROMPT,
+      attachments: undefined,
+      startupMemory: undefined,
+      memoryRecall: undefined,
+      messagePreamble: undefined,
+      sessionSystemText: undefined,
+      turnSystemText: undefined,
+      systemText: undefined,
+      context: {
+        ...payload.context,
+        sessionSystemText: undefined,
+        turnSystemText: undefined,
+        systemText: undefined,
+        messagePreamble: undefined,
+      },
+    };
+  }
+
+  private async stopFailedQueryForConnectionRecovery(state: ClaudeSdkSessionState): Promise<void> {
+    const q = state.currentQuery;
+    if (!q) return;
+    const child = state.currentChild;
+    try {
+      await Promise.race([
+        q.interrupt(),
+        new Promise<void>((resolve) => setTimeout(resolve, CANCEL_INTERRUPT_TIMEOUT_MS)),
+      ]);
+    } catch {}
+    try { q.close(); } catch {}
+    if (child && !child.killed) {
+      void killProcessTree(child, { gracefulMs: FORCE_KILL_TIMEOUT_MS });
+    }
+    if (state.currentChild === child) state.currentChild = null;
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

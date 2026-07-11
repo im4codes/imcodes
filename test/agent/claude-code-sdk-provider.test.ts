@@ -490,6 +490,92 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(errors).toEqual([]);
   });
 
+  it('interrupts a stuck connection-closed result and auto-continues the same session twice', async () => {
+    const connectionError = 'API Error: Connection closed mid-response. The response above may be incomplete.';
+    const makeIterator = (messages: any[], waitForClose: boolean) => {
+      const run = {
+        prompt: '',
+        options: {} as Record<string, unknown>,
+        closed: false,
+        interrupted: false,
+        stoppedTasks: [] as string[],
+        resolveClose: undefined as (() => void) | undefined,
+      };
+      async function* gen() {
+        for (const message of messages) yield message;
+        if (waitForClose && !run.closed) {
+          await new Promise<void>((resolve) => { run.resolveClose = resolve; });
+        }
+      }
+      const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
+      iterator.close = () => {
+        run.closed = true;
+        run.resolveClose?.();
+      };
+      iterator.interrupt = async () => { run.interrupted = true; };
+      iterator.stopTask = async (taskId: string) => { run.stoppedTasks.push(taskId); };
+      return { run, iterator };
+    };
+    const queueRun = (messages: any[], waitForClose: boolean) => ({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+      const { run, iterator } = makeIterator(messages, waitForClose);
+      run.prompt = prompt;
+      run.options = options;
+      sdkMock.runs.push(run);
+      return iterator;
+    };
+
+    sdkMock.query
+      .mockImplementationOnce(queueRun([
+        { type: 'system', subtype: 'init', session_id: 'session-connection-retry', model: 'claude-sonnet-4-6' },
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true, errors: [connectionError] },
+      ], true))
+      .mockImplementationOnce(queueRun([
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'error', is_error: true, errors: [connectionError] },
+      ], true))
+      .mockImplementationOnce(queueRun([
+        { type: 'result', session_id: 'session-connection-retry', subtype: 'success', is_error: false, result: 'Recovered answer', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ], false));
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-connection-retry', cwd: '/tmp/project' });
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    await provider.send('route-connection-retry', 'original work');
+    for (let i = 0; i < 8; i++) await flush();
+
+    expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['original work', 'continue', 'continue']);
+    expect(sdkMock.runs.slice(0, 2).every((run) => run.interrupted && run.closed)).toBe(true);
+    expect(sdkMock.runs.slice(1).every((run) => run.options.resume === 'session-connection-retry')).toBe(true);
+    expect(completed).toEqual(['Recovered answer']);
+    expect(errors).toEqual([]);
+  });
+
+  it('stops after two auto-continues and emits a recoverable terminal error', async () => {
+    const connectionError = 'Claude Code returned an error result: API Error: Connection closed mid-response.';
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-connection-exhausted', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-connection-exhausted', subtype: 'error', is_error: true, errors: [connectionError] },
+    ]);
+    sdkMock.setWaitForClose(true);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-connection-exhausted', cwd: '/tmp/project' });
+    const errors: Array<{ message: string; recoverable: boolean }> = [];
+    provider.onError((_sid, err) => errors.push({ message: err.message, recoverable: err.recoverable }));
+
+    await provider.send('route-connection-exhausted', 'original work');
+    for (let i = 0; i < 10; i++) await flush();
+
+    expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['original work', 'continue', 'continue']);
+    expect(sdkMock.runs.every((run) => run.interrupted && run.closed)).toBe(true);
+    expect(errors).toEqual([{ message: connectionError, recoverable: true }]);
+  });
+
   it('passes session env through to the Claude SDK query options', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-env', model: 'claude-sonnet-4-6' },
