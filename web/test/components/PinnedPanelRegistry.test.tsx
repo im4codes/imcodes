@@ -7,6 +7,7 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
 import { afterEach } from 'vitest';
 
 const fileBrowserProps: any[] = [];
+const cronManagerProps: any[] = [];
 
 vi.mock('../../src/components/file-browser-lazy.js', () => ({
   FileBrowser: (props: any) => {
@@ -26,7 +27,12 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
 vi.mock('../../src/components/ChatView.js', () => ({ ChatView: () => null }));
 vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: () => null }));
 vi.mock('../../src/pages/RepoPage.js', () => ({ RepoPage: () => null }));
-vi.mock('../../src/pages/CronManager.js', () => ({ CronManager: () => null }));
+vi.mock('../../src/pages/CronManager.js', () => ({
+  CronManager: (props: any) => {
+    cronManagerProps.push(props);
+    return <div data-testid="mock-cron-manager" />;
+  },
+}));
 vi.mock('../../src/components/LocalWebPreviewPanel.js', () => ({ LocalWebPreviewPanel: () => null }));
 vi.mock('../../src/components/SharedContextManagementPanel.js', () => ({ SharedContextManagementPanel: () => null }));
 vi.mock('../../src/components/ContextDiagnosticsPanel.js', () => ({ ContextDiagnosticsPanel: () => null }));
@@ -48,6 +54,33 @@ import { renderPanelContent } from '../../src/components/PinnedPanelRegistry.js'
 afterEach(() => {
   cleanup();
   fileBrowserProps.length = 0;
+  cronManagerProps.length = 0;
+});
+
+describe('pinned cron manager panel', () => {
+  it('forwards the active websocket so backend cron changes refresh immediately', () => {
+    const ws = { onMessage: vi.fn() } as any;
+    render(
+      <>{renderPanelContent(
+        { id: 'cronmanager:srv:project', type: 'cronmanager', props: { projectName: 'project' } },
+        {
+          ws,
+          connected: true,
+          serverId: 'srv',
+          subSessions: [],
+          activeSession: 'deck_project_brain',
+          sessions: [{
+            name: 'deck_project_brain', project: 'project', role: 'main', agentType: 'codex', state: 'idle',
+          }],
+          t: (key: string) => key,
+        },
+      )}</>,
+    );
+
+    expect(screen.getByTestId('mock-cron-manager')).toBeTruthy();
+    expect(cronManagerProps).toHaveLength(1);
+    expect(cronManagerProps[0].ws).toBe(ws);
+  });
 });
 
 describe('pinned file browser panel', () => {

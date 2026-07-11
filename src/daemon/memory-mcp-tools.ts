@@ -45,7 +45,7 @@ import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagVa
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
-import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, type CronMcpClientOptions } from './cron-mcp-client.js';
+import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
@@ -112,6 +112,7 @@ export interface MemoryMcpToolDeps {
   cronOptions?: CronMcpClientOptions;
   cronCreate?: typeof cronMcpCreate;
   cronCreateSelf?: typeof cronMcpCreateSelf;
+  cronUpdateSelf?: typeof cronMcpUpdateSelf;
   cronUpdate?: typeof cronMcpUpdate;
   cronDelete?: typeof cronMcpDelete;
   cronList?: typeof cronMcpList;
@@ -470,6 +471,26 @@ function defaultSelfCronName(message: string): string {
   return name;
 }
 
+function selfCronControlMetadata(jobId: string): Record<string, unknown> {
+  return {
+    preferredCronInterface: true,
+    jobId,
+    controls: {
+      update: { tool: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF, args: { id: jobId } },
+      cancel: { tool: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF, args: { id: jobId } },
+    },
+    lifecycleInstruction: `When the scheduled work is complete, call ${MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF} with this jobId.`,
+  };
+}
+
+function cronResultJobId(result: { body?: unknown }, fallback?: string): string | undefined {
+  if (result.body && typeof result.body === 'object') {
+    const id = (result.body as Record<string, unknown>).id;
+    if (typeof id === 'string' && id) return id;
+  }
+  return fallback;
+}
+
 function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'> }): string | undefined {
   const projectId = caller.namespace.projectId?.trim();
   return projectId || undefined;
@@ -575,6 +596,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     ?? ((ids: string[]) => contextStoreClient().run<void>('recordMemoryHits', [ids]));
   const cronCreate = deps.cronCreate ?? cronMcpCreate;
   const createSelfCron = deps.cronCreateSelf ?? cronMcpCreateSelf;
+  const updateSelfCron = deps.cronUpdateSelf ?? cronMcpUpdateSelf;
   const cronUpdate = deps.cronUpdate ?? cronMcpUpdate;
   const cronDelete = deps.cronDelete ?? cronMcpDelete;
   const cronList = deps.cronList ?? cronMcpList;
@@ -864,7 +886,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!isCronSelfBinding(binding)) return binding;
       const cronOptions = cronOptionsForCaller(binding.scopedCaller, deps);
       if ('status' in cronOptions) return cronOptions;
-      return createSelfCron({
+      const result = await createSelfCron({
         name: stringArg(args, 'name') ?? defaultSelfCronName(message),
         cronExpr,
         projectName: binding.projectName,
@@ -873,7 +895,45 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         message,
         timezone: stringArg(args, 'timezone'),
         expiresAt,
-      }, cronOptions) as unknown as Promise<ToolResult>;
+      }, cronOptions);
+      if (result.status !== 'ok') return result as unknown as ToolResult;
+      const jobId = cronResultJobId(result);
+      return {
+        ...result,
+        ...(jobId ? selfCronControlMetadata(jobId) : {}),
+      } as unknown as ToolResult;
+    },
+    [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id', 'cronExpr', 'message', 'name', 'timezone', 'expiresAt']);
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const hasUpdate = ['cronExpr', 'message', 'name', 'timezone'].some((key) => stringArg(args, key) !== undefined)
+        || args.expiresAt !== undefined;
+      if (!hasUpdate) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'at least one update field is required');
+      if (args.message !== undefined && !stringArg(args, 'message')) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message must not be empty');
+      }
+      const expiresAt = parseExpiresAt(args.expiresAt);
+      if (Number.isNaN(expiresAt)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expiresAt must be a timestamp or ISO string');
+      const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF);
+      if (!isCronSelfBinding(binding)) return binding;
+      const cronOptions = cronOptionsForCaller(binding.scopedCaller, deps);
+      if ('status' in cronOptions) return cronOptions;
+      const listed = await cronList({ projectName: binding.projectName, limit: MEMORY_MCP_CAPS.CRON_LIST_MAX_LIMIT }, cronOptions);
+      if (listed.status !== 'ok') return listed as unknown as ToolResult;
+      const job = cronJobsFromListBody(listed.body).find((candidate) => candidate.id === id && cronJobTargetsSelf(candidate, binding));
+      if (!job) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scheduled job is not available for the current session');
+      const result = await updateSelfCron({
+        id,
+        projectName: binding.projectName,
+        name: stringArg(args, 'name'),
+        cronExpr: stringArg(args, 'cronExpr'),
+        message: stringArg(args, 'message'),
+        timezone: stringArg(args, 'timezone'),
+        expiresAt,
+      }, cronOptions);
+      if (result.status !== 'ok') return result as unknown as ToolResult;
+      return { ...result, ...selfCronControlMetadata(id) } as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['id', 'name', 'all']);
@@ -1084,6 +1144,14 @@ const schemas = {
     name: z.string().optional().describe('Optional job name; defaults to a short name derived from the message.'),
     timezone: z.string().optional().describe('Optional cron timezone for schedule evaluation only.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional absolute expiration timestamp or ISO string with an explicit offset or Z suffix.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: z.object({
+    id: z.string().describe('Current-session cron job id returned by creation or injected into a wake-up prompt.'),
+    cronExpr: z.string().optional().describe(`Optional replacement cron expression with at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`),
+    message: z.string().optional().describe('Optional replacement prompt delivered to the current session on future runs.'),
+    name: z.string().optional().describe('Optional replacement human-readable task name.'),
+    timezone: z.string().optional().describe('Optional replacement cron schedule timezone.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional replacement absolute expiration timestamp or explicit-offset ISO string.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: z.object({
     id: z.string().optional().describe('Exact current-session cron job id returned by creation or listing.'),

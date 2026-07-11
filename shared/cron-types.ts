@@ -7,6 +7,8 @@ export type CronActionType = 'command' | 'p2p' | 'send';
 export interface CronCommandAction {
   type: 'command';
   command: string;
+  /** Marks a runtime-bound self cron whose prompt should include lifecycle controls. */
+  selfManaged?: boolean;
 }
 
 /** A participant can be identified by main-session role or direct sub-session name. */
@@ -70,6 +72,9 @@ export interface CronDispatchMessage {
   serverId: string;
   projectName: string;
   targetRole: string;
+  cronExpr?: string;
+  timezone?: string | null;
+  expiresAt?: number | null;
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
   action: CronAction;

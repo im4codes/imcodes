@@ -21,6 +21,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
   CRON_CREATE_SELF: 'cron_create_self',
+  CRON_UPDATE_SELF: 'cron_update_self',
   CRON_CANCEL_SELF: 'cron_cancel_self',
   CRON_CREATE: 'cron_create',
   CRON_LIST: 'cron_list',
@@ -46,6 +47,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
+  MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
@@ -329,7 +331,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
-    description: `Create a scheduled message for the current caller session. Session, project, user, and server identity are detected from the MCP runtime, so do not look up or pass a session id. Use this for reminders or recurring work that this same session should receive; schedules must leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
+    description: `PREFERRED cron creation interface for an SDK/agent scheduling its own progress checks, reminders, or recurring work. It creates a scheduled message for the current caller session; session, project, user, and server identity are detected from the MCP runtime, so never look up or pass a session id. The wake-up prompt includes the job id and exact update/cancel instructions. Schedules must leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
     inputSchema: objectSchema({
       cronExpr: stringSchema(`Required cron expression accepted by the cron service. The server rejects schedules whose next two runs are less than ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`),
       message: stringSchema('Required prompt or instruction delivered directly to the current caller session when the schedule runs.'),
@@ -339,9 +341,22 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['cronExpr', 'message']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: {
+    name: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
+    description: 'PREFERRED cron modification interface for a task owned by the current caller session. Use the job id injected into each wake-up prompt to change its name, schedule, message, timezone, or expiration without supplying session/project/server identity. The job must still target this runtime-bound session.',
+    inputSchema: objectSchema({
+      id: stringSchema('Required current-session cron job id returned by creation or injected into the scheduled wake-up prompt.'),
+      cronExpr: stringSchema(`Optional replacement cron expression; consecutive runs must remain at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`),
+      message: stringSchema('Optional replacement prompt or progress-check instruction delivered to this same session on future runs.'),
+      name: stringSchema('Optional replacement human-readable task name.'),
+      timezone: stringSchema('Optional replacement cron timezone for schedule evaluation only.'),
+      expiresAt: stringSchema(`Optional replacement absolute expiration as epoch milliseconds or an ISO timestamp with an explicit offset or Z suffix, within ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days.`),
+    }, ['id']),
+    outputSchema: statusSchema,
+  },
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
-    description: 'Cancel scheduled jobs belonging to the current caller session without supplying session, project, user, or server identity. Select one job by the id returned from creation, select a uniquely named job by name, or explicitly set all=true to remove every job targeting this session.',
+    description: 'PREFERRED cron cancellation interface for SDKs/agents finishing a self-scheduled progress check in the current caller session. Cancel the task as soon as its completion condition is met. Session/project/server identity is runtime-bound; use the job id injected into the wake-up prompt, a unique job name, or explicitly all=true for every task targeting this session.',
     inputSchema: objectSchema({
       id: stringSchema('Optional exact cron job id returned by cron_create_self or cron_list. Cannot be combined with name or all.'),
       name: stringSchema('Optional exact human-readable job name. It must identify exactly one current-session job and cannot be combined with id or all.'),
@@ -351,7 +366,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE,
-    description: `Create a scheduled structured send job through the bound server. Use it for future reminders or delegated messages; caller identity and server binding are runtime-bound, actions must be structured sends, and the cron schedule must leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
+    description: `Advanced compatibility interface for scheduling a structured send from one session to another. Do not use this for an SDK/agent waking itself; prefer cron_create_self, which binds the current session and injects lifecycle controls. Structured-send schedules must leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
     inputSchema: objectSchema({
       name: stringSchema('Required human-readable scheduled job name.'),
       cronExpr: stringSchema(`Required cron expression accepted by the cron service. The server rejects schedules whose next two runs are less than ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart, for example every-minute expressions such as "* * * * *".`),
@@ -375,7 +390,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
-    description: `Update an owned cron job through the bound server. Use it to change schedule fields or keep an MCP-created action as a structured send action; identity and server are runtime-bound, and replacement cron schedules must still leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
+    description: `Advanced compatibility interface for updating generic or delegated cron jobs. For a task targeting the current SDK/agent session, prefer cron_update_self with the injected task id. Identity and server are runtime-bound, and replacement schedules must still leave at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`,
     inputSchema: objectSchema({
       id: stringSchema('Required cron job id to update.'),
       name: stringSchema('Optional replacement human-readable scheduled job name.'),
@@ -391,7 +406,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
-    description: 'Delete an owned cron job by id through the bound server. Use it to cancel scheduled work; caller identity and server binding are runtime-bound.',
+    description: 'Advanced compatibility interface for deleting any owned cron job by id. For self-scheduled SDK/agent work, prefer cron_cancel_self so runtime session ownership is checked and use the task id injected into the wake-up prompt.',
     inputSchema: objectSchema({
       id: stringSchema('Required cron job id to delete.'),
     }, ['id']),

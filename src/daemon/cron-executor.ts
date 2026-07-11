@@ -4,6 +4,7 @@
  */
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { sendKeys } from '../agent/tmux.js';
 import { getSession } from '../store/session-store.js';
 import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
@@ -47,6 +48,22 @@ let cronSendDispatcherOverride: CronSendDispatcher | null = null;
 
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
   cronSendDispatcherOverride = dispatcher;
+}
+
+export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, sessionName: string, message: string): string {
+  const expirationDate = msg.expiresAt == null ? null : new Date(msg.expiresAt);
+  const expiresAt = msg.expiresAt == null
+    ? null
+    : { epochMs: msg.expiresAt, iso: expirationDate && Number.isFinite(expirationDate.getTime()) ? expirationDate.toISOString() : null };
+  const config = JSON.stringify({
+    id: msg.jobId,
+    name: msg.jobName,
+    sessionName,
+    cronExpr: msg.cronExpr ?? null,
+    timezone: msg.timezone ?? null,
+    expiresAt,
+  }, null, 2);
+  return `${message}\n\n<imcodes-cron-control>\nThis is a self-managed scheduled task.\nCurrent task configuration:\n${config}\n\nPreferred MCP controls:\n- Modify: ${MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF}({ id: ${JSON.stringify(msg.jobId)}, cronExpr?, message?, name?, timezone?, expiresAt? })\n- Cancel: ${MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF}({ id: ${JSON.stringify(msg.jobId)} })\n\nIf this progress check has reached its completion condition, call ${MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF} with the task id before your final response. Keep the task only when another scheduled check is still needed.\n</imcodes-cron-control>`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
@@ -134,14 +151,17 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
 
   if (action.type === 'command') {
     logger.info({ jobId, jobName, sessionName: name, command: action.command.slice(0, 80) }, 'Cron: sending command');
+    const command = action.selfManaged
+      ? buildSelfManagedCronPrompt(msg, name, action.command)
+      : action.command;
 
     if (session.runtimeType === 'transport') {
       const runtime = getTransportRuntime(name);
       if (runtime) {
         try {
-          const result = await runtime.send(action.command);
+          const result = await runtime.send(command);
           if (result !== 'queued') {
-            timelineEmitter.emit(name, 'user.message', { text: action.command, allowDuplicate: true });
+            timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
           }
         } catch (err) {
           logger.error({ jobId, sessionName: name, err }, 'Cron: transport send failed');
@@ -164,8 +184,8 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         });
       }
     } else {
-      await sendKeys(name, action.command, { cwd: session.projectDir });
-      timelineEmitter.emit(name, 'user.message', { text: action.command, allowDuplicate: true });
+      await sendKeys(name, command, { cwd: session.projectDir });
+      timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
     }
 
     // Capture agent response: collect assistant.text events until session goes idle

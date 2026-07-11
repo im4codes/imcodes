@@ -38,6 +38,7 @@ describe('memory MCP shared contracts', () => {
       'send_stop',
       'destroy_execution_clone',
       'cron_create_self',
+      'cron_update_self',
       'cron_cancel_self',
       'cron_create',
       'cron_list',
@@ -192,6 +193,18 @@ describe('memory MCP shared contracts', () => {
     expect(cronCreateSelf.required).toEqual(['cronExpr', 'message']);
     expect(cronCreateSelf.properties ?? {}).not.toHaveProperty('sessionName');
 
+    const cronUpdateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF].inputSchema;
+    expect(Object.keys(cronUpdateSelf.properties ?? {})).toEqual([
+      'id',
+      'cronExpr',
+      'message',
+      'name',
+      'timezone',
+      'expiresAt',
+    ]);
+    expect(cronUpdateSelf.required).toEqual(['id']);
+    expect(cronUpdateSelf.properties ?? {}).not.toHaveProperty('sessionName');
+
     const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF].inputSchema;
     expect(Object.keys(cronCancelSelf.properties ?? {})).toEqual(['id', 'name', 'all']);
     expect(cronCancelSelf.properties ?? {}).not.toHaveProperty('sessionName');
@@ -235,6 +248,7 @@ describe('memory MCP shared contracts', () => {
 
   it('documents cron scheduling limits and structured send source-target resolution', () => {
     const cronCreateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF];
+    const cronUpdateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF];
     const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF];
     const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE];
     const cronUpdate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE];
@@ -243,7 +257,11 @@ describe('memory MCP shared contracts', () => {
 
     expect(cronCreateSelf.description).toContain('current caller session');
     expect(cronCreateSelf.description).toContain('detected from the MCP runtime');
+    expect(cronCreateSelf.description).toContain('PREFERRED');
+    expect(cronUpdateSelf.description).toContain('PREFERRED');
     expect(cronCancelSelf.description).toContain('current caller session');
+    expect(cronCancelSelf.description).toContain('PREFERRED');
+    expect(cronCreate.description).toContain('prefer cron_create_self');
     expect(cronCreate.description).toContain('at least 5 minutes');
     expect((createProps.cronExpr as { description?: string }).description).toContain('* * * * *');
     expect((createProps.targetSessionName as { description?: string }).description).toContain('source session');

@@ -117,6 +117,33 @@ describe('executeCronJob', () => {
     );
   });
 
+  it('injects self-management id, configuration, update, and cancel guidance into wake-up prompts', async () => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-progress-1',
+      jobName: 'Check implementation progress',
+      cronExpr: '*/10 * * * *',
+      timezone: 'Asia/Shanghai',
+      expiresAt: Date.parse('2026-07-12T00:00:00Z'),
+      action: { type: 'command', command: 'Inspect the current progress.', selfManaged: true },
+    }), mockServerLink);
+
+    const prompt = (sendKeys as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(prompt).toContain('Inspect the current progress.');
+    expect(prompt).toContain('"id": "job-progress-1"');
+    expect(prompt).toContain('"cronExpr": "*/10 * * * *"');
+    expect(prompt).toContain('"timezone": "Asia/Shanghai"');
+    expect(prompt).toContain('cron_update_self({ id: "job-progress-1"');
+    expect(prompt).toContain('cron_cancel_self({ id: "job-progress-1" })');
+    expect(prompt).toContain('before your final response');
+    expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
+      text: prompt,
+      allowDuplicate: true,
+    });
+  });
+
   // 2. Command to streaming session — skips (busy)
   it('skips command when session is streaming', async () => {
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());

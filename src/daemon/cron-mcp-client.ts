@@ -48,6 +48,16 @@ export interface CronCreateSelfInput {
   expiresAt?: number | null;
 }
 
+export interface CronUpdateSelfInput {
+  id: string;
+  name?: string;
+  cronExpr?: string;
+  projectName: string;
+  message?: string;
+  timezone?: string;
+  expiresAt?: number | null;
+}
+
 export interface CronUpdateInput extends MemoryMcpSourceProvenance {
   id: string;
   name?: string;
@@ -226,11 +236,12 @@ export async function cronMcpCreateSelf(
     body: JSON.stringify(buildCreateBody(input, identity.runtimeServerId, {
       type: 'command',
       command: input.message,
+      selfManaged: true,
     })),
   }, options);
 }
 
-function buildUpdateBody(input: CronUpdateInput, action: CronSendAction | undefined): Record<string, unknown> {
+function buildUpdateBody(input: CronUpdateInput, action: CronAction | undefined): Record<string, unknown> {
   return {
     ...(input.name !== undefined ? { name: input.name } : {}),
     ...(input.cronExpr !== undefined ? { cronExpr: input.cronExpr } : {}),
@@ -241,6 +252,28 @@ function buildUpdateBody(input: CronUpdateInput, action: CronSendAction | undefi
     ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
   };
+}
+
+export async function cronMcpUpdateSelf(
+  input: CronUpdateSelfInput,
+  options: CronMcpClientOptions = {},
+): Promise<CronMcpResult<{ body: unknown }>> {
+  if (input.message !== undefined && !input.message.trim()) {
+    return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message must not be empty');
+  }
+  const expiresError = validateExpiresAt(input.expiresAt, (options.nowMs ?? Date.now)());
+  if (expiresError) return expiresError;
+  const identity = await getEndpoint(options);
+  if ('status' in identity) return identity;
+  const action: CronAction | undefined = input.message === undefined ? undefined : {
+    type: 'command',
+    command: input.message,
+    selfManaged: true,
+  };
+  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(input.id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(buildUpdateBody(input, action)),
+  }, options);
 }
 
 export async function cronMcpCreate(

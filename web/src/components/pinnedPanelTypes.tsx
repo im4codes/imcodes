@@ -240,6 +240,7 @@ registerPanelType('cronmanager', {
     return (
       <CronManager
         key={`${ctx.serverId}:${projectName}`}
+        ws={ctx.ws}
         serverId={ctx.serverId}
         projectName={projectName}
         sessions={(ctx.sessions ?? []) as any}

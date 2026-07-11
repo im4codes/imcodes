@@ -5,6 +5,7 @@ import {
   cronMcpDelete,
   cronMcpList,
   cronMcpUpdate,
+  cronMcpUpdateSelf,
 } from '../../src/daemon/cron-mcp-client.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 
@@ -119,7 +120,7 @@ describe('cron MCP client', () => {
       projectName: 'proj',
       targetRole: 'brain',
       targetSessionName: 'deck_sub_scheduler',
-      action: { type: 'command', command: 'Review the latest status' },
+      action: { type: 'command', command: 'Review the latest status', selfManaged: true },
       timezone: 'Asia/Shanghai',
     });
   });
@@ -137,6 +138,29 @@ describe('cron MCP client', () => {
       reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
     });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('updates a self-managed job without caller-supplied session identity', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdateSelf({
+      id: 'job-self',
+      projectName: 'proj',
+      cronExpr: '*/20 * * * *',
+      message: 'Check progress again',
+      name: 'Progress check',
+      timezone: 'Asia/Shanghai',
+    }, { ...boundIdentity, fetchImpl });
+
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://worker.test/api/server/srv-bound/cron/job-self');
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: 'Progress check',
+      cronExpr: '*/20 * * * *',
+      projectName: 'proj',
+      action: { type: 'command', command: 'Check progress again', selfManaged: true },
+      timezone: 'Asia/Shanghai',
+    });
   });
 
   it('rejects non-send create actions before HTTP', async () => {

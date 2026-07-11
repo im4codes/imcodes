@@ -228,6 +228,16 @@ describe('Cron API routes', () => {
       expect(body.action).toEqual({ type: 'command', command: '/status' });
     });
 
+    it('preserves the self-managed command marker used by MCP lifecycle prompts', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        action: { type: 'command', command: 'check progress', selfManaged: true },
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.action).toEqual({ type: 'command', command: 'check progress', selfManaged: true });
+    });
+
     it('rejects share-only server-scoped cron creation with the direct-surface reason', async () => {
       mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
         ok: false,

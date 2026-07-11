@@ -56,6 +56,7 @@ describe('jobDispatchCron', () => {
       id: 'j1', server_id: 's1', user_id: 'u1', name: 'Test Job',
       cron_expr: '*/10 * * * *', action: '{"type":"command","command":"hello"}',
       project_name: 'myapp', target_role: 'brain', status: 'active',
+      timezone: 'Asia/Shanghai',
       last_run_at: null, next_run_at: Date.now() - 1000, expires_at: null,
       created_at: Date.now(), updated_at: null,
     });
@@ -69,6 +70,9 @@ describe('jobDispatchCron', () => {
     expect(sent.executionId).toBe('a'.repeat(24));
     expect(sent.projectName).toBe('myapp');
     expect(sent.targetRole).toBe('brain');
+    expect(sent.cronExpr).toBe('*/10 * * * *');
+    expect(sent.timezone).toBe('Asia/Shanghai');
+    expect(sent.expiresAt).toBeNull();
     expect(sent.action).toEqual({ type: 'command', command: 'hello' });
   });
 

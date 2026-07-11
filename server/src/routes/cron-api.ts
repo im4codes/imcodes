@@ -32,7 +32,7 @@ const cronParticipantSchema = z.discriminatedUnion('type', [
 ]);
 
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('command'), command: z.string().min(1) }),
+  z.object({ type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional() }),
   z.object({
     type: z.literal('send'),
     target: z.string().min(1),
@@ -249,8 +249,10 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   let nextRunAt: number | undefined;
   const newCronExpr = updates.cronExpr;
   const effectiveTz = updates.timezone ?? job.timezone ?? undefined;
-  if (newCronExpr && newCronExpr !== job.cron_expr) {
-    const validation = validateCronExpr(newCronExpr, effectiveTz);
+  const scheduleChanged = (newCronExpr !== undefined && newCronExpr !== job.cron_expr)
+    || (updates.timezone !== undefined && updates.timezone !== job.timezone);
+  if (scheduleChanged) {
+    const validation = validateCronExpr(newCronExpr ?? job.cron_expr, effectiveTz);
     if ('error' in validation) {
       return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
     }

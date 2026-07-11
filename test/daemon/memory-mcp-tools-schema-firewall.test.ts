@@ -551,7 +551,7 @@ describe('memory MCP tool schema firewall', () => {
       isMemoryFeatureEnabled: () => true,
     });
 
-    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
       cronExpr: '*/10 * * * *',
       message: 'Check the current work',
       sessionName: 'deck_sub_forged',
@@ -567,6 +567,15 @@ describe('memory MCP tool schema firewall', () => {
       targetRole: 'brain',
       targetSessionName: null,
     }), expect.objectContaining({ runtimeServerId: 'srv-1' }));
+    expect(result).toMatchObject({
+      status: 'ok',
+      preferredCronInterface: true,
+      jobId: 'job-self',
+      controls: {
+        update: { tool: 'cron_update_self', args: { id: 'job-self' } },
+        cancel: { tool: 'cron_cancel_self', args: { id: 'job-self' } },
+      },
+    });
   });
 
   it('creates a self cron directly for the runtime-bound sub-session', async () => {
@@ -602,6 +611,50 @@ describe('memory MCP tool schema firewall', () => {
       targetSessionName: 'deck_sub_worker',
       message: 'Continue this task',
     }), expect.any(Object));
+  });
+
+  it('updates only a cron targeting the runtime-bound current session', async () => {
+    const cronUpdateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          { id: 'self-1', name: 'Progress', project_name: 'proj', target_role: 'brain', target_session_name: null },
+          { id: 'worker-1', name: 'Worker progress', project_name: 'proj', target_role: 'w1', target_session_name: null },
+        ],
+      },
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronUpdateSelf,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'self-1',
+      cronExpr: '*/20 * * * *',
+      message: 'Check whether the work is complete',
+      sessionName: 'deck_proj_w1',
+      serverId: 'srv-forged',
+    });
+
+    expect(cronUpdateSelf).toHaveBeenCalledWith({
+      id: 'self-1',
+      projectName: 'proj',
+      name: undefined,
+      cronExpr: '*/20 * * * *',
+      message: 'Check whether the work is complete',
+      timezone: undefined,
+      expiresAt: undefined,
+    }, expect.objectContaining({ runtimeServerId: 'srv-1' }));
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
+      id: 'worker-1',
+      name: 'Do not change',
+    })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(cronUpdateSelf).toHaveBeenCalledTimes(1);
   });
 
   it('cancels only a uniquely named cron targeting the current session', async () => {
