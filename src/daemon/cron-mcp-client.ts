@@ -1,4 +1,4 @@
-import type { CronSendAction } from '../../shared/cron-types.js';
+import type { CronAction, CronSendAction } from '../../shared/cron-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance } from '../../shared/memory-mcp-provenance.js';
 import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags.js';
@@ -35,6 +35,17 @@ export interface CronCreateInput extends MemoryMcpSourceProvenance {
   serverId?: string;
   token?: string;
   actorId?: string;
+}
+
+export interface CronCreateSelfInput {
+  name: string;
+  cronExpr: string;
+  projectName: string;
+  targetRole: string;
+  targetSessionName?: string | null;
+  message: string;
+  timezone?: string;
+  expiresAt?: number | null;
 }
 
 export interface CronUpdateInput extends MemoryMcpSourceProvenance {
@@ -181,7 +192,11 @@ async function requestCron(
   }
 }
 
-function buildCreateBody(input: CronCreateInput, runtimeServerId: string, action: CronSendAction): Record<string, unknown> {
+function buildCreateBody(
+  input: Pick<CronCreateInput, 'name' | 'cronExpr' | 'projectName' | 'targetRole' | 'targetSessionName' | 'timezone' | 'expiresAt'>,
+  runtimeServerId: string,
+  action: CronAction,
+): Record<string, unknown> {
   return {
     name: input.name,
     cronExpr: input.cronExpr,
@@ -193,6 +208,26 @@ function buildCreateBody(input: CronCreateInput, runtimeServerId: string, action
     ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
   };
+}
+
+export async function cronMcpCreateSelf(
+  input: CronCreateSelfInput,
+  options: CronMcpClientOptions = {},
+): Promise<CronMcpResult<{ body: unknown }>> {
+  if (!input.message.trim()) {
+    return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message is required');
+  }
+  const expiresError = validateExpiresAt(input.expiresAt, (options.nowMs ?? Date.now)());
+  if (expiresError) return expiresError;
+  const identity = await getEndpoint(options);
+  if ('status' in identity) return identity;
+  return requestCron(identity.endpoint, identity.runtimeServerId, '', {
+    method: 'POST',
+    body: JSON.stringify(buildCreateBody(input, identity.runtimeServerId, {
+      type: 'command',
+      command: input.message,
+    })),
+  }, options);
 }
 
 function buildUpdateBody(input: CronUpdateInput, action: CronSendAction | undefined): Record<string, unknown> {

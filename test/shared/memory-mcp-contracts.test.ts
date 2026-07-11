@@ -37,6 +37,8 @@ describe('memory MCP shared contracts', () => {
       'send_message',
       'send_stop',
       'destroy_execution_clone',
+      'cron_create_self',
+      'cron_cancel_self',
       'cron_create',
       'cron_list',
       'cron_update',
@@ -179,6 +181,21 @@ describe('memory MCP shared contracts', () => {
   });
 
   it('keeps cron shared schemas aligned with the registered top-level MCP inputs', () => {
+    const cronCreateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF].inputSchema;
+    expect(Object.keys(cronCreateSelf.properties ?? {})).toEqual([
+      'cronExpr',
+      'message',
+      'name',
+      'timezone',
+      'expiresAt',
+    ]);
+    expect(cronCreateSelf.required).toEqual(['cronExpr', 'message']);
+    expect(cronCreateSelf.properties ?? {}).not.toHaveProperty('sessionName');
+
+    const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF].inputSchema;
+    expect(Object.keys(cronCancelSelf.properties ?? {})).toEqual(['id', 'name', 'all']);
+    expect(cronCancelSelf.properties ?? {}).not.toHaveProperty('sessionName');
+
     const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE].inputSchema;
     expect(Object.keys(cronCreate.properties ?? {})).toEqual([
       'name',
@@ -217,11 +234,16 @@ describe('memory MCP shared contracts', () => {
   });
 
   it('documents cron scheduling limits and structured send source-target resolution', () => {
+    const cronCreateSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF];
+    const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF];
     const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE];
     const cronUpdate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE];
     const createProps = cronCreate.inputSchema.properties ?? {};
     const updateProps = cronUpdate.inputSchema.properties ?? {};
 
+    expect(cronCreateSelf.description).toContain('current caller session');
+    expect(cronCreateSelf.description).toContain('detected from the MCP runtime');
+    expect(cronCancelSelf.description).toContain('current caller session');
     expect(cronCreate.description).toContain('at least 5 minutes');
     expect((createProps.cronExpr as { description?: string }).description).toContain('* * * * *');
     expect((createProps.targetSessionName as { description?: string }).description).toContain('source session');

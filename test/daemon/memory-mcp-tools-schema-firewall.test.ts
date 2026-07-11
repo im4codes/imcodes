@@ -543,6 +543,127 @@ describe('memory MCP tool schema firewall', () => {
     expect(cronCreate.mock.calls[0][1]).toMatchObject({ runtimeServerId: 'srv-1' });
   });
 
+  it('creates a self cron for the runtime-bound main session without session arguments', async () => {
+    const cronCreateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { id: 'job-self' } }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronCreateSelf,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      cronExpr: '*/10 * * * *',
+      message: 'Check the current work',
+      sessionName: 'deck_sub_forged',
+      projectName: 'other',
+      serverId: 'srv-forged',
+    });
+
+    expect(cronCreateSelf).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'Check the current work',
+      cronExpr: '*/10 * * * *',
+      message: 'Check the current work',
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: null,
+    }), expect.objectContaining({ runtimeServerId: 'srv-1' }));
+  });
+
+  it('creates a self cron directly for the runtime-bound sub-session', async () => {
+    const cronCreateSelf = vi.fn(async () => ({ status: 'ok' as const, body: { id: 'job-sub' } }));
+    const handlers = createMemoryMcpToolHandlers(caller({
+      sessionName: 'deck_sub_worker',
+      projectName: 'deck_sub_worker',
+    }), {
+      cronCreateSelf,
+      sendDeps: {
+        listSessions: () => [
+          sessionRecord(),
+          sessionRecord({
+            name: 'deck_sub_worker',
+            projectName: 'deck_sub_worker',
+            parentSession: 'deck_proj_brain',
+            role: 'w1',
+          }),
+        ],
+      },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]({
+      name: 'Sub reminder',
+      cronExpr: '0 9 * * *',
+      message: 'Continue this task',
+    });
+
+    expect(cronCreateSelf).toHaveBeenCalledWith(expect.objectContaining({
+      projectName: 'proj',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_worker',
+      message: 'Continue this task',
+    }), expect.any(Object));
+  });
+
+  it('cancels only a uniquely named cron targeting the current session', async () => {
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          { id: 'self-1', name: 'Daily check', project_name: 'proj', target_role: 'brain', target_session_name: null },
+          { id: 'worker-1', name: 'Daily check', project_name: 'proj', target_role: 'w1', target_session_name: null },
+          { id: 'other-project', name: 'Daily check', project_name: 'other', target_role: 'brain', target_session_name: null },
+        ],
+      },
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronDelete,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({ name: 'Daily check' })).resolves.toEqual({
+      status: 'ok',
+      count: 1,
+      deleted: [{ id: 'self-1', name: 'Daily check' }],
+    });
+    expect(cronDelete).toHaveBeenCalledOnce();
+    expect(cronDelete).toHaveBeenCalledWith('self-1', expect.objectContaining({ runtimeServerId: 'srv-1' }));
+  });
+
+  it('requires an explicit unambiguous self-cron cancellation selector', async () => {
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          { id: 'self-1', name: 'Duplicate', project_name: 'proj', target_role: 'brain', target_session_name: null },
+          { id: 'self-2', name: 'Duplicate', project_name: 'proj', target_role: 'brain', target_session_name: null },
+        ],
+      },
+    }));
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronDelete,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({})).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({ name: 'Duplicate' })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      matches: [{ id: 'self-1' }, { id: 'self-2' }],
+    });
+    expect(cronDelete).not.toHaveBeenCalled();
+  });
+
   it('resolves cron project scope from the caller session store for sub-sessions', async () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller({

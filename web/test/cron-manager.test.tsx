@@ -232,7 +232,7 @@ describe('CronManager', () => {
     expect((screen.getByLabelText('cron.send_reply') as HTMLInputElement).checked).toBe(true);
   });
 
-  it('creates send cron jobs from the normal form', async () => {
+  it('creates a direct-message cron for the active session without a second recipient', async () => {
     apiFetch
       .mockResolvedValueOnce({ jobs: [] })
       .mockResolvedValueOnce({})
@@ -244,6 +244,7 @@ describe('CronManager', () => {
         projectName="cd"
         sessions={sessions}
         subSessions={subSessions}
+        activeSession="deck_sub_52123h2r"
         onBack={vi.fn()}
         servers={[{ id: 'srv-current', name: 'Current' }]}
       />,
@@ -252,27 +253,25 @@ describe('CronManager', () => {
     expect(await screen.findByText('cron.no_tasks')).toBeDefined();
     fireEvent.click(screen.getByTitle('cron.create'));
 
-    fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Send check' } });
+    fireEvent.input(screen.getByPlaceholderText('cron.name_placeholder'), { target: { value: 'Direct check' } });
     fireEvent.input(screen.getByPlaceholderText('0 9 * * 1-5'), { target: { value: '0 11 * * *' } });
-    fireEvent.click(screen.getByLabelText('common.send'));
-    fireEvent.input(screen.getByPlaceholderText('cron.send_target_placeholder'), { target: { value: 'deck_sub_audit' } });
     fireEvent.input(screen.getByPlaceholderText('cron.send_message_placeholder'), { target: { value: 'Please check this task' } });
-    fireEvent.click(screen.getByLabelText('cron.send_reply'));
     fireEvent.click(screen.getByText('cron.save'));
 
     await waitFor(() => expect(apiFetch).toHaveBeenCalledWith('/api/cron', expect.objectContaining({ method: 'POST' })));
     const createCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron');
     const payload = JSON.parse(String(createCall?.[1]?.body));
     expect(payload).toMatchObject({
-      name: 'Send check',
+      name: 'Direct check',
       cronExpr: '0 11 * * *',
+      targetRole: 'brain',
+      targetSessionName: 'deck_sub_52123h2r',
       action: {
-        type: 'send',
-        target: 'deck_sub_audit',
-        message: 'Please check this task',
-        reply: true,
+        type: 'command',
+        command: 'Please check this task',
       },
     });
+    expect(screen.queryByPlaceholderText('cron.send_target_placeholder')).toBeNull();
   });
 
   it('shows persisted expiration timestamps in the browser local timezone when editing', async () => {
@@ -329,7 +328,7 @@ describe('CronManager', () => {
     const cronExprInput = screen.getByPlaceholderText('0 9 * * 1-5') as HTMLInputElement;
     fireEvent.input(cronExprInput, { target: { value: '0 9 * * *' } });
 
-    const textarea = screen.getByPlaceholderText('cron.command_placeholder') as HTMLTextAreaElement;
+    const textarea = screen.getByPlaceholderText('cron.send_message_placeholder') as HTMLTextAreaElement;
     const longCommand = '早上好主人！'.repeat(260);
     fireEvent.input(textarea, { target: { value: longCommand } });
 
@@ -404,8 +403,10 @@ describe('CronManager', () => {
     fireEvent.click(screen.getByTitle('cron.create'));
 
     expect(screen.queryByLabelText('cron.action_p2p')).toBeNull();
-    expect(screen.getByLabelText('cron.action_command')).toBeDefined();
-    expect(screen.getByLabelText('common.send')).toBeDefined();
+    expect(screen.queryByLabelText('cron.action_command')).toBeNull();
+    expect(screen.queryByLabelText('common.send')).toBeNull();
+    expect(screen.getByPlaceholderText('cron.send_message_placeholder')).toBeDefined();
+    expect(screen.queryByPlaceholderText('cron.send_target_placeholder')).toBeNull();
     expect(screen.queryByPlaceholderText('cron.p2p_topic_placeholder')).toBeNull();
   });
 

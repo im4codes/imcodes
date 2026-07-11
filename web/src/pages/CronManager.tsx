@@ -186,7 +186,7 @@ function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, s
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [], ws }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -468,6 +468,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               projectName={editingJob?.project_name ?? projectName}
               sessions={eligible}
               subSessions={scopedSubs}
+              activeSession={activeSession}
               job={editingJob}
               onDone={handleFormDone}
               onCancel={() => { setSubPanel(null); setEditingJob(null); }}
@@ -875,6 +876,7 @@ interface CronFormProps {
   projectName: string;
   sessions: SessionInfo[];
   subSessions?: SubSessionSlim[];
+  activeSession?: string | null;
   job: CronJob | null; // null = create, non-null = edit
   onDone: () => void;
   onCancel: () => void;
@@ -882,7 +884,7 @@ interface CronFormProps {
 
 const CRON_COMMAND_INLINE_CHAR_LIMIT = 1500;
 
-function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDone, onCancel }: CronFormProps) {
+function CronForm({ serverId, projectName, sessions, subSessions = [], activeSession, job, onDone, onCancel }: CronFormProps) {
   const { t } = useTranslation();
   const isEdit = !!job;
   const existingAction = job ? parseAction(job.action) : null;
@@ -890,9 +892,15 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
   const [name, setName] = useState(job?.name ?? '');
   const [cronExpr, setCronExpr] = useState(job?.cron_expr ?? '');
-  const [targetRole, setTargetRole] = useState(job?.target_role ?? 'brain');
-  const [targetSessionName, setTargetSessionName] = useState<string | null>(job?.target_session_name ?? null);
-  const [actionType, setActionType] = useState<'command' | 'p2p' | 'send'>(
+  const activeSubSession = !job && activeSession
+    ? subSessions.find((session) => session.sessionName === activeSession)
+    : undefined;
+  const activeMainSession = !job && activeSession
+    ? sessions.find((session) => session.name === activeSession)
+    : undefined;
+  const [targetRole, setTargetRole] = useState(job?.target_role ?? activeMainSession?.role ?? 'brain');
+  const [targetSessionName, setTargetSessionName] = useState<string | null>(job?.target_session_name ?? activeSubSession?.sessionName ?? null);
+  const [actionType] = useState<'command' | 'p2p' | 'send'>(
     hasExistingP2pAction || existingAction?.type === 'send' ? existingAction.type : 'command',
   );
   const [command, setCommand] = useState(existingAction?.type === 'command' ? existingAction.command : '');
@@ -1041,33 +1049,22 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
           ))}
         </select>
 
-        <label style={labelStyle}>{t('cron.action_type')}</label>
-        <div style={{ display: 'flex', gap: '16px', marginBottom: '12px' }}>
+        {(hasExistingP2pAction || existingAction?.type === 'send') && (
+          <div style={{ marginBottom: '12px' }}>
           {hasExistingP2pAction ? (
             <label style={{ color: '#94a3b8', fontSize: '14px', cursor: 'not-allowed' }}>
               <input type="radio" name="actionType" checked={actionType === 'p2p'} disabled style={{ marginRight: '6px' }} />
               {t('cron.action_p2p')}
             </label>
           ) : (
-            <>
-              <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-                <input type="radio" name="actionType" checked={actionType === 'command'} onChange={() => setActionType('command')} style={{ marginRight: '6px' }} />
-                {t('cron.action_command')}
-              </label>
-              <label style={{ color: '#e2e8f0', fontSize: '14px', cursor: 'pointer' }}>
-                <input type="radio" name="actionType" checked={actionType === 'send'} onChange={() => setActionType('send')} style={{ marginRight: '6px' }} />
-                {t('common.send')}
-              </label>
-            </>
+            <span style={{ color: '#94a3b8', fontSize: '12px' }}>{t('cron.legacy_send')}</span>
           )}
-        </div>
+          </div>
+        )}
 
         {actionType === 'command' && (
           <>
-            <label style={labelStyle}>{t('cron.command')}</label>
-            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6, lineHeight: 1.5 }}>
-              {t('cron.shell_hint')}
-            </div>
+            <label style={labelStyle}>{t('cron.send_message')}</label>
             <textarea
               style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
               value={command}
@@ -1075,7 +1072,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
                 setCommand((e.target as HTMLTextAreaElement).value);
                 setError((prev) => prev?.startsWith('Command is too long') ? null : prev);
               }}
-              placeholder={t('cron.command_placeholder')}
+              placeholder={t('cron.send_message_placeholder')}
               required
             />
             <div

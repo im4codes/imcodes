@@ -1810,6 +1810,7 @@
     "action_type": "작업 유형",
     "action_command": "명령",
     "action_p2p": "Team 토론",
+    "legacy_send": "레거시 위임 전송 작업(호환성 유지)",
     "send_target": "받는 세션",
     "send_target_placeholder": "정확한 세션 이름, 라벨 또는 에이전트 유형",
     "send_message": "메시지",
