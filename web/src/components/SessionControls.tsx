@@ -1808,19 +1808,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const event = msg.event;
       if (event.sessionId !== activeSession.name) return;
       if (event.type === 'user.message') {
-        const commandId = typeof event.payload.commandId === 'string'
-          ? event.payload.commandId
-          : typeof event.payload.clientMessageId === 'string'
-            ? event.payload.clientMessageId
-            : '';
+        const clientMessageId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId : '';
+        const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
         const deliveredText = typeof event.payload.text === 'string' ? event.payload.text : undefined;
-        removeLocalQueuedEntry(commandId, deliveredText);
-        // Record the delivered id so a stale daemon pending snapshot can't keep
-        // showing it as queued (the incoming snapshot is not under our control,
-        // unlike the optimistic set cleared above).
-        const idsToSettle = commandId ? [commandId] : [];
-        if (idsToSettle.length > 0) {
-          for (const id of idsToSettle) rememberSettledQueuedId(id);
+        // Settle/remove by BOTH ids. Queue entries — the authoritative snapshot
+        // AND the realtime override — are keyed by clientMessageId, but the
+        // recovery/resend drain path emits a user.message carrying BOTH commandId
+        // and clientMessageId where commandId != clientMessageId. Settling only
+        // commandId (the old behavior) missed the clientMessageId-keyed entries,
+        // so a message that had already drained into the timeline stayed in the
+        // queue card until the window remounted — the '不切窗口不清空' regression
+        // once stale turns began draining via the recovery path.
+        const idsToSettle = [clientMessageId, commandId].filter((v): v is string => !!v);
+        for (const id of idsToSettle) {
+          removeLocalQueuedEntry(id, deliveredText);
+          rememberSettledQueuedId(id);
         }
       } else if (event.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) {
         const payload = event.payload as Record<string, unknown>;

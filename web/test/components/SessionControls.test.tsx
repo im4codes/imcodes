@@ -2897,6 +2897,46 @@ afterEach(() => {
     expect(screen.queryByText('legacy stale send')).toBeNull();
   });
 
+  it('clears the queued card when a drained user.message carries commandId != clientMessageId (recovery drain)', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['commit&push'],
+          transportPendingMessageEntries: [{ clientMessageId: 'cmid-1', text: 'commit&push' }],
+          transportPendingMessageVersion: 1,
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('commit&push')).toBeDefined();
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:cmid-1',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          // Recovery/resend drain shape: BOTH ids, commandId != clientMessageId.
+          // Settling only commandId (the regression) left the card up.
+          payload: { text: 'commit&push', commandId: 'daemon-cmd-xyz', clientMessageId: 'cmid-1', pendingMessageVersion: 2 },
+        },
+      });
+    });
+
+    expect(screen.queryByText('commit&push')).toBeNull();
+  });
+
   it('treats partial queued transport entries as authoritative', () => {
     const ws = makeWs();
     render(
