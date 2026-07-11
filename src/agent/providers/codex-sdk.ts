@@ -3010,7 +3010,6 @@ export class CodexSdkProvider implements TransportProvider {
         !turnId
         || state.cancelled
         || state.runningCompact
-        || state.turnStartInFlight
         || this.isClosedCodexTurn(state, turnId)
       ) {
         this.clearRolloutSettlePoll(state);
@@ -3727,6 +3726,7 @@ export class CodexSdkProvider implements TransportProvider {
   private clearActiveTurnLease(state: CodexSdkSessionState): void {
     const lease = state.activeTurnLease;
     if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
+    this.clearRolloutSettlePoll(state);
     state.activeTurnLease = undefined;
   }
 
@@ -4100,7 +4100,7 @@ export class CodexSdkProvider implements TransportProvider {
       if (!lease || lease.id !== leaseGuard.leaseId || lease.attemptId !== leaseGuard.attemptId) return;
       if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
     } else {
-      if (state.cancelled || state.runningCompact || state.turnStartInFlight) return;
+      if (state.cancelled || state.runningCompact) return;
       if (state.runningTurnId !== turnId) return;
       if (this.isClosedCodexTurn(state, turnId)) return;
     }
@@ -4116,9 +4116,18 @@ export class CodexSdkProvider implements TransportProvider {
       if (!this.isHeartbeatLeaseActive(sessionId, latestState, latestLease)) return;
       if ((latestState.runningTurnId ?? latestLease.turnId) !== turnId) return;
     } else {
-      if (latestState.cancelled || latestState.runningCompact || latestState.turnStartInFlight) return;
+      if (latestState.cancelled || latestState.runningCompact) return;
       if (latestState.runningTurnId !== turnId) return;
       if (this.isClosedCodexTurn(latestState, turnId)) return;
+    }
+    // A missing turn/start JSON-RPC response can leave startTurn() awaiting
+    // forever even though turn/started notifications, final output, and the
+    // core rollout task_complete all arrived. The rollout record is
+    // authoritative terminal evidence for this exact turn. Remember it while
+    // the start RPC is still pending so a very late response cannot assign the
+    // completed turn back to running state.
+    if (latestState.turnStartInFlight) {
+      latestState.terminalDuringTurnStartIds.add(turnId);
     }
     if (evidence.lastAgentMessage && latestState.currentText !== evidence.lastAgentMessage) {
       latestState.currentMessageId = `${turnId}:rollout-task-complete`;

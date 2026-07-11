@@ -4672,6 +4672,77 @@ describe('CodexSdkProvider', () => {
     }
   }, 60_000);
 
+  it('settles from rollout task_complete when turn/start response never returns and ignores its late response', async () => {
+    vi.useFakeTimers();
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-pending-start-rollout-settle-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      childProcessMock.setHoldTurnStart(true);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-pending-start-rollout-settle', cwd: '/tmp/project' });
+
+      const completed: AgentMessage[] = [];
+      provider.onComplete((_sid, message) => completed.push(message));
+      const sendPromise = provider.send('route-pending-start-rollout-settle', 'finish despite the missing start response');
+      const child = childProcessMock.children[0];
+      await advanceFakeTimersUntil(() => child.requests.some((req) => req.method === 'turn/start'));
+
+      // The app-server accepted the turn and streamed its final item, but lost
+      // both the turn/start response and turn/completed notification. Codex
+      // core still writes the authoritative task_complete to the rollout.
+      child.emits({
+        method: 'turn/started',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } },
+      });
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { id: 'final-pending-start', type: 'agentMessage', text: 'durable final while start response is missing' },
+        },
+      });
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: 'turn-1',
+            last_agent_message: 'durable final while start response is missing',
+          },
+        },
+      ]);
+
+      for (let i = 0; i < 200 && completed.length === 0; i++) {
+        await vi.advanceTimersByTimeAsync(100);
+      }
+
+      expect(completed).toHaveLength(1);
+      expect(completed[0]?.content).toBe('durable final while start response is missing');
+      expect(provider.getSessionDiagnostics('route-pending-start-rollout-settle')).toMatchObject({
+        runningTurnId: null,
+        heartbeatLeaseActive: false,
+      });
+
+      // A delayed turn/start response must resolve the caller without reviving
+      // the already-completed turn or emitting a duplicate completion.
+      childProcessMock.releaseHeldTurnStarts();
+      await sendPromise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(completed).toHaveLength(1);
+      expect(provider.getSessionDiagnostics('route-pending-start-rollout-settle')).toMatchObject({
+        runningTurnId: null,
+        heartbeatLeaseActive: false,
+      });
+    } finally {
+      randomSpy.mockRestore();
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('does not settle from rollout evidence when task_complete belongs to a different turn', async () => {
     vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);

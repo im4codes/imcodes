@@ -1675,31 +1675,54 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     lastIncomingQueuedTransportVersionRef.current = incomingQueuedTransportVersion;
   }, [activeSession?.name, effectiveRuntimeType, incomingQueuedTransportEntries.length, incomingQueuedTransportEntriesKey, incomingQueuedTransportVersion, optimisticQueuedEntries]);
 
+  // Keep the queue listener mounted for the lifetime of the session. Timeline
+  // bursts update `activeSession` in the parent before every consumer has seen
+  // the same burst; depending on the whole object here used to tear this
+  // listener down between an authoritative empty queue snapshot and the
+  // following `user.message`. The chat timeline (a separate listener) advanced,
+  // while this queue card stayed stale until the sub-session window remounted.
+  // Read mutable queue/session metadata through a ref so ordinary state merges
+  // never create a live-delivery gap.
+  const realtimeQueueStateRef = useRef({
+    activeSession,
+    incomingQueuedTransportEntries,
+    incomingQueuedTransportVersion,
+  });
+  realtimeQueueStateRef.current = {
+    activeSession,
+    incomingQueuedTransportEntries,
+    incomingQueuedTransportVersion,
+  };
+
   useEffect(() => {
-    if (!ws || !activeSession) return;
-    return ws.onMessage((msg: ServerMessage) => {
-      const applyRealtimeQueueSnapshot = (payload: Record<string, unknown>, sessionName: string): boolean => {
-        if (sessionName !== activeSession.name || !hasTransportPendingSyncSnapshot(payload)) return false;
+    const sessionName = activeSession?.name;
+    if (!ws || !sessionName) return;
+    const handleRealtimeQueueMessage = (msg: ServerMessage) => {
+      const applyRealtimeQueueSnapshot = (payload: Record<string, unknown>, snapshotSessionName: string): boolean => {
+        if (snapshotSessionName !== sessionName || !hasTransportPendingSyncSnapshot(payload)) return false;
+        const current = realtimeQueueStateRef.current;
+        const currentSession = current.activeSession;
+        if (!currentSession || currentSession.name !== sessionName) return false;
         const patch = buildTransportPendingSyncPatch({
-          transportPendingMessageEntries: incomingQueuedTransportEntries,
-          transportPendingMessageVersion: incomingQueuedTransportVersion,
-          queueEpoch: activeSession.queueEpoch,
-          queueAuthorityId: activeSession.queueAuthorityId,
-          failedMessageEntries: activeSession.failedMessageEntries,
-        }, payload, sessionName);
+          transportPendingMessageEntries: current.incomingQueuedTransportEntries,
+          transportPendingMessageVersion: current.incomingQueuedTransportVersion,
+          queueEpoch: currentSession.queueEpoch,
+          queueAuthorityId: currentSession.queueAuthorityId,
+          failedMessageEntries: currentSession.failedMessageEntries,
+        }, payload, snapshotSessionName);
         if (Object.keys(patch).length === 0) return false;
         const entries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
           ...entry,
           status: 'queued' as const,
         }));
         setRealtimeQueueOverride({
-          sessionName,
+          sessionName: snapshotSessionName,
           entries,
           version: patch.transportPendingMessageVersion,
         });
         if (entries.length === 0) {
           lastRealtimeEmptyQueueSnapshotRef.current = {
-            sessionName,
+            sessionName: snapshotSessionName,
             version: patch.transportPendingMessageVersion,
             observedAtMs: Date.now(),
           };
@@ -1742,8 +1765,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       };
 
       if (msg.type === 'session_list') {
-        const session = msg.sessions.find((item) => item.name === activeSession.name);
-        if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, activeSession.name);
+        const session = msg.sessions.find((item) => item.name === sessionName);
+        if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, sessionName);
         return;
       }
       if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
@@ -1757,12 +1780,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return;
       }
       if (msg.type === 'command.ack') {
-        if (msg.session && msg.session !== activeSession.name) return;
+        if (msg.session && msg.session !== sessionName) return;
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         if (msg.status === 'error' || msg.status === 'conflict') {
           if (rollback) {
             setOptimisticQueuedEntries((prev) => {
-              const source = prev ?? incomingQueuedTransportEntries;
+              const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
               if (rollback.type === 'edit') {
                 return source.map((entry) => (
                   entry.clientMessageId === rollback.entry.clientMessageId ? rollback.entry : entry
@@ -1783,7 +1806,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return;
       }
       if (msg.type === MSG_COMMAND_FAILED) {
-        if (msg.session && msg.session !== activeSession.name) return;
+        if (msg.session && msg.session !== sessionName) return;
         markLocalQueuedEntry(msg.commandId, 'failed');
         return;
       }
@@ -1796,7 +1819,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         // The wire validator requires sessionName on delivery facts — a frame
         // without one is malformed and must NOT default to clearing the active
         // session's optimistic entries.
-        if (!maybeQueueDelivery.sessionName || maybeQueueDelivery.sessionName !== activeSession.name) return;
+        if (!maybeQueueDelivery.sessionName || maybeQueueDelivery.sessionName !== sessionName) return;
         const clientMessageId = typeof maybeQueueDelivery.clientMessageId === 'string'
           ? maybeQueueDelivery.clientMessageId.trim()
           : '';
@@ -1806,7 +1829,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       if (msg.type !== 'timeline.event') return;
       const event = msg.event;
-      if (event.sessionId !== activeSession.name) return;
+      if (event.sessionId !== sessionName) return;
       if (event.type === 'user.message') {
         const clientMessageId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId : '';
         const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
@@ -1831,11 +1854,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         rememberSettledQueuedId(clientMessageId);
       } else if (event.type === 'session.state') {
         const payload = event.payload as Record<string, unknown>;
-        const hasPendingSnapshot = applyRealtimeQueueSnapshot(payload, activeSession.name);
+        const hasPendingSnapshot = applyRealtimeQueueSnapshot(payload, sessionName);
         const queuedEntries = normalizeTransportPendingEntries(
           payload.pendingMessageEntries,
           undefined,
-          activeSession.name,
+          sessionName,
           { hasEntriesField: Object.prototype.hasOwnProperty.call(payload, 'pendingMessageEntries') },
         );
         if (queuedEntries.length === 0) {
@@ -1849,8 +1872,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           return next.length > 0 ? next : null;
         });
       }
-    });
-  }, [activeSession, incomingQueuedTransportEntries, incomingQueuedTransportVersion, ws]);
+    };
+    return ws.onMessage(handleRealtimeQueueMessage);
+  }, [activeSession?.name, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);

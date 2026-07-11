@@ -3625,6 +3625,98 @@ afterEach(() => {
     expect(screen.queryByText('sub stale queued')).toBeNull();
   });
 
+  it('keeps the sub-session queue listener mounted across parent session-state rerenders', () => {
+    const ws = makeWs();
+    const queuedEntry = { clientMessageId: 'sub-burst-1', text: 'sub burst queued' };
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_burst',
+          project: 'my-project',
+          role: 'w1',
+          agentType: 'codex-sdk',
+          state: 'stopping',
+          transportPendingMessageEntries: [queuedEntry],
+          transportPendingMessageVersion: 7,
+        })}
+        subSessionId="burst"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('sub burst queued')).toBeDefined();
+    const queueListenerRegistrationCount = () => ws.onMessage.mock.calls.filter(
+      ([handler]) => (handler as { name?: string }).name === 'handleRealtimeQueueMessage',
+    ).length;
+    expect(queueListenerRegistrationCount()).toBe(1);
+
+    // The parent queue/session projection handles the first state event before
+    // SessionControls and supplies a new SessionInfo object. This used to
+    // unsubscribe/re-subscribe the queue listener, creating a gap in which the
+    // next frames in the same daemon burst could be missed.
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_burst',
+          project: 'my-project',
+          role: 'w1',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          transportPendingMessageEntries: [queuedEntry],
+          transportPendingMessageVersion: 7,
+        })}
+        subSessionId="burst"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(queueListenerRegistrationCount()).toBe(1);
+
+    act(() => {
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-burst-empty-v8',
+          sessionId: 'deck_sub_burst',
+          type: 'session.state',
+          ts: Date.now(),
+          seq: 822,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            state: 'idle',
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+            pendingMessageVersion: 8,
+            pendingMessageEntries: [],
+          },
+        },
+      });
+      ws.emit({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-burst-user-message',
+          sessionId: 'deck_sub_burst',
+          type: 'user.message',
+          ts: Date.now() + 1,
+          seq: 827,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            text: 'sub burst queued',
+            commandId: 'sub-burst-1',
+            clientMessageId: 'sub-burst-1',
+          },
+        },
+      });
+    });
+
+    expect(screen.queryByText('sub burst queued')).toBeNull();
+    expect(queueListenerRegistrationCount()).toBe(1);
+  });
+
   it('applies session_list empty queue snapshots without waiting for parent props to refresh', () => {
     const ws = makeWs();
     render(
