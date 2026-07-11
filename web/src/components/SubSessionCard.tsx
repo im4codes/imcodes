@@ -478,6 +478,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 subSessionId={sub.id}
                 onSubStop={onClose}
                 onSubRestart={onRestart}
+                transportTimelineEvents={events}
                 sessions={sessions}
                 subSessions={subSessions}
                 serverId={serverId}

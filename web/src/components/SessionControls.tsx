@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks'
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, RefObject } from 'preact';
-import type { WsClient, ServerMessage } from '../ws-client.js';
+import type { WsClient, ServerMessage, TimelineEvent } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
@@ -157,6 +157,13 @@ interface Props {
   activeThinking?: boolean;
   /** True while transport timeline tail shows an in-flight turn, even if session.state has not caught up. */
   activeTransportTurn?: boolean;
+  /**
+   * Materialized timeline for the controlled session. A committed user-message
+   * or queue-delivery fact is stronger evidence than any stale queue snapshot:
+   * once either exists, that clientMessageId must never remain editable in the
+   * queue card. This also closes event-before-listener and reconnect/replay gaps.
+   */
+  transportTimelineEvents?: readonly TimelineEvent[];
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
@@ -917,7 +924,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1075,6 +1082,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
     ? realtimeQueueOverride.version
     : activeSessionPendingVersion;
+  const timelineSettledQueuedIds = useMemo(() => {
+    const ids = new Set<string>();
+    const sessionName = activeSession?.name;
+    if (!sessionName || !transportTimelineEvents) return ids;
+    for (const event of transportTimelineEvents) {
+      if (event.sessionId !== sessionName) continue;
+      if (event.type !== 'user.message' && event.type !== TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) continue;
+      const clientMessageId = typeof event.payload.clientMessageId === 'string'
+        ? event.payload.clientMessageId.trim()
+        : '';
+      if (clientMessageId) ids.add(clientMessageId);
+      if (event.type === 'user.message') {
+        const commandId = typeof event.payload.commandId === 'string'
+          ? event.payload.commandId.trim()
+          : '';
+        if (commandId) ids.add(commandId);
+      }
+    }
+    return ids;
+  }, [activeSession?.name, transportTimelineEvents]);
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
     let merged: LocalQueuedTransportEntry[];
     if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
@@ -1090,10 +1117,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     // Authoritative override: a message that reached the timeline is delivered,
     // so drop it from the queue even if a stale daemon snapshot still lists it.
-    if (settledQueuedIds.size === 0) return merged;
-    const filtered = merged.filter((entry) => !settledQueuedIds.has(entry.clientMessageId));
+    if (settledQueuedIds.size === 0 && timelineSettledQueuedIds.size === 0) return merged;
+    const filtered = merged.filter((entry) => (
+      !settledQueuedIds.has(entry.clientMessageId)
+      && !timelineSettledQueuedIds.has(entry.clientMessageId)
+    ));
     return filtered.length === merged.length ? merged : filtered;
-  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds]);
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds, timelineSettledQueuedIds]);
 
   // Settled ids and optimistic queue overlays are scoped to the active session.
   // Reset the local overlay on switch; canonical session/app state remains

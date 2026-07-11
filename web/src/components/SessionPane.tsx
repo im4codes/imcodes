@@ -573,6 +573,7 @@ export function SessionPane({
           hideShortcuts={false}
           activeThinking={!!activeThinkingTs}
           activeTransportTurn={activeTimelineTurn}
+          transportTimelineEvents={timelineEvents}
           keyboardActive={keyboardActive ?? isActive}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}

@@ -2937,6 +2937,55 @@ afterEach(() => {
     expect(screen.queryByText('commit&push')).toBeNull();
   });
 
+  it('suppresses a stale editable queue card from the materialized timeline after a live queue frame is missed', () => {
+    const ws = makeWs();
+    const activeSession = makeSession({
+      name: 'qwen-session',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'queued-before-drain', text: 'old queued text' }],
+      transportPendingMessageVersion: 8,
+    });
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={activeSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('old queued text')).toBeDefined();
+
+    // The sub-session timeline has already materialized the daemon's delivery,
+    // but the parent SessionInfo is intentionally stale and no live WS event is
+    // emitted to SessionControls. This is the production failure that left an
+    // editable card whose edit later failed with "Queued message not found".
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={activeSession}
+        quickData={makeQuickData() as any}
+        transportTimelineEvents={[{
+          eventId: 'transport-user:queued-before-drain',
+          sessionId: 'qwen-session',
+          type: 'user.message',
+          ts: Date.now(),
+          seq: 2,
+          epoch: 1,
+          source: 'daemon',
+          confidence: 'high',
+          payload: {
+            text: 'old queued text',
+            clientMessageId: 'queued-before-drain',
+            pendingMessageVersion: 9,
+          },
+        }]}
+      />,
+    );
+
+    expect(screen.queryByText('old queued text')).toBeNull();
+    expect(document.querySelector('.controls-queued-hint')).toBeFalsy();
+  });
+
   it('treats partial queued transport entries as authoritative', () => {
     const ws = makeWs();
     render(
