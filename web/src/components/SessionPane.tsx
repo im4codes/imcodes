@@ -13,6 +13,7 @@ import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
+import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
 import { hasActiveTimelineTurn } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
@@ -51,6 +52,9 @@ const IDLE_HISTORY_STATUS = {
 
 export interface SessionPaneProps {
   serverId: string;
+  /** Report the trailing pending ask.question (or null) so the app can
+   *  re-surface it in the dedicated question dialog from history. */
+  onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   session: SessionInfo;
   sessions: SessionInfo[];
   subSessions: Array<{
@@ -121,6 +125,7 @@ export interface SessionPaneProps {
 
 export function SessionPane({
   serverId,
+  onPendingQuestion,
   session,
   sessions,
   subSessions,
@@ -181,6 +186,13 @@ export function SessionPane({
     disableHistory: !hasChatTimeline,
   });
   const historyStatus = timelineHistoryStatus ?? IDLE_HISTORY_STATUS;
+
+  // Re-surface a still-pending agent question in the dedicated dialog from
+  // timeline history (e.g. opened from a push notification / after reload).
+  useEffect(() => {
+    if (!isActive || !onPendingQuestion) return;
+    onPendingQuestion(sessionName, findTrailingAskQuestion(timelineEvents));
+  }, [isActive, onPendingQuestion, sessionName, timelineEvents]);
 
   // ── Quotes ────────────────────────────────────────────────────────────────
   const [quotes, setQuotes] = useState<string[]>([]);

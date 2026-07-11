@@ -57,6 +57,7 @@ import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
+import type { TrailingAskQuestion } from './find-pending-question.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
 import { ingestSessionRepoContext } from './session-repo-context-store.js';
@@ -1631,6 +1632,9 @@ export function App() {
   // the question goes unanswered), while ignoring the question's own trailing
   // message-completion flush that arrives in the same instant.
   const pendingQuestionAtRef = useRef(0);
+  // Questions the user already answered/dismissed this session — so re-hydrating
+  // from history (below) never re-pops a question they've dealt with.
+  const dismissedQuestionsRef = useRef<Set<string>>(new Set());
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
     topic: string;
@@ -2505,6 +2509,25 @@ export function App() {
       setActiveSession(sid);
     }
   }, [pendingQuestion, openSubSessionWindow, setActiveSession]);
+
+  // Re-surface a still-pending question in the DEDICATED dialog from timeline
+  // history — `pendingQuestion` is otherwise only set from live WS events, so a
+  // question received via push (or after a reload / on another device) would be
+  // lost. A session view calls this with the trailing ask.question it finds.
+  // Only surfaces one that isn't already showing and hasn't been answered/dismissed.
+  const surfaceAskQuestionFromHistory = useCallback((sessionName: string, q: TrailingAskQuestion | null) => {
+    if (!q || !q.toolUseId || dismissedQuestionsRef.current.has(q.toolUseId)) return;
+    setPendingQuestion((prev) => {
+      if (prev) return prev; // a question (live or already-hydrated) is showing — don't override
+      pendingQuestionAtRef.current = Date.now();
+      return {
+        sessionName,
+        toolUseId: q.toolUseId,
+        questions: q.questions as PendingQuestion['questions'],
+        ...(typeof q.waitMs === 'number' ? { waitMs: q.waitMs } : {}),
+      };
+    });
+  }, []);
 
   const visibleSubSessionStackKey = useMemo(
     () => visibleSubSessions
@@ -5055,6 +5078,7 @@ export function App() {
               <SessionPane
                 key={s.name}
                 serverId={selectedServerId ?? ''}
+                onPendingQuestion={surfaceAskQuestionFromHistory}
                 session={s}
                 sessions={sessions}
                 subSessions={subSessionsSlim}
@@ -5841,6 +5865,7 @@ export function App() {
               ws={wsRef.current}
               connected={connected}
               active={isMobile || focusedSubId === sub.id}
+              onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
@@ -5925,10 +5950,14 @@ export function App() {
         <AskQuestionDialog
           pending={pendingQuestion}
           onSubmit={(answer) => {
+            dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
             wsRef.current?.askAnswer(pendingQuestion.sessionName, answer);
             setPendingQuestion(null);
           }}
-          onDismiss={() => setPendingQuestion(null)}
+          onDismiss={() => {
+            dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
+            setPendingQuestion(null);
+          }}
         />
       )}
 
