@@ -218,7 +218,8 @@
     "answerPlaceholder": "回答を入力",
     "dismiss": "閉じる",
     "answer": "回答",
-    "interrupt": "この回答で割り込む"
+    "interrupt": "この回答で割り込む",
+    "timelineBadge": "質問"
   },
   "chat": {
     "delete_message": "メッセージを削除",

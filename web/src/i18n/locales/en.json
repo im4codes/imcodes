@@ -218,7 +218,8 @@
     "answerPlaceholder": "Your answer",
     "dismiss": "Dismiss",
     "answer": "Answer",
-    "interrupt": "Interrupt with this"
+    "interrupt": "Interrupt with this",
+    "timelineBadge": "Question"
   },
   "chat": {
     "delete_message": "Delete message",
