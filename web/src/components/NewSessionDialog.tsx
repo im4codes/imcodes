@@ -453,7 +453,7 @@ export function NewSessionDialog({
       });
     } else {
       const extra: Record<string, unknown> = {};
-      if (ccPreset && (agentType === "claude-code" || agentType === "qwen"))
+      if (ccPreset && (agentType === "claude-code" || agentType === "claude-code-sdk" || agentType === "qwen"))
         extra.ccPreset = ccPreset;
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
@@ -505,7 +505,7 @@ export function NewSessionDialog({
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
-  const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
+  const supportsCcPreset = agentType === "claude-code" || agentType === "claude-code-sdk" || agentType === "qwen";
   const providerPresetLabel = customProviderSdk
     ? t("new_session.custom_provider_preset")
     : agentType === "qwen"

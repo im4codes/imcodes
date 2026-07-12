@@ -411,7 +411,7 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('does not show CC preset controls for claude-code-sdk', () => {
+  it('shows CC preset controls and submits preset for claude-code-sdk (default)', () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -425,7 +425,23 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    expect(screen.queryByText('api_provider')).toBeNull();
+    // Default agent type is claude-code-sdk, which now runs third-party CC presets via the CC SDK transport.
+    expect(screen.getByText('api_provider')).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options ?? []).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    presetSelect!.value = 'MiniMax';
+    fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+    }));
   });
 
   it('shows CC preset controls and submits preset for qwen', async () => {

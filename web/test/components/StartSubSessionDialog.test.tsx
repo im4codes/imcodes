@@ -210,7 +210,7 @@ describe('StartSubSessionDialog', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('does not show CC preset controls for claude-code-sdk sub-sessions', () => {
+  it('shows CC preset controls and passes preset for claude-code-sdk sub-sessions (default)', () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -235,7 +235,20 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    expect(screen.queryByText('api_provider')).toBeNull();
+    // Default sub-session type is claude-code-sdk, which now runs third-party CC presets via the CC SDK transport.
+    expect(screen.getByText('api_provider')).toBeDefined();
+
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    presetSelect!.value = 'MiniMax';
+    fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith(
+      'claude-code-sdk', undefined, '/tmp', undefined,
+      expect.objectContaining({ ccPreset: 'MiniMax' }),
+    );
   });
 
   it('shows the qwen provider-specific hint for qwen sub-sessions', async () => {

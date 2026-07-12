@@ -293,7 +293,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
+    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
     if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
@@ -311,7 +311,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           : type === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : [];
-  const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen';
   const providerPresetLabel = customProviderSdk
     ? t('new_session.custom_provider_preset')
     : type === 'qwen'
