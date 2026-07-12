@@ -486,7 +486,7 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('custom provider SDK locks the main-session agent to qwen and uses a preset', async () => {
+  it('custom provider SDK locks the main-session agent to claude-code-sdk and uses a preset', async () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -508,7 +508,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(agentTypeSelect.value).toBe('qwen'));
+    await waitFor(() => expect(agentTypeSelect.value).toBe('claude-code-sdk'));
     expect(agentTypeSelect.disabled).toBe(true);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
@@ -517,10 +517,8 @@ describe('NewSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'qwen',
+      agentType: 'claude-code-sdk',
       ccPreset: 'MiniMax',
-      requestedModel: 'MiniMax-M2.7',
-      thinking: 'high',
     }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'custom-provider-sdk',

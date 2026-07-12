@@ -197,8 +197,8 @@ export function NewSessionDialog({
     setError("");
     setPresetError("");
     if (enabled) {
-      if (agentType !== "qwen") setLastUnlockedAgentType(agentType);
-      setAgentType("qwen");
+      if (agentType !== "claude-code-sdk") setLastUnlockedAgentType(agentType);
+      setAgentType("claude-code-sdk");
       return;
     }
     setAgentType(lastUnlockedAgentType);
@@ -392,7 +392,7 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (agentType !== "qwen") setAgentType("qwen");
+    if (agentType !== "claude-code-sdk") setAgentType("claude-code-sdk");
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
 
@@ -797,7 +797,7 @@ export function NewSessionDialog({
                 : t("new_session.agent_flavor_sdk")}
             </div>
           )}
-          <QwenCodingPlanHint selected={agentType === "qwen"} />
+          <QwenCodingPlanHint selected={customProviderSdk || agentType === "qwen"} />
         </div>
 
         {thinkingLevels.length > 0 && (

@@ -125,7 +125,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     return preset;
   };
   const selectType = (nextType: string) => {
-    if (customProviderSdk && nextType !== 'qwen') return;
+    if (customProviderSdk && nextType !== 'claude-code-sdk') return;
     setType(nextType);
     if (!customProviderSdk) setLastUnlockedType(nextType);
     setPresetError('');
@@ -134,8 +134,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setCustomProviderSdk(enabled);
     setPresetError('');
     if (enabled) {
-      if (type !== 'qwen') setLastUnlockedType(type);
-      setType('qwen');
+      if (type !== 'claude-code-sdk') setLastUnlockedType(type);
+      setType('claude-code-sdk');
       return;
     }
     setType(lastUnlockedType);
@@ -238,7 +238,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (type !== 'qwen') setType('qwen');
+    if (type !== 'claude-code-sdk') setType('claude-code-sdk');
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
@@ -375,7 +375,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                       <button
                         key={choice.id}
                         class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
-                        disabled={customProviderSdk && choice.id !== 'qwen'}
+                        disabled={customProviderSdk && choice.id !== 'claude-code-sdk'}
                         onClick={() => selectType(choice.id)}
                       >
                         <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
@@ -432,7 +432,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 {t('new_session.custom_provider_sdk_help')}
               </div>
             </div>
-            <QwenCodingPlanHint selected={type === 'qwen'} />
+            <QwenCodingPlanHint selected={customProviderSdk || type === 'qwen'} />
           </div>
 
           {/* Script command (only for script type) */}

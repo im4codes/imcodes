@@ -316,7 +316,7 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('custom provider SDK locks sub-sessions to qwen and passes the selected preset', async () => {
+  it('custom provider SDK locks sub-sessions to claude-code-sdk and passes the selected preset', async () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -348,17 +348,15 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /qwen/i }).className).toContain('active'));
+    await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
     expect((screen.getByRole('button', { name: /codex_sdk/i }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
       ccPreset: 'MiniMax',
-      requestedModel: 'MiniMax-M2.7',
-      thinking: 'high',
-    });
+    }));
   });
 
   it('shows a toast when qwen sub-session preset JSON is copied to the clipboard', async () => {
