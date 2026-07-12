@@ -2560,6 +2560,89 @@ describe('CodexSdkProvider', () => {
     }
   });
 
+  it('ROLLOUT-FIRST: self-heals a turn whose task_complete is already on disk — no idle hint, no 60s gate', async () => {
+    // Simulates the hard zombie / post-restart case: the durable rollout ALREADY
+    // records task_complete for the running turn, but the app-server sends no
+    // turn/completed and no thread/status idle hint at all. The real-time
+    // authority watch (armed at turn start) runs its immediate on-arm check and
+    // settles from the rollout — WITHOUT any app-server notification and WITHOUT
+    // waiting out the legacy 60s silence gate.
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-authority-heal-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-authority-heal', cwd: '/tmp/project' });
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+      // task_complete is durably on disk BEFORE the turn even becomes active.
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done' },
+        },
+      ]);
+
+      await provider.send('route-rollout-authority-heal', 'hello');
+
+      // No idle/status/completed hint is ever emitted. The turn still settles.
+      await waitForCondition(() => completed.length === 1);
+      expect(completed).toEqual(['Done']);
+      expect(provider.getSessionDiagnostics('route-rollout-authority-heal')).toMatchObject({ runningTurnId: null });
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('ROLLOUT-FIRST: settles in real time when task_complete is appended mid-turn (fs.watch, no idle hint)', async () => {
+    // The turn is genuinely running (rollout has no terminal record yet); the
+    // authority watch attaches to the file. When codex-core later appends
+    // task_complete, the kernel wakes the watcher and the turn settles at once —
+    // no thread/status idle hint, no turn/completed notification.
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-authority-live-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-authority-live', cwd: '/tmp/project' });
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+      // File exists (so the watcher can attach) but has no terminal record yet.
+      const rolloutPath = await writeCodexRolloutFile(codexHome, 'thread-1', [
+        { timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: 'thread-1' } },
+      ]);
+
+      await provider.send('route-rollout-authority-live', 'hello');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-rollout-authority-live')?.runningTurnId === 'turn-1',
+      );
+      expect(completed).toEqual([]);
+
+      // Core appends the terminal record; the watcher fires and settles.
+      await appendFile(
+        rolloutPath,
+        `${JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done live' },
+        })}\n`,
+      );
+
+      await waitForCondition(() => completed.length === 1);
+      expect(completed).toEqual(['Done live']);
+      expect(provider.getSessionDiagnostics('route-rollout-authority-live')).toMatchObject({ runningTurnId: null });
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('defers idle/rollout completion while a Codex commandExecution item is active', async () => {
     vi.useFakeTimers();
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-idle-active-command-'));

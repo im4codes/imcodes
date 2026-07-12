@@ -1,5 +1,5 @@
 import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { getCodexHome, recentCodexSessionDirs, findCodexRolloutPathByUuid } from '../../util/codex-rollout-path.js';
@@ -171,6 +171,17 @@ const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 // a few seconds. The read itself is still gated by CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS
 // (so healthy, actively-streaming turns never touch the file).
 const CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS = 2_000;
+// ROLLOUT-FIRST AUTHORITY: codex-core writes a terminal `task_complete{turn_id}`
+// to the thread's rollout the instant the model finishes a turn — empirically
+// ~2s BEFORE the process would even exit, and terminal in 2813/2813 sampled
+// turns. We attach a real-time `fs.watch` to that file so a dropped or absent
+// app-server `turn/completed` costs ~0ms instead of 60s+ (or forever on a hard
+// zombie). Unlike the legacy settle poll, this path has NO 60s silence gate and
+// does NOT depend on the heartbeat lease or any further app-server notification:
+// the kernel wakes us on the append, and the rollout record is authoritative
+// terminal evidence for that exact turn. The debounce only coalesces the burst
+// of change events that a single append can trigger.
+const CODEX_ROLLOUT_AUTHORITY_DEBOUNCE_MS = 40;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS = 2_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS = 15 * 60_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS = 5_000;
@@ -780,6 +791,14 @@ interface CodexSdkSessionState {
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
   rolloutSettlePollTimer: ReturnType<typeof setTimeout> | null;
+  /** ROLLOUT-FIRST AUTHORITY: real-time fs.watch on the thread's rollout file. */
+  rolloutAuthorityWatcher?: FSWatcher;
+  rolloutAuthorityWatchPath?: string;
+  /** Turn id the authority watcher is currently settling; re-armed when it changes. */
+  rolloutAuthorityTurnId?: string;
+  rolloutAuthorityDebounce?: ReturnType<typeof setTimeout>;
+  /** Guards the async path-resolution while (re)arming the authority watcher. */
+  rolloutAuthorityArmInFlight?: boolean;
   childSubagentRolloutStartedAt: number;
   childSubagentRolloutSeenIds: Set<string>;
   childSubagentRolloutCompletedIds: Set<string>;
@@ -3038,6 +3057,128 @@ export class CodexSdkProvider implements TransportProvider {
     state.rolloutSettlePollTimer = null;
   }
 
+  // ROLLOUT-FIRST AUTHORITY — front-line, real-time turn-completion detection.
+  //
+  // Attaches an fs.watch to the running turn's rollout file so the terminal
+  // `task_complete{turn_id}` record settles the turn the instant it lands —
+  // independent of the app-server's `turn/completed`, the heartbeat lease, and
+  // the legacy 60s silence gate. Armed at the single activity choke-point
+  // (`refreshActiveTurnLease`), so every observed turn is covered; the immediate
+  // check on arm also self-heals a turn whose `task_complete` was already on disk
+  // (e.g. the app-server went silent, or the record landed between events).
+  private armRolloutAuthorityWatch(sessionId: string, state: CodexSdkSessionState, turnId: string | undefined): void {
+    if (!turnId || !state.threadId) return;
+    if (state.cancelled || state.runningCompact) return;
+    if (this.isClosedCodexTurn(state, turnId)) return;
+    // Already watching this exact turn — cheap no-op (called on every activity).
+    if (state.rolloutAuthorityWatcher && state.rolloutAuthorityTurnId === turnId) return;
+    if (state.rolloutAuthorityArmInFlight && state.rolloutAuthorityTurnId === turnId) return;
+    // New turn (or first arm): tear down any prior watcher and re-target.
+    this.disarmRolloutAuthorityWatch(state);
+    state.rolloutAuthorityTurnId = turnId;
+    state.rolloutAuthorityArmInFlight = true;
+    void (async () => {
+      try {
+        const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+        const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+        const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId!, { env });
+        const latest = this.sessions.get(sessionId);
+        // Turn rolled over or session gone while resolving the path.
+        if (!latest || latest.rolloutAuthorityTurnId !== turnId) return;
+        if (!rolloutPath) return; // file not resolvable yet; a later activity re-arms
+        latest.rawChecklistRolloutPath = rolloutPath;
+        let watcher: FSWatcher;
+        try {
+          watcher = watch(rolloutPath, { persistent: false }, () => {
+            this.scheduleRolloutAuthorityCheck(sessionId, CODEX_ROLLOUT_AUTHORITY_DEBOUNCE_MS);
+          });
+        } catch (err) {
+          logger.debug({ provider: this.id, sessionId, threadId: latest.threadId, turnId, rolloutPath, err }, 'Codex rollout authority watch failed to attach');
+          return;
+        }
+        const cur = this.sessions.get(sessionId);
+        if (!cur || cur.rolloutAuthorityTurnId !== turnId) {
+          try { watcher.close(); } catch { /* ignore */ }
+          return;
+        }
+        cur.rolloutAuthorityWatcher = watcher;
+        cur.rolloutAuthorityWatchPath = rolloutPath;
+        // Immediate check: the terminal record may already be on disk (post-restart
+        // zombie, or it landed before the watcher attached).
+        this.scheduleRolloutAuthorityCheck(sessionId, 0);
+      } finally {
+        const s = this.sessions.get(sessionId);
+        if (s) s.rolloutAuthorityArmInFlight = false;
+      }
+    })();
+  }
+
+  private scheduleRolloutAuthorityCheck(sessionId: string, delayMs: number): void {
+    const state = this.sessions.get(sessionId);
+    if (!state || !state.rolloutAuthorityTurnId) return;
+    if (state.rolloutAuthorityDebounce) return; // coalesce the append burst
+    state.rolloutAuthorityDebounce = setTimeout(() => {
+      const s = this.sessions.get(sessionId);
+      if (s) s.rolloutAuthorityDebounce = undefined;
+      void this.runRolloutAuthorityCheck(sessionId);
+    }, Math.max(0, delayMs));
+    state.rolloutAuthorityDebounce.unref?.();
+  }
+
+  private async runRolloutAuthorityCheck(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    const turnId = state.rolloutAuthorityTurnId ?? state.runningTurnId;
+    if (!turnId) return;
+    if (state.cancelled || state.runningCompact || this.isClosedCodexTurn(state, turnId)) {
+      this.disarmRolloutAuthorityWatch(state);
+      return;
+    }
+    // Shared with the legacy settle poll so only one rollout read runs at a time.
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    try {
+      const evidence = await this.rolloutTailReportsTaskComplete(state, turnId);
+      if (!evidence) return;
+      const latest = this.sessions.get(sessionId);
+      if (!latest) return;
+      if (latest.cancelled || latest.runningCompact || this.isClosedCodexTurn(latest, turnId)) return;
+      // A missing turn/start RPC response can leave startTurn() awaiting forever;
+      // record the terminal turn so a very late response cannot re-run it.
+      if (latest.turnStartInFlight) latest.terminalDuringTurnStartIds.add(turnId);
+      if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
+        latest.currentMessageId = `${turnId}:rollout-task-complete`;
+        latest.currentText = evidence.lastAgentMessage;
+      }
+      logger.warn({
+        provider: this.id,
+        sessionId,
+        ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
+        threadId: latest.threadId,
+        turnId,
+      }, 'Codex rollout task_complete observed via real-time watch; settling turn from authoritative rollout evidence');
+      await this.completeTurn(sessionId, latest, turnId, 'rollout_task_complete');
+    } catch (err) {
+      logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout authority check failed');
+    } finally {
+      const s = this.sessions.get(sessionId);
+      if (s) s.rolloutTaskCompleteCheckInFlight = false;
+    }
+  }
+
+  private disarmRolloutAuthorityWatch(state: CodexSdkSessionState): void {
+    if (state.rolloutAuthorityWatcher) {
+      try { state.rolloutAuthorityWatcher.close(); } catch { /* ignore */ }
+      state.rolloutAuthorityWatcher = undefined;
+    }
+    if (state.rolloutAuthorityDebounce) {
+      clearTimeout(state.rolloutAuthorityDebounce);
+      state.rolloutAuthorityDebounce = undefined;
+    }
+    state.rolloutAuthorityWatchPath = undefined;
+    state.rolloutAuthorityTurnId = undefined;
+  }
+
   private clearChildSubagentRolloutPollTimer(state: CodexSdkSessionState): void {
     if (state.childSubagentRolloutTimer) clearTimeout(state.childSubagentRolloutTimer);
     state.childSubagentRolloutTimer = null;
@@ -3752,6 +3893,7 @@ export class CodexSdkProvider implements TransportProvider {
     const lease = state.activeTurnLease;
     if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
     this.clearRolloutSettlePoll(state);
+    this.disarmRolloutAuthorityWatch(state);
     state.activeTurnLease = undefined;
   }
 
@@ -3795,6 +3937,10 @@ export class CodexSdkProvider implements TransportProvider {
     } else {
       lease.lastWeakActivityAtMs = now;
     }
+    // ROLLOUT-FIRST: attach the authoritative real-time watch before the legacy
+    // heartbeat/poll fallbacks. The watch settles a dropped/absent
+    // `turn/completed` in ~0ms; the poll/heartbeat remain only as belt-and-suspenders.
+    this.armRolloutAuthorityWatch(sessionId, state, options.turnId ?? lease.turnId ?? state.runningTurnId);
     this.scheduleHeartbeat(sessionId, state, lease);
     this.armRolloutSettlePoll(sessionId, state);
   }
