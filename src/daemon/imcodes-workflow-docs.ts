@@ -22,6 +22,9 @@ To target by agent type:
 Use \`imcodes send --list\` to see available sibling sessions.
 
 Notes:
+- Choose targets only from \`imcodes send --list\`. Do not guess raw
+  \`deck_<project>_wN\` names: unlisted legacy workers are hidden compatibility
+  sessions and are not user-visible conversation targets.
 - Messages are delivered via the daemon's hook server. If the target is busy, the message is queued.
 - The \`--files\` flag attaches file references; format depends on the target agent type.
 - Your session identity is auto-detected from $${IMCODES_SESSION_ENV}. SDK/transport sessions also expose

@@ -62,6 +62,32 @@ describe('send-tool', () => {
     expect(result.items[0]).not.toHaveProperty('projectDir');
   });
 
+  it('hides unlabelled legacy project workers from discovery and ordinary sends', async () => {
+    const hiddenWorker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' });
+    const visibleSub = session({
+      name: 'deck_sub_cc1',
+      projectName: 'alpha',
+      role: 'w1',
+      label: 'CC1',
+      parentSession: 'deck_alpha_brain',
+      userCreated: true,
+    });
+    const sessions = [
+      session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+      hiddenWorker,
+      visibleSub,
+    ];
+    const listed = listSendTargets(caller, {}, { listSessions: () => sessions });
+    expect(listed.status).toBe('ok');
+    if (listed.status !== 'ok') throw new Error('expected ok');
+    expect(listed.items.map((item) => item.sessionName)).toEqual(['deck_sub_cc1']);
+
+    await expect(dispatchSendMessage(caller, {
+      target: 'deck_alpha_w1',
+      message: 'must not reach a hidden target',
+    }, { listSessions: () => sessions })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+  });
+
   it('rejects unscoped list and disabled list without target lookup', () => {
     const listSessions = vi.fn(() => []);
 
@@ -265,7 +291,7 @@ describe('send-tool', () => {
     }, {
       listSessions: () => [
         session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
-        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
       ],
       dispatchMessage,
     });
@@ -283,7 +309,7 @@ describe('send-tool', () => {
       files: ['../secret.txt'],
     }, {
       listSessions: () => [
-        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
       ],
       dispatchMessage,
     });
@@ -297,7 +323,7 @@ describe('send-tool', () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
     const deps = {
       now: () => now,
-      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' })],
+      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' })],
       dispatchMessage,
     };
 
@@ -323,8 +349,8 @@ describe('send-tool', () => {
       now: () => now,
       listSessions: () => [
         session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
-        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' }),
-        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder1' }),
+        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2', label: 'Coder2' }),
       ],
       dispatchMessage,
     };
@@ -350,7 +376,7 @@ describe('send-tool', () => {
   it('rejects control-character file references and oversized send inputs', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
     const deps = {
-      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' })],
+      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' })],
       dispatchMessage,
     };
 
@@ -408,8 +434,8 @@ describe('send-tool', () => {
       getSession: (name) => session({ name, projectName: 'alpha', role: 'brain' }),
       listSessions: () => [
         session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
-        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' }),
-        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder1' }),
+        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2', label: 'Coder2' }),
       ],
       dispatchMessage,
     });
@@ -459,7 +485,7 @@ describe('send-tool', () => {
   it('adds callback instructions when reply is requested', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
     await dispatchSendMessage(caller, { target: 'deck_alpha_w1', message: 'do it', reply: true }, {
-      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' })],
+      listSessions: () => [session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' })],
       dispatchMessage,
     });
 

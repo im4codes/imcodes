@@ -5,7 +5,7 @@ import { IMCODES_SEND_MCP_DISPATCH_FEATURE_FLAG } from '../../shared/imcodes-sen
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_CAPS } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
-import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_ERROR_CODES,
@@ -884,6 +884,7 @@ function getSiblingSessions(caller: SendRuntimeCaller, allSessions: SessionRecor
     s.state !== 'stopped'
     && s.name !== caller.sessionName
     && !isExecutionClone(s)
+    && isDiscoverableInterAgentSession(s)
     && effectiveProjectName(s, allSessions) === callerProjectName
   ));
 }

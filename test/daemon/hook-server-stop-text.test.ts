@@ -113,7 +113,7 @@ describe('hook-server /send with "/stop" text', () => {
 
   it('routes surrounding-whitespace "/stop" to the force-stop as well', async () => {
     const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
-    const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1' });
+    const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1', label: 'Coder' });
     getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
     listSessionsMock.mockReturnValue([brain, worker]);
 
@@ -128,7 +128,7 @@ describe('hook-server /send with "/stop" text', () => {
   it('reports not-stoppable without queueing when the priority stop declines', async () => {
     stopSessionNowMock.mockReturnValue(false);
     const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
-    const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1' });
+    const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1', label: 'Coder' });
     getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
     listSessionsMock.mockReturnValue([brain, worker]);
 
@@ -141,7 +141,7 @@ describe('hook-server /send with "/stop" text', () => {
 
   it('keeps messages that merely CONTAIN "/stop" on the ordinary send path', async () => {
     const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
-    const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1' });
+    const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1', label: 'Coder' });
     getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
     listSessionsMock.mockReturnValue([brain, worker]);
 
