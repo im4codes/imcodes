@@ -63,3 +63,4 @@ tmp/
 .imc/
 
 docs/
+dist-node-exe

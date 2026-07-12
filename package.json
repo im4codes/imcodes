@@ -49,7 +49,9 @@
     "trace:daemon": "node scripts/trace-daemon-latency.mjs",
     "prepublishOnly": "npm run build && npm run test:unit && npm run test:server && npm run test:web",
     "prepare": "husky",
-    "bench:memory": "tsx bench/memory-pipeline.bench.ts"
+    "bench:memory": "tsx bench/memory-pipeline.bench.ts",
+    "build:node-exe": "node scripts/build-node-exe.mjs",
+    "check:node-exe-deps": "node scripts/check-node-exe-deps.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.20.0",

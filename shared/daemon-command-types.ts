@@ -5,6 +5,8 @@ export const DAEMON_COMMAND_TYPES = {
   SESSION_EXECUTION_CLONES: 'session.execution_clones',
   SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
   SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
+  /** Server → controlled node: run a one-shot command locally (RemoteExecRequest). */
+  MACHINE_EXEC: 'machine.exec',
 } as const;
 
 export type DaemonCommandType =

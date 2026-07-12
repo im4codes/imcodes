@@ -20,6 +20,8 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { resolvePendingExec, abandonPriorGenerations } from './machine-exec-registry.js';
+import { NODE_ROLE, type NodeRole, type RemoteExecResult } from '../../../shared/remote-exec.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
@@ -1056,6 +1058,10 @@ export class WsBridge {
   private static instances = new Map<string, WsBridge>();
 
   private daemonWs: WebSocket | null = null;
+  /** Bumped on every new daemon connection; binds pending MACHINE_EXEC results to a generation. */
+  private daemonGeneration = 0;
+  /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
+  private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
   private daemonVersion: string | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
@@ -2336,6 +2342,11 @@ export class WsBridge {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
+    // New connection generation: abandon any pending exec bound to a prior
+    // generation (they resolve as indeterminate) so a reconnect never delivers a
+    // stale result to a new waiter (10.6).
+    this.daemonGeneration++;
+    abandonPriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
@@ -2396,10 +2407,10 @@ export class WsBridge {
         this.authPromise = new Promise<void>((res) => { resolveAuth = res; });
 
         const tokenHash = sha256Hex(msg.token);
-        let server: { token_hash: string; user_id?: string } | null = null;
+        let server: { token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null } | null = null;
         try {
-          server = await db.queryOne<{ token_hash: string; user_id?: string }>(
-            'SELECT token_hash, user_id FROM servers WHERE id = $1',
+          server = await db.queryOne<{ token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null }>(
+            'SELECT token_hash, user_id, node_role, revoked_at FROM servers WHERE id = $1',
             [this.serverId],
           );
         } catch (err) {
@@ -2416,6 +2427,19 @@ export class WsBridge {
           return;
         }
 
+        // A revoked credential is denied at the WS entry point too (10.3).
+        if (server.revoked_at != null) {
+          logger.warn({ serverId: this.serverId }, 'Daemon auth rejected: revoked');
+          ws.close(4003, 'revoked');
+          resolveAuth();
+          this.authPromise = null;
+          return;
+        }
+
+        // node_role is authoritative from the DB; any client-declared `nodeRole`
+        // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
+        // presence/heartbeat + MACHINE_EXEC_RESULT surface.
+        this.daemonNodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
@@ -2428,7 +2452,9 @@ export class WsBridge {
         updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
-        if (typeof server.user_id === 'string' && server.user_id.trim()) {
+        // Full-daemon-only traffic (memory feature config) is NOT pushed to a
+        // controlled node — it is a restricted presence/exec-result surface (10.2).
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && typeof server.user_id === 'string' && server.user_id.trim()) {
           try {
             this.sendMemoryFeatureConfigApply(await this.readUserMemoryFeatureFlags(server.user_id));
           } catch (err) {
@@ -2547,6 +2573,14 @@ export class WsBridge {
 
       if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
         this.handleDaemonP2pWorkflowHello(msg);
+        return;
+      }
+
+      // A controlled node's exec result — deliver to the pending relay request,
+      // bound to this connection's (serverId, generation). Unmatched/forged
+      // correlationIds are dropped by the registry (10.6).
+      if (msg.type === DAEMON_MSG.MACHINE_EXEC_RESULT) {
+        resolvePendingExec(this.serverId, this.daemonGeneration, msg as unknown as RemoteExecResult & { correlationId?: string });
         return;
       }
 
@@ -6010,6 +6044,11 @@ export class WsBridge {
 
   sendPreviewControl(message: Record<string, unknown>): void {
     this.sendToDaemon(JSON.stringify(message));
+  }
+
+  /** Current daemon connection generation (binds pending MACHINE_EXEC results). */
+  daemonConnectionGeneration(): number {
+    return this.daemonGeneration;
   }
 
   sendPreviewRequestBodyChunk(requestId: string, payload: Uint8Array): void {
