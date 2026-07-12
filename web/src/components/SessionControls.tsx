@@ -988,6 +988,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  // Queue mutations are overlaid on top of the latest authoritative snapshot.
+  // Keep removals as explicit tombstones: representing a deletion only by
+  // omitting the item from `optimisticQueuedEntries` is insufficient when
+  // another queued item remains, because the render merge starts from the
+  // (temporarily stale) authoritative snapshot and would add the deleted item
+  // straight back. This was visible as "delete does nothing" with 2+ queued
+  // messages even though the daemon and SQLite deletion had succeeded.
+  const [optimisticallyRemovedQueuedIds, setOptimisticallyRemovedQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
@@ -1117,19 +1125,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     // Authoritative override: a message that reached the timeline is delivered,
     // so drop it from the queue even if a stale daemon snapshot still lists it.
-    if (settledQueuedIds.size === 0 && timelineSettledQueuedIds.size === 0) return merged;
+    if (
+      settledQueuedIds.size === 0
+      && timelineSettledQueuedIds.size === 0
+      && optimisticallyRemovedQueuedIds.size === 0
+    ) return merged;
     const filtered = merged.filter((entry) => (
       !settledQueuedIds.has(entry.clientMessageId)
       && !timelineSettledQueuedIds.has(entry.clientMessageId)
+      && !optimisticallyRemovedQueuedIds.has(entry.clientMessageId)
     ));
     return filtered.length === merged.length ? merged : filtered;
-  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds, timelineSettledQueuedIds]);
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, optimisticallyRemovedQueuedIds, settledQueuedIds, timelineSettledQueuedIds]);
 
   // Settled ids and optimistic queue overlays are scoped to the active session.
   // Reset the local overlay on switch; canonical session/app state remains
   // responsible for retaining or clearing authoritative pending entries.
   useEffect(() => {
     setSettledQueuedIds(new Set());
+    setOptimisticallyRemovedQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
     setRealtimeQueueOverride(null);
     lastRealtimeEmptyQueueSnapshotRef.current = null;
@@ -1755,6 +1769,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           entries,
           version: patch.transportPendingMessageVersion,
         });
+        // Once an authoritative snapshot no longer contains an optimistically
+        // removed id, its deletion is fully reconciled and the tombstone can be
+        // discarded. Keep tombstones that are still present in a stale/equal
+        // snapshot so those cards cannot flash back into the UI.
+        const authoritativeIds = new Set(entries.map((entry) => entry.clientMessageId));
+        setOptimisticallyRemovedQueuedIds((prev) => {
+          if (prev.size === 0) return prev;
+          const next = new Set([...prev].filter((id) => authoritativeIds.has(id)));
+          return next.size === prev.size ? prev : next;
+        });
         if (entries.length === 0) {
           lastRealtimeEmptyQueueSnapshotRef.current = {
             sessionName: snapshotSessionName,
@@ -1819,6 +1843,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         if (msg.status === 'error' || msg.status === 'conflict') {
           if (rollback) {
+            if (rollback.type === 'undo') {
+              setOptimisticallyRemovedQueuedIds((prev) => {
+                if (!prev.has(rollback.entry.clientMessageId)) return prev;
+                const next = new Set(prev);
+                next.delete(rollback.entry.clientMessageId);
+                return next;
+              });
+            }
             setOptimisticQueuedEntries((prev) => {
               const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
               if (rollback.type === 'edit') {
@@ -3416,6 +3448,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     if (!mutationCommandId) return;
     queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
+    setOptimisticallyRemovedQueuedIds((prev) => {
+      if (prev.has(entry.clientMessageId)) return prev;
+      return new Set([...prev, entry.clientMessageId]);
+    });
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? incomingQueuedTransportEntries;
       return source.filter((item) => item.clientMessageId !== entry.clientMessageId);

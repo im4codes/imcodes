@@ -4349,6 +4349,79 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
+  it('keeps a deleted item hidden while a stale multi-item queue snapshot remains', () => {
+    const ws = makeWs();
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['same queued text', 'same queued text'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: 'same queued text' },
+        { clientMessageId: 'msg-2', text: 'same queued text' },
+      ],
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getAllByText('same queued text')).toHaveLength(2);
+    fireEvent.click(screen.getAllByRole('button', { name: /delete/i })[0]);
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.undo_queued_message',
+      sessionName: 'qwen-session',
+      clientMessageId: 'msg-1',
+      commandId: expect.any(String),
+    }));
+    // The parent session snapshot still contains both ids until the daemon's
+    // deletion event arrives. The local tombstone must prevent msg-1 from being
+    // merged straight back, which previously made Delete appear to do nothing.
+    expect(screen.getAllByText('same queued text')).toHaveLength(1);
+  });
+
+  it('restores a tombstoned queue item when deletion is rejected', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'first queued text' },
+            { clientMessageId: 'msg-2', text: 'second queued text' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: /delete/i })[0]);
+    expect(screen.queryByText('first queued text')).toBeNull();
+    const mutation = ws.send.mock.calls.at(-1)?.[0] as { commandId: string };
+
+    await act(async () => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: mutation.commandId,
+        status: 'error',
+        error: 'Queued message not found',
+      });
+    });
+
+    expect(screen.getByText('first queued text')).toBeDefined();
+    expect(screen.getByText('second queued text')).toBeDefined();
+  });
+
   it('pressing Escape in a focused running transport input sends direct cancel', () => {
     const ws = makeWs();
     render(
