@@ -854,15 +854,35 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const canContinue = projection?.visibility === 'full' && projection.canContinue === true && !active;
   const now = useNowTicker(active);
   const elapsed = projection ? formatElapsed(projectionElapsedMs(projection, now)) : '00:00';
-  const finalScoreItems = useMemo(() => (
-    projection?.finalAfterRepair?.moduleScores
-    ?? (!projection?.auditBeforeRepair ? projection?.moduleScores ?? [] : [])
-  ), [projection?.auditBeforeRepair, projection?.finalAfterRepair, projection?.moduleScores]);
+  // `implementation` in a SPEC acceptance audit means artifact
+  // implementation-readiness, not completed product implementation. Only a
+  // final implementation-stage snapshot may populate the Final Impl card.
+  // Likewise, transient `moduleScores` are never final acceptance evidence.
+  const finalScoreItems = useMemo(
+    () => projection?.finalAfterRepair?.moduleScores ?? [],
+    [projection?.finalAfterRepair],
+  );
   const preRepairScoreItems = useMemo(() => projection?.auditBeforeRepair?.moduleScores ?? [], [projection?.auditBeforeRepair]);
   const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
   const progress = projection ? computeOpenSpecAutoDeliverProgress(projection) : null;
   const finalSpecScore = useMemo(() => findScoreByModule(finalScoreItems, ['spec']), [finalScoreItems]);
-  const finalImplementationScore = useMemo(() => findScoreByModule(finalScoreItems, ['implementation', 'impl', 'code']), [finalScoreItems]);
+  const finalImplementationScore = useMemo(() => (
+    projection?.finalAfterRepair?.stage === 'implementation_audit_repair'
+      ? findScoreByModule(finalScoreItems, ['implementation', 'impl', 'code'])
+      : undefined
+  ), [finalScoreItems, projection?.finalAfterRepair?.stage]);
+  const displayedVerdict = useMemo(() => {
+    const implementationPhase = (projection?.implementationPromptCount ?? 0) > 0
+      || stage === 'implementation_task_loop'
+      || stage === 'implementation_audit_repair'
+      || stage === 'commit_push'
+      || stage === 'passed';
+    if (!implementationPhase) return projection?.latestVerdict;
+    return [...auditResults]
+      .reverse()
+      .find((result) => result.stage === 'implementation_audit_repair')
+      ?.verdict;
+  }, [auditResults, projection?.implementationPromptCount, projection?.latestVerdict, stage]);
   const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
   const repairingFromAudit = stage === 'implementation_task_loop'
     && projection?.recentFinding?.startsWith('implementation_repair_prompt_dispatched:');
@@ -971,7 +991,7 @@ export function OpenSpecAutoDeliverDetailsPanel({
           <DetailRow label={t('openspec.auto.active_p2p')} value={projection.activeP2pRunId} />
           <DetailRow label={t('openspec.auto.combo_id')} value={projection.selectedTeamComboId ? comboModeLabel(projection.selectedTeamComboId, t) : undefined} />
           <DetailRow label={t('openspec.auto.active_prompt')} value={projection.activeOpenSpecPromptId} />
-          <DetailRow label={t('openspec.auto.verdict')} value={projection.latestVerdict} />
+          <DetailRow label={t('openspec.auto.verdict')} value={displayedVerdict} />
           {projection.visibility === 'conflict' && (
             <DetailRow label={t('openspec.auto.conflict_summary')} value={translateAutoDeliverReason(projection.conflictReason, t)} />
           )}
