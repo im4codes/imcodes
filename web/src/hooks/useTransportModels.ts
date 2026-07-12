@@ -37,6 +37,7 @@ export function useTransportModels(
 ): TransportModelState & { refresh: () => void } {
   const [state, setState] = useState<TransportModelState>({ models: [], loading: false });
   const pendingRequestId = useRef<string | null>(null);
+  const catalogAgentType = useRef<string | undefined | null>(agentType);
   const wsConnected = !!ws?.connected;
 
   const fetchModels = useCallback(
@@ -47,10 +48,14 @@ export function useTransportModels(
       }
       const requestId = `models-${Math.random().toString(36).slice(2)}-${Date.now()}`;
       pendingRequestId.current = requestId;
-      // A picker can switch providers while the previous provider's response is
-      // still rendered. Clear that catalog immediately so Claude defaults such
-      // as `fable` cannot leak into a newly selected Codex session.
-      setState({ models: [], loading: true });
+      // Clear only when the picker actually changes provider. Reconnects and
+      // repeated refreshes for the same provider keep the last good catalog
+      // visible until its replacement arrives.
+      const providerChanged = catalogAgentType.current !== agentType;
+      catalogAgentType.current = agentType;
+      setState((prev) => providerChanged
+        ? { models: [], loading: true }
+        : { ...prev, loading: true, error: undefined });
       try {
         ws.send({
           type: 'transport.list_models',
@@ -74,6 +79,7 @@ export function useTransportModels(
     if (!supportsDynamicTransportModels(agentType)) {
       setState({ models: [], loading: false });
       pendingRequestId.current = null;
+      catalogAgentType.current = agentType;
       return;
     }
 

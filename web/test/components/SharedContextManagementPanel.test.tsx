@@ -436,7 +436,7 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'gpt-5.4',
+      primaryContextModel: 'gpt-5.6',
       primaryContextPreset: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
