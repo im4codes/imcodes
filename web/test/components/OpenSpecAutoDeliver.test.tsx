@@ -276,6 +276,46 @@ describe('OpenSpecAutoDeliver components', () => {
     expect(document.body.textContent).not.toContain('VerdictPASS');
   });
 
+  it('preserves the accepted spec score after implementation repair clears the shared final snapshot', () => {
+    const projection = specAuditProjection();
+    projection.status = 'implementation_task_loop';
+    projection.stage = 'implementation_task_loop';
+    projection.specAuditRound = { current: 1, total: 1 };
+    projection.implementationAuditRound = { current: 0, total: 2 };
+    projection.implementationPromptCount = 1;
+    projection.finalAfterRepair = undefined;
+    projection.auditResults = [{
+      stage: 'spec_audit_repair',
+      roundIndex: 1,
+      attemptId: 'accepted-spec',
+      generation: 1,
+      verdict: 'PASS',
+      moduleScores: [
+        { module: 'spec', score: 9, max_score: 10, summary: 'Spec accepted.' },
+        { module: 'implementation', score: 8, max_score: 10, summary: 'Artifact implementation-ready.' },
+      ],
+      uncheckedTasks: [],
+      requiredChanges: [],
+      repairSummaries: [],
+      evidence: [],
+      completedAt: 123,
+    }];
+
+    render(
+      <OpenSpecAutoDeliverDetailsPanel
+        projection={projection}
+        onClose={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+
+    const hero = screen.getByTestId('openspec-auto-hero');
+    expect(hero.textContent).toContain('Final Spec9/10');
+    expect(hero.textContent).toContain('Final Impl—');
+    expect(document.body.textContent).toContain('Spec accepted.');
+    expect(document.body.textContent).not.toContain('Final Impl8/10');
+  });
+
   it('separates pre-repair audit scores from pending final acceptance scores', () => {
     const projection: OpenSpecAutoDeliverProjection = {
       visibility: 'full',

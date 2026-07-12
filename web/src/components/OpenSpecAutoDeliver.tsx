@@ -865,24 +865,38 @@ export function OpenSpecAutoDeliverDetailsPanel({
   const preRepairScoreItems = useMemo(() => projection?.auditBeforeRepair?.moduleScores ?? [], [projection?.auditBeforeRepair]);
   const auditResults = useMemo(() => projection?.auditResults ?? [], [projection?.auditResults]);
   const progress = projection ? computeOpenSpecAutoDeliverProgress(projection) : null;
-  const finalSpecScore = useMemo(() => findScoreByModule(finalScoreItems, ['spec']), [finalScoreItems]);
+  const implementationHasStarted = (projection?.implementationPromptCount ?? 0) > 0
+    || stage === 'implementation_task_loop'
+    || stage === 'implementation_audit_repair'
+    || stage === 'commit_push'
+    || stage === 'passed';
+  const acceptedSpecScore = useMemo(() => {
+    const currentSnapshotScore = findScoreByModule(finalScoreItems, ['spec']);
+    if (currentSnapshotScore) return currentSnapshotScore;
+    if (!implementationHasStarted) return undefined;
+    const latestAcceptedSpecAudit = [...auditResults]
+      .reverse()
+      .find((result) => result.stage === 'spec_audit_repair' && result.verdict === 'PASS');
+    return findScoreByModule(latestAcceptedSpecAudit?.moduleScores ?? [], ['spec']);
+  }, [auditResults, finalScoreItems, implementationHasStarted]);
+  const displayedFinalScoreItems = useMemo(() => (
+    finalScoreItems.length > 0
+      ? finalScoreItems
+      : acceptedSpecScore ? [acceptedSpecScore] : []
+  ), [acceptedSpecScore, finalScoreItems]);
+  const finalSpecScore = acceptedSpecScore;
   const finalImplementationScore = useMemo(() => (
     projection?.finalAfterRepair?.stage === 'implementation_audit_repair'
       ? findScoreByModule(finalScoreItems, ['implementation', 'impl', 'code'])
       : undefined
   ), [finalScoreItems, projection?.finalAfterRepair?.stage]);
   const displayedVerdict = useMemo(() => {
-    const implementationPhase = (projection?.implementationPromptCount ?? 0) > 0
-      || stage === 'implementation_task_loop'
-      || stage === 'implementation_audit_repair'
-      || stage === 'commit_push'
-      || stage === 'passed';
-    if (!implementationPhase) return projection?.latestVerdict;
+    if (!implementationHasStarted) return projection?.latestVerdict;
     return [...auditResults]
       .reverse()
       .find((result) => result.stage === 'implementation_audit_repair')
       ?.verdict;
-  }, [auditResults, projection?.implementationPromptCount, projection?.latestVerdict, stage]);
+  }, [auditResults, implementationHasStarted, projection?.latestVerdict]);
   const latestMessage = translateAutoDeliverMessage(projection?.recentFinding, t);
   const repairingFromAudit = stage === 'implementation_task_loop'
     && projection?.recentFinding?.startsWith('implementation_repair_prompt_dispatched:');
@@ -1048,10 +1062,10 @@ export function OpenSpecAutoDeliverDetailsPanel({
           {repairingFromAudit && preRepairScoreItems.length > 0 && (
             <div class="openspec-auto-detail-note">{t('openspec.auto.scores_pending_repair_rescore')}</div>
           )}
-          {finalScoreItems.length === 0 ? (
+          {displayedFinalScoreItems.length === 0 ? (
             <div class="openspec-auto-detail-note">{t('openspec.auto.scores_empty')}</div>
           ) : (
-            <ScoreGrid scores={finalScoreItems} t={t} keyPrefix="final-after-repair" />
+            <ScoreGrid scores={displayedFinalScoreItems} t={t} keyPrefix="final-after-repair" />
           )}
         </div>
         {(projection.latestRepairSummary || projection.evidence?.length) && (
