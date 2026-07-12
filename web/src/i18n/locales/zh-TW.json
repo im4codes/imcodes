@@ -34,6 +34,23 @@
       "generic": "發生錯誤，請重試。"
     }
   },
+  "machine": {
+    "feature_label": "機器",
+    "category": "機器",
+    "category_desc": "插入目標機器標記",
+    "empty": "尚無可用機器",
+    "empty_hint": "註冊一個受控節點後，即可用 ^^(名稱) 標記向其傳送命令。",
+    "usage_hint": "點按機器即可插入其 ^^(名稱) 標記。在輸入框中輸入 ^ 可自動完成。離線機器無法選擇。",
+    "no_results": "沒有符合的機器",
+    "search_placeholder": "搜尋機器",
+    "online": "在線",
+    "offline": "離線",
+    "offline_hint": "離線 — 無法選擇",
+    "error": {
+      "list_unavailable": "機器清單仍在載入或載入失敗，請稍後重試。",
+      "machine_unresolved_failclosed": "無法解析該機器，未傳送。"
+    }
+  },
   "common": {
     "cancel": "取消",
     "confirm": "確認",

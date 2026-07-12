@@ -21,7 +21,7 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
 }
 
 describe('memory MCP shared contracts', () => {
-  it('exposes the registered MCP tool names including the execution-clone destroy tool', () => {
+  it('exposes the registered MCP tool names including the execution-clone destroy + machine tools', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
       'list_memory_summaries',
@@ -44,6 +44,9 @@ describe('memory MCP shared contracts', () => {
       'cron_list',
       'cron_update',
       'cron_delete',
+      // Machine remote-exec surface — FULL-only (controlled-node-remote-exec 10.12).
+      'list_machines',
+      'exec_remote',
     ]);
     expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
   });

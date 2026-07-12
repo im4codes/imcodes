@@ -34,6 +34,23 @@
       "generic": "出错了，请重试。"
     }
   },
+  "machine": {
+    "feature_label": "机器",
+    "category": "机器",
+    "category_desc": "插入目标机器标记",
+    "empty": "暂无可用机器",
+    "empty_hint": "注册一个被控节点后，即可用 ^^(名称) 标记向其发送命令。",
+    "usage_hint": "点按机器即可插入其 ^^(名称) 标记。在输入框中输入 ^ 可自动补全。离线机器无法选择。",
+    "no_results": "没有匹配的机器",
+    "search_placeholder": "搜索机器",
+    "online": "在线",
+    "offline": "离线",
+    "offline_hint": "离线 — 无法选择",
+    "error": {
+      "list_unavailable": "机器列表仍在加载或加载失败，请稍后重试。",
+      "machine_unresolved_failclosed": "无法解析该机器，未发送。"
+    }
+  },
   "common": {
     "cancel": "取消",
     "confirm": "确认",

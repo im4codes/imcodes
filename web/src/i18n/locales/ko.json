@@ -34,6 +34,23 @@
       "generic": "문제가 발생했습니다. 다시 시도해 주세요."
     }
   },
+  "machine": {
+    "feature_label": "머신",
+    "category": "머신",
+    "category_desc": "대상 머신 마커 삽입",
+    "empty": "사용 가능한 머신이 없습니다",
+    "empty_hint": "제어 대상 노드를 등록하면 ^^(이름) 마커로 명령을 보낼 수 있습니다.",
+    "usage_hint": "머신을 탭하면 ^^(이름) 마커가 삽입됩니다. 입력창에 ^ 를 입력하면 자동 완성됩니다. 오프라인 머신은 선택할 수 없습니다.",
+    "no_results": "검색과 일치하는 머신이 없습니다",
+    "search_placeholder": "머신 검색",
+    "online": "온라인",
+    "offline": "오프라인",
+    "offline_hint": "오프라인 — 선택할 수 없음",
+    "error": {
+      "list_unavailable": "머신을 아직 불러오는 중이거나 불러오지 못했습니다. 잠시 후 다시 시도하세요.",
+      "machine_unresolved_failclosed": "이 머신을 확인할 수 없어 전송되지 않았습니다."
+    }
+  },
   "common": {
     "cancel": "취소",
     "confirm": "확인",

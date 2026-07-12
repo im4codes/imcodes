@@ -16,6 +16,9 @@ export const MACHINE_NAME_PATTERN = /^[\p{L}\p{N}._-]{1,40}$/u;
 export const MACHINE_REF_NAME_MAX = 40;
 export const MACHINE_DISPLAY_NAME_MAX = 120;
 
+/** Owner-scoped controllable-machine list endpoint (DB-backed presence, F1). */
+export const MACHINE_API_PATH = '/api/machines';
+
 /** Reason codes for machine reference resolution + exec targeting. */
 export const MACHINE_REASONS = {
   INVALID_NAME: 'machine_invalid_name',

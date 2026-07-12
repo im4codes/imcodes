@@ -1,0 +1,66 @@
+import { describe, it, expect, vi } from 'vitest';
+import type { ContextNamespace } from '../../shared/context-types.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { createMemoryMcpToolHandlers, type MachineToolDeps } from '../../src/daemon/memory-mcp-tools.js';
+import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+
+function caller(): McpRuntimeCaller {
+  const namespace: ContextNamespace = { scope: 'user_private', userId: 'user-1', projectId: 'repo-1' };
+  return { userId: 'user-1', namespace, sessionName: 'deck_proj_brain', projectName: 'proj', projectRoot: '/tmp/proj', serverId: 'srv-1', transport: 'in_process' };
+}
+
+const listMachines = MEMORY_MCP_TOOL_NAMES.LIST_MACHINES;
+const execRemote = MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE;
+
+describe('exec_remote / list_machines handlers (10.12)', () => {
+  it('returns feature_disabled when the node cannot control machines (no machineDeps)', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller(), {});
+    expect(await handlers[execRemote]({ machine: 'm', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+    expect(await handlers[listMachines]({})).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+  });
+
+  it('validates required + typed fields before dispatching', async () => {
+    const machineDeps: MachineToolDeps = { listMachines: async () => [], execRemote: vi.fn(async () => ({ outcome: 'completed' as const })) };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    expect(await handlers[execRemote]({ command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: 'm' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: 'm', command: 'x', shell: 'zsh' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: 'm', command: 'x', timeoutMs: -5 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: 'm', command: 'x', timeoutMs: 999_999_999 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(machineDeps.execRemote).not.toHaveBeenCalled();
+  });
+
+  it('maps a typed reason from the dep to a shared MCP error (offline is not a command failure)', async () => {
+    const machineDeps: MachineToolDeps = {
+      listMachines: async () => [],
+      execRemote: async () => ({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: 'machine "m" is offline' }),
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    const r = await handlers[execRemote]({ machine: 'm', command: 'x' });
+    expect(r).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+  });
+
+  it('passes a completed outcome through untouched (discriminated union preserved)', async () => {
+    const machineDeps: MachineToolDeps = {
+      listMachines: async () => [],
+      execRemote: async ({ machine, command, shell, timeoutMs }) => {
+        expect({ machine, command, shell, timeoutMs }).toEqual({ machine: 'win', command: 'echo hi', shell: 'powershell', timeoutMs: 5000 });
+        return { outcome: 'completed', ok: true, exitCode: 0, stdout: 'hi', durationMs: 12 };
+      },
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    const r = await handlers[execRemote]({ machine: 'win', command: 'echo hi', shell: 'powershell', timeoutMs: 5000 });
+    expect(r).toMatchObject({ status: 'ok', outcome: 'completed', ok: true, exitCode: 0, stdout: 'hi' });
+  });
+
+  it('list_machines returns the machines from the dep', async () => {
+    const machineDeps: MachineToolDeps = {
+      listMachines: async ({ includeOffline }) => (includeOffline ? [{ name: 'a', online: true, execEnabled: true }, { name: 'b', online: false, execEnabled: true }] : [{ name: 'a', online: true, execEnabled: true }]),
+      execRemote: async () => ({ outcome: 'completed' as const }),
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    expect(await handlers[listMachines]({})).toMatchObject({ status: 'ok', machines: [{ name: 'a' }] });
+    expect(await handlers[listMachines]({ includeOffline: true })).toMatchObject({ status: 'ok', machines: [{ name: 'a' }, { name: 'b' }] });
+  });
+});

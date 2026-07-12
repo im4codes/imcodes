@@ -34,6 +34,23 @@
       "generic": "Algo salió mal. Inténtalo de nuevo."
     }
   },
+  "machine": {
+    "feature_label": "Máquina",
+    "category": "Máquina",
+    "category_desc": "Insertar un marcador de máquina de destino",
+    "empty": "No hay máquinas disponibles",
+    "empty_hint": "Registra un nodo controlado para enviarle comandos con un marcador ^^(nombre).",
+    "usage_hint": "Toca una máquina para insertar su marcador ^^(nombre). Escribe ^ en el redactor para autocompletar. Las máquinas sin conexión no se pueden seleccionar.",
+    "no_results": "Ninguna máquina coincide con tu búsqueda",
+    "search_placeholder": "Buscar máquinas",
+    "online": "En línea",
+    "offline": "Sin conexión",
+    "offline_hint": "Sin conexión — no se puede seleccionar",
+    "error": {
+      "list_unavailable": "Las máquinas aún se están cargando o no se pudieron cargar. Inténtalo de nuevo en un momento.",
+      "machine_unresolved_failclosed": "No se pudo resolver esta máquina y no se envió."
+    }
+  },
   "common": {
     "cancel": "Cancelar",
     "confirm": "Confirmar",

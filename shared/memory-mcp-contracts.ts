@@ -4,6 +4,15 @@ import { MCP_FEATURE_FLAGS_BY_NAME } from './memory-mcp-feature-flags.js';
 import { MEMORY_MCP_SOURCE_FIELDS } from './memory-mcp-provenance.js';
 import { PREFERENCE_MAX_BYTES } from './preference-ingest.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES } from './execution-clone.js';
+import {
+  NODE_ROLE,
+  type NodeRole,
+  REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_DEFAULT_TIMEOUT_MS,
+  REMOTE_EXEC_MAX_TIMEOUT_MS,
+  REMOTE_EXEC_MAX_COMMAND_BYTES,
+  REMOTE_EXEC_OUTCOMES,
+} from './remote-exec.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -27,6 +36,9 @@ export const MEMORY_MCP_TOOL_NAMES = {
   CRON_LIST: 'cron_list',
   CRON_UPDATE: 'cron_update',
   CRON_DELETE: 'cron_delete',
+  // Machine remote-exec surface — FULL-only (see FULL_ONLY_MCP_TOOLS).
+  LIST_MACHINES: 'list_machines',
+  EXEC_REMOTE: 'exec_remote',
 } as const;
 
 export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMORY_MCP_TOOL_NAMES];
@@ -53,7 +65,30 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.CRON_LIST,
   MEMORY_MCP_TOOL_NAMES.CRON_UPDATE,
   MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
+  MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+  MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
 ] as const satisfies readonly MemoryMcpToolName[];
+
+/**
+ * Tools available ONLY to FULL nodes. A controlled node never advertises these
+ * (and structurally never even starts the memory MCP server) — the explicit gate
+ * here is the shared role check the spec requires (10.12).
+ */
+export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
+  MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+  MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+]);
+
+/** Whether a tool is available to a node of the given role. */
+export function isToolAvailableForRole(name: MemoryMcpToolName, role: NodeRole): boolean {
+  if (role === NODE_ROLE.CONTROLLED && FULL_ONLY_MCP_TOOLS.has(name)) return false;
+  return true;
+}
+
+/** The advertised tool-name list for a node of the given role (controlled excludes FULL-only tools). */
+export function advertisedMcpToolNames(role: NodeRole): readonly MemoryMcpToolName[] {
+  return MEMORY_MCP_TOOL_NAME_LIST.filter((name) => isToolAvailableForRole(name, role));
+}
 
 export const MEMORY_MCP_CAPS = {
   SEARCH_MEMORY_DEFAULT_LIMIT: 20,
@@ -411,6 +446,54 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       id: stringSchema('Job id.'),
     }, ['id']),
     outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: {
+    name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+    description:
+      'List the controllable machines (controlled nodes) enrolled by the caller-bound account, with DB-backed online/offline presence. Use the returned `name` (ref_name) as the target for exec_remote. Offline machines are excluded unless includeOffline is set. FULL nodes only.',
+    inputSchema: objectSchema({
+      includeOffline: booleanSchema('Include offline machines in the result (default false — the agent-facing list excludes offline).'),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('ok, disabled, or error.'),
+      reason: stringSchema('Optional machine-readable reason when status is not ok.'),
+      machines: {
+        type: 'array',
+        description: 'Controllable machines for the account.',
+        items: objectSchema({
+          name: stringSchema('Unique server-derived ref_name — the key for exec_remote and ^^(name) markers.'),
+          displayName: stringSchema('Render-only display name (sanitized).'),
+          os: stringSchema('Declared OS (advisory only).'),
+          online: booleanSchema('DB-backed presence: whether the node is currently connected.'),
+          execEnabled: booleanSchema('Whether remote exec is enabled for this machine.'),
+        }, ['name', 'online']),
+      },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
+    name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+    description:
+      `Run a single one-shot shell command on a controllable machine and return its output. Address the target by its list_machines \`name\` (ref_name). The outcome is a discriminated union (${REMOTE_EXEC_OUTCOMES.join(' | ')}): 'not_dispatched' means the command did NOT run (offline/denied, retry-safe), 'dispatched_no_result' means it MAY have run (indeterminate — do not auto-retry non-idempotent commands). Offline/unknown/ambiguous targets return a typed reason, never a hang. FULL nodes only.`,
+    inputSchema: objectSchema({
+      machine: stringSchema('Target machine ref_name from list_machines.'),
+      command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
+      shell: stringSchema(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`, { enum: [...REMOTE_EXEC_SHELLS] }),
+      timeoutMs: numberSchema(`Optional timeout in ms; defaults to ${REMOTE_EXEC_DEFAULT_TIMEOUT_MS}, clamped to ${REMOTE_EXEC_MAX_TIMEOUT_MS}.`, { minimum: 1, maximum: REMOTE_EXEC_MAX_TIMEOUT_MS }),
+      idempotencyKey: stringSchema('Optional key that is stable across a relay retransmit of the same request.'),
+    }, ['machine', 'command']),
+    outputSchema: objectSchema({
+      status: stringSchema('ok, disabled, or error.'),
+      reason: stringSchema('Optional machine-readable reason when status is not ok.'),
+      outcome: stringSchema(`Discriminated outcome: ${REMOTE_EXEC_OUTCOMES.join(' | ')}.`, { enum: [...REMOTE_EXEC_OUTCOMES] }),
+      ok: booleanSchema('True when the command ran and exited 0.'),
+      exitCode: numberSchema('Process exit code when the command ran.'),
+      stdout: stringSchema('Captured stdout (may be truncated).'),
+      stderr: stringSchema('Captured stderr (may be truncated).'),
+      timedOut: booleanSchema('True when the command hit its timeout and was killed.'),
+      truncated: booleanSchema('True when output hit the byte cap and was cut.'),
+      durationMs: numberSchema('Wall-clock duration of the command in ms.'),
+      error: stringSchema('Optional error detail when the command did not complete normally.'),
+    }),
   },
 };
 

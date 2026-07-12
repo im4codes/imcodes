@@ -18,9 +18,18 @@ import {
   buildMcpErrorResult,
   MEMORY_MCP_CAPS,
   pickAllowedMcpArgs,
+  advertisedMcpToolNames,
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import {
+  NODE_ROLE,
+  REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_MAX_TIMEOUT_MS,
+  type NodeRole,
+  type RemoteExecShell,
+  type RemoteExecOutcome,
+} from '../../shared/remote-exec.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -116,6 +125,55 @@ export interface MemoryMcpToolDeps {
   cronUpdate?: typeof cronMcpUpdate;
   cronDelete?: typeof cronMcpDelete;
   cronList?: typeof cronMcpList;
+  /**
+   * Machine remote-exec tools (list_machines / exec_remote). Absent on a node
+   * that cannot control machines — the handlers then return a typed
+   * feature-disabled error rather than throwing. The production default is
+   * wired in `mergeDefaultToolDeps` (relays via the daemon's own credential).
+   */
+  machineDeps?: MachineToolDeps;
+  /**
+   * The node's own role. Only FULL nodes advertise the machine tools; a
+   * controlled node excludes them from its tool surface (10.12). Defaults to
+   * FULL — a controlled node structurally never starts this MCP server anyway,
+   * so this is the explicit belt-and-suspenders gate the spec requires.
+   */
+  nodeRole?: NodeRole;
+}
+
+/** One machine in the `list_machines` result (agent-facing, ref_name-keyed). */
+export interface MachineSummaryForTool {
+  name: string;
+  displayName?: string;
+  os?: string;
+  online: boolean;
+  execEnabled: boolean;
+}
+
+/** The end-to-end outcome of `exec_remote`, preserving the discriminated union. */
+export interface MachineExecToolResult {
+  outcome: RemoteExecOutcome;
+  ok?: boolean;
+  exitCode?: number | null;
+  stdout?: string;
+  stderr?: string;
+  timedOut?: boolean;
+  truncated?: boolean;
+  durationMs?: number;
+  error?: string;
+  /** Set when the target is unusable — surfaced as a typed shared MCP error reason. */
+  reason?: MCPErrorReason;
+}
+
+export interface MachineToolDeps {
+  listMachines: (input: { includeOffline?: boolean }) => Promise<MachineSummaryForTool[]> | MachineSummaryForTool[];
+  execRemote: (input: {
+    machine: string;
+    command: string;
+    shell?: RemoteExecShell;
+    timeoutMs?: number;
+    idempotencyKey?: string;
+  }) => Promise<MachineExecToolResult> | MachineExecToolResult;
 }
 
 function readBooleanEnv(value: string | undefined): boolean | undefined {
@@ -1038,6 +1096,41 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if ('status' in cronOptions) return cronOptions;
       return cronDelete(id, cronOptions) as unknown as Promise<ToolResult>;
     },
+    [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: async (input) => {
+      if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['includeOffline']);
+      const includeOffline = boolArg(args, 'includeOffline') ?? false;
+      const machines = await deps.machineDeps.listMachines({ includeOffline });
+      return { status: 'ok', machines };
+    },
+    [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: async (input) => {
+      if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs', 'idempotencyKey']);
+      const machine = stringArg(args, 'machine');
+      const command = stringArg(args, 'command');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine is required');
+      if (!command) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command is required');
+      const shellRaw = stringArg(args, 'shell');
+      if (shellRaw && !(REMOTE_EXEC_SHELLS as readonly string[]).includes(shellRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `shell must be one of ${REMOTE_EXEC_SHELLS.join(', ')}`);
+      }
+      const timeoutMs = numberArg(args, 'timeoutMs');
+      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > REMOTE_EXEC_MAX_TIMEOUT_MS)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [1, ${REMOTE_EXEC_MAX_TIMEOUT_MS}]`);
+      }
+      const idempotencyKey = stringArg(args, 'idempotencyKey');
+      const result = await deps.machineDeps.execRemote({
+        machine,
+        command,
+        ...(shellRaw ? { shell: shellRaw as RemoteExecShell } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      });
+      // A typed reason means the target was unusable (offline/unknown/ambiguous/
+      // disabled) — surface it as a shared MCP error, never an ad-hoc string.
+      if (result.reason) return error(result.reason, result.error);
+      return { status: 'ok', ...result };
+    },
   });
 }
 
@@ -1186,15 +1279,28 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
     id: z.string().describe('Cron job id to delete.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.object({
+    includeOffline: z.boolean().optional().describe('Include offline machines in the result (default false — the agent-facing list excludes offline).'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.object({
+    machine: z.string().describe('Target machine ref_name from list_machines.'),
+    command: z.string().describe('Command to run on the target machine.'),
+    shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`),
+    timeoutMs: z.number().int().min(1).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe(`Optional timeout in ms, clamped to ${REMOTE_EXEC_MAX_TIMEOUT_MS}.`),
+    idempotencyKey: z.string().optional().describe('Optional key stable across a relay retransmit of the same request.'),
+  }),
 } as const;
 
-export function listMemoryMcpToolDescriptors() {
-  return MEMORY_MCP_TOOL_NAME_LIST.map((name) => MEMORY_MCP_TOOL_CONTRACTS[name]);
+/** Descriptors advertised for a node of the given role (controlled excludes FULL-only tools). */
+export function listMemoryMcpToolDescriptors(role: NodeRole = NODE_ROLE.FULL) {
+  return advertisedMcpToolNames(role).map((name) => MEMORY_MCP_TOOL_CONTRACTS[name]);
 }
 
 export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): void {
   const handlers = createMemoryMcpToolHandlers(caller, deps);
-  for (const name of MEMORY_MCP_TOOL_NAME_LIST) {
+  // Role-gate the advertised surface: a controlled node never registers the
+  // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).
+  for (const name of advertisedMcpToolNames(deps.nodeRole ?? NODE_ROLE.FULL)) {
     const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
     server.registerTool(name, {
       title: name,

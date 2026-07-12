@@ -1,0 +1,60 @@
+import { describe, it, expect, vi } from 'vitest';
+import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+
+const creds = { serverUrl: 'https://relay.example', serverId: 's1', token: 't1' };
+type ClientMachine = { serverId: string; name: string; refName: string; displayName: string; os?: string; online: boolean; nodeRole: 'controlled'; execEnabled: boolean };
+const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
+
+describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', () => {
+  it('returns [] and a feature_disabled exec when the daemon is unbound', async () => {
+    const deps = createDaemonMachineToolDeps({ loadCredential: async () => null });
+    expect(await deps.listMachines({})).toEqual([]);
+    expect(await deps.execRemote({ machine: 'a', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+  });
+
+  it('maps client machines to ref_name-keyed summaries', async () => {
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [m({ serverId: 'srvA', refName: 'mac-a1b2', displayName: 'My Mac', os: 'darwin' })],
+      execRemote: async () => ({ outcome: 'completed' }),
+    });
+    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: 'mac-a1b2', displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true }]);
+  });
+
+  it('unknown ref_name → machine_not_found (never a silent retarget)', async () => {
+    const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'other' })], execRemote: async () => ({ outcome: 'completed' }) });
+    expect(await deps.execRemote({ machine: 'missing', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+  });
+
+  it('duplicate ref_name → machine_ambiguous', async () => {
+    const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ serverId: 'a', refName: 'dup' }), m({ serverId: 'b', refName: 'dup' })], execRemote: async () => ({ outcome: 'completed' }) });
+    expect(await deps.execRemote({ machine: 'dup', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS });
+  });
+
+  it('exec-disabled target → exec_disabled (before dispatch)', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'off', execEnabled: false })], execRemote: exec });
+    expect(await deps.execRemote({ machine: 'off', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('offline target → exec_offline (retry-safe, not confused with a command failure)', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'sleepy', online: false })], execRemote: exec });
+    expect(await deps.execRemote({ machine: 'sleepy', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('resolves ref_name → serverId and forwards to the client, preserving the outcome', async () => {
+    const exec = vi.fn(async (opts: { targetServerId: string; command: string }) => ({ outcome: 'completed' as const, ok: true, exitCode: 0, stdout: `ran:${opts.command}@${opts.targetServerId}` }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [m({ serverId: 'srv-win', refName: 'win-1' })],
+      execRemote: exec as never,
+    });
+    const r = await deps.execRemote({ machine: 'win-1', command: 'whoami', shell: 'powershell', timeoutMs: 3000 });
+    expect(exec).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', command: 'whoami', shell: 'powershell', timeoutMs: 3000, sourceServerId: 's1' }));
+    expect(r).toMatchObject({ outcome: 'completed', ok: true, stdout: 'ran:whoami@srv-win' });
+  });
+});

@@ -34,6 +34,23 @@
       "generic": "Something went wrong. Please try again."
     }
   },
+  "machine": {
+    "feature_label": "Machine",
+    "category": "Machine",
+    "category_desc": "Insert a machine target marker",
+    "empty": "No machines available",
+    "empty_hint": "Enroll a controlled node to send it commands with a ^^(name) marker.",
+    "usage_hint": "Tap a machine to insert its ^^(name) marker. Type ^ in the composer to autocomplete. Offline machines can't be selected.",
+    "no_results": "No machines match your search",
+    "search_placeholder": "Search machines",
+    "online": "Online",
+    "offline": "Offline",
+    "offline_hint": "Offline — cannot be selected",
+    "error": {
+      "list_unavailable": "Machines are still loading or failed to load. Please try again in a moment.",
+      "machine_unresolved_failclosed": "This machine could not be resolved and was not sent."
+    }
+  },
   "common": {
     "cancel": "Cancel",
     "confirm": "Confirm",

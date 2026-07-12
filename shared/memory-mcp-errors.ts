@@ -8,6 +8,13 @@ export const MCP_ERROR_REASONS = {
   VALIDATION_FAILED: 'validation_failed',
   RATE_LIMITED: 'rate_limited',
   INTERNAL_ERROR: 'internal_error',
+  // Machine remote-exec tool surface (list_machines / exec_remote). A typed
+  // reason for each way a target can be unusable, so the agent tool never
+  // returns an ad-hoc string (controlled-node-remote-exec 10.12).
+  MACHINE_NOT_FOUND: 'machine_not_found',
+  MACHINE_AMBIGUOUS: 'machine_ambiguous',
+  EXEC_OFFLINE: 'exec_offline',
+  EXEC_DISABLED: 'exec_disabled',
 } as const;
 
 export type MCPErrorReason = (typeof MCP_ERROR_REASONS)[keyof typeof MCP_ERROR_REASONS];

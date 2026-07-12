@@ -7,7 +7,7 @@ import {
 } from '../../shared/memory-mcp-errors.js';
 
 describe('memory MCP error reasons', () => {
-  it('pins the exact ordered MVP reason set', () => {
+  it('pins the exact ordered reason set (incl. machine remote-exec reasons)', () => {
     expect(Object.values(MCP_ERROR_REASONS)).toEqual([
       'invalid_namespace',
       'feature_disabled',
@@ -18,6 +18,11 @@ describe('memory MCP error reasons', () => {
       'validation_failed',
       'rate_limited',
       'internal_error',
+      // Machine remote-exec (list_machines / exec_remote) — controlled-node-remote-exec 10.12.
+      'machine_not_found',
+      'machine_ambiguous',
+      'exec_offline',
+      'exec_disabled',
     ] satisfies MCPErrorReason[]);
   });
 
