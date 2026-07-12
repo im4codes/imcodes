@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   CONTROLLED_NODE_SERVICE,
   windowsScheduledTaskArgs,
+  windowsCredentialDir,
+  windowsCredentialAclArgs,
   macosLaunchDaemonPlist,
   linuxSystemdUnit,
   MACOS_PLIST_PATH,
@@ -27,6 +29,27 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(args).toContain('HIGHEST');
     expect(args).toContain('imcodes-node');
     expect(args.join(' ')).toContain(EXE);
+  });
+
+  it('Windows credential dir is ProgramData-scoped (SYSTEM service), honoring %ProgramData% (10.10)', () => {
+    expect(windowsCredentialDir({ ProgramData: 'D:\\PD' })).toBe('D:\\PD\\imcodes-node');
+    expect(windowsCredentialDir({})).toBe('C:\\ProgramData\\imcodes-node');
+    // Not a per-user path.
+    expect(windowsCredentialDir({ ProgramData: 'C:\\ProgramData' })).not.toMatch(/Users/i);
+  });
+
+  it('Windows credential ACL grants only SYSTEM + Administrators and strips inheritance (10.10)', () => {
+    const dir = 'C:\\ProgramData\\imcodes-node';
+    const args = windowsCredentialAclArgs(dir);
+    expect(args[0]).toBe(dir);
+    expect(args).toContain('/inheritance:r'); // remove inherited/other-user access
+    expect(args).toContain('SYSTEM:(OI)(CI)F');
+    expect(args).toContain('Administrators:(OI)(CI)F');
+    // No broad principals (Users/Everyone/Authenticated Users) are granted.
+    const joined = args.join(' ');
+    expect(joined).not.toMatch(/\bUsers:/);
+    expect(joined).not.toMatch(/Everyone/i);
+    expect(joined).not.toMatch(/Authenticated Users/i);
   });
 
   it('macOS artifact is a LaunchDaemon (root, boot), not a LaunchAgent (4.2)', () => {

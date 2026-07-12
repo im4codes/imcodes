@@ -1,22 +1,12 @@
 #!/usr/bin/env node
-import {
-  burnEnrollmentBlob,
-  loadCredential,
-  persistCredential,
-  readEnrollmentBlob,
-  redeemEnrollment,
-} from './enrollment.js';
+import { bootstrapControlledNode, defaultBootstrapDeps } from './bootstrap.js';
 import { createControlledNodeRuntime } from './runtime.js';
 
 async function main(): Promise<void> {
-  let credential = await loadCredential();
-  if (!credential) {
-    const blob = await readEnrollmentBlob();
-    if (!blob) throw new Error('controlled node is not enrolled');
-    credential = await redeemEnrollment(blob);
-    await persistCredential(credential);
-    await burnEnrollmentBlob().catch(() => {});
-  }
+  // Journaled first-run bootstrap: prepares the protected credential dir BEFORE
+  // redeeming the one-time token and backs off (never re-redeems) if persist
+  // fails — see bootstrap.ts / task 10.10. A normal boot just loads the credential.
+  const credential = await bootstrapControlledNode(defaultBootstrapDeps(Date.now()));
   const runtime = createControlledNodeRuntime(credential);
   runtime.start();
   const stop = () => {

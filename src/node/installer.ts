@@ -34,6 +34,33 @@ export function windowsScheduledTaskArgs(exePath: string): string[] {
   ];
 }
 
+/**
+ * Default protected credential directory on Windows (SYSTEM-scoped service ⇒
+ * `%ProgramData%`, not a per-user path). Falls back to the conventional path when
+ * `ProgramData` is unset. Mirrors the POSIX `0700` credential dir on macOS/Linux.
+ */
+export function windowsCredentialDir(env: NodeJS.ProcessEnv = process.env): string {
+  const base = env.ProgramData && env.ProgramData.trim() ? env.ProgramData : 'C:\\ProgramData';
+  return `${base}\\imcodes-node`;
+}
+
+/**
+ * `icacls` args to lock the credential directory to SYSTEM + Administrators only
+ * (the Windows equivalent of POSIX dir `0700`, 10.10). Removes inherited ACEs
+ * (`/inheritance:r`) so no interactive/other user retains access, then grants
+ * SYSTEM and Administrators full control with object+container inheritance so the
+ * credential file underneath is covered. The actual `icacls` invocation is
+ * applied at install time (E2E on real Windows); this builder is unit-tested.
+ */
+export function windowsCredentialAclArgs(dir: string): string[] {
+  return [
+    dir,
+    '/inheritance:r',
+    '/grant:r', 'SYSTEM:(OI)(CI)F',
+    '/grant:r', 'Administrators:(OI)(CI)F',
+  ];
+}
+
 /** macOS LaunchDaemon plist (boot-scoped, root, keep-alive). */
 export function macosLaunchDaemonPlist(exePath: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -93,4 +120,18 @@ export async function installControlledNodeService(exePath: string): Promise<str
     return CONTROLLED_NODE_SERVICE.LINUX_UNIT;
   }
   throw new Error(`unsupported platform: ${process.platform}`);
+}
+
+/**
+ * Create + lock the Windows credential directory to SYSTEM + Administrators only
+ * — the Windows analog of the POSIX `0700` credential dir in `enrollment.ts`,
+ * applied during the `credential_prepared` install-journal phase (10.10, BEFORE
+ * redemption/persistence). No-op guard off Windows. Real `icacls` enforcement is
+ * E2E on Windows; the arg construction is unit-tested via `windowsCredentialAclArgs`.
+ */
+export async function secureWindowsCredentialDir(dir: string = windowsCredentialDir()): Promise<string> {
+  if (process.platform !== 'win32') throw new Error('secureWindowsCredentialDir is Windows-only');
+  await mkdir(dir, { recursive: true });
+  execFileSync('icacls', windowsCredentialAclArgs(dir), { stdio: 'ignore' });
+  return dir;
 }
