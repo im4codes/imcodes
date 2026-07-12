@@ -80,12 +80,23 @@ describe('shared-context-runtime-config', () => {
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
       primaryContextPreset: 'Should Not Persist',
-      backupContextBackend: 'claude-code-sdk',
+      backupContextBackend: 'openclaw',
       backupContextModel: 'haiku',
       backupContextPreset: 'Also Ignored',
     });
     expect(result.primaryContextPreset).toBeUndefined();
     expect(result.backupContextPreset).toBeUndefined();
+  });
+
+  it('keeps preset selections for claude-code-sdk (third-party CC SDK)', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M3',
+      primaryContextPreset: 'minimax',
+    });
+    expect(result.primaryContextBackend).toBe('claude-code-sdk');
+    expect(result.primaryContextPreset).toBe('minimax');
+    expect(result.primaryContextModel).toBe('MiniMax-M3');
   });
 
   it('omits sdk fields when not provided', () => {

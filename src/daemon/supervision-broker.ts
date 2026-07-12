@@ -345,10 +345,10 @@ export class SupervisionBroker {
     const sessionKey = `deck_supervision_${randomUUID()}`;
 
     // Delegate backend/model/preset → env/agentId/settings resolution to the
-    // shared processing-provider config. For qwen with a preset this applies
-    // ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / pinned ANTHROPIC_MODEL; for
-    // everything else it short-circuits to `{ agentId: model }`. See
-    // openspec change `supervision-qwen-preset-support` design §1.
+    // shared processing-provider config. For qwen or claude-code-sdk with a
+    // preset this applies ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / pinned
+    // ANTHROPIC_MODEL; for everything else it short-circuits to
+    // `{ agentId: model }`. See openspec change `supervision-qwen-preset-support` design §1.
     let resolved: Awaited<ReturnType<typeof resolveProcessingProviderSessionConfig>>;
     try {
       resolved = await resolveProcessingProviderSessionConfig({
