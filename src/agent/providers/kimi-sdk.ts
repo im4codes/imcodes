@@ -78,6 +78,9 @@ import type {
   SessionInfoUpdate,
   ProviderStatusUpdate,
   ToolCallEvent,
+  ApprovalRequest,
+  ProviderCompactCapability,
+  RemoteSessionInfo,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -91,6 +94,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
+import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
@@ -98,6 +102,37 @@ import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 const KIMI_BIN = 'kimi';
 /** Kimi ACP currently advertises one mode named `default`. */
 const KIMI_DEFAULT_MODE = 'default';
+
+export interface AcpCliProviderProfile {
+  id: string;
+  displayName: string;
+  binary: string;
+  args: string[];
+  defaultMode?: string;
+  compact: ProviderCompactCapability;
+  approval: 'auto-allow' | 'bridge';
+  loadFailure: 'fresh' | 'error';
+  probeOnConnect?: boolean;
+  privacySafeErrors?: boolean;
+}
+
+const KIMI_PROFILE: AcpCliProviderProfile = {
+  id: 'kimi-sdk',
+  displayName: 'Kimi',
+  binary: KIMI_BIN,
+  args: ['acp'],
+  defaultMode: KIMI_DEFAULT_MODE,
+  approval: 'auto-allow',
+  loadFailure: 'fresh',
+  compact: {
+    execution: 'slash-command',
+    providerCommand: '/compact',
+    verified: true,
+    completion: 'command-result',
+    cancellation: 'provider-cancel',
+    reason: 'Verified from MoonshotAI/kimi-cli source: `kimi acp` exposes the soul slash command registry, including /compact.',
+  },
+};
 
 interface KimiSdkSessionState {
   routeId: string;
@@ -117,6 +152,10 @@ interface KimiSdkSessionState {
   modeApplied: boolean;
   /** Set while a `prompt` RPC is in flight. */
   promptInFlight: boolean;
+  /** Monotonic local turn generation used to suppress duplicate terminals. */
+  turnGeneration: number;
+  /** Most recent generation that emitted a terminal completion/error. */
+  settledGeneration: number;
   /** Set while `loadSession` is actively streaming history replay updates.
    *  During this window we drop `agent_message_chunk` / `tool_call` events so
    *  prior-turn content doesn't leak into the current turn's delta stream. */
@@ -151,27 +190,12 @@ interface MergedToolCall {
 }
 
 export class KimiSdkProvider implements TransportProvider {
-  readonly id = 'kimi-sdk';
+  readonly id: string;
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
-  readonly capabilities: ProviderCapabilities = {
-    streaming: true,
-    toolCalling: true,
-    approval: false,
-    sessionRestore: true,
-    multiTurn: true,
-    attachments: false,
-    reasoningEffort: false,
-    contextSupport: 'degraded-message-side-context-mapping',
-    compact: {
-      execution: 'slash-command',
-      providerCommand: '/compact',
-      verified: true,
-      completion: 'command-result',
-      cancellation: 'provider-cancel',
-      reason: 'Verified from MoonshotAI/kimi-cli source: `kimi acp` exposes the soul slash command registry, including /compact.',
-    },
-  };
+  readonly capabilities: ProviderCapabilities;
+
+  protected readonly profile: AcpCliProviderProfile;
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, KimiSdkSessionState>();
@@ -184,9 +208,16 @@ export class KimiSdkProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private approvalCallbacks: Array<(sessionId: string, request: ApprovalRequest) => void> = [];
+  private pendingApprovals = new Map<string, {
+    routeId: string;
+    options: RequestPermissionRequest['options'];
+    resolve: (response: RequestPermissionResponse) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   private child: ChildProcessWithoutNullStreams | null = null;
-  private connection: ClientSideConnection | null = null;
+  protected connection: ClientSideConnection | null = null;
   /** Resolves once `initialize` has completed so subsequent RPCs can proceed. */
   private initPromise: Promise<void> | null = null;
   /** Models returned by the first ACP `newSession` call, cached for the
@@ -194,10 +225,26 @@ export class KimiSdkProvider implements TransportProvider {
   private cachedModels: Array<{ id: string; name?: string }> | null = null;
   private cachedDefaultModel: string | null = null;
 
+  constructor(profile: AcpCliProviderProfile = KIMI_PROFILE) {
+    this.profile = profile;
+    this.id = profile.id;
+    this.capabilities = {
+      streaming: true,
+      toolCalling: true,
+      approval: profile.approval === 'bridge',
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+      reasoningEffort: false,
+      contextSupport: 'degraded-message-side-context-mapping',
+      compact: profile.compact,
+    };
+  }
+
   async connect(config: ProviderConfig): Promise<void> {
     await this.startAcpServer(config);
     this.config = config;
-    logger.info({ provider: this.id }, 'Kimi SDK provider connected via acp');
+    logger.info({ provider: this.id }, `${this.profile.displayName} SDK provider connected via ACP`);
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
@@ -237,7 +284,30 @@ export class KimiSdkProvider implements TransportProvider {
     };
   }
 
+  getActiveWorkSnapshot(sessionId: string): ProviderActiveWorkSnapshot | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    const pendingApprovalCount = [...this.pendingApprovals.values()]
+      .filter((approval) => approval.routeId === sessionId).length;
+    const activeToolCount = [...state.toolCalls.values()]
+      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
+    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount;
+    const busyReasons: ProviderActiveWorkSnapshot['busyReasons'] = [];
+    if (state.promptInFlight || pendingApprovalCount > 0) busyReasons.push('provider_wait');
+    if (state.replaying) busyReasons.push('provider_session_binding');
+    if (activeToolCount > 0) busyReasons.push('open_tool_call');
+    return {
+      status: 'current',
+      activeWorkCount,
+      activeToolCount,
+      busyReasons,
+      providerDiagnosticGeneration: state.acpSessionId ?? null,
+      updatedAt: Date.now(),
+    };
+  }
+
   async disconnect(): Promise<void> {
+    this.cancelPendingApprovals();
     this.teardownChild();
     this.acpToRoute.clear();
     this.sessions.clear();
@@ -263,6 +333,8 @@ export class KimiSdkProvider implements TransportProvider {
       loaded: false,
       modeApplied: false,
       promptInFlight: false,
+      turnGeneration: existing?.turnGeneration ?? 0,
+      settledGeneration: existing?.settledGeneration ?? 0,
       replaying: false,
       cancelled: false,
       currentMessageId: null,
@@ -283,6 +355,7 @@ export class KimiSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    this.cancelPendingApprovals(sessionId);
     // ACP has a session/close RPC (optional capability). We call it best-effort
     // so the agent can free state; if it fails, the session is still gone on
     // our side. closeSession is optional on the Agent interface so we have to
@@ -295,6 +368,29 @@ export class KimiSdkProvider implements TransportProvider {
       this.acpToRoute.delete(state.acpSessionId);
     }
     this.sessions.delete(sessionId);
+  }
+
+  async restoreSession(sessionId: string): Promise<boolean> {
+    const state = this.sessions.get(sessionId)
+      ?? [...this.sessions.values()].find((candidate) => candidate.acpSessionId === sessionId);
+    if (!state) return false;
+    if (state.loaded) return true;
+    try {
+      await this.ensureSessionReady(state.routeId, state);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async listSessions(): Promise<RemoteSessionInfo[]> {
+    return [...this.sessions.values()]
+      .filter((state) => typeof state.acpSessionId === 'string')
+      .map((state) => ({
+        key: state.acpSessionId!,
+        displayName: state.sessionName ?? state.routeId,
+        ...(state.model ? { agentId: state.model } : {}),
+      }));
   }
 
   onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
@@ -369,14 +465,14 @@ export class KimiSdkProvider implements TransportProvider {
     extraSystemPrompt?: string,
   ): Promise<void> {
     if (!this.config || !this.connection) {
-      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Kimi ACP server not connected', false);
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
     }
     const state = this.sessions.get(sessionId);
     if (!state) {
-      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Kimi SDK session: ${sessionId}`, false);
+      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown ${this.profile.displayName} SDK session: ${sessionId}`, false);
     }
     if (state.promptInFlight) {
-      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Kimi SDK session is already busy', true);
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} SDK session is already busy`, true);
     }
 
     state.cancelled = false;
@@ -395,13 +491,15 @@ export class KimiSdkProvider implements TransportProvider {
     // ACP `prompt()` is long-lived and resolves only when the turn finishes, so
     // awaiting it here would make generic send-start watchdogs look like total
     // turn timeouts for normal long-running Kimi work.
-    void this.startTurn(sessionId, state, payload);
+    const generation = ++state.turnGeneration;
+    void this.startTurn(sessionId, state, payload, generation);
   }
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state?.acpSessionId || !state.promptInFlight || !this.connection) return;
     state.cancelled = true;
+    this.cancelPendingApprovals(sessionId);
     // `cancel` is a one-shot notification; the pending prompt() Promise will
     // then resolve with stopReason='cancelled' (or occasionally the agent
     // settles with the partial turn — we handle both in startTurn).
@@ -417,37 +515,49 @@ export class KimiSdkProvider implements TransportProvider {
 
     const binaryPath = this.resolveBinaryPath(config);
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, 'acp'];
+    const args = [...resolved.prependArgs, ...this.profile.args];
     const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
       windowsHide: true,
     });
     this.child = child;
+    const spawnFailure = new Promise<never>((_resolve, reject) => {
+      child.once('error', reject);
+    });
 
     child.stderr.on('data', (chunk: Buffer | string) => {
       const text = chunk.toString().trim();
       if (!text) return;
       // Kimi CLI writes verbose startup noise to stderr. Keep it at debug to
       // avoid polluting normal daemon logs.
-      logger.debug({ provider: this.id, stderr: text }, 'Kimi ACP stderr');
+      logger.debug({ provider: this.id, stderrBytes: Buffer.byteLength(text) }, `${this.profile.displayName} ACP stderr`);
     });
 
     child.on('exit', (code, signal) => {
-      const err = new Error(`Kimi ACP server exited with code=${code} signal=${signal}`);
+      const err = new Error(`${this.profile.displayName} ACP server exited with code=${code} signal=${signal}`);
+      this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
-        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+        if (this.clearSessionWorkAfterFailure(sid)) {
+          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+        }
       }
       this.child = null;
       this.connection = null;
       this.initPromise = null;
     });
     child.on('error', (err) => {
-      logger.error({ provider: this.id, err }, 'Kimi ACP spawn error');
+      logger.error(
+        { provider: this.id, errorCode: (err as NodeJS.ErrnoException).code ?? 'spawn_failed' },
+        `${this.profile.displayName} ACP spawn error`,
+      );
+      this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
-        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+        if (this.clearSessionWorkAfterFailure(sid)) {
+          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+        }
       }
       this.child = null;
       this.connection = null;
@@ -462,8 +572,12 @@ export class KimiSdkProvider implements TransportProvider {
       filterAcpJsonLines(child.stdout, (line, n) => {
         if (n === 1 || n % 200 === 0) {
           logger.debug(
-            { provider: this.id, droppedCount: n, sample: line.slice(0, 200) },
-            'Kimi ACP: dropped non-JSON stdout line',
+            {
+              provider: this.id,
+              droppedCount: n,
+              ...(this.profile.privacySafeErrors ? {} : { sample: line.slice(0, 200) }),
+            },
+            `${this.profile.displayName} ACP: dropped non-JSON stdout line`,
           );
         }
       }),
@@ -490,14 +604,40 @@ export class KimiSdkProvider implements TransportProvider {
       });
       logger.info(
         { provider: this.id, agentInfo: result.agentInfo, caps: result.agentCapabilities },
-        'Kimi ACP initialized',
+        `${this.profile.displayName} ACP initialized`,
       );
+      await this.validateConnectedAgent(result as unknown as Record<string, unknown>, config);
     })().catch((err: unknown) => {
-      logger.error({ provider: this.id, err }, 'Kimi ACP initialize failed');
+      logger.error(
+        { provider: this.id, errorCode: getPrivacySafeErrorCode(err) },
+        `${this.profile.displayName} ACP initialize failed`,
+      );
       throw err;
     });
 
-    await this.initPromise;
+    let initTimer: ReturnType<typeof setTimeout> | undefined;
+    const initTimeout = new Promise<never>((_resolve, reject) => {
+      initTimer = setTimeout(
+        () => reject(new Error(`${this.profile.displayName} ACP initialization timed out`)),
+        15_000,
+      );
+      initTimer.unref?.();
+    });
+    try {
+      await Promise.race([this.initPromise, spawnFailure, initTimeout]);
+    } catch (error) {
+      this.teardownChild();
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        throw this.makeError(
+          PROVIDER_ERROR_CODES.CONFIG_ERROR,
+          `${this.profile.displayName} CLI is unavailable. Install the official CLI and authenticate before starting a session.`,
+          false,
+        );
+      }
+      throw error;
+    } finally {
+      if (initTimer) clearTimeout(initTimer);
+    }
   }
 
   /** Build the Client impl passed to ClientSideConnection. The SDK invokes
@@ -507,10 +647,10 @@ export class KimiSdkProvider implements TransportProvider {
       requestPermission: async (
         params: RequestPermissionRequest,
       ): Promise<RequestPermissionResponse> => {
-        // Kimi ACP has no yolo mode switch; permission requests are explicit
-        // ACP reverse-RPC calls. IM.codes transport sessions are already local
-        // coding agents, so choose the broadest allow option Kimi offered and
-        // keep the turn moving instead of deadlocking behind an unavailable UI.
+        if (this.profile.approval === 'bridge') {
+          return this.bridgePermissionRequest(params);
+        }
+        // Preserve Kimi's existing behavior for compatibility.
         const selected = params.options.find((opt) => opt.optionId === 'approve_for_session')
           ?? params.options.find((opt) => opt.kind === 'allow_always')
           ?? params.options.find((opt) => opt.optionId === 'approve')
@@ -531,6 +671,15 @@ export class KimiSdkProvider implements TransportProvider {
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
         this.handleSessionUpdate(params);
       },
+      extNotification: async (method: string, _params: Record<string, unknown>): Promise<void> => {
+        // Grok publishes MCP catalog refreshes through an xAI extension. The
+        // provider does not need the payload because managed MCP state is
+        // already owned by the session configuration, but registering the
+        // extension handler prevents spurious JSON-RPC method-not-found noise.
+        if (method !== '_x.ai/mcp/servers_updated') {
+          logger.debug({ provider: this.id, method }, 'Ignored ACP extension notification');
+        }
+      },
       // Provide `readTextFile`/`writeTextFile` stubs so that if the agent ever
       // tries to call them despite our caps advertising false, we fail loudly
       // instead of hanging. These throw RequestError so the JSON-RPC layer
@@ -550,6 +699,7 @@ export class KimiSdkProvider implements TransportProvider {
     sessionId: string,
     state: KimiSdkSessionState,
     payload: ProviderContextPayload,
+    generation: number,
   ): Promise<void> {
     state.promptInFlight = true;
     try {
@@ -570,9 +720,15 @@ export class KimiSdkProvider implements TransportProvider {
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
       });
-      this.settleTurn(sessionId, state, result.stopReason, includeSessionSystemText ? sessionSystemText : undefined);
+      this.settleTurn(sessionId, state, generation, result.stopReason, includeSessionSystemText ? sessionSystemText : undefined);
     } catch (err) {
+      if (state.settledGeneration === generation) return;
+      state.settledGeneration = generation;
       state.promptInFlight = false;
+      state.cancelled = false;
+      state.toolCalls.clear();
+      state.emittedToolSignatures.clear();
+      this.cancelPendingApprovals(sessionId);
       this.clearStatus(sessionId, state);
       this.emitError(sessionId, this.normalizeError(err));
     }
@@ -585,7 +741,7 @@ export class KimiSdkProvider implements TransportProvider {
     state: KimiSdkSessionState,
   ): Promise<void> {
     if (!this.connection) {
-      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Kimi ACP connection not ready', false);
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP connection not ready`, false);
     }
     await this.initPromise;
 
@@ -617,9 +773,10 @@ export class KimiSdkProvider implements TransportProvider {
           this.cacheModelsFromSessionResponse(loadResult);
           this.applySessionMetadata(sessionId, state, loadResult);
         } catch (err) {
+          if (this.profile.loadFailure === 'error') throw err;
           logger.info(
             { provider: this.id, sessionId, acpSessionId: state.acpSessionId, err },
-            'Kimi ACP loadSession failed; falling back to newSession',
+            `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
           );
           this.acpToRoute.delete(state.acpSessionId);
           state.acpSessionId = undefined;
@@ -630,12 +787,12 @@ export class KimiSdkProvider implements TransportProvider {
       }
     }
 
-    if (!state.modeApplied && state.acpSessionId && this.connection) {
+    if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && this.connection) {
       const modeSetter = (this.connection as AcpAgent).setSessionMode;
       if (typeof modeSetter === 'function') {
         await modeSetter.call(this.connection, {
           sessionId: state.acpSessionId,
-          modeId: KIMI_DEFAULT_MODE,
+          modeId: this.profile.defaultMode,
         }).catch((err: unknown) => {
           // Not fatal — Kimi's server already defaults to this mode.
           logger.debug({ provider: this.id, sessionId, err }, 'setSessionMode(default) failed (non-fatal)');
@@ -686,7 +843,7 @@ export class KimiSdkProvider implements TransportProvider {
       ...(m.name ? { name: String(m.name) } : {}),
     })).filter((m) => m.id);
     this.cachedDefaultModel = typeof models.currentModelId === 'string' ? models.currentModelId : null;
-    logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, 'Kimi models cached');
+    logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, `${this.profile.displayName} models cached`);
   }
 
   private mcpServersForState(state: KimiSdkSessionState): ReturnType<typeof getDefaultAcpMcpServers> {
@@ -721,7 +878,7 @@ export class KimiSdkProvider implements TransportProvider {
             void closer.call(this.connection, { sessionId: result.sessionId }).catch(() => {});
           }
         } catch (err) {
-          logger.debug({ provider: this.id, err }, 'Kimi model probe failed (non-fatal)');
+          logger.debug({ provider: this.id, err }, `${this.profile.displayName} model probe failed (non-fatal)`);
         }
       }
     }
@@ -754,28 +911,34 @@ export class KimiSdkProvider implements TransportProvider {
   private settleTurn(
     sessionId: string,
     state: KimiSdkSessionState,
+    generation: number,
     stopReason: StopReason,
     sessionSystemTextToCommit?: string,
   ): void {
+    if (state.settledGeneration === generation) return;
+    state.settledGeneration = generation;
     state.promptInFlight = false;
     this.clearStatus(sessionId, state);
     const text = state.currentText;
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
     state.currentText = '';
     state.currentMessageId = null;
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
+    this.cancelPendingApprovals(sessionId);
 
     if (stopReason === 'cancelled' || state.cancelled) {
       state.cancelled = false;
       this.emitError(
         sessionId,
-        this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Kimi turn cancelled', true),
+        this.makeError(PROVIDER_ERROR_CODES.CANCELLED, `${this.profile.displayName} turn cancelled`, true),
       );
       return;
     }
     if (stopReason === 'refusal') {
       this.emitError(
         sessionId,
-        this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Kimi refused the request', false),
+        this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} refused the request`, false),
       );
       return;
     }
@@ -843,6 +1006,15 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.replaying) {
       return;
     }
+    const turnScopedUpdate = update.sessionUpdate === 'agent_message_chunk'
+      || update.sessionUpdate === 'agent_thought_chunk'
+      || update.sessionUpdate === 'tool_call'
+      || update.sessionUpdate === 'tool_call_update'
+      || update.sessionUpdate === 'usage_update'
+      || update.sessionUpdate === 'plan';
+    if (turnScopedUpdate && (!state.promptInFlight || state.cancelled)) {
+      return;
+    }
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         this.handleAgentChunk(routeId, state, update);
@@ -864,7 +1036,7 @@ export class KimiSdkProvider implements TransportProvider {
         // agent's own command vocabulary. Treat as metadata.
         logger.debug(
           { provider: this.id, sessionId: routeId, modeId: update.currentModeId },
-          'Kimi ACP mode changed',
+          `${this.profile.displayName} ACP mode changed`,
         );
         return;
       case 'usage_update': {
@@ -1055,7 +1227,7 @@ export class KimiSdkProvider implements TransportProvider {
   private resolveBinaryPath(config: ProviderConfig | null): string {
     return typeof config?.binaryPath === 'string' && config.binaryPath.trim()
       ? config.binaryPath
-      : KIMI_BIN;
+      : this.profile.binary;
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
@@ -1068,6 +1240,27 @@ export class KimiSdkProvider implements TransportProvider {
       return err as ProviderError;
     }
     const message = err instanceof Error ? err.message : String(err);
+    if (this.profile.privacySafeErrors) {
+      if (/auth|login|credential|unauthorized|forbidden/i.test(message)) {
+        return this.makeError(
+          PROVIDER_ERROR_CODES.AUTH_FAILED,
+          `${this.profile.displayName} authentication is required. Complete the official CLI login and retry.`,
+          false,
+        );
+      }
+      if (/rate|429|quota/i.test(message)) {
+        return this.makeError(
+          PROVIDER_ERROR_CODES.RATE_LIMITED,
+          `${this.profile.displayName} temporarily rate limited the request.`,
+          true,
+        );
+      }
+      return this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        `${this.profile.displayName} ACP request failed.`,
+        false,
+      );
+    }
     if (err instanceof RequestError) {
       // Map ACP auth_required (code -32000 in Kimi CLI today, but spec
       // reserves this code) onto our AUTH_FAILED so the UI surfaces a
@@ -1077,8 +1270,12 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
     }
-    if (/ENOENT|not found|spawn .*kimi/i.test(message)) {
-      return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Kimi CLI not found: ${message}`, false, err);
+    if (/ENOENT|not found/i.test(message)) {
+      return this.makeError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        `${this.profile.displayName} CLI is unavailable. Install the official CLI and authenticate before starting a session.`,
+        false,
+      );
     }
     if (/auth/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, message, false, err);
@@ -1091,6 +1288,78 @@ export class KimiSdkProvider implements TransportProvider {
    *  providers define the method so we mirror the shape. */
   setSessionEffort(_sessionId: string, _effort: TransportEffortLevel): void {
     // no-op — effort is baked into the model choice.
+  }
+
+  onApprovalRequest(cb: (sessionId: string, request: ApprovalRequest) => void): void {
+    this.approvalCallbacks.push(cb);
+  }
+
+  async respondApproval(sessionId: string, requestId: string, approved: boolean): Promise<void> {
+    const pending = this.pendingApprovals.get(requestId);
+    if (!pending || pending.routeId !== sessionId) return;
+    this.pendingApprovals.delete(requestId);
+    clearTimeout(pending.timer);
+    const selected = pending.options.find((option) => approved
+      ? option.kind === 'allow_once' || option.kind === 'allow_always'
+      : option.kind === 'reject_once' || option.kind === 'reject_always');
+    pending.resolve(selected
+      ? { outcome: { outcome: 'selected', optionId: selected.optionId } }
+      : { outcome: { outcome: 'cancelled' } });
+  }
+
+  protected async validateConnectedAgent(
+    _initializeResult: Record<string, unknown>,
+    _config: ProviderConfig,
+  ): Promise<void> {
+    // Kimi preserves its existing lazy authentication/session behavior.
+  }
+
+  private bridgePermissionRequest(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    const routeId = this.acpToRoute.get(params.sessionId);
+    if (!routeId || this.approvalCallbacks.length === 0) {
+      return Promise.resolve({ outcome: { outcome: 'cancelled' } });
+    }
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingApprovals.delete(requestId);
+        resolve({ outcome: { outcome: 'cancelled' } });
+      }, 120_000);
+      this.pendingApprovals.set(requestId, { routeId, options: params.options, resolve, timer });
+      const request: ApprovalRequest = {
+        id: requestId,
+        description: params.toolCall?.title ?? 'Grok requested permission to use a tool',
+        ...(params.toolCall?.title ? { tool: params.toolCall.title } : {}),
+        provider: this.id,
+        ...(params.toolCall?.toolCallId ? { providerToolUseId: params.toolCall.toolCallId } : {}),
+      };
+      for (const callback of this.approvalCallbacks) callback(routeId, request);
+    });
+  }
+
+  private cancelPendingApprovals(routeId?: string): void {
+    for (const [requestId, pending] of this.pendingApprovals) {
+      if (routeId && pending.routeId !== routeId) continue;
+      this.pendingApprovals.delete(requestId);
+      clearTimeout(pending.timer);
+      pending.resolve({ outcome: { outcome: 'cancelled' } });
+    }
+  }
+
+  private clearSessionWorkAfterFailure(routeId: string): boolean {
+    const state = this.sessions.get(routeId);
+    if (!state) return false;
+    const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
+    if (hadActiveWork) state.settledGeneration = state.turnGeneration;
+    state.promptInFlight = false;
+    state.replaying = false;
+    state.cancelled = false;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
+    this.clearStatus(routeId, state);
+    return hadActiveWork;
   }
 }
 
@@ -1137,4 +1406,12 @@ function mapToolStatus(status: string): 'running' | 'complete' | 'error' {
     default:
       return 'running';
   }
+}
+
+function getPrivacySafeErrorCode(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string' || typeof code === 'number') return String(code).slice(0, 64);
+  }
+  return error instanceof RequestError ? 'acp_request_error' : 'unknown';
 }

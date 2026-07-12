@@ -6614,6 +6614,46 @@ afterEach(() => {
     });
   });
 
+  it('shows only dynamically discovered grok-sdk models and sends /model', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'grok-sdk-session',
+          agentType: 'grok-sdk',
+          runtimeType: 'transport',
+          activeModel: 'grok-build',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    expect(request).toMatchObject({ type: 'transport.list_models', agentType: 'grok-sdk' });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'grok-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'grok-build', name: 'Grok Build' },
+        { id: 'grok-build-fast', name: 'Grok Build Fast' },
+      ],
+      defaultModel: 'grok-build',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^grok-build$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /grok-build-fast/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'grok-sdk-session',
+      text: '/model grok-build-fast',
+    });
+  });
+
   // ── dedicated-execution-clone-sessions: generic launcher moved to footer ─────
   describe('generic execution-clone launcher placement', () => {
     it('does not render the old input-side 🤖 execution dropdown', async () => {

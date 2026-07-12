@@ -80,6 +80,7 @@ type AgentType =
   | "opencode"
   | "gemini"
   | "gemini-sdk"
+  | "grok-sdk"
   | "kimi-sdk"
   | "openclaw"
   | "qwen";
@@ -462,6 +463,7 @@ export function NewSessionDialog({
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
+          || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
           || agentType === "qwen") &&
         requestedModel.trim()
@@ -487,7 +489,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "kimi-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -515,6 +517,7 @@ export function NewSessionDialog({
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
+    || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
@@ -881,6 +884,11 @@ export function NewSessionDialog({
                   <option key={model} value={model} />
                 ))}
               </datalist>
+            )}
+            {agentType === "grok-sdk" && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.grok_prerequisite_error", { error: transportModels.error })}
+              </div>
             )}
           </div>
         )}

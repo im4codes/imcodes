@@ -610,6 +610,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -862,6 +863,7 @@
     "dir_required": "工作目录不能为空",
     "not_connected": "未连接到 daemon",
     "daemon_offline": "Daemon 离线 — 请确认 imcodes daemon 正在运行",
+    "grok_prerequisite_error": "Grok Build 当前不可用：{{error}}",
     "start": "启动",
     "starting": "启动中...",
     "timeout": "等待会话启动超时，请检查 daemon 日志。",
@@ -2314,6 +2316,7 @@
       "mcpProviderStatusHint": "MCP 专用状态会独立于 provider 连接状态上报。",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",

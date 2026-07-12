@@ -109,6 +109,16 @@ describe('watch projection store', () => {
     expect(snapshot.sessions[1]?.isPinned).toBeUndefined();
   });
 
+  it('projects the Grok transport badge', () => {
+    const { store } = makeSnapshotStore();
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [{ name: 'deck_grok_brain', project: 'Grok', role: 'brain', agentType: 'grok-sdk', state: 'idle' }],
+    );
+
+    expect(store.getSnapshot().sessions[0]).toMatchObject({ agentBadge: 'gr' });
+  });
+
   it('keeps auth/routing fields explicit even when apiKey is unavailable', () => {
     const { store } = makeSnapshotStore(1_500);
     store.setApiKey(null);

@@ -45,6 +45,7 @@ const TYPE_ICON: Record<string, string> = {
   'qwen': '千',
   'gemini': '♊',
   'gemini-sdk': '♊',
+  'grok-sdk': '𝕏',
   'kimi-sdk': '月',
   'shell': '🐚',
   'script': '🔄',

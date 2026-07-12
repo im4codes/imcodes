@@ -496,4 +496,19 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps the Grok agent label present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      const label = readPath(messages, 'session.agentType.grok_sdk');
+      const prerequisiteError = readPath(messages, 'new_session.grok_prerequisite_error');
+      expect(label, `${locale}:session.agentType.grok_sdk`).toEqual(expect.any(String));
+      expect((label as string).trim().length).toBeGreaterThan(0);
+      expect(prerequisiteError, `${locale}:new_session.grok_prerequisite_error`).toEqual(expect.any(String));
+      expect((prerequisiteError as string).trim().length).toBeGreaterThan(0);
+      const mcpLabel = readPath(messages, 'sharedContext.management.mcpProviderGrokAcp');
+      expect(mcpLabel, `${locale}:sharedContext.management.mcpProviderGrokAcp`).toEqual(expect.any(String));
+      expect((mcpLabel as string).trim().length).toBeGreaterThan(0);
+    }
+  });
 });

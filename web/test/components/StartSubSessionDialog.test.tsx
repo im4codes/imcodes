@@ -50,6 +50,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -509,6 +510,29 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'moonshot-v1-auto,thinking',
+    });
+  });
+
+  it('passes a dynamically selected model for grok-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /grok_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'grok-build' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('grok-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'grok-build',
     });
   });
 

@@ -41,6 +41,19 @@ function makeDetail(overrides: Partial<SdkSubagentDetail> = {}): SdkSubagentDeta
 }
 
 describe('sdk-subagent-status shared contract', () => {
+  it('accepts explicitly structured Grok runtime subagent details', () => {
+    const detail = makeDetail({
+      meta: {
+        ...makeDetail().meta,
+        provider: SDK_SUBAGENT_PROVIDERS.GROK_SDK,
+        providerKind: SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT,
+        canonicalKey: 'grok:deck:task-1',
+      },
+    });
+
+    expect(parseSdkSubagentDetail(detail)).toEqual(expect.objectContaining({ kind: 'ok' }));
+  });
+
   it('rejects malformed enum values instead of accepting any string', () => {
     const detail = makeDetail({
       meta: {

@@ -8,7 +8,7 @@ import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import { isTransportAgent } from './detect.js';
-import { buildTransportResumeLaunchOpts } from './transport-resume-opts.js';
+import { buildTransportResumeLaunchOpts, usesProviderResumeId } from './transport-resume-opts.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
@@ -1015,14 +1015,12 @@ export async function relaunchSessionWithSettings(
     && record.agentType === targetAgentType
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
     // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
-    // codexSessionId; Kimi uses providerResumeId, so these providers use a fresh
+    // codexSessionId; Kimi/Grok use providerResumeId, so these providers use a fresh
     // local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
     && targetAgentType !== 'qoder-sdk'
-    && targetAgentType !== 'copilot-sdk'
-    && targetAgentType !== 'cursor-headless'
-    && targetAgentType !== 'kimi-sdk'
+    && !usesProviderResumeId(targetAgentType)
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -1046,7 +1044,7 @@ export async function relaunchSessionWithSettings(
       bindExistingKey: record.providerSessionId,
       skipCreate: true,
     } : {}),
-    ...((targetAgentType === 'copilot-sdk' || targetAgentType === 'cursor-headless' || targetAgentType === 'kimi-sdk') && record.providerResumeId
+    ...(!targetFresh && usesProviderResumeId(targetAgentType) && record.providerResumeId
       ? { providerResumeId: record.providerResumeId }
       : {}),
     ...compatibleIds,
@@ -1292,7 +1290,7 @@ async function recoverTransportRuntimeAfterError(
       ...(record.agentType === 'qwen' ? { fresh: true } : {}),
       ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
       ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-      ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
+      ...(usesProviderResumeId(record.agentType) && record.providerResumeId
         ? { providerResumeId: record.providerResumeId }
         : {}),
       ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
@@ -1663,7 +1661,7 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if ((agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') && next.providerResumeId !== info.resumeId) {
+      if (usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -2057,15 +2055,13 @@ export async function restoreTransportSessions(
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
         || s.providerId === 'qoder-sdk'
-        || s.providerId === 'cursor-headless'
-        || s.providerId === 'copilot-sdk'
-        || s.providerId === 'kimi-sdk';
+        || usesProviderResumeId(s.providerId);
       const effectiveSessionKey = freshOnRestore || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
           ? (freshAfterInterruptedCodexRestore ? undefined : s.codexSessionId)
-          : (s.providerId === 'cursor-headless' || s.providerId === 'copilot-sdk' || s.providerId === 'kimi-sdk')
+          : usesProviderResumeId(s.providerId)
             ? s.providerResumeId
             : undefined;
       const preserveStartupMemoryOnRestore = s.startupMemoryInjected === true && !freshAfterInterruptedCodexRestore;
@@ -2497,13 +2493,14 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     effectiveBindExistingKey = undefined;
     effectiveSkipCreate = false;
     transportResumeId = undefined;
-  } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
+  } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
-    if (transportResumeId) {
-      effectiveSkipCreate = true;
-    }
+    // providerSessionId is only an IM.codes route key for this family. Durable
+    // continuity comes exclusively from providerResumeId, so a stale route key
+    // must never make us skip session creation without a real resume target.
+    effectiveSkipCreate = !!transportResumeId;
   }
 
   // `preserveStartupMemoryInject` is declared earlier so the bootstrap
@@ -2566,7 +2563,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...((agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'kimi-sdk') && transportResumeId
+        ...(usesProviderResumeId(agentType) && transportResumeId
           ? { providerResumeId: transportResumeId }
           : {}),
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),

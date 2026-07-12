@@ -15,6 +15,7 @@ export const SDK_SUBAGENT_PROVIDERS = {
   CODEX_SDK: 'codex-sdk',
   QWEN: 'qwen',
   GEMINI_SDK: 'gemini-sdk',
+  GROK_SDK: 'grok-sdk',
 } as const;
 
 export const SDK_SUBAGENT_PROVIDER_KINDS = {
@@ -24,6 +25,7 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   CODEX_RUNTIME_AGENT: 'codexRuntimeAgent',
   QWEN_RUNTIME_AGENT: 'qwenRuntimeAgent',
   GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
+  GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {

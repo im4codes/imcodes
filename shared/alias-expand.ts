@@ -33,6 +33,7 @@ export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpans
   'cursor-headless': 'legend',
   'opencode': 'legend',
   'gemini-sdk': 'legend',
+  'grok-sdk': 'legend',
   'gemini': 'legend',
   'qwen': 'legend',
   'openclaw': 'legend',

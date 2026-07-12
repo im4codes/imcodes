@@ -37,6 +37,8 @@
     "test:e2e": "vitest run --project e2e",
     "test:integration": "vitest run --workspace vitest.integration.config.ts",
     "test:preview-dist": "node scripts/run-preview-dist-smoke.mjs",
+    "test:grok-acp-smoke": "node scripts/smoke-grok-acp.mjs",
+    "test:grok-auth-smoke": "tsx scripts/smoke-grok-sdk-auth.ts",
     "test:coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=html --coverage.reporter=json --coverage.reporter=json-summary --testTimeout=120000 --hookTimeout=120000 --teardownTimeout=60000 --minWorkers=1 --maxWorkers=4 --project daemon --project web --project server && node scripts/write-coverage-summary.mjs && node scripts/check-coverage-thresholds.mjs",
     "coverage:summary": "node scripts/write-coverage-summary.mjs",
     "coverage:check": "node scripts/check-coverage-thresholds.mjs",

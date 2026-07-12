@@ -187,7 +187,8 @@ describe('GeminiSdkProvider.listModels', () => {
 describe('KimiSdkProvider.listModels', () => {
   it('uses the supported `kimi acp` entrypoint, not deprecated `kimi --acp`', async () => {
     const source = await readFile('src/agent/providers/kimi-sdk.ts', 'utf8');
-    expect(source).toContain("const args = [...resolved.prependArgs, 'acp'];");
+    expect(source).toContain("args: ['acp']");
+    expect(source).toContain('...this.profile.args');
     expect(source).not.toContain("resolved.prependArgs, '--acp'");
   });
 
@@ -266,8 +267,9 @@ describe('ProviderModelList contract', () => {
     const { CursorHeadlessProvider } = await import('../../../src/agent/providers/cursor-headless.js');
     const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
     const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
+    const { GrokSdkProvider } = await import('../../../src/agent/providers/grok-sdk.js');
 
-    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider, KimiSdkProvider]) {
+    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider, KimiSdkProvider, GrokSdkProvider]) {
       const p = new Cls();
       expect(typeof (p as unknown as { listModels?: unknown }).listModels, `${Cls.name} must implement listModels()`).toBe('function');
     }

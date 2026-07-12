@@ -14,6 +14,7 @@ import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
@@ -34,6 +35,7 @@ export interface SubSessionRecord {
   runtimeType?: 'process' | 'transport' | null;
   providerId?: string | null;
   providerSessionId?: string | null;
+  providerResumeId?: string | null;
   requestedModel?: string | null;
   activeModel?: string | null;
   /** Qwen model ID — threaded into launchTransportSession so the Qwen family
@@ -102,6 +104,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   if (isTransportAgent(agentType)) {
     if (await getTransportRuntime(sessionName)) return;
+    const providerResumeFamily = usesProviderResumeId(agentType);
+    const providerResumeId = providerResumeFamily ? (sub.providerResumeId ?? undefined) : undefined;
     if (forceFresh) {
       // Forced fresh: never bind/resume an existing provider session. No
       // identity ids reach the launch layer for any transport family (qwen,
@@ -140,11 +144,17 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       requestedModel: sub.requestedModel ?? undefined,
       qwenModel: sub.qwenModel ?? undefined,
       transportConfig: sub.transportConfig ?? undefined,
-      bindExistingKey: sub.providerSessionId ?? undefined,
-      skipCreate: !!sub.providerSessionId,
+      bindExistingKey: providerResumeFamily ? undefined : (sub.providerSessionId ?? undefined),
+      skipCreate: providerResumeFamily ? !!providerResumeId : !!sub.providerSessionId,
+      ...(providerResumeId
+        ? { providerResumeId }
+        : {}),
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-      ...(!sub.providerSessionId && (agentType === 'codex-sdk' || agentType === 'kimi-sdk') ? { fresh: true } : {}),
+      ...((agentType === 'codex-sdk' && !sub.providerSessionId)
+        || ((agentType === 'kimi-sdk' || agentType === 'grok-sdk') && !providerResumeId)
+        ? { fresh: true }
+        : {}),
       ...(sub.effort ? { effort: sub.effort } : {}),
       // Carry the preset through the transport launch so Qwen doesn't revert
       // to the OAuth `coder-model` when the sub-session record says the run
@@ -442,6 +452,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         requestedModel: sub.requestedModel ?? existing?.requestedModel,
         activeModel: sub.activeModel ?? existing?.activeModel,
         providerSessionId: sub.providerSessionId ?? existing?.providerSessionId,
+        providerResumeId: sub.providerResumeId ?? existing?.providerResumeId,
         ccSessionId: sub.ccSessionId ?? existing?.ccSessionId,
         codexSessionId: sub.codexSessionId ?? existing?.codexSessionId,
         effort: sub.effort ?? existing?.effort,

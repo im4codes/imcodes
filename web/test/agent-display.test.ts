@@ -18,5 +18,6 @@ describe('agent display helpers', () => {
     expect(getAutoSessionLabelPrefix('codex-sdk')).toBe('Cx');
     expect(getAutoSessionLabelPrefix('copilot-sdk')).toBe('Co');
     expect(getAutoSessionLabelPrefix('cursor-headless')).toBe('Cu');
+    expect(getAutoSessionLabelPrefix('grok-sdk')).toBe('Gr');
   });
 });

@@ -67,6 +67,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'grok-sdk',
+    icon: '𝕏',
+    fallbackLabel: 'Grok Build',
+    labelKey: 'session.agentType.grok_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'kimi-sdk',
     icon: '月',
     fallbackLabel: 'Kimi Code',

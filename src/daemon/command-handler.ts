@@ -745,14 +745,15 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' {
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'cursor-headless'
     || agentType === 'openclaw'
     || agentType === 'qwen'
-    || agentType === 'kimi-sdk';
+    || agentType === 'kimi-sdk'
+    || agentType === 'grok-sdk';
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -772,7 +773,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -1940,7 +1941,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1950,7 +1951,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk',
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -1997,7 +1998,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'gemini-sdk' || agentType === 'kimi-sdk') {
+    } else if (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
       // ACP SDK providers share the codex-sdk shape: fresh launch, optional
       // requested model, no ccPreset. The provider emits a durable resume id
       // after the first real ACP session is created.
@@ -2006,7 +2007,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'gemini-sdk' | 'kimi-sdk',
+        agentType: agentType as 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -3995,7 +3996,20 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
         return;
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk') && modelMatch) {
+      if (record?.agentType === 'grok-sdk' && modelMatch) {
+        const nextModel = modelMatch[1];
+        const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
+        const availableModels = grokModels?.models.map((model) => model.id) ?? [];
+        if (!availableModels.includes(nextModel)) {
+          const error = `Unknown Grok model: ${nextModel}`;
+          emitTransportUserMessage(text);
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${error}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error });
+          return;
+        }
+      }
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -5637,6 +5651,9 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     ? requestedEffort
     : getDefaultThinkingLevel(type);
   const sessionName = subSessionName(id);
+  const projectName = parentSession
+    ? (getSession(parentSession)?.projectName ?? parentSession)
+    : sessionName;
   if (isKnownTestSessionName(parentSession)) {
     logger.warn({ id, type, cwd, parentSession }, 'subsession.start rejected by test-session guard');
     return;
@@ -5656,7 +5673,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     try {
       await launchTransportSession({
         name: sessionName,
-        projectName: sessionName,
+        projectName,
         role: 'w1',
         agentType: type as any,
         projectDir: (cwd as string) || process.cwd(),
@@ -5666,7 +5683,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'kimi-sdk' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -9911,7 +9928,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -9964,7 +9981,7 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk') {
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
     return { models: [] };
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };

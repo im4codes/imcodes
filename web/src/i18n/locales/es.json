@@ -610,6 +610,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -861,6 +862,7 @@
     "dir_required": "El directorio de trabajo es obligatorio",
     "not_connected": "No conectado al daemon",
     "daemon_offline": "El daemon está desconectado — verifica que imcodes daemon esté en ejecución",
+    "grok_prerequisite_error": "Grok Build no está disponible: {{error}}",
     "start": "Iniciar",
     "starting": "Iniciando...",
     "timeout": "Tiempo de espera agotado para iniciar la sesión. Revisa los registros del daemon.",
@@ -2313,6 +2315,7 @@
       "mcpProviderStatusHint": "El estado específico de MCP se informa aparte de la conectividad del proveedor.",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",

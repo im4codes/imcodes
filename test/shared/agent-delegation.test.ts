@@ -130,6 +130,7 @@ describe('agent delegation shared contract', () => {
       'cursor-headless',
       'opencode',
       'gemini-sdk',
+      'grok-sdk',
       'gemini',
       'qwen',
       'openclaw',

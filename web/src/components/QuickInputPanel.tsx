@@ -36,6 +36,7 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'cursor-headless': ['/compact', '/clear', '/model'],
   'opencode':    ['/compact', '/clear', '/model', '/help'],
   'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
+  'grok-sdk':    ['/compact', '/clear', '/model'],
   'kimi-sdk':    ['/compact', '/clear', '/model'],
   'openclaw':    ['/compact', '/stop', '/clear', '/thinking'],
 };

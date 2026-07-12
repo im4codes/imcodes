@@ -189,9 +189,9 @@ describe('startSubSession — forced fresh (transport families)', () => {
     vi.clearAllMocks();
   });
 
-  // openclaw included; qwen/cursor-headless/copilot-sdk/gemini-sdk are the
+  // openclaw included; qwen/cursor-headless/copilot-sdk/gemini-sdk/grok-sdk are the
   // families the OLD code never passed `fresh` to.
-  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'gemini-sdk', 'openclaw'] as const;
+  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'gemini-sdk', 'grok-sdk', 'openclaw'] as const;
 
   for (const type of TRANSPORT_FAMILIES) {
     it(`${type}: fresh:true reaches launch, NO old identity / bind reaches launchTransportSession`, async () => {
@@ -370,6 +370,38 @@ describe('startSubSession — non-fresh path unchanged (no regression)', () => {
     expect(arg.skipCreate).toBe(true);
     // The old behavior forwards sub.fresh (undefined here) under providerSessionId
     expect(arg.fresh).toBeUndefined();
+  });
+
+  it('grok-sdk non-fresh resumes only from providerResumeId and never binds the stale route key', async () => {
+    await startSubSession({
+      id: 'nf-grok',
+      type: 'grok-sdk',
+      cwd: '/proj',
+      parentSession: 'deck_proj_brain',
+      providerSessionId: 'stale-local-route',
+      providerResumeId: 'grok-acp-session',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBe('grok-acp-session');
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(true);
+    expect(arg.fresh).toBeUndefined();
+  });
+
+  it('grok-sdk ignores a local route key without providerResumeId and starts fresh', async () => {
+    await startSubSession({
+      id: 'nf-grok-stale-route',
+      type: 'grok-sdk',
+      cwd: '/proj',
+      providerSessionId: 'stale-local-route',
+    });
+
+    const arg = lastTransportLaunchArg();
+    expect(arg.providerResumeId).toBeUndefined();
+    expect(arg.bindExistingKey).toBeUndefined();
+    expect(arg.skipCreate).toBe(false);
+    expect(arg.fresh).toBe(true);
   });
 
   it('process non-fresh forwards stored ccSessionId into bootstrap + launch opts (existing behavior)', async () => {

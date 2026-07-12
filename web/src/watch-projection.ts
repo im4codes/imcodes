@@ -170,6 +170,7 @@ const BADGE_MAP: Record<string, string> = {
   'qwen': 'qw',
   'gemini': 'gm',
   'gemini-sdk': 'gm',
+  'grok-sdk': 'gr',
   'kimi-sdk': 'km',
   'shell': 'sh',
   'script': 'sc',

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildTransportResumeLaunchOpts } from '../../src/agent/transport-resume-opts.js';
+import { buildTransportResumeLaunchOpts, usesProviderResumeId } from '../../src/agent/transport-resume-opts.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 function rec(overrides: Partial<SessionRecord>): SessionRecord {
@@ -18,6 +18,12 @@ function rec(overrides: Partial<SessionRecord>): SessionRecord {
 }
 
 describe('buildTransportResumeLaunchOpts', () => {
+  it('classifies Grok with the generic provider-resume family', () => {
+    expect(usesProviderResumeId('grok-sdk')).toBe(true);
+    expect(usesProviderResumeId('kimi-sdk')).toBe(true);
+    expect(usesProviderResumeId('gemini-sdk')).toBe(false);
+  });
+
   it('carries core identity (name/projectName/role/projectDir/agentType) from the record', () => {
     const opts = buildTransportResumeLaunchOpts(rec({ name: 'deck_sub_abc', projectName: 'p', role: 'w1', projectDir: '/x' }));
     expect(opts).toMatchObject({ name: 'deck_sub_abc', projectName: 'p', role: 'w1', projectDir: '/x', agentType: 'claude-code-sdk' });
@@ -33,8 +39,8 @@ describe('buildTransportResumeLaunchOpts', () => {
     expect(buildTransportResumeLaunchOpts(rec({ agentType: 'claude-code-sdk', codexSessionId: 'cx-1' })).codexSessionId).toBeUndefined();
   });
 
-  it('threads providerResumeId for cursor-headless / copilot-sdk / kimi-sdk', () => {
-    for (const agentType of ['cursor-headless', 'copilot-sdk', 'kimi-sdk'] as const) {
+  it('threads providerResumeId for cursor-headless / copilot-sdk / kimi-sdk / grok-sdk', () => {
+    for (const agentType of ['cursor-headless', 'copilot-sdk', 'kimi-sdk', 'grok-sdk'] as const) {
       expect(buildTransportResumeLaunchOpts(rec({ agentType, providerResumeId: 'pr-1' }))).toMatchObject({ providerResumeId: 'pr-1' });
     }
   });

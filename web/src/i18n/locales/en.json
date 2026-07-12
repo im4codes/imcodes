@@ -610,6 +610,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -862,6 +863,7 @@
     "dir_required": "Working directory is required",
     "not_connected": "Not connected to daemon",
     "daemon_offline": "Daemon is offline — check that imcodes daemon is running",
+    "grok_prerequisite_error": "Grok Build is unavailable: {{error}}",
     "start": "Start",
     "starting": "Starting...",
     "timeout": "Timed out waiting for session to start. Check daemon logs.",
@@ -2314,6 +2316,7 @@
       "mcpProviderStatusHint": "MCP-specific status is reported separately from provider connectivity.",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
