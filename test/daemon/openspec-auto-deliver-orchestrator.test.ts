@@ -1178,6 +1178,8 @@ exec "${realGit}" "$@"
     expect(firstImplementationPrompt).toContain('Use all applicable testing tools and already-authorized test devices/environments');
     expect(firstImplementationPrompt).toContain('focused unit, integration, end-to-end, and real-device checks');
     expect(firstImplementationPrompt).toContain('accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount');
+    expect(firstImplementationPrompt).toContain('MUST write the completed marker with the matching skippableTaskCount');
+    expect(firstImplementationPrompt).toContain('Do NOT write a failed marker for those tasks');
 
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     const reminderPrompt = await waitForTransportSend((text) =>
@@ -1364,11 +1366,11 @@ exec "${realGit}" "$@"
     expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
-  it('continues implementation when the agent reports an incomplete failed marker', async () => {
+  it('terminalizes as needs_human instead of re-prompting when the agent reports a failed marker', async () => {
     await makeChange('demo-change', '- [x] first\n- [x] second\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
-      requestId: 'req-failed-implementation-marker-continues',
+      requestId: 'req-failed-implementation-marker-terminalizes',
       sessionName: 'deck_demo_brain',
       changeName: 'demo-change',
       presetId: 'fast',
@@ -1386,27 +1388,17 @@ exec "${realGit}" "$@"
     })).toBe(true);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
-    const reminderPrompt = await waitForTransportSend((text) =>
-      text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
-      && text.includes('Reason: implementation_marker_failed:remaining repair checklist gaps')
-      && text.includes('incomplete checklist work means continue implementing, not stop'),
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'needs_human'
+      && msg.projection?.terminalReason === 'implementation_marker_failed:remaining repair checklist gaps',
       SEND_WAIT_MS,
     );
-    expect(reminderPrompt).toContain('finish the required code, test, and tasks.md work');
-    expect(serverLinkMock.send.mock.calls.some((call) =>
-      call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
-      && call[0]?.projection?.terminalReason === 'implementation_marker_failed:remaining repair checklist gaps',
+    expect(terminal.projection.status).toBe('needs_human');
+    expect(transportSendMock.mock.calls.some((call) =>
+      String(call[0] ?? '').includes('Reason: implementation_marker_failed:remaining repair checklist gaps'),
     )).toBe(false);
-
-    expect(await writeLatestImplementationMarker()).toBe(true);
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-
-    await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
-      && msg.projection?.stage === 'implementation_audit_repair',
-      SEND_WAIT_MS,
-    );
-    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+    expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
   it('dispatches final acceptance scoring instead of stopping early when implementation prompt budget is spent', async () => {

@@ -1391,7 +1391,8 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
     `- After you have completed implementation, tasks.md updates, and reasonable validation, write this exact JSON marker to: ${active.markerPath}`,
     '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. The sole required value to calculate before writing is skippableTaskCount: set it to the exact number of currently unchecked tasks that are external, deployment-only, authorization-gated, or explicitly deferred; keep it 0 when every unchecked task is still implementable. Do not write the marker before doing the work.',
     '- The orchestrator re-reads tasks.md and accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount. A completed marker cannot bypass more unchecked tasks than it explicitly declares.',
-    '- Use the failed marker only when external input or an unrecoverable blocker prevents further implementation. If work is merely incomplete, keep working and overwrite any old failed marker with the completed marker after finishing.',
+    '- When code/tests are complete and only external, deployment-only, authorization-gated, or explicitly deferred tasks remain, you MUST write the completed marker with the matching skippableTaskCount. Do NOT write a failed marker for those tasks.',
+    '- Use the failed marker only for an unrecoverable implementation/infrastructure failure that prevents an honest completed handoff. A failed marker terminates Auto Deliver as needs_human and is not retried. If implementable work is merely incomplete, keep working and do not write either marker yet.',
     '- Idling without this marker does not count as implementation completion; Auto Deliver will keep the run in implementation until the marker is present and valid.',
     '',
     'Completed marker:',
@@ -1511,7 +1512,7 @@ async function advanceAfterCompletedImplementationMarker(
   await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
 }
 
-async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: string): Promise<void> {
+function handleFailedImplementationMarker(run: AutoDeliverRun, reason: string): void {
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'implementation_reported',
     summary: `Implementation completion marker reported failure: ${reason}`,
@@ -1521,10 +1522,7 @@ async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: str
   clearImplementationMarkerPollTimer(run.runId);
   clearImplementationAwaitingDispatchIdleTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, `openspec-auto-deliver-implementation-marker-failed:${reason}`);
-  const projection = await dispatchImplementationMarkerReminder(run, `implementation_marker_failed:${reason}`);
-  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-  }
+  terminalizeAndSend(run, 'needs_human', `implementation_marker_failed:${reason}`);
 }
 
 async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promise<void> {
@@ -1593,7 +1591,7 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
     'Do not start an audit report. Continue from the current implementation state and finish the required code, test, and tasks.md work.',
     AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
     'If validation fails, fix the failure and validate again.',
-    'Write the completed marker only after the implementation is genuinely finished and validated. Use a failed marker only for external input or unrecoverable blockers; incomplete checklist work means continue implementing, not stop.',
+    'Write the completed marker only after the implementation is genuinely finished and validated. If only external, deployment-only, authorization-gated, or explicitly deferred tasks remain, write completed with their exact skippableTaskCount; do not write failed. Use failed only for an unrecoverable implementation/infrastructure failure; incomplete implementable work means continue without writing a marker.',
     'A false idle without this marker is not completion; Auto Deliver will keep the run in implementation.',
     '',
     buildImplementationCompletionMarkerBlock(run),
