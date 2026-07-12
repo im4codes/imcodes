@@ -454,10 +454,13 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     startP2pRunMock.mockImplementation(async (opts: { launchOrigin?: unknown; userText?: string; initiatorSession?: string; locale?: string }) => {
       const id = `p2p-${p2pRuns.size + 1}`;
       const contextFilePath = join(projectDir, '.imc', 'discussions', `${id}.md`);
+      const run = { id, status: 'queued', contextFilePath, mainSession: opts.initiatorSession, launchOrigin: opts.launchOrigin, userText: opts.userText, locale: opts.locale };
+      // Register synchronously, matching the real P2P lifecycle. If teardown
+      // clears the registry while the mocked filesystem work is pending, the
+      // old run must not be inserted into the next test after that clear.
+      p2pRuns.set(id, run);
       await mkdir(join(projectDir, '.imc', 'discussions'), { recursive: true });
       await writeFile(contextFilePath, '# mocked p2p\n', 'utf8');
-      const run = { id, status: 'queued', contextFilePath, mainSession: opts.initiatorSession, launchOrigin: opts.launchOrigin, userText: opts.userText, locale: opts.locale };
-      p2pRuns.set(id, run);
       return run;
     });
     getTransportRuntimeMock.mockReset();

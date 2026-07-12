@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 
+// Keep a native event-loop yield available after individual tests install
+// fake timers. Rollout checks perform real filesystem I/O, which must get a
+// chance to complete while virtual provider timers are advanced.
+const realSetImmediate = setImmediate;
+
 const childProcessMock = vi.hoisted(() => {
   type Request = { id?: number; method?: string; params?: Record<string, any> };
   type ChildRecord = {
@@ -285,6 +290,20 @@ async function advanceFakeTimersUntil(
     await vi.advanceTimersByTimeAsync(stepMs);
   }
   throw new Error('Timed out waiting for fake-timer condition');
+}
+
+async function advanceFakeTimersWithRealIoUntil(
+  check: () => boolean,
+  timeoutMs = 20_000,
+  stepMs = 100,
+): Promise<void> {
+  const steps = Math.max(1, Math.ceil(timeoutMs / stepMs));
+  for (let i = 0; i <= steps; i += 1) {
+    if (check()) return;
+    await vi.advanceTimersByTimeAsync(stepMs);
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+  }
+  throw new Error('Timed out waiting for fake-timer condition with real I/O');
 }
 
 async function writeCodexAuthFile(codexHome: string, version: number): Promise<void> {
@@ -2549,9 +2568,7 @@ describe('CodexSdkProvider', () => {
       });
       child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
       expect(completed).toEqual(['Done']);
       expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
       await provider.disconnect();
@@ -4422,9 +4439,7 @@ describe('CodexSdkProvider', () => {
       });
       child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
-      for (let i = 0; i < 200 && !(completed.length === 1 && tools.length === 2); i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1 && tools.length === 2);
       expect(completed).toEqual(['Done.']);
       expect(tools).toEqual([
         expect.objectContaining({ id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
@@ -4731,9 +4746,7 @@ describe('CodexSdkProvider', () => {
       // few seconds later — long before the ~20s heartbeat or the 30-min last
       // resort. Advance in small async steps so the real fs read resolves under
       // fake timers.
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]).toMatchObject({ role: 'assistant', status: 'complete' });
@@ -4799,9 +4812,7 @@ describe('CodexSdkProvider', () => {
         },
       ]);
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('durable final while start response is missing');
@@ -4874,9 +4885,7 @@ describe('CodexSdkProvider', () => {
         },
       }]);
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('new turn completed normally');
@@ -4982,9 +4991,7 @@ describe('CodexSdkProvider', () => {
           },
         },
       ]);
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('now the durable final answer exists');
@@ -5034,9 +5041,7 @@ describe('CodexSdkProvider', () => {
       // evidence instead of leaving the runtime active until stop+continue.
       state!.activeTurnLease = undefined;
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('durable rollout final answer');
