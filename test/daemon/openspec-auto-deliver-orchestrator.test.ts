@@ -1157,7 +1157,7 @@ exec "${realGit}" "$@"
     expect([...p2pRuns.values()]).toHaveLength(2);
   });
 
-  it('keeps one implementation prompt active until tasks.md is fully checked', async () => {
+  it('keeps one implementation prompt active while tasks remain unchecked and no completed marker exists', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-loop',
@@ -1175,8 +1175,11 @@ exec "${realGit}" "$@"
     expect(firstImplementationPrompt).toContain(`Change root: ${join(projectDir, 'openspec', 'changes', 'demo-change')}`);
     expect(firstImplementationPrompt).toContain('Before inspecting, editing, validating, or committing anything, work from the project root above.');
     expect(firstImplementationPrompt).toContain('Remaining tasks:');
+    expect(firstImplementationPrompt).toContain('Use all applicable testing tools and already-authorized test devices/environments');
+    expect(firstImplementationPrompt).toContain('focused unit, integration, end-to-end, and real-device checks');
+    expect(firstImplementationPrompt).toContain('accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount');
 
-    await emitDeckDemoIdle();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
     const reminderPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')
       && text.includes('Reason: implementation_tasks_still_unchecked'),
@@ -1301,7 +1304,7 @@ exec "${realGit}" "$@"
     );
     expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
     expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
-    expect(reminderPrompt).toContain('Run the appropriate validation for the files you touched.');
+    expect(reminderPrompt).toContain('Use all applicable testing tools and already-authorized test devices/environments');
     expect(startP2pRunMock).not.toHaveBeenCalled();
 
     expect(await writeLatestImplementationMarker()).toBe(true);
@@ -1311,8 +1314,8 @@ exec "${realGit}" "$@"
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
   });
 
-  it('advances implementation from a valid completion marker without waiting for idle', async () => {
-    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+  it('advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle', async () => {
+    await makeChange('demo-change', '- [x] first\n- [ ] production deploy requires user authorization\n');
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
       requestId: 'req-marker-advances-without-idle',
@@ -1326,11 +1329,39 @@ exec "${realGit}" "$@"
       && text.includes('write this exact JSON marker to:'),
       SEND_WAIT_MS,
     );
-    expect(await writeLatestImplementationMarker()).toBe(true);
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
 
     await waitForP2pStartCount(1);
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
     expect(transportSettleExternalMock).toHaveBeenCalledWith('openspec-auto-deliver-implementation-marker-completed');
+    expect(transportSendMock.mock.calls.some((call) =>
+      String(call[0] ?? '').includes('Reason: implementation_tasks_still_unchecked'),
+    )).toBe(false);
+  });
+
+  it('rejects a completed marker when unchecked tasks exceed its declared skip allowance', async () => {
+    await makeChange('demo-change', '- [x] first\n- [ ] external deploy\n- [ ] pending implementation\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-marker-skip-allowance-too-small',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
+
+    const reminder = await waitForTransportSend((text) =>
+      text.includes('Reason: implementation_tasks_exceed_marker_skip_allowance:unchecked=2:allowed=1'),
+      SEND_WAIT_MS,
+    );
+    expect(reminder).toContain('A completed marker cannot bypass more unchecked tasks than it explicitly declares.');
+    expect(startP2pRunMock).not.toHaveBeenCalled();
   });
 
   it('continues implementation when the agent reports an incomplete failed marker', async () => {
@@ -3472,7 +3503,7 @@ exec "${realGit}" "$@"
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Discovered safe validation command candidates from project manifests: pnpm typecheck; pnpm test');
     expect(transportSendMock.mock.calls[0]?.[0]).toContain('Unsafe validation commands were skipped: pnpm deploy');
     expect(transportSendMock.mock.calls[0]?.[0]).not.toContain('Recommended validation commands:');
-    await emitDeckDemoIdle();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
     const reminderPrompt = await waitForTransportSend((text) =>
       text.includes('OpenSpec Auto Deliver implementation is not complete yet for @openspec/changes/demo-change.')

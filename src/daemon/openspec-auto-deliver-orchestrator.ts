@@ -98,6 +98,9 @@ import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js'
  */
 const AUTO_DELIVER_IMPLEMENTATION_STAGE: ExecutionCloneParentStage = 'auto_deliver_implementation';
 
+const AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION =
+  'Run reasonable local validation for the touched code when available. Use all applicable testing tools and already-authorized test devices/environments available to you to test implementation completeness, including focused unit, integration, end-to-end, and real-device checks where relevant and safe. Do not expand authorization or access new devices without user approval. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands, devices/environments, and outcomes, or explain why validation could not run.';
+
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
 
@@ -795,6 +798,7 @@ function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExec
     marker.summary,
     marker.changedFiles?.length ? `changedFiles=${marker.changedFiles.join(',')}` : undefined,
     marker.tests?.length ? `tests=${marker.tests.join(',')}` : undefined,
+    `skippableTaskCount=${marker.skippableTaskCount ?? 0}`,
   ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'implementation_reported',
@@ -804,6 +808,27 @@ function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExec
     ...(run.activeCommandId ? { command: run.activeCommandId } : {}),
     stale: false,
   }]);
+}
+
+function implementationMarkerTaskGate(
+  marker: P2pExecutionMarker,
+  taskStats: OpenSpecAutoDeliverTaskStats,
+): { accepted: boolean; allowed: number } {
+  const allowed = marker.skippableTaskCount ?? 0;
+  return { accepted: taskStats.unchecked <= allowed, allowed };
+}
+
+async function dispatchImplementationTaskGateReminder(
+  run: AutoDeliverRun,
+  allowed: number,
+): Promise<void> {
+  const projection = await dispatchImplementationMarkerReminder(
+    run,
+    `implementation_tasks_exceed_marker_skip_allowance:unchecked=${run.taskStats.unchecked}:allowed=${allowed}`,
+  );
+  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+  }
 }
 
 function elapsedLimitExceeded(run: AutoDeliverRun): boolean {
@@ -1335,7 +1360,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
     'All relative file paths in this prompt are relative to that project root.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
-    'Run reasonable local validation for the touched code when available. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
+    AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
     '',
     'Remaining tasks:',
     remainingBlock,
@@ -1353,7 +1378,10 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
 function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
   const active = run.activeImplementationMarker;
   if (!active) return 'Implementation completion marker: unavailable.';
-  const completedMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(active.spec, 'completed')).trimEnd();
+  const completedMarker = stringifyP2pExecutionMarker({
+    ...buildP2pExecutionMarker(active.spec, 'completed'),
+    skippableTaskCount: 0,
+  }).trimEnd();
   const failedMarker = stringifyP2pExecutionMarker({
     ...buildP2pExecutionMarker(active.spec, 'failed'),
     error: 'short reason',
@@ -1361,7 +1389,8 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
   return [
     'Implementation completion marker (required):',
     `- After you have completed implementation, tasks.md updates, and reasonable validation, write this exact JSON marker to: ${active.markerPath}`,
-    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.',
+    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. The sole required value to calculate before writing is skippableTaskCount: set it to the exact number of currently unchecked tasks that are external, deployment-only, authorization-gated, or explicitly deferred; keep it 0 when every unchecked task is still implementable. Do not write the marker before doing the work.',
+    '- The orchestrator re-reads tasks.md and accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount. A completed marker cannot bypass more unchecked tasks than it explicitly declares.',
     '- Use the failed marker only when external input or an unrecoverable blocker prevents further implementation. If work is merely incomplete, keep working and overwrite any old failed marker with the completed marker after finishing.',
     '- Idling without this marker does not count as implementation completion; Auto Deliver will keep the run in implementation until the marker is present and valid.',
     '',
@@ -1501,6 +1530,13 @@ async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: str
 async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId || !run.activeImplementationMarker) return;
   if (enforceElapsedLimit(run)) return;
+
+  const markerState = await readImplementationCompletionMarker(run);
+  if (!markerState.ok && markerState.failedByAgent) {
+    await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
@@ -1514,20 +1550,20 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  if (markerState.ok) {
+    const taskGate = implementationMarkerTaskGate(markerState.marker, run.taskStats);
+    if (taskGate.accepted) {
+      await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+      return;
+    }
+    await dispatchImplementationTaskGateReminder(run, taskGate.allowed);
+    return;
+  }
   if (run.taskStats.unchecked > 0) {
     scheduleImplementationMarkerPoll(run);
     return;
   }
 
-  const markerState = await readImplementationCompletionMarker(run);
-  if (markerState.ok) {
-    await advanceAfterCompletedImplementationMarker(run, markerState.marker);
-    return;
-  }
-  if (markerState.failedByAgent) {
-    await handleFailedImplementationMarker(run, markerState.reason);
-    return;
-  }
   const activeMarker = run.activeImplementationMarker;
   if (!activeMarker) return;
   const markerAgeMs = Date.now() - activeMarker.createdAt;
@@ -1555,7 +1591,8 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
     `Reason: ${reason}`,
     '',
     'Do not start an audit report. Continue from the current implementation state and finish the required code, test, and tasks.md work.',
-    'Run the appropriate validation for the files you touched. If validation fails, fix the failure and validate again.',
+    AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
+    'If validation fails, fix the failure and validate again.',
     'Write the completed marker only after the implementation is genuinely finished and validated. Use a failed marker only for external input or unrecoverable blockers; incomplete checklist work means continue implementing, not stop.',
     'A false idle without this marker is not completion; Auto Deliver will keep the run in implementation.',
     '',
@@ -3438,6 +3475,13 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
   if (run.activeImplementationPromptAwaitingDispatch) return;
   if (enforceElapsedLimit(run)) return;
+
+  const markerState = await readImplementationCompletionMarker(run);
+  if (!markerState.ok && markerState.failedByAgent) {
+    await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
@@ -3453,20 +3497,20 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-  if (run.taskStats.unchecked <= 0) {
-    const markerState = await readImplementationCompletionMarker(run);
-    if (!markerState.ok) {
-      if (markerState.failedByAgent) {
-        await handleFailedImplementationMarker(run, markerState.reason);
-        return;
-      }
-      const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
-      if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-      }
+  if (markerState.ok) {
+    const taskGate = implementationMarkerTaskGate(markerState.marker, run.taskStats);
+    if (taskGate.accepted) {
+      await advanceAfterCompletedImplementationMarker(run, markerState.marker);
       return;
     }
-    await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+    await dispatchImplementationTaskGateReminder(run, taskGate.allowed);
+    return;
+  }
+  if (run.taskStats.unchecked <= 0) {
+    const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+    if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    }
     return;
   }
   const projection = await dispatchImplementationMarkerReminder(run, 'implementation_tasks_still_unchecked');
