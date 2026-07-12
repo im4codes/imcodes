@@ -528,9 +528,9 @@ export function NewSessionDialog({
     if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
-      return agentType === "gemini-sdk"
-        ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
-        : dynamicModelIds;
+      if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
+      return dynamicModelIds;
     }
     if (agentType === "qwen") return qwenPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
@@ -547,10 +547,12 @@ export function NewSessionDialog({
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
       const stored = loadCodexModelPreference();
       if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      const fallback = CODEX_SDK_MODEL_FALLBACK[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
         return transportModels.defaultModel;
       }
-      return trimmed;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 

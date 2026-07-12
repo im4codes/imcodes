@@ -73,7 +73,7 @@ import { serializeContextNamespace } from '../context/context-keys.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 
-const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.5';
+const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.6';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT

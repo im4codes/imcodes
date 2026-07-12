@@ -47,7 +47,10 @@ export function useTransportModels(
       }
       const requestId = `models-${Math.random().toString(36).slice(2)}-${Date.now()}`;
       pendingRequestId.current = requestId;
-      setState((prev) => ({ ...prev, loading: true, error: undefined }));
+      // A picker can switch providers while the previous provider's response is
+      // still rendered. Clear that catalog immediately so Claude defaults such
+      // as `fable` cannot leak into a newly selected Codex session.
+      setState({ models: [], loading: true });
       try {
         ws.send({
           type: 'transport.list_models',

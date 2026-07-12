@@ -121,7 +121,10 @@ describe('StartSubSessionDialog', () => {
     fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.6',
+      thinking: 'high',
+    });
   });
 
   it('locks sub-session cwd to the current directory', () => {
@@ -164,6 +167,31 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'gpt-5.5',
+      thinking: 'high',
+    });
+  });
+
+  it('replaces the Claude default with GPT-5.6 when switching to codex-sdk', async () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+    const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    await waitFor(() => expect(modelInput.value).toBe('gpt-5.6'));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.6',
       thinking: 'high',
     });
   });

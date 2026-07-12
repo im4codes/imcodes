@@ -326,6 +326,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     : transportModels.models.length > 0
       ? (type === 'gemini-sdk'
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === 'codex-sdk'
+          ? mergeModelSuggestions(CODEX_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
       : type === 'codex-sdk'
         ? [...CODEX_SDK_MODEL_SUGGESTIONS]
@@ -347,10 +349,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
       const stored = loadCodexModelPreference();
       if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      const fallback = CODEX_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
         return transportModels.defaultModel;
       }
-      return trimmed;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 

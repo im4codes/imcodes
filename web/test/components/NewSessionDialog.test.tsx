@@ -401,12 +401,17 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'codex-sdk';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    await waitFor(() => {
+      const modelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
+      expect(modelSelect.value).toBe('gpt-5.6');
+    });
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[1], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'codex-sdk',
+      requestedModel: 'gpt-5.6',
       thinking: 'high',
     }));
   });
