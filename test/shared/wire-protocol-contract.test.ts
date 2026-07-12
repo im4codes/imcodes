@@ -69,6 +69,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       DISCONNECTED: 'daemon.disconnected',
       UPGRADE_BLOCKED: 'daemon.upgrade_blocked',
       UPGRADING: 'daemon.upgrading',
+      MACHINE_EXEC_RESULT: 'machine.exec_result',
     });
 
     expect(DAEMON_COMMAND_TYPES).toEqual({
@@ -78,6 +79,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       SESSION_EXECUTION_CLONES: 'session.execution_clones',
       SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
       SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
+      MACHINE_EXEC: 'machine.exec',
     });
   });
 

@@ -108,7 +108,8 @@ export class AuthenticatedWebSocketClient {
     this.watchdogTimer = setInterval(() => {
       if (this.socket !== socket || this.stopped) return;
       if (Date.now() - this.lastInboundAt >= silenceTimeoutMs) {
-        socket.terminate?.() ?? socket.close(4001, 'inbound_silence');
+        if (socket.terminate) socket.terminate();
+        else socket.close(4001, 'inbound_silence');
         return;
       }
       if (socket.readyState === 1) socket.send(JSON.stringify(this.options.heartbeatMessage));
