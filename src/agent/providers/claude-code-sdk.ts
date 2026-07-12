@@ -3,6 +3,7 @@ import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { query, type PermissionMode, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { stripLeakedThink } from '../../util/strip-leaked-think.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
   TransportProvider,
@@ -751,6 +752,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
   }
 
+  // Third-party Anthropic-compatible reasoning models (e.g. MiniMax via a preset
+  // ANTHROPIC_BASE_URL) leak `<think>…</think>` into the assistant text. Strip it
+  // only for those sessions; real Claude uses proper thinking blocks and never
+  // puts `<think>` in text, so this leaves first-party output untouched.
+  private shouldStripLeakedThink(state: ClaudeSdkSessionState): boolean {
+    const base = state.env?.['ANTHROPIC_BASE_URL'];
+    return typeof base === 'string' && base.trim().length > 0;
+  }
+
   private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage): void {
     if ('session_id' in msg && typeof msg.session_id === 'string' && msg.session_id) {
       state.resumeId = msg.session_id;
@@ -867,7 +877,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         const delta: MessageDelta = {
           messageId,
           type: 'text',
-          delta: state.currentText,
+          delta: this.shouldStripLeakedThink(state) ? stripLeakedThink(state.currentText) : state.currentText,
           role: 'assistant',
         };
         for (const cb of this.deltaCallbacks) cb(sessionId, delta);
@@ -915,7 +925,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
         };
       }
-      const text = collectAssistantText(msg);
+      const rawAssistantText = collectAssistantText(msg);
+      const text = this.shouldStripLeakedThink(state) ? stripLeakedThink(rawAssistantText) : rawAssistantText;
       const runtimeSubagentPayload = parseRuntimeSubagentTag(text);
       if (runtimeSubagentPayload) {
         this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
@@ -1037,7 +1048,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         sessionId,
         kind: 'text',
         role: 'assistant',
-        content: success.result,
+        content: typeof success.result === 'string' && this.shouldStripLeakedThink(state) ? stripLeakedThink(success.result) : success.result,
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
