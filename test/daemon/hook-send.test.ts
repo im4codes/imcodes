@@ -341,7 +341,7 @@ describe('Hook server /send endpoint', () => {
   describe('Successful delivery', () => {
     it('delivers shell-originated callback sends when the target is an exact active session name', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
-      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
+      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
 
       getSessionMock.mockReturnValue(null);
       listSessionsMock.mockReturnValue([brain, w1]);
@@ -357,7 +357,7 @@ describe('Hook server /send endpoint', () => {
 
     it('REGRESSION GUARD: CLI /send to process sessions must route through session.send recall pipeline and this test must not be deleted', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
-      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
+      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
 
       getSessionMock.mockImplementation((name: string) => {
         if (name === 'deck_proj_brain') return brain;
@@ -379,7 +379,7 @@ describe('Hook server /send endpoint', () => {
 
     it('delivers message to transport session via runtime.send()', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
-      const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport' });
+      const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport', label: 'OpenClaw' });
 
       getSessionMock.mockImplementation((name: string) => {
         if (name === 'deck_proj_brain') return brain;
@@ -415,7 +415,7 @@ describe('Hook server /send endpoint', () => {
 
     it('records queued transport sends as queue state until runtime drain emits the user message', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
-      const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport' });
+      const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport', label: 'OpenClaw' });
 
       getSessionMock.mockImplementation((name: string) => {
         if (name === 'deck_proj_brain') return brain;
@@ -482,7 +482,7 @@ describe('Hook server /send endpoint', () => {
   describe.skip('Queue-when-busy', () => {
     it('queues message when target is busy', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
-      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
+      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
 
       getSessionMock.mockImplementation((name: string) => {
         if (name === 'deck_proj_brain') return brain;
@@ -591,7 +591,7 @@ describe('Hook server /send endpoint', () => {
 
     it('rejects when rate limit exceeded (> 10 per minute)', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
-      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
+      const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
 
       getSessionMock.mockImplementation((name: string) => {
         if (name === 'deck_proj_brain') return brain;
@@ -617,7 +617,7 @@ describe('Hook server /send endpoint', () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       // Create 10 siblings
       const siblings = Array.from({ length: 10 }, (_, i) =>
-        makeSession({ name: `deck_proj_w${i + 1}`, role: `w${i + 1}`, agentType: 'codex' }),
+        makeSession({ name: `deck_proj_w${i + 1}`, role: `w${i + 1}`, agentType: 'codex', label: `Worker ${i + 1}` }),
       );
 
       getSessionMock.mockReturnValue(brain);

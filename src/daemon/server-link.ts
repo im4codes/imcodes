@@ -754,7 +754,10 @@ export class ServerLink {
   trySendBinary(data: Buffer): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     try {
-      this.ws.send(data);
+      // TS7 models WebSocket BufferSource with an ArrayBuffer-backed view,
+      // while Node's Buffer may also be backed by SharedArrayBuffer. Materialize
+      // a plain Uint8Array so both runtimes and the native compiler agree.
+      this.ws.send(Uint8Array.from(data));
       return true;
     } catch (err) {
       logger.warn({ err }, 'ServerLink: binary send failed');

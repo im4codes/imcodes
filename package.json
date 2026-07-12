@@ -45,6 +45,7 @@
     "test:watch": "vitest",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
+    "typecheck:legacy": "tsc6 --noEmit",
     "trace:daemon": "node scripts/trace-daemon-latency.mjs",
     "prepublishOnly": "npm run build && npm run test:unit && npm run test:server && npm run test:web",
     "prepare": "husky",
@@ -72,6 +73,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
@@ -83,7 +85,7 @@
     "jsdom": "^28.1.0",
     "lint-staged": "^16.3.4",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vitest": "^2.1.0"
   },
   "lint-staged": {

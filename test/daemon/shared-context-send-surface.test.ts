@@ -222,13 +222,13 @@ describe('shared-context send-surface parity integration', () => {
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_transport_brain') return makeSession({ name: 'deck_transport_brain', runtimeType: 'transport', agentType: 'codex-sdk' });
       if (name === 'deck_proj_brain') return makeSession({ name: 'deck_proj_brain' });
-      if (name === 'deck_proj_w1') return makeSession({ name: 'deck_proj_w1', role: 'w1', runtimeType: 'transport', agentType: 'openclaw' });
+      if (name === 'deck_proj_w1') return makeSession({ name: 'deck_proj_w1', role: 'w1', runtimeType: 'transport', agentType: 'openclaw', label: 'OpenClaw' });
       if (name === 'deck_myapp_brain') return makeSession({ name: 'deck_myapp_brain', projectName: 'myapp', runtimeType: 'transport', projectDir: '/myapp' });
       return null;
     });
     listSessionsMock.mockReturnValue([
       makeSession({ name: 'deck_proj_brain' }),
-      makeSession({ name: 'deck_proj_w1', role: 'w1', runtimeType: 'transport', agentType: 'openclaw' }),
+      makeSession({ name: 'deck_proj_w1', role: 'w1', runtimeType: 'transport', agentType: 'openclaw', label: 'OpenClaw' }),
     ]);
     const started = await startHookServer(vi.fn());
     server = started.server;
