@@ -135,7 +135,15 @@ const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
   'runtime/subagent/status',
 ]);
 
-const CODEX_TOOL_LIKE_ITEM_TYPES = new Set(['commandExecution', 'mcpToolCall']);
+const CODEX_TOOL_LIKE_ITEM_TYPES = new Set([
+  'commandExecution',
+  'mcpToolCall',
+  'customToolCall',
+  'custom_tool_call',
+  'customTool',
+  'custom_tool',
+]);
+const CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT = 2_000;
 type CodexAppServerDisconnectClass =
   | 'intentional_shutdown'
   | 'auth_refresh_restart'
@@ -198,6 +206,11 @@ interface CodexRawSpawnAgentCall {
   callId: string;
   args: Record<string, any>;
   startedAtMs: number;
+}
+
+interface CodexCustomToolLifecycle {
+  tool: ToolCallEvent;
+  terminal: boolean;
 }
 
 interface CodexTrackedSubagentThread {
@@ -747,6 +760,13 @@ interface CodexSdkSessionState {
   activeToolItemIds: Set<string>;
   activeCompactionItemIds: Set<string>;
   openProviderToolCalls: Map<string, ToolCallEvent>;
+  /**
+   * Correlates custom tool lifecycle across both app-server surfaces:
+   * `item/started|completed` and `rawResponseItem/completed`. Newer Codex
+   * versions can expose either channel (and occasionally both), so call_id is
+   * the canonical identity and this map prevents duplicate timeline cards.
+   */
+  customToolLifecycleByCallId: Map<string, CodexCustomToolLifecycle>;
   runtimeSubagentStartedAtByKey: Map<string, number>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
@@ -1500,6 +1520,101 @@ function parseJsonRecord(value: unknown): Record<string, any> | undefined {
   }
 }
 
+function customToolOutputText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (isRecord(parsed) || Array.isArray(parsed)) return customToolOutputText(parsed);
+      } catch {}
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => customToolOutputText(entry))
+      .filter((entry): entry is string => entry !== undefined);
+    return parts.length > 0 ? parts.join('\n') : undefined;
+  }
+  if (!isRecord(value)) return value === undefined || value === null ? undefined : String(value);
+
+  for (const key of ['text', 'output', 'content', 'value', 'message']) {
+    const text = customToolOutputText(value[key]);
+    if (text !== undefined) return text;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function customToolOutputRecords(value: unknown): Record<string, any>[] {
+  if (Array.isArray(value)) return value.flatMap((entry) => customToolOutputRecords(entry));
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return customToolOutputRecords(parsed);
+    } catch {
+      return [];
+    }
+  }
+  if (!isRecord(value)) return [];
+  const nested = [value.output, value.content, value.result, value.metadata]
+    .flatMap((entry) => customToolOutputRecords(entry));
+  return [value, ...nested];
+}
+
+function customToolTerminalFromOutput(item: Record<string, any>): {
+  status: Exclude<ToolCallEvent['status'], 'running'>;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  output: string;
+} {
+  const rawOutput = item.output ?? item.result ?? item.content ?? item.error;
+  const output = customToolOutputText(rawOutput) ?? '';
+  const normalizedStatus = normalizeStatusName(meaningfulString(item.status));
+  const records = [
+    item,
+    ...customToolOutputRecords(rawOutput),
+    ...customToolOutputRecords(item.metadata),
+  ];
+  const cancelled = normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled'
+    || normalizedStatus === 'interrupted'
+    || normalizedStatus === 'aborted'
+    || records.some((record) => record.cancelled === true || record.canceled === true || record.interrupted === true)
+    || /^script (?:cancelled|canceled|interrupted|aborted)\b/im.test(output);
+  if (cancelled) {
+    return {
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: normalizedStatus === 'interrupted' ? 'provider_interrupted' : 'provider_cancelled',
+      output,
+    };
+  }
+
+  const failed = normalizedStatus === 'failed'
+    || normalizedStatus === 'error'
+    || normalizedStatus === 'errored'
+    || (item.error !== undefined && item.error !== null)
+    || records.some((record) => {
+      const exitCode = finiteNumber(record.exit_code) ?? finiteNumber(record.exitCode);
+      return record.is_error === true
+        || record.isError === true
+        || record.success === false
+        || (exitCode !== undefined && exitCode !== 0)
+        || (record.error !== undefined && record.error !== null);
+    })
+    || /^script failed\b/im.test(output);
+  return failed
+    ? { status: 'error', terminalStatus: 'errored', terminalReason: 'provider_error', output }
+    : { status: 'complete', terminalStatus: 'succeeded', terminalReason: 'provider_result', output };
+}
+
 function rawChecklistText(item: Record<string, unknown>): string | undefined {
   for (const key of ['content', 'step', 'text', 'title', 'task', 'description', 'name']) {
     const value = item[key];
@@ -1724,7 +1839,10 @@ function collabAgentToolFromItem(
  */
 function customToolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
   void sessionId;
-  const id = meaningfulString(item.id) ?? meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+  // call_id is shared by the raw-response and typed-item channels; item.id is
+  // channel-specific. Prefer call_id so both paths converge on one card.
+  const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+  const id = callId ?? meaningfulString(item.id);
   const name = meaningfulString(item.name) ?? meaningfulString(item.tool);
   if (!id || !name) return null;
   const rawInput = item.input ?? item.arguments ?? item.command ?? item.script;
@@ -1732,9 +1850,14 @@ function customToolFromItem(sessionId: string, item: Record<string, any>, lifecy
     || meaningfulString(item.call_id) !== undefined
     || meaningfulString(item.callId) !== undefined;
   if (!hasCallShape) return null; // not a tool call — do not fabricate a card
+  const normalizedStatus = normalizeStatusName(meaningfulString(item.status));
+  const cancelled = normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled'
+    || normalizedStatus === 'interrupted'
+    || normalizedStatus === 'aborted';
   const status: ToolCallEvent['status'] = item.status === 'inProgress' || item.status === 'running' || lifecycle === 'started'
     ? 'running'
-    : item.status === 'failed' || item.status === 'error'
+    : item.status === 'failed' || item.status === 'error' || item.status === 'errored' || cancelled
       ? 'error'
       : 'complete';
   const input = typeof rawInput === 'string'
@@ -1754,6 +1877,13 @@ function customToolFromItem(sessionId: string, item: Record<string, any>, lifecy
     status,
     input,
     ...(status !== 'running' && output !== undefined ? { output } : {}),
+    ...(status !== 'running' ? {
+      terminalStatus: cancelled ? 'cancelled' : status === 'complete' ? 'succeeded' : 'errored',
+      terminalReason: cancelled ? 'provider_cancelled' : status === 'complete' ? 'provider_result' : 'provider_error',
+      terminalSynthetic: false,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: cancelled ? 'custom_tool_cancelled' : status === 'complete' ? 'custom_tool_result' : 'custom_tool_error',
+    } : {}),
     detail: {
       kind: 'customToolCall',
       summary: name,
@@ -1761,7 +1891,7 @@ function customToolFromItem(sessionId: string, item: Record<string, any>, lifecy
       ...(rawOutput !== undefined ? { output: rawOutput } : {}),
       meta: {
         status: item.status,
-        callId: meaningfulString(item.call_id) ?? meaningfulString(item.callId),
+        callId,
       },
       raw: item,
     },
@@ -2142,6 +2272,7 @@ export class CodexSdkProvider implements TransportProvider {
       activeToolItemIds: new Set(),
       activeCompactionItemIds: new Set(),
       openProviderToolCalls: new Map(),
+      customToolLifecycleByCallId: new Map(),
       runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       cancelled: false,
       cancelTimer: null,
@@ -3400,6 +3531,72 @@ export class CodexSdkProvider implements TransportProvider {
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
     if (state.cancelled) return true;
+    if (item.type === 'custom_tool_call') {
+      const tool = customToolFromItem(sessionId, item, 'started');
+      if (!tool) return false;
+      const turnId = readParamTurnId(params) ?? state.runningTurnId;
+      this.recordStrongActivity(sessionId, state, turnId);
+      this.emitTrackedProviderToolCall(sessionId, state, {
+        ...tool,
+        ...(turnId ? { turnId } : {}),
+      });
+      return true;
+    }
+
+    if (item.type === 'custom_tool_call_output') {
+      const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+      if (!callId) return false;
+      let prior = state.customToolLifecycleByCallId.get(callId)?.tool;
+      if (!prior) {
+        // A reconnect/version skew can deliver the result without its matching
+        // call notification. Emit a minimal running snapshot first so the
+        // transport relay has a card to terminate instead of an orphan result.
+        this.emitTrackedProviderToolCall(sessionId, state, {
+          id: callId,
+          name: meaningfulString(item.name) ?? 'custom_tool',
+          status: 'running',
+          detail: {
+            kind: 'customToolCall',
+            summary: meaningfulString(item.name) ?? 'custom_tool',
+            meta: { callId, status: 'running', synthesizedFromOutput: true },
+            raw: item,
+          },
+        });
+        prior = state.customToolLifecycleByCallId.get(callId)?.tool;
+      }
+      const terminal = customToolTerminalFromOutput(item);
+      const turnId = readParamTurnId(params) ?? state.runningTurnId;
+      this.recordStrongActivity(sessionId, state, turnId);
+      const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
+      const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+      this.emitTrackedProviderToolCall(sessionId, state, {
+        id: callId,
+        name: prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
+        status: terminal.status,
+        ...(prior?.input !== undefined ? { input: prior.input } : {}),
+        output: terminal.output,
+        terminalStatus: terminal.terminalStatus,
+        terminalReason: terminal.terminalReason,
+        terminalSynthetic: false,
+        terminalSource: 'app_server_jsonrpc',
+        terminalDecisionReason: terminal.terminalReason,
+        ...(turnId ? { turnId } : {}),
+        detail: {
+          kind: 'customToolCall',
+          summary: priorDetail?.summary ?? prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
+          ...(prior?.input !== undefined ? { input: prior.input } : {}),
+          output: item.output ?? item.result ?? item.content,
+          meta: {
+            ...priorMeta,
+            callId,
+            status: item.status ?? terminal.terminalStatus,
+          },
+          raw: item,
+        },
+      });
+      return true;
+    }
+
     if (item.type === 'function_call') {
       const name = meaningfulString(item.name);
       const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
@@ -4914,6 +5111,9 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private emitTrackedProviderToolCall(sessionId: string, state: CodexSdkSessionState, tool: ToolCallEvent): void {
+    const dedupedTool = this.dedupeCustomToolLifecycle(state, tool);
+    if (!dedupedTool) return;
+    tool = dedupedTool;
     const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
     if (tool.status === 'running' && !backgroundedSubagent) {
       state.openProviderToolCalls.set(tool.id, tool);
@@ -4931,6 +5131,59 @@ export class CodexSdkProvider implements TransportProvider {
         tool.terminalReason ?? (tool.status === 'complete' ? 'provider_result' : 'provider_error'),
         tool.id,
       );
+    }
+  }
+
+  private dedupeCustomToolLifecycle(state: CodexSdkSessionState, tool: ToolCallEvent): ToolCallEvent | null {
+    const detail = isRecord(tool.detail) ? tool.detail : undefined;
+    if (detail?.kind !== 'customToolCall') return tool;
+    const meta = isRecord(detail.meta) ? detail.meta : undefined;
+    const callId = meaningfulString(meta?.callId) ?? meaningfulString(tool.id);
+    if (!callId) return tool;
+
+    const priorLifecycle = state.customToolLifecycleByCallId.get(callId);
+    if (priorLifecycle?.terminal) return null;
+    const prior = priorLifecycle?.tool;
+    const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
+    const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+    const mergedDetail = {
+      ...(priorDetail ?? {}),
+      ...detail,
+      kind: 'customToolCall',
+      ...(tool.input !== undefined || prior?.input !== undefined ? { input: tool.input ?? prior?.input } : {}),
+      meta: { ...priorMeta, ...meta, callId },
+    };
+    const normalizedTool: ToolCallEvent = {
+      ...(prior ?? {}),
+      ...tool,
+      id: callId,
+      name: tool.name || prior?.name || 'custom_tool',
+      ...(tool.input !== undefined || prior?.input !== undefined ? { input: tool.input ?? prior?.input } : {}),
+      detail: mergedDetail,
+    };
+
+    // The same logical start can arrive once as a typed item and once as a raw
+    // response item. Retain whichever snapshot is richer, but emit only once.
+    if (tool.status === 'running' && priorLifecycle) {
+      state.customToolLifecycleByCallId.set(callId, { tool: normalizedTool, terminal: false });
+      state.openProviderToolCalls.set(callId, normalizedTool);
+      return null;
+    }
+
+    state.customToolLifecycleByCallId.set(callId, {
+      tool: normalizedTool,
+      terminal: tool.status !== 'running',
+    });
+    this.pruneCustomToolLifecycleCache(state);
+    return normalizedTool;
+  }
+
+  private pruneCustomToolLifecycleCache(state: CodexSdkSessionState): void {
+    if (state.customToolLifecycleByCallId.size <= CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT) return;
+    for (const [callId, lifecycle] of state.customToolLifecycleByCallId) {
+      if (!lifecycle.terminal) continue;
+      state.customToolLifecycleByCallId.delete(callId);
+      if (state.customToolLifecycleByCallId.size <= CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT) return;
     }
   }
 
@@ -5038,6 +5291,15 @@ export class CodexSdkProvider implements TransportProvider {
       ...(detail ? { detail } : {}),
     };
     state.openProviderToolCalls.delete(toolId);
+    const customDetail = isRecord(terminalTool.detail) ? terminalTool.detail : undefined;
+    const customMeta = isRecord(customDetail?.meta) ? customDetail.meta : undefined;
+    if (customDetail?.kind === 'customToolCall') {
+      const callId = meaningfulString(customMeta?.callId) ?? meaningfulString(toolId);
+      if (callId) {
+        state.customToolLifecycleByCallId.set(callId, { tool: terminalTool, terminal: true });
+        this.pruneCustomToolLifecycleCache(state);
+      }
+    }
     for (const cb of this.toolCallCallbacks) cb(sessionId, terminalTool);
   }
 

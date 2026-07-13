@@ -24,7 +24,7 @@ describe('codex-sdk toolFromItem — custom tools (exec)', () => {
     const tool = toolFromItem('codex-sess', execStarted, 'started');
     expect(tool).not.toBeNull();
     expect(tool).toMatchObject({
-      id: 'item-1',
+      id: 'call_51OQGJ7uM0PMQrl9Slueevwa',
       name: 'exec',
       status: 'running',
       input: { command: execStarted.input },
@@ -36,7 +36,7 @@ describe('codex-sdk toolFromItem — custom tools (exec)', () => {
     const done = { ...execStarted, status: 'completed', output: 'session 88588 ready' };
     const tool = toolFromItem('codex-sess', done, 'completed');
     expect(tool).toMatchObject({
-      id: 'item-1',
+      id: 'call_51OQGJ7uM0PMQrl9Slueevwa',
       name: 'exec',
       status: 'complete',
       output: 'session 88588 ready',
@@ -51,7 +51,7 @@ describe('codex-sdk toolFromItem — custom tools (exec)', () => {
   it('also catches a not-yet-enumerated custom tool type via the tool-shaped fallback', () => {
     const unknown = { id: 'x1', type: 'someFutureToolCall', name: 'weird_tool', call_id: 'c1', arguments: { a: 1 }, status: 'inProgress' };
     const tool = toolFromItem('codex-sess', unknown, 'started');
-    expect(tool).toMatchObject({ id: 'x1', name: 'weird_tool', status: 'running', input: { a: 1 } });
+    expect(tool).toMatchObject({ id: 'c1', name: 'weird_tool', status: 'running', input: { a: 1 } });
   });
 
   it('does NOT fabricate a tool card for non-tool items (no name / no call payload)', () => {

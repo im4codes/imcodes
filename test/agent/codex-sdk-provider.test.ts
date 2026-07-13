@@ -1300,6 +1300,232 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('correlates raw custom tool calls and outputs into one complete lifecycle', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-custom-tool', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-custom-tool', 'run a command');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'custom_tool_call',
+          id: 'ctc-1',
+          status: 'completed',
+          call_id: 'call-custom-1',
+          name: 'exec',
+          input: 'const r = await tools.exec_command({cmd:"pwd"}); text(r.output);',
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'custom_tool_call_output',
+          call_id: 'call-custom-1',
+          output: [
+            { type: 'input_text', text: 'Script completed' },
+            { type: 'input_text', text: '/tmp/project' },
+          ],
+        },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({
+      id: 'call-custom-1',
+      name: 'exec',
+      status: 'running',
+    });
+    expect(tools[1]).toMatchObject({
+      id: 'call-custom-1',
+      name: 'exec',
+      status: 'complete',
+      output: 'Script completed\n/tmp/project',
+      terminalStatus: 'succeeded',
+      terminalReason: 'provider_result',
+      terminalSynthetic: false,
+    });
+  });
+
+  it('terminates failed, cancelled, and output-less raw custom tools', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-custom-terminal', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-raw-custom-terminal', 'run tools');
+    const child = childProcessMock.children[0];
+
+    const emitCall = (callId: string) => child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call', call_id: callId, name: 'exec', input: `run ${callId}` },
+      },
+    });
+    const emitOutput = (callId: string, output: Record<string, unknown>) => child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call_output', call_id: callId, ...output },
+      },
+    });
+
+    emitCall('call-failed');
+    emitOutput('call-failed', { output: JSON.stringify({ output: 'boom', metadata: { exit_code: 2 } }) });
+    emitCall('call-cancelled');
+    emitOutput('call-cancelled', { status: 'cancelled' });
+    emitCall('call-empty');
+    emitOutput('call-empty', {});
+    await flush();
+
+    expect(tools.filter((tool) => tool.status !== 'running')).toMatchObject([
+      {
+        id: 'call-failed',
+        status: 'error',
+        output: 'boom',
+        terminalStatus: 'errored',
+        terminalReason: 'provider_error',
+      },
+      {
+        id: 'call-cancelled',
+        status: 'error',
+        output: '',
+        terminalStatus: 'cancelled',
+        terminalReason: 'provider_cancelled',
+      },
+      {
+        id: 'call-empty',
+        status: 'complete',
+        output: '',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      },
+    ]);
+  });
+
+  it('deduplicates a custom tool lifecycle exposed on raw and typed item channels', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-custom-tool-dedupe', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-custom-tool-dedupe', 'run once');
+    const child = childProcessMock.children[0];
+    const item = {
+      id: 'typed-item-1',
+      type: 'custom_tool_call',
+      call_id: 'call-shared-1',
+      name: 'exec',
+      input: 'run once',
+    };
+
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item },
+    });
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { ...item, status: 'inProgress' } },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call_output', call_id: 'call-shared-1', output: 'done' },
+      },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { ...item, status: 'completed', output: 'done' } },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools.map((tool) => [tool.id, tool.status])).toEqual([
+      ['call-shared-1', 'running'],
+      ['call-shared-1', 'complete'],
+    ]);
+  });
+
+  it('synthesizes an output-only custom call and closes a call whose output never arrives', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-custom-tool-missing-half', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-custom-tool-missing-half', 'run partial tools');
+    const child = childProcessMock.children[0];
+
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call_output', call_id: 'call-output-only', name: 'exec', output: 'recovered' },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call', call_id: 'call-no-output', name: 'exec', input: 'run and disappear' },
+      },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await flush();
+
+    expect(tools.map((tool) => ({
+      id: tool.id,
+      status: tool.status,
+      output: tool.output,
+      terminalStatus: tool.terminalStatus,
+      terminalReason: tool.terminalReason,
+      terminalSynthetic: tool.terminalSynthetic,
+    }))).toMatchObject([
+      { id: 'call-output-only', status: 'running' },
+      {
+        id: 'call-output-only',
+        status: 'complete',
+        output: 'recovered',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+        terminalSynthetic: false,
+      },
+      { id: 'call-no-output', status: 'running' },
+      {
+        id: 'call-no-output',
+        status: 'complete',
+        output: 'completed',
+        terminalStatus: 'succeeded',
+        terminalReason: 'app_server_completed',
+        terminalSynthetic: true,
+      },
+    ]);
+  });
+
   it('surfaces codex>=0.139 native turn/plan/updated events as checklist tool events (new+old compatible)', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
