@@ -24,12 +24,8 @@ import {
 } from '../services/controlled-node-artifact-catalog.js';
 
 function resolveTicketEncryptionKey(c: { env: Env }): string {
-  if (c.env.IMCODES_ENCRYPTION_KEY) return c.env.IMCODES_ENCRYPTION_KEY;
-  if ((c.env.NODE_ENV ?? 'development') === 'production') {
-    throw new Error('IMCODES_ENCRYPTION_KEY required for v2 ticket issuance in production');
-  }
   const key = c.env.BOT_ENCRYPTION_KEY;
-  if (!key) throw new Error('IMCODES_ENCRYPTION_KEY or BOT_ENCRYPTION_KEY required for v2 ticket issuance');
+  if (!key) throw new Error('BOT_ENCRYPTION_KEY required for v2 ticket issuance');
   return key;
 }
 

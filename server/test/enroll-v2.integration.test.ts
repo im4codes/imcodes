@@ -35,6 +35,7 @@ const sha256 = (value: string | Buffer) => createHash('sha256').update(value).di
 let exeDir: string;
 let artifactCatalog: ArtifactCatalog;
 const FAKE_BINARY = Buffer.from('IMCODES_FAKE_EXECUTABLE_BINARY_v1');
+const TEST_ENCRYPTION_KEY = 'test-bot-encryption-key-do-not-use-in-prod';
 
 async function writeManifest(
   fileName: 'imcodes-node-linux' | 'imcodes-node.exe' | 'imcodes-node-macos',
@@ -62,7 +63,6 @@ async function writeManifest(
 }
 
 beforeAll(async () => {
-  process.env.IMCODES_ENCRYPTION_KEY = process.env.IMCODES_ENCRYPTION_KEY || 'test-encryption-key-do-not-use-in-prod';
   process.env.NODE_ENV = 'development'; // default for HTTPS-off tests; per-test overrides
   db = createDatabase(process.env.TEST_DATABASE_URL!);
   await runMigrations(db);
@@ -75,7 +75,6 @@ beforeAll(async () => {
 afterAll(async () => {
   await rm(exeDir, { recursive: true, force: true });
   delete process.env.IMCODES_NODE_EXE_DIR;
-  delete process.env.IMCODES_ENCRYPTION_KEY;
   await db.close();
 });
 
@@ -106,8 +105,7 @@ function buildApp(options: { serverUrl?: string | null; artifactCatalog?: Artifa
     const serverUrl = options.serverUrl === undefined ? 'http://localhost' : options.serverUrl;
     (c as unknown as { env: Record<string, unknown> }).env = {
       DB: db,
-      IMCODES_ENCRYPTION_KEY: process.env.IMCODES_ENCRYPTION_KEY,
-      BOT_ENCRYPTION_KEY: 'unused',
+      BOT_ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
       JWT_SIGNING_KEY: 'unused',
       ...(serverUrl === null ? {} : { SERVER_URL: serverUrl }),
       DATABASE_URL: 'unused',
@@ -168,7 +166,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     expect(row?.encrypted_code).toBeTruthy();
     expect(row?.encrypted_code).not.toContain(body.ticket);
     const { decryptBotConfig } = await import('../src/security/crypto.js');
-    expect(decryptBotConfig(row!.encrypted_code, process.env.IMCODES_ENCRYPTION_KEY!).serverUrl).toBe('http://localhost');
+    expect(decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).serverUrl).toBe('http://localhost');
     expect(row?.used_at).toBeNull();
     expect(row?.install_id).toBeNull();
     expect(row?.node_token_hash).toBeNull();
@@ -325,6 +323,30 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
     });
     expect(response.status).toBe(403);
+  });
+
+  it('reuses BOT_ENCRYPTION_KEY for production ticket mint and download', async () => {
+    process.env.NODE_ENV = 'production';
+    const app = buildApp({ serverUrl: 'https://legacy-deployment.example' });
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+
+    const download = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(download.status).toBe(200);
+    const downloaded = Buffer.from(await download.arrayBuffer());
+    expect(downloaded.subarray(0, FAKE_BINARY.length)).toEqual(FAKE_BINARY);
+    expect(decodeEnrollmentTrailer(downloaded)?.serverUrl).toBe('https://legacy-deployment.example');
   });
 });
 
@@ -721,7 +743,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const row = await db.queryOne<{ encrypted_code: string; code_hash: string }>(
       'SELECT encrypted_code, code_hash FROM controlled_node_enrollments_v2 LIMIT 1',
     );
-    const encryptionKey = process.env.IMCODES_ENCRYPTION_KEY!;
+    const encryptionKey = TEST_ENCRYPTION_KEY;
     // Use the route helper via a tiny in-test decrypt using crypto module.
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const decrypted = decryptBotConfig(row!.encrypted_code, encryptionKey);
@@ -768,7 +790,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
-    const enrollCode = decryptBotConfig(row!.encrypted_code, process.env.IMCODES_ENCRYPTION_KEY!).enrollCode;
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
 
     const installId = `inst-${hex(4)}`;
     const nodeTokenHash = sha256(hex(16));
@@ -808,7 +830,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
-    const enrollCode = decryptBotConfig(row!.encrypted_code, process.env.IMCODES_ENCRYPTION_KEY!).enrollCode;
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
     const installId = `inst-${hex(4)}`;
     const originalHash = sha256(hex(16));
 
@@ -837,7 +859,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
-    const enrollCode = decryptBotConfig(row!.encrypted_code, process.env.IMCODES_ENCRYPTION_KEY!).enrollCode;
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
     const nodeTokenHash = sha256(hex(16));
     const r1 = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -863,7 +885,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
-    const enrollCode = decryptBotConfig(row!.encrypted_code, process.env.IMCODES_ENCRYPTION_KEY!).enrollCode;
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
     const r = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'i1', nodeTokenHash: sha256(hex(8)), hostname: 'h', os: 'win', arch: 'x64' }),

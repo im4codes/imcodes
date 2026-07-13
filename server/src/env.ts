@@ -7,15 +7,12 @@ export interface EnvConfig {
 
   // Secrets
   JWT_SIGNING_KEY: string;
-  BOT_ENCRYPTION_KEY: string;
   /**
-   * Symmetric secret used by the controlled-node download-ticket flow to
-   * encrypt the per-download enrollment code at rest (so a DB dump does not
-   * reveal valid un-redeemed codes). REQUIRED for v2 ticket issuance.
-   * Production requires a dedicated value for key separation and independent
-   * rotation. Development may fall back to BOT_ENCRYPTION_KEY for local tests.
+   * Symmetric secret used for platform bot credentials and controlled-node
+   * download tickets. Reusing this established key keeps existing deployments
+   * upgrade-compatible without introducing another required secret.
    */
-  IMCODES_ENCRYPTION_KEY?: string;
+  BOT_ENCRYPTION_KEY: string;
 
   // GitHub OAuth (optional — disables GitHub login if absent)
   GITHUB_CLIENT_ID?: string;
@@ -111,7 +108,6 @@ export function loadEnv(): EnvConfig {
     DATABASE_URL: process.env.DATABASE_URL!,
     JWT_SIGNING_KEY: process.env.JWT_SIGNING_KEY!,
     BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',
-    IMCODES_ENCRYPTION_KEY: process.env.IMCODES_ENCRYPTION_KEY ?? '',
     GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
