@@ -319,7 +319,12 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+      # The cross-layer suite intentionally executes daemon MCP code as well as
+      # server code, so both dependency trees must be present in this job.
+      - run: ./scripts/ci-npm-ci.sh .
       - run: ./scripts/ci-npm-ci.sh server
       - name: Warm DB test container image
         shell: bash

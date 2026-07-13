@@ -121,6 +121,12 @@ async function waitForTransportSend(predicate: (text: string) => boolean, maxMs 
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  // Under a saturated CI worker, the final polling timer can resume after the
+  // deadline even though the send was recorded while that timer was delayed.
+  // Check once more before reporting a timeout instead of discarding it solely
+  // because the event loop crossed the wall-clock boundary.
+  const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  if (found) return found;
   throw new Error('Expected transport send was not observed');
 }
 
