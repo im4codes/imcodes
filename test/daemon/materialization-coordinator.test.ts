@@ -3,7 +3,7 @@ import type { ContextNamespace, ContextTargetRef } from '../../shared/context-ty
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { localOnlyCompressor, type CompressionInput } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
-import { commitMaterialization, getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
+import { claimContextJob, commitMaterialization, getArchivedEvent, getReplicationState, listContextEvents, queryProcessedProjections } from '../../src/store/context-store.js';
 import { getContextStoreClient, resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -177,6 +177,41 @@ describe('MaterializationCoordinator', () => {
     expect(calls[1].previousSummary).toBeUndefined();
     expect(first.summaryProjection.content.hadPreviousSummary).toBe(false);
     expect(second.summaryProjection.content.hadPreviousSummary).toBe(true);
+  });
+
+  it('compresses a coalesced materialization job only once across overlapping callers', async () => {
+    let releaseCompression!: () => void;
+    let markCompressionStarted!: () => void;
+    const compressionStarted = new Promise<void>((resolve) => { markCompressionStarted = resolve; });
+    const compressionGate = new Promise<void>((resolve) => { releaseCompression = resolve; });
+    const compressor = vi.fn(async () => {
+      markCompressionStarted();
+      await compressionGate;
+      return {
+        summary: '## Problem\nDeduplicate overlapping materialization\n\n## Done\nCompressed once.',
+        model: 'test-model',
+        backend: 'test-backend',
+        usedBackup: false,
+        fromSdk: true,
+      };
+    });
+    const coordinator = new MaterializationCoordinator({
+      compressor,
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+    await coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'compress me once', createdAt: 100 });
+
+    const first = coordinator.materializeTarget(target, 'manual', 500);
+    await compressionStarted;
+    const duplicate = await coordinator.materializeTarget(target, 'manual', 501);
+
+    expect(duplicate).toEqual({ replicationQueued: false });
+    expect(compressor).toHaveBeenCalledTimes(1);
+
+    releaseCompression();
+    const completed = await first;
+    expect(completed.summaryProjection?.summary).toContain('Compressed once.');
+    expect(compressor).toHaveBeenCalledTimes(1);
   });
 
   it('excludes tool.call and assistant.delta from materialized summaries even when present in staged events', async () => {
@@ -362,8 +397,13 @@ describe('MaterializationCoordinator', () => {
     const callSpy = vi.spyOn(client, 'call').mockImplementation(
       // Simulate the worker by running the real atomic commit in-process.
       (async (op: string, args: unknown[]) => {
-        if (op !== 'commitMaterialization') throw new Error(`unexpected op ${op}`);
-        return commitMaterialization(args[0] as Parameters<typeof commitMaterialization>[0]);
+        if (op === 'claimContextJob') {
+          return claimContextJob(args[0] as string, args[1] as number);
+        }
+        if (op === 'commitMaterialization') {
+          return commitMaterialization(args[0] as Parameters<typeof commitMaterialization>[0]);
+        }
+        throw new Error(`unexpected op ${op}`);
       }) as typeof client.call,
     );
 
