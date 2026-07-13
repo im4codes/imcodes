@@ -2693,6 +2693,83 @@ exec "${realGit}" "$@"
     expect([...p2pRuns.values()]).toHaveLength(1);
   });
 
+  it('continues implementation repair on fixable work even when external blocked_items are also listed', async () => {
+    // Regression: status="incomplete" (locally-fixable gaps) plus a non-empty
+    // blocked_items list (external deploy/CI/hardware) must NOT hard-stop as
+    // needs_human:repair_completion_blocked — the fixable work still earns a
+    // repair round; the external blockers are only surfaced to the human.
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-incomplete-with-external-blockers');
+    const unresolved = 'test/staging.test.ts:42 — add durable-step fault-injection coverage';
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: [unresolved],
+      repair_completion: repairCompletion({
+        status: 'incomplete',
+        previous_items_complete: false,
+        completed_items: [],
+        incomplete_items: [unresolved],
+        blocked_items: [
+          '9.3 authorized commit/push/CI/production release',
+          '13.13 native Linux/Windows build + device evidence',
+        ],
+        summary: 'A locally-testable fault-injection gap remains; external release/hardware items are blocked.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tasks' || module === 'tests' || module === 'risk' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    });
+    await emitDeckDemoIdle();
+
+    // It dispatches another implementation repair round for the fixable gap...
+    const repairPrompt = await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes(unresolved)
+      && text.includes('Do not write another audit report. Edit the product code, tests, and tasks.md now'),
+      SEND_WAIT_MS,
+    );
+    expect(repairPrompt).toContain('Previous implementation audit verdict: REWORK');
+    // ...and lands in the implementation loop rather than terminalizing to human.
+    const gate = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && String(msg.projection?.lastMessage ?? '').includes('quality_gate_low_score:tasks=5,tests=5,risk=5'),
+      SEND_WAIT_MS,
+    );
+    expect(gate.projection.status).toBe('implementation_task_loop');
+    expect(String(gate.projection.lastMessage ?? '')).not.toContain('repair_completion_blocked');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('hands off to a human only when no fixable work remains and external blockers persist', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-truly-blocked');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['authorized production release still pending'],
+      repair_completion: repairCompletion({
+        status: 'blocked',
+        previous_items_complete: true,
+        completed_items: ['all in-repo repair items verified'],
+        incomplete_items: [],
+        blocked_items: ['9.3 authorized commit/push/CI/production release'],
+        summary: 'All in-repo repairs are complete; only an authorized external release remains.',
+      }),
+      module_scores: OPENSPEC_AUTO_DELIVER_SCORE_MODULE_IDS.map((module) => ({
+        module,
+        score: module === 'tasks' || module === 'tests' || module === 'risk' ? 5 : 8,
+        max_score: 10,
+        summary: `${module} final acceptance`,
+      })),
+    });
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
+    expect(terminal?.projection.status).toBe('needs_human');
+    expect(String(terminal?.projection.terminalReason ?? '')).toContain('repair_completion_blocked');
+    expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
   it('starts another Team implementation audit only after final acceptance says previous repairs are complete but still low scoring', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-final-complete-low-score-new-round');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, {

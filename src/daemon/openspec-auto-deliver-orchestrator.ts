@@ -1857,7 +1857,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     '- repair_completion.previous_items_complete must answer whether ALL previous required_changes, unchecked/falsely-complete tasks, repair scorecard gates, and repair task checklist/fallback plan items are now completed.',
     '- Use status="incomplete" and previous_items_complete=false when the prior repair checklist was not fully completed; list exact unfinished prior items in incomplete_items.',
     '- Use status="complete" and previous_items_complete=true only when the prior repair checklist is complete. If the checklist is complete but new or deeper issues still make the score low, put those new issues in required_changes.',
-    '- Use status="blocked" only for external blockers that cannot be repaired in this repository; list blockers in blocked_items.',
+    '- Use status="blocked" ONLY when NO in-repo repair remains and progress is impossible without external action (deployment, authorization, CI/release, physical hardware/device evidence). If ANY remaining gap is fixable or testable in this repository, use status="incomplete" — even if you also list genuinely external items in blocked_items.',
+    '- blocked_items are surfaced to the human but do NOT by themselves stop the automated repair loop: while incomplete_items remain, Auto Deliver keeps repairing the fixable work and only hands off to a human once nothing fixable is left. Never park a repairable/testable gap in blocked_items to force a stop; put it in incomplete_items.',
     '- Fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     '',
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences.',
@@ -1866,7 +1867,7 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     `Verdict scope for this final ${specStage ? 'specification' : 'implementation'} acceptance audit:`,
     passScope,
     reworkScope,
-    '- BLOCKED only for external blockers that cannot be repaired in this repository.',
+    '- BLOCKED (status="blocked") only when NO in-repo repair remains; a fixable/testable gap is REWORK/incomplete, not blocked, even if external items are also listed in blocked_items.',
     scoreScope,
     '',
     'Scoring discipline:',
@@ -2951,14 +2952,19 @@ type RepairCompletionDecision = 'complete' | 'incomplete' | 'blocked' | 'unknown
 function repairCompletionDecision(verdict: OpenSpecAutoDeliverVerdictPayload): RepairCompletionDecision {
   const completion = verdict.repair_completion;
   if (!completion) return 'unknown';
-  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
-  if (
-    completion.status === 'incomplete'
+  // In-repo fixable work takes PRIORITY over external blockers. The auditor uses
+  // blocked_items to surface external blockers (deploy/CI/hardware/authorization)
+  // for the human while STILL asking for a REWORK of the locally-fixable gaps in
+  // incomplete_items. A non-empty blocked_items list alone MUST NOT hard-stop the
+  // run — doing so throws away the auto-repair round for work that can actually be
+  // fixed here (the exact `status:incomplete + blocked_items:[…]` → needs_human
+  // over-trigger). Only a run with NO fixable work left and genuine blockers is
+  // handed to a human.
+  const hasFixableWork = completion.status === 'incomplete'
     || completion.previous_items_complete === false
-    || completion.incomplete_items.length > 0
-  ) {
-    return 'incomplete';
-  }
+    || completion.incomplete_items.length > 0;
+  if (hasFixableWork) return 'incomplete';
+  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
   if (completion.status === 'complete' && completion.previous_items_complete === true) return 'complete';
   return 'unknown';
 }
