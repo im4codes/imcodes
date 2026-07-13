@@ -2035,6 +2035,17 @@ export function App() {
   }, [showSharedContextManagement, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   useEffect(() => {
+    if (showControlledNodes) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+        kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes);
+    }
+  }, [showControlledNodes, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
     if (showSharedContextDiagnostics) {
       ensureDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextDiagnostics, {
         kind: DESKTOP_WINDOW_KINDS.sharedContextDiagnostics,
@@ -4689,7 +4700,13 @@ export function App() {
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={() => setShowControlledNodes(true)}
+                onClick={() => {
+                  ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+                    kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+                    serverId: selectedServerId ?? undefined,
+                  }, { bringToFront: true });
+                  setShowControlledNodes(true);
+                }}
               >
                 {trans('controlled_nodes.title')}
               </button>
@@ -5755,6 +5772,8 @@ export function App() {
           onClose={() => setShowControlledNodes(false)}
           defaultW={720}
           defaultH={560}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.controlledNodes, 5100)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.controlledNodes)}
         >
           <ControlledNodesPanel />
         </FloatingPanel>

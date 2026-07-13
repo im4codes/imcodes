@@ -284,7 +284,7 @@ describe('shared-context and file API contracts', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(revokeSpy).toHaveBeenCalledWith('blob:imcodes');
 
-    vi.stubGlobal('Capacitor', {});
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
     await downloadAttachment('srv-1', 'att-3');
     expect(browserOpenMock).toHaveBeenCalledWith({
       url: `https://api.example/api/server/srv-1/uploads/att-3/download?token=${'x'.repeat(32)}`,

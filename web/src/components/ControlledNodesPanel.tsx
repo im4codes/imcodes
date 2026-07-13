@@ -16,6 +16,7 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { useMachines } from '../hooks/useMachines.js';
+import { isNative } from '../native.js';
 
 function formatByteSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -101,9 +102,8 @@ export function ControlledNodesPanel() {
     const key = artifactSelectionKey(target);
     setDownloadingKey(key);
     setDownloadError(null);
-    const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
     let desktopWindow: Window | null = null;
-    if (!isNative) {
+    if (!isNative()) {
       try {
         desktopWindow = beginControlledNodeDesktopDownload();
       } catch (err) {

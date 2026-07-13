@@ -130,8 +130,7 @@ export async function buildAttachmentDownloadUrl(serverId: string, attachmentId:
   const encodedServerId = encodeURIComponent(serverId);
   const encodedAttachmentId = encodeURIComponent(attachmentId);
   const baseUrl = _baseUrl || window.location.origin;
-  const isNativeRuntime = !!(globalThis as Record<string, unknown>).Capacitor;
-  if (!isNativeRuntime) {
+  if (!isNative()) {
     return `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download`;
   }
   const tokenRes = await apiFetch(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, { method: 'POST' });
@@ -1499,8 +1498,7 @@ export async function uploadFile(
 export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
   // Native: skip blob fetch — WebViews can't reliably trigger downloads from blob URLs.
   // Get a one-time token and open in system browser which handles save natively.
-  const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
-  if (isNative) {
+  if (isNative()) {
     const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId);
     const { Browser } = await import('@capacitor/browser');
     await Browser.open({ url: downloadUrl });
@@ -1587,14 +1585,14 @@ export async function downloadControlledNodeExecutable(
   opts: ControlledNodeDownloadOptions = {},
 ): Promise<import('./api/machines.js').ControlledNodeExecutableTicket> {
   const { mintControlledNodeExecutableTicket, buildControlledNodeBootstrapUrl } = await import('./api/machines.js');
-  const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
-  const desktopWindow = !isNative ? (opts.desktopWindow ?? null) : null;
-  if (!isNative && !desktopWindow) throw new Error('desktop_window_required');
+  const nativeRuntime = isNative();
+  const desktopWindow = !nativeRuntime ? (opts.desktopWindow ?? null) : null;
+  if (!nativeRuntime && !desktopWindow) throw new Error('desktop_window_required');
 
   try {
     const ticket = await mintControlledNodeExecutableTicket(selection);
     const url = buildControlledNodeBootstrapUrl(ticket.ticket);
-    if (isNative) {
+    if (nativeRuntime) {
       const { Browser } = await import('@capacitor/browser');
       await Browser.open({ url });
       return ticket;

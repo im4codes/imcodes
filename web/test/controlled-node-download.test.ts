@@ -22,7 +22,10 @@ import {
 } from '../src/api.js';
 import { buildControlledNodeDownloadTargets } from '../src/api/machines.js';
 
-afterEach(() => { vi.clearAllMocks(); });
+afterEach(() => {
+  vi.clearAllMocks();
+  vi.unstubAllGlobals();
+});
 
 const VALID_SHA256 = 'a'.repeat(64);
 
@@ -95,7 +98,8 @@ describe('controlledNodeDownloadErrorKey', () => {
 });
 
 describe('controlled-node desktop download', () => {
-  it('pre-opens a blank window before awaiting ticket mint', async () => {
+  it('uses the desktop flow when the Capacitor web shim is present', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
     const callOrder: string[] = [];
     const mockWin = {
       location: { href: 'about:blank' },

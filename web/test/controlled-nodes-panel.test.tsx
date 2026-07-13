@@ -71,7 +71,12 @@ vi.mock('../src/api.js', async (importOriginal) => {
 
 import { ControlledNodesPanel } from '../src/components/ControlledNodesPanel.js';
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); machines = []; });
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.unstubAllGlobals();
+  machines = [];
+});
 
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
 
@@ -92,7 +97,8 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('9.4 MB');
   });
 
-  it('clicking a download button pre-opens desktop window then mints with os and arch', async () => {
+  it('clicking a download button uses desktop flow with the Capacitor web shim present', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
     const { container } = render(<ControlledNodesPanel />);
     const btn = await waitFor(() => {
       const b = Array.from(container.querySelectorAll('.controlled-nodes-download-btn')).find((x) =>

@@ -715,18 +715,44 @@ describe('App shell', () => {
     expect(ws.connect).toHaveBeenCalled();
   }, 20_000);
 
-  it('opens controlled-node management from the desktop sidebar', async () => {
+  it('opens controlled-node management above sub-session windows and re-fronts it from the sidebar', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_open_subs_deck_alpha_brain', JSON.stringify(['sub-1']));
+    useSubSessionsState.subSessions = [{
+      id: 'sub-1',
+      sessionName: 'deck_sub_alpha_helper',
+      parentSession: 'deck_alpha_brain',
+      label: 'Helper',
+      description: 'Helper session',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
 
     const { App } = await importApp();
     render(<App />);
 
     await waitFor(() => expect(wsInstances.length).toBe(1));
+    const subWindow = await screen.findByTestId('sub-session-window-sub-1');
     fireEvent.click(await screen.findByText('controlled_nodes.title'));
 
     const panel = await screen.findByTestId('floating-panel-controlled-nodes');
     expect(panel.textContent).toContain('controlled-nodes-panel');
+    const panelZ = () => Number((panel as HTMLElement).style.zIndex);
+    const subZ = () => Number((subWindow as HTMLElement).style.zIndex);
+
+    await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
+
+    fireEvent.mouseDown(subWindow);
+    await waitFor(() => expect(subZ()).toBeGreaterThan(panelZ()));
+
+    fireEvent.click(screen.getByText('controlled_nodes.title'));
+    await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
   }, 20_000);
 
   it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {
