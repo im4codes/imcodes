@@ -1710,6 +1710,64 @@ function collabAgentToolFromItem(
   };
 }
 
+/**
+ * Surface a Codex CUSTOM tool call (e.g. the newer unified `exec` tool, whose
+ * rollout records are `custom_tool_call{name,input,call_id,status}`) as a
+ * timeline tool card. Older Codex shells arrived as `commandExecution`; the
+ * current binary drives shell/JS execution through a custom tool that lands in
+ * `toolFromItem`'s default branch and used to be dropped — so a turn doing all
+ * its work via `exec` showed NO tool updates in the UI. This maps any
+ * tool-call-shaped item (has an id, a name, and a call payload) to a tool card,
+ * so custom tools are visible regardless of the exact app-server item.type.
+ * Returns null for non-tool items (no name / no call payload), so structural
+ * items are never turned into spurious tool cards.
+ */
+function customToolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+  void sessionId;
+  const id = meaningfulString(item.id) ?? meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+  const name = meaningfulString(item.name) ?? meaningfulString(item.tool);
+  if (!id || !name) return null;
+  const rawInput = item.input ?? item.arguments ?? item.command ?? item.script;
+  const hasCallShape = rawInput !== undefined
+    || meaningfulString(item.call_id) !== undefined
+    || meaningfulString(item.callId) !== undefined;
+  if (!hasCallShape) return null; // not a tool call — do not fabricate a card
+  const status: ToolCallEvent['status'] = item.status === 'inProgress' || item.status === 'running' || lifecycle === 'started'
+    ? 'running'
+    : item.status === 'failed' || item.status === 'error'
+      ? 'error'
+      : 'complete';
+  const input = typeof rawInput === 'string'
+    ? { command: rawInput }
+    : isRecord(rawInput)
+      ? rawInput
+      : rawInput !== undefined
+        ? { input: rawInput }
+        : {};
+  const rawOutput = item.output ?? item.aggregatedOutput ?? item.result;
+  const output = rawOutput === undefined
+    ? undefined
+    : typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput);
+  return {
+    id,
+    name,
+    status,
+    input,
+    ...(status !== 'running' && output !== undefined ? { output } : {}),
+    detail: {
+      kind: 'customToolCall',
+      summary: name,
+      input,
+      ...(rawOutput !== undefined ? { output: rawOutput } : {}),
+      meta: {
+        status: item.status,
+        callId: meaningfulString(item.call_id) ?? meaningfulString(item.callId),
+      },
+      raw: item,
+    },
+  };
+}
+
 export function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
   if (typeof item.type === 'string' && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(item.type))) {
     return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
@@ -1876,8 +1934,18 @@ export function toolFromItem(sessionId: string, item: Record<string, any>, lifec
         detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
       };
     }
+    case 'customToolCall':
+    case 'custom_tool_call':
+    case 'customTool':
+    case 'custom_tool':
+    case 'localShellCall':
+    case 'local_shell_call':
+      return customToolFromItem(sessionId, item, lifecycle);
     default:
-      return null;
+      // Best-effort: surface any remaining tool-call-shaped item (id + name +
+      // call payload) so a not-yet-enumerated Codex tool type is still visible
+      // instead of silently dropped. Non-tool items return null here.
+      return customToolFromItem(sessionId, item, lifecycle);
   }
 }
 
