@@ -3153,31 +3153,44 @@ export class CodexSdkProvider implements TransportProvider {
     // the window before this turn's own task_started has been flushed to disk.
     const turnStartedAtMs = state.activeTurnLease?.startedAtMs ?? state.activeTurnLease?.turnStartInFlightAtMs ?? null;
     try {
-      // ONE session-scoped tail read (the rollout file is already per-thread), and
-      // we judge turn liveness by the tail's LAST lifecycle marker rather than by
-      // matching a specific turn_id. This is immune to the exact failure that used
-      // to strand a finished turn as "working" forever: in-memory runningTurnId
-      // desynced from the turn_id codex-core actually wrote (turn/start result
-      // missing / late / wrong id), so the turnId-scoped match never fired even
-      // though task_complete was durably on disk. We settle when the terminal
-      // record is a task_complete that either matches the tracked turn id OR was
-      // written at/after this turn started (the start-time guard, above).
-      const terminal = await this.rolloutTailReportsTerminalTaskComplete(state);
-      if (!terminal) return;
-      const desync = terminal.turnId !== turnId;
-      if (desync) {
-        if (turnStartedAtMs == null || terminal.completedAtMs == null || terminal.completedAtMs < turnStartedAtMs) return;
+      // Fast path — UNCHANGED behavior/timing: settle when the tracked turn's own
+      // task_complete is on disk. Keeping this first preserves the exact prior
+      // code path (and timing) for every healthy turn.
+      let evidence: CodexRolloutTaskCompleteEvidence | null = await this.rolloutTailReportsTaskComplete(state, turnId);
+      let settledTurnId = turnId;
+      let desync = false;
+      if (!evidence) {
+        // Desync fallback: the tracked turnId no longer matches the turn_id
+        // codex-core actually wrote (turn/start result missing / late / wrong id),
+        // so the turnId-scoped match above never fires even though task_complete
+        // is durably on disk — the exact case that used to strand a finished turn
+        // as "working" forever. The rollout file is already session-scoped, so
+        // judge liveness by the tail's LAST lifecycle marker and settle when the
+        // terminal task_complete was written at/after this turn started (the
+        // start-time guard rejects a stale prior turn's completion).
+        const terminal = await this.rolloutTailReportsTerminalTaskComplete(state);
+        if (
+          terminal
+          && terminal.turnId !== turnId
+          && turnStartedAtMs != null
+          && terminal.completedAtMs != null
+          && terminal.completedAtMs >= turnStartedAtMs
+        ) {
+          evidence = terminal;
+          settledTurnId = terminal.turnId;
+          desync = true;
+        }
       }
-      const settledTurnId = terminal.turnId;
+      if (!evidence) return;
       const latest = this.sessions.get(sessionId);
       if (!latest) return;
       if (latest.cancelled || latest.runningCompact || this.isClosedCodexTurn(latest, settledTurnId)) return;
       // A missing turn/start RPC response can leave startTurn() awaiting forever;
       // record the terminal turn so a very late response cannot re-run it.
       if (latest.turnStartInFlight) latest.terminalDuringTurnStartIds.add(settledTurnId);
-      if (terminal.lastAgentMessage && latest.currentText !== terminal.lastAgentMessage) {
+      if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
         latest.currentMessageId = `${settledTurnId}:rollout-task-complete`;
-        latest.currentText = terminal.lastAgentMessage;
+        latest.currentText = evidence.lastAgentMessage;
       }
       logger.warn({
         provider: this.id,
