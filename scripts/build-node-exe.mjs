@@ -14,13 +14,20 @@
 // SEA produces a binary for the HOST platform only; CI runs one matrix job per OS.
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
-import { mkdir, rm, copyFile, writeFile, chmod, stat } from 'node:fs/promises';
+import { mkdir, rm, copyFile, writeFile, chmod, stat, readFile, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import {
+  createNodeExeManifest,
+  verifyOfficialNodeArtifact,
+  writeNodeExeManifest,
+  NODE_EXE_MANIFEST_SUFFIX,
+} from './node-exe-artifacts.mjs';
 
 const NODE_VERSION = process.env.NODE_EXE_NODE_VERSION ?? 'v22.11.0';
-const MIRROR = process.env.NODE_EXE_MIRROR ?? 'https://registry.npmmirror.com/-/binary/node';
+const OFFICIAL_NODE_DIST = 'https://nodejs.org/dist';
+const MIRROR = (process.env.NODE_EXE_MIRROR ?? OFFICIAL_NODE_DIST).replace(/\/+$/, '');
 const SEA_FUSE = 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2';
 
 const platform = process.platform; // darwin | linux | win32
@@ -38,23 +45,37 @@ async function ensureOfficialNode() {
   const nodePlatform = platform === 'win32' ? 'win' : platform; // darwin|linux|win
   const dirName = `node-${NODE_VERSION}-${nodePlatform}-${arch}`;
   const cacheRoot = process.env.NODE_EXE_CACHE ?? join(tmpdir(), 'officialnode');
+  const archiveName = `${dirName}.${isWin ? 'zip' : 'tar.gz'}`;
+  const archivePath = join(cacheRoot, archiveName);
+  const archiveTemp = `${archivePath}.${process.pid}.tmp`;
+  const shasumsPath = join(workDir, 'SHASUMS256.txt');
   const nodeBin = isWin
     ? join(cacheRoot, dirName, 'node.exe')
     : join(cacheRoot, dirName, 'bin', 'node');
-  if (existsSync(nodeBin)) return nodeBin;
   await mkdir(cacheRoot, { recursive: true });
-  if (isWin) {
-    // Windows ships a standalone node.exe under win-x64/.
-    sh('curl', ['-fsSL', `${MIRROR}/${NODE_VERSION}/win-${arch}/node.exe`, '-o', nodeBin]);
-    return nodeBin;
+  await mkdir(workDir, { recursive: true });
+
+  // The mirror is only a byte source. Trust is anchored to the official
+  // nodejs.org SHASUMS256 entry for the exact archive on every build, including
+  // cache hits. A corrupted cache or mirror response therefore fails closed.
+  sh('curl', ['-fsSL', `${OFFICIAL_NODE_DIST}/${NODE_VERSION}/SHASUMS256.txt`, '-o', shasumsPath]);
+  if (!existsSync(archivePath)) {
+    await rm(archiveTemp, { force: true });
+    sh('curl', ['-fsSL', `${MIRROR}/${NODE_VERSION}/${archiveName}`, '-o', archiveTemp]);
+    await rename(archiveTemp, archivePath);
   }
-  const tarball = `${dirName}.tar.gz`;
-  sh('bash', ['-c', `cd ${cacheRoot} && curl -fsSL ${MIRROR}/${NODE_VERSION}/${tarball} -o n.tgz && tar xzf n.tgz && rm n.tgz`]);
-  return nodeBin;
+  const nodeArchiveSha256 = await verifyOfficialNodeArtifact(archivePath, archiveName, await readFile(shasumsPath, 'utf8'));
+
+  // Re-extract from the verified archive so a tampered extracted cache cannot
+  // bypass archive verification.
+  await rm(join(cacheRoot, dirName), { recursive: true, force: true });
+  sh('tar', ['-xf', archivePath, '-C', cacheRoot]);
+  if (!existsSync(nodeBin)) throw new Error(`verified Node archive did not contain ${nodeBin}`);
+  return { nodeBin, nodeArchive: archiveName, nodeArchiveSha256 };
 }
 
 async function main() {
-  const officialNode = await ensureOfficialNode();
+  const { nodeBin: officialNode, nodeArchive, nodeArchiveSha256 } = await ensureOfficialNode();
   await rm(workDir, { recursive: true, force: true });
   await mkdir(workDir, { recursive: true });
   await mkdir(buildDir, { recursive: true });
@@ -80,14 +101,32 @@ async function main() {
   await chmod(outPath, 0o755).catch(() => {});
   if (platform === 'darwin') { try { sh('codesign', ['--remove-signature', outPath]); } catch { /* unsigned already */ } }
 
-  // 5. postject-inject the SEA blob.
+  // 5. postject-inject the SEA blob with the exact lockfile dependency. Never
+  // resolve mutable registry state during a release build.
   const postjectArgs = [outPath, 'NODE_SEA_BLOB', blobPath, '--sentinel-fuse', SEA_FUSE];
   if (platform === 'darwin') postjectArgs.push('--macho-segment-name', 'NODE_SEA');
-  sh('npx', ['-y', 'postject', ...postjectArgs]);
+  const postjectPackage = JSON.parse(await readFile(join(root, 'node_modules', 'postject', 'package.json'), 'utf8'));
+  const postjectVersion = postjectPackage.version;
+  if (typeof postjectVersion !== 'string' || !postjectPackage.bin?.postject) throw new Error('invalid installed postject package');
+  sh(process.execPath, [join(root, 'node_modules', 'postject', postjectPackage.bin.postject), ...postjectArgs]);
   if (platform === 'darwin') { try { sh('codesign', ['--sign', '-', outPath]); } catch { /* ad-hoc sign best-effort */ } }
 
   const { size } = await stat(outPath);
+  const buildCommit = process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  const manifestPath = `${outPath}${NODE_EXE_MANIFEST_SUFFIX}`;
+  const manifest = await createNodeExeManifest({
+    artifactPath: outPath,
+    os: platform,
+    arch,
+    nodeVersion: NODE_VERSION,
+    nodeArchive,
+    nodeArchiveSha256,
+    postjectVersion,
+    buildCommit,
+  });
+  await writeNodeExeManifest(manifest, manifestPath);
   console.log(`\n✅ built ${outName} (${(size / 1048576).toFixed(1)} MB) at ${outPath}`);
+  console.log(`✅ wrote verified artifact manifest at ${manifestPath}`);
 }
 
 main().catch((err) => { console.error('build failed:', err?.message ?? err); process.exit(1); });

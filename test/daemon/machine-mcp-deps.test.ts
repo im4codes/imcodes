@@ -7,10 +7,12 @@ type ClientMachine = { serverId: string; name: string; refName: string; displayN
 const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
 
 describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', () => {
-  it('returns [] and a feature_disabled exec when the daemon is unbound', async () => {
+  it('unbound daemon: exec → FEATURE_DISABLED, list throws an unbound-kind control-plane error (not an empty list)', async () => {
+    const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => null });
-    expect(await deps.listMachines({})).toEqual([]);
     expect(await deps.execRemote({ machine: 'a', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+    await expect(deps.listMachines({})).rejects.toMatchObject({ name: 'MachineControlPlaneError', kind: 'unbound' });
+    void MachineControlPlaneError;
   });
 
   it('maps client machines to ref_name-keyed summaries', async () => {
@@ -19,7 +21,19 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       listMachines: async () => [m({ serverId: 'srvA', refName: 'mac-a1b2', displayName: 'My Mac', os: 'darwin' })],
       execRemote: async () => ({ outcome: 'completed' }),
     });
-    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: 'mac-a1b2', displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true }]);
+    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: 'mac-a1b2', displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true, role: 'controlled' }]);
+  });
+
+  it('a control-plane failure during exec name-resolution surfaces as control_plane_unavailable, NOT machine_not_found', async () => {
+    const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => { throw new MachineControlPlaneError('http_status', 'machines API returned http_503'); },
+      execRemote: exec,
+    });
+    expect(await deps.execRemote({ machine: 'anything', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE });
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it('unknown ref_name → machine_not_found (never a silent retarget)', async () => {

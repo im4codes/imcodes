@@ -4,7 +4,7 @@
 // accepted ONLY from that exact (serverId, generation) with a matching in-flight
 // correlationId; everything else is dropped and counted. A new connection
 // generation abandons all prior-generation pendings as `indeterminate`.
-import type { RemoteExecResult } from '../../../shared/remote-exec.js';
+import type { MachineExecResultFrame, RemoteExecResult } from '../../../shared/remote-exec.js';
 
 interface PendingExec {
   targetServerId: string;
@@ -49,10 +49,9 @@ export function registerPendingExec(
 export function resolvePendingExec(
   fromServerId: string,
   fromGeneration: number,
-  result: RemoteExecResult & { correlationId?: string },
+  result: MachineExecResultFrame,
 ): boolean {
-  const correlationId = typeof result.correlationId === 'string' ? result.correlationId : undefined;
-  if (!correlationId) { droppedResults++; return false; }
+  const correlationId = result.correlationId;
   const entry = pending.get(correlationId);
   if (!entry || entry.targetServerId !== fromServerId || entry.generation !== fromGeneration) {
     droppedResults++;
@@ -60,8 +59,46 @@ export function resolvePendingExec(
   }
   pending.delete(correlationId);
   clearTimeout(entry.timer);
-  entry.resolve(result);
+  // `RemoteExecResult` keeps the historical requestId field for route/MCP
+  // consumers. The trusted wire identity is correlationId, so derive requestId
+  // server-side rather than accepting a second caller-controlled identity.
+  entry.resolve({ requestId: correlationId, ...result });
   return true;
+}
+
+/**
+ * Cancel a single in-flight pending without delivering a result — used when the
+ * relay could not actually hand the frame to the socket (send failed / offline /
+ * generation changed between register and send). The awaiting relay treats a
+ * `null` resolution as `not_dispatched` when it also knows the send never landed.
+ * Idempotent: a no-op if the entry is already gone (e.g. deadline fired).
+ */
+export function cancelPendingExec(correlationId: string): boolean {
+  const entry = pending.get(correlationId);
+  if (!entry) return false;
+  pending.delete(correlationId);
+  clearTimeout(entry.timer);
+  entry.resolve(null);
+  return true;
+}
+
+/**
+ * Abandon EVERY in-flight pending for a target regardless of generation — used on
+ * revocation / forced disconnect. Each resolves to `null` so an exec that was
+ * already sent surfaces as indeterminate (`dispatched_no_result`) rather than a
+ * fabricated success/failure. Returns the number abandoned.
+ */
+export function abandonAllForTarget(targetServerId: string): number {
+  let abandoned = 0;
+  for (const [id, entry] of pending) {
+    if (entry.targetServerId === targetServerId) {
+      pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.resolve(null); // → dispatched_no_result (indeterminate)
+      abandoned++;
+    }
+  }
+  return abandoned;
 }
 
 /** Abandon all pendings for a target's prior generations (reconnect / disconnect). */

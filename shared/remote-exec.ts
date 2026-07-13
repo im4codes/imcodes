@@ -1,3 +1,6 @@
+import { DAEMON_MSG } from './daemon-events.js';
+import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
+
 // Remote-exec / controlled-node protocol shared by daemon (source + controlled
 // node), server relay, and the exe build pipeline.
 //
@@ -31,6 +34,7 @@ export const REMOTE_EXEC_SHELLS = ['powershell', 'cmd', 'bash', 'sh'] as const;
 export type RemoteExecShell = (typeof REMOTE_EXEC_SHELLS)[number];
 
 export const REMOTE_EXEC_DEFAULT_TIMEOUT_MS = 120_000;
+export const REMOTE_EXEC_MIN_TIMEOUT_MS = 1_000;
 export const REMOTE_EXEC_MAX_TIMEOUT_MS = 600_000;
 /** Hard cap on captured stdout/stderr each; excess is truncated (flagged). */
 export const REMOTE_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
@@ -40,11 +44,18 @@ export const REMOTE_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
  * WsBridge). Kept > the daemon heartbeat interval so a healthy node never flaps.
  */
 export const MACHINE_PRESENCE_STALENESS_MS = 90_000;
+/** Explicit maximum returned by list_machines / GET /api/machines. */
+export const MACHINE_LIST_MAX_ITEMS = 200;
 /** Envelope input bounds (server is the trust boundary; both ends validate). */
 export const REMOTE_EXEC_MAX_COMMAND_BYTES = 64 * 1024;
 export const REMOTE_EXEC_MAX_CWD_BYTES = 4096;
 export const REMOTE_EXEC_CORRELATION_ID_MAX = 128;
 export const REMOTE_EXEC_IDEMPOTENCY_KEY_MAX = 128;
+/** Diagnostic error returned by the node; bounded independently from stdout/stderr. */
+export const REMOTE_EXEC_MAX_ERROR_BYTES = 4096;
+/** Worst-case JSON string escaping can expand each UTF-8 byte to a six-byte \\uXXXX sequence. */
+export const MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES =
+  (REMOTE_EXEC_MAX_OUTPUT_BYTES * 2 + REMOTE_EXEC_MAX_ERROR_BYTES) * 6 + 4096;
 
 /**
  * End-to-end exec outcome, preserved from node → relay → MCP (never collapsed to
@@ -97,10 +108,16 @@ export interface RemoteExecResult {
 export interface MachineSummary {
   serverId: string;
   name: string;
-  os?: string;
+  os?: EnrollmentOs;
   online: boolean;
   nodeRole: NodeRole;
   lastSeenMs?: number;
+}
+
+export function canonicalMachineOs(value: unknown): EnrollmentOs | undefined {
+  return (typeof value === 'string' && (ENROLLMENT_OSES as readonly string[]).includes(value))
+    ? value as EnrollmentOs
+    : undefined;
 }
 
 // ── Enrollment (pre-paired exe) ──────────────────────────────────────────────
@@ -120,28 +137,60 @@ export interface EnrollmentBlob {
   enrollToken: string;
 }
 
-/** Payload a controlled node POSTs to redeem its enrollment token (D-A). */
-export interface EnrollRedeemRequest {
-  enrollToken: string;
-  /** Durable, client-generated id making redemption idempotent across retries (D-A). */
-  installId?: string;
-  /** sha256(nodeToken) — under D-A the raw nodeToken never leaves the node. */
-  nodeTokenHash?: string;
-  hostname: string;
-  os: string;
-}
+/** D-A v2 redeem protocol version — explicit, not inferred from optional fields. */
+export const ENROLLMENT_REDEEM_VERSION_V2 = 2 as const;
+
+/** Canonical OS vocabulary used by v2 enrollment and artifact selection. */
+export const ENROLLMENT_OSES = ['win', 'mac', 'linux'] as const;
+export type EnrollmentOs = (typeof ENROLLMENT_OSES)[number];
 
 /**
- * Server response after a successful redeem. Under D-A the node keeps its own
- * client-generated `nodeToken` and the server persists only `nodeTokenHash`;
- * `token` remains for the transitional path where the server still issues one.
+ * Convert Node's `process.platform` vocabulary to the enrollment wire vocabulary.
+ * Unsupported platforms fail closed rather than leaking a value the server cannot
+ * bind to a verified artifact.
  */
-export interface EnrollRedeemResponse {
+export function enrollmentOsFromNodePlatform(platform: string): EnrollmentOs {
+  if (platform === 'win32') return 'win';
+  if (platform === 'darwin') return 'mac';
+  if (platform === 'linux') return 'linux';
+  throw new Error(`unsupported_enrollment_platform:${platform}`);
+}
+
+/** sha256(nodeToken) hex length (lowercase hex, no prefix). */
+export const ENROLLMENT_NODE_TOKEN_HASH_HEX_LEN = 64;
+
+/** Node POST body for D-A v2 redeem — all identity fields required. */
+export interface EnrollRedeemV2Request {
+  version: typeof ENROLLMENT_REDEEM_VERSION_V2;
+  enrollToken: string;
+  installId: string;
+  nodeTokenHash: string;
+  hostname: string;
+  os: EnrollmentOs;
+  arch: string;
+}
+
+/** Server response for D-A v2 — MUST NOT include a recoverable raw token. */
+export interface EnrollRedeemV2Response {
   serverId: string;
-  token: string;
   nodeRole: typeof NODE_ROLE.CONTROLLED;
   refName?: string;
   displayName?: string;
+}
+
+export interface EnrollmentTrailerRange {
+  blob: EnrollmentBlob;
+  /** Absolute byte offset in the executable where the trailer begins. */
+  trailerStart: number;
+  /** Trailer byte length (JSON body + footer). */
+  trailerLength: number;
+}
+
+/** Validate a normalized lowercase hex sha256 nodeTokenHash. */
+export function isEnrollmentNodeTokenHash(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length === ENROLLMENT_NODE_TOKEN_HASH_HEX_LEN
+    && /^[0-9a-f]{64}$/.test(value);
 }
 
 // ── Enrollment blob fixed-footer framing (D-A / 10.4) ────────────────────────
@@ -178,6 +227,19 @@ export function encodeEnrollmentTrailer(blob: EnrollmentBlob): Buffer {
  * `<= ENROLLMENT_MAX_TRAILER_BYTES` bytes). Returns null if absent/malformed.
  */
 export function decodeEnrollmentTrailer(tail: Buffer): EnrollmentBlob | null {
+  const decoded = decodeEnrollmentTrailerWithRange(tail);
+  return decoded?.blob ?? null;
+}
+
+/**
+ * Decode the enrollment blob and its exact byte range within the executable.
+ * `tailFileOffset` is the absolute file offset of `tail[0]` (defaults to 0 for
+ * buffers that start at file origin). Never reads beyond the bounded tail window.
+ */
+export function decodeEnrollmentTrailerWithRange(
+  tail: Buffer,
+  tailFileOffset = 0,
+): EnrollmentTrailerRange | null {
   const magicLen = ENROLLMENT_MAGIC_BYTE_LENGTH;
   const footerLen = 4 + magicLen + 1;
   if (tail.length < footerLen) return null;
@@ -189,11 +251,18 @@ export function decodeEnrollmentTrailer(tail: Buffer): EnrollmentBlob | null {
   const bodyEnd = magicStart - 4;
   const bodyStart = bodyEnd - bodyLen;
   if (bodyStart < 0 || bodyLen <= 0 || bodyLen > ENROLLMENT_BLOB_MAX_BODY_BYTES) return null;
+  const trailerLength = bodyLen + footerLen;
+  const trailerStartInTail = bodyStart;
+  const trailerStart = tailFileOffset + trailerStartInTail;
   try {
     const parsed = JSON.parse(tail.toString('utf8', bodyStart, bodyEnd)) as Partial<EnrollmentBlob>;
     if (typeof parsed?.serverUrl === 'string' && typeof parsed?.enrollToken === 'string'
       && /^https?:\/\//.test(parsed.serverUrl) && parsed.enrollToken.length > 0) {
-      return { serverUrl: parsed.serverUrl.replace(/\/+$/, ''), enrollToken: parsed.enrollToken };
+      return {
+        blob: { serverUrl: parsed.serverUrl.replace(/\/+$/, ''), enrollToken: parsed.enrollToken },
+        trailerStart,
+        trailerLength,
+      };
     }
     return null;
   } catch {
@@ -209,6 +278,11 @@ export function decodeEnrollmentTrailer(tail: Buffer): EnrollmentBlob | null {
 
 export interface MachineExecFrame {
   correlationId: string;
+  /**
+   * Reserved wire-compatibility nonce. The relay owns this value and currently
+   * sets it to `correlationId`; it is not a durable deduplication key and MUST
+   * NOT be interpreted as an exactly-once or retry guarantee.
+   */
   idempotencyKey: string;
   command: string;
   shell?: RemoteExecShell;
@@ -216,16 +290,45 @@ export interface MachineExecFrame {
   timeoutMs?: number;
 }
 
+/** Controlled node → server flat result envelope (without transport identity). */
+export interface MachineExecResultFrame {
+  correlationId: string;
+  ok: boolean;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  truncated?: boolean;
+  timedOut?: boolean;
+  durationMs: number;
+  error?: string;
+}
+
 export type EnvelopeValidation<T> = { ok: true; value: T } | { ok: false; error: string };
 
-function byteLen(s: string): number {
+export function utf8ByteLength(s: string): number {
   return new TextEncoder().encode(s).length;
 }
 
+const MACHINE_EXEC_REQUEST_KEYS = new Set([
+  'type',
+  'correlationId',
+  'idempotencyKey',
+  'command',
+  'shell',
+  'cwd',
+  'timeoutMs',
+]);
+
 /** Validate an inbound MACHINE_EXEC frame (used by BOTH node and server). */
 export function validateMachineExecFrame(raw: unknown): EnvelopeValidation<MachineExecFrame> {
-  if (typeof raw !== 'object' || raw === null) return { ok: false, error: 'not_an_object' };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false, error: 'not_an_object' };
   const r = raw as Record<string, unknown>;
+  for (const key of Object.keys(r)) {
+    if (!MACHINE_EXEC_REQUEST_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
+  }
+  if (r.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) {
+    return { ok: false, error: 'invalid_type' };
+  }
   const correlationId = r.correlationId;
   if (typeof correlationId !== 'string' || correlationId.length < 1 || correlationId.length > REMOTE_EXEC_CORRELATION_ID_MAX) {
     return { ok: false, error: 'invalid_correlationId' };
@@ -235,7 +338,7 @@ export function validateMachineExecFrame(raw: unknown): EnvelopeValidation<Machi
     return { ok: false, error: 'invalid_idempotencyKey' };
   }
   const command = r.command;
-  if (typeof command !== 'string' || command.length === 0 || byteLen(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
+  if (typeof command !== 'string' || command.length === 0 || utf8ByteLength(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
     return { ok: false, error: 'invalid_command' };
   }
   let shell: RemoteExecShell | undefined;
@@ -247,17 +350,290 @@ export function validateMachineExecFrame(raw: unknown): EnvelopeValidation<Machi
   }
   let cwd: string | undefined;
   if (r.cwd !== undefined) {
-    if (typeof r.cwd !== 'string' || byteLen(r.cwd) > REMOTE_EXEC_MAX_CWD_BYTES) {
+    if (typeof r.cwd !== 'string' || utf8ByteLength(r.cwd) > REMOTE_EXEC_MAX_CWD_BYTES) {
       return { ok: false, error: 'invalid_cwd' };
     }
     cwd = r.cwd;
   }
   let timeoutMs: number | undefined;
   if (r.timeoutMs !== undefined) {
-    if (typeof r.timeoutMs !== 'number' || !Number.isInteger(r.timeoutMs) || r.timeoutMs < 1 || r.timeoutMs > REMOTE_EXEC_MAX_TIMEOUT_MS) {
+    if (typeof r.timeoutMs !== 'number' || !Number.isInteger(r.timeoutMs) || r.timeoutMs < REMOTE_EXEC_MIN_TIMEOUT_MS || r.timeoutMs > REMOTE_EXEC_MAX_TIMEOUT_MS) {
       return { ok: false, error: 'invalid_timeoutMs' };
     }
     timeoutMs = r.timeoutMs;
   }
   return { ok: true, value: { correlationId, idempotencyKey, command, shell, cwd, timeoutMs } };
+}
+
+const MACHINE_EXEC_RESULT_KEYS = new Set([
+  'type',
+  'correlationId',
+  'ok',
+  'exitCode',
+  'stdout',
+  'stderr',
+  'truncated',
+  'timedOut',
+  'durationMs',
+  'error',
+]);
+
+/**
+ * Strictly validate an inbound MACHINE_EXEC_RESULT frame. The canonical `type`
+ * is required at the WS boundary; synthetic callers must inject it before using
+ * this validator. Identity and unknown fields are rejected rather than silently
+ * trusted or relayed.
+ */
+export function validateMachineExecResultFrame(raw: unknown): EnvelopeValidation<MachineExecResultFrame> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'not_an_object' };
+  }
+  const r = raw as Record<string, unknown>;
+  for (const key of Object.keys(r)) {
+    if (!MACHINE_EXEC_RESULT_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
+  }
+  if (r.type !== DAEMON_MSG.MACHINE_EXEC_RESULT) {
+    return { ok: false, error: 'invalid_type' };
+  }
+  const correlationId = r.correlationId;
+  if (typeof correlationId !== 'string' || correlationId.length < 1 || correlationId.length > REMOTE_EXEC_CORRELATION_ID_MAX) {
+    return { ok: false, error: 'invalid_correlationId' };
+  }
+  if (typeof r.ok !== 'boolean') return { ok: false, error: 'invalid_ok' };
+  if (r.exitCode !== null && (typeof r.exitCode !== 'number' || !Number.isSafeInteger(r.exitCode))) {
+    return { ok: false, error: 'invalid_exitCode' };
+  }
+  if (typeof r.stdout !== 'string' || utf8ByteLength(r.stdout) > REMOTE_EXEC_MAX_OUTPUT_BYTES) {
+    return { ok: false, error: 'invalid_stdout' };
+  }
+  if (typeof r.stderr !== 'string' || utf8ByteLength(r.stderr) > REMOTE_EXEC_MAX_OUTPUT_BYTES) {
+    return { ok: false, error: 'invalid_stderr' };
+  }
+  if (r.truncated !== undefined && typeof r.truncated !== 'boolean') {
+    return { ok: false, error: 'invalid_truncated' };
+  }
+  if (r.timedOut !== undefined && typeof r.timedOut !== 'boolean') {
+    return { ok: false, error: 'invalid_timedOut' };
+  }
+  if (typeof r.durationMs !== 'number' || !Number.isSafeInteger(r.durationMs) || r.durationMs < 0) {
+    return { ok: false, error: 'invalid_durationMs' };
+  }
+  if (r.error !== undefined && (typeof r.error !== 'string' || utf8ByteLength(r.error) > REMOTE_EXEC_MAX_ERROR_BYTES)) {
+    return { ok: false, error: 'invalid_error' };
+  }
+  const timedOut = r.timedOut === true;
+  const hasErrorField = r.error !== undefined;
+  const hasNonEmptyError = typeof r.error === 'string' && r.error.length > 0;
+  if (r.ok) {
+    if (r.exitCode === null) return { ok: false, error: 'ok_requires_exitCode' };
+    if (timedOut) return { ok: false, error: 'ok_forbids_timeout' };
+    if (hasErrorField) return { ok: false, error: 'ok_forbids_error' };
+  } else {
+    if (r.exitCode !== null) return { ok: false, error: 'failure_requires_null_exitCode' };
+    if (!hasNonEmptyError) return { ok: false, error: 'failure_requires_error' };
+  }
+  return {
+    ok: true,
+    value: {
+      correlationId,
+      ok: r.ok,
+      exitCode: r.exitCode,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      ...(r.truncated !== undefined ? { truncated: r.truncated } : {}),
+      ...(r.timedOut !== undefined ? { timedOut: r.timedOut } : {}),
+      durationMs: r.durationMs,
+      ...(r.error !== undefined ? { error: r.error } : {}),
+    },
+  };
+}
+
+export const MACHINE_EXEC_HTTP_PROTOCOL = 'imcodes.machine_exec.http' as const;
+export const MACHINE_EXEC_HTTP_ENVELOPE_VERSION = 1 as const;
+
+export const MACHINE_EXEC_HTTP_REASONS = [
+  'completed',
+  'scoped_auth',
+  'invalid_request',
+  'target_forbidden',
+  'exec_disabled',
+  'intent_unavailable',
+  'target_unavailable',
+  'relay_deadline',
+  'node_timeout',
+  'spawn_error',
+  'invalid_result',
+] as const;
+export type MachineExecHttpReason = (typeof MACHINE_EXEC_HTTP_REASONS)[number];
+
+export interface MachineExecHttpEnvelope {
+  protocol: typeof MACHINE_EXEC_HTTP_PROTOCOL;
+  version: typeof MACHINE_EXEC_HTTP_ENVELOPE_VERSION;
+  outcome: RemoteExecOutcome;
+  reason: MachineExecHttpReason;
+  ok?: boolean;
+  exitCode?: number | null;
+  stdout?: string;
+  stderr?: string;
+  truncated?: boolean;
+  timedOut?: boolean;
+  durationMs?: number;
+  error?: string;
+}
+
+const MACHINE_EXEC_HTTP_RESULT_KEYS = [
+  'ok',
+  'exitCode',
+  'stdout',
+  'stderr',
+  'truncated',
+  'timedOut',
+  'durationMs',
+  'error',
+] as const;
+
+export function reasonForRemoteExecOutcome(outcome: RemoteExecOutcome): MachineExecHttpReason {
+  if (outcome === 'not_dispatched') return 'target_unavailable';
+  if (outcome === 'dispatched_no_result') return 'relay_deadline';
+  if (outcome === 'node_timeout') return 'node_timeout';
+  if (outcome === 'spawn_error') return 'spawn_error';
+  return 'completed';
+}
+
+const MACHINE_EXEC_HTTP_PRE_DISPATCH_REASONS = new Set<MachineExecHttpReason>([
+  'scoped_auth',
+  'invalid_request',
+  'target_forbidden',
+  'exec_disabled',
+  'intent_unavailable',
+  'target_unavailable',
+]);
+
+function isMachineExecHttpReason(value: unknown): value is MachineExecHttpReason {
+  return typeof value === 'string' && (MACHINE_EXEC_HTTP_REASONS as readonly string[]).includes(value);
+}
+
+function isRemoteExecOutcome(value: unknown): value is RemoteExecOutcome {
+  return typeof value === 'string' && (REMOTE_EXEC_OUTCOMES as readonly string[]).includes(value);
+}
+
+function validateMachineExecHttpReasonForOutcome(outcome: RemoteExecOutcome, reason: MachineExecHttpReason): boolean {
+  if (outcome === 'not_dispatched') return MACHINE_EXEC_HTTP_PRE_DISPATCH_REASONS.has(reason);
+  if (outcome === 'dispatched_no_result') return reason === 'relay_deadline' || reason === 'invalid_result';
+  if (outcome === 'node_timeout') return reason === 'node_timeout';
+  if (outcome === 'spawn_error') return reason === 'spawn_error';
+  return reason === 'completed';
+}
+
+function validateMachineExecHttpResultForOutcome(outcome: RemoteExecOutcome, result: MachineExecResultFrame): boolean {
+  if (outcome === 'completed') return result.ok === true && result.exitCode !== null && result.timedOut === false && result.error === undefined;
+  if (outcome === 'node_timeout') return result.ok === false && result.exitCode === null && result.timedOut === true && typeof result.error === 'string' && result.error.length > 0;
+  if (outcome === 'spawn_error') return result.ok === false && result.exitCode === null && result.timedOut === false && typeof result.error === 'string' && result.error.length > 0;
+  return false;
+}
+
+export function encodeMachineExecHttpEnvelope(
+  outcome: RemoteExecOutcome,
+  result?: RemoteExecResult,
+  reason: MachineExecHttpReason = reasonForRemoteExecOutcome(outcome),
+): MachineExecHttpEnvelope {
+  if (!validateMachineExecHttpReasonForOutcome(outcome, reason)) {
+    throw new Error(`invalid_machine_exec_http_reason:${outcome}:${reason}`);
+  }
+  const normalized = result ? validateMachineExecResultFrame({
+    type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+    correlationId: 'http-envelope',
+    ok: result.ok,
+    exitCode: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    truncated: result.truncated ?? false,
+    timedOut: result.timedOut ?? false,
+    durationMs: result.durationMs,
+    error: result.error,
+  }) : undefined;
+  if (result && !normalized?.ok) throw new Error(`invalid_machine_exec_http_result:${normalized?.error}`);
+  if (outcome === 'completed' || outcome === 'node_timeout' || outcome === 'spawn_error') {
+    if (!normalized?.ok) throw new Error(`missing_machine_exec_http_result:${outcome}`);
+    if (!validateMachineExecHttpResultForOutcome(outcome, normalized.value)) {
+      throw new Error(`machine_exec_http_result_outcome_mismatch:${outcome}`);
+    }
+  } else if (result) {
+    throw new Error(`forbidden_machine_exec_http_result:${outcome}`);
+  }
+  return {
+    protocol: MACHINE_EXEC_HTTP_PROTOCOL,
+    version: MACHINE_EXEC_HTTP_ENVELOPE_VERSION,
+    outcome,
+    reason,
+    ...(result
+      ? {
+          ok: result.ok,
+          exitCode: result.exitCode,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          timedOut: result.timedOut ?? false,
+          truncated: result.truncated ?? false,
+          durationMs: result.durationMs,
+          ...(result.error ? { error: result.error } : {}),
+        }
+      : {}),
+  };
+}
+
+const MACHINE_EXEC_HTTP_ENVELOPE_KEYS = new Set([
+  'protocol',
+  'version',
+  'outcome',
+  'reason',
+  'ok',
+  'exitCode',
+  'stdout',
+  'stderr',
+  'truncated',
+  'timedOut',
+  'durationMs',
+  'error',
+]);
+
+export function decodeMachineExecHttpEnvelope(raw: unknown): EnvelopeValidation<MachineExecHttpEnvelope> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false, error: 'not_an_object' };
+  const r = raw as Record<string, unknown>;
+  for (const key of Object.keys(r)) {
+    if (!MACHINE_EXEC_HTTP_ENVELOPE_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
+  }
+  if (r.protocol !== MACHINE_EXEC_HTTP_PROTOCOL) return { ok: false, error: 'invalid_protocol' };
+  if (r.version !== MACHINE_EXEC_HTTP_ENVELOPE_VERSION) return { ok: false, error: 'invalid_version' };
+  if (!isRemoteExecOutcome(r.outcome)) return { ok: false, error: 'invalid_outcome' };
+  if (!isMachineExecHttpReason(r.reason)) return { ok: false, error: 'invalid_reason' };
+  if (!validateMachineExecHttpReasonForOutcome(r.outcome, r.reason)) return { ok: false, error: 'reason_outcome_mismatch' };
+  const hasResult = r.ok !== undefined || r.exitCode !== undefined || r.stdout !== undefined || r.stderr !== undefined
+    || r.truncated !== undefined || r.timedOut !== undefined || r.durationMs !== undefined || r.error !== undefined;
+  const resultRequired = r.outcome === 'completed' || r.outcome === 'node_timeout' || r.outcome === 'spawn_error';
+  if (!resultRequired && hasResult) return { ok: false, error: 'forbidden_result_fields' };
+  if (resultRequired && !hasResult) return { ok: false, error: 'missing_result_fields' };
+  if (hasResult) {
+    for (const key of MACHINE_EXEC_HTTP_RESULT_KEYS) {
+      if (r[key] === undefined && key !== 'error') {
+        return { ok: false, error: `missing_result_field:${key}` };
+      }
+    }
+    const frame = validateMachineExecResultFrame({
+      type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+      correlationId: 'http-envelope',
+      ok: r.ok,
+      exitCode: r.exitCode,
+      stdout: r.stdout,
+      stderr: r.stderr,
+      truncated: r.truncated,
+      timedOut: r.timedOut,
+      durationMs: r.durationMs,
+      error: r.error,
+    });
+    if (!frame.ok) return { ok: false, error: frame.error };
+    if (!validateMachineExecHttpResultForOutcome(r.outcome, frame.value)) {
+      return { ok: false, error: 'result_outcome_mismatch' };
+    }
+  }
+  return { ok: true, value: r as unknown as MachineExecHttpEnvelope };
 }

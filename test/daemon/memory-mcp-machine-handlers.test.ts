@@ -46,7 +46,16 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
       listMachines: async () => [],
       execRemote: async ({ machine, command, shell, timeoutMs }) => {
         expect({ machine, command, shell, timeoutMs }).toEqual({ machine: 'win', command: 'echo hi', shell: 'powershell', timeoutMs: 5000 });
-        return { outcome: 'completed', ok: true, exitCode: 0, stdout: 'hi', durationMs: 12 };
+        return {
+          outcome: 'completed',
+          ok: true,
+          exitCode: 0,
+          stdout: 'hi',
+          stderr: '',
+          timedOut: false,
+          truncated: false,
+          durationMs: 12,
+        };
       },
     };
     const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
@@ -56,7 +65,10 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
 
   it('list_machines returns the machines from the dep', async () => {
     const machineDeps: MachineToolDeps = {
-      listMachines: async ({ includeOffline }) => (includeOffline ? [{ name: 'a', online: true, execEnabled: true }, { name: 'b', online: false, execEnabled: true }] : [{ name: 'a', online: true, execEnabled: true }]),
+      listMachines: async ({ includeOffline }) => (includeOffline ? [
+        { name: 'a', os: 'win', online: true, execEnabled: true, role: 'controlled' },
+        { name: 'b', os: 'linux', online: false, execEnabled: true, role: 'controlled' },
+      ] : [{ name: 'a', os: 'win', online: true, execEnabled: true, role: 'controlled' }]),
       execRemote: async () => ({ outcome: 'completed' as const }),
     };
     const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });

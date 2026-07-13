@@ -1,13 +1,22 @@
 #!/usr/bin/env node
-import { bootstrapControlledNode, defaultBootstrapDeps } from './bootstrap.js';
+import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
 import { createControlledNodeRuntime } from './runtime.js';
 
 async function main(): Promise<void> {
-  // Journaled first-run bootstrap: prepares the protected credential dir BEFORE
-  // redeeming the one-time token and backs off (never re-redeems) if persist
-  // fails — see bootstrap.ts / task 10.10. A normal boot just loads the credential.
-  const credential = await bootstrapControlledNode(defaultBootstrapDeps(Date.now()));
-  const runtime = createControlledNodeRuntime(credential);
+  const now = Date.now();
+  const deps = defaultBootstrapDeps(now);
+  const bootstrap = await bootstrapControlledNodeWithDisposition(deps);
+  if (bootstrap.disposition === 'handoff_complete') return;
+  const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
+    onAuthenticated: () => markServiceHealthy(deps.journalPath, Date.now(), {
+      isStableRuntime: deps.isStableRuntime,
+      inspectServiceState: deps.inspectServiceState,
+    }),
+    onAuthenticationError: (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`imcodes-node: failed to record service_healthy (${message})\n`);
+    },
+  });
   runtime.start();
   const stop = () => {
     runtime.stop();
@@ -21,3 +30,5 @@ void main().catch((error) => {
   process.stderr.write(`imcodes-node: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = 1;
 });
+
+export { journalPathFor };

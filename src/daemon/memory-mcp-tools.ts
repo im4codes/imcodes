@@ -24,9 +24,18 @@ import {
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import {
   NODE_ROLE,
+  ENROLLMENT_OSES,
+  REMOTE_EXEC_OUTCOMES,
+  REMOTE_EXEC_MIN_TIMEOUT_MS,
   REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_MAX_COMMAND_BYTES,
+  REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  REMOTE_EXEC_MAX_ERROR_BYTES,
   REMOTE_EXEC_MAX_TIMEOUT_MS,
+  MACHINE_LIST_MAX_ITEMS,
+  utf8ByteLength,
   type NodeRole,
+  type EnrollmentOs,
   type RemoteExecShell,
   type RemoteExecOutcome,
 } from '../../shared/remote-exec.js';
@@ -145,9 +154,11 @@ export interface MemoryMcpToolDeps {
 export interface MachineSummaryForTool {
   name: string;
   displayName?: string;
-  os?: string;
+  os?: EnrollmentOs;
   online: boolean;
   execEnabled: boolean;
+  /** Node role — always `controlled` for controllable machines (spec: list returns role). */
+  role: typeof NODE_ROLE.CONTROLLED;
 }
 
 /** The end-to-end outcome of `exec_remote`, preserving the discriminated union. */
@@ -172,9 +183,87 @@ export interface MachineToolDeps {
     command: string;
     shell?: RemoteExecShell;
     timeoutMs?: number;
-    idempotencyKey?: string;
   }) => Promise<MachineExecToolResult> | MachineExecToolResult;
 }
+
+export interface MachineListToolSuccess extends Record<string, unknown> {
+  status: 'ok';
+  machines: MachineSummaryForTool[];
+}
+
+interface MachineExecTerminalFields {
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  durationMs: number;
+}
+
+export type MachineExecToolSuccess = Record<string, unknown> & (
+  | { status: 'ok'; outcome: 'not_dispatched' | 'dispatched_no_result' }
+  | ({ status: 'ok'; outcome: 'completed'; ok: true; exitCode: number; timedOut: false } & MachineExecTerminalFields)
+  | ({ status: 'ok'; outcome: 'node_timeout'; ok: false; exitCode: null; timedOut: true; error: string } & MachineExecTerminalFields)
+  | ({ status: 'ok'; outcome: 'spawn_error'; ok: false; exitCode: null; timedOut: false; error: string } & MachineExecTerminalFields)
+);
+
+const machineSummaryShape = {
+  name: z.string(),
+  displayName: z.string().optional(),
+  os: z.enum(ENROLLMENT_OSES).optional(),
+  online: z.boolean(),
+  execEnabled: z.boolean(),
+  role: z.literal(NODE_ROLE.CONTROLLED),
+} as const;
+
+const machineSummaryRuntimeSchema: z.ZodType<MachineSummaryForTool> = z.strictObject(machineSummaryShape);
+const machineListDependencyResultSchema = z.array(machineSummaryRuntimeSchema).max(MACHINE_LIST_MAX_ITEMS);
+
+const boundedUtf8String = (maxBytes: number) => z.string().refine(
+  (value) => utf8ByteLength(value) <= maxBytes,
+  { message: `must be at most ${maxBytes} UTF-8 bytes` },
+);
+
+const mcpReasonSchema = z.enum(Object.values(MCP_ERROR_REASONS) as [MCPErrorReason, ...MCPErrorReason[]]);
+const machineExecDependencyTerminalBase = {
+  stdout: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+  stderr: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+  truncated: z.boolean(),
+  durationMs: z.number().int().safe().nonnegative(),
+} as const;
+const machineExecDependencyResultSchema = z.discriminatedUnion('outcome', [
+  z.strictObject({
+    outcome: z.literal('not_dispatched'),
+    reason: mcpReasonSchema.optional(),
+    error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).optional(),
+  }),
+  z.strictObject({ outcome: z.literal('dispatched_no_result') }),
+  z.strictObject({
+    ...machineExecDependencyTerminalBase,
+    outcome: z.literal('completed'),
+    ok: z.literal(true),
+    exitCode: z.number().int().safe(),
+    timedOut: z.literal(false),
+  }),
+  z.strictObject({
+    ...machineExecDependencyTerminalBase,
+    outcome: z.literal('node_timeout'),
+    ok: z.literal(false),
+    exitCode: z.null(),
+    timedOut: z.literal(true),
+    error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).refine((value) => value.length > 0),
+  }),
+  z.strictObject({
+    ...machineExecDependencyTerminalBase,
+    outcome: z.literal('spawn_error'),
+    ok: z.literal(false),
+    exitCode: z.null(),
+    timedOut: z.literal(false),
+    error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).refine((value) => value.length > 0),
+  }),
+]).superRefine((result, ctx) => {
+  if (result.outcome === 'not_dispatched' && result.error !== undefined && result.reason === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'not_dispatched error requires a typed reason' });
+  }
+});
 
 function readBooleanEnv(value: string | undefined): boolean | undefined {
   if (value == null) return undefined;
@@ -1100,36 +1189,63 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
       const args = pickAllowedMcpArgs(input, ['includeOffline']);
       const includeOffline = boolArg(args, 'includeOffline') ?? false;
-      const machines = await deps.machineDeps.listMachines({ includeOffline });
-      return { status: 'ok', machines };
+      // Unbound → FEATURE_DISABLED; a real control-plane failure
+      // (transport/http/malformed) → CONTROL_PLANE_UNAVAILABLE. Never a silent
+      // empty "no machines" list. Kept consistent with the exec path.
+      let machines: MachineSummaryForTool[];
+      try {
+        machines = await deps.machineDeps.listMachines({ includeOffline });
+      } catch (err) {
+        const kind = (err as { kind?: string }).kind;
+        const reason = kind === 'unbound' ? MCP_ERROR_REASONS.FEATURE_DISABLED : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+        return error(reason, err instanceof Error ? err.message : 'machine control plane unavailable');
+      }
+      const parsedMachines = machineListDependencyResultSchema.safeParse(machines);
+      if (!parsedMachines.success) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine control plane returned a malformed machine list');
+      }
+      const success: MachineListToolSuccess = { status: 'ok', machines: parsedMachines.data };
+      return success;
     },
     [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: async (input) => {
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
-      const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs', 'idempotencyKey']);
+      const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs']);
       const machine = stringArg(args, 'machine');
       const command = stringArg(args, 'command');
       if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine is required');
       if (!command) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command is required');
+      if (utf8ByteLength(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `command must be at most ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes`);
+      }
       const shellRaw = stringArg(args, 'shell');
       if (shellRaw && !(REMOTE_EXEC_SHELLS as readonly string[]).includes(shellRaw)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `shell must be one of ${REMOTE_EXEC_SHELLS.join(', ')}`);
       }
       const timeoutMs = numberArg(args, 'timeoutMs');
-      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > REMOTE_EXEC_MAX_TIMEOUT_MS)) {
-        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [1, ${REMOTE_EXEC_MAX_TIMEOUT_MS}]`);
+      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < REMOTE_EXEC_MIN_TIMEOUT_MS || timeoutMs > REMOTE_EXEC_MAX_TIMEOUT_MS)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}]`);
       }
-      const idempotencyKey = stringArg(args, 'idempotencyKey');
-      const result = await deps.machineDeps.execRemote({
+      const injectedResult = await deps.machineDeps.execRemote({
         machine,
         command,
         ...(shellRaw ? { shell: shellRaw as RemoteExecShell } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-        ...(idempotencyKey ? { idempotencyKey } : {}),
       });
+      const parsedResult = machineExecDependencyResultSchema.safeParse(injectedResult);
+      if (!parsedResult.success) {
+        // The request may already have reached the controlled node. Never turn
+        // an untrusted/malformed post-dispatch result into a retry-safe error.
+        const indeterminate: MachineExecToolSuccess = { status: 'ok', outcome: 'dispatched_no_result' };
+        return indeterminate;
+      }
+      const result = parsedResult.data;
       // A typed reason means the target was unusable (offline/unknown/ambiguous/
       // disabled) — surface it as a shared MCP error, never an ad-hoc string.
-      if (result.reason) return error(result.reason, result.error);
-      return { status: 'ok', ...result };
+      if (result.outcome === 'not_dispatched' && result.reason) return error(result.reason, result.error);
+      const success = result.outcome === 'not_dispatched'
+        ? { status: 'ok', outcome: result.outcome } as MachineExecToolSuccess
+        : { status: 'ok', ...result } as MachineExecToolSuccess;
+      return success;
     },
   });
 }
@@ -1279,16 +1395,66 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
     id: z.string().describe('Cron job id to delete.'),
   }),
-  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.object({
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
     includeOffline: z.boolean().optional().describe('Include offline machines in the result (default false — the agent-facing list excludes offline).'),
   }),
-  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.object({
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
     machine: z.string().describe('Target machine ref_name from list_machines.'),
     command: z.string().describe('Command to run on the target machine.'),
     shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`),
-    timeoutMs: z.number().int().min(1).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe(`Optional timeout in ms, clamped to ${REMOTE_EXEC_MAX_TIMEOUT_MS}.`),
-    idempotencyKey: z.string().optional().describe('Optional key stable across a relay retransmit of the same request.'),
+    timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe(`Optional timeout in ms, in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}].`),
   }),
+} as const;
+
+/**
+ * Output schemas for the machine tools ONLY. Registering these publishes the
+ * shape to the SDK, which validates non-error `structuredContent` against them —
+ * catching field/nullable/outcome drift between the shared descriptor and the
+ * runtime result. `exitCode` is nullable (signal/spawn failures have no code).
+ */
+const machineExecToolOutputRuntimeSchema = z.strictObject({
+  status: z.literal('ok'),
+  outcome: z.enum(REMOTE_EXEC_OUTCOMES),
+  ok: z.boolean().optional(),
+  exitCode: z.number().int().safe().nullable().optional(),
+  stdout: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES).optional(),
+  stderr: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES).optional(),
+  timedOut: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+  durationMs: z.number().int().safe().nonnegative().optional(),
+  error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).optional(),
+}).superRefine((result, ctx) => {
+  const fields = ['ok', 'exitCode', 'stdout', 'stderr', 'timedOut', 'truncated', 'durationMs'] as const;
+  const hasAny = fields.some((field) => result[field] !== undefined) || result.error !== undefined;
+  if (result.outcome === 'not_dispatched' || result.outcome === 'dispatched_no_result') {
+    if (hasAny) ctx.addIssue({ code: 'custom', message: `${result.outcome} forbids command result fields` });
+    return;
+  }
+  if (!fields.every((field) => result[field] !== undefined)) {
+    ctx.addIssue({ code: 'custom', message: `${result.outcome} requires every command result field` });
+    return;
+  }
+  if (result.outcome === 'completed') {
+    if (result.ok !== true || result.exitCode === null || result.timedOut !== false || result.error !== undefined) {
+      ctx.addIssue({ code: 'custom', message: 'completed result fields are inconsistent' });
+    }
+    return;
+  }
+  if (result.ok !== false || result.exitCode !== null || typeof result.error !== 'string' || result.error.length === 0) {
+    ctx.addIssue({ code: 'custom', message: `${result.outcome} result fields are inconsistent` });
+    return;
+  }
+  if ((result.outcome === 'node_timeout') !== (result.timedOut === true)) {
+    ctx.addIssue({ code: 'custom', message: `${result.outcome} timedOut field is inconsistent` });
+  }
+});
+
+const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>> = {
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
+    status: z.literal('ok'),
+    machines: z.array(machineSummaryRuntimeSchema).max(MACHINE_LIST_MAX_ITEMS),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: machineExecToolOutputRuntimeSchema,
 } as const;
 
 /** Descriptors advertised for a node of the given role (controlled excludes FULL-only tools). */
@@ -1302,10 +1468,14 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
   // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).
   for (const name of advertisedMcpToolNames(deps.nodeRole ?? NODE_ROLE.FULL)) {
     const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
+    const outputSchema = machineToolOutputSchemas[name];
     server.registerTool(name, {
       title: name,
       description: contract.description,
       inputSchema: schemas[name],
+      // Machine tools publish an output schema so the SDK validates structuredContent
+      // shape/nullable/outcome against the shared descriptor (catches drift).
+      ...(outputSchema ? { outputSchema } : {}),
     }, async (args: unknown) => toolResult(await handlers[name](args)));
   }
 }

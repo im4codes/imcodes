@@ -3,6 +3,8 @@ import {
   registerPendingExec,
   resolvePendingExec,
   abandonPriorGenerations,
+  abandonAllForTarget,
+  cancelPendingExec,
   machineExecRegistryStats,
 } from '../src/ws/machine-exec-registry.js';
 
@@ -35,5 +37,31 @@ describe('machine-exec pending registry (10.6)', () => {
 
   it('resolves to null when the deadline elapses', async () => {
     await expect(registerPendingExec('srv3', 'corr-C', 1, 10)).resolves.toBeNull();
+  });
+
+  it('cancelPendingExec removes the entry, clears its timer, and resolves null (send-failure path)', async () => {
+    const before = machineExecRegistryStats().inFlight;
+    const p = registerPendingExec('srv4', 'corr-D', 2, 60_000);
+    expect(machineExecRegistryStats().inFlight).toBe(before + 1);
+    expect(cancelPendingExec('corr-D')).toBe(true);
+    expect(machineExecRegistryStats().inFlight).toBe(before);
+    await expect(p).resolves.toBeNull();
+    // A late result for a cancelled correlation is dropped (no double-resolve).
+    expect(resolvePendingExec('srv4', 2, result('corr-D'))).toBe(false);
+    // Idempotent: cancelling an unknown/gone correlation is a no-op.
+    expect(cancelPendingExec('corr-D')).toBe(false);
+  });
+
+  it('abandonAllForTarget abandons EVERY pending for a target (all generations) as indeterminate', async () => {
+    const p1 = registerPendingExec('srv5', 'corr-E1', 1, 60_000);
+    const p2 = registerPendingExec('srv5', 'corr-E2', 2, 60_000);
+    const pOther = registerPendingExec('srv6', 'corr-F', 1, 60_000);
+    const abandoned = abandonAllForTarget('srv5');
+    expect(abandoned).toBe(2);
+    await expect(p1).resolves.toBeNull(); // → dispatched_no_result (indeterminate)
+    await expect(p2).resolves.toBeNull();
+    // A different target is untouched.
+    expect(resolvePendingExec('srv6', 1, result('corr-F'))).toBe(true);
+    await expect(pOther).resolves.toMatchObject({ correlationId: 'corr-F' });
   });
 });

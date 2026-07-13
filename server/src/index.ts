@@ -22,7 +22,7 @@ import { authRoutes, initializeAuthNonceCleanup } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
 import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
-import { enrollRoutes } from './routes/enroll.js';
+import { enrollRoutes, runEnrollmentRetention } from './routes/enroll.js';
 import { machinesRoutes } from './routes/machines.js';
 import { machineExecRoutes } from './routes/machine-exec.js';
 import { serverRoutes } from './routes/server.js';
@@ -56,7 +56,7 @@ import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { memoryPruningCron } from './cron/memory-pruning.js';
-import { WsBridge } from './ws/bridge.js';
+import { SERVER_WS_MAX_PAYLOAD_BYTES, WsBridge } from './ws/bridge.js';
 import {
   SHARE_REASONS,
   SHARE_WS_TICKET_TYPE,
@@ -343,8 +343,16 @@ export function buildApp(env: Env) {
 
 // ── WebSocket upgrade handler ─────────────────────────────────────────────────
 
+/** Build the shared WS server with the production inbound payload ceiling. */
+export function createServerWebSocketServer(): WebSocketServer {
+  return new WebSocketServer({
+    noServer: true,
+    maxPayload: SERVER_WS_MAX_PAYLOAD_BYTES,
+  });
+}
+
 export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = createServerWebSocketServer();
   // Compile trust function once — same proxy-addr library used by HTTP middleware
   const wsTrust = proxyAddr.compile(
     env.TRUSTED_PROXIES
@@ -629,6 +637,11 @@ function scheduleCrons(env: Env) {
       .catch((err) => logger.error({ err }, 'Auth lockout cleanup failed'));
     // Delete archived cloud memory projections older than 90 days
     memoryPruningCron(env).catch((err) => logger.error({ err }, 'Memory pruning cron failed'));
+    runEnrollmentRetention(env.DB)
+      .then(({ rows }) => {
+        if (rows > 0) logger.info({ rows }, 'Expired controlled-node enrollment rows removed');
+      })
+      .catch((err) => logger.error({ err }, 'Controlled-node enrollment retention failed'));
   });
   cron.schedule('* * * * *', () => {
     jobDispatchCron(env).catch((err) => logger.error({ err }, 'Job dispatch cron failed'));

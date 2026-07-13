@@ -53,6 +53,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist-node-exe/${{ matrix.artifact }}
+          path: |
+            dist-node-exe/${{ matrix.artifact }}
+            dist-node-exe/${{ matrix.artifact }}.manifest.json
           if-no-files-found: error
           retention-days: 30

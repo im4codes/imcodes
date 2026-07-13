@@ -6,12 +6,15 @@ import { PREFERENCE_MAX_BYTES } from './preference-ingest.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES } from './execution-clone.js';
 import {
   NODE_ROLE,
+  ENROLLMENT_OSES,
   type NodeRole,
   REMOTE_EXEC_SHELLS,
   REMOTE_EXEC_DEFAULT_TIMEOUT_MS,
+  REMOTE_EXEC_MIN_TIMEOUT_MS,
   REMOTE_EXEC_MAX_TIMEOUT_MS,
   REMOTE_EXEC_MAX_COMMAND_BYTES,
   REMOTE_EXEC_OUTCOMES,
+  MACHINE_LIST_MAX_ITEMS,
 } from './remote-exec.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
@@ -156,8 +159,10 @@ type JsonSchema = {
   readonly enum?: readonly unknown[];
   readonly minimum?: number;
   readonly maximum?: number;
+  readonly minLength?: number;
   readonly maxLength?: number;
   readonly maxItems?: number;
+  readonly anyOf?: readonly JsonSchema[];
 };
 
 export interface MemoryMcpToolContract {
@@ -455,20 +460,21 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       includeOffline: booleanSchema('Include offline machines in the result (default false — the agent-facing list excludes offline).'),
     }),
     outputSchema: objectSchema({
-      status: stringSchema('ok, disabled, or error.'),
-      reason: stringSchema('Optional machine-readable reason when status is not ok.'),
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
       machines: {
         type: 'array',
         description: 'Controllable machines for the account.',
+        maxItems: MACHINE_LIST_MAX_ITEMS,
         items: objectSchema({
           name: stringSchema('Unique server-derived ref_name — the key for exec_remote and ^^(name) markers.'),
           displayName: stringSchema('Render-only display name (sanitized).'),
-          os: stringSchema('Declared OS (advisory only).'),
+          os: stringSchema('Canonical OS (win | mac | linux); advisory, absent if unknown.', { enum: [...ENROLLMENT_OSES] }),
           online: booleanSchema('DB-backed presence: whether the node is currently connected.'),
           execEnabled: booleanSchema('Whether remote exec is enabled for this machine.'),
-        }, ['name', 'online']),
+          role: stringSchema('Node role; always "controlled" for controllable machines.', { enum: [NODE_ROLE.CONTROLLED] }),
+        }, ['name', 'online', 'execEnabled', 'role']),
       },
-    }),
+    }, ['status', 'machines']),
   },
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
@@ -478,22 +484,20 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       machine: stringSchema('Target machine ref_name from list_machines.'),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
       shell: stringSchema(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`, { enum: [...REMOTE_EXEC_SHELLS] }),
-      timeoutMs: numberSchema(`Optional timeout in ms; defaults to ${REMOTE_EXEC_DEFAULT_TIMEOUT_MS}, clamped to ${REMOTE_EXEC_MAX_TIMEOUT_MS}.`, { minimum: 1, maximum: REMOTE_EXEC_MAX_TIMEOUT_MS }),
-      idempotencyKey: stringSchema('Optional key that is stable across a relay retransmit of the same request.'),
+      timeoutMs: numberSchema(`Optional timeout in ms; defaults to ${REMOTE_EXEC_DEFAULT_TIMEOUT_MS}, in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}].`, { minimum: REMOTE_EXEC_MIN_TIMEOUT_MS, maximum: REMOTE_EXEC_MAX_TIMEOUT_MS }),
     }, ['machine', 'command']),
     outputSchema: objectSchema({
-      status: stringSchema('ok, disabled, or error.'),
-      reason: stringSchema('Optional machine-readable reason when status is not ok.'),
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
       outcome: stringSchema(`Discriminated outcome: ${REMOTE_EXEC_OUTCOMES.join(' | ')}.`, { enum: [...REMOTE_EXEC_OUTCOMES] }),
-      ok: booleanSchema('True when the command ran and exited 0.'),
-      exitCode: numberSchema('Process exit code when the command ran.'),
+      ok: booleanSchema('True when the process spawned and exited (any exit code) — inspect exitCode for command success; false on spawn error or timeout.'),
+      exitCode: { type: ['number', 'null'], description: 'Process exit code when the command ran; null on timeout/spawn failure.' },
       stdout: stringSchema('Captured stdout (may be truncated).'),
       stderr: stringSchema('Captured stderr (may be truncated).'),
-      timedOut: booleanSchema('True when the command hit its timeout and was killed.'),
+      timedOut: booleanSchema('True only for node_timeout.'),
       truncated: booleanSchema('True when output hit the byte cap and was cut.'),
-      durationMs: numberSchema('Wall-clock duration of the command in ms.'),
-      error: stringSchema('Optional error detail when the command did not complete normally.'),
-    }),
+      durationMs: numberSchema('Wall-clock duration in ms.', { minimum: 0 }),
+      error: stringSchema('Required non-empty detail for node_timeout/spawn_error; forbidden otherwise.', { minLength: 1 }),
+    }, ['status', 'outcome']),
   },
 };
 

@@ -9,7 +9,8 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { execRemote as clientExecRemote, listMachines as clientListMachines } from './machine-exec-client.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { execRemote as clientExecRemote, listMachines as clientListMachines, MachineControlPlaneError } from './machine-exec-client.js';
 import type { MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
 
 export interface DaemonCredential {
@@ -48,22 +49,39 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
     ...(m.os ? { os: m.os } : {}),
     online: m.online,
     execEnabled: m.execEnabled,
+    // /api/machines returns only controlled nodes by definition; publish the
+    // literal role the spec/output-schema require.
+    role: NODE_ROLE.CONTROLLED,
   });
 
   return {
+    // Both failure kinds propagate as `MachineControlPlaneError` so the tool
+    // surface maps them consistently with the exec path: `unbound` →
+    // FEATURE_DISABLED, a real control-plane failure (transport/http/malformed) →
+    // CONTROL_PLANE_UNAVAILABLE — never a silent empty "no machines" list.
     async listMachines({ includeOffline }): Promise<MachineSummaryForTool[]> {
       const creds = await load();
-      if (!creds) return [];
+      if (!creds) throw new MachineControlPlaneError('unbound', 'daemon is not bound to a server');
       const machines = await list({ serverUrl: creds.serverUrl, sourceServerId: creds.serverId, sourceToken: creds.token, ...(includeOffline ? { includeOffline } : {}) });
       return machines.map(toSummary);
     },
 
-    async execRemote({ machine, command, shell, timeoutMs, idempotencyKey }): Promise<MachineExecToolResult> {
+    async execRemote({ machine, command, shell, timeoutMs }): Promise<MachineExecToolResult> {
       const creds = await load();
       if (!creds) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
       // Resolve the ref_name against the FULL machine list (offline included) so
-      // "unknown" is distinguished from "offline".
-      const all = await list({ serverUrl: creds.serverUrl, sourceServerId: creds.serverId, sourceToken: creds.token, includeOffline: true });
+      // "unknown" is distinguished from "offline". A control-plane failure here
+      // must surface as CONTROL_PLANE_UNAVAILABLE, never as MACHINE_NOT_FOUND.
+      let all: Awaited<ReturnType<typeof list>>;
+      try {
+        all = await list({ serverUrl: creds.serverUrl, sourceServerId: creds.serverId, sourceToken: creds.token, includeOffline: true });
+      } catch (err) {
+        if (err instanceof MachineControlPlaneError) {
+          const reason = err.kind === 'unbound' ? MCP_ERROR_REASONS.FEATURE_DISABLED : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+          return { outcome: 'not_dispatched', reason, error: `machine control plane: ${err.kind}` };
+        }
+        throw err;
+      }
       const matches = all.filter((m) => m.refName === machine);
       if (matches.length === 0) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` };
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
@@ -78,7 +96,6 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         command,
         ...(shell ? { shell } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-        ...(idempotencyKey ? { idempotencyKey } : {}),
       });
     },
   };

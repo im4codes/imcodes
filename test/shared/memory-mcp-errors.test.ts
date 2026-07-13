@@ -23,6 +23,9 @@ describe('memory MCP error reasons', () => {
       'machine_ambiguous',
       'exec_offline',
       'exec_disabled',
+      // A bound daemon's machine control plane (list/exec API) is unreachable or
+      // returned an unusable response — distinct from "no machines"/"not found".
+      'control_plane_unavailable',
     ] satisfies MCPErrorReason[]);
   });
 
@@ -31,6 +34,7 @@ describe('memory MCP error reasons', () => {
       'feature_disabled',
       'projection_unavailable',
       'rate_limited',
+      'control_plane_unavailable',
     ]);
     for (const reason of Object.values(MCP_ERROR_REASONS)) {
       expect(isRecoverableMcpErrorReason(reason)).toBe(RECOVERABLE_MCP_ERROR_REASONS.has(reason));

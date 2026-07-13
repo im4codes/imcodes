@@ -543,6 +543,9 @@ vi.mock('../src/components/SharedContextManagementPanel.js', () => ({
     <button onClick={() => onEnterpriseChange?.('ent-2')}>shared-context-management</button>
   ),
 }));
+vi.mock('../src/components/ControlledNodesPanel.js', () => ({
+  ControlledNodesPanel: textComponent('controlled-nodes-panel'),
+}));
 vi.mock('../src/components/ContextDiagnosticsPanel.js', () => ({
   ContextDiagnosticsPanel: ({ onStateChange }: any) => (
     <button onClick={() => onStateChange?.({ enterpriseId: 'ent-1', language: 'ts' })}>context-diagnostics</button>
@@ -710,6 +713,20 @@ describe('App shell', () => {
     expect(view.container.textContent).toContain('session-pane:deck_alpha_brain');
     expect(view.container.textContent).toContain('session-tree');
     expect(ws.connect).toHaveBeenCalled();
+  }, 20_000);
+
+  it('opens controlled-node management from the desktop sidebar', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    fireEvent.click(await screen.findByText('controlled_nodes.title'));
+
+    const panel = await screen.findByTestId('floating-panel-controlled-nodes');
+    expect(panel.textContent).toContain('controlled-nodes-panel');
   }, 20_000);
 
   it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {

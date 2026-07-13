@@ -66,6 +66,7 @@ import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
+import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
@@ -1593,6 +1594,7 @@ export function App() {
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
+  const [showControlledNodes, setShowControlledNodes] = useState(false);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -4684,6 +4686,13 @@ export function App() {
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
+              <button
+                class="btn"
+                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
+                onClick={() => setShowControlledNodes(true)}
+              >
+                {trans('controlled_nodes.title')}
+              </button>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"
@@ -5737,6 +5746,17 @@ export function App() {
                 source: session.name === activeSession ? 'active_session' as const : 'recent_session' as const,
               }))}
           />
+        </FloatingPanel>
+      )}
+      {showControlledNodes && (
+        <FloatingPanel
+          id="controlled-nodes"
+          title={trans('controlled_nodes.title')}
+          onClose={() => setShowControlledNodes(false)}
+          defaultW={720}
+          defaultH={560}
+        >
+          <ControlledNodesPanel />
         </FloatingPanel>
       )}
 

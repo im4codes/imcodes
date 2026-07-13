@@ -36,9 +36,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AddressInfo } from 'node:net';
-import { WsBridge } from '../src/ws/bridge.js';
+import { SERVER_WS_MAX_PAYLOAD_BYTES, WsBridge } from '../src/ws/bridge.js';
+import { dispatchPush } from '../src/routes/push.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { P2P_WORKFLOW_CAPABILITY_V1 } from '../../shared/p2p-workflow-constants.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  cancelPendingExec,
+  machineExecRegistryStats,
+  registerPendingExec,
+} from '../src/ws/machine-exec-registry.js';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 // Match the existing bridge.test.ts crypto stub so the auth path validates.
@@ -57,14 +64,16 @@ vi.mock('../src/routes/push.js', () => ({
 interface DeferredDb {
   /** Override the DB query latency for the next handshake (ms). 0 = synchronous. */
   setLatency(ms: number): void;
+  setNodeRole(role: 'full' | 'controlled'): void;
   db: import('../src/db/client.js').Database;
 }
 
 function makeDeferredDb(tokenHash: string): DeferredDb {
   let latency = 0;
+  let nodeRole: 'full' | 'controlled' = 'full';
   const queryOne = async <T = unknown>(): Promise<T | null> => {
     if (latency > 0) await new Promise((r) => setTimeout(r, latency));
-    return { token_hash: tokenHash } as T;
+    return { token_hash: tokenHash, user_id: 'user-1', node_role: nodeRole, revoked_at: null } as T;
   };
   const db = {
     queryOne,
@@ -77,6 +86,7 @@ function makeDeferredDb(tokenHash: string): DeferredDb {
   };
   return {
     setLatency: (ms: number) => { latency = ms; },
+    setNodeRole: (role) => { nodeRole = role; },
     db: db as unknown as import('../src/db/client.js').Database,
   };
 }
@@ -191,13 +201,24 @@ describe('WsBridge daemon auth-handshake race — e2e (real ws server)', () => {
   beforeAll(async () => {
     deferredDb = makeDeferredDb('valid-hash');
     httpServer = createServer();
-    wss = new WebSocketServer({ noServer: true });
+    wss = new WebSocketServer({
+      noServer: true,
+      maxPayload: SERVER_WS_MAX_PAYLOAD_BYTES,
+    });
+    expect(wss.options.maxPayload).toBe(SERVER_WS_MAX_PAYLOAD_BYTES);
 
     httpServer.on('upgrade', (req, socket, head) => {
       // Extract the serverId from the URL path so each test's
       // connection lands on the right bridge instance even when tests
       // run back-to-back with overlapping close handlers.
       const url = req.url ?? '';
+      const browserMatch = url.match(/\/test-browser\/([^/]+)/);
+      if (browserMatch?.[1]) {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          WsBridge.get(browserMatch[1]!).handleBrowserConnection(ws as never, 'user-1', deferredDb.db);
+        });
+        return;
+      }
       const match = url.match(/\/api\/server\/([^/]+)\/ws/);
       const serverId = match?.[1];
       if (!serverId) { socket.destroy(); return; }
@@ -233,6 +254,7 @@ describe('WsBridge daemon auth-handshake race — e2e (real ws server)', () => {
   const OBSERVE_MS = 1_000;
 
   it('single back-to-back auth + daemon.hello stays open and authenticates', async () => {
+    deferredDb.setNodeRole('full');
     deferredDb.setLatency(0);
     const serverId = newServerId();
     const url = `ws://127.0.0.1:${port}/api/server/${serverId}/ws`;
@@ -246,6 +268,7 @@ describe('WsBridge daemon auth-handshake race — e2e (real ws server)', () => {
   });
 
   it('survives a 50ms-DB-latency window without 4001-close', async () => {
+    deferredDb.setNodeRole('full');
     // 50 ms of DB latency is the worst-case race window: definitely long
     // enough that BOTH messages are queued in the message handler before
     // auth's DB lookup resolves. Without the `authPromise` serialization
@@ -260,6 +283,7 @@ describe('WsBridge daemon auth-handshake race — e2e (real ws server)', () => {
   });
 
   it('burst of 10 back-to-back reconnect cycles all authenticate cleanly (server-restart simulation)', { timeout: 30_000 }, async () => {
+    deferredDb.setNodeRole('full');
     // Simulates the production reconnect cascade after a server restart.
     // Each cycle: open → auth + daemon.hello → close. The race must be
     // closed for every single cycle, not just statistically most.
@@ -291,5 +315,76 @@ describe('WsBridge daemon auth-handshake race — e2e (real ws server)', () => {
       auth: c.authenticatedDuringWindow, received: c.received.length,
     })), null, 2);
     expect(failedAuth, `expected 10 cycles to authenticate, got ${10 - failedAuth.length} of 10. cycles=${diagnostic}`).toHaveLength(0);
+  });
+
+  it('real WS controlled connection allows heartbeat but drops browser/push injection', async () => {
+    deferredDb.setLatency(0);
+    deferredDb.setNodeRole('controlled');
+    vi.mocked(dispatchPush).mockClear();
+    const serverId = newServerId();
+    const daemon = new WebSocket(`ws://127.0.0.1:${port}/api/server/${serverId}/ws`);
+    await new Promise<void>((resolve, reject) => {
+      daemon.once('open', resolve);
+      daemon.once('error', reject);
+    });
+    const receivedByDaemon: Array<Record<string, unknown>> = [];
+    daemon.on('message', (raw) => receivedByDaemon.push(JSON.parse(raw.toString()) as Record<string, unknown>));
+    daemon.send(JSON.stringify({ type: 'auth', serverId, token: TOKEN, nodeRole: 'full' }));
+    const authDeadline = Date.now() + 1_000;
+    while (!WsBridge.get(serverId).isAuthenticated && Date.now() < authDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(WsBridge.get(serverId).isAuthenticated).toBe(true);
+
+    const browser = new WebSocket(`ws://127.0.0.1:${port}/test-browser/${serverId}`);
+    await new Promise<void>((resolve, reject) => {
+      browser.once('open', resolve);
+      browser.once('error', reject);
+    });
+    const browserMessages: string[] = [];
+    browser.on('message', (raw) => browserMessages.push(raw.toString()));
+
+    const droppedBefore = WsBridge.controlledInboundDropped;
+    daemon.send(JSON.stringify({ type: 'heartbeat' }));
+    const heartbeatDeadline = Date.now() + 1_000;
+    while (!receivedByDaemon.some((message) => message.type === 'heartbeat_ack') && Date.now() < heartbeatDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(receivedByDaemon.some((message) => message.type === 'heartbeat_ack')).toBe(true);
+
+    const correlationId = 'invalid-real-ws-result';
+    const generation = WsBridge.get(serverId).daemonConnectionGeneration();
+    const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+    const inFlightBefore = machineExecRegistryStats().inFlight;
+    const invalidBefore = WsBridge.invalidMachineExecResultsDropped;
+    daemon.send(JSON.stringify({
+      type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+      correlationId,
+      ok: true,
+      exitCode: 0,
+      stdout: 'forged',
+      stderr: '',
+      durationMs: 1,
+      serverId: 'identity-injection-is-forbidden',
+    }));
+    const invalidDeadline = Date.now() + 1_000;
+    while (WsBridge.invalidMachineExecResultsDropped === invalidBefore && Date.now() < invalidDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(WsBridge.invalidMachineExecResultsDropped).toBe(invalidBefore + 1);
+    expect(machineExecRegistryStats().inFlight).toBe(inFlightBefore);
+    expect(cancelPendingExec(correlationId)).toBe(true);
+    await expect(pending).resolves.toBeNull();
+
+    daemon.send(Buffer.from([0x01, 0x00, 0x00]));
+    daemon.send(JSON.stringify({ type: 'session.notification', title: 'forged', body: 'do not push' }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(WsBridge.controlledInboundDropped).toBe(droppedBefore + 3);
+    expect(browserMessages).toHaveLength(0);
+    expect(dispatchPush).not.toHaveBeenCalled();
+
+    browser.close(1000, 'test_done');
+    daemon.close(1000, 'test_done');
+    deferredDb.setNodeRole('full');
   });
 });

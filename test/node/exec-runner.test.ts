@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { runRemoteExec, defaultRemoteExecShell, shellInvocation } from '../../src/node/exec-runner.js';
-import { REMOTE_EXEC_MAX_OUTPUT_BYTES } from '../../shared/remote-exec.js';
+import { REMOTE_EXEC_MAX_OUTPUT_BYTES, REMOTE_EXEC_MIN_TIMEOUT_MS } from '../../shared/remote-exec.js';
 
 // Cross-platform: tests drive `sh` explicitly so they run on the CI/dev Mac.
 // (On the real Windows target the node defaults to powershell.)
@@ -40,6 +40,20 @@ describe('runRemoteExec', () => {
     const r = await runRemoteExec({ requestId: 'r5', command: 'noop', shell: 'bash', cwd: '/nonexistent-dir-xyz' });
     expect(r.ok).toBe(false);
     expect(r.error).toBeTruthy();
+  });
+
+  it('never reports signal termination as a completed result with a null exit code', async () => {
+    const r = await runRemoteExec({ requestId: 'signal', command: 'kill -TERM $$', shell: SH });
+    expect(r).toMatchObject({ ok: false, exitCode: null });
+    expect(r.error).toMatch(/signal/i);
+  });
+
+  it('rejects a timeout below the shared minimum instead of silently clamping it', async () => {
+    const r = await runRemoteExec({
+      requestId: 'invalid-timeout', command: 'echo must-not-run', shell: SH,
+      timeoutMs: REMOTE_EXEC_MIN_TIMEOUT_MS - 1,
+    });
+    expect(r).toMatchObject({ ok: false, exitCode: null, stdout: '', error: 'invalid timeoutMs' });
   });
 
   it('caps and flags oversized output as truncated', async () => {

@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MachineExecWorker } from '../../src/node/machine-exec-worker.js';
 
 const frame = (correlationId: string, command: string, extra: Record<string, unknown> = {}) =>
-  ({ correlationId, idempotencyKey: correlationId, command, ...extra });
+  ({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, correlationId, idempotencyKey: correlationId, command, ...extra });
 
 describe('MachineExecWorker (10.8)', () => {
   it('validates the envelope and rejects an unknown shell without spawning', async () => {
