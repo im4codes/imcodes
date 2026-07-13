@@ -326,6 +326,7 @@ const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTime
 const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
 const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
@@ -3559,6 +3560,43 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(
 ): Promise<void> {
   if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   if (enforceElapsedLimit(run)) return;
+  const active = run.activeAcceptanceAudit;
+  const activeCommandId = run.activeCommandId;
+  const advanceKey = `${run.runId}:${active.attemptId}`;
+  const existingAdvance = acceptanceAuditAdvancesInFlight.get(advanceKey);
+  if (existingAdvance) {
+    await existingAdvance;
+    // A result-file poll deliberately avoids dispatching a repair prompt. If a
+    // real idle arrives while that weaker observation is in flight, replay the
+    // idle after the poll only when the same command is still active. Successful
+    // consumption or a repair dispatch changes the active audit/command and
+    // therefore does not run twice.
+    if (
+      (options.allowResultFileRepairPrompt ?? true)
+      && run.activeAcceptanceAudit?.attemptId === active.attemptId
+      && run.activeCommandId === activeCommandId
+      && run.status === active.stage
+    ) {
+      await advanceAfterPostRepairAcceptanceAuditIdle(run, options);
+    }
+    return;
+  }
+  const advance = advanceAfterPostRepairAcceptanceAuditIdleOnce(run, options);
+  acceptanceAuditAdvancesInFlight.set(advanceKey, advance);
+  try {
+    await advance;
+  } finally {
+    if (acceptanceAuditAdvancesInFlight.get(advanceKey) === advance) {
+      acceptanceAuditAdvancesInFlight.delete(advanceKey);
+    }
+  }
+}
+
+async function advanceAfterPostRepairAcceptanceAuditIdleOnce(
+  run: AutoDeliverRun,
+  options: { allowResultFileRepairPrompt?: boolean },
+): Promise<void> {
+  if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   const allowResultFileRepairPrompt = options.allowResultFileRepairPrompt ?? true;
   const active = run.activeAcceptanceAudit;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
@@ -4037,6 +4075,7 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   promptIdleAdvanceTimers.clear();
   for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
   acceptanceResultFilePollTimers.clear();
+  acceptanceAuditAdvancesInFlight.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }

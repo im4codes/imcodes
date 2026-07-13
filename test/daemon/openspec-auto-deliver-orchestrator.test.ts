@@ -2972,6 +2972,24 @@ exec "${realGit}" "$@"
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
+  it('consumes one final acceptance result only once when duplicate idle events race', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-duplicate-final-acceptance-idle');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt);
+
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL
+      && msg.projection?.status === 'passed',
+      SEND_WAIT_MS,
+    );
+    expect(terminal?.projection.auditResults).toHaveLength(1);
+    expect(serverLinkMock.send.mock.calls.filter(([msg]) =>
+      (msg as Record<string, unknown>).type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL,
+    )).toHaveLength(1);
+  });
+
   it('requests authoritative result file repair for verdict payload format errors', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-invalid-verdict-payload-repair');
     const origin = parseAutoDeliverMetadataBlock(acceptancePrompt);
