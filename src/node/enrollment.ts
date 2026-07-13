@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type Stats } from 'node:fs';
-import { chmod, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { chmod, chown, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -103,6 +103,7 @@ export interface EnrollmentStagingFs {
   unlink(path: string): Promise<void>;
   lstat(path: string): Promise<Stats>;
   fsyncParentDirectory(path: string): Promise<void>;
+  openSourceWritable(path: string): Promise<NodeFileHandle>;
 }
 
 const DEFAULT_ENROLLMENT_STAGING_FS: EnrollmentStagingFs = {
@@ -113,6 +114,7 @@ const DEFAULT_ENROLLMENT_STAGING_FS: EnrollmentStagingFs = {
   unlink,
   lstat,
   fsyncParentDirectory,
+  openSourceWritable: (path) => openNoFollow(path, true),
 };
 
 export function createEnrollmentStagingFs(
@@ -273,7 +275,7 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
     try {
       const before = await lstat(this.sourcePath);
       if (before.isSymbolicLink() || !sameFileIdentity(this.identity, fileIdentityFromStat(before))) return 'skipped';
-      cleanupHandle = await openNoFollow(this.sourcePath, true);
+      cleanupHandle = await this.stagingFs.openSourceWritable(this.sourcePath);
       const after = await cleanupHandle.stat();
       if (!sameFileIdentity(this.identity, fileIdentityFromStat(after))) return 'skipped';
       // EXACT WRITE LOOP: a single `write()` may return short. Use the shared
@@ -283,14 +285,57 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
         await writeExactly(cleanupHandle, Buffer.alloc(trailerLength), trailerStart);
         await cleanupHandle.sync();
         return 'cleaned';
-      } catch {
+      } catch (error) {
+        if (process.platform === 'linux' && isTextFileBusyError(error)) {
+          await cleanupHandle.close().catch(() => {});
+          cleanupHandle = null;
+          return this.replaceRunningLinuxSource(trailerStart);
+        }
         return 'failed';
       }
     } catch (error) {
       if (isNotFoundError(error)) return 'skipped';
+      if (process.platform === 'linux' && isTextFileBusyError(error)) {
+        return this.replaceRunningLinuxSource(trailerStart);
+      }
       return 'failed';
     } finally {
       if (cleanupHandle) await cleanupHandle.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Linux refuses O_RDWR on the currently executing image with ETXTBSY. Build
+   * a trailer-free sibling and atomically replace the pathname instead. The
+   * running process keeps its original inode, while future launches use the
+   * sanitized executable.
+   */
+  private async replaceRunningLinuxSource(trailerStart: number): Promise<SourceCleanupStatus> {
+    const replacementPath = `${this.sourcePath}.${process.pid}.${randomUUID()}.cleanup`;
+    try {
+      const before = await this.stagingFs.lstat(this.sourcePath);
+      if (before.isSymbolicLink() || !sameFileIdentity(this.identity, fileIdentityFromStat(before))) return 'skipped';
+
+      await this.stageTrailerFreeExecutable(replacementPath, trailerStart);
+      await chown(replacementPath, before.uid, before.gid);
+      await this.stagingFs.chmod(replacementPath, before.mode & 0o777);
+      const replacementHandle = await openNoFollow(replacementPath);
+      try {
+        await replacementHandle.sync();
+      } finally {
+        await replacementHandle.close();
+      }
+
+      const current = await this.stagingFs.lstat(this.sourcePath);
+      if (current.isSymbolicLink() || !sameFileIdentity(this.identity, fileIdentityFromStat(current))) return 'skipped';
+      await this.stagingFs.rename(replacementPath, this.sourcePath);
+      await this.stagingFs.fsyncParentDirectory(this.sourcePath);
+      return 'cleaned';
+    } catch (error) {
+      if (isNotFoundError(error)) return 'skipped';
+      return 'failed';
+    } finally {
+      await this.stagingFs.unlink(replacementPath).catch(() => {});
     }
   }
 
@@ -299,6 +344,10 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
     this.closed = true;
     await this.handle.close();
   }
+}
+
+function isTextFileBusyError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ETXTBSY';
 }
 
 export async function openVerifiedEnrollmentSource(

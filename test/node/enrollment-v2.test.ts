@@ -339,4 +339,30 @@ describe('copyCleanExecutable', () => {
       await source.close();
     }
   });
+
+  it.runIf(process.platform === 'linux')('atomically strips the trailer when Linux reports the running image as busy', async () => {
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const sourcePath = join(dir, 'busy-source.bin');
+    const prefix = Buffer.alloc(32, 0x62);
+    await writeFile(sourcePath, Buffer.concat([prefix, blob]), { mode: 0o751 });
+    const original = await stat(sourcePath);
+    const source = await openVerifiedEnrollmentSource(sourcePath, createEnrollmentStagingFs({
+      openSourceWritable: async () => {
+        const error = new Error('text file busy') as NodeJS.ErrnoException;
+        error.code = 'ETXTBSY';
+        throw error;
+      },
+    }));
+    try {
+      await expect(source.cleanupEnrollmentSource(prefix.length, blob.length)).resolves.toBe('cleaned');
+      await expect(readFile(sourcePath)).resolves.toEqual(prefix);
+      const cleaned = await stat(sourcePath);
+      expect(cleaned.mode & 0o777).toBe(original.mode & 0o777);
+      expect(cleaned.uid).toBe(original.uid);
+      expect(cleaned.gid).toBe(original.gid);
+      expect((await readdir(dir)).filter((entry) => entry.endsWith('.cleanup'))).toEqual([]);
+    } finally {
+      await source.close();
+    }
+  });
 });
