@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import {
+  getFullServersByUserId,
   getServersByUserId,
   updateServerHeartbeat,
   updateServerName,
@@ -355,7 +356,7 @@ function buildRemoteMemoryResponse(
 // GET /api/server — list all servers accessible to the authenticated user
 serverRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const dbServers = await getServersByUserId(c.env.DB, userId);
+  const dbServers = await getFullServersByUserId(c.env.DB, userId);
 
   const servers = dbServers.map((s) => ({
     id: s.id,

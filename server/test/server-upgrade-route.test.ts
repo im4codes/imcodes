@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
 
 const mockGetServersByUserId = vi.fn();
+const mockGetFullServersByUserId = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockRequestDaemonUpgrade = vi.fn();
 const mockDeleteServer = vi.fn();
@@ -16,6 +17,7 @@ vi.mock('../src/security/authorization.js', () => ({
 }));
 
 vi.mock('../src/db/queries.js', () => ({
+  getFullServersByUserId: (...args: unknown[]) => mockGetFullServersByUserId(...args),
   getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
   updateServerHeartbeat: vi.fn(),
   updateServerName: vi.fn(),
@@ -65,6 +67,7 @@ describe('server routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetServersByUserId.mockResolvedValue([{ id: 'srv-1', name: 'Alpha' }]);
+    mockGetFullServersByUserId.mockResolvedValue([{ id: 'srv-1', name: 'Alpha' }]);
     mockRequestDaemonUpgrade.mockReturnValue({
       ok: true,
       upgradeId: 'upgrade-1',
@@ -76,7 +79,7 @@ describe('server routes', () => {
   });
 
   it('GET /api/server returns persisted daemonVersion', async () => {
-    mockGetServersByUserId.mockResolvedValue([{
+    mockGetFullServersByUserId.mockResolvedValue([{
       id: 'srv-1',
       name: 'Alpha',
       status: 'online',

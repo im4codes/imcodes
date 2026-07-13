@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import {
-  getServersByUserId,
+  getFullServersByUserId,
   getDbSessionsByServer,
   getSubSessionsByServer,
   getUserPref,
@@ -382,7 +382,7 @@ function orderMainSessions<T extends { sessionName: string; isPinned?: boolean |
 
 watchRoutes.get('/watch/servers', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const servers = await getServersByUserId(c.env.DB, userId);
+  const servers = await getFullServersByUserId(c.env.DB, userId);
   const baseUrl = resolveBaseUrl(c.req.url, c.env.SERVER_URL);
   return c.json({
     servers: servers.map((server) => ({

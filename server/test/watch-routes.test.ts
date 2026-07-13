@@ -6,7 +6,7 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { TIMELINE_DETAIL_FIELD_PATHS } from '../../shared/timeline-protocol.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
-const mockGetServersByUserId = vi.fn();
+const mockGetFullServersByUserId = vi.fn();
 const mockGetDbSessionsByServer = vi.fn();
 const mockGetSubSessionsByServer = vi.fn();
 const mockGetUserPref = vi.fn();
@@ -35,7 +35,7 @@ vi.mock('../src/db/queries.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/db/queries.js')>();
   return {
     ...actual,
-    getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+    getFullServersByUserId: (...args: unknown[]) => mockGetFullServersByUserId(...args),
     getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
     getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
     getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
@@ -111,7 +111,7 @@ describe('Watch routes', () => {
         ? { membership: 'none', actor: { kind: 'none' } }
         : { membership: role, actor: { kind: 'server-member', effectiveActorRole: role === 'member' ? 'server-member' : 'server-manager' } };
     });
-    mockGetServersByUserId.mockResolvedValue([]);
+    mockGetFullServersByUserId.mockResolvedValue([]);
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
     mockGetUserPref.mockResolvedValue(null);
@@ -134,7 +134,7 @@ describe('Watch routes', () => {
   });
 
   it('GET /api/watch/servers returns visible servers with baseUrl', async () => {
-    mockGetServersByUserId.mockResolvedValue([
+    mockGetFullServersByUserId.mockResolvedValue([
       { id: 'srv-1', name: 'Alpha' },
       { id: 'srv-2', name: 'Beta' },
     ]);

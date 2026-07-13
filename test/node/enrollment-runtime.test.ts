@@ -71,6 +71,26 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('keeps the process alive while a disconnected controlled node waits to reconnect', () => {
+    const firstSocket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => firstSocket);
+
+    runtime.start();
+    firstSocket.close();
+
+    const reconnectTimer = (runtime as unknown as {
+      reconnectTimer: NodeJS.Timeout | null;
+    }).reconnectTimer;
+    expect(reconnectTimer).not.toBeNull();
+    expect(reconnectTimer?.hasRef()).toBe(true);
+    runtime.stop();
+  });
+
   it('persists service_registered -> service_healthy after heartbeat authentication proof', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-service-healthy-'));
     temporaryDirs.push(dir);

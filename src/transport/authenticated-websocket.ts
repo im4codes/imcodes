@@ -125,6 +125,9 @@ export class AuthenticatedWebSocketClient {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
-    this.reconnectTimer.unref?.();
+    // This client is the controlled node's long-lived process owner. Once the
+    // socket closes there may be no other referenced handles, so unref'ing the
+    // retry timer lets Node exit cleanly before reconnecting. Keep it referenced
+    // until stop() explicitly clears it.
   }
 }

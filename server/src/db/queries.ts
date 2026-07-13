@@ -42,6 +42,8 @@ export interface DbServer {
   shared_context_runtime_config?: Record<string, unknown> | string | null;
   bound_with_key_id: string | null;
   created_at: number;
+  /** Missing/null is a legacy full daemon; only the explicit controlled role is passive. */
+  node_role?: NodeRole | null;
 }
 
 export interface DbChannelBinding {
@@ -522,6 +524,12 @@ export async function getServersByUserId(db: Database, userId: string): Promise<
     }
   }
   return servers;
+}
+
+/** General server-navigation surfaces must never expose passive controlled nodes. */
+export async function getFullServersByUserId(db: Database, userId: string): Promise<DbServer[]> {
+  const servers = await getServersByUserId(db, userId);
+  return servers.filter((server) => server.node_role !== NODE_ROLE.CONTROLLED);
 }
 
 // ── Channel bindings ──────────────────────────────────────────────────────
