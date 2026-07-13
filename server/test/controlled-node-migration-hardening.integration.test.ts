@@ -16,11 +16,13 @@ import { randomBytes } from 'node:crypto';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/queries.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const migFile = (name: string) => join(__dirname, '..', 'src', 'db', 'migrations', name);
 const MIGRATION_056 = '056_controlled_node_v2_ticket_hash_hardening.sql';
 const MIGRATION_057 = '057_machine_exec_audit_immutable_server_ids.sql';
+const MIGRATION_058 = '058_controlled_node_exec_default_enabled.sql';
 const hex = (n: number) => randomBytes(n).toString('hex');
 
 let db: Database;
@@ -50,9 +52,40 @@ async function ticketHashIsNullable(): Promise<boolean> {
 
 beforeAll(async () => {
   db = createDatabase(process.env.TEST_DATABASE_URL!);
-  await runMigrations(db); // applies 052..057
+  await runMigrations(db); // applies 052..058
 });
 afterAll(async () => { await db.close(); });
+
+describe('058 controlled-node execution default', () => {
+  it('defaults new server rows to executable without changing an existing explicit false', async () => {
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const defaultedId = `ctl_default_${hex(6)}`;
+    const disabledId = `ctl_disabled_${hex(6)}`;
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role)
+       VALUES ($1, $2, 'default-enabled', $3, 'offline', $4, $5)`,
+      [defaultedId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled)
+       VALUES ($1, $2, 'explicitly-disabled', $3, 'offline', $4, $5, false)`,
+      [disabledId, userId, hex(16), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+
+    const sql = await readFile(migFile(MIGRATION_058), 'utf8');
+    await db.execute(sql);
+
+    const rows = await db.query<{ id: string; exec_enabled: boolean }>(
+      'SELECT id, exec_enabled FROM servers WHERE id IN ($1, $2) ORDER BY id',
+      [defaultedId, disabledId],
+    );
+    expect(new Map(rows.map((row) => [row.id, row.exec_enabled]))).toEqual(new Map([
+      [defaultedId, true],
+      [disabledId, false],
+    ]));
+  });
+});
 
 describe('056 controlled_node_enrollments_v2 partial-upgrade hardening', () => {
   it('fresh full-migration end state: exactly ONE UNIQUE(ticket_hash) and NOT NULL (052 duplicate-unique bug resolved)', async () => {

@@ -614,8 +614,8 @@ async function insertControlledServer(
   const refName = deriveRefName(hostname, serverId);
   const displayName = deriveDisplayName(hostname, os);
   await tx.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, ref_name, display_name, os, arch)
-     VALUES ($1, $2, $3, $4, 'offline', $5, $6, $7, $8, $9, $10)`,
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, arch)
+     VALUES ($1, $2, $3, $4, 'offline', $5, $6, true, $7, $8, $9, $10)`,
     [serverId, userId, displayName, tokenHash, Date.now(), NODE_ROLE.CONTROLLED, refName, displayName, os, arch],
   );
   return { refName, displayName };

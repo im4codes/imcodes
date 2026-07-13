@@ -1,7 +1,8 @@
 /**
  * Controlled-node hardening — real PostgreSQL (testcontainers via integration-global).
  * Covers D-A transactional/idempotent redeem, global node_role default-deny,
- * revocation kill-switch, and the owner-scoped DB-backed machine listing.
+ * default-enabled controlled-node execution, revocation kill-switch, and the
+ * owner-scoped DB-backed machine listing.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { Hono } from 'hono';
@@ -166,7 +167,7 @@ describe('owner-scoped machine listing (DB presence)', () => {
     const list = (await mine.json() as { machines: { serverId: string; online: boolean; execEnabled: boolean; os?: string; nodeRole: string }[] }).machines;
     expect(list.length).toBe(1);
     expect(list[0].online).toBe(false); // no heartbeat yet
-    expect(list[0].execEnabled).toBe(false); // D-E default off
+    expect(list[0].execEnabled).toBe(true); // installation is explicit consent; owner can still disable later
     expect(list[0].nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(list[0].os).toBe('linux');
 
