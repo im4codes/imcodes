@@ -846,7 +846,13 @@
     "upgrade_blocked_title": "업그레이드 차단됨",
     "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
-    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다."
+    "upgrade_blocked_master_compaction_active": "메모리 마스터 요약 압축이 실행 중입니다. 완료되면 daemon이 업그레이드됩니다.",
+    "upgrade_blocked_compression_active": "메모리 압축이 실행 중입니다. 완료되면 daemon이 업그레이드됩니다.",
+    "upgrade_blocked_transport_busy": "transport session이 turn을 실행 중입니다. idle 상태가 된 뒤 daemon을 업그레이드하세요.",
+    "upgrade_blocked_session_busy": "세션에 아직 활성 작업이 있습니다. idle 상태가 된 뒤 daemon을 업그레이드하세요.",
+    "upgrade_blocked_cooldown_active": "daemon이 최근 업그레이드되었습니다. 대기 시간이 끝나면 자동 업그레이드를 다시 시도합니다.",
+    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다.",
+    "upgrade_blocked_unknown": "daemon이 일시적으로 사용 중입니다. 자동 업그레이드를 다시 시도합니다."
   },
   "discussion": {
     "role_critic": "비평가",

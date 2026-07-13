@@ -846,7 +846,13 @@
     "upgrade_blocked_title": "Actualización bloqueada",
     "upgrade_blocked_p2p_active": "Team sigue en ejecución. Deténlo antes de actualizar el daemon.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver sigue en ejecución. Deténlo antes de actualizar el daemon.",
-    "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces."
+    "upgrade_blocked_master_compaction_active": "La compactación del resumen maestro de memoria sigue en curso. El daemon se actualizará cuando termine.",
+    "upgrade_blocked_compression_active": "La compresión de memoria sigue en curso. El daemon se actualizará cuando termine.",
+    "upgrade_blocked_transport_busy": "Una sesión de transporte sigue ejecutando un turno. Espera a que quede inactiva antes de actualizar el daemon.",
+    "upgrade_blocked_session_busy": "Una sesión todavía tiene trabajo activo. Espera a que quede inactiva antes de actualizar el daemon.",
+    "upgrade_blocked_cooldown_active": "El daemon se actualizó recientemente. La actualización automática volverá a intentarlo después del tiempo de espera.",
+    "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces.",
+    "upgrade_blocked_unknown": "El daemon está ocupado temporalmente. La actualización automática volverá a intentarlo."
   },
   "discussion": {
     "role_critic": "Crítico",

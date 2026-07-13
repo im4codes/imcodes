@@ -237,7 +237,7 @@ import {
   searchLocalMemorySemanticForManagement,
   searchLocalMemorySemanticFrontOfTurn,
 } from '../context/memory-recall-client.js';
-import { getCompressionQueueState, resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
+import { resumeAcceptingCompression, stopAcceptingCompression } from '../context/summary-compressor.js';
 import { closeLiveContextMaterializationAdmission, reopenLiveContextMaterializationAdmission } from '../context/live-context-ingestion.js';
 import { getInflightMasterCompactionCount, resumeAcceptingMasterCompactions, stopAcceptingMasterCompactions } from './master-compaction-registry.js';
 import { detectRepo, parseRemotes } from '../repo/detector.js';
@@ -6765,18 +6765,12 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
-  const compressionState = getCompressionQueueState();
-  if (!compressionState.idle) {
-    logger.warn({ targetVersion, compressionState }, 'daemon.upgrade: blocked because memory compression is active');
-    try {
-      serverLink?.send({
-        type: DAEMON_MSG.UPGRADE_BLOCKED,
-        reason: 'compression_active',
-        compressionState,
-      });
-    } catch { /* ignore */ }
-    return;
-  }
+  // Memory compression is derived, recoverable background work backed by
+  // durable staged events. It must never veto a daemon upgrade: below we close
+  // materialization/compression admission before spawning the upgrade, and a
+  // restart can safely resume unfinished targets from the store. In
+  // particular, a slow SDK compression backend must not pin the daemon on an
+  // old version indefinitely.
 
   // Cover BOTH transport-runtime sessions (claude-code-sdk, codex-sdk,
   // copilot-sdk, cursor-headless, openclaw, qwen) and process-runtime
@@ -6999,19 +6993,6 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
       } catch { /* ignore */ }
       return;
     }
-    const postFreezeCompressionState = getCompressionQueueState();
-    if (!postFreezeCompressionState.idle) {
-      logger.warn({ targetVersion, compressionState: postFreezeCompressionState }, 'daemon.upgrade: blocked because memory compression became active after freeze');
-      try {
-        serverLink?.send({
-          type: DAEMON_MSG.UPGRADE_BLOCKED,
-          reason: 'compression_active',
-          compressionState: postFreezeCompressionState,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
-
   logger.info('daemon.upgrade: preparing upgrade script');
 
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));

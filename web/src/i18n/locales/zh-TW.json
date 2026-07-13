@@ -846,8 +846,13 @@
     "upgrade_blocked_title": "升級已阻止",
     "upgrade_blocked_p2p_active": "團隊 仍在執行中。請先停止，再升級 daemon。",
     "upgrade_blocked_auto_deliver_active": "自動交付仍在執行中。請先停止，再升級 daemon。",
+    "upgrade_blocked_master_compaction_active": "記憶主摘要正在壓縮，完成後將自動升級 daemon。",
+    "upgrade_blocked_compression_active": "記憶壓縮正在執行，完成後將自動升級 daemon。",
     "upgrade_blocked_transport_busy": "還有 transport session 正在 turn 中。等它回到 idle 再升級 daemon。",
-    "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。"
+    "upgrade_blocked_session_busy": "仍有工作階段正在執行任務。等它回到 idle 再升級 daemon。",
+    "upgrade_blocked_cooldown_active": "daemon 最近剛完成升級，冷卻結束後會自動重試。",
+    "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。",
+    "upgrade_blocked_unknown": "daemon 暫時忙碌，稍後會自動重試升級。"
   },
   "discussion": {
     "role_critic": "評論者",

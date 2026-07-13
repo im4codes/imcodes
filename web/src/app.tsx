@@ -92,6 +92,11 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
+import {
+  daemonUpgradeBlockedToastKey,
+  shouldShowDaemonUpgradeBlockedToast,
+  type DaemonUpgradeBlockedToastState,
+} from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import {
@@ -1207,6 +1212,7 @@ export function App() {
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<AppToast[]>([]);
+  const lastUpgradeBlockedToastRef = useRef<DaemonUpgradeBlockedToastState | null>(null);
   const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
   const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
   const appUpdateRequiredRef = useRef(false);
@@ -3432,13 +3438,10 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        const message = msg.reason === 'toolchain_unavailable'
-          ? trans('toast.upgrade_blocked_toolchain_unavailable')
-          : msg.reason === 'transport_busy'
-            ? trans('toast.upgrade_blocked_transport_busy')
-            : msg.reason === 'auto_deliver_active'
-              ? trans('toast.upgrade_blocked_auto_deliver_active')
-            : trans('toast.upgrade_blocked_p2p_active');
+        const now = Date.now();
+        if (!shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) return;
+        lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
+        const message = trans(daemonUpgradeBlockedToastKey(msg.reason));
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
           id,

@@ -846,8 +846,13 @@
     "upgrade_blocked_title": "Upgrade blocked",
     "upgrade_blocked_p2p_active": "Team is still running. Stop it before upgrading the daemon.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver is still running. Stop it before upgrading the daemon.",
+    "upgrade_blocked_master_compaction_active": "Memory master-summary compaction is still running. The daemon will upgrade after it finishes.",
+    "upgrade_blocked_compression_active": "Memory compression is still running. The daemon will upgrade after it finishes.",
     "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon.",
-    "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then."
+    "upgrade_blocked_session_busy": "A session still has active work. Wait until it goes idle before upgrading the daemon.",
+    "upgrade_blocked_cooldown_active": "The daemon was upgraded recently. Automatic upgrade will retry after the cooldown.",
+    "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then.",
+    "upgrade_blocked_unknown": "The daemon is temporarily busy. Automatic upgrade will retry."
   },
   "discussion": {
     "role_critic": "Critic",

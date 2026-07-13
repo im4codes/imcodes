@@ -846,7 +846,13 @@
     "upgrade_blocked_title": "Обновление заблокировано",
     "upgrade_blocked_p2p_active": "Team всё ещё выполняется. Остановите его перед обновлением daemon.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver всё ещё выполняется. Остановите его перед обновлением daemon.",
-    "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого."
+    "upgrade_blocked_master_compaction_active": "Выполняется сжатие сводной памяти. daemon обновится после его завершения.",
+    "upgrade_blocked_compression_active": "Выполняется сжатие памяти. daemon обновится после его завершения.",
+    "upgrade_blocked_transport_busy": "Transport session всё ещё выполняет turn. Дождитесь состояния idle перед обновлением daemon.",
+    "upgrade_blocked_session_busy": "В сессии ещё выполняется работа. Дождитесь состояния idle перед обновлением daemon.",
+    "upgrade_blocked_cooldown_active": "daemon недавно обновлялся. Автообновление повторится после периода ожидания.",
+    "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого.",
+    "upgrade_blocked_unknown": "daemon временно занят. Автообновление повторит попытку."
   },
   "discussion": {
     "role_critic": "Критик",
