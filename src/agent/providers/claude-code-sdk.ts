@@ -62,6 +62,7 @@ const RESULT_COMPLETION_FALLBACK_MS = 5_000;
 const CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT = 2;
 const CONNECTION_CLOSED_CONTINUE_PROMPT = 'continue';
 const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
+const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -234,6 +235,12 @@ function makeMessageId(state: ClaudeSdkSessionState): string {
 
 function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function appendClaudeAuthRecoveryGuidance(message: string): string {
+  if (!/failed to authenticate|invalid authentication credentials|(?:api error:\s*)?401\b/i.test(message)) return message;
+  if (message.includes(CLAUDE_AUTH_RECOVERY_GUIDANCE)) return message;
+  return `${message}\n\n${CLAUDE_AUTH_RECOVERY_GUIDANCE}`;
 }
 
 function getSubagentStaleWithoutTerminalMs(): number {
@@ -925,7 +932,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
         };
       }
-      const rawAssistantText = collectAssistantText(msg);
+      const rawAssistantText = appendClaudeAuthRecoveryGuidance(collectAssistantText(msg));
       const text = this.shouldStripLeakedThink(state) ? stripLeakedThink(rawAssistantText) : rawAssistantText;
       const runtimeSubagentPayload = parseRuntimeSubagentTag(text);
       if (runtimeSubagentPayload) {
@@ -1023,9 +1030,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           : [];
         // Real claude-agent-sdk failures sometimes omit errors[] and expose the
         // only useful reason in the immediately preceding assistant diagnostic.
-        const details = sdkErrors.length > 0
+        const details = appendClaudeAuthRecoveryGuidance(sdkErrors.length > 0
           ? sdkErrors.join('; ')
-          : (state.currentText.trim() || 'Claude execution failed');
+          : (state.currentText.trim() || 'Claude execution failed'));
         const connectionClosed = this.isConnectionClosedMidResponseError(details);
         state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, connectionClosed, msg);
         if (connectionClosed) {
@@ -1960,7 +1967,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private normalizeError(err: unknown): ProviderError {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = appendClaudeAuthRecoveryGuidance(err instanceof Error ? err.message : String(err));
     if (/ENOENT|not found|spawn .*claude/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Claude binary not found: ${message}`, false, err);
     }

@@ -3650,6 +3650,10 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'rawResponseItem/completed') {
+      try {
+        const it = isRecord(params.item) ? params.item : undefined;
+        logger.info({ channel: 'raw', method, itemType: it?.type, itemName: (it as any)?.name }, 'CODEX_ITEM_PROBE');
+      } catch { /* probe only */ }
       this.handleRawResponseItem(params);
       return;
     }
@@ -3725,6 +3729,11 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      try {
+        if (item.type !== 'reasoning' && item.type !== 'agentMessage') {
+          logger.info({ channel: 'item', method, itemType: item.type, itemName: (item as any).name }, 'CODEX_ITEM_PROBE');
+        }
+      } catch { /* probe only */ }
       if (closedTurn && item.type !== 'agentMessage') return;
       // NEVER drop a real provider item. If our turn bookkeeping lags the
       // app-server (turn/start's result carried no turn id, or this event's

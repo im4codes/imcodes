@@ -557,6 +557,44 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(errors).toEqual([]);
   });
 
+  it('tells users to logout, fully exit, and login again after a 401', async () => {
+    const authError = 'Failed to authenticate. API Error: 401 Invalid authentication credentials';
+    sdkMock.setNextMessages([
+      {
+        type: 'assistant',
+        session_id: 'session-auth-guidance',
+        message: { content: [{ type: 'text', text: authError }] },
+      },
+      {
+        type: 'result',
+        session_id: 'session-auth-guidance',
+        subtype: 'error',
+        is_error: true,
+        errors: [authError],
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-auth-guidance', cwd: '/tmp/project' });
+    const deltas: string[] = [];
+    const errors: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-auth-guidance', 'hello');
+    await flush();
+
+    for (const message of [...deltas, ...errors]) {
+      expect(message).toContain(authError);
+      expect(message).toContain('run `/logout`');
+      expect(message).toContain('fully exit Claude Code');
+      expect(message).toContain('run `/login`');
+    }
+    expect(deltas).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+  });
+
   it('stops after two auto-continues and emits a recoverable terminal error', async () => {
     const connectionError = 'Claude Code returned an error result: API Error: Connection closed mid-response.';
     sdkMock.setNextMessages([
