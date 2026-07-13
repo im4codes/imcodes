@@ -89,7 +89,7 @@ function escapeXmlText(value: string): string {
  * count is an unsigned byte, so use the maximum valid count.
  */
 export function windowsScheduledTaskXml(exePath: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>IM.codes controlled node</Description>
@@ -102,7 +102,6 @@ export function windowsScheduledTaskXml(exePath: string): string {
   <Principals>
     <Principal id="System">
       <UserId>S-1-5-18</UserId>
-      <LogonType>ServiceAccount</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -133,6 +132,13 @@ export function windowsScheduledTaskXml(exePath: string): string {
 `;
 }
 
+export function encodeWindowsScheduledTaskXml(xml: string): Buffer {
+  // Task Scheduler's COM XML loader expects the declared UTF-16 encoding to
+  // match a BOM-prefixed UTF-16LE file. UTF-8 without a BOM is rejected on
+  // Windows PowerShell 5-era hosts with "cannot switch encoding".
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, 'utf16le')]);
+}
+
 /** Windows `schtasks /Create` args for an XML task definition. */
 export function windowsScheduledTaskArgs(taskXmlPath: string): string[] {
   return [
@@ -159,25 +165,45 @@ export function windowsCredentialDir(env: NodeJS.ProcessEnv = process.env): stri
  * credential file underneath is covered. The actual `icacls` invocation is
  * applied at install time (E2E on real Windows); this builder is unit-tested.
  */
-export function windowsCredentialAclArgs(dir: string): string[] {
+const WINDOWS_SYSTEM_SID = '*S-1-5-18';
+const WINDOWS_ADMINISTRATORS_SID = '*S-1-5-32-544';
+
+export type WindowsAclCommand = readonly [path: string, ...args: string[]];
+
+/**
+ * `icacls /setowner` is a separate command form and cannot be combined with
+ * `/grant` or `/inheritance`. Grant the durable principals first so the
+ * elevated installer never removes its own access between ACL operations,
+ * then strip inherited ACEs and transfer ownership to SYSTEM.
+ *
+ * Numeric well-known SIDs keep this locale-independent on non-English Windows.
+ */
+export function windowsCredentialAclCommands(dir: string): WindowsAclCommand[] {
   return [
-    dir,
-    '/inheritance:r',
-    '/setowner', 'SYSTEM',
-    '/grant:r', 'SYSTEM:(OI)(CI)F',
-    '/grant:r', 'Administrators:(OI)(CI)F',
+    [dir, '/grant:r', `${WINDOWS_SYSTEM_SID}:(OI)(CI)F`],
+    [dir, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F`],
+    [dir, '/inheritance:r'],
+    [dir, '/setowner', WINDOWS_SYSTEM_SID],
   ];
 }
 
 /** Explicit protected DACL for each persisted secret file (no inheritance). */
-export function windowsSecretFileAclArgs(path: string): string[] {
+export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] {
   return [
-    path,
-    '/inheritance:r',
-    '/setowner', 'SYSTEM',
-    '/grant:r', 'SYSTEM:F',
-    '/grant:r', 'Administrators:F',
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID],
   ];
+}
+
+export function applyWindowsAclCommands(
+  commands: readonly WindowsAclCommand[],
+  runCommand: (file: string, args: readonly string[]) => void = (file, args) => {
+    execFileSync(file, args, { stdio: 'ignore' });
+  },
+): void {
+  for (const args of commands) runCommand('icacls', args);
 }
 
 /** macOS LaunchDaemon plist (boot-scoped, root, keep-alive). */
@@ -263,7 +289,7 @@ async function installWindowsTaskDefinition(
     const artifactDir = await mkdtemp(join(tmpdir(), 'imcodes-node-task-'));
     const artifactPath = join(artifactDir, 'task.xml');
     try {
-      await writeFile(artifactPath, xml, { mode: 0o600 });
+      await writeFile(artifactPath, encodeWindowsScheduledTaskXml(xml), { mode: 0o600 });
       runCommand('schtasks', windowsScheduledTaskArgs(artifactPath));
     } finally {
       await rm(artifactDir, { recursive: true, force: true });
@@ -386,11 +412,18 @@ interface WindowsTaskInspection {
 function inspectWindowsTaskXml(xml: string, expectedAction: string | undefined): WindowsTaskInspection {
   const commandMatch = /<Command>([^<]*)<\/Command>/i.exec(xml);
   const action = commandMatch ? decodeXmlText(commandMatch[1].trim()) : null;
-  const bootTrigger = /<BootTrigger>[\s\S]*?<Enabled>\s*true\s*<\/Enabled>[\s\S]*?<\/BootTrigger>/i.test(xml);
-  const settingsEnabled = /<Settings>[\s\S]*?<Enabled>\s*true\s*<\/Enabled>[\s\S]*?<\/Settings>/i.test(xml);
+  // Task Scheduler normalizes default-true settings away and exports an
+  // enabled boot trigger as `<BootTrigger />`. Treat an explicit false as the
+  // only disabled form instead of requiring tags the manager removes.
+  const bootBlock = /<BootTrigger\b[^>]*(?:\/>|>[\s\S]*?<\/BootTrigger>)/i.exec(xml)?.[0] ?? '';
+  const settingsBlock = /<Settings\b[^>]*>[\s\S]*?<\/Settings>/i.exec(xml)?.[0] ?? '';
+  const bootTrigger = bootBlock.length > 0 && !/<Enabled>\s*false\s*<\/Enabled>/i.test(bootBlock);
+  const settingsEnabled = settingsBlock.length > 0 && !/<Enabled>\s*false\s*<\/Enabled>/i.test(settingsBlock);
   const systemPrincipal = /<UserId>\s*S-1-5-18\s*<\/UserId>/i.test(xml);
   const highRunLevel = /<RunLevel>\s*HighestAvailable\s*<\/RunLevel>/i.test(xml);
-  const restartOnFailure = /<RestartOnFailure>[\s\S]*?<Interval>\s*PT1M\s*<\/Interval>[\s\S]*?<Count>\s*255\s*<\/Count>[\s\S]*?<\/RestartOnFailure>/i.test(xml);
+  const restartBlock = /<RestartOnFailure\b[^>]*>[\s\S]*?<\/RestartOnFailure>/i.exec(xml)?.[0] ?? '';
+  const restartOnFailure = /<Interval>\s*PT1M\s*<\/Interval>/i.test(restartBlock)
+    && /<Count>\s*255\s*<\/Count>/i.test(restartBlock);
   const userIdMatch = /<UserId>\s*([^<]+?)\s*<\/UserId>/i.exec(xml);
   return {
     action,
@@ -780,6 +813,6 @@ export async function installControlledNodeService(
 export async function secureWindowsCredentialDir(dir: string = windowsCredentialDir()): Promise<string> {
   if (process.platform !== 'win32') throw new Error('secureWindowsCredentialDir is Windows-only');
   await mkdir(dir, { recursive: true });
-  execFileSync('icacls', windowsCredentialAclArgs(dir), { stdio: 'ignore' });
+  applyWindowsAclCommands(windowsCredentialAclCommands(dir));
   return dir;
 }

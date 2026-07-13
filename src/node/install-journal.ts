@@ -218,7 +218,14 @@ function mergeJournal(existing: InstallJournal | null, patch: Partial<InstallJou
   };
 }
 
+export function shouldFsyncInstallJournalParent(platform: NodeJS.Platform = process.platform): boolean {
+  // Windows can open a directory handle through Node, but fsync on that handle
+  // fails with EPERM. The journal file itself is already fsynced before rename.
+  return platform !== 'win32';
+}
+
 async function fsyncParentDir(path: string): Promise<void> {
+  if (!shouldFsyncInstallJournalParent()) return;
   const dir = dirname(path);
   const fh = await open(dir, 'r');
   try {
@@ -270,7 +277,7 @@ export async function loadInstallJournal(path: string): Promise<InstallJournal> 
   }
 }
 
-/** Persist a phase durably: merge metadata, write temp + fsync + atomic rename + parent fsync. */
+/** Persist a phase durably: merge metadata, write temp + fsync + atomic rename + supported parent fsync. */
 export async function writeInstallPhase(
   path: string,
   phase: InstallPhase,

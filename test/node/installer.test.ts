@@ -7,10 +7,12 @@ import { describe, it, expect } from 'vitest';
 import {
   CONTROLLED_NODE_SERVICE,
   windowsScheduledTaskArgs,
+  encodeWindowsScheduledTaskXml,
   windowsScheduledTaskXml,
   windowsCredentialDir,
-  windowsCredentialAclArgs,
-  windowsSecretFileAclArgs,
+  applyWindowsAclCommands,
+  windowsCredentialAclCommands,
+  windowsSecretFileAclCommands,
   macosLaunchDaemonPlist,
   linuxSystemdUnit,
   MACOS_PLIST_PATH,
@@ -56,7 +58,9 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('Windows task is boot-scoped SYSTEM and restarts after failure (4.1)', () => {
     const xml = windowsScheduledTaskXml('C:\\Program Files\\IM.codes\\node<&>.exe');
     expect(xml).toContain('<BootTrigger>');
+    expect(xml).toContain('<?xml version="1.0" encoding="UTF-16"?>');
     expect(xml).toContain('<UserId>S-1-5-18</UserId>');
+    expect(xml).not.toContain('<LogonType>');
     expect(xml).toContain('<RunLevel>HighestAvailable</RunLevel>');
     expect(xml).toContain('<RestartOnFailure>');
     expect(xml).toContain('<Interval>PT1M</Interval>');
@@ -76,7 +80,9 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
           expect(args).toEqual(windowsScheduledTaskArgs(String(args[4])));
           expect(args).toContain('/F');
           artifactPath = String(args[4]);
-          artifact = readFileSync(artifactPath, 'utf8');
+          const bytes = readFileSync(artifactPath);
+          expect([...bytes.subarray(0, 2)]).toEqual([0xff, 0xfe]);
+          artifact = bytes.subarray(2).toString('utf16le');
           return;
         }
         if (args[0] === '/Query') return '<Task />';
@@ -87,6 +93,8 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     })).resolves.toBe(CONTROLLED_NODE_SERVICE.WINDOWS_TASK);
 
     expect(artifact).toBe(windowsScheduledTaskXml(EXE));
+    expect(encodeWindowsScheduledTaskXml(windowsScheduledTaskXml(EXE)).subarray(0, 2))
+      .toEqual(Buffer.from([0xff, 0xfe]));
     expect(existsSync(artifactPath)).toBe(false);
   });
 
@@ -99,23 +107,38 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
 
   it('Windows credential ACL grants only SYSTEM + Administrators and strips inheritance (10.10)', () => {
     const dir = 'C:\\ProgramData\\imcodes-node';
-    const args = windowsCredentialAclArgs(dir);
-    expect(args[0]).toBe(dir);
-    expect(args).toContain('/inheritance:r'); // remove inherited/other-user access
-    expect(args).toContain('/setowner');
-    expect(args).toContain('SYSTEM:(OI)(CI)F');
-    expect(args).toContain('Administrators:(OI)(CI)F');
+    const commands = windowsCredentialAclCommands(dir);
+    expect(commands).toEqual([
+      [dir, '/grant:r', '*S-1-5-18:(OI)(CI)F'],
+      [dir, '/grant:r', '*S-1-5-32-544:(OI)(CI)F'],
+      [dir, '/inheritance:r'],
+      [dir, '/setowner', '*S-1-5-18'],
+    ]);
+    // `icacls /setowner` is an exclusive command form on Windows. Combining it
+    // with grants/inheritance caused first-run installation to stop at elevated.
+    expect(commands.find((args) => args.includes('/setowner'))).toHaveLength(3);
     // No broad principals (Users/Everyone/Authenticated Users) are granted.
-    const joined = args.join(' ');
+    const joined = commands.flat().join(' ');
     expect(joined).not.toMatch(/\bUsers:/);
     expect(joined).not.toMatch(/Everyone/i);
     expect(joined).not.toMatch(/Authenticated Users/i);
-    const fileArgs = windowsSecretFileAclArgs(`${dir}\\credential.json`);
-    expect(fileArgs).toContain('/inheritance:r');
-    expect(fileArgs).toContain('/setowner');
-    expect(fileArgs).toContain('SYSTEM:F');
-    expect(fileArgs).toContain('Administrators:F');
-    expect(fileArgs.join(' ')).not.toMatch(/\bUsers:/);
+    const fileCommands = windowsSecretFileAclCommands(`${dir}\\credential.json`);
+    expect(fileCommands).toEqual([
+      [`${dir}\\credential.json`, '/grant:r', '*S-1-5-18:F'],
+      [`${dir}\\credential.json`, '/grant:r', '*S-1-5-32-544:F'],
+      [`${dir}\\credential.json`, '/inheritance:r'],
+      [`${dir}\\credential.json`, '/setowner', '*S-1-5-18'],
+    ]);
+    expect(fileCommands.flat().join(' ')).not.toMatch(/\bUsers:/);
+  });
+
+  it('runs each Windows ACL operation as its own icacls process', () => {
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    const commands = windowsCredentialAclCommands('C:\\ProgramData\\imcodes-node');
+    applyWindowsAclCommands(commands, (file, args) => calls.push({ file, args }));
+
+    expect(calls).toEqual(commands.map((args) => ({ file: 'icacls', args })));
+    expect(calls).toHaveLength(4);
   });
 
   it('macOS artifact is a LaunchDaemon (root, boot), not a LaunchAgent (4.2)', () => {
@@ -280,6 +303,32 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(calls.map(({ file }) => file)).toEqual(['schtasks', 'powershell.exe']);
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Create');
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Run');
+  });
+
+  it('accepts Task Scheduler normalized defaults and reordered restart fields', async () => {
+    const action = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
+    const normalized = `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><RestartOnFailure><Count>255</Count><Interval>PT1M</Interval></RestartOnFailure></Settings>
+  <Triggers><BootTrigger /></Triggers>
+  <Actions Context="System"><Exec><Command>${action}</Command></Exec></Actions>
+</Task>`;
+    const inspection = await inspectServiceState({
+      name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+      platform: 'win32',
+      action,
+    }, {
+      platform: 'win32',
+      runCommand: (file) => (file === 'schtasks' ? normalized : 'Running'),
+    });
+
+    expect(inspection).toMatchObject({
+      bootEnabled: true,
+      restartPolicy: 'on-failure',
+      definitionMatches: true,
+      runState: 'running',
+    });
   });
 
   it('Windows flags a registered task whose Command no longer matches the receipt action', async () => {

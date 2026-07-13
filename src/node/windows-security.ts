@@ -120,12 +120,19 @@ function Get-Rights {
 }
 [pscustomobject]@{
   path = $p
-  owner = [Security.Principal.SecurityIdentifier]::new($a.Owner).Value
+  owner = $a.GetOwner([Security.Principal.SecurityIdentifier]).Value
   protectedDacl = $a.AreAccessRulesProtected
   principals = Get-Rights -rules $a.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
-}
-| ConvertTo-Json -Depth 6 -Compress
+} | ConvertTo-Json -Depth 6 -Compress
 `.trim();
+
+export function buildCredentialAclQueryScript(dir: string): string {
+  const escaped = dir.replaceAll("'", "''");
+  return ACL_QUERY_SCRIPT.replace(
+    '$p = $null # substituted with a single-quoted literal by readCredentialDirAcl',
+    `$p = '${escaped}'`,
+  );
+}
 
 /** Parse the JSON output of the ACL query script into a structured AclReport. */
 export function parseAclJson(json: string): AclReport {
@@ -172,11 +179,7 @@ export function readCredentialDirAcl(
   options: { runPowerShellImpl?: (script: string) => string } = {},
 ): AclReport {
   const runner = options.runPowerShellImpl ?? runPowerShell;
-  const escaped = dir.replaceAll("'", "''");
-  const script = ACL_QUERY_SCRIPT.replace(
-    '$p = $null # substituted with a single-quoted literal by readCredentialDirAcl',
-    `$p = '${escaped}'`,
-  );
+  const script = buildCredentialAclQueryScript(dir);
   const json = runner(script);
   return parseAclJson(json);
 }

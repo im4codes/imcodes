@@ -11,6 +11,7 @@ import {
 } from '../../src/node/enrollment.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import {
+  buildCredentialAclQueryScript,
   FS_RIGHTS,
   evaluateAclReport,
   parseAclJson,
@@ -70,6 +71,15 @@ const secureWindowsReport = (overrides: Partial<AclReport> = {}): AclReport => (
 });
 
 describe('controlled credential ACL (10.10, Windows effective rights)', () => {
+  it('emits Windows PowerShell 5-compatible JSON piping', () => {
+    const script = buildCredentialAclQueryScript("C:\\ProgramData\\imcodes-node's");
+    expect(script).toContain("$p = 'C:\\ProgramData\\imcodes-node''s'");
+    expect(script).toContain('$a.GetOwner([Security.Principal.SecurityIdentifier]).Value');
+    expect(script).toContain('} | ConvertTo-Json -Depth 6 -Compress');
+    expect(script).not.toMatch(/\n\s*\|/);
+    expect(script).not.toContain('}\n} | ConvertTo-Json');
+  });
+
   it('accepts only a protected SYSTEM + Administrators full-control DACL', () => {
     expect(evaluateAclReport(secureWindowsReport())).toMatchObject({ ok: true, reason: 'ok' });
   });

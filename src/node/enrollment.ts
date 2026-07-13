@@ -1,5 +1,4 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { constants as fsConstants, type Stats } from 'node:fs';
 import { chmod, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import os from 'node:os';
@@ -19,7 +18,11 @@ import {
   type EnrollmentBlob,
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
-import { windowsCredentialDir, windowsSecretFileAclArgs } from './installer.js';
+import {
+  applyWindowsAclCommands,
+  windowsCredentialDir,
+  windowsSecretFileAclCommands,
+} from './installer.js';
 
 export interface ControlledNodeCredential {
   serverId: string;
@@ -343,7 +346,7 @@ async function writeProtectedJson(path: string, value: unknown): Promise<void> {
   if (process.platform !== 'win32') await chmod(temp, 0o600);
   await rename(temp, path);
   if (process.platform === 'win32') {
-    execFileSync('icacls', windowsSecretFileAclArgs(path), { stdio: 'ignore' });
+    applyWindowsAclCommands(windowsSecretFileAclCommands(path));
   }
   await fsyncParentDirectory(path);
 }

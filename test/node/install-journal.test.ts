@@ -9,6 +9,7 @@ import {
   isInstallComplete,
   mayRedeem,
   loadInstallJournal,
+  shouldFsyncInstallJournalParent,
   writeInstallPhase,
   InstallJournalCorruptError,
   InstallJournalTransitionError,
@@ -77,6 +78,12 @@ describe('install journal phase ordering (10.10)', () => {
 });
 
 describe('install journal persistence + resume (10.10)', () => {
+  it('skips unsupported directory fsync on Windows', () => {
+    expect(shouldFsyncInstallJournalParent('win32')).toBe(false);
+    expect(shouldFsyncInstallJournalParent('linux')).toBe(true);
+    expect(shouldFsyncInstallJournalParent('darwin')).toBe(true);
+  });
+
   it('a fresh/absent journal reads as uninstalled', async () => {
     expect((await loadInstallJournal(path)).phase).toBe('uninstalled');
   });
