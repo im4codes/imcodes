@@ -171,6 +171,13 @@ const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 // a few seconds. The read itself is still gated by CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS
 // (so healthy, actively-streaming turns never touch the file).
 const CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS = 2_000;
+// Store-driven settle BACKSTOP grace. The per-turn rollout settle poll above and
+// the fs.watch that arms it are torn down with the turn; if they miss the
+// terminal record (disarmed watch, cleared timer, runningTurnId desync) the turn
+// stays "running" forever. An always-on health-poll backstop re-derives
+// terminality from the rollout's last lifecycle marker, but must never race the
+// 2s primary path — it only acts once the completion has been durable this long.
+const CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS = 90_000;
 // ROLLOUT-FIRST AUTHORITY: codex-core writes a terminal `task_complete{turn_id}`
 // to the thread's rollout the instant the model finishes a turn — empirically
 // ~2s BEFORE the process would even exit, and terminal in 2813/2813 sampled
@@ -683,6 +690,11 @@ interface HeartbeatThreadSummary {
 interface CodexRolloutTaskCompleteEvidence {
   turnId: string;
   lastAgentMessage?: string;
+}
+
+interface CodexRolloutTerminalEvidence extends CodexRolloutTaskCompleteEvidence {
+  /** Wall-clock ms of the rollout `task_complete` wrapper timestamp, or null if unparseable. */
+  completedAtMs: number | null;
 }
 
 interface CodexActiveTurnLease {
@@ -3137,27 +3149,45 @@ export class CodexSdkProvider implements TransportProvider {
     // Shared with the legacy settle poll so only one rollout read runs at a time.
     if (state.rolloutTaskCompleteCheckInFlight) return;
     state.rolloutTaskCompleteCheckInFlight = true;
+    // Current turn's start wallclock — rejects a PRIOR turn's task_complete during
+    // the window before this turn's own task_started has been flushed to disk.
+    const turnStartedAtMs = state.activeTurnLease?.startedAtMs ?? state.activeTurnLease?.turnStartInFlightAtMs ?? null;
     try {
-      const evidence = await this.rolloutTailReportsTaskComplete(state, turnId);
-      if (!evidence) return;
+      // ONE session-scoped tail read (the rollout file is already per-thread), and
+      // we judge turn liveness by the tail's LAST lifecycle marker rather than by
+      // matching a specific turn_id. This is immune to the exact failure that used
+      // to strand a finished turn as "working" forever: in-memory runningTurnId
+      // desynced from the turn_id codex-core actually wrote (turn/start result
+      // missing / late / wrong id), so the turnId-scoped match never fired even
+      // though task_complete was durably on disk. We settle when the terminal
+      // record is a task_complete that either matches the tracked turn id OR was
+      // written at/after this turn started (the start-time guard, above).
+      const terminal = await this.rolloutTailReportsTerminalTaskComplete(state);
+      if (!terminal) return;
+      const desync = terminal.turnId !== turnId;
+      if (desync) {
+        if (turnStartedAtMs == null || terminal.completedAtMs == null || terminal.completedAtMs < turnStartedAtMs) return;
+      }
+      const settledTurnId = terminal.turnId;
       const latest = this.sessions.get(sessionId);
       if (!latest) return;
-      if (latest.cancelled || latest.runningCompact || this.isClosedCodexTurn(latest, turnId)) return;
+      if (latest.cancelled || latest.runningCompact || this.isClosedCodexTurn(latest, settledTurnId)) return;
       // A missing turn/start RPC response can leave startTurn() awaiting forever;
       // record the terminal turn so a very late response cannot re-run it.
-      if (latest.turnStartInFlight) latest.terminalDuringTurnStartIds.add(turnId);
-      if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
-        latest.currentMessageId = `${turnId}:rollout-task-complete`;
-        latest.currentText = evidence.lastAgentMessage;
+      if (latest.turnStartInFlight) latest.terminalDuringTurnStartIds.add(settledTurnId);
+      if (terminal.lastAgentMessage && latest.currentText !== terminal.lastAgentMessage) {
+        latest.currentMessageId = `${settledTurnId}:rollout-task-complete`;
+        latest.currentText = terminal.lastAgentMessage;
       }
       logger.warn({
         provider: this.id,
         sessionId,
         ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
         threadId: latest.threadId,
-        turnId,
+        turnId: settledTurnId,
+        ...(desync ? { trackedTurnId: turnId, desyncSettle: true } : {}),
       }, 'Codex rollout task_complete observed via real-time watch; settling turn from authoritative rollout evidence');
-      await this.completeTurn(sessionId, latest, turnId, 'rollout_task_complete');
+      await this.completeTurn(sessionId, latest, settledTurnId, 'rollout_task_complete');
     } catch (err) {
       logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout authority check failed');
     } finally {
@@ -4355,6 +4385,130 @@ export class CodexSdkProvider implements TransportProvider {
       return null;
     } catch (err) {
       logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, turnId, err }, 'Codex rollout task_complete tail read failed');
+      return null;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Store-driven settle BACKSTOP (rollout is authority). When the persisted
+   * session state still says a codex turn is running but the rollout tail proves
+   * the turn already reached `task_complete`, settle it — WITHOUT requiring the
+   * per-turn rollout settle timer/fs.watch to still be armed and WITHOUT
+   * requiring `state.runningTurnId` to have been re-observed by a live
+   * notification. This closes the gap where a lost `turn/completed`, a disarmed
+   * rollout watch, or a `runningTurnId` desync leaves a finished turn "working"
+   * forever — a state neither the 2s primary settle poll nor the 12-minute
+   * active-turn watchdog can clear (both need a live, matching active turn).
+   *
+   * Called from the always-on daemon health poll, so it is independent of the
+   * per-turn timers that can be torn down mid-flight. Returns true iff it
+   * settled a turn. It deliberately only fires while the provider STILL holds
+   * this exact turn as in-flight, so it drives the same completion callback the
+   * normal path would (no duplicate assistant message, no settling a turn the
+   * provider already closed).
+   */
+  async settleCompletedTurnFromRolloutBackstop(
+    sessionId: string,
+    opts: { minCompleteAgeMs?: number; nowMs?: number } = {},
+  ): Promise<boolean> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return false;
+    if (state.cancelled || state.runningCompact) return false;
+    const evidence = await this.rolloutTailReportsTerminalTaskComplete(state);
+    if (!evidence) return false;
+    // Never race the 2s primary settle path: only act once the terminal record
+    // has been durable for the grace window.
+    const minAge = opts.minCompleteAgeMs ?? CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS;
+    const now = opts.nowMs ?? Date.now();
+    if (evidence.completedAtMs != null && now - evidence.completedAtMs < minAge) return false;
+    // Re-read after the await; a newer turn may have genuinely started.
+    const latest = this.sessions.get(sessionId);
+    if (!latest || latest.cancelled || latest.runningCompact) return false;
+    // Only settle while the provider still believes THIS exact turn is in-flight.
+    // If the provider already closed it (runningTurnId cleared / a different turn
+    // running), re-firing completeTurn would duplicate the final message or kill
+    // real work — so we defer to the normal path / a newer turn instead.
+    const providerStillRunningThisTurn =
+      latest.runningTurnId === evidence.turnId
+      || latest.activeTurnLease?.turnId === evidence.turnId
+      || (latest.turnStartInFlight && latest.runningTurnId === undefined);
+    if (!providerStillRunningThisTurn) return false;
+    if (this.isClosedCodexTurn(latest, evidence.turnId)) return false;
+    if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
+      latest.currentMessageId = `${evidence.turnId}:rollout-backstop`;
+      latest.currentText = evidence.lastAgentMessage;
+    }
+    logger.warn({
+      provider: this.id,
+      sessionId,
+      ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
+      threadId: latest.threadId,
+      turnId: evidence.turnId,
+      completedAtMs: evidence.completedAtMs,
+      ageMs: evidence.completedAtMs != null ? Math.max(0, now - evidence.completedAtMs) : null,
+    }, 'Codex store-driven backstop: rollout proves the running turn is complete; settling the zombie turn from rollout evidence');
+    await this.completeTurn(sessionId, latest, evidence.turnId, 'rollout_task_complete');
+    return true;
+  }
+
+  /**
+   * Reads the tail of the thread's rollout looking for the LAST turn-lifecycle
+   * marker. `task_started` (with no later completion) => a turn is in flight;
+   * `task_complete` / `turn_aborted` => the turn is closed. Deriving terminality
+   * from the last marker needs no in-memory turnId and is immune to a lost
+   * `turn/completed` notification or a `runningTurnId` desync. Returns the
+   * terminal `task_complete` evidence (with its wall-clock completion time) iff
+   * the tail's last marker is a `task_complete`, else null.
+   */
+  private async rolloutTailReportsTerminalTaskComplete(state: CodexSdkSessionState): Promise<CodexRolloutTerminalEvidence | null> {
+    if (!state.threadId) return null;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
+    if (!rolloutPath) return null;
+    state.rawChecklistRolloutPath = rolloutPath;
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const start = Math.max(0, size - CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES);
+      if (start >= size) return null;
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      if (bytesRead <= 0) return null;
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      let terminal: CodexRolloutTerminalEvidence | null = null;
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        // Cheap pre-filter before JSON.parse — only the three lifecycle markers matter.
+        if (!trimmed.includes('task_started') && !trimmed.includes('task_complete') && !trimmed.includes('turn_aborted')) continue;
+        let record: Record<string, unknown>;
+        try { record = JSON.parse(trimmed) as Record<string, unknown>; } catch { continue; }
+        const payload = isRecord(record.payload) ? record.payload : record;
+        const type = payload.type;
+        if (type === 'task_complete') {
+          const turnId = meaningfulString(payload.turn_id) ?? meaningfulString(payload.turnId);
+          if (!turnId) { terminal = null; continue; }
+          const parsed = meaningfulString(record.timestamp) ? Date.parse(String(record.timestamp)) : NaN;
+          const lastAgentMessage = readRolloutTaskCompleteMessage(payload as Record<string, any>);
+          terminal = {
+            turnId,
+            ...(lastAgentMessage ? { lastAgentMessage } : {}),
+            completedAtMs: Number.isFinite(parsed) ? parsed : null,
+          };
+        } else if (type === 'task_started' || type === 'turn_aborted') {
+          // A start (or abort) AFTER the last task_complete means the completed
+          // turn is no longer the tail state: a new turn is running, or the tail
+          // ended on an abort with nothing to settle here. Either way, not terminal.
+          terminal = null;
+        }
+      }
+      return terminal;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, err }, 'Codex rollout terminal tail read failed');
       return null;
     } finally {
       if (fh) await fh.close().catch(() => {});

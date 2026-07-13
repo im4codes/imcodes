@@ -852,6 +852,30 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
+   * Codex-only store-driven settle backstop passthrough. Delegates to the
+   * CodexSdkProvider's rollout-terminality backstop when this runtime is bound
+   * to a codex-sdk provider session; a no-op (returns false) for every other
+   * provider. Feature-detected structurally so this module needs no dependency
+   * on the codex provider type. The always-on health poll calls this so a turn
+   * the rollout proves complete cannot stay "working" forever after the
+   * per-turn settle timer / fs.watch is torn down.
+   */
+  async reconcileCompletedCodexTurnFromRollout(
+    opts: { minCompleteAgeMs?: number; nowMs?: number } = {},
+  ): Promise<boolean> {
+    const sid = this._providerSessionId;
+    if (!sid) return false;
+    const provider = this.provider as unknown as {
+      settleCompletedTurnFromRolloutBackstop?: (
+        sessionId: string,
+        opts?: { minCompleteAgeMs?: number; nowMs?: number },
+      ) => Promise<boolean>;
+    };
+    if (typeof provider.settleCompletedTurnFromRolloutBackstop !== 'function') return false;
+    return provider.settleCompletedTurnFromRolloutBackstop(sid, opts);
+  }
+
+  /**
    * Repair the only invalid queue-visible idle state: no active turn, runtime
    * status idle, but queued messages are still waiting. This can happen when a
    * provider surfaces an idle/finished status without a matching completion

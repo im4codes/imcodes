@@ -1587,8 +1587,18 @@ function startHealthPoller(): void {
       } catch (err) {
         logger.warn({ err, sessionName: s.name }, 'memory compression auto-continue watchdog failed');
       }
-      let codexRecovered = false;
+      // Store-driven settle backstop runs FIRST: if the rollout proves the
+      // turn already completed, settle it to idle (no `continue` nudge) rather
+      // than letting the stale-turn watchdog treat a finished turn as stalled.
+      let codexSettledFromRollout = false;
       if (!memoryCompressionRecovered) {
+        codexSettledFromRollout = await reconcileCodexCompletedTurnFromRollout(s).catch((err) => {
+          logger.warn({ err, sessionName: s.name }, 'codex rollout settle backstop failed');
+          return false;
+        });
+      }
+      let codexRecovered = false;
+      if (!memoryCompressionRecovered && !codexSettledFromRollout) {
         codexRecovered = await recoverCodexStalledSession(s).catch((err) => {
           logger.warn({ err, sessionName: s.name }, 'codex stale-turn auto-continue watchdog failed');
           return false;
@@ -1667,6 +1677,32 @@ function rememberCodexAutoContinuedGeneration(generationKey: string): void {
     if (oldest === undefined) break;
     codexAutoContinuedActivityGenerations.delete(oldest);
   }
+}
+
+/**
+ * Store-driven settle BACKSTOP for codex-sdk sessions. The 2s primary rollout
+ * settle poll and the fs.watch that arms it are per-turn and torn down with the
+ * turn; the 12-minute active-turn watchdog only fires while the runtime reports
+ * an ACTIVE turn (isTransportDiagnosticActive) — so a turn that genuinely
+ * completed (task_complete in the rollout) but whose completion notification was
+ * lost, whose rollout watch was disarmed, or whose in-memory runningTurnId
+ * desynced falls into a gap: nothing clears the persisted `running` state and
+ * the UI shows "working" forever. This backstop runs on the always-on health
+ * poll (independent of any per-turn timer): for a codex session the store still
+ * reports as `running`, it asks the provider whether the rollout tail proves the
+ * turn already reached task_complete and, if so, settles it via the normal
+ * completion path. Returns true iff a turn was settled.
+ */
+export async function reconcileCodexCompletedTurnFromRollout(
+  s: Pick<SessionRecord, 'name' | 'agentType' | 'providerId' | 'state'>,
+  nowMs = Date.now(),
+): Promise<boolean> {
+  if (!isCodexTransportSession(s)) return false;
+  // Only a session the store still believes is working can be a zombie turn.
+  if (s.state !== 'running') return false;
+  const runtime = getTransportRuntime(s.name);
+  if (!runtime) return false;
+  return runtime.reconcileCompletedCodexTurnFromRollout({ nowMs });
 }
 
 export async function recoverCodexStalledSession(
