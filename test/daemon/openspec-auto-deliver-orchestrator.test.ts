@@ -288,7 +288,8 @@ function expectAuthoritativeResultSchemaHints(text: string): void {
   expect(text).toContain('Each evidence entry requires fields: source, summary; optional fields: command, exitCode');
   expect(text).toContain('Final acceptance audits must include repair_completion with fields');
   expect(text).toContain('evidence.source is informational only');
-  expect(text).toContain('PASS must leave unchecked_tasks and required_changes empty');
+  expect(text).toContain('PASS must leave required_changes empty');
+  expect(text).toContain('PASS may leave the external / deployment-only / authorization-gated / explicitly-deferred tasks unchecked');
 }
 
 function expectFinalAcceptanceScoringDiscipline(text: string): void {
@@ -309,7 +310,11 @@ function expectFinalAcceptanceScoringDiscipline(text: string): void {
   // Anti-gaming guards retained on the other side.
   expect(text).toContain('do not exceed the repair scorecard full-score conditions, and do not restore points for claims you could not verify');
   expect(text).toContain('Award 9 or 10 only when fresh post-repair evidence shows the relevant module is complete');
-  expect(text).toContain('If any previous finding remains unresolved or only unverified, verdict must be REWORK');
+  expect(text).toContain('If any previous finding remains unresolved or only unverified');
+  expect(text).toContain('fixable or verifiable IN THIS REPOSITORY');
+  // Accepted external/deferred gates must not tank scores or force REWORK.
+  expect(text).toContain('are accepted deferrals, NOT defects');
+  expect(text).toContain('A run whose only remaining gaps are these accepted external gates should PASS');
   expect(text).toContain('Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS');
 }
 
@@ -2768,6 +2773,52 @@ exec "${realGit}" "$@"
     expect(terminal?.projection.status).toBe('needs_human');
     expect(String(terminal?.projection.terminalReason ?? '')).toContain('repair_completion_blocked');
     expect([...p2pRuns.values()]).toHaveLength(1);
+  });
+
+  it('delivers (passed) when the only unchecked tasks are accepted external/deferred gates', async () => {
+    // One in-repo task done + one external release gate deliberately left
+    // unchecked and declared skippable. External verification must not block
+    // delivery: the run should PASS with the external gate surfaced as an open
+    // follow-up (still unchecked, never auto-closed), not re-blocked at final
+    // acceptance as audit_pass_with_unchecked_tasks.
+    await makeChange('demo-change', '- [x] wire the feature end to end\n- [ ] production deploy requires user authorization\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-external-deferral-delivers',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    // Complete implementation with the one external task declared skippable.
+    await waitForTransportSend((text) => text.includes('Implementation completion marker (required):'), SEND_WAIT_MS);
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+      && msg.projection?.stage === 'implementation_audit_repair', SEND_WAIT_MS);
+    await completeLatestDiscussion();
+    await waitForTransportSend((text) =>
+      text.includes('Audit findings to repair now:')
+      && text.includes('Reason: implementation_audit_followup_repair'), SEND_WAIT_MS);
+
+    // Post-repair completion — external task still unchecked, still skippable=1
+    // (must NOT reset the accepted allowance to 0).
+    expect(await writeLatestImplementationMarker({ skippableTaskCount: 1 })).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    const acceptancePrompt = await waitForTransportSend((text) =>
+      text.includes('OpenSpec Auto Deliver final implementation acceptance audit for @openspec/changes/demo-change'), SEND_WAIT_MS);
+
+    // PASS with the external task NOT reported as unchecked (accepted deferral).
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, { verdict: 'PASS', unchecked_tasks: [], required_changes: [] });
+    await emitDeckDemoIdle();
+
+    const terminal = await waitForSend((msg) =>
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', 8000);
+    expect(terminal?.projection.status).toBe('passed');
+    expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
 
   it('starts another Team implementation audit only after final acceptance says previous repairs are complete but still low scoring', async () => {

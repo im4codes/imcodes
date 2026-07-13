@@ -212,6 +212,12 @@ interface AutoDeliverRun {
   specAuditRepairRound: number;
   implementationAuditRepairRound: number;
   taskStats: OpenSpecAutoDeliverTaskStats;
+  /** Skippable-task allowance accepted from the completed implementation marker:
+   *  the count of unchecked tasks that are external / deployment-only /
+   *  authorization-gated / explicitly deferred. Final acceptance may PASS while
+   *  up to this many tasks remain unchecked — those external gates are surfaced
+   *  as deferred follow-ups, never auto-checked, so they cannot block delivery. */
+  acceptedSkippableTaskCount?: number;
   terminalReason?: string;
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
@@ -1492,6 +1498,9 @@ async function advanceAfterCompletedImplementationMarker(
   marker: P2pExecutionMarker,
 ): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
+  // Carry the accepted external/deferred allowance forward so final acceptance
+  // can PASS with these gates still unchecked instead of re-blocking on them.
+  run.acceptedSkippableTaskCount = marker.skippableTaskCount ?? 0;
   recordImplementationMarkerEvidence(run, marker);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
@@ -1880,7 +1889,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     specStage
       ? '- For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria. If OpenSpec validation was not run after repair, cap spec, tasks, tests, and risk at 7 even if the text looks clean.'
       : '- For implementation-stage scoring, tests means actual test coverage plus executed validation. If product validation was not run after repair, cap implementation and risk at 7 and cap tests at 6 even if the code looks plausible.',
-    '- If any previous finding remains unresolved or only unverified, verdict must be REWORK and the affected module score must be 5 or lower.',
+    '- External / deployment-only / authorization-gated / physical-hardware / real-reboot / CI-release gates that are CORRECTLY kept unchecked-and-deferred are accepted deferrals, NOT defects: do not lower any module score for them, do not treat their unverifiability as an unresolved finding, and do not make the verdict REWORK because of them. Score only the in-repo work that CAN be verified here; surface the deferred external gates in evidence/blocked_items so a human can complete them. A run whose only remaining gaps are these accepted external gates should PASS.',
+    '- If any previous finding remains unresolved or only unverified — and it is fixable or verifiable IN THIS REPOSITORY — verdict must be REWORK and the affected module score must be 5 or lower. (This does NOT apply to the accepted external/deferred gates above.)',
     '- Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS.',
     '',
     'The top-level auto_deliver object must exactly equal this metadata object:',
@@ -2530,7 +2540,7 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
     `Each evidence entry requires fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS.join(', ')}; optional fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS.join(', ')}.`,
     'Final acceptance audits must include repair_completion with fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     'evidence.source is informational only; use any useful label, or "none" when no label is available.',
-    'PASS must leave unchecked_tasks and required_changes empty.',
+    'PASS must leave required_changes empty. PASS may leave the external / deployment-only / authorization-gated / explicitly-deferred tasks unchecked (they are accepted deferrals, surfaced as follow-ups, not defects): do NOT list those in unchecked_tasks or required_changes, and do NOT lower any module score for them — record them in evidence (and blocked_items) instead. unchecked_tasks must contain only genuinely IMPLEMENTABLE work that still remains; if any such implementable work remains, the verdict is REWORK, not PASS.',
   ];
 }
 
@@ -2731,8 +2741,15 @@ function repairSummaryText(repairs: OpenSpecAutoDeliverRepairSummary[]): string 
 function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerdictPayload, changedFiles: string[] = []): string | null {
   if (verdict.verdict !== 'PASS') return null;
   if (run.taskStats.total <= 0) return 'tasks_missing_checkboxes';
-  if (run.taskStats.unchecked > 0) return 'audit_pass_with_unchecked_tasks';
-  if (verdict.unchecked_tasks.length > 0) return 'audit_pass_with_reported_unchecked_tasks';
+  // External / deployment-only / authorization-gated / explicitly-deferred tasks
+  // that the completed implementation marker declared skippable are accepted
+  // deferrals: PASS may leave up to that many tasks unchecked so real-world
+  // release/verification gates never block delivery. They stay unchecked (never
+  // auto-closed) and are surfaced as follow-ups. Only IMPLEMENTABLE unchecked
+  // work beyond the allowance blocks a PASS.
+  const allowedSkip = run.acceptedSkippableTaskCount ?? 0;
+  if (run.taskStats.unchecked > allowedSkip) return 'audit_pass_with_unchecked_tasks';
+  if (verdict.unchecked_tasks.length > allowedSkip) return 'audit_pass_with_reported_unchecked_tasks';
   if (verdict.required_changes.length > 0) return 'audit_pass_with_required_changes';
   const repairedFiles = new Set(verdict.repairs_applied.flatMap((repair) => repair.files));
   const uncoveredChangedFiles = changedFiles.filter((file) => !repairedFiles.has(file));
