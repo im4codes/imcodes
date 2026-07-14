@@ -27,6 +27,7 @@ import {
 } from '../../src/node/installer.js';
 
 const EXE = '/opt/imcodes-node/imcodes-node';
+const WINDOWS_WATCHDOG_NOW = new Date(2026, 6, 14, 11, 36, 7);
 
 describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects POSIX root without attempting privilege escalation', () => {
@@ -56,17 +57,23 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
   });
 
   it('Windows task is boot-scoped SYSTEM and restarts after failure (4.1)', () => {
-    const xml = windowsScheduledTaskXml('C:\\Program Files\\IM.codes\\node<&>.exe');
+    const xml = windowsScheduledTaskXml('C:\\Program Files\\IM.codes\\node<&>.exe', WINDOWS_WATCHDOG_NOW);
     expect(xml).toContain('<BootTrigger>');
+    expect(xml).toContain('<TimeTrigger>');
+    expect(xml).toContain('<StartBoundary>2026-07-14T11:37:00</StartBoundary>');
+    expect(xml).toContain('<Repetition>');
     expect(xml).toContain('<?xml version="1.0" encoding="UTF-16"?>');
     expect(xml).toContain('<UserId>S-1-5-18</UserId>');
     expect(xml).not.toContain('<LogonType>');
     expect(xml).toContain('<RunLevel>HighestAvailable</RunLevel>');
     expect(xml).toContain('<RestartOnFailure>');
-    expect(xml).toContain('<Interval>PT1M</Interval>');
+    expect(xml.match(/<Interval>PT1M<\/Interval>/g)).toHaveLength(2);
+    expect(xml).not.toContain('<Duration>');
+    expect(xml).toContain('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
     expect(xml).toContain('<Count>255</Count>');
     expect(xml).toContain('<Command>C:\\Program Files\\IM.codes\\node&lt;&amp;&gt;.exe</Command>');
-    expect(windowsScheduledTaskXml(EXE)).toBe(windowsScheduledTaskXml(EXE));
+    expect(windowsScheduledTaskXml(EXE, WINDOWS_WATCHDOG_NOW))
+      .toBe(windowsScheduledTaskXml(EXE, WINDOWS_WATCHDOG_NOW));
   });
 
   it('installs the Windows task from a private temporary artifact with overwrite enabled', async () => {
@@ -74,6 +81,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     let artifact = '';
     await expect(installControlledNodeService(EXE, {
       platform: 'win32',
+      now: () => WINDOWS_WATCHDOG_NOW,
       runCommand: (file, args) => {
         expect(file).toBe('schtasks');
         if (args[0] === '/Create') {
@@ -92,8 +100,8 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       },
     })).resolves.toBe(CONTROLLED_NODE_SERVICE.WINDOWS_TASK);
 
-    expect(artifact).toBe(windowsScheduledTaskXml(EXE));
-    expect(encodeWindowsScheduledTaskXml(windowsScheduledTaskXml(EXE)).subarray(0, 2))
+    expect(artifact).toBe(windowsScheduledTaskXml(EXE, WINDOWS_WATCHDOG_NOW));
+    expect(encodeWindowsScheduledTaskXml(windowsScheduledTaskXml(EXE, WINDOWS_WATCHDOG_NOW)).subarray(0, 2))
       .toEqual(Buffer.from([0xff, 0xfe]));
     expect(existsSync(artifactPath)).toBe(false);
   });
@@ -310,8 +318,8 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     const normalized = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings><RestartOnFailure><Count>255</Count><Interval>PT1M</Interval></RestartOnFailure></Settings>
-  <Triggers><BootTrigger /></Triggers>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Count>255</Count><Interval>PT1M</Interval></RestartOnFailure></Settings>
+  <Triggers><BootTrigger /><TimeTrigger><StartBoundary>2026-07-14T11:37:00</StartBoundary><Repetition><Interval>PT1M</Interval></Repetition></TimeTrigger></Triggers>
   <Actions Context="System"><Exec><Command>${action}</Command></Exec></Actions>
 </Task>`;
     const inspection = await inspectServiceState({
@@ -328,6 +336,33 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       restartPolicy: 'on-failure',
       definitionMatches: true,
       runState: 'running',
+    });
+  });
+
+  it('rejects a legacy Windows task without an indefinite force-kill watchdog', async () => {
+    const action = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
+    const legacyXml = windowsScheduledTaskXml(action, WINDOWS_WATCHDOG_NOW)
+      .replace(/\s*<TimeTrigger>[\s\S]*?<\/TimeTrigger>/, '');
+    const finiteWatchdogXml = windowsScheduledTaskXml(action, WINDOWS_WATCHDOG_NOW)
+      .replace('</Repetition>', '<Duration>PT1H</Duration></Repetition>');
+    const inspect = (xml: string) => inspectServiceState({
+      name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+      platform: 'win32',
+      action,
+    }, {
+      platform: 'win32',
+      runCommand: (file) => (file === 'schtasks' ? xml : 'Running'),
+    });
+
+    await expect(inspect(legacyXml)).resolves.toMatchObject({
+      bootEnabled: true,
+      restartPolicy: 'on-failure',
+      definitionMatches: false,
+    });
+    await expect(inspect(finiteWatchdogXml)).resolves.toMatchObject({
+      bootEnabled: true,
+      restartPolicy: 'on-failure',
+      definitionMatches: false,
     });
   });
 

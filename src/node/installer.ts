@@ -39,6 +39,8 @@ export interface ServiceInstallOptions {
   runCommand?: (file: string, args: readonly string[]) => unknown;
   macosPlistPath?: string;
   linuxUnitPath?: string;
+  /** Test seam for the Windows watchdog trigger's local start boundary. */
+  now?: () => Date;
 }
 
 const WINDOWS_ADMIN_CHECK = [
@@ -83,12 +85,27 @@ function escapeXmlText(value: string): string {
     .replaceAll('>', '&gt;');
 }
 
+const WINDOWS_WATCHDOG_INTERVAL = 'PT1M';
+
+function windowsWatchdogStartBoundary(now: Date): string {
+  const start = new Date(now.getTime());
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() + 1);
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`
+    + `T${pad(start.getHours())}:${pad(start.getMinutes())}:00`;
+}
+
 /**
- * Deterministic Task Scheduler artifact for boot-time SYSTEM autostart. Task
- * Scheduler's restart interval cannot be shorter than one minute and its retry
- * count is an unsigned byte, so use the maximum valid count.
+ * Task Scheduler artifact for boot-time SYSTEM autostart plus a one-minute
+ * watchdog. RestartOnFailure does not reliably restart an action terminated by
+ * an external force-kill, so the recurring TimeTrigger supplies the durable
+ * liveness guarantee; IgnoreNew makes its ticks no-ops while the node is alive.
+ * The start boundary is the next local minute so first-run journal handoff can
+ * finish before the watchdog becomes eligible.
  */
-export function windowsScheduledTaskXml(exePath: string): string {
+export function windowsScheduledTaskXml(exePath: string, now: Date = new Date()): string {
+  const watchdogStartBoundary = windowsWatchdogStartBoundary(now);
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -98,6 +115,12 @@ export function windowsScheduledTaskXml(exePath: string): string {
     <BootTrigger>
       <Enabled>true</Enabled>
     </BootTrigger>
+    <TimeTrigger>
+      <StartBoundary>${watchdogStartBoundary}</StartBoundary>
+      <Repetition>
+        <Interval>${WINDOWS_WATCHDOG_INTERVAL}</Interval>
+      </Repetition>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="System">
@@ -119,7 +142,7 @@ export function windowsScheduledTaskXml(exePath: string): string {
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
     <RestartOnFailure>
-      <Interval>PT1M</Interval>
+      <Interval>${WINDOWS_WATCHDOG_INTERVAL}</Interval>
       <Count>255</Count>
     </RestartOnFailure>
   </Settings>
@@ -284,8 +307,9 @@ function runCommandFromOptions(options: ServiceInstallOptions): (file: string, a
 async function installWindowsTaskDefinition(
   exePath: string,
   runCommand: (file: string, args: readonly string[]) => unknown,
+  now: Date,
 ): Promise<ServiceReceipt> {
-    const xml = windowsScheduledTaskXml(exePath);
+    const xml = windowsScheduledTaskXml(exePath, now);
     const artifactDir = await mkdtemp(join(tmpdir(), 'imcodes-node-task-'));
     const artifactPath = join(artifactDir, 'task.xml');
     try {
@@ -424,10 +448,24 @@ function inspectWindowsTaskXml(xml: string, expectedAction: string | undefined):
   const restartBlock = /<RestartOnFailure\b[^>]*>[\s\S]*?<\/RestartOnFailure>/i.exec(xml)?.[0] ?? '';
   const restartOnFailure = /<Interval>\s*PT1M\s*<\/Interval>/i.test(restartBlock)
     && /<Count>\s*255\s*<\/Count>/i.test(restartBlock);
+  const watchdogBlock = /<TimeTrigger\b[^>]*>[\s\S]*?<\/TimeTrigger>/i.exec(xml)?.[0] ?? '';
+  const watchdogRepetition = /<Repetition\b[^>]*>[\s\S]*?<\/Repetition>/i.exec(watchdogBlock)?.[0] ?? '';
+  const watchdogEnabled = watchdogBlock.length > 0
+    && !/<Enabled>\s*false\s*<\/Enabled>/i.test(watchdogBlock);
+  // An omitted Duration means the repetition continues indefinitely. A finite
+  // duration would silently remove crash recovery after that window expires.
+  const watchdogRepeatsIndefinitely = watchdogRepetition.length > 0
+    && /<Interval>\s*PT1M\s*<\/Interval>/i.test(watchdogRepetition)
+    && !/<Duration>\s*[^<]+\s*<\/Duration>/i.test(watchdogRepetition);
+  const watchdogStartPresent = /<StartBoundary>\s*[^<]+\s*<\/StartBoundary>/i.test(watchdogBlock);
+  const ignoresConcurrentTicks = /<MultipleInstancesPolicy>\s*IgnoreNew\s*<\/MultipleInstancesPolicy>/i.test(settingsBlock);
   const userIdMatch = /<UserId>\s*([^<]+?)\s*<\/UserId>/i.exec(xml);
   return {
     action,
-    matches: systemPrincipal && highRunLevel && settingsEnabled && restartOnFailure && bootTrigger && action !== null && action === expectedAction,
+    matches: systemPrincipal && highRunLevel && settingsEnabled && restartOnFailure
+      && bootTrigger && watchdogEnabled && watchdogRepeatsIndefinitely
+      && watchdogStartPresent && ignoresConcurrentTicks
+      && action !== null && action === expectedAction,
     bootEnabled: bootTrigger && settingsEnabled,
     principal: userIdMatch ? userIdMatch[1].trim() : null,
     restartPolicy: restartOnFailure ? 'on-failure' : null,
@@ -527,7 +565,7 @@ export async function installDefinition(
   const runCommand = runCommandFromOptions(options);
 
   if (platform === 'win32') {
-    return installWindowsTaskDefinition(exePath, runCommand);
+    return installWindowsTaskDefinition(exePath, runCommand, options.now?.() ?? new Date());
   }
   if (platform === 'darwin') {
     const plistPath = options.macosPlistPath ?? MACOS_PLIST_PATH;
