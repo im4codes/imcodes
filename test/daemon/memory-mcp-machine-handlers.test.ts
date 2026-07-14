@@ -12,12 +12,15 @@ function caller(): McpRuntimeCaller {
 
 const listMachines = MEMORY_MCP_TOOL_NAMES.LIST_MACHINES;
 const execRemote = MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE;
+const computerUseDocs = MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS;
+const computerUseCall = MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL;
 
 describe('exec_remote / list_machines handlers (10.12)', () => {
   it('returns feature_disabled when the node cannot control machines (no machineDeps)', async () => {
     const handlers = createMemoryMcpToolHandlers(caller(), {});
     expect(await handlers[execRemote]({ machine: 'm', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
     expect(await handlers[listMachines]({})).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
   });
 
   it('validates required + typed fields before dispatching', async () => {
@@ -74,5 +77,53 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
     expect(await handlers[listMachines]({})).toMatchObject({ status: 'ok', machines: [{ name: 'a' }] });
     expect(await handlers[listMachines]({ includeOffline: true })).toMatchObject({ status: 'ok', machines: [{ name: 'a' }, { name: 'b' }] });
+  });
+
+  it('computer_use_docs returns focused documentation without machine deps', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller(), {});
+    const r = await handlers[computerUseDocs]({ topic: 'workflow' });
+    expect(r).toMatchObject({ status: 'ok', topic: 'workflow' });
+    expect((r as { text: string }).text).toContain('get_app_state');
+  });
+
+  it('computer_use_call validates input before dispatching', async () => {
+    const computerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const machineDeps: MachineToolDeps = {
+      listMachines: async () => [],
+      execRemote: async () => ({ outcome: 'completed' as const }),
+      computerUseCall: computerUse,
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    expect(await handlers[computerUseCall]({ tool: 'list_apps' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[computerUseCall]({ machine: 'm' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'nope' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps', arguments: [] })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps', timeoutMs: -1 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(computerUse).not.toHaveBeenCalled();
+  });
+
+  it('computer_use_call maps typed pre-dispatch reasons to MCP errors and passes completed results through', async () => {
+    const machineDeps: MachineToolDeps = {
+      listMachines: async () => [],
+      execRemote: async () => ({ outcome: 'completed' as const }),
+      computerUseCall: vi.fn(async ({ machine, tool, arguments: args, timeoutMs }) => {
+        if (machine === 'offline') return { outcome: 'not_dispatched' as const, reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: 'offline' };
+        expect({ machine, tool, args, timeoutMs }).toEqual({ machine: 'win', tool: 'list_apps', args: {}, timeoutMs: 5000 });
+        return {
+          outcome: 'completed' as const,
+          result: {
+            correlationId: 'cu-12345678',
+            ok: true,
+            tool,
+            content: [{ type: 'text' as const, text: 'apps' }],
+            durationMs: 7,
+          },
+        };
+      }),
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    expect(await handlers[computerUseCall]({ machine: 'offline', tool: 'list_apps' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+    const r = await handlers[computerUseCall]({ machine: 'win', tool: 'list_apps', arguments: {}, timeoutMs: 5000 });
+    expect(r).toMatchObject({ status: 'ok', outcome: 'completed', result: { ok: true, content: [{ text: 'apps' }] } });
   });
 });

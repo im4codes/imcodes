@@ -14,6 +14,7 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import type { ComputerUseFrame, ComputerUseResult } from '../../shared/computer-use.js';
 import {
   NODE_ROLE,
   type RemoteExecOutputChunk,
@@ -22,6 +23,7 @@ import {
 } from '../../shared/remote-exec.js';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { execRemote as daemonExecRemote, MachineControlPlaneError } from '../../src/daemon/machine-exec-client.js';
+import { computerUseCall as daemonComputerUseCall } from '../../src/daemon/computer-use-client.js';
 import { registerMemoryMcpTools, type MachineToolDeps } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { MachineExecWorker } from '../../src/node/machine-exec-worker.js';
@@ -33,6 +35,7 @@ import {
   createMachineExecRoutes,
   machineExecAuditIntentStore,
 } from '../src/routes/machine-exec.js';
+import { createMachineComputerUseRoutes } from '../src/routes/machine-computer-use.js';
 import { WsBridge } from '../src/ws/bridge.js';
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -93,6 +96,32 @@ class ControlledLoopbackSocket extends EventEmitter {
     if (typeof data !== 'string') return;
     let message: Record<string, unknown>;
     try { message = JSON.parse(data) as Record<string, unknown>; } catch { return; }
+    if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
+      queueMicrotask(() => {
+        if (this.mode === 'lost') return;
+        if (this.mode === 'malformed') {
+          this.emit('message', Buffer.from(JSON.stringify({
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: message.correlationId,
+            ok: true,
+            tool: message.tool,
+            content: [{ type: 'text', text: 'bad' }],
+            durationMs: -1,
+          })), false);
+          return;
+        }
+        const request = message as unknown as ComputerUseFrame;
+        const result: ComputerUseResult = {
+          correlationId: request.correlationId,
+          ok: true,
+          tool: request.tool,
+          content: [{ type: 'text', text: `computer:${request.tool}` }],
+          durationMs: 5,
+        };
+        this.emit('message', Buffer.from(JSON.stringify({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...result })), false);
+      });
+      return;
+    }
     if (message.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) return;
     queueMicrotask(async () => {
       if (this.mode === 'lost') return;
@@ -161,6 +190,7 @@ function machineDeps(overrides: { token?: string; unbound?: boolean; listFailure
       }];
     },
     execRemote: (options) => daemonExecRemote({ ...options, fetchImpl: appFetch as typeof fetch }),
+    computerUseCall: (options) => daemonComputerUseCall({ ...options, fetchImpl: appFetch as typeof fetch }),
   });
 }
 
@@ -200,6 +230,7 @@ beforeAll(async () => {
     await next();
   });
   app.route('/api/machine/exec', createMachineExecRoutes(undefined, machineExecAuditIntentStore));
+  app.route('/api/machine/computer-use', createMachineComputerUseRoutes());
 
   bridge = WsBridge.get(target.serverId);
   socket = new ControlledLoopbackSocket();
@@ -247,6 +278,8 @@ describe('controlled-node cross-layer product path', () => {
     expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
       MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
     ]));
     const listed = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(listed.structuredContent).toMatchObject({
@@ -256,6 +289,25 @@ describe('controlled-node cross-layer product path', () => {
     const result = await callExec(client, 'nonzero');
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', ok: true, exitCode: 7, stdout: 'nonzero' });
+    await client.close();
+  });
+
+  it('carries computer_use_call through MCP, daemon client, HTTP route, Bridge, and generation-bound result registry', async () => {
+    socket.mode = 'worker';
+    const client = await connectMcp(machineDeps());
+    const docs = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS, arguments: { topic: 'workflow' } });
+    expect(docs.isError).toBeFalsy();
+    expect(docs.structuredContent).toMatchObject({ status: 'ok', topic: 'workflow' });
+    const result = await client.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+      arguments: { machine: 'node-linux', tool: 'list_apps', timeoutMs: 1_000 },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      status: 'ok',
+      outcome: 'completed',
+      result: { ok: true, tool: 'list_apps', content: [{ type: 'text', text: 'computer:list_apps' }] },
+    });
     await client.close();
   });
 

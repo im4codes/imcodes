@@ -22,6 +22,16 @@ async function connect(machineDeps: MachineToolDeps): Promise<Client> {
 const okDeps: MachineToolDeps = {
   listMachines: () => [{ name: 'win-1', displayName: 'Win Box', os: 'win', online: true, execEnabled: true, role: NODE_ROLE.CONTROLLED }],
   execRemote: () => ({ outcome: 'completed', ok: true, exitCode: 7, stdout: 'ok', stderr: '', timedOut: false, truncated: false, durationMs: 3 }),
+  computerUseCall: ({ tool }) => ({
+    outcome: 'completed',
+    result: {
+      correlationId: 'cu-12345678',
+      ok: true,
+      tool,
+      content: [{ type: 'text', text: 'apps' }],
+      durationMs: 4,
+    },
+  }),
 };
 
 type PublishedSchema = {
@@ -42,17 +52,23 @@ function optionalKeys(schema: PublishedSchema | undefined): string[] {
 }
 
 describe('machine MCP tools — in-process discovery + call parity', () => {
-  it('tools/list advertises both tools WITH output schemas and no caller idempotencyKey', async () => {
+  it('tools/list advertises machine + computer-use tools WITH output schemas and no caller idempotencyKey', async () => {
     const client = await connect(okDeps);
     const { tools } = await client.listTools();
     const byName = new Map(tools.map((t) => [t.name, t]));
     const exec = byName.get(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
     const list = byName.get(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
+    const docs = byName.get(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS);
+    const call = byName.get(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
     expect(exec).toBeTruthy();
     expect(list).toBeTruthy();
+    expect(docs).toBeTruthy();
+    expect(call).toBeTruthy();
     expect(Object.keys(exec!.inputSchema.properties ?? {})).not.toContain('idempotencyKey');
     expect(exec!.outputSchema).toBeTruthy();
     expect(list!.outputSchema).toBeTruthy();
+    expect(docs!.outputSchema).toBeTruthy();
+    expect(call!.outputSchema).toBeTruthy();
     // Published input schema enforces the single-source minimum timeout (1000ms).
     const timeoutMs = (exec!.inputSchema.properties as Record<string, { minimum?: number }>).timeoutMs;
     expect(timeoutMs?.minimum).toBe(1000);
@@ -64,7 +80,12 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const { tools } = await client.listTools();
     const byName = new Map(tools.map((tool) => [tool.name, tool]));
 
-    for (const name of [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE] as const) {
+    for (const name of [
+      MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
+      MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+    ] as const) {
       const published = byName.get(name)!;
       const shared = MEMORY_MCP_TOOL_CONTRACTS[name];
       for (const key of ['inputSchema', 'outputSchema'] as const) {
@@ -103,6 +124,18 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, arguments: { machine: 'win-1', command: 'whoami' } });
     expect(res.isError).toBeFalsy();
     expect(res.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', ok: true, exitCode: 7 });
+    await client.close();
+  });
+
+  it('tools/call computer_use_docs and computer_use_call return SDK-validated structuredContent', async () => {
+    const client = await connect(okDeps);
+    const docs = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS, arguments: { topic: 'tools' } });
+    expect(docs.isError).toBeFalsy();
+    expect(docs.structuredContent).toMatchObject({ status: 'ok', topic: 'tools' });
+
+    const call = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: { machine: 'win-1', tool: 'list_apps', arguments: {} } });
+    expect(call.isError).toBeFalsy();
+    expect(call.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', result: { ok: true, content: [{ text: 'apps' }] } });
     await client.close();
   });
 

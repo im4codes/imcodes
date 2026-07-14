@@ -11,6 +11,7 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => null });
     expect(await deps.execRemote({ machine: 'a', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+    expect(await deps.computerUseCall?.({ machine: 'a', tool: 'list_apps' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
     await expect(deps.listMachines({})).rejects.toMatchObject({ name: 'MachineControlPlaneError', kind: 'unbound' });
     void MachineControlPlaneError;
   });
@@ -36,6 +37,19 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it('a control-plane failure during computer-use name-resolution surfaces as control_plane_unavailable', async () => {
+    const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
+    const computerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => { throw new MachineControlPlaneError('http_status', 'machines API returned http_503'); },
+      execRemote: async () => ({ outcome: 'completed' }),
+      computerUseCall: computerUse as never,
+    });
+    expect(await deps.computerUseCall?.({ machine: 'anything', tool: 'list_apps' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE });
+    expect(computerUse).not.toHaveBeenCalled();
+  });
+
   it('unknown ref_name → machine_not_found (never a silent retarget)', async () => {
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'other' })], execRemote: async () => ({ outcome: 'completed' }) });
     expect(await deps.execRemote({ machine: 'missing', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
@@ -51,6 +65,39 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'off', execEnabled: false })], execRemote: exec });
     expect(await deps.execRemote({ machine: 'off', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED });
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('computer-use resolves ref_name → serverId and forwards to the client, preserving the outcome', async () => {
+    const computerUse = vi.fn(async (opts: { targetServerId: string; tool: string }) => ({
+      outcome: 'completed' as const,
+      result: {
+        correlationId: 'cu-12345678',
+        ok: true,
+        tool: opts.tool,
+        content: [{ type: 'text' as const, text: `ran:${opts.tool}@${opts.targetServerId}` }],
+        durationMs: 9,
+      },
+    }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [m({ serverId: 'srv-win', refName: 'win-1' })],
+      execRemote: async () => ({ outcome: 'completed' }),
+      computerUseCall: computerUse as never,
+    });
+    const r = await deps.computerUseCall?.({
+      machine: 'win-1',
+      tool: 'get_app_state',
+      arguments: { app: 'msedge' },
+      timeoutMs: 3000,
+    });
+    expect(computerUse).toHaveBeenCalledWith(expect.objectContaining({
+      targetServerId: 'srv-win',
+      tool: 'get_app_state',
+      arguments: { app: 'msedge' },
+      timeoutMs: 3000,
+      sourceServerId: 's1',
+    }));
+    expect(r).toMatchObject({ outcome: 'completed', result: { ok: true, content: [{ text: 'ran:get_app_state@srv-win' }] } });
   });
 
   it('offline target → exec_offline (retry-safe, not confused with a command failure)', async () => {
