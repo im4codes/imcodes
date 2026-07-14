@@ -98,6 +98,27 @@ describe('AtPicker', () => {
     expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
   });
 
+  it('keeps one synchronous keyboard listener while rapid navigation updates the highlight', () => {
+    const addSpy = vi.spyOn(document, 'addEventListener');
+    const removeSpy = vi.spyOn(document, 'removeEventListener');
+    try {
+      renderPicker();
+
+      fireEvent.keyDown(document, { key: 'ArrowDown' });
+      fireEvent.keyDown(document, { key: 'ArrowDown' });
+      fireEvent.keyDown(document, { key: 'Enter' });
+
+      expect(screen.getByText('brain')).toBeDefined();
+      expect(addSpy.mock.calls.filter(([type]) => type === 'keydown')).toHaveLength(1);
+
+      cleanup();
+      expect(removeSpy.mock.calls.filter(([type]) => type === 'keydown')).toHaveLength(1);
+    } finally {
+      addSpy.mockRestore();
+      removeSpy.mockRestore();
+    }
+  });
+
   it('shows current main-session group agents and disables the current session', () => {
     renderPicker();
 

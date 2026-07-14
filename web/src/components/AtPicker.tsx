@@ -2,7 +2,7 @@
  * AtPicker — dropdown autocomplete for @-mentions.
  * Two-step: first pick category (Files / Agents), then search/select within that category.
  */
-import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { ServerMessage } from '../ws-client.js';
 import {
@@ -402,11 +402,19 @@ export function AtPicker({
     [visible, category, highlightIdx, fileResults, delegateAgents, aliasResults, machineResults, teamRoundsIdx, teamComboOptions, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onLaunchTeam],
   );
 
-  useEffect(() => {
+  // Keep one capture listener for the lifetime of the open picker. Rebinding a
+  // document listener after every highlight change leaves a passive-effect gap
+  // where SessionControls already suppresses the key but the picker cannot act
+  // on it. That made the first/rapid Arrow and Enter presses appear dead.
+  const handleKeyDownRef = useRef(handleKeyDown);
+  handleKeyDownRef.current = handleKeyDown;
+
+  useLayoutEffect(() => {
     if (!visible) return;
-    document.addEventListener('keydown', handleKeyDown, true);
-    return () => document.removeEventListener('keydown', handleKeyDown, true);
-  }, [visible, handleKeyDown]);
+    const listener = (event: KeyboardEvent) => handleKeyDownRef.current(event);
+    document.addEventListener('keydown', listener, true);
+    return () => document.removeEventListener('keydown', listener, true);
+  }, [visible]);
 
   // Scroll highlighted item into view
   useEffect(() => {
