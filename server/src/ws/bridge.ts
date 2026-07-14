@@ -20,11 +20,12 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
-import { resolvePendingExec, abandonPriorGenerations } from './machine-exec-registry.js';
+import { resolvePendingExec, resolvePendingExecChunk, abandonPriorGenerations } from './machine-exec-registry.js';
 import {
   NODE_ROLE,
   REMOTE_EXEC_MAX_ERROR_BYTES,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  validateMachineExecChunkFrame,
   validateMachineExecResultFrame,
   type NodeRole,
 } from '../../../shared/remote-exec.js';
@@ -1084,6 +1085,8 @@ export class WsBridge {
   static controlledInboundDropped = 0;
   /** Count of malformed/oversized MACHINE_EXEC_RESULT frames rejected before pending-RPC resolution. */
   static invalidMachineExecResultsDropped = 0;
+  /** Count of malformed/oversized MACHINE_EXEC_CHUNK frames rejected before pending-RPC delivery. */
+  static invalidMachineExecChunksDropped = 0;
   /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
@@ -2612,6 +2615,12 @@ export class WsBridge {
       // trigger APNs/FCM. Client-declared role is irrelevant — `daemonNodeRole` is
       // DB-authoritative (set during auth).
       if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {
+          if (!this.resolveValidatedMachineExecChunk(msg)) {
+            WsBridge.controlledInboundDropped++;
+          }
+          return;
+        }
         if (msg.type === DAEMON_MSG.MACHINE_EXEC_RESULT) {
           if (!this.resolveValidatedMachineExecResult(msg)) {
             WsBridge.controlledInboundDropped++;
@@ -2641,6 +2650,10 @@ export class WsBridge {
       // correlationIds are dropped by the registry (10.6). FULL daemons can
       // still return this compatibility frame, but cross the exact same schema
       // trust boundary before registry resolution.
+      if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {
+        this.resolveValidatedMachineExecChunk(msg);
+        return;
+      }
       if (msg.type === DAEMON_MSG.MACHINE_EXEC_RESULT) {
         this.resolveValidatedMachineExecResult(msg);
         return;
@@ -5900,6 +5913,16 @@ export class WsBridge {
       return false;
     }
     return resolvePendingExec(this.serverId, this.daemonGeneration, validated.value);
+  }
+
+  /** Validate and generation-bind one live stdout/stderr fragment. */
+  private resolveValidatedMachineExecChunk(message: Record<string, unknown>): boolean {
+    const validated = validateMachineExecChunkFrame(message);
+    if (!validated.ok) {
+      WsBridge.invalidMachineExecChunksDropped++;
+      return false;
+    }
+    return resolvePendingExecChunk(this.serverId, this.daemonGeneration, validated.value);
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {

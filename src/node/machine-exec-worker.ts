@@ -5,6 +5,7 @@
 // group, and echoes the `correlationId` (not any client-declared identity).
 import { tmpdir } from 'node:os';
 import { validateMachineExecFrame } from '../../shared/remote-exec.js';
+import type { RemoteExecOutputChunk } from '../../shared/remote-exec.js';
 import { runRemoteExec } from './exec-runner.js';
 
 export interface ExecReply {
@@ -28,7 +29,7 @@ export class MachineExecWorker {
   constructor(private readonly run: RunFn = runRemoteExec, private readonly defaultCwd: string = tmpdir()) {}
 
   /** Handle one inbound MACHINE_EXEC frame. Returns the reply envelope, or null if the frame lacks a usable correlationId. */
-  async handle(rawFrame: unknown): Promise<ExecReply | null> {
+  async handle(rawFrame: unknown, onChunk?: (chunk: RemoteExecOutputChunk) => void): Promise<ExecReply | null> {
     const v = validateMachineExecFrame(rawFrame);
     if (!v.ok) {
       const cid = typeof (rawFrame as { correlationId?: unknown })?.correlationId === 'string'
@@ -47,7 +48,7 @@ export class MachineExecWorker {
     try {
       const result = await this.run(
         { requestId: frame.correlationId, command: frame.command, shell: frame.shell, cwd: frame.cwd ?? this.defaultCwd, timeoutMs: frame.timeoutMs },
-        { signal: ac.signal },
+        { signal: ac.signal, onChunk },
       );
       return {
         correlationId: frame.correlationId,

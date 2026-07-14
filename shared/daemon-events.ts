@@ -7,6 +7,8 @@ export const DAEMON_MSG = {
   // to browsers so the UI can show an "upgrading…" state next to the daemon
   // version instead of a bare disconnect. Cleared on the next reconnect/online.
   UPGRADING: 'daemon.upgrading',
+  /** Controlled node → server: one ordered stdout/stderr fragment for an in-flight exec. */
+  MACHINE_EXEC_CHUNK: 'machine.exec_chunk',
   /** Controlled node → server: result of a MACHINE_EXEC request (RemoteExecResult). */
   MACHINE_EXEC_RESULT: 'machine.exec_result',
 } as const;

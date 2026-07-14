@@ -755,6 +755,33 @@ describe('App shell', () => {
     await waitFor(() => expect(panelZ()).toBeGreaterThan(subZ()));
   }, 20_000);
 
+  it('opens controlled-node management from the mobile server menu', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+
+      const controlledNodesButton = await screen.findByRole('button', { name: 'controlled_nodes.title' });
+      expect(controlledNodesButton.classList.contains('mobile-server-menu-controlled-nodes')).toBe(true);
+      fireEvent.click(controlledNodesButton);
+
+      const panel = await screen.findByTestId('floating-panel-controlled-nodes');
+      expect(panel.textContent).toContain('controlled-nodes-panel');
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
   it('refreshes the session list when the daemon reconnects behind an open browser socket', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');

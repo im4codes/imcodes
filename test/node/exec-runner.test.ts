@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { runRemoteExec, defaultRemoteExecShell, shellInvocation } from '../../src/node/exec-runner.js';
-import { REMOTE_EXEC_MAX_OUTPUT_BYTES, REMOTE_EXEC_MIN_TIMEOUT_MS } from '../../shared/remote-exec.js';
+import {
+  REMOTE_EXEC_MAX_CHUNK_BYTES,
+  REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  REMOTE_EXEC_MIN_TIMEOUT_MS,
+  type RemoteExecOutputChunk,
+} from '../../shared/remote-exec.js';
 
 // Cross-platform: tests drive `sh` explicitly so they run on the CI/dev Mac.
 // (On the real Windows target the node defaults to powershell.)
@@ -28,9 +33,59 @@ describe('runRemoteExec', () => {
     expect(r.stderr.trim()).toBe('oops');
   });
 
+  it('emits ordered stdout/stderr chunks before returning the terminal result', async () => {
+    const chunks: RemoteExecOutputChunk[] = [];
+    let settled = false;
+    const promise = runRemoteExec({
+      requestId: 'stream',
+      command: "printf first; sleep 0.1; printf err >&2; printf second",
+      shell: SH,
+    }, {
+      onChunk: (chunk) => {
+        expect(settled).toBe(false);
+        chunks.push(chunk);
+      },
+    });
+    const result = await promise;
+    settled = true;
+
+    expect(chunks.map((chunk) => chunk.seq)).toEqual(chunks.map((_, index) => index));
+    expect(chunks.filter((chunk) => chunk.stream === 'stdout').map((chunk) => chunk.chunk).join('')).toBe(result.stdout);
+    expect(chunks.filter((chunk) => chunk.stream === 'stderr').map((chunk) => chunk.chunk).join('')).toBe(result.stderr);
+    expect(result.stdout).toBe('firstsecond');
+    expect(result.stderr).toBe('err');
+  });
+
+  it('splits large live fragments at the per-frame UTF-8 byte cap', async () => {
+    const chunks: RemoteExecOutputChunk[] = [];
+    const result = await runRemoteExec({
+      requestId: 'stream-cap',
+      command: `yes 你 | head -c ${REMOTE_EXEC_MAX_CHUNK_BYTES * 2}`,
+      shell: SH,
+      timeoutMs: 15_000,
+    }, { onChunk: (chunk) => chunks.push(chunk) });
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => Buffer.byteLength(chunk.chunk, 'utf8') <= REMOTE_EXEC_MAX_CHUNK_BYTES)).toBe(true);
+    expect(chunks.map((chunk) => chunk.chunk).join('')).toBe(result.stdout);
+  });
+
+  it('preserves a UTF-8 code point split across process data events', async () => {
+    const chunks: RemoteExecOutputChunk[] = [];
+    const result = await runRemoteExec({
+      requestId: 'split-utf8',
+      command: `node -e "process.stdout.write(Buffer.from([0xe4,0xbd])); setTimeout(() => process.stdout.write(Buffer.from([0xa0])), 50)"`,
+      shell: SH,
+    }, { onChunk: (chunk) => chunks.push(chunk) });
+
+    expect(result.stdout).toBe('你');
+    expect(chunks.map((chunk) => chunk.chunk).join('')).toBe('你');
+  });
+
   it('kills and flags a command that exceeds its timeout', async () => {
     const r = await runRemoteExec({ requestId: 'r4', command: 'sleep 5', shell: SH, timeoutMs: 1000 });
     expect(r.ok).toBe(false);
+    expect(r.exitCode).toBeNull();
     expect(r.timedOut).toBe(true);
     expect(r.error).toMatch(/timed out/);
     expect(r.durationMs).toBeLessThan(4000);

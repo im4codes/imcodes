@@ -1609,6 +1609,14 @@ export function App() {
   const [username, setUsername] = useState<string | null>(null);
   const [userHasPassword, setUserHasPassword] = useState(false);
 
+  const openControlledNodes = useCallback(() => {
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+      kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
+    setShowControlledNodes(true);
+  }, [ensureDesktopWindow, selectedServerId]);
+
   // Fetch current user info on auth
   useEffect(() => {
     if (!auth) {
@@ -4703,13 +4711,7 @@ export function App() {
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={() => {
-                  ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
-                    kind: DESKTOP_WINDOW_KINDS.controlledNodes,
-                    serverId: selectedServerId ?? undefined,
-                  }, { bringToFront: true });
-                  setShowControlledNodes(true);
-                }}
+                onClick={openControlledNodes}
               >
                 {trans('controlled_nodes.title')}
               </button>
@@ -4933,6 +4935,16 @@ export function App() {
                   <div class="mobile-server-menu">
                     <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
                       ← Home
+                    </button>
+                    <button
+                      class="mobile-server-menu-item mobile-server-menu-controlled-nodes"
+                      onClick={() => {
+                        setShowMobileServerMenu(false);
+                        openControlledNodes();
+                      }}
+                    >
+                      <span aria-hidden="true">🖥</span>
+                      <span>{trans('controlled_nodes.title')}</span>
                     </button>
                     {isNative() && (
                       <button class="mobile-server-menu-item mobile-server-menu-change" onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}>
@@ -5773,10 +5785,11 @@ export function App() {
           id="controlled-nodes"
           title={trans('controlled_nodes.title')}
           onClose={() => setShowControlledNodes(false)}
-          defaultW={720}
-          defaultH={560}
+          defaultW={860}
+          defaultH={680}
           zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.controlledNodes, 5100)}
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.controlledNodes)}
+          className="controlled-nodes-floating-panel"
         >
           <ControlledNodesPanel />
         </FloatingPanel>

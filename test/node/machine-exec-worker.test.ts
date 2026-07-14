@@ -21,6 +21,19 @@ describe('MachineExecWorker (10.8)', () => {
     expect(r?.stdout.trim()).toBe('hi');
   });
 
+  it('forwards ordered live chunks and still returns the complete terminal output', async () => {
+    const w = new MachineExecWorker();
+    const chunks: Array<{ seq: number; stream: string; chunk: string }> = [];
+    const r = await w.handle(
+      frame('stream-worker', 'printf one; sleep 0.1; printf two', { shell: 'sh' }),
+      (chunk) => chunks.push(chunk),
+    );
+
+    expect(chunks.map((chunk) => chunk.seq)).toEqual(chunks.map((_, index) => index));
+    expect(chunks.map((chunk) => chunk.chunk).join('')).toBe('onetwo');
+    expect(r?.stdout).toBe('onetwo');
+  });
+
   it('rejects a second concurrent command as busy (no double-spawn)', async () => {
     const w = new MachineExecWorker();
     const slow = w.handle(frame('c3', 'sleep 1', { shell: 'sh' }));

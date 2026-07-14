@@ -14,7 +14,12 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
-import { NODE_ROLE, type RemoteExecRequest, type RemoteExecResult } from '../../shared/remote-exec.js';
+import {
+  NODE_ROLE,
+  type RemoteExecOutputChunk,
+  type RemoteExecRequest,
+  type RemoteExecResult,
+} from '../../shared/remote-exec.js';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { execRemote as daemonExecRemote, MachineControlPlaneError } from '../../src/daemon/machine-exec-client.js';
 import { registerMemoryMcpTools, type MachineToolDeps } from '../../src/daemon/memory-mcp-tools.js';
@@ -44,7 +49,10 @@ let socket: ControlledLoopbackSocket;
 let holdStarted: (() => void) | undefined;
 let releaseHold: (() => void) | undefined;
 
-const runControlled = async (request: RemoteExecRequest): Promise<RemoteExecResult> => {
+const runControlled = async (
+  request: RemoteExecRequest,
+  options: { signal?: AbortSignal; onChunk?: (chunk: RemoteExecOutputChunk) => void } = {},
+): Promise<RemoteExecResult> => {
   if (request.command === 'hold') {
     holdStarted?.();
     await new Promise<void>((resolve) => { releaseHold = resolve; });
@@ -61,6 +69,13 @@ const runControlled = async (request: RemoteExecRequest): Promise<RemoteExecResu
   }
   if (request.command === 'signal') {
     return { requestId: request.requestId, ok: false, exitCode: null, stdout: '', stderr: '', durationMs: 2, error: 'terminated by signal' };
+  }
+  if (request.command === 'stream') {
+    options.onChunk?.({ seq: 0, stream: 'stdout', chunk: 'first' });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    options.onChunk?.({ seq: 1, stream: 'stderr', chunk: 'warn' });
+    options.onChunk?.({ seq: 2, stream: 'stdout', chunk: 'second' });
+    return { requestId: request.requestId, ok: true, exitCode: 0, stdout: 'firstsecond', stderr: 'warn', durationMs: 30 };
   }
   return { requestId: request.requestId, ok: true, exitCode: 0, stdout: 'ok', stderr: '', durationMs: 1 };
 };
@@ -94,7 +109,13 @@ class ControlledLoopbackSocket extends EventEmitter {
         })), false);
         return;
       }
-      const reply = await this.worker.handle(message);
+      const reply = await this.worker.handle(message, (chunk) => {
+        this.emit('message', Buffer.from(JSON.stringify({
+          type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+          correlationId: message.correlationId,
+          ...chunk,
+        })), false);
+      });
       if (reply) this.emit('message', Buffer.from(JSON.stringify({ type: DAEMON_MSG.MACHINE_EXEC_RESULT, ...reply })), false);
     });
   }
@@ -195,6 +216,30 @@ afterAll(async () => {
 });
 
 describe('controlled-node cross-layer product path', () => {
+  it('streams node stdout/stderr through Bridge, HTTP NDJSON, daemon client, and MCP progress', async () => {
+    socket.mode = 'worker';
+    const client = await connectMcp(machineDeps());
+    const progress: Array<{ progress: number; message?: string }> = [];
+    const result = await client.callTool(
+      {
+        name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+        arguments: { machine: 'node-linux', command: 'stream', timeoutMs: 1_000 },
+      },
+      undefined,
+      { onprogress: (update) => progress.push({ progress: update.progress, message: update.message }) },
+    );
+
+    expect(progress).toEqual([
+      { progress: 1, message: '[stdout] first' },
+      { progress: 2, message: '[stderr] warn' },
+      { progress: 3, message: '[stdout] second' },
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      status: 'ok', outcome: 'completed', stdout: 'firstsecond', stderr: 'warn', exitCode: 0,
+    });
+    await client.close();
+  });
+
   it('publishes canonical machine identity and carries non-zero completion through tools/list and tools/call', async () => {
     socket.mode = 'worker';
     const client = await connectMcp(machineDeps());

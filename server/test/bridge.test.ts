@@ -36,6 +36,7 @@ import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-co
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
+  REMOTE_EXEC_MAX_CHUNK_BYTES,
   REMOTE_EXEC_MAX_ERROR_BYTES,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
 } from '../../shared/remote-exec.js';
@@ -1011,6 +1012,57 @@ describe('WsBridge', () => {
       stderr: '',
       durationMs: 1,
       ...overrides,
+    });
+
+    const validChunk = (correlationId: string, overrides: Record<string, unknown> = {}) => ({
+      type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+      correlationId,
+      seq: 0,
+      stream: 'stdout',
+      chunk: 'hello',
+      ...overrides,
+    });
+
+    it('delivers valid CONTROLLED chunks in order before the terminal result', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const correlationId = 'valid-live-output';
+      const chunks: Array<{ seq: number; stream: string; chunk: string }> = [];
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000, (chunk) => chunks.push(chunk));
+
+      daemonWs.emit('message', JSON.stringify(validChunk(correlationId, { chunk: 'first' })));
+      daemonWs.emit('message', JSON.stringify(validChunk(correlationId, { seq: 1, stream: 'stderr', chunk: 'warn' })));
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, { stdout: 'first', stderr: 'warn' })));
+
+      await expect(pending).resolves.toMatchObject({ ok: true, stdout: 'first', stderr: 'warn' });
+      expect(chunks).toEqual([
+        { seq: 0, stream: 'stdout', chunk: 'first' },
+        { seq: 1, stream: 'stderr', chunk: 'warn' },
+      ]);
+    });
+
+    it('drops malformed and oversized CONTROLLED chunks without settling the pending exec', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const invalidFrames = [
+        validChunk('bad-seq', { seq: -1 }),
+        validChunk('bad-stream', { stream: 'combined' }),
+        validChunk('empty-chunk', { chunk: '' }),
+        validChunk('large-chunk', { chunk: 'x'.repeat(REMOTE_EXEC_MAX_CHUNK_BYTES + 1) }),
+        validChunk('identity-field', { userId: 'forged-user' }),
+      ];
+      const invalidBefore = WsBridge.invalidMachineExecChunksDropped;
+      const controlledBefore = WsBridge.controlledInboundDropped;
+
+      for (const frame of invalidFrames) {
+        const correlationId = frame.correlationId;
+        const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+        daemonWs.emit('message', JSON.stringify(frame));
+        await flushAsync();
+        expect(cancelPendingExec(correlationId)).toBe(true);
+        await expect(pending).resolves.toBeNull();
+      }
+
+      expect(WsBridge.invalidMachineExecChunksDropped - invalidBefore).toBe(invalidFrames.length);
+      expect(WsBridge.controlledInboundDropped - controlledBefore).toBe(invalidFrames.length);
     });
 
     it('drops malformed, oversized, and identity-injecting CONTROLLED results before pending resolution', async () => {

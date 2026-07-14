@@ -479,7 +479,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
     description:
-      `Run a single one-shot shell command on a controllable machine and return its output. Address the target by its list_machines \`name\` (ref_name). The outcome is a discriminated union (${REMOTE_EXEC_OUTCOMES.join(' | ')}): 'not_dispatched' means the command did NOT run (offline/denied, retry-safe), 'dispatched_no_result' means it MAY have run (indeterminate — do not auto-retry non-idempotent commands). Offline/unknown/ambiguous targets return a typed reason, never a hang. FULL nodes only.`,
+      `Run a single one-shot shell command on a controllable machine and return its output. When the caller supplies an MCP progress token, stdout/stderr fragments are emitted as progress notifications while the command is running; the terminal result remains authoritative and complete. Address the target by its list_machines \`name\` (ref_name). The outcome is a discriminated union (${REMOTE_EXEC_OUTCOMES.join(' | ')}): 'not_dispatched' means the command did NOT run (offline/denied, retry-safe), 'dispatched_no_result' means it MAY have run (indeterminate — do not auto-retry non-idempotent commands). Offline/unknown/ambiguous targets return a typed reason, never a hang. FULL nodes only.`,
     inputSchema: objectSchema({
       machine: stringSchema('Target machine ref_name from list_machines.'),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),

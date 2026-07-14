@@ -11,7 +11,13 @@ import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser, createServer } from '../src/db/queries.js';
 import { createMachineExecRoutes, machineExecAuditIntentStore, type ExecDispatcher, type ExecIntentStore } from '../src/routes/machine-exec.js';
-import { MACHINE_EXEC_HTTP_ENVELOPE_VERSION, MACHINE_EXEC_HTTP_PROTOCOL, NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  decodeMachineExecHttpStreamFrame,
+  MACHINE_EXEC_HTTP_ENVELOPE_VERSION,
+  MACHINE_EXEC_HTTP_PROTOCOL,
+  MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE,
+  NODE_ROLE,
+} from '../../shared/remote-exec.js';
 
 let db: Database;
 const hex = (n: number) => randomBytes(n).toString('hex');
@@ -31,7 +37,7 @@ function buildApp() {
     (c as unknown as { env: { DB: Database } }).env = { DB: db };
     await next();
   });
-  app.route('/api/machine/exec', createMachineExecRoutes((t, f, d) => dispatcher(t, f, d)));
+  app.route('/api/machine/exec', createMachineExecRoutes((t, f, d, onChunk) => dispatcher(t, f, d, onChunk)));
   return app;
 }
 
@@ -49,10 +55,16 @@ async function controlledServer(userId: string, opts: { execEnabled?: boolean; r
   );
   return { serverId, token };
 }
-function post(app: ReturnType<typeof buildApp>, source: { serverId: string; token: string }, target: string, body: unknown) {
+function post(
+  app: ReturnType<typeof buildApp>,
+  source: { serverId: string; token: string },
+  target: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+) {
   return app.request(`/api/machine/exec?serverId=${target}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'X-Server-Id': source.serverId, authorization: `Bearer ${source.token}` },
+    headers: { 'content-type': 'application/json', 'X-Server-Id': source.serverId, authorization: `Bearer ${source.token}`, ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -90,6 +102,39 @@ describe('exec relay authorization matrix', () => {
     expect(b.version).toBe(MACHINE_EXEC_HTTP_ENVELOPE_VERSION);
     expect(b.outcome).toBe('completed'); expect(b.stdout).toBe('hi'); expect(b.exitCode).toBe(0);
     expect(b.reason).toBe('completed');
+  });
+
+  it('streams ordered stdout/stderr fragments before one authoritative terminal frame', async () => {
+    const app = buildApp(); const u = `u_${hex(4)}`; await createUser(db, u);
+    const src = await fullCredential(u); const tgt = await controlledServer(u);
+    dispatcher = async (_target, _frame, _deadline, onChunk) => {
+      onChunk?.({ seq: 0, stream: 'stdout', chunk: 'first' });
+      onChunk?.({ seq: 1, stream: 'stderr', chunk: 'warn' });
+      return {
+        online: true,
+        result: { requestId: 'x', ok: true, exitCode: 0, stdout: 'first', stderr: 'warn', durationMs: 5 },
+      };
+    };
+
+    const response = await post(
+      app,
+      src,
+      tgt.serverId,
+      { command: 'long task' },
+      { accept: MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE },
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain(MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE);
+    const frames = (await response.text()).trim().split('\n').map((line) => {
+      const decoded = decodeMachineExecHttpStreamFrame(JSON.parse(line));
+      expect(decoded.ok).toBe(true);
+      if (!decoded.ok) throw new Error(decoded.error);
+      return decoded.value;
+    });
+    expect(frames.map((frame) => frame.kind)).toEqual(['chunk', 'chunk', 'result']);
+    expect(frames[0]).toMatchObject({ kind: 'chunk', seq: 0, stream: 'stdout', chunk: 'first' });
+    expect(frames[1]).toMatchObject({ kind: 'chunk', seq: 1, stream: 'stderr', chunk: 'warn' });
+    expect(frames[2]).toMatchObject({ kind: 'result', result: { outcome: 'completed', stdout: 'first', stderr: 'warn' } });
   });
 
   it('offline target → not_dispatched (retry-safe)', async () => {
@@ -261,7 +306,7 @@ describe('exec durable intent invariant (audit checklist)', () => {
       (c as unknown as { env: { DB: Database } }).env = { DB: db };
       await next();
     });
-    app.route('/api/machine/exec', createMachineExecRoutes((t, f, d) => dispatcher(t, f, d), store));
+    app.route('/api/machine/exec', createMachineExecRoutes((t, f, d, onChunk) => dispatcher(t, f, d, onChunk), store));
     return app;
   }
 

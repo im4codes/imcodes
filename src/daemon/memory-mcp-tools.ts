@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import {
   MEMORY_FEATURE_FLAGS,
   MEMORY_FEATURE_FLAGS_BY_NAME,
@@ -38,6 +39,7 @@ import {
   type EnrollmentOs,
   type RemoteExecShell,
   type RemoteExecOutcome,
+  type RemoteExecOutputChunk,
 } from '../../shared/remote-exec.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
@@ -76,7 +78,11 @@ import {
 } from './alias-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
-export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
+export interface MemoryMcpToolContext {
+  signal?: AbortSignal;
+  onProgress?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
+}
+export type MemoryMcpToolHandler = (input?: unknown, context?: MemoryMcpToolContext) => Promise<ToolResult> | ToolResult;
 type MemoryMcpSearch = (query: MemorySearchQuery) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
 type MemoryMcpListSummaries = (query: {
   namespace?: MemorySearchQuery['namespace'];
@@ -183,6 +189,8 @@ export interface MachineToolDeps {
     command: string;
     shell?: RemoteExecShell;
     timeoutMs?: number;
+    signal?: AbortSignal;
+    onOutput?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
   }) => Promise<MachineExecToolResult> | MachineExecToolResult;
 }
 
@@ -1207,7 +1215,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const success: MachineListToolSuccess = { status: 'ok', machines: parsedMachines.data };
       return success;
     },
-    [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: async (input) => {
+    [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: async (input, context) => {
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
       const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs']);
       const machine = stringArg(args, 'machine');
@@ -1230,6 +1238,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         command,
         ...(shellRaw ? { shell: shellRaw as RemoteExecShell } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+        ...(context?.onProgress ? { onOutput: context.onProgress } : {}),
       });
       const parsedResult = machineExecDependencyResultSchema.safeParse(injectedResult);
       if (!parsedResult.success) {
@@ -1253,9 +1263,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
 function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const wrapped = {} as Record<MemoryMcpToolName, MemoryMcpToolHandler>;
   for (const name of MEMORY_MCP_TOOL_NAME_LIST) {
-    wrapped[name] = async (input?: unknown) => {
+    wrapped[name] = async (input?: unknown, context?: MemoryMcpToolContext) => {
       try {
-        return await handlers[name](input);
+        return await handlers[name](input, context);
       } catch (err) {
         return sanitizeCaughtError(err);
       }
@@ -1476,7 +1486,24 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
       // Machine tools publish an output schema so the SDK validates structuredContent
       // shape/nullable/outcome against the shared descriptor (catches drift).
       ...(outputSchema ? { outputSchema } : {}),
-    }, async (args: unknown) => toolResult(await handlers[name](args)));
+    }, async (args: unknown, extra: RequestHandlerExtra<ServerRequest, ServerNotification>) => {
+      const progressToken = extra._meta?.progressToken;
+      const context: MemoryMcpToolContext = { signal: extra.signal };
+      if (name === MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE && progressToken !== undefined) {
+        context.onProgress = async (chunk) => {
+          if (extra.signal.aborted) return;
+          await extra.sendNotification({
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: chunk.seq + 1,
+              message: `[${chunk.stream}] ${chunk.chunk}`,
+            },
+          }).catch(() => {});
+        };
+      }
+      return toolResult(await handlers[name](args, context));
+    });
   }
 }
 

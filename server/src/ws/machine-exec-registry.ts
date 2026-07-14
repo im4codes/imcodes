@@ -4,21 +4,29 @@
 // accepted ONLY from that exact (serverId, generation) with a matching in-flight
 // correlationId; everything else is dropped and counted. A new connection
 // generation abandons all prior-generation pendings as `indeterminate`.
-import type { MachineExecResultFrame, RemoteExecResult } from '../../../shared/remote-exec.js';
+import type {
+  MachineExecChunkFrame,
+  MachineExecResultFrame,
+  RemoteExecOutputChunk,
+  RemoteExecResult,
+} from '../../../shared/remote-exec.js';
 
 interface PendingExec {
   targetServerId: string;
   generation: number;
   resolve: (result: RemoteExecResult | null) => void;
+  onChunk?: (chunk: RemoteExecOutputChunk) => void;
+  nextChunkSeq: number;
   timer: ReturnType<typeof setTimeout>;
 }
 
 const pending = new Map<string, PendingExec>();
 let droppedResults = 0;
+let droppedChunks = 0;
 
 /** Metrics accessor (diagnostics / tests). */
-export function machineExecRegistryStats(): { inFlight: number; droppedResults: number } {
-  return { inFlight: pending.size, droppedResults };
+export function machineExecRegistryStats(): { inFlight: number; droppedResults: number; droppedChunks: number } {
+  return { inFlight: pending.size, droppedResults, droppedChunks };
 }
 
 /**
@@ -30,6 +38,7 @@ export function registerPendingExec(
   correlationId: string,
   generation: number,
   deadlineMs: number,
+  onChunk?: (chunk: RemoteExecOutputChunk) => void,
 ): Promise<RemoteExecResult | null> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -37,8 +46,31 @@ export function registerPendingExec(
       resolve(null);
     }, deadlineMs);
     timer.unref?.();
-    pending.set(correlationId, { targetServerId, generation, resolve, timer });
+    pending.set(correlationId, { targetServerId, generation, resolve, onChunk, nextChunkSeq: 0, timer });
   });
+}
+
+/** Deliver one strictly ordered live fragment to the matching pending request. */
+export function resolvePendingExecChunk(
+  fromServerId: string,
+  fromGeneration: number,
+  frame: MachineExecChunkFrame,
+): boolean {
+  const entry = pending.get(frame.correlationId);
+  if (!entry
+    || entry.targetServerId !== fromServerId
+    || entry.generation !== fromGeneration
+    || frame.seq !== entry.nextChunkSeq) {
+    droppedChunks++;
+    return false;
+  }
+  entry.nextChunkSeq++;
+  try {
+    entry.onChunk?.({ seq: frame.seq, stream: frame.stream, chunk: frame.chunk });
+  } catch {
+    // A disconnected HTTP/MCP consumer must not corrupt the authoritative exec.
+  }
+  return true;
 }
 
 /**

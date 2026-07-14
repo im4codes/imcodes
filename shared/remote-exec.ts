@@ -38,6 +38,8 @@ export const REMOTE_EXEC_MIN_TIMEOUT_MS = 1_000;
 export const REMOTE_EXEC_MAX_TIMEOUT_MS = 600_000;
 /** Hard cap on captured stdout/stderr each; excess is truncated (flagged). */
 export const REMOTE_EXEC_MAX_OUTPUT_BYTES = 1_000_000;
+/** Per-frame stdout/stderr payload cap; large process chunks are split before WS dispatch. */
+export const REMOTE_EXEC_MAX_CHUNK_BYTES = 64 * 1024;
 /**
  * A controlled node is considered "online" in DB-backed listings when its last
  * heartbeat is within this window (F1: list presence reads the DB, not per-pod
@@ -56,6 +58,8 @@ export const REMOTE_EXEC_MAX_ERROR_BYTES = 4096;
 /** Worst-case JSON string escaping can expand each UTF-8 byte to a six-byte \\uXXXX sequence. */
 export const MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES =
   (REMOTE_EXEC_MAX_OUTPUT_BYTES * 2 + REMOTE_EXEC_MAX_ERROR_BYTES) * 6 + 4096;
+/** Streaming duplicates bounded chunks in the terminal result, so allow two escaped result bodies. */
+export const MACHINE_EXEC_HTTP_STREAM_MAX_BYTES = MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES * 2 + 128 * 1024;
 
 /**
  * End-to-end exec outcome, preserved from node → relay → MCP (never collapsed to
@@ -290,6 +294,21 @@ export interface MachineExecFrame {
   timeoutMs?: number;
 }
 
+export const REMOTE_EXEC_OUTPUT_STREAMS = ['stdout', 'stderr'] as const;
+export type RemoteExecOutputStream = (typeof REMOTE_EXEC_OUTPUT_STREAMS)[number];
+
+/** One ordered, bounded fragment emitted while a command is still running. */
+export interface RemoteExecOutputChunk {
+  seq: number;
+  stream: RemoteExecOutputStream;
+  chunk: string;
+}
+
+/** Controlled node → server flat output fragment envelope. */
+export interface MachineExecChunkFrame extends RemoteExecOutputChunk {
+  correlationId: string;
+}
+
 /** Controlled node → server flat result envelope (without transport identity). */
 export interface MachineExecResultFrame {
   correlationId: string;
@@ -363,6 +382,49 @@ export function validateMachineExecFrame(raw: unknown): EnvelopeValidation<Machi
     timeoutMs = r.timeoutMs;
   }
   return { ok: true, value: { correlationId, idempotencyKey, command, shell, cwd, timeoutMs } };
+}
+
+const MACHINE_EXEC_CHUNK_KEYS = new Set([
+  'type',
+  'correlationId',
+  'seq',
+  'stream',
+  'chunk',
+]);
+
+/** Strictly validate a live output fragment at the controlled-node WS boundary. */
+export function validateMachineExecChunkFrame(raw: unknown): EnvelopeValidation<MachineExecChunkFrame> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'not_an_object' };
+  }
+  const r = raw as Record<string, unknown>;
+  for (const key of Object.keys(r)) {
+    if (!MACHINE_EXEC_CHUNK_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
+  }
+  if (r.type !== DAEMON_MSG.MACHINE_EXEC_CHUNK) return { ok: false, error: 'invalid_type' };
+  if (typeof r.correlationId !== 'string'
+    || r.correlationId.length < 1
+    || r.correlationId.length > REMOTE_EXEC_CORRELATION_ID_MAX) {
+    return { ok: false, error: 'invalid_correlationId' };
+  }
+  if (typeof r.seq !== 'number' || !Number.isSafeInteger(r.seq) || r.seq < 0) {
+    return { ok: false, error: 'invalid_seq' };
+  }
+  if (typeof r.stream !== 'string' || !(REMOTE_EXEC_OUTPUT_STREAMS as readonly string[]).includes(r.stream)) {
+    return { ok: false, error: 'invalid_stream' };
+  }
+  if (typeof r.chunk !== 'string' || r.chunk.length === 0 || utf8ByteLength(r.chunk) > REMOTE_EXEC_MAX_CHUNK_BYTES) {
+    return { ok: false, error: 'invalid_chunk' };
+  }
+  return {
+    ok: true,
+    value: {
+      correlationId: r.correlationId,
+      seq: r.seq,
+      stream: r.stream as RemoteExecOutputStream,
+      chunk: r.chunk,
+    },
+  };
 }
 
 const MACHINE_EXEC_RESULT_KEYS = new Set([
@@ -450,6 +512,9 @@ export function validateMachineExecResultFrame(raw: unknown): EnvelopeValidation
 
 export const MACHINE_EXEC_HTTP_PROTOCOL = 'imcodes.machine_exec.http' as const;
 export const MACHINE_EXEC_HTTP_ENVELOPE_VERSION = 1 as const;
+export const MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE = 'application/x-ndjson' as const;
+export const MACHINE_EXEC_HTTP_STREAM_PROTOCOL = 'imcodes.machine_exec.http_stream' as const;
+export const MACHINE_EXEC_HTTP_STREAM_VERSION = 1 as const;
 
 export const MACHINE_EXEC_HTTP_REASONS = [
   'completed',
@@ -636,4 +701,95 @@ export function decodeMachineExecHttpEnvelope(raw: unknown): EnvelopeValidation<
     }
   }
   return { ok: true, value: r as unknown as MachineExecHttpEnvelope };
+}
+
+export interface MachineExecHttpStreamChunkFrame extends RemoteExecOutputChunk {
+  protocol: typeof MACHINE_EXEC_HTTP_STREAM_PROTOCOL;
+  version: typeof MACHINE_EXEC_HTTP_STREAM_VERSION;
+  kind: 'chunk';
+}
+
+export interface MachineExecHttpStreamResultFrame {
+  protocol: typeof MACHINE_EXEC_HTTP_STREAM_PROTOCOL;
+  version: typeof MACHINE_EXEC_HTTP_STREAM_VERSION;
+  kind: 'result';
+  result: MachineExecHttpEnvelope;
+}
+
+export type MachineExecHttpStreamFrame = MachineExecHttpStreamChunkFrame | MachineExecHttpStreamResultFrame;
+
+const MACHINE_EXEC_HTTP_STREAM_CHUNK_KEYS = new Set(['protocol', 'version', 'kind', 'seq', 'stream', 'chunk']);
+const MACHINE_EXEC_HTTP_STREAM_RESULT_KEYS = new Set(['protocol', 'version', 'kind', 'result']);
+
+/** Strict decoder for each negotiated NDJSON line. */
+export function decodeMachineExecHttpStreamFrame(raw: unknown): EnvelopeValidation<MachineExecHttpStreamFrame> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false, error: 'not_an_object' };
+  const r = raw as Record<string, unknown>;
+  if (r.protocol !== MACHINE_EXEC_HTTP_STREAM_PROTOCOL) return { ok: false, error: 'invalid_protocol' };
+  if (r.version !== MACHINE_EXEC_HTTP_STREAM_VERSION) return { ok: false, error: 'invalid_version' };
+  if (r.kind === 'chunk') {
+    for (const key of Object.keys(r)) {
+      if (!MACHINE_EXEC_HTTP_STREAM_CHUNK_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
+    }
+    const validated = validateMachineExecChunkFrame({
+      type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+      correlationId: 'http-stream',
+      seq: r.seq,
+      stream: r.stream,
+      chunk: r.chunk,
+    });
+    if (!validated.ok) return { ok: false, error: validated.error };
+    return {
+      ok: true,
+      value: {
+        protocol: MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+        version: MACHINE_EXEC_HTTP_STREAM_VERSION,
+        kind: 'chunk',
+        seq: validated.value.seq,
+        stream: validated.value.stream,
+        chunk: validated.value.chunk,
+      },
+    };
+  }
+  if (r.kind === 'result') {
+    for (const key of Object.keys(r)) {
+      if (!MACHINE_EXEC_HTTP_STREAM_RESULT_KEYS.has(key)) return { ok: false, error: `unknown_field:${key}` };
+    }
+    const decoded = decodeMachineExecHttpEnvelope(r.result);
+    if (!decoded.ok) return { ok: false, error: `invalid_result:${decoded.error}` };
+    return {
+      ok: true,
+      value: {
+        protocol: MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+        version: MACHINE_EXEC_HTTP_STREAM_VERSION,
+        kind: 'result',
+        result: decoded.value,
+      },
+    };
+  }
+  return { ok: false, error: 'invalid_kind' };
+}
+
+export function encodeMachineExecHttpStreamChunk(chunk: RemoteExecOutputChunk): MachineExecHttpStreamChunkFrame {
+  const decoded = decodeMachineExecHttpStreamFrame({
+    protocol: MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+    version: MACHINE_EXEC_HTTP_STREAM_VERSION,
+    kind: 'chunk',
+    ...chunk,
+  });
+  if (!decoded.ok) throw new Error(`invalid_machine_exec_http_stream_chunk:${decoded.error}`);
+  if (decoded.value.kind !== 'chunk') throw new Error('invalid_machine_exec_http_stream_chunk:wrong_kind');
+  return decoded.value;
+}
+
+export function encodeMachineExecHttpStreamResult(result: MachineExecHttpEnvelope): MachineExecHttpStreamResultFrame {
+  const decoded = decodeMachineExecHttpStreamFrame({
+    protocol: MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+    version: MACHINE_EXEC_HTTP_STREAM_VERSION,
+    kind: 'result',
+    result,
+  });
+  if (!decoded.ok) throw new Error(`invalid_machine_exec_http_stream_result:${decoded.error}`);
+  if (decoded.value.kind !== 'result') throw new Error('invalid_machine_exec_http_stream_result:wrong_kind');
+  return decoded.value;
 }

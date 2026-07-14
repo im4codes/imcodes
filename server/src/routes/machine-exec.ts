@@ -12,9 +12,12 @@ import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import {
   NODE_ROLE,
   encodeMachineExecHttpEnvelope,
+  encodeMachineExecHttpStreamChunk,
+  encodeMachineExecHttpStreamResult,
   MACHINE_EXEC_HTTP_ENVELOPE_VERSION,
   MACHINE_EXEC_HTTP_PROTOCOL,
   MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES,
+  MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE,
   utf8ByteLength,
   validateMachineExecFrame,
   validateMachineExecResultFrame,
@@ -23,6 +26,7 @@ import {
   type MachineExecFrame,
   type MachineExecHttpEnvelope,
   type MachineExecHttpReason,
+  type RemoteExecOutputChunk,
   type RemoteExecOutcome,
   type RemoteExecResult,
 } from '../../../shared/remote-exec.js';
@@ -51,6 +55,7 @@ export type ExecDispatcher = (
   targetServerId: string,
   frame: MachineExecFrame,
   deadlineMs: number,
+  onChunk?: (chunk: RemoteExecOutputChunk) => void,
 ) => Promise<{ online: boolean; result?: RemoteExecResult }>;
 
 /** Body fields a source may supply. Identity/target/correlation are server-owned and rejected if present. */
@@ -87,7 +92,7 @@ export interface ExecIntentStore {
 }
 
 /** Default dispatcher: live WsBridge push + per-pod pending-RPC (bound to connection generation). */
-const defaultDispatcher: ExecDispatcher = async (targetServerId, frame, deadlineMs) => {
+const defaultDispatcher: ExecDispatcher = async (targetServerId, frame, deadlineMs, onChunk) => {
   const bridge = WsBridge.get(targetServerId);
   if (!bridge.isDaemonConnected()) return { online: false };
   const generation = bridge.daemonConnectionGeneration();
@@ -96,7 +101,7 @@ const defaultDispatcher: ExecDispatcher = async (targetServerId, frame, deadline
   // non-queueing + generation-bound — if it doesn't land on this exact live
   // generation the pending is cancelled and the outcome is `not_dispatched`
   // (the command definitely did not execute), never a queued late replay.
-  const pending = registerPendingExec(targetServerId, frame.correlationId, generation, deadlineMs);
+  const pending = registerPendingExec(targetServerId, frame.correlationId, generation, deadlineMs, onChunk);
   const sent = bridge.trySendMachineExec(
     JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, ...frame }),
     generation,
@@ -225,59 +230,93 @@ export function createMachineExecRoutes(
     }
 
     const nodeTimeout = Math.min(v.value.timeoutMs ?? REMOTE_EXEC_DEFAULT_TIMEOUT_MS, REMOTE_EXEC_MAX_TIMEOUT_MS);
-    let outcome: RemoteExecOutcome = 'dispatched_no_result';
-    let result: RemoteExecResult | undefined;
-    let envelope: MachineExecHttpEnvelope = postDispatchIndeterminateEnvelope('invalid_result');
-    try {
-      let dispatch = await dispatcher(targetId, v.value, nodeTimeout + relayDeadlineBufferMs);
-      let invalidResult = false;
-      if (dispatch.result) {
-        const normalized = validateMachineExecResultFrame({
-          type: DAEMON_MSG.MACHINE_EXEC_RESULT,
-          correlationId: v.value.correlationId,
-          ok: dispatch.result.ok,
-          exitCode: dispatch.result.exitCode,
-          stdout: dispatch.result.stdout,
-          stderr: dispatch.result.stderr,
-          truncated: dispatch.result.truncated,
-          timedOut: dispatch.result.timedOut,
-          durationMs: dispatch.result.durationMs,
-          error: dispatch.result.error,
-        });
-        if (!normalized.ok) {
-          invalidResult = true;
-          dispatch = { online: dispatch.online };
+    const executeDispatched = async (onChunk?: (chunk: RemoteExecOutputChunk) => void): Promise<MachineExecHttpEnvelope> => {
+      let outcome: RemoteExecOutcome = 'dispatched_no_result';
+      let result: RemoteExecResult | undefined;
+      let envelope: MachineExecHttpEnvelope = postDispatchIndeterminateEnvelope('invalid_result');
+      try {
+        let dispatch = await dispatcher(targetId, v.value, nodeTimeout + relayDeadlineBufferMs, onChunk);
+        let invalidResult = false;
+        if (dispatch.result) {
+          const normalized = validateMachineExecResultFrame({
+            type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+            correlationId: v.value.correlationId,
+            ok: dispatch.result.ok,
+            exitCode: dispatch.result.exitCode,
+            stdout: dispatch.result.stdout,
+            stderr: dispatch.result.stderr,
+            truncated: dispatch.result.truncated,
+            timedOut: dispatch.result.timedOut,
+            durationMs: dispatch.result.durationMs,
+            error: dispatch.result.error,
+          });
+          if (!normalized.ok) {
+            invalidResult = true;
+            dispatch = { online: dispatch.online };
+          }
         }
+        outcome = invalidResult ? 'dispatched_no_result' : outcomeFor(dispatch);
+        result = dispatch.result;
+        envelope = encodeMachineExecHttpEnvelope(outcome, result, invalidResult ? 'invalid_result' : undefined);
+        assertHttpEnvelopeWithinCap(envelope);
+      } catch (err) {
+        // The dispatcher may have sent before throwing, and an invalid/oversized
+        // result may fail during normalization or encoding. All such paths are
+        // conservatively indeterminate and remain on the current versioned wire.
+        logger.error({ serverId: targetId, correlationId, err }, 'Exec post-dispatch processing failed; returning indeterminate outcome');
+        outcome = 'dispatched_no_result';
+        result = undefined;
+        envelope = postDispatchIndeterminateEnvelope('invalid_result');
       }
-      outcome = invalidResult ? 'dispatched_no_result' : outcomeFor(dispatch);
-      result = dispatch.result;
-      envelope = encodeMachineExecHttpEnvelope(outcome, result, invalidResult ? 'invalid_result' : undefined);
-      assertHttpEnvelopeWithinCap(envelope);
-    } catch (err) {
-      // The dispatcher may have sent before throwing, and an invalid/oversized
-      // result may fail during normalization or encoding. All such paths are
-      // conservatively indeterminate and remain on the current versioned wire.
-      logger.error({ serverId: targetId, correlationId, err }, 'Exec post-dispatch processing failed; returning indeterminate outcome');
-      outcome = 'dispatched_no_result';
-      result = undefined;
-      envelope = postDispatchIndeterminateEnvelope('invalid_result');
-    }
 
-    // Update the SAME correlationId record with the truthful terminal outcome.
-    // A settle failure after dispatch cannot un-run the command and MUST NOT turn a
-    // completed exec into a 5xx (that would induce a retry of a non-idempotent
-    // command); the `pending` row remains as indeterminate evidence.
-    if (intentStore) {
-      await intentStore.settle(c.env.DB, correlationId, outcome, {
-        exitCode: result?.exitCode ?? null,
-        timedOut: result?.timedOut ?? false,
-        durationMs: result?.durationMs ?? 0,
-      }).catch((err) => logger.error({ serverId: targetId, correlationId, err }, 'Failed to settle exec intent'));
-    }
-    // NOTE: no separate `logAudit('machine.exec')` here — the durable
-    // `machine_exec_audit` row (record → settle) is the single semantic record.
+      // Update the SAME correlationId record with the truthful terminal outcome.
+      // A settle failure after dispatch cannot un-run the command and MUST NOT turn a
+      // completed exec into a 5xx (that would induce a retry of a non-idempotent
+      // command); the `pending` row remains as indeterminate evidence.
+      if (intentStore) {
+        await intentStore.settle(c.env.DB, correlationId, outcome, {
+          exitCode: result?.exitCode ?? null,
+          timedOut: result?.timedOut ?? false,
+          durationMs: result?.durationMs ?? 0,
+        }).catch((err) => logger.error({ serverId: targetId, correlationId, err }, 'Failed to settle exec intent'));
+      }
+      // NOTE: no separate `logAudit('machine.exec')` here — the durable
+      // `machine_exec_audit` row (record → settle) is the single semantic record.
+      return envelope;
+    };
 
-    return c.json(envelope);
+    const wantsStream = c.req.header('accept')?.toLowerCase().includes(MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE) === true;
+    if (!wantsStream) return c.json(await executeDispatched());
+
+    const encoder = new TextEncoder();
+    let consumerClosed = false;
+    const bodyStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const writeLine = (frame: unknown) => {
+          if (consumerClosed) return;
+          try { controller.enqueue(encoder.encode(`${JSON.stringify(frame)}\n`)); } catch { consumerClosed = true; }
+        };
+        void executeDispatched((chunk) => writeLine(encodeMachineExecHttpStreamChunk(chunk)))
+          .then((envelope) => writeLine(encodeMachineExecHttpStreamResult(envelope)))
+          .catch((err) => {
+            logger.error({ serverId: targetId, correlationId, err }, 'Exec stream finalization failed');
+            writeLine(encodeMachineExecHttpStreamResult(postDispatchIndeterminateEnvelope('invalid_result')));
+          })
+          .finally(() => {
+            if (consumerClosed) return;
+            try { controller.close(); } catch { /* already closed */ }
+          });
+      },
+      cancel() { consumerClosed = true; },
+    });
+    return new Response(bodyStream, {
+      status: 200,
+      headers: {
+        'content-type': `${MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE}; charset=utf-8`,
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+      },
+    });
   });
 
   return routes;

@@ -1,9 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   validateMachineExecFrame,
+  validateMachineExecChunkFrame,
   validateMachineExecResultFrame,
   decodeMachineExecHttpEnvelope,
+  decodeMachineExecHttpStreamFrame,
   encodeMachineExecHttpEnvelope,
+  encodeMachineExecHttpStreamChunk,
+  encodeMachineExecHttpStreamResult,
   enrollmentOsFromNodePlatform,
   encodeEnrollmentTrailer,
   decodeEnrollmentTrailer,
@@ -17,11 +21,14 @@ import {
   REMOTE_EXEC_MIN_TIMEOUT_MS,
   REMOTE_EXEC_MAX_TIMEOUT_MS,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  REMOTE_EXEC_MAX_CHUNK_BYTES,
   REMOTE_EXEC_MAX_ERROR_BYTES,
   REMOTE_EXEC_CORRELATION_ID_MAX,
   MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES,
   MACHINE_EXEC_HTTP_PROTOCOL,
   MACHINE_EXEC_HTTP_ENVELOPE_VERSION,
+  MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+  MACHINE_EXEC_HTTP_STREAM_VERSION,
   MACHINE_LIST_MAX_ITEMS,
   type EnrollRedeemV2Request,
   type EnrollRedeemV2Response,
@@ -158,6 +165,36 @@ describe('validateMachineExecResultFrame', () => {
       timedOut: false,
       error: 'spawn failed',
     }).ok).toBe(false);
+  });
+});
+
+describe('validateMachineExecChunkFrame', () => {
+  const base = {
+    type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+    correlationId: 'c1',
+    seq: 0,
+    stream: 'stdout',
+    chunk: 'hello',
+  };
+
+  it('accepts a strict live-output frame and strips its transport identity', () => {
+    expect(validateMachineExecChunkFrame(base)).toEqual({
+      ok: true,
+      value: { correlationId: 'c1', seq: 0, stream: 'stdout', chunk: 'hello' },
+    });
+  });
+
+  it('rejects identity fields, invalid sequence/stream, and empty or oversized chunks', () => {
+    expect(validateMachineExecChunkFrame({ ...base, serverId: 'forged' })).toEqual({ ok: false, error: 'unknown_field:serverId' });
+    expect(validateMachineExecChunkFrame({ ...base, type: 'wrong' })).toEqual({ ok: false, error: 'invalid_type' });
+    expect(validateMachineExecChunkFrame({ ...base, seq: -1 })).toEqual({ ok: false, error: 'invalid_seq' });
+    expect(validateMachineExecChunkFrame({ ...base, seq: 0.5 })).toEqual({ ok: false, error: 'invalid_seq' });
+    expect(validateMachineExecChunkFrame({ ...base, stream: 'combined' })).toEqual({ ok: false, error: 'invalid_stream' });
+    expect(validateMachineExecChunkFrame({ ...base, chunk: '' })).toEqual({ ok: false, error: 'invalid_chunk' });
+    expect(validateMachineExecChunkFrame({
+      ...base,
+      chunk: '界'.repeat(Math.floor(REMOTE_EXEC_MAX_CHUNK_BYTES / 3) + 1),
+    })).toEqual({ ok: false, error: 'invalid_chunk' });
   });
 });
 
@@ -337,6 +374,45 @@ describe('machine-exec HTTP envelope', () => {
       reason: 'invalid_request',
     });
     expect(() => encodeMachineExecHttpEnvelope('not_dispatched', undefined, 'relay_deadline')).toThrow(/invalid_machine_exec_http_reason/);
+  });
+});
+
+describe('machine-exec HTTP stream frames', () => {
+  const terminal = encodeMachineExecHttpEnvelope('completed', {
+    requestId: 'r1',
+    ok: true,
+    exitCode: 0,
+    stdout: 'hello',
+    stderr: '',
+    durationMs: 5,
+  });
+
+  it('round-trips ordered chunks and the authoritative terminal envelope', () => {
+    const chunk = encodeMachineExecHttpStreamChunk({ seq: 0, stream: 'stdout', chunk: 'hello' });
+    const result = encodeMachineExecHttpStreamResult(terminal);
+    expect(chunk).toEqual({
+      protocol: MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+      version: MACHINE_EXEC_HTTP_STREAM_VERSION,
+      kind: 'chunk',
+      seq: 0,
+      stream: 'stdout',
+      chunk: 'hello',
+    });
+    expect(decodeMachineExecHttpStreamFrame(chunk)).toEqual({ ok: true, value: chunk });
+    expect(decodeMachineExecHttpStreamFrame(result)).toEqual({ ok: true, value: result });
+  });
+
+  it('rejects unknown fields, wrong protocol, malformed chunks, and invalid terminal results', () => {
+    const chunk = encodeMachineExecHttpStreamChunk({ seq: 0, stream: 'stderr', chunk: 'oops' });
+    expect(decodeMachineExecHttpStreamFrame({ ...chunk, injected: true })).toEqual({ ok: false, error: 'unknown_field:injected' });
+    expect(decodeMachineExecHttpStreamFrame({ ...chunk, protocol: 'old' })).toEqual({ ok: false, error: 'invalid_protocol' });
+    expect(decodeMachineExecHttpStreamFrame({ ...chunk, seq: 1.5 })).toEqual({ ok: false, error: 'invalid_seq' });
+    expect(decodeMachineExecHttpStreamFrame({
+      protocol: MACHINE_EXEC_HTTP_STREAM_PROTOCOL,
+      version: MACHINE_EXEC_HTTP_STREAM_VERSION,
+      kind: 'result',
+      result: { ...terminal, outcome: 'not_dispatched' },
+    })).toEqual({ ok: false, error: 'invalid_result:reason_outcome_mismatch' });
   });
 });
 

@@ -81,12 +81,30 @@ afterEach(() => {
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
 
 describe('ControlledNodesPanel (12.3)', () => {
+  it('renders the node-grid hierarchy and live machine metrics', async () => {
+    machines = [
+      machine({ serverId: 'online', refName: 'win-edge', displayName: 'Edge One', os: 'win', online: true, execEnabled: true }),
+      machine({ serverId: 'offline', refName: 'linux-edge', displayName: 'Edge Two', os: 'linux', online: false, execEnabled: false }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Edge One'));
+
+    expect(container.querySelector('.controlled-nodes-hero')).toBeTruthy();
+    expect(Array.from(container.querySelectorAll('.controlled-nodes-metric strong')).map((node) => node.textContent)).toEqual(['2', '1', '1']);
+    expect(container.querySelector('.controlled-nodes-machine-row.is-online code')?.textContent).toBe('win-edge');
+    expect(container.querySelector('.controlled-nodes-machine-row.is-offline code')?.textContent).toBe('linux-edge');
+    expect(container.querySelector('.controlled-nodes-exec-toggle.is-enabled')?.getAttribute('aria-pressed')).toBe('true');
+  });
+
   it('offers one download button per canonical (os, arch) artifact', async () => {
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_target'));
     const downloadBtns = Array.from(container.querySelectorAll('.controlled-nodes-download-btn'));
     expect(downloadBtns).toHaveLength(3); // win x64, mac arm64, linux x64
     expect(container.textContent).toContain('arm64');
+    expect(container.querySelector('.controlled-nodes-download-item.is-win')).toBeTruthy();
+    expect(container.querySelector('.controlled-nodes-download-item.is-mac')).toBeTruthy();
+    expect(container.querySelector('.controlled-nodes-download-item.is-linux')).toBeTruthy();
   });
 
   it('shows artifact metadata (arch + size) when present', async () => {
@@ -101,9 +119,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
     const { container } = render(<ControlledNodesPanel />);
     const btn = await waitFor(() => {
-      const b = Array.from(container.querySelectorAll('.controlled-nodes-download-btn')).find((x) =>
-        x.textContent === 'controlled_nodes.download_target',
-      );
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-download-btn');
       if (!b) throw new Error('win x64 download button not found');
       return b;
     });
@@ -203,7 +219,8 @@ describe('ControlledNodesPanel (12.3)', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('Mac'));
-    const revoke = Array.from(container.querySelectorAll('button')).find((b) => b.textContent === 'controlled_nodes.revoke');
+    const revoke = container.querySelector('.controlled-nodes-revoke');
+    expect(revoke).toBeTruthy();
     fireEvent.click(revoke!);
     expect(confirmSpy).toHaveBeenCalled();
     expect(revokeMachine).not.toHaveBeenCalled(); // declined

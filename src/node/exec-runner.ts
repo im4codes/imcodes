@@ -2,13 +2,16 @@
 // so it packages cleanly into the self-contained exe. Runs a single shell
 // command with a hard timeout and captured, byte-capped stdout/stderr.
 import { execFileSync, spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import {
   REMOTE_EXEC_DEFAULT_TIMEOUT_MS,
   REMOTE_EXEC_MIN_TIMEOUT_MS,
   REMOTE_EXEC_MAX_TIMEOUT_MS,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  REMOTE_EXEC_MAX_CHUNK_BYTES,
   type RemoteExecRequest,
   type RemoteExecResult,
+  type RemoteExecOutputChunk,
   type RemoteExecShell,
 } from '../../shared/remote-exec.js';
 
@@ -74,7 +77,48 @@ function clampTimeout(ms: number | undefined): number {
  *     graph. If `taskkill` is not on PATH (extremely unusual), we fall back
  *     to `child.kill('SIGKILL')` which is best-effort.
  */
-export function runRemoteExec(req: RemoteExecRequest, opts: { signal?: AbortSignal } = {}): Promise<RemoteExecResult> {
+function emitOutputChunks(
+  text: string,
+  stream: RemoteExecOutputChunk['stream'],
+  nextSeq: () => number,
+  onChunk?: (chunk: RemoteExecOutputChunk) => void,
+): void {
+  if (!text || !onChunk) return;
+  let chars: string[] = [];
+  let bytes = 0;
+  const flush = () => {
+    if (chars.length === 0) return;
+    try { onChunk({ seq: nextSeq(), stream, chunk: chars.join('') }); } catch { /* progress is best-effort */ }
+    chars = [];
+    bytes = 0;
+  };
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes > 0 && bytes + charBytes > REMOTE_EXEC_MAX_CHUNK_BYTES) flush();
+    chars.push(char);
+    bytes += charBytes;
+  }
+  flush();
+}
+
+function takeUtf8Prefix(text: string, maxBytes: number): string {
+  if (maxBytes <= 0 || !text) return '';
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let bytes = 0;
+  let chars = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes + charBytes > maxBytes) break;
+    bytes += charBytes;
+    chars += char.length;
+  }
+  return text.slice(0, chars);
+}
+
+export function runRemoteExec(
+  req: RemoteExecRequest,
+  opts: { signal?: AbortSignal; onChunk?: (chunk: RemoteExecOutputChunk) => void } = {},
+): Promise<RemoteExecResult> {
   const startedAt = Date.now();
   const shell = req.shell ?? defaultRemoteExecShell();
   if (req.timeoutMs !== undefined
@@ -101,6 +145,9 @@ export function runRemoteExec(req: RemoteExecRequest, opts: { signal?: AbortSign
     let truncated = false;
     let timedOut = false;
     let aborted = false;
+    let chunkSeq = 0;
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
 
     const capture = (chunk: Buffer, isErr: boolean): void => {
       const used = isErr ? errBytes : outBytes;
@@ -109,20 +156,22 @@ export function runRemoteExec(req: RemoteExecRequest, opts: { signal?: AbortSign
         truncated = true;
         return;
       }
-      const slice = chunk.length > room ? chunk.subarray(0, room) : chunk;
-      if (chunk.length > room) truncated = true;
-      let text = slice.toString('utf8');
-      // A cap can split a multi-byte code point; Buffer decoding would insert
-      // U+FFFD (three encoded bytes) and make the returned payload exceed the
-      // byte cap. Drop only that incomplete trailing character.
-      while (Buffer.byteLength(text, 'utf8') > slice.length) text = text.slice(0, -1);
+      // StringDecoder preserves UTF-8 code points split across child-process
+      // `data` events. The byte cap is applied to decoded output, so neither a
+      // split code point nor an invalid byte sequence can inflate the result
+      // beyond the shared stdout/stderr boundary.
+      const decoded = (isErr ? stderrDecoder : stdoutDecoder).write(chunk);
+      const text = takeUtf8Prefix(decoded, room);
+      if (text.length < decoded.length) truncated = true;
+      const textBytes = Buffer.byteLength(text, 'utf8');
       if (isErr) {
         stderr += text;
-        errBytes += slice.length;
+        errBytes += textBytes;
       } else {
         stdout += text;
-        outBytes += slice.length;
+        outBytes += textBytes;
       }
+      emitOutputChunks(text, isErr ? 'stderr' : 'stdout', () => chunkSeq++, opts.onChunk);
     };
 
     // On unix, run the command as its own process-group leader (detached) so a
@@ -187,10 +236,15 @@ export function runRemoteExec(req: RemoteExecRequest, opts: { signal?: AbortSign
       clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
       const error = spawnError ?? (aborted ? 'aborted' : (timedOut ? `timed out after ${timeoutMs}ms` : undefined));
+      // Windows taskkill can report a numeric close code even though the
+      // command was forcibly terminated. Failed result frames require a null
+      // exitCode; otherwise the server rejects the frame and the caller waits
+      // until the relay deadline instead of receiving node_timeout promptly.
+      const reportedExitCode = error ? null : exitCode;
       resolve({
         requestId: req.requestId,
         ok: !error,
-        exitCode,
+        exitCode: reportedExitCode,
         stdout,
         stderr,
         ...(truncated ? { truncated: true } : {}),

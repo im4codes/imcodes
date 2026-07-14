@@ -20,11 +20,16 @@
 import {
   canonicalMachineOs,
   decodeMachineExecHttpEnvelope,
+  decodeMachineExecHttpStreamFrame,
   MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES,
+  MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE,
+  MACHINE_EXEC_HTTP_STREAM_MAX_BYTES,
   MACHINE_LIST_MAX_ITEMS,
   NODE_ROLE,
   type RemoteExecOutcome,
+  type RemoteExecOutputChunk,
   type RemoteExecShell,
+  type MachineExecHttpEnvelope,
   type MachineSummary,
 } from '../../shared/remote-exec.js';
 
@@ -36,6 +41,8 @@ export interface ExecRemoteOptions {
   command: string;
   shell?: RemoteExecShell;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  onOutput?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
   fetchImpl?: typeof fetch;
 }
 
@@ -110,33 +117,7 @@ async function readBoundedText(res: Response, maxBytes: number): Promise<string 
   return null;
 }
 
-/** Run a one-shot command on a controlled target via the relay. Never throws; ambiguity → indeterminate. */
-export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteResult> {
-  const doFetch = opts.fetchImpl ?? fetch;
-  const base = opts.serverUrl.replace(/\/+$/, '');
-  const url = `${base}/api/machine/exec?serverId=${encodeURIComponent(opts.targetServerId)}`;
-  let res: Response;
-  try {
-    res = await doFetch(url, {
-      method: 'POST',
-      headers: { ...authHeaders(opts.sourceServerId, opts.sourceToken), 'content-type': 'application/json' },
-      body: JSON.stringify({
-        command: opts.command,
-        ...(opts.shell ? { shell: opts.shell } : {}),
-        ...(typeof opts.timeoutMs === 'number' ? { timeoutMs: opts.timeoutMs } : {}),
-      }),
-    });
-  } catch {
-    // Transport failed AFTER the request may have been sent → indeterminate.
-    return { outcome: 'dispatched_no_result' };
-  }
-  const text = await readBoundedText(res, MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES);
-  if (text === null) return { outcome: 'dispatched_no_result' };
-  let parsed: unknown;
-  try { parsed = JSON.parse(text); } catch { return { outcome: 'dispatched_no_result' }; }
-  const decoded = decodeMachineExecHttpEnvelope(parsed);
-  if (!decoded.ok) return { outcome: 'dispatched_no_result' };
-  const e = decoded.value;
+function resultFromEnvelope(e: MachineExecHttpEnvelope): ExecRemoteResult {
   return {
     outcome: e.outcome,
     ...(e.ok !== undefined ? { ok: e.ok } : {}),
@@ -148,6 +129,110 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
     ...(e.durationMs !== undefined ? { durationMs: e.durationMs } : {}),
     ...(e.error !== undefined ? { error: e.error } : {}),
   };
+}
+
+/** Consume the negotiated NDJSON stream without buffering the long-running response. */
+async function readExecStream(
+  res: Response,
+  onOutput?: (chunk: RemoteExecOutputChunk) => void | Promise<void>,
+): Promise<ExecRemoteResult | null> {
+  const reader = res.body?.getReader();
+  if (!reader) return null;
+  const decoder = new TextDecoder();
+  let pending = '';
+  let totalBytes = 0;
+  let nextSeq = 0;
+  let terminal: MachineExecHttpEnvelope | null = null;
+  let invalid = false;
+
+  const processLine = async (line: string): Promise<void> => {
+    if (invalid || !line) return;
+    if (Buffer.byteLength(line, 'utf8') > MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES + 128 * 1024) {
+      invalid = true;
+      return;
+    }
+    let raw: unknown;
+    try { raw = JSON.parse(line); } catch { invalid = true; return; }
+    const decoded = decodeMachineExecHttpStreamFrame(raw);
+    if (!decoded.ok) { invalid = true; return; }
+    if (decoded.value.kind === 'chunk') {
+      if (terminal || decoded.value.seq !== nextSeq) { invalid = true; return; }
+      nextSeq++;
+      try {
+        await onOutput?.({ seq: decoded.value.seq, stream: decoded.value.stream, chunk: decoded.value.chunk });
+      } catch {
+        // Progress notification delivery is best-effort; the terminal result is authoritative.
+      }
+      return;
+    }
+    if (terminal) { invalid = true; return; }
+    terminal = decoded.value.result;
+  };
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > MACHINE_EXEC_HTTP_STREAM_MAX_BYTES) {
+        invalid = true;
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      pending += decoder.decode(value, { stream: true });
+      for (;;) {
+        const newline = pending.indexOf('\n');
+        if (newline < 0) break;
+        const line = pending.slice(0, newline).replace(/\r$/, '');
+        pending = pending.slice(newline + 1);
+        await processLine(line);
+      }
+    }
+    pending += decoder.decode();
+    if (pending.trim()) await processLine(pending.replace(/\r$/, ''));
+  } catch {
+    return null;
+  }
+  return invalid || !terminal ? null : resultFromEnvelope(terminal);
+}
+
+/** Run a one-shot command on a controlled target via the relay. Never throws; ambiguity → indeterminate. */
+export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const base = opts.serverUrl.replace(/\/+$/, '');
+  const url = `${base}/api/machine/exec?serverId=${encodeURIComponent(opts.targetServerId)}`;
+  let res: Response;
+  try {
+    res = await doFetch(url, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(opts.sourceServerId, opts.sourceToken),
+        'content-type': 'application/json',
+        ...(opts.onOutput ? { accept: MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE } : {}),
+      },
+      body: JSON.stringify({
+        command: opts.command,
+        ...(opts.shell ? { shell: opts.shell } : {}),
+        ...(typeof opts.timeoutMs === 'number' ? { timeoutMs: opts.timeoutMs } : {}),
+      }),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+  } catch {
+    // Transport failed AFTER the request may have been sent → indeterminate.
+    return { outcome: 'dispatched_no_result' };
+  }
+  const contentType = res.headers?.get?.('content-type')?.toLowerCase() ?? '';
+  if (contentType.includes(MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE)) {
+    return await readExecStream(res, opts.onOutput) ?? { outcome: 'dispatched_no_result' };
+  }
+  const text = await readBoundedText(res, MACHINE_EXEC_HTTP_RESPONSE_MAX_BYTES);
+  if (text === null) return { outcome: 'dispatched_no_result' };
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return { outcome: 'dispatched_no_result' }; }
+  const decoded = decodeMachineExecHttpEnvelope(parsed);
+  if (!decoded.ok) return { outcome: 'dispatched_no_result' };
+  return resultFromEnvelope(decoded.value);
 }
 
 type MachineListItem = MachineSummary & { refName: string; displayName: string; execEnabled: boolean };

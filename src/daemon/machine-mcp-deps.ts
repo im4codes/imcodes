@@ -66,7 +66,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
       return machines.map(toSummary);
     },
 
-    async execRemote({ machine, command, shell, timeoutMs }): Promise<MachineExecToolResult> {
+    async execRemote({ machine, command, shell, timeoutMs, signal, onOutput }): Promise<MachineExecToolResult> {
       const creds = await load();
       if (!creds) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
       // Resolve the ref_name against the FULL machine list (offline included) so
@@ -96,6 +96,8 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         command,
         ...(shell ? { shell } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(signal ? { signal } : {}),
+        ...(onOutput ? { onOutput } : {}),
       });
     },
   };

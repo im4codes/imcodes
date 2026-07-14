@@ -60,14 +60,22 @@ describe('controlled node enrollment and runtime', () => {
     expect(isControlledNodeAuthAck({ type: 'heartbeat_ack' })).toBe(true);
 
     socket.emit('message', JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, correlationId: 'exec-1', idempotencyKey: 'exec-1', command: 'printf ok', shell: 'sh' }));
-    await vi.waitFor(() => expect(socket.sent).toHaveLength(3));
-    expect(JSON.parse(socket.sent[2]!)).toMatchObject({
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThanOrEqual(4));
+    const execFrames = socket.sent.slice(2).map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(execFrames).toContainEqual(expect.objectContaining({
+      type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+      correlationId: 'exec-1',
+      seq: 0,
+      stream: 'stdout',
+      chunk: 'ok',
+    }));
+    expect(execFrames).toContainEqual(expect.objectContaining({
       type: DAEMON_MSG.MACHINE_EXEC_RESULT,
       correlationId: 'exec-1',
       ok: true,
       exitCode: 0,
       stdout: 'ok',
-    });
+    }));
     runtime.stop();
   });
 

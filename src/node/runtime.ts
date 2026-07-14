@@ -78,7 +78,11 @@ export function createControlledNodeRuntime(
       }
       if (isControlledNodeAuthAck(message)) persistAuthentication();
       if (message.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) return;
-      const reply = await worker.handle(message);
+      const correlationId = typeof message.correlationId === 'string' ? message.correlationId : '';
+      const reply = await worker.handle(message, (chunk) => {
+        if (!correlationId) return;
+        client.send({ type: DAEMON_MSG.MACHINE_EXEC_CHUNK, correlationId, ...chunk });
+      });
       if (reply) client.send({ type: DAEMON_MSG.MACHINE_EXEC_RESULT, ...reply });
     },
   });

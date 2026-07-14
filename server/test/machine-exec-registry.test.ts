@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   registerPendingExec,
+  resolvePendingExecChunk,
   resolvePendingExec,
   abandonPriorGenerations,
   abandonAllForTarget,
@@ -26,6 +27,30 @@ describe('machine-exec pending registry (10.6)', () => {
     const before = machineExecRegistryStats().droppedResults;
     expect(resolvePendingExec('srvX', 1, result('nope'))).toBe(false);
     expect(machineExecRegistryStats().droppedResults).toBeGreaterThan(before);
+  });
+
+  it('delivers live chunks only for the exact target, generation, correlation, and next sequence', async () => {
+    const chunks: Array<{ seq: number; stream: string; chunk: string }> = [];
+    const p = registerPendingExec('srv-stream', 'corr-stream', 4, 5000, (chunk) => chunks.push(chunk));
+    const frame = (seq: number, chunk: string) => ({
+      correlationId: 'corr-stream', seq, stream: 'stdout' as const, chunk,
+    });
+    const before = machineExecRegistryStats().droppedChunks;
+
+    expect(resolvePendingExecChunk('other', 4, frame(0, 'wrong-target'))).toBe(false);
+    expect(resolvePendingExecChunk('srv-stream', 5, frame(0, 'wrong-generation'))).toBe(false);
+    expect(resolvePendingExecChunk('srv-stream', 4, frame(1, 'out-of-order'))).toBe(false);
+    expect(resolvePendingExecChunk('srv-stream', 4, frame(0, 'first'))).toBe(true);
+    expect(resolvePendingExecChunk('srv-stream', 4, frame(0, 'duplicate'))).toBe(false);
+    expect(resolvePendingExecChunk('srv-stream', 4, { ...frame(1, 'warn'), stream: 'stderr' })).toBe(true);
+
+    expect(chunks).toEqual([
+      { seq: 0, stream: 'stdout', chunk: 'first' },
+      { seq: 1, stream: 'stderr', chunk: 'warn' },
+    ]);
+    expect(machineExecRegistryStats().droppedChunks - before).toBe(4);
+    expect(resolvePendingExec('srv-stream', 4, result('corr-stream'))).toBe(true);
+    await expect(p).resolves.toMatchObject({ correlationId: 'corr-stream' });
   });
 
   it('a new generation abandons prior-generation pendings as indeterminate (null)', async () => {

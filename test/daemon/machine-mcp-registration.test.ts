@@ -106,6 +106,33 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     await client.close();
   });
 
+  it('streams ordered stdout/stderr through standard MCP progress notifications', async () => {
+    const client = await connect({
+      listMachines: okDeps.listMachines,
+      execRemote: async ({ onOutput }) => {
+        await onOutput?.({ seq: 0, stream: 'stdout', chunk: 'first' });
+        await onOutput?.({ seq: 1, stream: 'stderr', chunk: 'warn' });
+        return {
+          outcome: 'completed', ok: true, exitCode: 0,
+          stdout: 'first', stderr: 'warn', timedOut: false, truncated: false, durationMs: 3,
+        };
+      },
+    });
+    const progress: Array<{ progress: number; message?: string }> = [];
+    const res = await client.callTool(
+      { name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, arguments: { machine: 'win-1', command: 'long task' } },
+      undefined,
+      { onprogress: (update) => progress.push({ progress: update.progress, message: update.message }) },
+    );
+
+    expect(progress).toEqual([
+      { progress: 1, message: '[stdout] first' },
+      { progress: 2, message: '[stderr] warn' },
+    ]);
+    expect(res.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', stdout: 'first', stderr: 'warn' });
+    await client.close();
+  });
+
   it('exec_remote output schema accepts a null exitCode (signal/spawn failure)', async () => {
     const client = await connect({
       listMachines: okDeps.listMachines,
