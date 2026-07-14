@@ -30,8 +30,23 @@ function pipePath(): string {
     : join(tmpdir(), `imcodes-computer-use-${suffix}.sock`);
 }
 
-function quoteWin(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+export function quoteWinArg(value: string): string {
+  let out = '"';
+  let backslashes = 0;
+  for (const ch of value) {
+    if (ch === '\\') {
+      backslashes++;
+      continue;
+    }
+    if (ch === '"') {
+      out += '\\'.repeat(backslashes * 2 + 1) + '"';
+      backslashes = 0;
+      continue;
+    }
+    out += '\\'.repeat(backslashes) + ch;
+    backslashes = 0;
+  }
+  return `${out}${'\\'.repeat(backslashes * 2)}"`;
 }
 
 function helperArgv(pipe: string): string[] {
@@ -47,7 +62,7 @@ function psBase64(value: string): string {
 }
 
 function launchWindowsUserSessionHelper(exe: string, pipe: string): void {
-  const helperArgs = helperArgv(pipe).map(quoteWin).join(' ');
+  const helperArgs = helperArgv(pipe).map(quoteWinArg).join(' ');
   const exe64 = Buffer.from(exe, 'utf8').toString('base64');
   const args64 = Buffer.from(helperArgs, 'utf8').toString('base64');
   const script = String.raw`
