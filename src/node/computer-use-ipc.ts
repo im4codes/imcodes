@@ -1,0 +1,279 @@
+import { spawn } from 'node:child_process';
+import net from 'node:net';
+import { randomBytes } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runComputerUseTool } from './computer-use-runner.js';
+import {
+  COMPUTER_USE_DEFAULT_TIMEOUT_MS,
+  COMPUTER_USE_MAX_TIMEOUT_MS,
+  validateComputerUseFrame,
+  validateComputerUseResultFrame,
+  type ComputerUseFrame,
+  type ComputerUseResultFrame,
+} from '../../shared/computer-use.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+
+interface IpcRequestWire { id: string; request: ComputerUseFrame }
+interface IpcResultWire { id: string; result?: ComputerUseResultFrame; error?: string }
+
+type PendingIpc = {
+  resolve: (value: ComputerUseResultFrame) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+function pipePath(): string {
+  const suffix = `${process.pid}-${randomBytes(8).toString('hex')}`;
+  return process.platform === 'win32'
+    ? `\\\\.\\pipe\\imcodes-computer-use-${suffix}`
+    : join(tmpdir(), `imcodes-computer-use-${suffix}.sock`);
+}
+
+function quoteWin(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function helperArgv(pipe: string): string[] {
+  const entry = process.argv[1];
+  const isNodeRuntime = /(?:^|[/\\])node(?:\.exe)?$/i.test(process.execPath);
+  return isNodeRuntime && entry
+    ? [entry, '--computer-use-helper', '--pipe', pipe]
+    : ['--computer-use-helper', '--pipe', pipe];
+}
+
+function psBase64(value: string): string {
+  return Buffer.from(value, 'utf16le').toString('base64');
+}
+
+function launchWindowsUserSessionHelper(exe: string, pipe: string): void {
+  const helperArgs = helperArgv(pipe).map(quoteWin).join(' ');
+  const exe64 = Buffer.from(exe, 'utf8').toString('base64');
+  const args64 = Buffer.from(helperArgs, 'utf8').toString('base64');
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$exe = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__EXE64__'))
+$argsLine = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__ARGS64__'))
+$src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class ImcodesUserProc {
+  [StructLayout(LayoutKind.Sequential)] public struct WTS_SESSION_INFO { public int SessionID; public IntPtr pWinStationName; public int State; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public string lpReserved; public string lpDesktop; public string lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
+  [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId; }
+  [DllImport("wtsapi32.dll", SetLastError=true)] static extern bool WTSEnumerateSessions(IntPtr hServer, int reserved, int version, out IntPtr ppSessionInfo, out int count);
+  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr memory);
+  [DllImport("wtsapi32.dll", SetLastError=true)] static extern bool WTSQueryUserToken(int sessionId, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr existing, uint desiredAccess, IntPtr attrs, int impersonationLevel, int tokenType, out IntPtr newToken);
+  [DllImport("userenv.dll", SetLastError=true)] static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+  [DllImport("userenv.dll", SetLastError=true)] static extern bool DestroyEnvironmentBlock(IntPtr env);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr procAttrs, IntPtr threadAttrs, bool inheritHandles, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
+  const int WTSActive = 0;
+  const uint TOKEN_ALL_ACCESS = 0xF01FF;
+  const int SecurityImpersonation = 2;
+  const int TokenPrimary = 1;
+  const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+  public static int ActiveSessionId() {
+    IntPtr p; int count;
+    if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out p, out count)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      int size = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+      for (int i = 0; i < count; i++) {
+        WTS_SESSION_INFO s = (WTS_SESSION_INFO)Marshal.PtrToStructure(IntPtr.Add(p, i * size), typeof(WTS_SESSION_INFO));
+        if (s.State == WTSActive) return s.SessionID;
+      }
+    } finally { WTSFreeMemory(p); }
+    throw new Exception("no active user session");
+  }
+  public static void Start(string exe, string argsLine) {
+    IntPtr token, primary, env;
+    int sid = ActiveSessionId();
+    if (!WTSQueryUserToken(sid, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      if (!DuplicateTokenEx(token, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out primary)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      try {
+        if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
+        try {
+          STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO)); si.lpDesktop = "winsta0\\default";
+          PROCESS_INFORMATION pi;
+          string cmd = "\"" + exe + "\" " + argsLine;
+          if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+          CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        } finally { if (env != IntPtr.Zero) DestroyEnvironmentBlock(env); }
+      } finally { CloseHandle(primary); }
+    } finally { CloseHandle(token); }
+  }
+}
+'@
+Add-Type -TypeDefinition $src
+[ImcodesUserProc]::Start($exe, $argsLine)
+`.replace('__EXE64__', exe64).replace('__ARGS64__', args64);
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', psBase64(script)], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+}
+
+function launchSameSessionHelper(exe: string, pipe: string): void {
+  const child = spawn(exe, helperArgv(pipe), {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+}
+
+export class ComputerUseIpcHost {
+  private server: net.Server | null = null;
+  private socket: net.Socket | null = null;
+  private pending = new Map<string, PendingIpc>();
+  private buffer = '';
+  private readyPromise: Promise<void> | null = null;
+  private readonly path = pipePath();
+
+  async call(frame: ComputerUseFrame): Promise<ComputerUseResultFrame> {
+    await this.ensureStarted();
+    const socket = this.socket;
+    if (!socket || socket.destroyed) throw new Error('computer_use_helper_not_connected');
+    const id = randomBytes(12).toString('hex');
+    const timeoutMs = Math.min(frame.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS, COMPUTER_USE_MAX_TIMEOUT_MS) + 5_000;
+    return await new Promise<ComputerUseResultFrame>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('computer_use_ipc_timeout'));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
+      socket.write(`${JSON.stringify({ id, request: frame } satisfies IpcRequestWire)}\n`, (err) => {
+        if (!err) return;
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      });
+    });
+  }
+
+  close(): void {
+    for (const [id, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error('computer_use_ipc_closed'));
+      this.pending.delete(id);
+    }
+    this.socket?.destroy();
+    this.socket = null;
+    this.server?.close();
+    this.server = null;
+    this.readyPromise = null;
+  }
+
+  private ensureStarted(): Promise<void> {
+    if (this.socket && !this.socket.destroyed) return Promise.resolve();
+    if (this.readyPromise) return this.readyPromise;
+    this.readyPromise = new Promise((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        if (this.socket && !this.socket.destroyed) socket.destroy();
+        this.socket = socket;
+        socket.setEncoding('utf8');
+        socket.on('data', (chunk) => this.onData(String(chunk)));
+        socket.on('close', () => {
+          if (this.socket === socket) this.socket = null;
+          for (const [id, entry] of this.pending) {
+            clearTimeout(entry.timer);
+            entry.reject(new Error('computer_use_helper_disconnected'));
+            this.pending.delete(id);
+          }
+        });
+        resolve();
+      });
+      this.server = server;
+      const timer = setTimeout(() => {
+        server.close();
+        this.readyPromise = null;
+        reject(new Error('computer_use_helper_connect_timeout'));
+      }, 15_000);
+      timer.unref?.();
+      server.once('error', (err) => {
+        clearTimeout(timer);
+        this.readyPromise = null;
+        reject(err);
+      });
+      server.listen(this.path, () => {
+        try {
+          if (process.platform === 'win32') launchWindowsUserSessionHelper(process.execPath, this.path);
+          else launchSameSessionHelper(process.execPath, this.path);
+        } catch (err) {
+          clearTimeout(timer);
+          this.readyPromise = null;
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+      const done = () => clearTimeout(timer);
+      this.readyPromise?.then(done, done);
+    });
+    return this.readyPromise;
+  }
+
+  private onData(chunk: string): void {
+    this.buffer += chunk;
+    for (;;) {
+      const newline = this.buffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = this.buffer.slice(0, newline).trim();
+      this.buffer = this.buffer.slice(newline + 1);
+      if (!line) continue;
+      let parsed: IpcResultWire;
+      try { parsed = JSON.parse(line) as IpcResultWire; } catch { continue; }
+      if (!parsed || typeof parsed.id !== 'string') continue;
+      const entry = this.pending.get(parsed.id);
+      if (!entry) continue;
+      clearTimeout(entry.timer);
+      this.pending.delete(parsed.id);
+      if (parsed.result) {
+        const v = validateComputerUseResultFrame(parsed.result);
+        if (v.ok) entry.resolve(v.value);
+        else entry.reject(new Error(`invalid_computer_use_ipc_result:${v.error}`));
+      } else {
+        entry.reject(new Error(parsed.error || 'computer_use_ipc_error'));
+      }
+    }
+  }
+}
+
+export async function runComputerUseIpcHelper(pipe: string): Promise<void> {
+  const socket = net.createConnection(pipe);
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+  socket.setEncoding('utf8');
+  let buffer = '';
+  socket.on('data', (chunk) => {
+    buffer += String(chunk);
+    void (async () => {
+      for (;;) {
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let parsed: IpcRequestWire;
+        try { parsed = JSON.parse(line) as IpcRequestWire; } catch { continue; }
+        const id = typeof parsed.id === 'string' ? parsed.id : '';
+        if (!id) continue;
+        const request = validateComputerUseFrame(parsed.request);
+        if (!request.ok) {
+          socket.write(`${JSON.stringify({ id, error: request.error } satisfies IpcResultWire)}\n`);
+          continue;
+        }
+        const result = await runComputerUseTool(request.value);
+        const frame: ComputerUseResultFrame = { type: DAEMON_MSG.COMPUTER_USE_RESULT, ...result };
+        const validated = validateComputerUseResultFrame(frame);
+        socket.write(`${JSON.stringify(validated.ok ? { id, result: validated.value } : { id, error: validated.error } satisfies IpcResultWire)}\n`);
+      }
+    })().catch((err) => socket.write(`${JSON.stringify({ id: 'unknown', error: err instanceof Error ? err.message : String(err) })}\n`));
+  });
+  await new Promise<void>((resolve) => socket.once('close', resolve));
+}

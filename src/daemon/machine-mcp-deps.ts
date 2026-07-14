@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { execRemote as clientExecRemote, listMachines as clientListMachines, MachineControlPlaneError } from './machine-exec-client.js';
+import { computerUseCall as clientComputerUseCall } from './computer-use-client.js';
 import type { MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
 
 export interface DaemonCredential {
@@ -35,6 +36,7 @@ export interface DaemonMachineToolDepsOverrides {
   loadCredential?: () => Promise<DaemonCredential | null>;
   listMachines?: typeof clientListMachines;
   execRemote?: typeof clientExecRemote;
+  computerUseCall?: typeof clientComputerUseCall;
 }
 
 /** Build the FULL-node machine tool deps from the daemon's own credential. */
@@ -42,6 +44,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
   const load = overrides.loadCredential ?? loadDaemonCredential;
   const list = overrides.listMachines ?? clientListMachines;
   const exec = overrides.execRemote ?? clientExecRemote;
+  const computerUse = overrides.computerUseCall ?? clientComputerUseCall;
 
   const toSummary = (m: Awaited<ReturnType<typeof clientListMachines>>[number]): MachineSummaryForTool => ({
     name: m.refName,
@@ -98,6 +101,37 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(signal ? { signal } : {}),
         ...(onOutput ? { onOutput } : {}),
+      });
+    },
+
+    async computerUseCall({ machine, tool, arguments: args, timeoutMs, signal }) {
+      const creds = await load();
+      if (!creds) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
+      let all: Awaited<ReturnType<typeof list>>;
+      try {
+        all = await list({ serverUrl: creds.serverUrl, sourceServerId: creds.serverId, sourceToken: creds.token, includeOffline: true });
+      } catch (err) {
+        if (err instanceof MachineControlPlaneError) {
+          const reason = err.kind === 'unbound' ? MCP_ERROR_REASONS.FEATURE_DISABLED : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+          return { outcome: 'not_dispatched', reason, error: `machine control plane: ${err.kind}` };
+        }
+        throw err;
+      }
+      const matches = all.filter((m) => m.refName === machine);
+      if (matches.length === 0) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` };
+      if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
+      const target = matches[0]!;
+      if (!target.execEnabled) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `machine control is disabled for "${machine}"` };
+      if (!target.online) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: `machine "${machine}" is offline` };
+      return computerUse({
+        serverUrl: creds.serverUrl,
+        sourceServerId: creds.serverId,
+        sourceToken: creds.token,
+        targetServerId: target.serverId,
+        tool,
+        ...(args ? { arguments: args } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(signal ? { signal } : {}),
       });
     },
   };

@@ -41,6 +41,22 @@ import {
   type RemoteExecOutcome,
   type RemoteExecOutputChunk,
 } from '../../shared/remote-exec.js';
+import {
+  COMPUTER_USE_DOC_TOPICS,
+  COMPUTER_USE_TOOLS,
+  COMPUTER_USE_OUTCOMES,
+  COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_MAX_TIMEOUT_MS,
+  COMPUTER_USE_MAX_ARGUMENT_BYTES,
+  COMPUTER_USE_MAX_TEXT_BYTES,
+  COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
+  COMPUTER_USE_MAX_ERROR_BYTES,
+  computerUseDocs,
+  type ComputerUseDocTopic,
+  type ComputerUseToolName,
+  type ComputerUseOutcome,
+  type ComputerUseResult,
+} from '../../shared/computer-use.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -182,6 +198,13 @@ export interface MachineExecToolResult {
   reason?: MCPErrorReason;
 }
 
+export interface ComputerUseToolResult {
+  outcome: ComputerUseOutcome;
+  result?: ComputerUseResult;
+  reason?: MCPErrorReason;
+  error?: string;
+}
+
 export interface MachineToolDeps {
   listMachines: (input: { includeOffline?: boolean }) => Promise<MachineSummaryForTool[]> | MachineSummaryForTool[];
   execRemote: (input: {
@@ -192,6 +215,13 @@ export interface MachineToolDeps {
     signal?: AbortSignal;
     onOutput?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
   }) => Promise<MachineExecToolResult> | MachineExecToolResult;
+  computerUseCall?: (input: {
+    machine: string;
+    tool: ComputerUseToolName;
+    arguments?: Record<string, unknown>;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
 }
 
 export interface MachineListToolSuccess extends Record<string, unknown> {
@@ -272,6 +302,32 @@ const machineExecDependencyResultSchema = z.discriminatedUnion('outcome', [
     ctx.addIssue({ code: 'custom', message: 'not_dispatched error requires a typed reason' });
   }
 });
+
+const computerUseContentItemSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('text'), text: boundedUtf8String(COMPUTER_USE_MAX_TEXT_BYTES) }),
+  z.strictObject({ type: z.literal('image'), data: boundedUtf8String(COMPUTER_USE_MAX_IMAGE_BASE64_BYTES), mimeType: z.literal('image/png') }),
+]);
+
+const computerUseResultSchema = z.strictObject({
+  correlationId: z.string().min(8).max(128),
+  ok: z.boolean(),
+  tool: z.enum(COMPUTER_USE_TOOLS),
+  content: z.array(computerUseContentItemSchema),
+  durationMs: z.number().int().safe().nonnegative(),
+  error: boundedUtf8String(COMPUTER_USE_MAX_ERROR_BYTES).optional(),
+  timedOut: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+}).superRefine((result, ctx) => {
+  if (result.ok && result.error !== undefined) ctx.addIssue({ code: 'custom', message: 'ok result forbids error' });
+  if (!result.ok && result.error === undefined) ctx.addIssue({ code: 'custom', message: 'failed result requires error' });
+});
+
+const computerUseDependencyResultSchema = z.discriminatedUnion('outcome', [
+  z.strictObject({ outcome: z.literal('not_dispatched'), reason: mcpReasonSchema.optional(), error: boundedUtf8String(COMPUTER_USE_MAX_ERROR_BYTES).optional() }),
+  z.strictObject({ outcome: z.literal('dispatched_no_result') }),
+  z.strictObject({ outcome: z.literal('completed'), result: computerUseResultSchema }),
+  z.strictObject({ outcome: z.literal('tool_error'), result: computerUseResultSchema }),
+]);
 
 function readBooleanEnv(value: string | undefined): boolean | undefined {
   if (value == null) return undefined;
@@ -1257,6 +1313,49 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         : { status: 'ok', ...result } as MachineExecToolSuccess;
       return success;
     },
+    [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['topic']);
+      const topicRaw = stringArg(args, 'topic');
+      if (!topicRaw || !(COMPUTER_USE_DOC_TOPICS as readonly string[]).includes(topicRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `topic must be one of ${COMPUTER_USE_DOC_TOPICS.join(', ')}`);
+      }
+      return { status: 'ok', topic: topicRaw, text: computerUseDocs(topicRaw as ComputerUseDocTopic) };
+    },
+    [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: async (input, context) => {
+      if (!deps.machineDeps?.computerUseCall) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'computer use control is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'tool', 'arguments', 'timeoutMs']);
+      const machine = stringArg(args, 'machine');
+      const toolRaw = stringArg(args, 'tool');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine is required');
+      if (!toolRaw || !(COMPUTER_USE_TOOLS as readonly string[]).includes(toolRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `tool must be one of ${COMPUTER_USE_TOOLS.join(', ')}`);
+      }
+      const toolArgs = args.arguments === undefined ? undefined : args.arguments;
+      if (toolArgs !== undefined && (typeof toolArgs !== 'object' || toolArgs === null || Array.isArray(toolArgs))) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'arguments must be an object');
+      }
+      if (toolArgs !== undefined && utf8ByteLength(JSON.stringify(toolArgs)) > COMPUTER_USE_MAX_ARGUMENT_BYTES) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `arguments must be at most ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes`);
+      }
+      const timeoutMs = numberArg(args, 'timeoutMs');
+      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > COMPUTER_USE_MAX_TIMEOUT_MS)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]`);
+      }
+      const injectedResult = await deps.machineDeps.computerUseCall({
+        machine,
+        tool: toolRaw as ComputerUseToolName,
+        ...(toolArgs !== undefined ? { arguments: toolArgs as Record<string, unknown> } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      const parsedResult = computerUseDependencyResultSchema.safeParse(injectedResult);
+      if (!parsedResult.success) return { status: 'ok', outcome: 'dispatched_no_result' };
+      const result = parsedResult.data;
+      if (result.outcome === 'not_dispatched' && result.reason) return error(result.reason, result.error);
+      return result.outcome === 'not_dispatched' || result.outcome === 'dispatched_no_result'
+        ? { status: 'ok', outcome: result.outcome }
+        : { status: 'ok', outcome: result.outcome, result: result.result };
+    },
   });
 }
 
@@ -1414,6 +1513,15 @@ const schemas = {
     shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`),
     timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe(`Optional timeout in ms, in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}].`),
   }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
+    topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe(`Documentation topic; one of ${COMPUTER_USE_DOC_TOPICS.join(', ')}.`),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
+    machine: z.string().describe('Target machine ref_name from list_machines.'),
+    tool: z.enum(COMPUTER_USE_TOOLS).describe(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`),
+    arguments: z.record(z.string(), z.unknown()).optional().describe('JSON object arguments for the selected method.'),
+    timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_MAX_TIMEOUT_MS).optional().describe(`Optional timeout in ms, in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}].`),
+  }),
 } as const;
 
 /**
@@ -1465,6 +1573,20 @@ const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>>
     machines: z.array(machineSummaryRuntimeSchema).max(MACHINE_LIST_MAX_ITEMS),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: machineExecToolOutputRuntimeSchema,
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
+    status: z.literal('ok'),
+    topic: z.enum(COMPUTER_USE_DOC_TOPICS),
+    text: z.string(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
+    status: z.literal('ok'),
+    outcome: z.enum(COMPUTER_USE_OUTCOMES),
+    result: computerUseResultSchema.optional(),
+  }).superRefine((value, ctx) => {
+    if ((value.outcome === 'completed' || value.outcome === 'tool_error') !== (value.result !== undefined)) {
+      ctx.addIssue({ code: 'custom', message: 'computer_use_call outcome/result mismatch' });
+    }
+  }),
 } as const;
 
 /** Descriptors advertised for a node of the given role (controlled excludes FULL-only tools). */

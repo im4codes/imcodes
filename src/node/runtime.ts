@@ -3,6 +3,7 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { AuthenticatedWebSocketClient, type AuthenticatedWebSocketFactory } from '../transport/authenticated-websocket.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
+import { ComputerUseWorker } from './computer-use-worker.js';
 import type { ControlledNodeCredential } from './enrollment.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
@@ -29,6 +30,7 @@ export function createControlledNodeRuntime(
   options: ControlledNodeRuntimeOptions = {},
 ): AuthenticatedWebSocketClient {
   const worker = new MachineExecWorker();
+  const computerUseWorker = new ComputerUseWorker();
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
   const reportAuthenticationError = (error: unknown) => {
@@ -67,7 +69,7 @@ export function createControlledNodeRuntime(
     onOpen: () => {
       client.send({ type: 'heartbeat' });
     },
-    onClose: () => worker.abortAll(),
+    onClose: () => { worker.abortAll(); computerUseWorker.abortAll(); },
     onMessage: async (raw) => {
       let message: Record<string, unknown>;
       try {
@@ -77,6 +79,11 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) persistAuthentication();
+      if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
+        const reply = await computerUseWorker.handle(message);
+        if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
       if (message.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) return;
       const correlationId = typeof message.correlationId === 'string' ? message.correlationId : '';
       const reply = await worker.handle(message, (chunk) => {

@@ -11,6 +11,8 @@ export const DAEMON_MSG = {
   MACHINE_EXEC_CHUNK: 'machine.exec_chunk',
   /** Controlled node → server: result of a MACHINE_EXEC request (RemoteExecResult). */
   MACHINE_EXEC_RESULT: 'machine.exec_result',
+  /** Controlled node → server: result of a typed Computer Use request. */
+  COMPUTER_USE_RESULT: 'computer.use_result',
 } as const;
 
 export type DaemonMessageType = (typeof DAEMON_MSG)[keyof typeof DAEMON_MSG];

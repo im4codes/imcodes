@@ -7,6 +7,8 @@ export const DAEMON_COMMAND_TYPES = {
   SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
   /** Server → controlled node: run a one-shot command locally (RemoteExecRequest). */
   MACHINE_EXEC: 'machine.exec',
+  /** Server → controlled node: invoke one typed Computer Use tool locally. */
+  COMPUTER_USE: 'computer.use',
 } as const;
 
 export type DaemonCommandType =

@@ -1,8 +1,16 @@
 #!/usr/bin/env node
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
+import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createControlledNodeRuntime } from './runtime.js';
 
 async function main(): Promise<void> {
+  if (process.argv[2] === '--computer-use-helper') {
+    const pipeFlag = process.argv.indexOf('--pipe');
+    const pipe = pipeFlag >= 0 ? process.argv[pipeFlag + 1] : undefined;
+    if (!pipe) throw new Error('missing --pipe for computer-use helper');
+    await runComputerUseIpcHelper(pipe);
+    return;
+  }
   const now = Date.now();
   const deps = defaultBootstrapDeps(now);
   const bootstrap = await bootstrapControlledNodeWithDisposition(deps);

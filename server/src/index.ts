@@ -25,6 +25,7 @@ import { bindRoutes } from './routes/bind.js';
 import { enrollRoutes, runEnrollmentRetention } from './routes/enroll.js';
 import { machinesRoutes } from './routes/machines.js';
 import { machineExecRoutes } from './routes/machine-exec.js';
+import { machineComputerUseRoutes } from './routes/machine-computer-use.js';
 import { serverRoutes } from './routes/server.js';
 import { webhookRoutes } from './routes/webhook.js';
 import { outboundRoutes } from './routes/outbound.js';
@@ -169,6 +170,7 @@ export function buildApp(env: Env) {
   app.route('/api/enroll', enrollRoutes);
   app.route('/api/machines', machinesRoutes);
   app.route('/api/machine/exec', machineExecRoutes);
+  app.route('/api/machine/computer-use', machineComputerUseRoutes);
   app.route('/api/server', serverRoutes);
   app.route('/webhook', webhookRoutes);
   app.route('/api/outbound', outboundRoutes);

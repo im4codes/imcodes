@@ -16,6 +16,14 @@ import {
   REMOTE_EXEC_OUTCOMES,
   MACHINE_LIST_MAX_ITEMS,
 } from './remote-exec.js';
+import {
+  COMPUTER_USE_DOC_TOPICS,
+  COMPUTER_USE_MAX_ARGUMENT_BYTES,
+  COMPUTER_USE_MAX_TIMEOUT_MS,
+  COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_OUTCOMES,
+  COMPUTER_USE_TOOLS,
+} from './computer-use.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -42,6 +50,8 @@ export const MEMORY_MCP_TOOL_NAMES = {
   // Machine remote-exec surface — FULL-only (see FULL_ONLY_MCP_TOOLS).
   LIST_MACHINES: 'list_machines',
   EXEC_REMOTE: 'exec_remote',
+  COMPUTER_USE_DOCS: 'computer_use_docs',
+  COMPUTER_USE_CALL: 'computer_use_call',
 } as const;
 
 export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMORY_MCP_TOOL_NAMES];
@@ -70,6 +80,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
 ] as const satisfies readonly MemoryMcpToolName[];
 
 /**
@@ -80,6 +92,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+  MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
 ]);
 
 /** Whether a tool is available to a node of the given role. */
@@ -497,6 +511,33 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       truncated: booleanSchema('True when output hit the byte cap and was cut.'),
       durationMs: numberSchema('Wall-clock duration in ms.', { minimum: 0 }),
       error: stringSchema('Required non-empty detail for node_timeout/spawn_error; forbidden otherwise.', { minLength: 1 }),
+    }, ['status', 'outcome']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: {
+    name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
+    description: 'Return focused documentation for the typed Computer Use surface. Call this for only the topic you need instead of loading all Computer Use details into the model context. FULL nodes only.',
+    inputSchema: objectSchema({
+      topic: stringSchema(`Documentation topic; one of ${COMPUTER_USE_DOC_TOPICS.join(', ')}.`, { enum: [...COMPUTER_USE_DOC_TOPICS] }),
+    }, ['topic']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
+      topic: stringSchema('Returned topic.', { enum: [...COMPUTER_USE_DOC_TOPICS] }),
+      text: stringSchema('Focused Computer Use guidance for this topic.'),
+    }, ['status', 'topic', 'text']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
+    name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+    description: `Invoke one typed Computer Use method on a controlled machine through session IPC. Use exec_remote for session-0/SYSTEM shell; use tool=shell_session1 for active-user/session-1 shell. For GUI actions, call computer_use_docs for the relevant topic then get_app_state before acting. Tools: ${COMPUTER_USE_TOOLS.join(', ')}. Outcomes: ${COMPUTER_USE_OUTCOMES.join(' | ')}. FULL nodes only.`,
+    inputSchema: objectSchema({
+      machine: stringSchema('Target machine ref_name from list_machines.'),
+      tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
+      arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes.`, additionalProperties: true },
+      timeoutMs: numberSchema(`Optional timeout in ms, in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_MAX_TIMEOUT_MS }),
+    }, ['machine', 'tool']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
+      outcome: stringSchema(`Discriminated outcome: ${COMPUTER_USE_OUTCOMES.join(' | ')}.`, { enum: [...COMPUTER_USE_OUTCOMES] }),
+      result: { type: 'object', description: 'Bounded Computer Use result content when the target method returned.', additionalProperties: true },
     }, ['status', 'outcome']),
   },
 };

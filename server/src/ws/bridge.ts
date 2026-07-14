@@ -21,6 +21,7 @@ import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { resolvePendingExec, resolvePendingExecChunk, abandonPriorGenerations } from './machine-exec-registry.js';
+import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
 import {
   NODE_ROLE,
   REMOTE_EXEC_MAX_ERROR_BYTES,
@@ -29,6 +30,7 @@ import {
   validateMachineExecResultFrame,
   type NodeRole,
 } from '../../../shared/remote-exec.js';
+import { validateComputerUseResultFrame } from '../../../shared/computer-use.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
@@ -1087,6 +1089,8 @@ export class WsBridge {
   static invalidMachineExecResultsDropped = 0;
   /** Count of malformed/oversized MACHINE_EXEC_CHUNK frames rejected before pending-RPC delivery. */
   static invalidMachineExecChunksDropped = 0;
+  /** Count of malformed/oversized COMPUTER_USE_RESULT frames rejected before pending-RPC resolution. */
+  static invalidComputerUseResultsDropped = 0;
   /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
@@ -2374,6 +2378,7 @@ export class WsBridge {
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
+    abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
@@ -2560,6 +2565,7 @@ export class WsBridge {
             // MACHINE_EXEC is never replayed — a one-shot SYSTEM command must not
             // execute on a fresh generation after the relay gave up (10.6).
             if (parsed.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC) continue;
+            if (parsed.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) continue;
             if (parsed.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
               this.requestDaemonUpgrade({
                 targetVersion: (parsed as { targetVersion?: unknown }).targetVersion,
@@ -2627,6 +2633,12 @@ export class WsBridge {
           }
           return;
         }
+        if (msg.type === DAEMON_MSG.COMPUTER_USE_RESULT) {
+          if (!this.resolveValidatedComputerUseResult(msg)) {
+            WsBridge.controlledInboundDropped++;
+          }
+          return;
+        }
         if (msg.type === 'heartbeat') {
           const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
           if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
@@ -2656,6 +2668,10 @@ export class WsBridge {
       }
       if (msg.type === DAEMON_MSG.MACHINE_EXEC_RESULT) {
         this.resolveValidatedMachineExecResult(msg);
+        return;
+      }
+      if (msg.type === DAEMON_MSG.COMPUTER_USE_RESULT) {
+        this.resolveValidatedComputerUseResult(msg);
         return;
       }
 
@@ -5859,6 +5875,19 @@ export class WsBridge {
     }
   }
 
+  /** Non-queueing, generation-bound send for typed Computer Use calls. */
+  trySendComputerUse(frameJson: string, expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    try {
+      this.daemonWs.send(frameJson);
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to send COMPUTER_USE');
+      return 'send_failed';
+    }
+  }
+
   sendToDaemon(message: string): void {
     const parsed = this.parseJsonObject(message);
     if (parsed?.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
@@ -5868,13 +5897,13 @@ export class WsBridge {
       });
       return;
     }
-    // MACHINE_EXEC is dispatched ONLY via the generation-bound, non-queueing
-    // `trySendMachineExec`. It must NEVER traverse this generic path (which queues
+    // MACHINE_EXEC / COMPUTER_USE are dispatched ONLY via generation-bound,
+    // non-queueing methods. They must NEVER traverse this generic path (which queues
     // when offline → late replay on a new generation, and is not generation-bound
     // even when connected). Drop it UNCONDITIONALLY so no caller can bypass
     // `trySendMachineExec`, whether the daemon is connected or not.
-    if (parsed?.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC) {
-      logger.warn({ serverId: this.serverId }, 'Dropped MACHINE_EXEC sent via generic sendToDaemon — use trySendMachineExec');
+    if (parsed?.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC || parsed?.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
+      logger.warn({ serverId: this.serverId, type: parsed.type }, 'Dropped control command sent via generic sendToDaemon');
       return;
     }
     if (this.daemonWs && this.authenticated) {
@@ -5923,6 +5952,15 @@ export class WsBridge {
       return false;
     }
     return resolvePendingExecChunk(this.serverId, this.daemonGeneration, validated.value);
+  }
+
+  private resolveValidatedComputerUseResult(message: Record<string, unknown>): boolean {
+    const validated = validateComputerUseResultFrame(message);
+    if (!validated.ok) {
+      WsBridge.invalidComputerUseResultsDropped++;
+      return false;
+    }
+    return resolvePendingComputerUse(this.serverId, this.daemonGeneration, validated.value);
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {
