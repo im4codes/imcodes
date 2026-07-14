@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { runRemoteExec, defaultRemoteExecShell, shellInvocation } from '../../src/node/exec-runner.js';
+import {
+  runRemoteExec,
+  defaultRemoteExecShell,
+  shellInvocation,
+  utf8ExecEnvironment,
+} from '../../src/node/exec-runner.js';
 import {
   REMOTE_EXEC_MAX_CHUNK_BYTES,
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
@@ -31,6 +36,15 @@ describe('runRemoteExec', () => {
     const r = await runRemoteExec({ requestId: 'r3', command: 'echo oops 1>&2; exit 1', shell: SH });
     expect(r.exitCode).toBe(1);
     expect(r.stderr.trim()).toBe('oops');
+  });
+
+  it('preserves non-ASCII text on both UTF-8 output streams', async () => {
+    const r = await runRemoteExec({
+      requestId: 'utf8-streams',
+      command: `printf '中文✓'; printf '错误✓' >&2`,
+      shell: SH,
+    });
+    expect(r).toMatchObject({ ok: true, exitCode: 0, stdout: '中文✓', stderr: '错误✓' });
   });
 
   it('emits ordered stdout/stderr chunks before returning the terminal result', async () => {
@@ -80,6 +94,15 @@ describe('runRemoteExec', () => {
 
     expect(result.stdout).toBe('你');
     expect(chunks.map((chunk) => chunk.chunk).join('')).toBe('你');
+  });
+
+  it('reports an incomplete trailing UTF-8 sequence instead of dropping it', async () => {
+    const r = await runRemoteExec({
+      requestId: 'incomplete-utf8',
+      command: `node -e "process.stdout.write(Buffer.from([0xe4,0xbd]))"`,
+      shell: SH,
+    });
+    expect(r.stdout).toBe('\uFFFD');
   });
 
   it('kills and flags a command that exceeds its timeout', async () => {
@@ -140,6 +163,19 @@ describe('runRemoteExec', () => {
     expect(defaultRemoteExecShell('linux')).toBe('sh');
   });
 
+  it('normalizes child-process locale and common runtime output to UTF-8', () => {
+    const base = { PATH: '/bin', LANG: 'zh_CN.GBK', PYTHONUTF8: '0' };
+    const env = utf8ExecEnvironment(base);
+    expect(env).toMatchObject({
+      PATH: '/bin',
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C.UTF-8',
+      PYTHONUTF8: '1',
+      PYTHONIOENCODING: 'utf-8',
+    });
+    expect(base).toEqual({ PATH: '/bin', LANG: 'zh_CN.GBK', PYTHONUTF8: '0' });
+  });
+
   it('builds a non-interactive, no-profile, UTF-8-forced powershell invocation', () => {
     const { file, args } = shellInvocation('powershell', 'Get-Date');
     expect(file).toBe('powershell.exe');
@@ -148,7 +184,32 @@ describe('runRemoteExec', () => {
     // UTF-8 preamble prepended (verified on real Windows: fixes gb2312 mojibake),
     // user command preserved at the end.
     const command = args[args.length - 1];
-    expect(command).toContain('[System.Text.Encoding]::UTF8');
+    expect(command.match(/\[System\.Text\.Encoding\]::UTF8/g)).toHaveLength(3);
+    expect(command).toContain('[Console]::InputEncoding=');
+    expect(command).toContain('[Console]::OutputEncoding=');
     expect(command.endsWith('Get-Date')).toBe(true);
+  });
+
+  it('delays cmd command parsing until after its Windows console is UTF-8', () => {
+    const command = 'echo 中文✓ & echo 错误✓ 1>&2';
+    const { file, args, env } = shellInvocation('cmd', command);
+    expect(file).toBe('powershell.exe');
+    expect(args).toContain('-NonInteractive');
+    expect(args.at(-1)).toContain('& cmd.exe /d /s /c $env:IMCODES_REMOTE_EXEC_COMMAND');
+    expect(args.at(-1)).toContain('exit $LASTEXITCODE');
+    expect(args.join('')).not.toContain(command);
+    expect(env).toEqual({ IMCODES_REMOTE_EXEC_COMMAND: command });
+  });
+
+  it.skipIf(process.platform !== 'win32')('preserves cmd Unicode input, both output streams, and exit status on Windows', async () => {
+    const r = await runRemoteExec({
+      requestId: 'cmd-utf8',
+      command: 'echo 中文✓ & echo 错误✓ 1>&2 & exit 7',
+      shell: 'cmd',
+    });
+    expect(r).toMatchObject({ ok: true, exitCode: 7 });
+    expect(r.stdout.trim()).toBe('中文✓');
+    expect(r.stderr.trim()).toBe('错误✓');
+    expect(r.stdout).not.toMatch(/Active code page|活动代码页/);
   });
 });

@@ -28,14 +28,43 @@ export function defaultRemoteExecShell(platform: NodeJS.Platform = process.platf
   return platform === 'win32' ? 'powershell' : 'sh';
 }
 
+/**
+ * Every controlled-node command speaks UTF-8 on the relay wire. Keep the
+ * child environment deterministic too, including tools that choose their
+ * stdio encoding from locale variables instead of the parent shell.
+ */
+export function utf8ExecEnvironment(
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    LANG: 'C.UTF-8',
+    LC_ALL: 'C.UTF-8',
+    // Python on Windows otherwise follows the active ANSI code page even
+    // when its parent shell has switched the console to code page 65001.
+    PYTHONUTF8: '1',
+    PYTHONIOENCODING: 'utf-8',
+  };
+}
+
+const WINDOWS_UTF8_PREAMBLE = '$OutputEncoding=[System.Text.Encoding]::UTF8; '
+  + '[Console]::InputEncoding=[System.Text.Encoding]::UTF8; '
+  + '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;';
+const CMD_COMMAND_ENV = 'IMCODES_REMOTE_EXEC_COMMAND';
+
+interface ShellInvocation {
+  file: string;
+  args: string[];
+  env?: NodeJS.ProcessEnv;
+}
+
 /** Resolve the executable + argv for a one-shot command in the requested shell. */
-export function shellInvocation(shell: RemoteExecShell, command: string): { file: string; args: string[] } {
+export function shellInvocation(shell: RemoteExecShell, command: string): ShellInvocation {
   switch (shell) {
     case 'powershell':
-      // Force UTF-8 for captured (piped) output: Windows consoles default to the
-      // OEM/ANSI codepage (e.g. gb2312), which mojibakes non-ASCII over the relay.
-      // Setting $OutputEncoding + [Console]::OutputEncoding at the top makes all
-      // subsequent output UTF-8 so the daemon captures it cleanly.
+      // Windows consoles default to an OEM/ANSI code page (for example GBK).
+      // Set every PowerShell/native-process console encoding surface before
+      // the caller's untouched command runs.
       return {
         file: 'powershell.exe',
         args: [
@@ -44,11 +73,28 @@ export function shellInvocation(shell: RemoteExecShell, command: string): { file
           '-ExecutionPolicy',
           'Bypass',
           '-Command',
-          `$OutputEncoding=[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ${command}`,
+          `${WINDOWS_UTF8_PREAMBLE} ${command}`,
         ],
       };
     case 'cmd':
-      return { file: 'cmd.exe', args: ['/d', '/s', '/c', command] };
+      // cmd.exe parses its /c argument using the inherited OEM code page
+      // before an inline `chcp 65001` can run, so non-ASCII command text is
+      // already corrupted by then. Carry the untouched Unicode command in the
+      // environment, establish UTF-8 in a small ASCII-only PowerShell launcher,
+      // and only then create the real cmd.exe process. The caller still gets
+      // cmd syntax, streams, and exit status without any encoding boilerplate.
+      return {
+        file: 'powershell.exe',
+        args: [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          `${WINDOWS_UTF8_PREAMBLE} & cmd.exe /d /s /c $env:${CMD_COMMAND_ENV}; exit $LASTEXITCODE`,
+        ],
+        env: { [CMD_COMMAND_ENV]: command },
+      };
     case 'bash':
       return { file: 'bash', args: ['-lc', command] };
     case 'sh':
@@ -134,7 +180,7 @@ export function runRemoteExec(
     });
   }
   const timeoutMs = clampTimeout(req.timeoutMs);
-  const { file, args } = shellInvocation(shell, req.command);
+  const { file, args, env: invocationEnv } = shellInvocation(shell, req.command);
 
   return new Promise<RemoteExecResult>((resolve) => {
     let settled = false;
@@ -149,18 +195,14 @@ export function runRemoteExec(
     const stdoutDecoder = new StringDecoder('utf8');
     const stderrDecoder = new StringDecoder('utf8');
 
-    const capture = (chunk: Buffer, isErr: boolean): void => {
+    const appendDecoded = (decoded: string, isErr: boolean): void => {
+      if (!decoded) return;
       const used = isErr ? errBytes : outBytes;
       const room = REMOTE_EXEC_MAX_OUTPUT_BYTES - used;
       if (room <= 0) {
         truncated = true;
         return;
       }
-      // StringDecoder preserves UTF-8 code points split across child-process
-      // `data` events. The byte cap is applied to decoded output, so neither a
-      // split code point nor an invalid byte sequence can inflate the result
-      // beyond the shared stdout/stderr boundary.
-      const decoded = (isErr ? stderrDecoder : stdoutDecoder).write(chunk);
       const text = takeUtf8Prefix(decoded, room);
       if (text.length < decoded.length) truncated = true;
       const textBytes = Buffer.byteLength(text, 'utf8');
@@ -172,6 +214,14 @@ export function runRemoteExec(
         outBytes += textBytes;
       }
       emitOutputChunks(text, isErr ? 'stderr' : 'stdout', () => chunkSeq++, opts.onChunk);
+    };
+
+    const capture = (chunk: Buffer, isErr: boolean): void => {
+      // StringDecoder preserves UTF-8 code points split across child-process
+      // `data` events. The byte cap is applied to decoded output, so neither a
+      // split code point nor an invalid byte sequence can inflate the result
+      // beyond the shared stdout/stderr boundary.
+      appendDecoded((isErr ? stderrDecoder : stdoutDecoder).write(chunk), isErr);
     };
 
     // On unix, run the command as its own process-group leader (detached) so a
@@ -186,7 +236,12 @@ export function runRemoteExec(
     const isWin = process.platform === 'win32';
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(file, args, { cwd: req.cwd, windowsHide: true, detached: !isWin });
+      child = spawn(file, args, {
+        cwd: req.cwd,
+        env: { ...utf8ExecEnvironment(), ...invocationEnv },
+        windowsHide: true,
+        detached: !isWin,
+      });
     } catch (err) {
       resolve({
         requestId: req.requestId,
@@ -235,6 +290,11 @@ export function runRemoteExec(
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
+      // Flush a final partial sequence. Valid UTF-8 is preserved; malformed or
+      // incomplete trailing bytes become the standard replacement character
+      // instead of disappearing silently from the terminal result.
+      appendDecoded(stdoutDecoder.end(), false);
+      appendDecoded(stderrDecoder.end(), true);
       const error = spawnError ?? (aborted ? 'aborted' : (timedOut ? `timed out after ${timeoutMs}ms` : undefined));
       // Windows taskkill can report a numeric close code even though the
       // command was forcibly terminated. Failed result frames require a null
