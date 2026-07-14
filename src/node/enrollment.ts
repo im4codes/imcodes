@@ -21,6 +21,7 @@ import {
 import {
   applyWindowsAclCommands,
   windowsCredentialDir,
+  windowsExecutableFileAclCommands,
   windowsSecretFileAclCommands,
 } from './installer.js';
 
@@ -250,6 +251,9 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
       if (process.platform !== 'win32') await this.stagingFs.chmod(temp, 0o755);
       await this.stagingFs.rename(temp, destPath);
       renamed = true;
+      if (process.platform === 'win32') {
+        applyWindowsAclCommands(windowsExecutableFileAclCommands(destPath));
+      }
       await this.stagingFs.fsyncParentDirectory(destPath);
     } catch (error) {
       await dst?.close().catch(() => {});

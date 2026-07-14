@@ -190,6 +190,7 @@ export function windowsCredentialDir(env: NodeJS.ProcessEnv = process.env): stri
  */
 const WINDOWS_SYSTEM_SID = '*S-1-5-18';
 const WINDOWS_ADMINISTRATORS_SID = '*S-1-5-32-544';
+const WINDOWS_AUTHENTICATED_USERS_SID = '*S-1-5-11';
 
 export type WindowsAclCommand = readonly [path: string, ...args: string[]];
 
@@ -215,6 +216,22 @@ export function windowsSecretFileAclCommands(path: string): WindowsAclCommand[] 
   return [
     [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
     [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
+    [path, '/inheritance:r'],
+    [path, '/setowner', WINDOWS_SYSTEM_SID],
+  ];
+}
+
+/**
+ * The staged executable lives beside SYSTEM-only credentials, but Windows
+ * Computer Use launches a helper copy of this executable under the active
+ * interactive user token. Keep secrets sealed while allowing authenticated
+ * local users to read/execute only the binary.
+ */
+export function windowsExecutableFileAclCommands(path: string): WindowsAclCommand[] {
+  return [
+    [path, '/grant:r', `${WINDOWS_SYSTEM_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_ADMINISTRATORS_SID}:F`],
+    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:RX`],
     [path, '/inheritance:r'],
     [path, '/setowner', WINDOWS_SYSTEM_SID],
   ];

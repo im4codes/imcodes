@@ -12,6 +12,7 @@ import {
   windowsCredentialDir,
   applyWindowsAclCommands,
   windowsCredentialAclCommands,
+  windowsExecutableFileAclCommands,
   windowsSecretFileAclCommands,
   macosLaunchDaemonPlist,
   linuxSystemdUnit,
@@ -130,6 +131,15 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(joined).not.toMatch(/\bUsers:/);
     expect(joined).not.toMatch(/Everyone/i);
     expect(joined).not.toMatch(/Authenticated Users/i);
+    const exeCommands = windowsExecutableFileAclCommands(`${dir}\\imcodes-node.exe`);
+    expect(exeCommands).toEqual([
+      [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-18:F'],
+      [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-32-544:F'],
+      [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-11:RX'],
+      [`${dir}\\imcodes-node.exe`, '/inheritance:r'],
+      [`${dir}\\imcodes-node.exe`, '/setowner', '*S-1-5-18'],
+    ]);
+
     const fileCommands = windowsSecretFileAclCommands(`${dir}\\credential.json`);
     expect(fileCommands).toEqual([
       [`${dir}\\credential.json`, '/grant:r', '*S-1-5-18:F'],

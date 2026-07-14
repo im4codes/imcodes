@@ -16,6 +16,9 @@ import { DAEMON_MSG } from '../../shared/daemon-events.js';
 
 interface IpcRequestWire { id: string; request: ComputerUseFrame }
 interface IpcResultWire { id: string; result?: ComputerUseResultFrame; error?: string }
+interface IpcHelloWire { hello: typeof IPC_HELPER_HELLO }
+
+const IPC_HELPER_HELLO = 'imcodes-computer-use-helper-v1' as const;
 
 type PendingIpc = {
   resolve: (value: ComputerUseResultFrame) => void;
@@ -61,10 +64,41 @@ function psBase64(value: string): string {
   return Buffer.from(value, 'utf16le').toString('base64');
 }
 
-function launchWindowsUserSessionHelper(exe: string, pipe: string): void {
+export function windowsPipeClientAclCommand(path: string): readonly [string, string, string] {
+  return [path, '/grant', '*S-1-5-11:F'];
+}
+
+function allowWindowsPipeClients(path: string): void {
+  // `icacls \\.\pipe\...` opens the pipe while updating the DACL. Do not wait
+  // synchronously: that can deadlock the event loop before the server can drain
+  // and reject those non-helper probe connections.
+  const child = spawn('icacls', [...windowsPipeClientAclCommand(path)], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.on('error', () => {});
+  child.unref();
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function windowsCommandShellPath(): string {
+  return process.env.ComSpec?.trim() || 'C:\\Windows\\System32\\cmd.exe';
+}
+
+function windowsHelperCommandLine(exe: string, pipe: string): { shellExe: string; argsLine: string } {
   const helperArgs = helperArgv(pipe).map(quoteWinArg).join(' ');
-  const exe64 = Buffer.from(exe, 'utf8').toString('base64');
-  const args64 = Buffer.from(helperArgs, 'utf8').toString('base64');
+  const helperCommand = `${quoteWinArg(exe)} ${helperArgs}`;
+  return { shellExe: windowsCommandShellPath(), argsLine: `/d /s /c "${helperCommand}"` };
+}
+
+function launchWindowsUserSessionHelper(exe: string, pipe: string): void {
+  const { shellExe, argsLine } = windowsHelperCommandLine(exe, pipe);
+  const exe64 = Buffer.from(shellExe, 'utf8').toString('base64');
+  const args64 = Buffer.from(argsLine, 'utf8').toString('base64');
   const script = String.raw`
 $ErrorActionPreference = 'Stop'
 $exe = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__EXE64__'))
@@ -133,11 +167,11 @@ public static class ImcodesUserProc {
 Add-Type -TypeDefinition $src
 [ImcodesUserProc]::Start($exe, $argsLine)
 `.replace('__EXE64__', exe64).replace('__ARGS64__', args64);
-  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', psBase64(script)], {
-    detached: true,
+  const child = spawn('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', psBase64(script)], {
     stdio: 'ignore',
     windowsHide: true,
   });
+  child.on('error', () => {});
   child.unref();
 }
 
@@ -198,19 +232,7 @@ export class ComputerUseIpcHost {
     if (this.readyPromise) return this.readyPromise;
     this.readyPromise = new Promise((resolve, reject) => {
       const server = net.createServer((socket) => {
-        if (this.socket && !this.socket.destroyed) socket.destroy();
-        this.socket = socket;
-        socket.setEncoding('utf8');
-        socket.on('data', (chunk) => this.onData(String(chunk)));
-        socket.on('close', () => {
-          if (this.socket === socket) this.socket = null;
-          for (const [id, entry] of this.pending) {
-            clearTimeout(entry.timer);
-            entry.reject(new Error('computer_use_helper_disconnected'));
-            this.pending.delete(id);
-          }
-        });
-        resolve();
+        this.acceptConnection(socket, resolve);
       });
       this.server = server;
       const timer = setTimeout(() => {
@@ -225,19 +247,90 @@ export class ComputerUseIpcHost {
         reject(err);
       });
       server.listen(this.path, () => {
-        try {
-          if (process.platform === 'win32') launchWindowsUserSessionHelper(process.execPath, this.path);
-          else launchSameSessionHelper(process.execPath, this.path);
-        } catch (err) {
-          clearTimeout(timer);
-          this.readyPromise = null;
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
+        void (async () => {
+          try {
+            if (process.platform === 'win32') {
+              allowWindowsPipeClients(this.path);
+              await delay(750);
+              launchWindowsUserSessionHelper(process.execPath, this.path);
+            } else {
+              launchSameSessionHelper(process.execPath, this.path);
+            }
+          } catch (err) {
+            clearTimeout(timer);
+            server.close();
+            this.readyPromise = null;
+            reject(err instanceof Error ? err : new Error(String(err)));
+          }
+        })();
       });
       const done = () => clearTimeout(timer);
       this.readyPromise?.then(done, done);
     });
     return this.readyPromise;
+  }
+
+
+  private acceptConnection(socket: net.Socket, resolve: () => void): void {
+    socket.setEncoding('utf8');
+    let accepted = false;
+    socket.setTimeout(1_000, () => {
+      if (!accepted) socket.destroy();
+    });
+    let helloBuffer = '';
+    const rejectPending = (error: Error) => {
+      for (const [id, entry] of this.pending) {
+        clearTimeout(entry.timer);
+        entry.reject(error);
+        this.pending.delete(id);
+      }
+    };
+    const accept = (remaining: string) => {
+      if (this.socket && !this.socket.destroyed) this.socket.destroy();
+      accepted = true;
+      socket.setTimeout(0);
+      this.socket = socket;
+      socket.removeAllListeners('data');
+      socket.on('data', (chunk) => this.onData(String(chunk)));
+      if (remaining) this.onData(remaining);
+      resolve();
+    };
+    socket.on('error', (err) => {
+      if (accepted && this.socket === socket) {
+        this.socket = null;
+        rejectPending(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+    socket.on('close', () => {
+      if (!accepted || this.socket !== socket) return;
+      this.socket = null;
+      rejectPending(new Error('computer_use_helper_disconnected'));
+    });
+    socket.on('data', (chunk) => {
+      helloBuffer += String(chunk);
+      for (;;) {
+        const newline = helloBuffer.indexOf('\n');
+        if (newline < 0) return;
+        const line = helloBuffer.slice(0, newline).trim();
+        const remaining = helloBuffer.slice(newline + 1);
+        if (!line) {
+          helloBuffer = remaining;
+          continue;
+        }
+        let parsed: IpcHelloWire;
+        try { parsed = JSON.parse(line) as IpcHelloWire; } catch {
+          socket.destroy();
+          return;
+        }
+        if (!parsed || parsed.hello !== IPC_HELPER_HELLO) {
+          socket.destroy();
+          return;
+        }
+        helloBuffer = '';
+        accept(remaining);
+        return;
+      }
+    });
   }
 
   private onData(chunk: string): void {
@@ -272,6 +365,7 @@ export async function runComputerUseIpcHelper(pipe: string): Promise<void> {
     socket.once('connect', resolve);
     socket.once('error', reject);
   });
+  socket.write(`${JSON.stringify({ hello: IPC_HELPER_HELLO } satisfies IpcHelloWire)}\n`);
   socket.setEncoding('utf8');
   let buffer = '';
   socket.on('data', (chunk) => {
