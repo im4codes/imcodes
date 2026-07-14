@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
+import { useLayoutEffect } from 'preact/hooks';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
@@ -31,6 +32,17 @@ async function flush() {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
   }
+}
+
+function PressKeyDuringOpeningLayout({ keyName }: { keyName: string }) {
+  useLayoutEffect(() => {
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: keyName,
+      bubbles: true,
+      cancelable: true,
+    }));
+  }, [keyName]);
+  return null;
 }
 
 describe('AtPicker', () => {
@@ -117,6 +129,66 @@ describe('AtPicker', () => {
       addSpy.mockRestore();
       removeSpy.mockRestore();
     }
+  });
+
+  it.each([
+    ['ArrowDown', 'team'],
+    ['ArrowUp', '🖥️'],
+  ])('applies the first %s pressed immediately after the picker mounts', (keyName, highlightedText) => {
+    const wsClient = {
+      connected: true,
+      send: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    };
+
+    const { container } = render(
+      <>
+        <AtPicker
+          query=""
+          sessions={[]}
+          rootSession="deck_proj_brain"
+          wsClient={wsClient as any}
+          projectDir="/tmp/proj"
+          onSelectFile={vi.fn()}
+          onSelectAgent={vi.fn()}
+          onSelectDelegateAgent={vi.fn()}
+          onClose={vi.fn()}
+          visible
+        />
+        <PressKeyDuringOpeningLayout keyName={keyName} />
+      </>,
+    );
+
+    expect(container.querySelector('[data-hl="true"]')?.textContent).toContain(highlightedText);
+  });
+
+  it('applies Enter when it is the first key pressed after mount', () => {
+    const wsClient = {
+      connected: true,
+      send: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    };
+
+    render(
+      <>
+        <AtPicker
+          query=""
+          sessions={[]}
+          rootSession="deck_proj_brain"
+          wsClient={wsClient as any}
+          projectDir="/tmp/proj"
+          onSelectFile={vi.fn()}
+          onSelectAgent={vi.fn()}
+          onSelectDelegateAgent={vi.fn()}
+          onClose={vi.fn()}
+          visible
+        />
+        <PressKeyDuringOpeningLayout keyName="Enter" />
+      </>,
+    );
+
+    expect(screen.queryByText('team')).toBeNull();
+    expect(screen.getByText(/type_to_search/)).toBeDefined();
   });
 
   it('shows current main-session group agents and disables the current session', () => {

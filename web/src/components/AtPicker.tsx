@@ -271,20 +271,25 @@ export function AtPicker({
     return unsub;
   }, [wsClient]);
 
-  // Reset when visibility or category changes
-  useEffect(() => {
+  // These resets must finish in the opening commit. A passive effect can run
+  // after the user has already pressed the first Arrow/Enter, reverting that
+  // real interaction and making the picker appear to need two key presses.
+  useLayoutEffect(() => {
+    if (!visible) return;
+    setCategory('choose');
     setHighlightIdx(0);
-  }, [query, visible, category]);
-
-  // Reset to category chooser when picker opens
-  useEffect(() => {
-    if (visible) {
-      setCategory('choose');
-      setFileResults([]);
-    }
+    setFileResults([]);
   }, [visible]);
 
-  useEffect(() => {
+  // Category transitions set their own intended highlight (including the
+  // previous chooser row when navigating back). Only a changed search query
+  // should snap the current result list to its first row.
+  useLayoutEffect(() => {
+    if (!visible) return;
+    setHighlightIdx(0);
+  }, [query, visible]);
+
+  useLayoutEffect(() => {
     if (!visible) return;
     onStageChange?.(category);
   }, [visible, category, onStageChange]);
