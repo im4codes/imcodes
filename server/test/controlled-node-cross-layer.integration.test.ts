@@ -47,7 +47,7 @@ let bridge: WsBridge;
 let socket: ControlledLoopbackSocket;
 
 let holdStarted: (() => void) | undefined;
-let releaseHold: (() => void) | undefined;
+let releaseHolds: Array<() => void> = [];
 
 const runControlled = async (
   request: RemoteExecRequest,
@@ -55,7 +55,7 @@ const runControlled = async (
 ): Promise<RemoteExecResult> => {
   if (request.command === 'hold') {
     holdStarted?.();
-    await new Promise<void>((resolve) => { releaseHold = resolve; });
+    await new Promise<void>((resolve) => { releaseHolds.push(resolve); });
     return { requestId: request.requestId, ok: true, exitCode: 0, stdout: 'released', stderr: '', durationMs: 2 };
   }
   if (request.command === 'nonzero') {
@@ -272,21 +272,29 @@ describe('controlled-node cross-layer product path', () => {
     await client.close();
   });
 
-  it('uses the real worker concurrency gate so the second call returns spawn_error/busy', async () => {
+  it('uses the real worker concurrency gate so 10 calls run and the 11th returns spawn_error/busy', async () => {
     socket.mode = 'worker';
     let started!: () => void;
     const startedPromise = new Promise<void>((resolve) => { started = resolve; });
-    holdStarted = started;
+    let startedCount = 0;
+    holdStarted = () => {
+      startedCount++;
+      if (startedCount === 10) started();
+    };
     const client = await connectMcp(machineDeps());
-    const first = callExec(client, 'hold');
-    await startedPromise;
-    const second = await callExec(client, 'nonzero');
-    expect(second.structuredContent).toMatchObject({ status: 'ok', outcome: 'spawn_error', ok: false, error: 'busy' });
-    releaseHold?.();
-    await first;
-    holdStarted = undefined;
-    releaseHold = undefined;
-    await client.close();
+    const running = Array.from({ length: 10 }, () => callExec(client, 'hold'));
+    try {
+      await startedPromise;
+      expect(socket.worker.inFlightCount).toBe(10);
+      const overflow = await callExec(client, 'nonzero');
+      expect(overflow.structuredContent).toMatchObject({ status: 'ok', outcome: 'spawn_error', ok: false, error: 'busy' });
+    } finally {
+      for (const release of releaseHolds) release();
+      await Promise.allSettled(running);
+      holdStarted = undefined;
+      releaseHolds = [];
+      await client.close();
+    }
   });
 
   it.each([

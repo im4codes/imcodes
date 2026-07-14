@@ -1,8 +1,8 @@
 // Controlled-node exec worker (10.8): validates every inbound MACHINE_EXEC against
-// the SHARED envelope schema (never a bare cast), enforces per-node concurrency of
-// 1 (a second command in flight is rejected `busy`, never double-spawned), registers
-// the in-flight command's AbortController so a WS disconnect kills its process
-// group, and echoes the `correlationId` (not any client-declared identity).
+// the SHARED envelope schema (never a bare cast), enforces a bounded per-node
+// concurrency pool, registers every in-flight command's AbortController so a WS
+// disconnect kills all process groups, and echoes the `correlationId` (not any
+// client-declared identity).
 import { tmpdir } from 'node:os';
 import { validateMachineExecFrame } from '../../shared/remote-exec.js';
 import type { RemoteExecOutputChunk } from '../../shared/remote-exec.js';
@@ -22,11 +22,20 @@ export interface ExecReply {
 
 type RunFn = typeof runRemoteExec;
 
-export class MachineExecWorker {
-  private busy = false;
-  private current: AbortController | null = null;
+export const DEFAULT_MACHINE_EXEC_CONCURRENCY = 10;
 
-  constructor(private readonly run: RunFn = runRemoteExec, private readonly defaultCwd: string = tmpdir()) {}
+export class MachineExecWorker {
+  private readonly active = new Set<AbortController>();
+
+  constructor(
+    private readonly run: RunFn = runRemoteExec,
+    private readonly defaultCwd: string = tmpdir(),
+    private readonly maxConcurrency: number = DEFAULT_MACHINE_EXEC_CONCURRENCY,
+  ) {
+    if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
+      throw new RangeError('maxConcurrency must be a positive integer');
+    }
+  }
 
   /** Handle one inbound MACHINE_EXEC frame. Returns the reply envelope, or null if the frame lacks a usable correlationId. */
   async handle(rawFrame: unknown, onChunk?: (chunk: RemoteExecOutputChunk) => void): Promise<ExecReply | null> {
@@ -39,12 +48,11 @@ export class MachineExecWorker {
       return { correlationId: cid, ok: false, exitCode: null, stdout: '', stderr: '', durationMs: 0, error: `invalid_exec:${v.error}` };
     }
     const frame = v.value;
-    if (this.busy) {
+    if (this.active.size >= this.maxConcurrency) {
       return { correlationId: frame.correlationId, ok: false, exitCode: null, stdout: '', stderr: '', durationMs: 0, error: 'busy' };
     }
-    this.busy = true;
     const ac = new AbortController();
-    this.current = ac;
+    this.active.add(ac);
     try {
       const result = await this.run(
         { requestId: frame.correlationId, command: frame.command, shell: frame.shell, cwd: frame.cwd ?? this.defaultCwd, timeoutMs: frame.timeoutMs },
@@ -62,17 +70,20 @@ export class MachineExecWorker {
         ...(result.error ? { error: result.error } : {}),
       };
     } finally {
-      this.busy = false;
-      this.current = null;
+      this.active.delete(ac);
     }
   }
 
-  /** Abort the in-flight command (e.g. the relay connection dropped). */
+  /** Abort every in-flight command (e.g. the relay connection dropped). */
   abortAll(): void {
-    this.current?.abort();
+    for (const controller of this.active) controller.abort();
   }
 
   get isBusy(): boolean {
-    return this.busy;
+    return this.active.size >= this.maxConcurrency;
+  }
+
+  get inFlightCount(): number {
+    return this.active.size;
   }
 }
