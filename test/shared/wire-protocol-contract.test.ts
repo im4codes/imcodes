@@ -71,6 +71,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       UPGRADING: 'daemon.upgrading',
       MACHINE_EXEC_CHUNK: 'machine.exec_chunk',
       MACHINE_EXEC_RESULT: 'machine.exec_result',
+      COMPUTER_USE_RESULT: 'computer.use_result',
     });
 
     expect(DAEMON_COMMAND_TYPES).toEqual({
@@ -81,6 +82,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
       SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
       MACHINE_EXEC: 'machine.exec',
+      COMPUTER_USE: 'computer.use',
     });
   });
 

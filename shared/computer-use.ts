@@ -47,6 +47,17 @@ export const COMPUTER_USE_OUTCOMES = [
 
 export type ComputerUseOutcome = (typeof COMPUTER_USE_OUTCOMES)[number];
 
+export const COMPUTER_USE_HTTP_REASON = {
+  INVALID_REQUEST: 'invalid_request',
+  SCOPED_AUTH: 'scoped_auth',
+  TARGET_FORBIDDEN: 'target_forbidden',
+  EXEC_DISABLED: 'exec_disabled',
+  RELAY_DEADLINE: 'relay_deadline',
+  INVALID_RESULT: 'invalid_result',
+} as const;
+
+export type ComputerUseHttpReason = (typeof COMPUTER_USE_HTTP_REASON)[keyof typeof COMPUTER_USE_HTTP_REASON];
+
 export interface ComputerUseRequest {
   correlationId: string;
   tool: ComputerUseToolName;
@@ -85,7 +96,7 @@ export interface ComputerUseHttpEnvelope {
   version: typeof COMPUTER_USE_HTTP_ENVELOPE_VERSION;
   outcome: ComputerUseOutcome;
   result?: ComputerUseResult;
-  reason?: 'invalid_request' | 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'relay_deadline' | 'invalid_result';
+  reason?: ComputerUseHttpReason;
 }
 
 export type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -119,7 +130,7 @@ function isContentItem(value: unknown): value is ComputerUseContentItem {
 const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs']);
 const COMPUTER_USE_RESULT_KEYS = new Set(['type', 'correlationId', 'ok', 'tool', 'content', 'durationMs', 'error', 'timedOut', 'truncated']);
 const COMPUTER_USE_HTTP_ENVELOPE_KEYS = new Set(['protocol', 'version', 'outcome', 'result', 'reason']);
-const COMPUTER_USE_HTTP_REASONS = new Set(['invalid_request', 'scoped_auth', 'target_forbidden', 'exec_disabled', 'relay_deadline', 'invalid_result']);
+const COMPUTER_USE_HTTP_REASONS: ReadonlySet<string> = new Set(Object.values(COMPUTER_USE_HTTP_REASON));
 
 export function validateComputerUseFrame(raw: unknown): ValidationResult<ComputerUseFrame> {
   if (!isRecord(raw)) return { ok: false, error: 'not_object' };

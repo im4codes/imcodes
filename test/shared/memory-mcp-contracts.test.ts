@@ -47,6 +47,8 @@ describe('memory MCP shared contracts', () => {
       // Machine remote-exec surface — FULL-only (controlled-node-remote-exec 10.12).
       'list_machines',
       'exec_remote',
+      'computer_use_docs',
+      'computer_use_call',
     ]);
     expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
   });

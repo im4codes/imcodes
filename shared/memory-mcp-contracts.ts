@@ -527,7 +527,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: `Invoke one typed Computer Use method on a controlled machine through session IPC. Use exec_remote for session-0/SYSTEM shell; use tool=shell_session1 for active-user/session-1 shell. For GUI actions, call computer_use_docs for the relevant topic then get_app_state before acting. Tools: ${COMPUTER_USE_TOOLS.join(', ')}. Outcomes: ${COMPUTER_USE_OUTCOMES.join(' | ')}. FULL nodes only.`,
+    description: `Invoke one typed Computer Use method on a controlled machine through session IPC. Use exec_remote for session-0/SYSTEM shell; use method=shell_session1 for active-user/session-1 shell. For GUI actions, call computer_use_docs for the relevant topic then get_app_state before acting. Methods: ${COMPUTER_USE_TOOLS.join(', ')}. Outcomes: ${COMPUTER_USE_OUTCOMES.join(' | ')}. FULL nodes only.`,
     inputSchema: objectSchema({
       machine: stringSchema('Target machine ref_name from list_machines.'),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
