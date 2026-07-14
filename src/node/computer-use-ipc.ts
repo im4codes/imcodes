@@ -83,12 +83,15 @@ public static class ImcodesUserProc {
   [DllImport("userenv.dll", SetLastError=true)] static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
   [DllImport("userenv.dll", SetLastError=true)] static extern bool DestroyEnvironmentBlock(IntPtr env);
   [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessAsUser(IntPtr token, string app, string cmd, IntPtr procAttrs, IntPtr threadAttrs, bool inheritHandles, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string app, string cmd, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr h);
   const int WTSActive = 0;
   const uint TOKEN_ALL_ACCESS = 0xF01FF;
   const int SecurityImpersonation = 2;
   const int TokenPrimary = 1;
   const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+  const uint LOGON_WITH_PROFILE = 0x00000001;
+  const int ERROR_PRIVILEGE_NOT_HELD = 1314;
   public static int ActiveSessionId() {
     IntPtr p; int count;
     if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out p, out count)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
@@ -113,7 +116,13 @@ public static class ImcodesUserProc {
           STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO)); si.lpDesktop = "winsta0\\default";
           PROCESS_INFORMATION pi;
           string cmd = "\"" + exe + "\" " + argsLine;
-          if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+          if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) {
+            int error = Marshal.GetLastWin32Error();
+            if (error != ERROR_PRIVILEGE_NOT_HELD || !CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) {
+              if (error == ERROR_PRIVILEGE_NOT_HELD) error = Marshal.GetLastWin32Error();
+              throw new System.ComponentModel.Win32Exception(error);
+            }
+          }
           CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         } finally { if (env != IntPtr.Zero) DestroyEnvironmentBlock(env); }
       } finally { CloseHandle(primary); }
