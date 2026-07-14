@@ -237,6 +237,12 @@ export function windowsExecutableFileAclCommands(path: string): WindowsAclComman
   ];
 }
 
+export function windowsComputerUseHelperAclCommands(path: string): WindowsAclCommand[] {
+  return [
+    [path, '/grant:r', `${WINDOWS_AUTHENTICATED_USERS_SID}:(OI)(CI)RX`, '/T'],
+  ];
+}
+
 export function applyWindowsAclCommands(
   commands: readonly WindowsAclCommand[],
   runCommand: (file: string, args: readonly string[]) => void = (file, args) => {

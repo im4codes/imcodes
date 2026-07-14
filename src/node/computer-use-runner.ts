@@ -1,7 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { access } from 'node:fs/promises';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
   COMPUTER_USE_MAX_ERROR_BYTES,
@@ -13,9 +11,11 @@ import {
   type ComputerUseContentItem,
   type ComputerUseRequest,
   type ComputerUseResult,
+  type ComputerUseToolName,
 } from '../../shared/computer-use.js';
 
-const WINDOWS_DEFAULT_OCU_EXE = 'C:\\ProgramData\\imcodes-node\\computer-use-helper\\open-computer-use.exe';
+export const WINDOWS_DEFAULT_OCU_DIR = 'C:\\ProgramData\\imcodes-node\\computer-use-helper';
+const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.exe`;
 const SHELL_SESSION1_OUTPUT_MAX_BYTES = 96 * 1024;
 
 function utf8Bytes(value: string): number {
@@ -45,15 +45,52 @@ async function resolveOpenComputerUseBinary(): Promise<string> {
   return process.platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
 }
 
+export function openComputerUseCallArgs(tool: string, argsJson: string): string[] {
+  let args: Record<string, unknown> | null = null;
+  try {
+    const parsed = JSON.parse(argsJson);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) args = parsed as Record<string, unknown>;
+  } catch {
+    args = null;
+  }
+  if (isActionTool(tool) && typeof args?.app === 'string' && args.app.trim()) {
+    return ['call', '--calls', JSON.stringify([
+      { tool: 'get_app_state', args: { app: args.app, text_limit: 1_000, max_tree_nodes: 1_500, max_tree_depth: 80 } },
+      { tool, args },
+    ])];
+  }
+  return ['call', tool, '--args', argsJson];
+}
+
+export function openComputerUseEnv(tool: string, baseEnv: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv | undefined {
+  if (platform !== 'win32' || tool !== 'type_text') return undefined;
+  return { ...baseEnv, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' };
+}
+
+const ACTION_TOOLS: ReadonlySet<string> = new Set([
+  'click',
+  'perform_secondary_action',
+  'scroll',
+  'drag',
+  'type_text',
+  'press_key',
+  'set_value',
+]);
+
+function isActionTool(tool: string): tool is Exclude<ComputerUseToolName, 'list_apps' | 'get_app_state' | 'shell_session1'> {
+  return ACTION_TOOLS.has(tool);
+}
+
 type ExecOutcome = { stdout: string; stderr: string; timedOut: boolean; error?: string };
 
-function execFileBounded(file: string, args: string[], timeoutMs: number): Promise<ExecOutcome> {
+function execFileBounded(file: string, args: string[], timeoutMs: number, env?: NodeJS.ProcessEnv): Promise<ExecOutcome> {
   return new Promise((resolve) => {
     execFile(file, args, {
       timeout: timeoutMs,
       maxBuffer: COMPUTER_USE_MAX_TEXT_BYTES + COMPUTER_USE_MAX_IMAGE_BASE64_BYTES + COMPUTER_USE_MAX_ERROR_BYTES + 4096,
       windowsHide: true,
       encoding: 'utf8',
+      ...(env ? { env } : {}),
     }, (error, stdout, stderr) => {
       const anyErr = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string } | null;
       resolve({
@@ -98,6 +135,14 @@ function normalizeError(message: string): { error: string; truncated: boolean } 
   return { error: cut.value || 'computer use tool failed', truncated: cut.truncated };
 }
 
+function selectOpenComputerUseResult(raw: unknown): unknown {
+  if (!Array.isArray(raw)) return raw;
+  const last = raw.at(-1);
+  if (last && typeof last === 'object' && !Array.isArray(last) && 'result' in last) {
+    return (last as { result?: unknown }).result;
+  }
+  return last;
+}
 
 function shellCommandForPlatform(shell: string | undefined, command: string): { file: string; args: string[] } {
   if (process.platform === 'win32') {
@@ -202,28 +247,25 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
 
   if (request.tool === 'shell_session1') return runShellSession1(request, timeoutMs, started);
 
-  const temp = await mkdtemp(join(tmpdir(), 'imcodes-computer-use-'));
-  const argsFile = join(temp, 'args.json');
   try {
-    await writeFile(argsFile, argsJson, 'utf8');
     const bin = await resolveOpenComputerUseBinary();
-    const proc = await execFileBounded(bin, ['call', request.tool, '--args-file', argsFile, '--timeout', `${timeoutMs}ms`], timeoutMs + 1_000);
+    const proc = await execFileBounded(bin, openComputerUseCallArgs(request.tool, argsJson), timeoutMs + 1_000, openComputerUseEnv(request.tool));
     const durationMs = Date.now() - started;
-    if (proc.error) {
-      const normalized = normalizeError(proc.stderr || proc.error);
-      return {
-        correlationId: request.correlationId,
-        ok: false,
-        tool: request.tool,
-        content: [],
-        durationMs,
-        error: normalized.error,
-        ...(proc.timedOut ? { timedOut: true } : {}),
-        ...(normalized.truncated ? { truncated: true } : {}),
-      };
-    }
     let parsed: unknown;
     try { parsed = JSON.parse(proc.stdout); } catch {
+      if (proc.error) {
+        const normalized = normalizeError(proc.stderr || proc.error);
+        return {
+          correlationId: request.correlationId,
+          ok: false,
+          tool: request.tool,
+          content: [],
+          durationMs,
+          error: normalized.error,
+          ...(proc.timedOut ? { timedOut: true } : {}),
+          ...(normalized.truncated ? { truncated: true } : {}),
+        };
+      }
       const normalized = normalizeError(proc.stderr || proc.stdout || 'computer use tool returned non-json output');
       return {
         correlationId: request.correlationId,
@@ -235,6 +277,7 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
         ...(normalized.truncated ? { truncated: true } : {}),
       };
     }
+    parsed = selectOpenComputerUseResult(parsed);
     const { content, truncated } = normalizeContent(parsed);
     const isError = Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as { isError?: unknown }).isError);
     if (isError) {
@@ -269,7 +312,5 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
       error: normalized.error,
       ...(normalized.truncated ? { truncated: true } : {}),
     };
-  } finally {
-    await rm(temp, { recursive: true, force: true }).catch(() => {});
   }
 }

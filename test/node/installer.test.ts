@@ -11,6 +11,7 @@ import {
   windowsScheduledTaskXml,
   windowsCredentialDir,
   applyWindowsAclCommands,
+  windowsComputerUseHelperAclCommands,
   windowsCredentialAclCommands,
   windowsExecutableFileAclCommands,
   windowsSecretFileAclCommands,
@@ -138,6 +139,9 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       [`${dir}\\imcodes-node.exe`, '/grant:r', '*S-1-5-11:RX'],
       [`${dir}\\imcodes-node.exe`, '/inheritance:r'],
       [`${dir}\\imcodes-node.exe`, '/setowner', '*S-1-5-18'],
+    ]);
+    expect(windowsComputerUseHelperAclCommands(`${dir}\\computer-use-helper`)).toEqual([
+      [`${dir}\\computer-use-helper`, '/grant:r', '*S-1-5-11:(OI)(CI)RX', '/T'],
     ]);
 
     const fileCommands = windowsSecretFileAclCommands(`${dir}\\credential.json`);

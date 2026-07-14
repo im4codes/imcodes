@@ -1,9 +1,11 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runComputerUseTool } from './computer-use-runner.js';
+import { runComputerUseTool, WINDOWS_DEFAULT_OCU_DIR } from './computer-use-runner.js';
+import { applyWindowsAclCommands, windowsComputerUseHelperAclCommands } from './installer.js';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
   COMPUTER_USE_MAX_TIMEOUT_MS,
@@ -79,6 +81,11 @@ function allowWindowsPipeClients(path: string): void {
   });
   child.on('error', () => {});
   child.unref();
+}
+
+function allowWindowsComputerUseHelperFiles(): void {
+  if (!existsSync(WINDOWS_DEFAULT_OCU_DIR)) return;
+  applyWindowsAclCommands(windowsComputerUseHelperAclCommands(WINDOWS_DEFAULT_OCU_DIR));
 }
 
 function delay(ms: number): Promise<void> {
@@ -250,6 +257,7 @@ export class ComputerUseIpcHost {
         void (async () => {
           try {
             if (process.platform === 'win32') {
+              allowWindowsComputerUseHelperFiles();
               allowWindowsPipeClients(this.path);
               await delay(750);
               launchWindowsUserSessionHelper(process.execPath, this.path);
