@@ -12,6 +12,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderRolloutCompletionReconcileOptions,
   ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
@@ -179,12 +180,11 @@ const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 // a few seconds. The read itself is still gated by CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS
 // (so healthy, actively-streaming turns never touch the file).
 const CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS = 2_000;
-// Store-driven settle BACKSTOP grace. The per-turn rollout settle poll above and
-// the fs.watch that arms it are torn down with the turn; if they miss the
-// terminal record (disarmed watch, cleared timer, runningTurnId desync) the turn
-// stays "running" forever. An always-on health-poll backstop re-derives
-// terminality from the rollout's last lifecycle marker, but must never race the
-// 2s primary path — it only acts once the completion has been durable this long.
+// Store-driven health-poll BACKSTOP grace. The runtime also owns an independent
+// 2s poll with a 2s grace so a provider-side watcher teardown cannot leave a
+// false-working turn visible for a whole health cycle. This longer default is
+// retained for callers that do not carry the runtime's generation/ownership
+// evidence.
 const CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS = 90_000;
 // ROLLOUT-FIRST AUTHORITY: codex-core writes a terminal `task_complete{turn_id}`
 // to the thread's rollout the instant the model finishes a turn — empirically
@@ -754,6 +754,8 @@ interface CodexSdkSessionState {
   activeTurnLease?: CodexActiveTurnLease;
   turnStartInFlight: boolean;
   runningCompact: boolean;
+  /** True only for a user-issued standalone `/compact` transport turn. */
+  compactCommandInFlight: boolean;
   currentMessageId: string | null;
   currentText: string;
   activeItemIds: Set<string>;
@@ -2266,6 +2268,7 @@ export class CodexSdkProvider implements TransportProvider {
       activeTurnLease: undefined,
       turnStartInFlight: false,
       runningCompact: false,
+      compactCommandInFlight: false,
       currentMessageId: null,
       currentText: '',
       activeItemIds: new Set(),
@@ -2450,7 +2453,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelled = true;
     this.clearActiveTurnLease(state);
     if (!state.threadId) return;
-    if (state.runningCompact) {
+    if (state.runningCompact && state.compactCommandInFlight) {
       const turnId = state.runningTurnId;
       if (turnId) {
         void this.request('turn/interrupt', {
@@ -2483,6 +2486,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.compactObserved = false;
     state.currentMessageId = null;
     state.currentText = '';
@@ -2527,6 +2531,9 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
+      state.runningCompact = false;
+      state.compactCommandInFlight = false;
+      state.compactObserved = false;
       this.clearActiveItemEvidence(state);
       this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
       this.clearRawChecklistPollTimer(state);
@@ -2553,6 +2560,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.compactObserved = false;
     state.currentMessageId = null;
     state.currentText = '';
@@ -2845,6 +2853,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearPendingSessionSystemTextUpdate(state);
       this.clearActiveTurnLease(state);
       state.runningCompact = true;
+      state.compactCommandInFlight = true;
       state.compactObserved = false;
       state.currentText = '';
       state.currentMessageId = null;
@@ -2871,6 +2880,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
       this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
+      state.compactCommandInFlight = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;
@@ -3934,6 +3944,12 @@ export class CodexSdkProvider implements TransportProvider {
       if (!closedTurn) this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
+        // `contextCompaction` also occurs automatically INSIDE an ordinary
+        // model turn. Only a raw `/compact` send sets compactCommandInFlight.
+        // An inline compaction must keep the parent turn/dispatch alive; treating
+        // its item completion as a standalone transport completion produces a
+        // false idle while Codex immediately continues with more tool calls.
+        if (!state.runningCompact) state.compactCommandInFlight = false;
         state.runningCompact = true;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -4048,6 +4064,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
+        state.compactCommandInFlight = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -4069,6 +4086,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
         state.runningCompact = false;
+        state.compactCommandInFlight = false;
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
@@ -4088,8 +4106,11 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (state.runningCompact) {
-        this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
-        return;
+        if (state.compactCommandInFlight) {
+          this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
+          return;
+        }
+        this.completeInlineContextCompaction(sessionId, state, turnId);
       }
 
       if (state.cancelled) {
@@ -4130,6 +4151,11 @@ export class CodexSdkProvider implements TransportProvider {
     terminalReason: ToolTerminalReason = 'app_server_completed',
   ): Promise<void> {
     this.clearIdleSettleTimer(state);
+    this.clearCompactTimers(state);
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.compactObserved = false;
+    state.deferredCompactSettleTurnId = undefined;
     this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
     this.queueRawChecklistHistoryScan(sessionId, state);
@@ -4682,14 +4708,14 @@ export class CodexSdkProvider implements TransportProvider {
    *
    * Called from the always-on daemon health poll, so it is independent of the
    * per-turn timers that can be torn down mid-flight. Returns true iff it
-   * settled a turn. It deliberately only fires while the provider STILL holds
-   * this exact turn as in-flight, so it drives the same completion callback the
-   * normal path would (no duplicate assistant message, no settling a turn the
-   * provider already closed).
+   * settled a turn. It fires for the exact tracked turn, or for the guarded
+   * orphan shape where no newer dispatch/turn owns the runtime state. Both
+   * paths drive the normal completion callback while protecting a different or
+   * newly starting turn from stale rollout evidence.
    */
   async settleCompletedTurnFromRolloutBackstop(
     sessionId: string,
-    opts: { minCompleteAgeMs?: number; nowMs?: number } = {},
+    opts: ProviderRolloutCompletionReconcileOptions = {},
   ): Promise<boolean> {
     const state = this.sessions.get(sessionId);
     if (!state) return false;
@@ -4704,15 +4730,51 @@ export class CodexSdkProvider implements TransportProvider {
     // Re-read after the await; a newer turn may have genuinely started.
     const latest = this.sessions.get(sessionId);
     if (!latest || latest.cancelled || latest.runningCompact) return false;
-    // Only settle while the provider still believes THIS exact turn is in-flight.
-    // If the provider already closed it (runningTurnId cleared / a different turn
-    // running), re-firing completeTurn would duplicate the final message or kill
-    // real work — so we defer to the normal path / a newer turn instead.
+    // Normally settle only while the provider still believes THIS exact turn is
+    // in-flight. There is one additional zombie shape: app-server loses the
+    // terminal notification after leaving tool items open, then clears the turn
+    // identity. In that state the rollout tail is terminal, there is no current
+    // turn/start to protect, and the only provider "work" is orphaned tool
+    // evidence. Treat that evidence as stale and let completeTurn close it.
+    //
+    // Do NOT generalize this to every missing runningTurnId. During context
+    // bootstrap a fresh dispatch can briefly have no provider turn identity, and
+    // the rollout may still end with the previous turn's task_complete. An
+    // active runtime dispatch is eligible only when it crossed provider.send(),
+    // its generation still matches the provider generation, and orphaned tool
+    // evidence remains. That distinguishes the observed same-generation zombie
+    // from both a healthy pre-start window and a genuinely newer dispatch.
+    const activeWork = this.getCurrentTurnWorkState(latest);
+    const trackedTurnId = latest.runningTurnId ?? latest.activeTurnLease?.turnId;
+    const turnStartInFlightAtMs = latest.activeTurnLease?.turnStartInFlightAtMs;
+    const terminalBelongsToInFlightStart =
+      latest.turnStartInFlight
+      && latest.runningTurnId === undefined
+      && turnStartInFlightAtMs != null
+      && evidence.completedAtMs != null
+      && evidence.completedAtMs >= turnStartInFlightAtMs;
     const providerStillRunningThisTurn =
       latest.runningTurnId === evidence.turnId
       || latest.activeTurnLease?.turnId === evidence.turnId
-      || (latest.turnStartInFlight && latest.runningTurnId === undefined);
-    if (!providerStillRunningThisTurn) return false;
+      || terminalBelongsToInFlightStart;
+    const runtimeOwnsMatchingStartedDispatch =
+      opts.runtimeHasActiveDispatchOwnership === true
+      && opts.runtimeActiveDispatchProviderStarted === true
+      && sameActivityGeneration(opts.runtimeActivityGeneration, latest.runtimeActivityGeneration);
+    const terminalWithMatchingRuntimeDispatch =
+      trackedTurnId === undefined
+      && !latest.turnStartInFlight
+      && activeWork.activeToolCount > 0
+      && runtimeOwnsMatchingStartedDispatch;
+    const terminalWithNoRuntimeDispatch =
+      trackedTurnId === undefined
+      && !latest.turnStartInFlight
+      && opts.runtimeHasNoDispatchOwnership === true;
+    if (
+      !providerStillRunningThisTurn
+      && !terminalWithMatchingRuntimeDispatch
+      && !terminalWithNoRuntimeDispatch
+    ) return false;
     if (this.isClosedCodexTurn(latest, evidence.turnId)) return false;
     if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
       latest.currentMessageId = `${evidence.turnId}:rollout-backstop`;
@@ -4726,6 +4788,14 @@ export class CodexSdkProvider implements TransportProvider {
       turnId: evidence.turnId,
       completedAtMs: evidence.completedAtMs,
       ageMs: evidence.completedAtMs != null ? Math.max(0, now - evidence.completedAtMs) : null,
+      ...(terminalWithMatchingRuntimeDispatch
+        ? {
+            matchingRuntimeDispatchRecovered: true,
+            orphanedToolCount: activeWork.activeToolCount,
+            activityGeneration: normalizeActivityGeneration(latest.runtimeActivityGeneration),
+          }
+        : {}),
+      ...(terminalWithNoRuntimeDispatch ? { noRuntimeDispatchRecovered: true } : {}),
     }, 'Codex store-driven backstop: rollout proves the running turn is complete; settling the zombie turn from rollout evidence');
     await this.completeTurn(sessionId, latest, evidence.turnId, 'rollout_task_complete');
     return true;
@@ -4926,12 +4996,43 @@ export class CodexSdkProvider implements TransportProvider {
     });
   }
 
+  private completeInlineContextCompaction(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId?: string,
+  ): void {
+    this.clearCompactTimers(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.deferredCompactSettleTurnId = undefined;
+    state.compactObserved = false;
+    for (const itemId of state.activeCompactionItemIds) state.activeItemIds.delete(itemId);
+    state.activeCompactionItemIds.clear();
+
+    // Auto-compaction is an item INSIDE the current model turn, not a transport
+    // turn completion. Keep all parent turn identity/text/tool ownership intact
+    // and re-arm terminal authority now that the inline compact phase is over.
+    const activeTurnId = turnId ?? state.runningTurnId;
+    if (!state.cancelled && activeTurnId) {
+      state.runningTurnId = activeTurnId;
+      this.recordStrongActivity(sessionId, state, activeTurnId);
+      this.armRawChecklistPolling(sessionId, state);
+      this.armChildSubagentRolloutPolling(sessionId, state);
+    }
+  }
+
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    if (!state.compactCommandInFlight) {
+      this.completeInlineContextCompaction(sessionId, state, turnId);
+      return;
+    }
     this.clearCancelTimer(state);
     this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.deferredCompactSettleTurnId = undefined;
     this.clearActiveItemEvidence(state);
     state.runningTurnId = undefined;
@@ -5320,6 +5421,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRawChecklistPollTimer(state);    this.clearStatus(sessionId, state);
     this.rememberTerminatedCompactTurn(state, state.runningTurnId);
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.compactObserved = false;
@@ -5406,9 +5508,21 @@ export class CodexSdkProvider implements TransportProvider {
     state.compactHardTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
       if (!state.runningCompact) return;
+      if (!state.compactCommandInFlight) {
+        logger.warn({
+          provider: this.id,
+          sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          threadId: state.threadId,
+          turnId: state.runningTurnId,
+        }, 'Codex inline context compaction exceeded compact timeout; resuming parent turn without emitting completion');
+        this.completeInlineContextCompaction(sessionId, state, state.runningTurnId);
+        return;
+      }
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
       this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
+      state.compactCommandInFlight = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;

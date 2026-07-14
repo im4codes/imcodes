@@ -50,6 +50,7 @@ import { selectionSignature } from '../util/selection-signature.js';
 import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
+import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -624,7 +625,7 @@ function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean
     event.type !== 'command.ack' &&
     event.type !== 'terminal.snapshot' &&
     !(event.type === 'session.state'
-      && (event.payload.state === 'running' || event.payload.state === 'idle' || event.payload.state === 'queued')
+      && (isWorkingSessionState(event.payload.state) || event.payload.state === 'idle')
       && !getSessionStateDetail(event)) &&
     (showToolCalls || !TOOL_LIKE_EVENT_TYPES.has(event.type))
   );

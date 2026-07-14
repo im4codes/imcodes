@@ -48,7 +48,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
-import { buildCodexLifecycleTerminalMetadata, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import { buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -1498,7 +1498,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     if (status === 'thinking') {
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
-    const mapped = (status === 'streaming' || status === 'thinking' || status === 'tool_running') ? 'running' : status;
+    const mapped = isWorkingSessionState(status) ? 'running' : status;
     // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
     // During running/streaming, command-handler's 'queued' event is the sole queue-update
     // authority. This keeps queued messages visible in the UI until the drained turn completes.

@@ -12,6 +12,7 @@ import { NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '.
 import { deriveRefName, deriveDisplayName } from '../../../shared/machine-reference.js';
 import {
   isCanonicalControlledNodePair,
+  CONTROLLED_NODE_ARTIFACT_HEADERS,
   isControlledNodeArch,
   isControlledNodeOs,
   type ControlledNodeArch,
@@ -391,6 +392,37 @@ function buildArtifactStream(
   });
 }
 
+function buildBareArtifactStream(
+  handle: FileHandle,
+  sizeBytes: number,
+  closeOnce: () => Promise<void>,
+): ReadableStream<Uint8Array> {
+  let position = 0;
+  const buffer = Buffer.alloc(64 * 1024);
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (position < sizeBytes) {
+          const length = Math.min(buffer.length, sizeBytes - position);
+          const { bytesRead } = await handle.read(buffer, 0, length, position);
+          if (bytesRead <= 0) throw new Error('artifact_stream_ended_early');
+          position += bytesRead;
+          controller.enqueue(Buffer.from(buffer.subarray(0, bytesRead)));
+          return;
+        }
+        await closeOnce();
+        controller.close();
+      } catch (error) {
+        await closeOnce();
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await closeOnce();
+    },
+  });
+}
+
 // ── Consume + stream: reservation → pre-stream checks → committed → stream ─
 
 async function consumeAndStream(c: Context, rawTicket: string): Promise<Response> {
@@ -538,6 +570,81 @@ enrollRoutes.get('/v2/download', async (c) => {
   const m = BEARER_RE.exec(auth);
   if (!m || !m[1]) return c.json({ error: 'missing_or_invalid_ticket' }, 401);
   return consumeAndStream(c, m[1]);
+});
+
+
+const NODE_ARTIFACT_QUERY = z.object({
+  serverId: z.string().min(1).max(128),
+  os: z.string(),
+  arch: z.string(),
+}).strict();
+
+/**
+ * GET /api/enroll/v2/node-artifact — runtime self-upgrade download for an
+ * already-enrolled controlled node. Auth uses the node's existing server token;
+ * no user cookie, enrollment ticket, or fresh browser flow is required.
+ */
+enrollRoutes.get('/v2/node-artifact', async (c) => {
+  if (c.req.header('range')) {
+    c.header('Content-Range', 'bytes */0');
+    return c.body(null as unknown as ArrayBuffer, 416);
+  }
+  const auth = c.req.header('Authorization') ?? '';
+  const m = BEARER_RE.exec(auth);
+  if (!m || !m[1]) return c.json({ error: 'missing_or_invalid_token' }, 401);
+
+  const parsed = NODE_ARTIFACT_QUERY.safeParse({
+    serverId: c.req.query('serverId') ?? c.req.header('X-Server-Id') ?? '',
+    os: c.req.query('os') ?? '',
+    arch: c.req.query('arch') ?? '',
+  });
+  if (!parsed.success) return c.json({ error: 'invalid_query' }, 400);
+  const { serverId, os, arch } = parsed.data;
+  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
+    return c.json({ error: 'invalid_query' }, 400);
+  }
+
+  const tokenHash = sha256Hex(m[1]);
+  const server = await (c.env.DB as Database).queryOne<{
+    id: string;
+    token_hash: string;
+    node_role: string | null;
+    revoked_at: number | null;
+    os: string | null;
+    arch: string | null;
+  }>(
+    'SELECT id, token_hash, node_role, revoked_at, os, arch FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!server || server.token_hash !== tokenHash) return c.json({ error: 'unauthorized' }, 401);
+  if (server.revoked_at != null) return c.json({ error: 'revoked' }, 403);
+  if (server.node_role !== NODE_ROLE.CONTROLLED) return c.json({ error: 'forbidden' }, 403);
+  if ((server.os && server.os !== os) || (server.arch && server.arch !== arch)) {
+    return c.json({ error: 'platform_mismatch' }, 403);
+  }
+
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
+  const v = await artifactCatalog.ensureVerified(dir, os, arch);
+  if (!v.ok) return c.json({ error: 'executable_not_built', os, arch }, 503);
+  await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
+  const opened = await artifactCatalog.openPinned(dir, v.descriptor);
+  if (!opened) {
+    artifactCatalog.invalidate(dir, os, arch);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+
+  c.header('Content-Length', String(v.descriptor.sizeBytes));
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', `attachment; filename="${v.descriptor.filename}"`);
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Accept-Ranges', 'none');
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, v.descriptor.sha256);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(v.descriptor.sizeBytes));
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, v.descriptor.filename);
+  return c.body(buildBareArtifactStream(opened.handle, v.descriptor.sizeBytes, opened.close) as unknown as ReadableStream, 200);
 });
 
 // ── GET /api/enroll/v2/bootstrap (system-browser bridge) ──────────────────

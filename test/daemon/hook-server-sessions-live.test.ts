@@ -132,6 +132,31 @@ describe('hook-server /sessions/live', () => {
     expect(upsertSessionMock).not.toHaveBeenCalled();
   });
 
+  it('reconciles provider-owned work before reporting an apparently idle runtime', async () => {
+    const stale = makeSession({ name: 'deck_alpha_w_provider', state: 'idle' });
+    listSessionsMock.mockReturnValue([stale]);
+    getSessionMock.mockImplementation((name: string) => (name === stale.name ? stale : null));
+    let status = 'idle';
+    const drainPendingIfIdle = vi.fn(() => {
+      status = 'tool_running';
+      return false;
+    });
+    getTransportRuntimeMock.mockImplementation((name: string) =>
+      name === stale.name ? { getStatus: () => status, drainPendingIfIdle, pendingCount: 0 } : undefined);
+
+    const res = await postJson(port, '/sessions/live', {});
+
+    expect(drainPendingIfIdle).toHaveBeenCalledWith('sessions-live');
+    expect(res.status).toBe(200);
+    expect(res.body.sessions).toEqual([
+      { name: 'deck_alpha_w_provider', state: 'running', live: true, pendingCount: 0 },
+    ]);
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_alpha_w_provider',
+      state: 'running',
+    }));
+  });
+
   it('passes through record state for sessions without a live runtime and never repairs stopped records', async () => {
     const processSession = makeSession({ name: 'deck_alpha_shell', agentType: 'shell', state: 'idle' });
     const stopped = makeSession({ name: 'deck_alpha_w3', state: 'stopped' });

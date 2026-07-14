@@ -17,6 +17,7 @@ import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { expireResendEntries } from './transport-resend-queue.js';
 import { validateExecutionTemplateCandidate } from './execution-clone.js';
+import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -104,7 +105,7 @@ function resolveTransportSessionListState(
   runtime.drainPendingIfIdle?.('session-list');
   const status = runtime.getStatus();
   if (status === 'error') return 'error';
-  if (status === 'streaming' || status === 'thinking' || status === 'tool_running' || status === 'permission') {
+  if (isWorkingSessionState(status)) {
     return 'running';
   }
   if (status === 'idle') return 'idle';

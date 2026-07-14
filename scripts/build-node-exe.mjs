@@ -81,11 +81,15 @@ async function main() {
   await mkdir(buildDir, { recursive: true });
 
   // 2. Bundle the thin entry to a single CJS file.
+  const packageJson = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  const packageVersion = typeof packageJson.version === 'string' ? packageJson.version : '0.0.0';
   const bundlePath = join(workDir, 'app.cjs');
   await build({
     entryPoints: [join(root, 'src/node/index.ts')],
     bundle: true, platform: 'node', format: 'cjs', outfile: bundlePath,
-    external: ['bufferutil', 'utf8-validate'], logLevel: 'info',
+    external: ['bufferutil', 'utf8-validate'],
+    define: { 'process.env.IMCODES_BUILD_VERSION': JSON.stringify(packageVersion) },
+    logLevel: 'info',
   });
 
   // 3. Generate the SEA blob with the OFFICIAL node (V8 match).

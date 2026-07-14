@@ -24,6 +24,8 @@ import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
 const COMPLETE_TS = '2026-07-13T00:04:07.036Z';
 const COMPLETE_MS = Date.parse(COMPLETE_TS);
 const GRACE_MS = 90_000;
+const GENERATION_4 = { scope: 'session' as const, sessionName: 'deck_sub_backstop', generation: 4 };
+const GENERATION_5 = { scope: 'session' as const, sessionName: 'deck_sub_backstop', generation: 5 };
 
 let codexHome: string;
 let rolloutPath: string;
@@ -39,6 +41,9 @@ function makeState(over: Record<string, unknown> = {}): Record<string, unknown> 
     currentText: '',
     currentMessageId: undefined,
     imcodesSessionName: 'deck_sub_backstop',
+    activeToolItemIds: new Set(),
+    activeCompactionItemIds: new Set(),
+    openProviderToolCalls: new Map(),
     ...over,
   };
 }
@@ -127,6 +132,142 @@ describe('codex settle backstop — rollout terminality', () => {
     expect(complete).not.toHaveBeenCalled();
   });
 
+  it('does NOT settle orphaned tool evidence without matching runtime ownership proof', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Done')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      activeTurnLease: undefined,
+      activeToolItemIds: new Set(['orphaned-tool-item']),
+      openProviderToolCalls: new Map(),
+      runtimeActivityGeneration: GENERATION_4,
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', { nowMs: COMPLETE_MS + 3_600_000 });
+
+    expect(settled).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('settles the observed false-working shape: terminal rollout plus orphaned tool on the same started runtime generation', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Done')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      activeTurnLease: undefined,
+      activeToolItemIds: new Set(['orphaned-tool-item']),
+      openProviderToolCalls: new Map(),
+      runtimeActivityGeneration: GENERATION_4,
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', {
+      nowMs: COMPLETE_MS + 2_001,
+      minCompleteAgeMs: 2_000,
+      runtimeActivityGeneration: GENERATION_4,
+      runtimeHasActiveDispatchOwnership: true,
+      runtimeActiveDispatchProviderStarted: true,
+    });
+
+    expect(settled).toBe(true);
+    expect(complete).toHaveBeenCalledWith('sess-1', state, 'turn-1', 'rollout_task_complete');
+    expect(state.currentText).toBe('Done');
+  });
+
+  it('protects a fresh dispatch when orphaned tool evidence belongs to the previous generation', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Old')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      activeTurnLease: undefined,
+      activeToolItemIds: new Set(['old-tool-item']),
+      openProviderToolCalls: new Map(),
+      runtimeActivityGeneration: GENERATION_4,
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', {
+      nowMs: COMPLETE_MS + 3_600_000,
+      runtimeActivityGeneration: GENERATION_5,
+      runtimeHasActiveDispatchOwnership: true,
+      runtimeActiveDispatchProviderStarted: true,
+    });
+
+    expect(settled).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('protects the pre-provider bootstrap window even if a restarted runtime generation number collides', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Old')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      activeTurnLease: undefined,
+      activeToolItemIds: new Set(['old-tool-item']),
+      openProviderToolCalls: new Map(),
+      runtimeActivityGeneration: GENERATION_4,
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', {
+      nowMs: COMPLETE_MS + 3_600_000,
+      runtimeActivityGeneration: GENERATION_4,
+      runtimeHasActiveDispatchOwnership: true,
+      runtimeActiveDispatchProviderStarted: false,
+    });
+
+    expect(settled).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('does NOT settle an old terminal rollout during a healthy pre-start window with no tool evidence', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Old')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      activeTurnLease: undefined,
+      turnStartInFlight: false,
+      activeToolItemIds: new Set(),
+      openProviderToolCalls: new Map(),
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', { nowMs: COMPLETE_MS + 3_600_000 });
+
+    expect(settled).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('settles a terminal rollout when runtime proves its in-progress state has no dispatch owner', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Done')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      activeTurnLease: undefined,
+      turnStartInFlight: false,
+      activeToolItemIds: new Set(),
+      openProviderToolCalls: new Map(),
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', {
+      nowMs: COMPLETE_MS + 3_600_000,
+      runtimeHasNoDispatchOwnership: true,
+    });
+
+    expect(settled).toBe(true);
+    expect(complete).toHaveBeenCalledWith('sess-1', state, 'turn-1', 'rollout_task_complete');
+  });
+
+  it('protects a different tracked turn even if runtime reports no dispatch ownership', async () => {
+    await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Old')]);
+    const state = makeState({ runningTurnId: 'turn-2' });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', {
+      nowMs: COMPLETE_MS + 3_600_000,
+      runtimeHasNoDispatchOwnership: true,
+    });
+
+    expect(settled).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
   it('does NOT settle a cancelled or compacting session', async () => {
     await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1')]);
     const aged = { nowMs: COMPLETE_MS + 3_600_000 };
@@ -142,13 +283,32 @@ describe('codex settle backstop — rollout terminality', () => {
 
   it('settles when the provider has no runningTurnId but the start RPC is still in flight (terminal-during-start)', async () => {
     await writeRollout([TASK_STARTED('turn-1'), TASK_COMPLETE('turn-1', 'Done')]);
-    const state = makeState({ runningTurnId: undefined, turnStartInFlight: true });
+    const state = makeState({
+      runningTurnId: undefined,
+      turnStartInFlight: true,
+      activeTurnLease: { turnStartInFlightAtMs: COMPLETE_MS - 1_000 },
+    });
     const { provider, complete } = seededProvider(state);
 
     const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', { nowMs: COMPLETE_MS + 3_600_000 });
 
     expect(settled).toBe(true);
     expect(complete).toHaveBeenCalledWith('sess-1', state, 'turn-1', 'rollout_task_complete');
+  });
+
+  it('does NOT settle a prior terminal rollout while a newer start RPC is in flight', async () => {
+    await writeRollout([TASK_STARTED('turn-old'), TASK_COMPLETE('turn-old', 'Old')]);
+    const state = makeState({
+      runningTurnId: undefined,
+      turnStartInFlight: true,
+      activeTurnLease: { turnStartInFlightAtMs: COMPLETE_MS + 60_000 },
+    });
+    const { provider, complete } = seededProvider(state);
+
+    const settled = await provider.settleCompletedTurnFromRolloutBackstop('sess-1', { nowMs: COMPLETE_MS + 3_600_000 });
+
+    expect(settled).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
   });
 
   it('returns false for an unknown session', async () => {

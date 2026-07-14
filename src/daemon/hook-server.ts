@@ -597,6 +597,11 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
           if (!runtime) {
             return { name: record.name, state: record.state, live: false };
           }
+          // Reconcile the observable state before projecting it. An idle
+          // runtime can still have provider-owned work (or a queued dispatch)
+          // when a provider status callback arrived out of order; the runtime
+          // promotes that state to tool_running / starts the drain here.
+          runtime.drainPendingIfIdle?.('sessions-live');
           const status = runtime.getStatus();
           const state = status === 'idle' ? 'idle' : status === 'error' ? 'error' : 'running';
           if (record.state !== state && record.state !== 'stopped') {

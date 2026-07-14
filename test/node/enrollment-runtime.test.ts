@@ -50,7 +50,7 @@ describe('controlled node enrollment and runtime', () => {
     const authFrame = JSON.parse(socket.sent[0]!);
     expect(authFrame).toMatchObject({ type: 'auth', serverId: 'controlled-1' });
     expect(authFrame.nodeRole).toBeUndefined();
-    expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat' });
+    expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat', daemonVersion: expect.any(String) });
 
     socket.emit('message', JSON.stringify({ type: 'session.send', correlationId: 'ignored', command: 'echo nope' }));
     expect(onAuthenticated).not.toHaveBeenCalled();
@@ -59,8 +59,9 @@ describe('controlled node enrollment and runtime', () => {
     expect(onAuthenticated).toHaveBeenCalledOnce();
     expect(isControlledNodeAuthAck({ type: 'heartbeat_ack' })).toBe(true);
 
-    socket.emit('message', JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, correlationId: 'exec-1', idempotencyKey: 'exec-1', command: 'printf ok', shell: 'sh' }));
-    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThanOrEqual(4));
+    const execCommand = process.platform === 'win32' ? "[Console]::Write('ok')" : 'printf ok';
+    socket.emit('message', JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, correlationId: 'exec-1', idempotencyKey: 'exec-1', command: execCommand }));
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThanOrEqual(4), { timeout: 5_000 });
     const execFrames = socket.sent.slice(2).map((value) => JSON.parse(value) as Record<string, unknown>);
     expect(execFrames).toContainEqual(expect.objectContaining({
       type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
@@ -103,22 +104,29 @@ describe('controlled node enrollment and runtime', () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-service-healthy-'));
     temporaryDirs.push(dir);
     const journalPath = join(dir, 'install-journal.json');
+    const servicePath = process.platform === 'win32' ? 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe' : '/tmp/imcodes-node';
+    const serviceDefinitionPath = process.platform === 'win32'
+      ? 'C:\\Windows\\System32\\Tasks\\imcodes-node'
+      : (process.platform === 'darwin' ? '/Library/LaunchDaemons/imcodes-node.plist' : '/etc/systemd/system/imcodes-node.service');
+    const servicePrincipal = process.platform === 'win32' ? 'S-1-5-18' : 'root';
+    const serviceRestartPolicy = process.platform === 'darwin' ? 'keepalive' : 'on-failure';
+    const onAuthenticationError = vi.fn();
     await writeFile(journalPath, JSON.stringify({
       version: 1,
       phase: 'service_registered',
       updatedAt: 6,
       installId: 'install-1',
       nodeTokenHash: 'a'.repeat(64),
-      sourceExePath: '/tmp/imcodes-node-download',
-      stagedExePath: '/tmp/imcodes-node',
+      sourceExePath: `${servicePath}.download`,
+      stagedExePath: servicePath,
       serverId: 'controlled-1',
       serviceName: 'imcodes-node',
       serviceReceipt: {
         name: 'imcodes-node',
-        platform: 'linux',
-        definitionPath: '/etc/systemd/system/imcodes-node.service',
+        platform: process.platform,
+        definitionPath: serviceDefinitionPath,
         definitionSha256: 'b'.repeat(64),
-        action: '/tmp/imcodes-node',
+        action: servicePath,
       },
       cleanupStatus: 'cleaned',
     }), 'utf8');
@@ -129,17 +137,18 @@ describe('controlled node enrollment and runtime', () => {
       token: 'secret',
       nodeRole: NODE_ROLE.CONTROLLED,
     }, () => socket, {
+      onAuthenticationError,
       onAuthenticated: () => markServiceHealthy(journalPath, 7, {
         isStableRuntime: () => true,
         inspectServiceState: async () => ({
           installed: true,
-          action: '/tmp/imcodes-node',
-          effectiveAction: '/tmp/imcodes-node',
+          action: servicePath,
+          effectiveAction: servicePath,
           loadedActionMatches: true,
           loaded: true,
           bootEnabled: true,
-          principal: 'root',
-          restartPolicy: 'on-failure',
+          principal: servicePrincipal,
+          restartPolicy: serviceRestartPolicy,
           observedDefinitionSha256: 'b'.repeat(64),
           definitionMatches: true,
           runState: 'running',
@@ -156,12 +165,15 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
 
     await vi.waitFor(async () => {
+      if (onAuthenticationError.mock.calls.length > 0) {
+        throw onAuthenticationError.mock.calls[0]![0];
+      }
       expect(await loadInstallJournal(journalPath)).toMatchObject({
         phase: 'service_healthy',
         serviceStartRequestedAt: 7,
         healthyAt: 7,
       });
-    });
+    }, { timeout: 3_000 });
     runtime.stop();
   });
 

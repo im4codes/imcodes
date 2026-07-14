@@ -6,6 +6,7 @@ import {
   selectSessionHasLiveQueue,
   type TransportQueueReducerState,
 } from '../../shared/transport-queue-reducer.js';
+import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 
 export type SessionLiveStatusMode =
   | 'idle'
@@ -45,7 +46,7 @@ export interface SessionLiveStatus {
 }
 
 export function isRunningSessionState(sessionState: string | null | undefined): boolean {
-  return sessionState === 'running' || sessionState === 'queued';
+  return isWorkingSessionState(sessionState);
 }
 
 export function isStoppingSessionState(sessionState: string | null | undefined): boolean {

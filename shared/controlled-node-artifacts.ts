@@ -74,6 +74,17 @@ export const CONTROLLED_NODE_MINT_ERRORS = {
   INVALID_OR_EXPIRED_TICKET: 'invalid_or_expired_ticket',
 } as const;
 
+
+
+/** Controlled node runtime self-upgrade artifact endpoint (node-token authenticated). */
+export const CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH = '/api/enroll/v2/node-artifact' as const;
+
+export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
+  SHA256: 'x-imcodes-node-artifact-sha256',
+  SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
+  FILENAME: 'x-imcodes-node-artifact-filename',
+} as const;
+
 export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArch): string {
   return `${os}:${arch}`;
 }

@@ -26,7 +26,7 @@ import {
   makeSafeCloseOnce,
   type ArtifactCatalog,
 } from '../src/services/controlled-node-artifact-catalog.js';
-import { decodeEnrollmentTrailer } from '../../shared/remote-exec.js';
+import { NODE_ROLE, decodeEnrollmentTrailer } from '../../shared/remote-exec.js';
 
 let db: Database;
 const hex = (n: number) => randomBytes(n).toString('hex');
@@ -1116,5 +1116,53 @@ describe('GET /api/enroll/v2/availability + retention', () => {
       [enrollment!.id],
     );
     expect(parent?.consumed_count).toBe(1);
+  });
+});
+
+
+// ─────────────────────────── GET /v2/node-artifact ───────────────────────────
+
+describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () => {
+  it('streams the bare pinned artifact to an authenticated controlled node', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
+       VALUES ($1, $2, 'controlled-win', $3, 'online', $4, $5, TRUE, 'win', 'x64')`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+
+    const response = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_BINARY));
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_BINARY);
+  });
+
+  it('rejects full daemon tokens and platform mismatches', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const full = await owner(userId);
+    const fullResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${full.serverId}&os=win&arch=x64`, {
+      headers: { authorization: `Bearer ${full.token}` },
+    });
+    expect(fullResponse.status).toBe(403);
+
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+    const mismatch = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(mismatch.status).toBe(403);
   });
 });

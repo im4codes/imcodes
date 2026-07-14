@@ -3,7 +3,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -202,6 +202,14 @@ const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
 const MAX_SDK_TURN_LOST_RECOVERY_ATTEMPTS = 2;
 const LOCALLY_CANCELLED_ACTIVITY_GENERATION_LIMIT = 16;
+// Runtime-owned rollout backstop. The provider's primary fs.watch / 2s poll is
+// intentionally per-turn and can be torn down by a lost terminal callback. A
+// separate runtime timer survives that provider bookkeeping failure and keeps
+// checking while the runtime still looks active. Generation + provider-send
+// evidence passed below prevents a previous turn's terminal record from
+// settling a genuinely new dispatch during context bootstrap.
+const CODEX_RUNTIME_ROLLOUT_BACKSTOP_POLL_MS = 2_000;
+const CODEX_RUNTIME_ROLLOUT_BACKSTOP_MIN_AGE_MS = 2_000;
 // A turn with a RUNNING TOOL can be legitimately silent for minutes — a command
 // that sleeps / polls / builds (e.g. a 180s `tcpdump` wait, a long test/build)
 // emits no provider events while it runs. The phantom-turn recovery must NOT
@@ -446,6 +454,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sdkTurnLostRecoveryAttempt: SdkTurnLostRecoveryAttemptState | null = null;
   private _externalCompletionSettlementsToIgnore = 0;
   private _cancelledProviderErrorsToIgnore = 0;
+  private _codexRolloutBackstopTimer: ReturnType<typeof setTimeout> | null = null;
+  private _codexRolloutBackstopInFlight = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
@@ -861,18 +871,85 @@ export class TransportSessionRuntime implements SessionRuntime {
    * per-turn settle timer / fs.watch is torn down.
    */
   async reconcileCompletedCodexTurnFromRollout(
-    opts: { minCompleteAgeMs?: number; nowMs?: number } = {},
+    opts: ProviderRolloutCompletionReconcileOptions = {},
   ): Promise<boolean> {
     const sid = this._providerSessionId;
     if (!sid) return false;
     const provider = this.provider as unknown as {
       settleCompletedTurnFromRolloutBackstop?: (
         sessionId: string,
-        opts?: { minCompleteAgeMs?: number; nowMs?: number },
+        opts?: ProviderRolloutCompletionReconcileOptions,
       ) => Promise<boolean>;
     };
     if (typeof provider.settleCompletedTurnFromRolloutBackstop !== 'function') return false;
-    return provider.settleCompletedTurnFromRolloutBackstop(sid, opts);
+    const runtimeHasActiveDispatchOwnership = Boolean(
+      this._sending
+      || this._activeTurn
+      || this._activeDispatchEntries.length > 0,
+    );
+    return provider.settleCompletedTurnFromRolloutBackstop(sid, {
+      ...opts,
+      // This is stronger evidence than the provider's tool/turn bookkeeping:
+      // an in-progress UI status with no send and no dispatch entries means the
+      // runtime has nothing that can legitimately own the terminal rollout.
+      // A fresh dispatch installs its entries before provider.send(), so the
+      // pre-start/bootstrap window never satisfies this predicate.
+      runtimeHasNoDispatchOwnership:
+        this.isInProgressStatus(this._status)
+        && !this._sending
+        && !this._activeTurn
+        && this._activeDispatchEntries.length === 0,
+      runtimeActivityGeneration: this.currentActivityGeneration(),
+      runtimeHasActiveDispatchOwnership,
+      runtimeActiveDispatchProviderStarted:
+        runtimeHasActiveDispatchOwnership && this._activeDispatchProviderStarted,
+    });
+  }
+
+  private supportsCodexRolloutBackstop(): boolean {
+    return typeof (this.provider as unknown as {
+      settleCompletedTurnFromRolloutBackstop?: unknown;
+    }).settleCompletedTurnFromRolloutBackstop === 'function';
+  }
+
+  private shouldKeepCodexRolloutBackstopRunning(): boolean {
+    return Boolean(this._providerSessionId)
+      && this.supportsCodexRolloutBackstop()
+      && Boolean(
+        this._sending
+        || this._activeTurn
+        || this._activeDispatchEntries.length > 0
+        || this.isInProgressStatus(this._status),
+      );
+  }
+
+  private startCodexRolloutBackstop(): void {
+    if (this._codexRolloutBackstopTimer || this._codexRolloutBackstopInFlight) return;
+    if (!this.shouldKeepCodexRolloutBackstopRunning()) return;
+    this._codexRolloutBackstopTimer = setTimeout(() => {
+      this._codexRolloutBackstopTimer = null;
+      if (!this.shouldKeepCodexRolloutBackstopRunning()) return;
+      this._codexRolloutBackstopInFlight = true;
+      void this.reconcileCompletedCodexTurnFromRollout({
+        minCompleteAgeMs: CODEX_RUNTIME_ROLLOUT_BACKSTOP_MIN_AGE_MS,
+      }).catch((err) => {
+        logger.debug(
+          { err, sessionKey: this.sessionKey },
+          'transport runtime Codex rollout backstop check failed',
+        );
+      }).finally(() => {
+        this._codexRolloutBackstopInFlight = false;
+        this.startCodexRolloutBackstop();
+      });
+    }, CODEX_RUNTIME_ROLLOUT_BACKSTOP_POLL_MS);
+    this._codexRolloutBackstopTimer.unref?.();
+  }
+
+  private stopCodexRolloutBackstop(): void {
+    if (this._codexRolloutBackstopTimer) {
+      clearTimeout(this._codexRolloutBackstopTimer);
+      this._codexRolloutBackstopTimer = null;
+    }
   }
 
   /**
@@ -1760,6 +1837,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   get lastActivityAt(): number { return this._lastActivityAt; }
 
   async kill(options: { preserveTransportQueue?: boolean } = {}): Promise<void> {
+    this.stopCodexRolloutBackstop();
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
 
@@ -1830,6 +1908,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     if (this._status === status) return;
     this._status = status;
+    if (this.isInProgressStatus(status)) {
+      this.startCodexRolloutBackstop();
+    } else if (!this._sending && !this._activeTurn && this._activeDispatchEntries.length === 0) {
+      this.stopCodexRolloutBackstop();
+    }
     if (!this._onStatusChange) return;
     // Cx1 §2 / observer-isolation fix (audit 0419d1ac-1f4) — the status
     // observer is an external callback (registered by

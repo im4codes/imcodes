@@ -155,6 +155,25 @@ export interface TimelineActivityState {
   lastTerminalReason?: string;
 }
 
+/**
+ * Session/timeline states that mean a turn still owns the foreground session.
+ * `permission` is intentionally included: the provider may be waiting on the
+ * user rather than consuming CPU, but the turn is not idle and must not be
+ * projected as available for another dispatch.
+ */
+export const WORKING_SESSION_STATES: ReadonlySet<string> = new Set([
+  'running',
+  'queued',
+  'streaming',
+  'thinking',
+  'tool_running',
+  'permission',
+]);
+
+export function isWorkingSessionState(value: unknown): boolean {
+  return typeof value === 'string' && WORKING_SESSION_STATES.has(value);
+}
+
 export function normalizeActivityGeneration(value: ActivityGenerationLike): string | null {
   if (value == null) return null;
   if (typeof value === 'number') return Number.isFinite(value) ? `session:${value}` : null;
@@ -682,7 +701,7 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
         }
         continue;
       }
-      if (state === 'running' || state === 'queued' || state === 'streaming' || state === 'thinking' || state === 'tool_running') {
+      if (isWorkingSessionState(state)) {
         active = true;
       }
     }

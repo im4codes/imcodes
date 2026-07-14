@@ -235,6 +235,20 @@ async function fsyncParentDir(path: string): Promise<void> {
   }
 }
 
+async function replaceInstallJournal(temp: string, path: string): Promise<void> {
+  const maxAttempts = process.platform === 'win32' ? 20 : 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await rename(temp, path);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= maxAttempts || (code !== 'EPERM' && code !== 'EACCES')) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+    }
+  }
+}
+
 /** Read the journal, or `uninstalled` when absent. Corrupt journals fail closed. */
 export async function loadInstallJournal(path: string): Promise<InstallJournal> {
   try {
@@ -343,7 +357,7 @@ export async function writeInstallPhase(
   } finally {
     await fh.close();
   }
-  await rename(temp, path);
+  await replaceInstallJournal(temp, path);
   await fsyncParentDir(path);
   return payload;
 }

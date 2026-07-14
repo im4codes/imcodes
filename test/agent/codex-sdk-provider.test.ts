@@ -3732,6 +3732,72 @@ describe('CodexSdkProvider', () => {
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
   });
 
+  it('keeps an ordinary turn running when automatic context compaction completes inline', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-inline-auto-compact', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    const statuses: Array<string | null> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onStatus?.((_sid, status) => statuses.push(status.status));
+
+    await provider.send('route-inline-auto-compact', 'do a long task');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'auto-compact-item', type: 'contextCompaction' },
+      },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'auto-compact-item', type: 'contextCompaction' },
+      },
+    });
+    await flush();
+
+    expect(statuses).toContain('compacting');
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-inline-auto-compact')).toMatchObject({
+      active: true,
+      runningTurnId: 'turn-1',
+      runningCompact: false,
+      activeCompactionItemCount: 0,
+    });
+    expect(provider.getActiveWorkSnapshot('route-inline-auto-compact')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
+
+    // Same parent turn continues producing output after compaction. Only its
+    // eventual turn/completed may settle the transport runtime.
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'answer-after-compact', type: 'agentMessage', text: 'done after compact' },
+      },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null },
+      },
+    });
+    await flush();
+
+    expect(completed).toEqual(['done after compact']);
+  });
+
   it('ignores duplicate compact turn completion without scanning stale generated images', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-compact-images-'));
     const provider = createCodexProvider();

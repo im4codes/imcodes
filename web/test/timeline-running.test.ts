@@ -53,6 +53,14 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(true);
   });
 
+  it('keeps a permission-waiting turn active instead of presenting false idle', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'session.state', payload: { state: 'permission' } },
+      { type: 'command.ack', payload: { ok: true } },
+    ] as any)).toBe(true);
+  });
+
   it('lets a confirmed user message end active-turn inference when no newer running signal exists', () => {
     expect(hasActiveTimelineTurn([
       { type: 'session.state', payload: { state: 'idle' } },
