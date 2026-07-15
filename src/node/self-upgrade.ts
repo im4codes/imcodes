@@ -34,6 +34,7 @@ export interface ControlledNodeSelfUpgradeDeps {
   fetchImpl?: typeof fetch;
   spawnDetached?: (file: string, args: readonly string[], options: { windowsHide?: boolean }) => void;
   scheduleWindowsUpgrade?: (taskName: string, taskXmlPath: string) => void;
+  scheduleLinuxUpgrade?: (unitName: string, scriptPath: string) => void;
   execPath?: string;
   platform?: NodeJS.Platform;
   arch?: NodeJS.Architecture;
@@ -347,6 +348,29 @@ export function scheduleWindowsControlledNodeUpgrade(
   }
 }
 
+/**
+ * Run Linux replacement outside imcodes-node.service's cgroup. A detached
+ * child remains owned by the service and is killed by `systemctl stop` before
+ * it can copy the new executable or restart the unit.
+ */
+export function scheduleLinuxControlledNodeUpgrade(
+  unitName: string,
+  scriptPath: string,
+  runCommand: (file: string, args: readonly string[]) => void = (file, args) => {
+    execFileSync(file, [...args], { stdio: 'ignore' });
+  },
+): void {
+  runCommand('systemd-run', [
+    `--unit=${unitName}`,
+    '--collect',
+    '--no-block',
+    '--property=Type=oneshot',
+    '--property=TimeoutStartSec=10min',
+    '/bin/sh',
+    scriptPath,
+  ]);
+}
+
 export async function startControlledNodeSelfUpgrade(
   credential: ControlledNodeCredential,
   rawTargetVersion: unknown,
@@ -416,6 +440,9 @@ export async function startControlledNodeSelfUpgrade(
     await writeFile(taskXmlPath, encodeWindowsScheduledTaskXml(windowsControlledNodeUpgradeTaskXml(scriptPath)));
     const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? scheduleWindowsControlledNodeUpgrade;
     scheduleWindowsUpgrade(windowsUpgradeTaskName!, taskXmlPath);
+  } else if (platform === 'linux') {
+    const scheduleLinuxUpgrade = deps.scheduleLinuxUpgrade ?? scheduleLinuxControlledNodeUpgrade;
+    scheduleLinuxUpgrade(`${CONTROLLED_NODE_SERVICE.LINUX_UNIT.replace(/\.service$/, '')}-upgrade-${randomUUID()}`, scriptPath);
   } else {
     const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
     spawnDetached('/bin/sh', [scriptPath], {});

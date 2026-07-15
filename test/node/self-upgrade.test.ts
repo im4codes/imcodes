@@ -12,6 +12,7 @@ import {
   buildWindowsControlledNodeUpgradeScript,
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
+  scheduleLinuxControlledNodeUpgrade,
   scheduleWindowsControlledNodeUpgrade,
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
@@ -231,6 +232,25 @@ describe('controlled-node self-upgrade', () => {
       file: 'schtasks.exe',
       args: ['/Delete', '/TN', 'upgrade-fail', '/F'],
     });
+  });
+
+  it('starts Linux replacement in a transient unit outside the node service cgroup', () => {
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    scheduleLinuxControlledNodeUpgrade('imcodes-node-upgrade-test', '/tmp/upgrade.sh', (file, args) => {
+      calls.push({ file, args });
+    });
+    expect(calls).toEqual([{
+      file: 'systemd-run',
+      args: [
+        '--unit=imcodes-node-upgrade-test',
+        '--collect',
+        '--no-block',
+        '--property=Type=oneshot',
+        '--property=TimeoutStartSec=10min',
+        '/bin/sh',
+        '/tmp/upgrade.sh',
+      ],
+    }]);
   });
 
   it.each([
