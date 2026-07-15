@@ -22,6 +22,8 @@ async function connect(machineDeps: MachineToolDeps): Promise<Client> {
 const okDeps: MachineToolDeps = {
   listMachines: () => [{ name: 'win-1', displayName: 'Win Box', os: 'win', online: true, execEnabled: true, role: NODE_ROLE.CONTROLLED }],
   execRemote: () => ({ outcome: 'completed', ok: true, exitCode: 7, stdout: 'ok', stderr: '', timedOut: false, truncated: false, durationMs: 3 }),
+  sendFileToMachine: () => ({ ok: true, remotePath: '/var/lib/imcodes/uploads/a.txt', attachmentId: 'a'.repeat(32), size: 5 }),
+  fetchFileFromMachine: ({ destinationPath }) => ({ ok: true, destinationPath, attachmentId: 'b'.repeat(32), size: 7 }),
   computerUseCall: ({ tool }) => ({
     outcome: 'completed',
     result: {
@@ -40,6 +42,8 @@ type PublishedSchema = {
   additionalProperties?: boolean;
   items?: PublishedSchema;
   maxItems?: number;
+  minimum?: number;
+  maximum?: number;
 };
 
 function requiredKeys(schema: PublishedSchema | undefined): string[] {
@@ -60,10 +64,14 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const list = byName.get(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
     const docs = byName.get(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS);
     const call = byName.get(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
+    const sendFile = byName.get(MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE);
+    const fetchFile = byName.get(MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE);
     expect(exec).toBeTruthy();
     expect(list).toBeTruthy();
     expect(docs).toBeTruthy();
     expect(call).toBeTruthy();
+    expect(sendFile?.outputSchema).toBeTruthy();
+    expect(fetchFile?.outputSchema).toBeTruthy();
     expect(Object.keys(exec!.inputSchema.properties ?? {})).not.toContain('idempotencyKey');
     expect(exec!.outputSchema).toBeTruthy();
     expect(list!.outputSchema).toBeTruthy();
@@ -72,6 +80,8 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     // Published input schema enforces the single-source minimum timeout (1000ms).
     const timeoutMs = (exec!.inputSchema.properties as Record<string, { minimum?: number }>).timeoutMs;
     expect(timeoutMs?.minimum).toBe(1000);
+    const computerUseTimeout = (call!.inputSchema.properties as Record<string, { minimum?: number; maximum?: number }>).timeoutMs;
+    expect(computerUseTimeout).toMatchObject({ minimum: 1_000, maximum: 900_000 });
     await client.close();
   });
 
@@ -83,6 +93,8 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     for (const name of [
       MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
       MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+      MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
       MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
       MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
     ] as const) {
@@ -136,6 +148,29 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const call = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: { machine: 'win-1', tool: 'list_apps', arguments: {} } });
     expect(call.isError).toBeFalsy();
     expect(call.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', result: { ok: true, content: [{ text: 'apps' }] } });
+
+    const shell = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: { machine: 'win-1', tool: 'shell_session1', timeoutMs: 900_000 } });
+    expect(shell.isError).toBeFalsy();
+    const overlongGui = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: { machine: 'win-1', tool: 'list_apps', timeoutMs: 120_001 } });
+    expect(overlongGui.isError).toBe(true);
+    await client.close();
+  });
+
+  it('tools/call sends and fetches explicit files with SDK-validated metadata', async () => {
+    const client = await connect(okDeps);
+    const sent = await client.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      arguments: { machine: 'win-1', sourcePath: '/tmp/a.txt' },
+    });
+    expect(sent.isError).toBeFalsy();
+    expect(sent.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 5, remotePath: '/var/lib/imcodes/uploads/a.txt' });
+
+    const fetched = await client.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+      arguments: { machine: 'win-1', sourcePath: 'C:\\Temp\\a.txt', destinationPath: '/tmp/a.txt' },
+    });
+    expect(fetched.isError).toBeFalsy();
+    expect(fetched.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 7, destinationPath: '/tmp/a.txt' });
     await client.close();
   });
 

@@ -4,6 +4,8 @@ import { DAEMON_MSG } from '../shared/daemon-events.js';
 import {
   COMPUTER_USE_MIN_TIMEOUT_MS,
   COMPUTER_USE_MAX_TIMEOUT_MS,
+  COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+  computerUseMaxTimeoutMs,
   decodeComputerUseHttpEnvelope,
   encodeComputerUseHttpEnvelope,
   validateComputerUseFrame,
@@ -23,6 +25,20 @@ describe('computer-use shared protocol', () => {
     }).ok).toBe(true);
     expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'nope' }).ok).toBe(false);
     expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'list_apps', serverId: 'forged' })).toEqual({ ok: false, error: 'unknown_field:serverId' });
+    expect(computerUseMaxTimeoutMs('list_apps')).toBe(COMPUTER_USE_MAX_TIMEOUT_MS);
+    expect(computerUseMaxTimeoutMs('shell_session1')).toBe(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS);
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'shell_session1',
+      timeoutMs: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+    }).ok).toBe(true);
+    expect(validateComputerUseFrame({
+      type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+      correlationId,
+      tool: 'shell_session1',
+      timeoutMs: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS + 1,
+    }).ok).toBe(false);
     expect(validateComputerUseFrame({ type: DAEMON_COMMAND_TYPES.COMPUTER_USE, correlationId, tool: 'list_apps', timeoutMs: COMPUTER_USE_MAX_TIMEOUT_MS + 1 }).ok).toBe(false);
   });
 

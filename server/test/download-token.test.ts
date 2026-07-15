@@ -42,7 +42,11 @@ import { fileTransferRoutes } from '../src/routes/file-transfer.js';
 const app = new Hono();
 // Inject fake env.DB so resolveServerRole doesn't crash
 app.use('/*', async (c, next) => {
-  (c as any).env = { DB: {} };
+  (c as any).env = {
+    DB: {
+      queryOne: async () => ({ user_id: 'test-user', node_role: 'full', exec_enabled: true, revoked_at: null }),
+    },
+  };
   return next();
 });
 app.route('/api/server', fileTransferRoutes);

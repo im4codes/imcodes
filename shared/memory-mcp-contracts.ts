@@ -21,9 +21,11 @@ import {
   COMPUTER_USE_MAX_ARGUMENT_BYTES,
   COMPUTER_USE_MAX_TIMEOUT_MS,
   COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
   COMPUTER_USE_OUTCOMES,
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -50,6 +52,8 @@ export const MEMORY_MCP_TOOL_NAMES = {
   // Machine remote-exec surface — FULL-only (see FULL_ONLY_MCP_TOOLS).
   LIST_MACHINES: 'list_machines',
   EXEC_REMOTE: 'exec_remote',
+  SEND_FILE_TO_MACHINE: 'send_file_to_machine',
+  FETCH_FILE_FROM_MACHINE: 'fetch_file_from_machine',
   COMPUTER_USE_DOCS: 'computer_use_docs',
   COMPUTER_USE_CALL: 'computer_use_call',
 } as const;
@@ -80,6 +84,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+  MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+  MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
 ] as const satisfies readonly MemoryMcpToolName[];
@@ -92,6 +98,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
 export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
   MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
   MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+  MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+  MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
 ]);
@@ -513,6 +521,38 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       error: stringSchema('Required non-empty detail for node_timeout/spawn_error; forbidden otherwise.', { minLength: 1 }),
     }, ['status', 'outcome']),
   },
+  [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: {
+    name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+    description: 'Send one explicit regular file from this FULL daemon host to a list_machines controlled node. Reuses the protected attachment upload path; directories, symlinks, and sensitive credential directories are rejected. FULL nodes only.',
+    inputSchema: objectSchema({
+      machine: stringSchema('Target machine ref_name from list_machines.'),
+      sourcePath: stringSchema(`Explicit local regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes and ${FILE_TRANSFER_LIMITS.MAX_FILE_SIZE} file bytes.`),
+    }, ['machine', 'sourcePath']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
+      machine: stringSchema('Resolved machine ref_name.'),
+      remotePath: stringSchema('Exact protected staging path on the controlled node.'),
+      attachmentId: stringSchema('Short-lived attachment id.'),
+      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }),
+    }, ['status', 'machine', 'remotePath', 'attachmentId', 'size']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
+    name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+    description: 'Fetch one explicit regular file from a list_machines controlled node into an explicit path on this FULL daemon host. Uses a short-lived attachment handle and atomic destination commit; overwrite defaults false. FULL nodes only.',
+    inputSchema: objectSchema({
+      machine: stringSchema('Target machine ref_name from list_machines.'),
+      sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
+      destinationPath: stringSchema(`Explicit local destination path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
+      overwrite: booleanSchema('Replace an existing regular destination file; default false.'),
+    }, ['machine', 'sourcePath', 'destinationPath']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
+      machine: stringSchema('Resolved machine ref_name.'),
+      destinationPath: stringSchema('Exact committed local destination path.'),
+      attachmentId: stringSchema('Short-lived source attachment id.'),
+      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }),
+    }, ['status', 'machine', 'destinationPath', 'attachmentId', 'size']),
+  },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
     description: 'Return one focused Computer Use documentation topic. FULL nodes only.',
@@ -532,7 +572,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       machine: stringSchema('Target machine ref_name from list_machines, or local/localhost/self/this for this imcodes daemon host.'),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
       arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes.`, additionalProperties: true },
-      timeoutMs: numberSchema(`Optional timeout in ms, in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_MAX_TIMEOUT_MS }),
+      timeoutMs: numberSchema(`Optional timeout in ms. GUI/browser methods allow [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]; shell_session1 allows [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS }),
     }, ['machine', 'tool']),
     outputSchema: objectSchema({
       status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),

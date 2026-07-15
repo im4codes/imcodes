@@ -35,7 +35,7 @@ import {
   createMachineExecRoutes,
   machineExecAuditIntentStore,
 } from '../src/routes/machine-exec.js';
-import { createMachineComputerUseRoutes } from '../src/routes/machine-computer-use.js';
+import { computerUseRelayDeadlineMs, createMachineComputerUseRoutes } from '../src/routes/machine-computer-use.js';
 import { WsBridge } from '../src/ws/bridge.js';
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -278,6 +278,8 @@ describe('controlled-node cross-layer product path', () => {
     expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
       MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+      MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
       MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
       MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
     ]));
@@ -293,6 +295,8 @@ describe('controlled-node cross-layer product path', () => {
   });
 
   it('carries computer_use_call through MCP, daemon client, HTTP route, Bridge, and generation-bound result registry', async () => {
+    expect(computerUseRelayDeadlineMs({ tool: 'shell_session1', timeoutMs: 900_000 })).toBe(930_000);
+    expect(computerUseRelayDeadlineMs({ tool: 'list_apps', timeoutMs: 120_000 })).toBe(150_000);
     socket.mode = 'worker';
     const client = await connectMcp(machineDeps());
     const docs = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS, arguments: { topic: 'workflow' } });
@@ -300,13 +304,13 @@ describe('controlled-node cross-layer product path', () => {
     expect(docs.structuredContent).toMatchObject({ status: 'ok', topic: 'workflow' });
     const result = await client.callTool({
       name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-      arguments: { machine: 'node-linux', tool: 'list_apps', timeoutMs: 1_000 },
+      arguments: { machine: 'node-linux', tool: 'shell_session1', timeoutMs: 900_000 },
     });
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({
       status: 'ok',
       outcome: 'completed',
-      result: { ok: true, tool: 'list_apps', content: [{ type: 'text', text: 'computer:list_apps' }] },
+      result: { ok: true, tool: 'shell_session1', content: [{ type: 'text', text: 'computer:shell_session1' }] },
     });
     await client.close();
   });

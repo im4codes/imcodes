@@ -46,18 +46,20 @@ import {
   COMPUTER_USE_TOOLS,
   COMPUTER_USE_OUTCOMES,
   COMPUTER_USE_MIN_TIMEOUT_MS,
-  COMPUTER_USE_MAX_TIMEOUT_MS,
+  COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
   COMPUTER_USE_MAX_ARGUMENT_BYTES,
   COMPUTER_USE_MAX_TEXT_BYTES,
   COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
   COMPUTER_USE_MAX_ERROR_BYTES,
   COMPUTER_USE_IMAGE_MIME_TYPES,
   computerUseDocs,
+  computerUseMaxTimeoutMs,
   type ComputerUseDocTopic,
   type ComputerUseToolName,
   type ComputerUseOutcome,
   type ComputerUseResult,
 } from '../../shared/computer-use.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -206,6 +208,10 @@ export interface ComputerUseToolResult {
   error?: string;
 }
 
+export type MachineFileToolResult =
+  | { ok: true; size: number; attachmentId: string; remotePath?: string; destinationPath?: string }
+  | { ok: false; reason: MCPErrorReason; error?: string };
+
 export interface MachineToolDeps {
   listMachines: (input: { includeOffline?: boolean }) => Promise<MachineSummaryForTool[]> | MachineSummaryForTool[];
   execRemote: (input: {
@@ -216,6 +222,18 @@ export interface MachineToolDeps {
     signal?: AbortSignal;
     onOutput?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
   }) => Promise<MachineExecToolResult> | MachineExecToolResult;
+  sendFileToMachine?: (input: {
+    machine: string;
+    sourcePath: string;
+    signal?: AbortSignal;
+  }) => Promise<MachineFileToolResult> | MachineFileToolResult;
+  fetchFileFromMachine?: (input: {
+    machine: string;
+    sourcePath: string;
+    destinationPath: string;
+    overwrite?: boolean;
+    signal?: AbortSignal;
+  }) => Promise<MachineFileToolResult> | MachineFileToolResult;
   computerUseCall?: (input: {
     machine: string;
     tool: ComputerUseToolName;
@@ -1314,6 +1332,44 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         : { status: 'ok', ...result } as MachineExecToolSuccess;
       return success;
     },
+    [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: async (input, context) => {
+      if (!deps.machineDeps?.sendFileToMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath']);
+      const machine = stringArg(args, 'machine');
+      const sourcePath = stringArg(args, 'sourcePath');
+      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine and sourcePath are required');
+      if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'sourcePath is too long');
+      const result = await deps.machineDeps.sendFileToMachine({
+        machine,
+        sourcePath,
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      if (!result.remotePath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
+      return { status: 'ok', machine, remotePath: result.remotePath, attachmentId: result.attachmentId, size: result.size };
+    },
+    [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: async (input, context) => {
+      if (!deps.machineDeps?.fetchFileFromMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath', 'destinationPath', 'overwrite']);
+      const machine = stringArg(args, 'machine');
+      const sourcePath = stringArg(args, 'sourcePath');
+      const destinationPath = stringArg(args, 'destinationPath');
+      const overwrite = boolArg(args, 'overwrite') ?? false;
+      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine, sourcePath, and destinationPath are required');
+      if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES || utf8ByteLength(destinationPath) > FILE_TRANSFER_PATH_MAX_BYTES) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'file path is too long');
+      }
+      const result = await deps.machineDeps.fetchFileFromMachine({
+        machine,
+        sourcePath,
+        destinationPath,
+        overwrite,
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      if (!result.destinationPath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
+      return { status: 'ok', machine, destinationPath: result.destinationPath, attachmentId: result.attachmentId, size: result.size };
+    },
     [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['topic']);
       const topicRaw = stringArg(args, 'topic');
@@ -1339,8 +1395,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `arguments must be at most ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes`);
       }
       const timeoutMs = numberArg(args, 'timeoutMs');
-      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > COMPUTER_USE_MAX_TIMEOUT_MS)) {
-        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]`);
+      const maxTimeoutMs = computerUseMaxTimeoutMs(toolRaw as ComputerUseToolName);
+      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > maxTimeoutMs)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${maxTimeoutMs}] for ${toolRaw}`);
       }
       const injectedResult = await deps.machineDeps.computerUseCall({
         machine,
@@ -1514,6 +1571,16 @@ const schemas = {
     shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
     timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
+    machine: z.string().min(1),
+    sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
+    machine: z.string().min(1),
+    sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    overwrite: z.boolean().optional(),
+  }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
     topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
   }),
@@ -1521,7 +1588,11 @@ const schemas = {
     machine: z.string().describe('list_machines name/ref_name, or local/localhost/self/this for this imcodes daemon host.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe('Method arguments.'),
-    timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
+    timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),
+  }).superRefine((value, ctx) => {
+    if (value.timeoutMs !== undefined && value.timeoutMs > computerUseMaxTimeoutMs(value.tool)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['timeoutMs'], message: `timeoutMs exceeds the maximum for ${value.tool}` });
+    }
   }),
 } as const;
 
@@ -1574,6 +1645,20 @@ const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>>
     machines: z.array(machineSummaryRuntimeSchema).max(MACHINE_LIST_MAX_ITEMS),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: machineExecToolOutputRuntimeSchema,
+  [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
+    status: z.literal('ok'),
+    machine: z.string().min(1),
+    remotePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    attachmentId: z.string().min(1).max(128),
+    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
+    status: z.literal('ok'),
+    machine: z.string().min(1),
+    destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    attachmentId: z.string().min(1).max(128),
+    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+  }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
     status: z.literal('ok'),
     topic: z.enum(COMPUTER_USE_DOC_TOPICS),

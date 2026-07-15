@@ -6,6 +6,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+} from '../../shared/transport/file-transfer.js';
 import { markServiceHealthy } from '../../src/node/bootstrap.js';
 import { encodeEnrollmentBlob, parseEnrollmentBlob } from '../../src/node/enrollment.js';
 import { loadInstallJournal } from '../../src/node/install-journal.js';
@@ -50,6 +56,11 @@ describe('controlled node enrollment and runtime', () => {
     const authFrame = JSON.parse(socket.sent[0]!);
     expect(authFrame).toMatchObject({ type: 'auth', serverId: 'controlled-1' });
     expect(authFrame.nodeRole).toBeUndefined();
+    expect(authFrame.capabilities).toEqual(expect.arrayContaining([
+      FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+      FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+    ]));
     expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat', daemonVersion: expect.any(String) });
 
     socket.emit('message', JSON.stringify({ type: 'session.send', correlationId: 'ignored', command: 'echo nope' }));
@@ -77,6 +88,38 @@ describe('controlled node enrollment and runtime', () => {
       exitCode: 0,
       stdout: 'ok',
     }));
+    runtime.stop();
+  });
+
+  it('handles an explicit file path without enabling directory browsing', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-file-'));
+    temporaryDirs.push(dir);
+    const filePath = join(dir, 'report.txt');
+    await writeFile(filePath, 'report');
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket);
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE,
+      requestId: 'path-1',
+      path: filePath,
+    }));
+    await vi.waitFor(() => {
+      const frames = socket.sent.map((raw) => JSON.parse(raw));
+      expect(frames).toContainEqual(expect.objectContaining({
+        type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+        requestId: 'path-1',
+        attachment: expect.objectContaining({ daemonPath: expect.stringMatching(/report\.txt$/), size: 6 }),
+      }));
+    });
+    socket.emit('message', JSON.stringify({ type: 'fs.list', requestId: 'forbidden', path: dir }));
+    expect(socket.sent.some((raw) => raw.includes('forbidden'))).toBe(false);
     runtime.stop();
   });
 

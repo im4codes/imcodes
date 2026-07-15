@@ -11,10 +11,13 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FILE_PATH_HANDLE_ERROR } from '../../shared/transport/file-transfer.js';
 import { execRemote as clientExecRemote, listMachines as clientListMachines, MachineControlPlaneError } from './machine-exec-client.js';
 import { computerUseCall as clientComputerUseCall } from './computer-use-client.js';
+import { fetchFileFromMachine as clientFetchFileFromMachine, sendFileToMachine as clientSendFileToMachine } from './machine-file-client.js';
 import { runComputerUseTool } from '../node/computer-use-runner.js';
-import type { ComputerUseToolResult, MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
+import type { ComputerUseToolResult, MachineFileToolResult, MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
 
 export interface DaemonCredential {
   serverUrl: string;
@@ -38,6 +41,8 @@ export interface DaemonMachineToolDepsOverrides {
   loadCredential?: () => Promise<DaemonCredential | null>;
   listMachines?: typeof clientListMachines;
   execRemote?: typeof clientExecRemote;
+  sendFileToMachine?: typeof clientSendFileToMachine;
+  fetchFileFromMachine?: typeof clientFetchFileFromMachine;
   computerUseCall?: typeof clientComputerUseCall;
   localComputerUseCall?: (input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
 }
@@ -66,6 +71,8 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
   const list = overrides.listMachines ?? clientListMachines;
   const exec = overrides.execRemote ?? clientExecRemote;
   const computerUse = overrides.computerUseCall ?? clientComputerUseCall;
+  const sendFile = overrides.sendFileToMachine ?? clientSendFileToMachine;
+  const fetchFile = overrides.fetchFileFromMachine ?? clientFetchFileFromMachine;
   const localComputerUse = overrides.localComputerUseCall ?? defaultLocalComputerUseCall;
 
   const toSummary = (m: Awaited<ReturnType<typeof clientListMachines>>[number]): MachineSummaryForTool => ({
@@ -78,6 +85,54 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
     // literal role the spec/output-schema require.
     role: NODE_ROLE.CONTROLLED,
   });
+
+  const resolveFileTarget = async (machine: string): Promise<
+    | { ok: true; creds: DaemonCredential; targetServerId: string }
+    | { ok: false; result: MachineFileToolResult }
+  > => {
+    const creds = await load();
+    if (!creds) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' } };
+    let all: Awaited<ReturnType<typeof list>>;
+    try {
+      all = await list({ serverUrl: creds.serverUrl, sourceServerId: creds.serverId, sourceToken: creds.token, includeOffline: true });
+    } catch (err) {
+      const reason = err instanceof MachineControlPlaneError && err.kind === 'unbound'
+        ? MCP_ERROR_REASONS.FEATURE_DISABLED
+        : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+      return { ok: false, result: { ok: false, reason, error: 'machine control plane unavailable' } };
+    }
+    const matches = all.filter((candidate) => candidate.refName === machine);
+    if (matches.length === 0) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND, error: `no controllable machine named "${machine}"` } };
+    if (matches.length > 1) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` } };
+    const target = matches[0]!;
+    if (!target.execEnabled) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `machine control is disabled for "${machine}"` } };
+    if (!target.online) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: `machine "${machine}" is offline` } };
+    return { ok: true, creds, targetServerId: target.serverId };
+  };
+
+  const fileFailure = (err: unknown): MachineFileToolResult => {
+    if (err instanceof MachineControlPlaneError) {
+      const validationErrors = new Set([
+        FS_GENERIC_ERROR_CODES.INVALID_REQUEST,
+        FILE_PATH_HANDLE_ERROR.INVALID_PATH,
+        FILE_PATH_HANDLE_ERROR.NOT_FOUND,
+        FILE_PATH_HANDLE_ERROR.FORBIDDEN_PATH,
+        FILE_PATH_HANDLE_ERROR.NOT_REGULAR_FILE,
+        FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE,
+        'source file is unavailable', 'source must be a regular file',
+        'source path is forbidden', 'source file is too large', 'destination already exists',
+        'destination must be a regular file path', 'destination directory is unavailable or forbidden',
+      ]);
+      return {
+        ok: false,
+        reason: err.kind === 'malformed' || validationErrors.has(err.message)
+          ? MCP_ERROR_REASONS.VALIDATION_FAILED
+          : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+        error: err.message,
+      };
+    }
+    return { ok: false, reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, error: 'machine file transfer failed' };
+  };
 
   return {
     // Both failure kinds propagate as `MachineControlPlaneError` so the tool
@@ -124,6 +179,44 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
         ...(signal ? { signal } : {}),
         ...(onOutput ? { onOutput } : {}),
       });
+    },
+
+    async sendFileToMachine({ machine, sourcePath, signal }): Promise<MachineFileToolResult> {
+      const resolved = await resolveFileTarget(machine);
+      if (!resolved.ok) return resolved.result;
+      try {
+        const result = await sendFile({
+          serverUrl: resolved.creds.serverUrl,
+          sourceServerId: resolved.creds.serverId,
+          sourceToken: resolved.creds.token,
+          targetServerId: resolved.targetServerId,
+          sourcePath,
+          ...(signal ? { signal } : {}),
+        });
+        return { ok: true, ...result };
+      } catch (err) {
+        return fileFailure(err);
+      }
+    },
+
+    async fetchFileFromMachine({ machine, sourcePath, destinationPath, overwrite, signal }): Promise<MachineFileToolResult> {
+      const resolved = await resolveFileTarget(machine);
+      if (!resolved.ok) return resolved.result;
+      try {
+        const result = await fetchFile({
+          serverUrl: resolved.creds.serverUrl,
+          sourceServerId: resolved.creds.serverId,
+          sourceToken: resolved.creds.token,
+          targetServerId: resolved.targetServerId,
+          sourcePath,
+          destinationPath,
+          ...(overwrite !== undefined ? { overwrite } : {}),
+          ...(signal ? { signal } : {}),
+        });
+        return { ok: true, ...result };
+      } catch (err) {
+        return fileFailure(err);
+      }
     },
 
     async computerUseCall({ machine, tool, arguments: args, timeoutMs, signal }) {

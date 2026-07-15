@@ -34,7 +34,13 @@ import { validateComputerUseResultFrame } from '../../../shared/computer-use.js'
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
-import { FILE_TRANSFER_MSG } from '../../../shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  validateControlledFileTransferResponse,
+} from '../../../shared/transport/file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
@@ -1146,6 +1152,8 @@ export class WsBridge {
   private providerStatus = new Map<string, boolean>();
   /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
   private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
+  /** Auth-advertised file-transfer capabilities for a CONTROLLED node socket. */
+  private controlledFileTransferCapabilities = new Set<string>();
   /** Latest sanitized OpenSpec Auto Deliver projections; protocol routing waits for shared message constants. */
   private openspecAutoDeliverProjectionCache = new OpenSpecAutoDeliverProjectionCache();
   private pendingOpenSpecAutoDeliverRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout>; requestId: string; sessionName?: string; messageType: string }>();
@@ -2380,6 +2388,7 @@ export class WsBridge {
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
+    this.controlledFileTransferCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
     // for a different `ws`) auth.
@@ -2479,6 +2488,15 @@ export class WsBridge {
         // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
         // presence/heartbeat + MACHINE_EXEC_RESULT surface.
         this.daemonNodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+        this.controlledFileTransferCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+          ? new Set(
+              (Array.isArray(msg.capabilities) ? msg.capabilities : [])
+                .filter((capability): capability is string =>
+                  capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
+                  || capability === FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY
+                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY),
+            )
+          : new Set();
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
@@ -2639,6 +2657,24 @@ export class WsBridge {
           }
           return;
         }
+        const fileTransfer = validateControlledFileTransferResponse(msg);
+        if (fileTransfer.ok) {
+          const value = fileTransfer.value as unknown as Record<string, unknown>;
+          const requestId = typeof value.uploadId === 'string'
+            ? value.uploadId
+            : typeof value.downloadId === 'string'
+              ? value.downloadId
+              : typeof value.requestId === 'string'
+                ? value.requestId
+                : null;
+          const resolved = requestId
+            ? value.type === FILE_TRANSFER_MSG.UPLOAD_PROGRESS
+              ? this.notifyFileTransferProgress(requestId, value)
+              : this.resolveFileTransfer(requestId, value)
+            : false;
+          if (!resolved) WsBridge.controlledInboundDropped++;
+          return;
+        }
         if (msg.type === 'heartbeat') {
           const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
           if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
@@ -2757,6 +2793,7 @@ export class WsBridge {
         }
         this.providerStatus.clear();
         this.daemonP2pWorkflowCapabilities = null;
+        this.controlledFileTransferCapabilities.clear();
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
@@ -5852,6 +5889,7 @@ export class WsBridge {
       this.authenticated = false;
       this.authPromise = null;
       this.daemonP2pWorkflowCapabilities = null;
+      this.controlledFileTransferCapabilities.clear();
     }
   }
 
@@ -5890,9 +5928,10 @@ export class WsBridge {
 
   sendToDaemon(message: string): void {
     const parsed = this.parseJsonObject(message);
-    if (parsed?.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
+    const parsedType = parsed?.type;
+    if (parsedType === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
       this.requestDaemonUpgrade({
-        targetVersion: parsed.targetVersion,
+        targetVersion: parsed?.targetVersion,
         source: 'manual',
       });
       return;
@@ -5902,8 +5941,15 @@ export class WsBridge {
     // when offline → late replay on a new generation, and is not generation-bound
     // even when connected). Drop it UNCONDITIONALLY so no caller can bypass
     // `trySendMachineExec`, whether the daemon is connected or not.
-    if (parsed?.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC || parsed?.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
-      logger.warn({ serverId: this.serverId, type: parsed.type }, 'Dropped control command sent via generic sendToDaemon');
+    if (
+      parsedType === DAEMON_COMMAND_TYPES.MACHINE_EXEC
+      || parsedType === DAEMON_COMMAND_TYPES.COMPUTER_USE
+      || parsedType === FILE_TRANSFER_MSG.UPLOAD_FETCH
+      || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
+      || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
+      || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
+    ) {
+      logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
     }
     if (this.daemonWs && this.authenticated) {
@@ -6239,7 +6285,9 @@ export class WsBridge {
     timeoutMs: number,
     onProgress?: (msg: Record<string, unknown>) => void,
   ): Promise<Record<string, unknown>> {
-    if (!this.isDaemonConnected()) {
+    const socket = this.daemonWs;
+    const generation = this.daemonGeneration;
+    if (!socket || !this.authenticated || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('daemon_offline'));
     }
     return new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -6251,7 +6299,15 @@ export class WsBridge {
       this.pendingFileTransfers.set(requestId, { resolve, reject, timer, onProgress });
 
       try {
-        this.daemonWs!.send(JSON.stringify(message));
+        if (
+          this.daemonWs !== socket
+          || this.daemonGeneration !== generation
+          || !this.authenticated
+          || socket.readyState !== WebSocket.OPEN
+        ) {
+          throw new Error('daemon_generation_changed');
+        }
+        socket.send(JSON.stringify(message));
       } catch (err) {
         this.pendingFileTransfers.delete(requestId);
         clearTimeout(timer);
@@ -7255,6 +7311,9 @@ export class WsBridge {
     // P2P workflow launch freshness continues to use
     // getDaemonP2pWorkflowCapabilities(now).
     if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      return this.controlledFileTransferCapabilities.has(capability);
+    }
     return this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false;
   }
 

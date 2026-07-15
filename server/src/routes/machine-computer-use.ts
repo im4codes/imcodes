@@ -8,7 +8,7 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
   COMPUTER_USE_HTTP_REASON,
-  COMPUTER_USE_MAX_TIMEOUT_MS,
+  computerUseMaxTimeoutMs,
   encodeComputerUseHttpEnvelope,
   validateComputerUseFrame,
   validateComputerUseResultFrame,
@@ -53,6 +53,14 @@ function outcomeFor(dispatch: { online: boolean; result?: ComputerUseResult }): 
   return dispatch.result.ok ? 'completed' : 'tool_error';
 }
 
+export function computerUseRelayDeadlineMs(frame: Pick<ComputerUseFrame, 'tool' | 'timeoutMs'>): number {
+  const nodeTimeout = Math.min(
+    frame.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS,
+    computerUseMaxTimeoutMs(frame.tool),
+  );
+  return nodeTimeout + DEFAULT_RELAY_DEADLINE_BUFFER_MS;
+}
+
 export function createMachineComputerUseRoutes(dispatcher: ComputerUseDispatcher = defaultDispatcher) {
   const routes = new Hono<{ Bindings: Env }>();
 
@@ -86,10 +94,9 @@ export function createMachineComputerUseRoutes(dispatcher: ComputerUseDispatcher
     if (target.revoked_at != null) return c.json(pre(COMPUTER_USE_HTTP_REASON.TARGET_FORBIDDEN), 403);
     if (!target.exec_enabled) return c.json(pre(COMPUTER_USE_HTTP_REASON.EXEC_DISABLED), 403);
 
-    const nodeTimeout = Math.min(v.value.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS, COMPUTER_USE_MAX_TIMEOUT_MS);
     let dispatch: { online: boolean; result?: ComputerUseResult };
     try {
-      dispatch = await dispatcher(targetId, v.value, nodeTimeout + DEFAULT_RELAY_DEADLINE_BUFFER_MS);
+      dispatch = await dispatcher(targetId, v.value, computerUseRelayDeadlineMs(v.value));
     } catch {
       return c.json(encodeComputerUseHttpEnvelope('dispatched_no_result', undefined, COMPUTER_USE_HTTP_REASON.INVALID_RESULT));
     }

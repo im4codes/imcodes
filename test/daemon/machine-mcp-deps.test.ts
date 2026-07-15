@@ -169,4 +169,28 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(exec).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', command: 'whoami', shell: 'powershell', timeoutMs: 3000, sourceServerId: 's1' }));
     expect(r).toMatchObject({ outcome: 'completed', ok: true, stdout: 'ran:whoami@srv-win' });
   });
+
+  it('resolves file-transfer targets fail-closed and forwards explicit paths', async () => {
+    const sendFile = vi.fn(async () => ({ size: 5, attachmentId: 'a'.repeat(32), remotePath: '/staging/a.txt' }));
+    const fetchFile = vi.fn(async (input: { destinationPath: string }) => ({ size: 7, attachmentId: 'b'.repeat(32), destinationPath: input.destinationPath }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [
+        m({ serverId: 'srv-win', refName: 'win-1' }),
+        m({ serverId: 'srv-offline', refName: 'offline', online: false }),
+      ],
+      sendFileToMachine: sendFile as never,
+      fetchFileFromMachine: fetchFile as never,
+    });
+
+    expect(await deps.sendFileToMachine?.({ machine: 'missing', sourcePath: '/tmp/a' })).toMatchObject({ ok: false, reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(await deps.fetchFileFromMachine?.({ machine: 'offline', sourcePath: 'C:\\a', destinationPath: '/tmp/a' })).toMatchObject({ ok: false, reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+    expect(sendFile).not.toHaveBeenCalled();
+    expect(fetchFile).not.toHaveBeenCalled();
+
+    expect(await deps.sendFileToMachine?.({ machine: 'win-1', sourcePath: '/tmp/a' })).toMatchObject({ ok: true, remotePath: '/staging/a.txt' });
+    expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', sourcePath: '/tmp/a', sourceServerId: 's1' }));
+    expect(await deps.fetchFileFromMachine?.({ machine: 'win-1', sourcePath: 'C:\\a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ ok: true, destinationPath: '/tmp/a' });
+    expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', sourcePath: 'C:\\a', destinationPath: '/tmp/a', overwrite: true }));
+  });
 });

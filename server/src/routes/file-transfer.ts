@@ -11,12 +11,17 @@ import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
+  validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
   FileDownloadRequest,
   FileDownloadStreamRequest,
+  FilePathHandleRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
 } from '../../../shared/transport/file-transfer.js';
@@ -41,6 +46,7 @@ const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
 const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
 const UPLOAD_PROGRESS_STREAM_MIME = 'application/x-ndjson';
 const STAGED_DOWNLOAD_TTL_MS = FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS;
+const MACHINE_FILE_HANDLE_BODY_MAX_BYTES = FILE_TRANSFER_PATH_MAX_BYTES + 1024;
 const downloadTokens = new Map<string, {
   serverId: string;
   attachmentId: string;
@@ -308,6 +314,7 @@ function jsonLine(payload: unknown): string {
 const authMiddleware = requireAuth();
 
 fileTransferRoutes.use('/:id/upload', authMiddleware);
+fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
   // Token-based auth bypass for native downloads (system browser has no app auth)
@@ -333,6 +340,80 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
   // No token — fall back to cookie/bearer auth
   return (authMiddleware as any)(c, next);
 });
+
+type ControlledTargetGate =
+  | { ok: true; bridge: ReturnType<typeof WsBridge.get>; controlled: boolean }
+  | { ok: false; reason: 'scoped_auth' | 'target_forbidden' | 'exec_disabled' | 'daemon_offline' | 'capability_unavailable' };
+
+async function authorizeControlledFileTarget(
+  c: Context,
+  serverId: string,
+  capability: string,
+  requireControlled: boolean,
+): Promise<ControlledTargetGate> {
+  const target = await c.env.DB.queryOne(
+    'SELECT user_id, node_role, exec_enabled, revoked_at FROM servers WHERE id = $1',
+    [serverId],
+  ) as {
+    user_id: string;
+    node_role: string | null;
+    exec_enabled: boolean;
+    revoked_at: number | null;
+  } | null;
+  const controlled = target?.node_role === 'controlled';
+  if (!target || (requireControlled && !controlled)) return { ok: false, reason: 'target_forbidden' };
+
+  const bridge = WsBridge.get(serverId);
+  if (!controlled) return { ok: true, bridge, controlled: false };
+
+  const userId = c.get('userId' as never) as string;
+  const nodeRole = c.get('nodeRole' as never) as string | undefined;
+  const sourceServerId = c.get('authServerId' as never) as string | undefined;
+  if (nodeRole !== 'full' || !sourceServerId || sourceServerId === serverId) {
+    return { ok: false, reason: 'scoped_auth' };
+  }
+  if (target.user_id !== userId || target.revoked_at != null) return { ok: false, reason: 'target_forbidden' };
+  if (!target.exec_enabled) return { ok: false, reason: 'exec_disabled' };
+  if (!bridge.isDaemonConnected()) return { ok: false, reason: 'daemon_offline' };
+  if (!bridge.hasDaemonCapability(capability)) return { ok: false, reason: 'capability_unavailable' };
+  return { ok: true, bridge, controlled: true };
+}
+
+function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetGate, { ok: true }>['reason']): Response {
+  if (reason === 'daemon_offline') return c.json({ error: reason }, 503);
+  if (reason === 'capability_unavailable') return c.json({ error: reason }, 409);
+  return c.json({ error: reason }, 403);
+}
+
+async function readBoundedJsonObject(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; tooLarge: boolean }> {
+  const declared = Number(request.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) return { ok: false, tooLarge: true };
+  const reader = request.body?.getReader();
+  if (!reader) return { ok: false, tooLarge: false };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return { ok: false, tooLarge: true };
+      }
+      chunks.push(value);
+    }
+    const parsed = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, tooLarge: false };
+    return { ok: true, value: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false, tooLarge: false };
+  }
+}
 
 // ── GET /api/server/:id/upload-staged/:uploadId ─────────────────────────────
 // Token-authenticated, relay-local temporary object fetch for daemon uploads.
@@ -420,6 +501,60 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
 
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
 
+// A FULL daemon asks a CONTROLLED node to turn one explicit regular-file path
+// into the existing short-lived attachment handle. Directory browsing and
+// arbitrary filesystem CRUD remain outside this route.
+fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(c, serverId, FILE_TRANSFER_PATH_HANDLE_CAPABILITY, true);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+
+  const boundedBody = await readBoundedJsonObject(c.req.raw, MACHINE_FILE_HANDLE_BODY_MAX_BYTES);
+  if (!boundedBody.ok) {
+    return boundedBody.tooLarge
+      ? c.json({ error: 'request_too_large' }, 413)
+      : c.json({ error: 'invalid_body' }, 400);
+  }
+  const body = boundedBody.value;
+  if (Object.keys(body).length !== 1 || !Object.prototype.hasOwnProperty.call(body, 'path')) {
+    return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+  }
+  const requestId = randomHex(16);
+  const parsed = validateFilePathHandleRequest({
+    ...body,
+    type: FILE_TRANSFER_MSG.PATH_HANDLE,
+    requestId,
+  });
+  if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      requestId,
+      parsed.value as FilePathHandleRequest as unknown as Record<string, unknown>,
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+    );
+    if (result.type === FILE_TRANSFER_MSG.PATH_HANDLE_ERROR) {
+      const reason = typeof result.error === 'string' ? result.error : 'path_handle_failed';
+      if (reason === 'not_found') return c.json({ error: reason }, 404);
+      return c.json({ error: reason }, 400);
+    }
+    if (result.type !== FILE_TRANSFER_MSG.PATH_HANDLE_DONE || !result.attachment) {
+      return c.json({ error: 'invalid_daemon_response' }, 502);
+    }
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = serverId;
+    return c.json({ ok: true, attachment });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'path_handle_failed';
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    logger.error({ serverId, err }, 'Controlled node path handle failed');
+    return c.json({ error: 'path_handle_failed' }, 500);
+  }
+});
+
 fileTransferRoutes.post('/:id/upload', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
@@ -427,6 +562,13 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   // Permission check
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const controlledGate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+    false,
+  );
+  if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
 
   const contentLengthHeader = c.req.header('content-length');
   const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
@@ -456,7 +598,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   }
 
   // Daemon connectivity check
-  const bridge = WsBridge.get(serverId);
+  const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }
@@ -639,6 +781,13 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
 
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const controlledGate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+    false,
+  );
+  if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
 
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
@@ -682,6 +831,13 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   // Permission check
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const controlledGate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+    false,
+  );
+  if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
 
   // Validate attachment ID format (hex + optional extension)
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
@@ -689,7 +845,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   }
 
   // Daemon connectivity check
-  const bridge = WsBridge.get(serverId);
+  const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }

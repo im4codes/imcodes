@@ -3,15 +3,18 @@ import { Hono } from 'hono';
 import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 
-const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, mockResolveServerMemberAccessOrShareDeny } = vi.hoisted(() => ({
+const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, mockResolveServerMemberAccessOrShareDeny, queryOneMock } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
   isDaemonConnectedMock: vi.fn(),
   hasDaemonCapabilityMock: vi.fn(),
   mockResolveServerMemberAccessOrShareDeny: vi.fn(),
+  queryOneMock: vi.fn(),
 }));
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -23,6 +26,10 @@ vi.mock('../src/security/authorization.js', () => ({
       });
     }
     c.set('userId', 'user-1');
+    if (c.req.header('X-Server-Id')) {
+      c.set('nodeRole', 'full');
+      c.set('authServerId', c.req.header('X-Server-Id')!);
+    }
     return next();
   },
   resolveServerRole: vi.fn().mockResolvedValue('owner'),
@@ -55,7 +62,7 @@ import { fileTransferRoutes } from '../src/routes/file-transfer.js';
 function makeApp(): Hono {
   const app = new Hono();
   app.use('/*', async (c, next) => {
-    (c as never as { env: { DB: unknown } }).env = { DB: {} };
+    (c as never as { env: { DB: unknown } }).env = { DB: { queryOne: queryOneMock } };
     return next();
   });
   app.route('/api/server', fileTransferRoutes);
@@ -70,6 +77,8 @@ describe('file-transfer upload route', () => {
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    queryOneMock.mockReset();
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
     sendFileTransferRequestMock.mockResolvedValue({
       type: 'file.upload_done',
       attachment: {
@@ -79,6 +88,105 @@ describe('file-transfer upload route', () => {
         downloadable: true,
       },
     });
+  });
+
+  it('mints an explicit-path handle only for a FULL source and capable controlled target', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'a'.repeat(32),
+      attachment: {
+        id: 'b'.repeat(32),
+        source: 'local',
+        serverId: '',
+        daemonPath: '/tmp/report.txt',
+        createdAt: new Date().toISOString(),
+        downloadable: true,
+      },
+    });
+
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer source-token',
+        'X-Server-Id': 'full-1',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ path: '/tmp/report.txt' }),
+    });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      attachment: { serverId: 'controlled-1', daemonPath: '/tmp/report.txt' },
+    });
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_PATH_HANDLE_CAPABILITY);
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ type: FILE_TRANSFER_MSG.PATH_HANDLE, path: '/tmp/report.txt' }),
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+    );
+  });
+
+  it('denies controlled-node file access from browser-style auth before dispatch', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/tmp/report.txt' }),
+    });
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'scoped_auth' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['cross-account', { user_id: 'other', node_role: 'controlled', exec_enabled: true, revoked_at: null }, true, true, 403, 'target_forbidden'],
+    ['revoked', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: 1 }, true, true, 403, 'target_forbidden'],
+    ['disabled', { user_id: 'user-1', node_role: 'controlled', exec_enabled: false, revoked_at: null }, true, true, 403, 'exec_disabled'],
+    ['offline', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null }, false, true, 503, 'daemon_offline'],
+    ['missing capability', { user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null }, true, false, 409, 'capability_unavailable'],
+  ] as const)('rejects a %s controlled target before file dispatch', async (_label, row, online, capability, status, error) => {
+    queryOneMock.mockResolvedValue(row);
+    isDaemonConnectedMock.mockReturnValue(online);
+    hasDaemonCapabilityMock.mockReturnValue(capability);
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/tmp/private-value.txt' }),
+    });
+    expect(res.status).toBe(status);
+    const response = await res.json();
+    expect(response).toEqual({ error });
+    expect(JSON.stringify(response)).not.toContain('private-value');
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown explicit-path request fields without echoing them', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/tmp/private-value.txt', recursive: true }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'invalid_request' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an oversized explicit-path request before daemon dispatch', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'user-1', node_role: 'controlled', exec_enabled: true, revoked_at: null });
+    const privateValue = `private-${'x'.repeat(FILE_TRANSFER_PATH_MAX_BYTES + 1024)}`;
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer source', 'X-Server-Id': 'full-1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: privateValue }),
+    });
+    expect(res.status).toBe(413);
+    const response = await res.json();
+    expect(response).toEqual({ error: 'request_too_large' });
+    expect(JSON.stringify(response)).not.toContain(privateValue);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
   it('rejects share-only uploads with the direct-surface reason before daemon relay', async () => {

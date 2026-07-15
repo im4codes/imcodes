@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { quoteWinArg, windowsPipeClientAclCommand } from '../../src/node/computer-use-ipc.js';
+import { computerUseIpcDeadlineMs, quoteWinArg, windowsPipeClientAclCommand } from '../../src/node/computer-use-ipc.js';
 
 describe('computer use IPC Windows argv quoting', () => {
   it('preserves named pipe backslashes for CreateProcessAsUser command lines', () => {
@@ -22,5 +22,12 @@ describe('computer use IPC Windows pipe ACL', () => {
       '/grant',
       '*S-1-5-11:F',
     ]);
+  });
+});
+
+describe('computer use IPC deadline', () => {
+  it('keeps the full 900 second shell timeout plus transport cleanup buffer', () => {
+    expect(computerUseIpcDeadlineMs({ tool: 'shell_session1', timeoutMs: 900_000 })).toBe(905_000);
+    expect(computerUseIpcDeadlineMs({ tool: 'list_apps', timeoutMs: 120_000 })).toBe(125_000);
   });
 });

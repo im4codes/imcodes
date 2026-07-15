@@ -12,6 +12,8 @@ function caller(): McpRuntimeCaller {
 
 const listMachines = MEMORY_MCP_TOOL_NAMES.LIST_MACHINES;
 const execRemote = MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE;
+const sendFile = MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE;
+const fetchFile = MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE;
 const computerUseDocs = MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS;
 const computerUseCall = MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL;
 
@@ -21,6 +23,28 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(await handlers[execRemote]({ machine: 'm', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
     expect(await handlers[listMachines]({})).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
     expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+    expect(await handlers[sendFile]({ machine: 'm', sourcePath: '/tmp/a' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+    expect(await handlers[fetchFile]({ machine: 'm', sourcePath: '/tmp/a', destinationPath: '/tmp/b' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.FEATURE_DISABLED });
+  });
+
+  it('validates and returns metadata for explicit machine file transfers', async () => {
+    const send = vi.fn(async () => ({ ok: true as const, remotePath: '/staging/a.txt', attachmentId: 'a'.repeat(32), size: 5 }));
+    const fetch = vi.fn(async ({ destinationPath }: { destinationPath: string }) => ({ ok: true as const, destinationPath, attachmentId: 'b'.repeat(32), size: 7 }));
+    const machineDeps: MachineToolDeps = {
+      listMachines: async () => [],
+      execRemote: async () => ({ outcome: 'completed' as const }),
+      sendFileToMachine: send,
+      fetchFileFromMachine: fetch,
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+    expect(await handlers[sendFile]({ machine: 'win', sourcePath: '' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[fetchFile]({ machine: 'win', sourcePath: '/remote/a' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(send).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+
+    expect(await handlers[sendFile]({ machine: 'win', sourcePath: '/tmp/a' })).toMatchObject({ status: 'ok', remotePath: '/staging/a.txt', size: 5 });
+    expect(await handlers[fetchFile]({ machine: 'win', sourcePath: '/remote/a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ status: 'ok', destinationPath: '/tmp/a', size: 7 });
+    expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ overwrite: true }));
   });
 
   it('validates required + typed fields before dispatching', async () => {
@@ -87,7 +111,16 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
   });
 
   it('computer_use_call validates input before dispatching', async () => {
-    const computerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const computerUse = vi.fn(async ({ tool }: { tool: 'shell_session1' | 'list_apps' }) => ({
+      outcome: 'completed' as const,
+      result: {
+        correlationId: 'cu-12345678',
+        ok: true,
+        tool,
+        content: [{ type: 'text' as const, text: 'ok' }],
+        durationMs: 1,
+      },
+    }));
     const machineDeps: MachineToolDeps = {
       listMachines: async () => [],
       execRemote: async () => ({ outcome: 'completed' as const }),
@@ -99,7 +132,13 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(await handlers[computerUseCall]({ machine: 'm', tool: 'nope' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps', arguments: [] })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps', timeoutMs: -1 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps', timeoutMs: 120_001 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(computerUse).not.toHaveBeenCalled();
+
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'shell_session1', timeoutMs: 900_000 })).toMatchObject({ status: 'ok', outcome: 'completed' });
+    expect(computerUse).toHaveBeenCalledWith(expect.objectContaining({ machine: 'm', tool: 'shell_session1', timeoutMs: 900_000 }));
+    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'shell_session1', timeoutMs: 900_001 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(computerUse).toHaveBeenCalledTimes(1);
   });
 
   it('computer_use_call maps typed pre-dispatch reasons to MCP errors and passes completed results through', async () => {

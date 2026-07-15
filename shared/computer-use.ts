@@ -37,7 +37,10 @@ export type ComputerUseDocTopic = (typeof COMPUTER_USE_DOC_TOPICS)[number];
 
 export const COMPUTER_USE_DEFAULT_TIMEOUT_MS = 30_000;
 export const COMPUTER_USE_MIN_TIMEOUT_MS = 1_000;
+/** Maximum for GUI and browser Computer Use methods. */
 export const COMPUTER_USE_MAX_TIMEOUT_MS = 120_000;
+/** Maximum for the active-user shell; intentionally longer than GUI actions. */
+export const COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS = 900_000;
 export const COMPUTER_USE_MAX_ARGUMENT_BYTES = 64 * 1024;
 export const COMPUTER_USE_MAX_TEXT_BYTES = 256 * 1024;
 export const COMPUTER_USE_MAX_IMAGE_BASE64_BYTES = 2 * 1024 * 1024;
@@ -115,6 +118,12 @@ export function utf8ByteLength(value: string): number {
   return Buffer.byteLength(value, 'utf8');
 }
 
+export function computerUseMaxTimeoutMs(tool: ComputerUseToolName): number {
+  return tool === 'shell_session1'
+    ? COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS
+    : COMPUTER_USE_MAX_TIMEOUT_MS;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -153,8 +162,9 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
   if (raw.arguments !== undefined && !isRecord(raw.arguments)) return { ok: false, error: 'invalid_arguments' };
   if (raw.arguments !== undefined && utf8ByteLength(JSON.stringify(raw.arguments)) > COMPUTER_USE_MAX_ARGUMENT_BYTES) return { ok: false, error: 'arguments_too_large' };
   const timeoutMs = raw.timeoutMs;
+  const maxTimeoutMs = computerUseMaxTimeoutMs(raw.tool);
   if (timeoutMs !== undefined
-    && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > COMPUTER_USE_MAX_TIMEOUT_MS)) {
+    && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > maxTimeoutMs)) {
     return { ok: false, error: 'invalid_timeoutMs' };
   }
   return {
@@ -267,13 +277,14 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'tools':
       return [
         `Available tools: ${COMPUTER_USE_TOOLS.join(', ')}.`,
-        'shell_session1: run a bounded shell command in the active logged-in user session through the IPC helper. For SYSTEM/session-0 shell use exec_remote instead.',
+        'shell_session1: run a bounded shell command in the active logged-in user session through the IPC helper; its requested timeout may be 1,000..900,000 ms. For SYSTEM/session-0 shell use exec_remote instead.',
         'list_apps: enumerate controllable GUI apps.',
         'get_app_state: inspect one app/window accessibility tree.',
         'click, perform_secondary_action, scroll, drag: pointer/UI actions.',
         'type_text, press_key, set_value: keyboard/value actions.',
         'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
+        'GUI and browser methods keep the 1,000..120,000 ms timeout range; only shell_session1 permits up to 900,000 ms.',
       ].join('\n');
     case 'browser':
       return [

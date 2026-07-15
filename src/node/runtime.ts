@@ -7,6 +7,21 @@ import { MachineExecWorker } from './machine-exec-worker.js';
 import { ComputerUseWorker } from './computer-use-worker.js';
 import { startControlledNodeSelfUpgrade } from './self-upgrade.js';
 import type { ControlledNodeCredential } from './enrollment.js';
+import {
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  validateControlledFileTransferRequest,
+  validateControlledFileTransferResponse,
+} from '../../shared/transport/file-transfer.js';
+import {
+  handleFileDownload,
+  handleFileDownloadStream,
+  handleFilePathHandle,
+  handleFileUploadFetch,
+  type FileTransferSender,
+} from '../daemon/file-transfer-handler.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -62,9 +77,35 @@ export function createControlledNodeRuntime(
     });
   };
   let client!: AuthenticatedWebSocketClient;
+  const fileSender: FileTransferSender = {
+    send(message: unknown): boolean {
+      let candidate = message;
+      const raw = message && typeof message === 'object' && !Array.isArray(message)
+        ? message as Record<string, unknown>
+        : null;
+      const checked = validateControlledFileTransferResponse(candidate);
+      if (!checked.ok && raw?.type === 'file.upload_error' && typeof raw.uploadId === 'string') {
+        candidate = { type: 'file.upload_error', uploadId: raw.uploadId, message: 'upload_failed' };
+      } else if (!checked.ok && raw?.type === 'file.download_error' && typeof raw.downloadId === 'string') {
+        candidate = { type: 'file.download_error', downloadId: raw.downloadId, message: 'download_failed' };
+      }
+      const normalized = validateControlledFileTransferResponse(candidate);
+      return normalized.ok ? client.send(normalized.value) : false;
+    },
+  };
   client = new AuthenticatedWebSocketClient({
     url: controlledNodeWebSocketUrl(credential.serverUrl, credential.serverId),
-    auth: { type: 'auth', serverId: credential.serverId, token: credential.token, daemonVersion: DAEMON_VERSION },
+    auth: {
+      type: 'auth',
+      serverId: credential.serverId,
+      token: credential.token,
+      daemonVersion: DAEMON_VERSION,
+      capabilities: [
+        FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+        FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+        FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      ],
+    },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
     heartbeatMs: 5_000,
     silenceTimeoutMs: 30_000,
@@ -113,6 +154,35 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (message.type === 'file.upload_fetch'
+        || message.type === 'file.download'
+        || message.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
+        || message.type === FILE_TRANSFER_MSG.PATH_HANDLE) {
+        const parsed = validateControlledFileTransferRequest(message);
+        if (!parsed.ok) return;
+        const relayUrl = parsed.value.type === 'file.upload_fetch'
+          ? parsed.value.downloadUrl
+          : parsed.value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
+            ? parsed.value.uploadUrl
+            : undefined;
+        if (relayUrl) {
+          try {
+            if (new URL(relayUrl).origin !== new URL(credential.serverUrl).origin) return;
+          } catch {
+            return;
+          }
+        }
+        if (parsed.value.type === 'file.upload_fetch') {
+          await handleFileUploadFetch(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === 'file.download') {
+          await handleFileDownload(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
+          await handleFileDownloadStream(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else {
+          await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
+        }
         return;
       }
       if (message.type !== DAEMON_COMMAND_TYPES.MACHINE_EXEC) return;

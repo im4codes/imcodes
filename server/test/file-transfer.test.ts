@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { WsBridge } from '../src/ws/bridge.js';
+import { FILE_TRANSFER_MSG, FILE_TRANSFER_PATH_HANDLE_CAPABILITY } from '../../shared/transport/file-transfer.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -34,9 +35,9 @@ class MockWs extends EventEmitter {
   }
 }
 
-function makeDb(tokenHash: string) {
+function makeDb(tokenHash: string, nodeRole = 'full') {
   return {
-    queryOne: async () => ({ token_hash: tokenHash }),
+    queryOne: async () => ({ token_hash: tokenHash, user_id: 'user-1', node_role: nodeRole, revoked_at: null }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
@@ -57,10 +58,10 @@ async function flushAsync() {
   for (let i = 0; i < 5; i++) await new Promise((r) => process.nextTick(r));
 }
 
-async function authDaemon(bridge: WsBridge, daemonWs: MockWs, db: ReturnType<typeof makeDb>) {
+async function authDaemon(bridge: WsBridge, daemonWs: MockWs, db: ReturnType<typeof makeDb>, capabilities?: string[]) {
   bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
   daemonWs.emit('message', Buffer.from(JSON.stringify({
-    type: 'auth', serverId: 'test', token: 'tok',
+    type: 'auth', serverId: 'test', token: 'tok', ...(capabilities ? { capabilities } : {}),
   })));
   await flushAsync();
 }
@@ -93,6 +94,45 @@ describe('WsBridge file transfer', () => {
     await expect(
       bridge.sendFileTransferRequest('req1', { type: 'file.upload' }, 5000),
     ).rejects.toThrow('daemon_offline');
+  });
+
+  it('strictly resolves controlled-node path handles and never queues them through the generic sender', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash', 'controlled'), [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]);
+    expect(bridge.hasDaemonCapability(FILE_TRANSFER_PATH_HANDLE_CAPABILITY)).toBe(true);
+
+    const beforeGeneric = daemon.sentStrings.length;
+    bridge.sendToDaemon(JSON.stringify({ type: FILE_TRANSFER_MSG.PATH_HANDLE, requestId: 'generic', path: '/tmp/x' }));
+    expect(daemon.sentStrings).toHaveLength(beforeGeneric);
+
+    const promise = bridge.sendFileTransferRequest('path-1', {
+      type: FILE_TRANSFER_MSG.PATH_HANDLE,
+      requestId: 'path-1',
+      path: '/tmp/report.txt',
+    }, 5_000);
+    const droppedBefore = WsBridge.controlledInboundDropped;
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'path-1',
+      attachment: { injected: true },
+    })));
+    await flushAsync();
+    expect(WsBridge.controlledInboundDropped).toBe(droppedBefore + 1);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'path-1',
+      attachment: {
+        id: 'a'.repeat(32),
+        source: 'local',
+        serverId: '',
+        daemonPath: '/tmp/report.txt',
+        createdAt: new Date().toISOString(),
+        downloadable: true,
+      },
+    })));
+    await expect(promise).resolves.toMatchObject({ type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE });
   });
 
   it('sendFileTransferRequest sends to daemon and resolves on upload_done', async () => {

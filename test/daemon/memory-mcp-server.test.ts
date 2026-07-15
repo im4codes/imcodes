@@ -190,7 +190,9 @@ describe('memory MCP stdio server', () => {
       // Provider tokenizers differ, so enforce the stable serialized payload
       // size here. This keeps the fixed tools/list prompt near 5k tokens while
       // allowing a small margin for intentional schema additions.
-      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(23_000);
+      // Two explicit-path machine file-transfer tools add their safety and
+      // destination contracts to the fixed surface.
+      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(25_000);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {

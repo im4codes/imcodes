@@ -47,6 +47,8 @@ describe('memory MCP shared contracts', () => {
       // Machine remote-exec surface — FULL-only (controlled-node-remote-exec 10.12).
       'list_machines',
       'exec_remote',
+      'send_file_to_machine',
+      'fetch_file_from_machine',
       'computer_use_docs',
       'computer_use_call',
     ]);
@@ -77,6 +79,16 @@ describe('memory MCP shared contracts', () => {
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
     expect(files?.description).toMatch(/path references/i);
     expect(files?.description).toMatch(/not read or transferred/i);
+  });
+
+  it('advertises the active-user shell 900 second timeout without widening GUI methods', () => {
+    const call = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL];
+    const timeout = call.inputSchema.properties?.timeoutMs as { minimum?: number; maximum?: number; description?: string } | undefined;
+    expect(timeout).toMatchObject({ minimum: 1_000, maximum: 900_000 });
+    expect(timeout?.description).toContain('GUI/browser');
+    expect(timeout?.description).toContain('120000');
+    expect(timeout?.description).toContain('shell_session1');
+    expect(timeout?.description).toContain('900000');
   });
 
   it('documents scoped send target discovery and self-target rejection', () => {

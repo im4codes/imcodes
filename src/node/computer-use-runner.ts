@@ -10,7 +10,7 @@ import {
   COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
   COMPUTER_USE_MAX_ARGUMENT_BYTES,
   COMPUTER_USE_MIN_TIMEOUT_MS,
-  COMPUTER_USE_MAX_TIMEOUT_MS,
+  computerUseMaxTimeoutMs,
   type ComputerUseContentItem,
   type ComputerUseRequest,
   type ComputerUseResult,
@@ -1256,7 +1256,10 @@ async function runBrowserUseTool(request: ComputerUseRequest, timeoutMs: number,
 
 export async function runComputerUseTool(request: ComputerUseRequest): Promise<ComputerUseResult> {
   const started = Date.now();
-  const timeoutMs = Math.min(Math.max(request.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS, COMPUTER_USE_MIN_TIMEOUT_MS), COMPUTER_USE_MAX_TIMEOUT_MS);
+  const timeoutMs = Math.min(
+    Math.max(request.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS, COMPUTER_USE_MIN_TIMEOUT_MS),
+    computerUseMaxTimeoutMs(request.tool),
+  );
   const argsObject = request.arguments ?? {};
   const argsJson = JSON.stringify(argsObject);
   if (utf8Bytes(argsJson) > COMPUTER_USE_MAX_ARGUMENT_BYTES) {

@@ -8,7 +8,7 @@ import { runComputerUseTool, WINDOWS_DEFAULT_OCU_DIR } from './computer-use-runn
 import { applyWindowsAclCommands, windowsComputerUseHelperAclCommands } from './installer.js';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
-  COMPUTER_USE_MAX_TIMEOUT_MS,
+  computerUseMaxTimeoutMs,
   validateComputerUseFrame,
   validateComputerUseResultFrame,
   type ComputerUseFrame,
@@ -21,6 +21,13 @@ interface IpcResultWire { id: string; result?: ComputerUseResultFrame; error?: s
 interface IpcHelloWire { hello: typeof IPC_HELPER_HELLO }
 
 const IPC_HELPER_HELLO = 'imcodes-computer-use-helper-v1' as const;
+
+export function computerUseIpcDeadlineMs(frame: Pick<ComputerUseFrame, 'tool' | 'timeoutMs'>): number {
+  return Math.min(
+    frame.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS,
+    computerUseMaxTimeoutMs(frame.tool),
+  ) + 5_000;
+}
 
 type PendingIpc = {
   resolve: (value: ComputerUseResultFrame) => void;
@@ -204,7 +211,7 @@ export class ComputerUseIpcHost {
     const socket = this.socket;
     if (!socket || socket.destroyed) throw new Error('computer_use_helper_not_connected');
     const id = randomBytes(12).toString('hex');
-    const timeoutMs = Math.min(frame.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS, COMPUTER_USE_MAX_TIMEOUT_MS) + 5_000;
+    const timeoutMs = computerUseIpcDeadlineMs(frame);
     return await new Promise<ComputerUseResultFrame>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
