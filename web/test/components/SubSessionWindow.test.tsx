@@ -44,6 +44,7 @@ const usageFooterSpy = vi.fn((props: any) => (
     data-quota={props.quotaLabel ?? ''}
     data-state={props.sessionState ?? ''}
     data-model={props.modelOverride ?? ''}
+    data-pending-user-send={String(!!props.pendingUserSend)}
   />
 ));
 let timelineEventsMock: any[] = [];
@@ -346,6 +347,39 @@ describe('SubSessionWindow metadata wiring', () => {
       const props = chatViewPropsSpy.mock.calls.at(-1)?.[0];
       expect(props.events).toEqual(timelineEventsMock);
       expect(props.events[0].payload).toMatchObject({ text: 'window partial stream', streaming: true });
+    });
+  });
+
+  it('forwards a pending optimistic send for immediate sub-session status feedback', async () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_sub_sub-1', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'pending', sessionId: 'deck_sub_sub-1', ts: 2, type: 'user.message', payload: { text: 'just sent', pending: true, commandId: 'cmd-now' } },
+    ];
+
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          runtimeType: 'transport' as any,
+          state: 'idle',
+        } as any)}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.pendingUserSend).toBe('true');
     });
   });
 

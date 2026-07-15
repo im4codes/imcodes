@@ -379,6 +379,26 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-live-status-inline.running')).toBeNull();
   });
 
+  it('switches the robot to running immediately while an optimistic send is unresolved', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        pendingUserSend={true}
+      />,
+    );
+
+    expect(container.querySelector('.session-live-status-inline.running')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+  });
+
   it('keeps the robot running from authoritative session state even when timeline tail has settled', () => {
     const { container } = render(
       <UsageFooter

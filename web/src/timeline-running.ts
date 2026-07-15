@@ -61,6 +61,18 @@ export function isPendingUserMessageTimelineEvent(
   return event.type === 'user.message' && event.payload?.pending === true;
 }
 
+/**
+ * Client-owned dispatch evidence used for immediate send feedback. Unlike a
+ * stale thinking/tool tail, an unresolved optimistic user message represents
+ * work the current browser has actually submitted and is still tracking.
+ */
+export function hasPendingUserSend(events: TimelineTailEvent[]): boolean {
+  return events.some((event) => (
+    isPendingUserMessageTimelineEvent(event)
+    && event.payload?.failed !== true
+  ));
+}
+
 export function hasActiveTimelineTurn(
   events: TimelineTailEvent[],
 ): boolean {

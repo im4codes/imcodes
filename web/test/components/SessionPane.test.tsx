@@ -95,6 +95,7 @@ vi.mock('../../src/components/UsageFooter.js', () => ({
       data-testid="usage-footer"
       data-state={props.sessionState}
       data-active-timeline-turn={String(!!props.activeTimelineTurn)}
+      data-pending-user-send={String(!!props.pendingUserSend)}
       data-model={props.modelOverride ?? ''}
     >
       {props.quotaLabel ?? props.planLabel ?? 'footer'}
@@ -394,6 +395,37 @@ describe('SessionPane', () => {
       activeTransportTurn: true,
     }));
     expect(screen.getByRole('button', { name: 'send' }).getAttribute('data-active-transport-turn')).toBe('true');
+  });
+
+  it('forwards a pending optimistic send for immediate live-status feedback', () => {
+    timelineEventsMock = [
+      { eventId: 'idle', sessionId: 'deck_test_brain', ts: 1, type: 'session.state', payload: { state: 'idle' } },
+      { eventId: 'pending-user', sessionId: 'deck_test_brain', ts: 2, type: 'user.message', payload: { text: 'just sent', pending: true, commandId: 'cmd-now' } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(screen.getByTestId('usage-footer').getAttribute('data-pending-user-send')).toBe('true');
   });
 
   it('keeps active transport turn through a confirmed user message after running state', () => {
