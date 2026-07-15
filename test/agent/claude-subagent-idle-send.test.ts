@@ -16,6 +16,39 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * old rejection still applies while the main turn is genuinely running.
  */
 
+// The provider resolves + spawns the `claude` binary. CI runners have no
+// `claude` on PATH (a dev box running Claude Code does), so without this the
+// suite passes locally and dies with `spawn claude ENOENT` in CI. Mirrors the
+// mock in claude-code-sdk-provider.test.ts.
+const childProcessMock = vi.hoisted(() => ({
+  // Accept both (file, args, cb) and (file, args, opts, cb) signatures.
+  execFile: vi.fn((..._args: unknown[]) => {
+    const cb = (typeof _args[2] === 'function' ? _args[2] : _args[3]) as
+      | ((err: Error | null, stdout: string, stderr: string) => void)
+      | undefined;
+    cb?.(null, 'ok\n', '');
+    return {} as never;
+  }),
+  spawn: vi.fn(() => ({
+    killed: false,
+    kill: vi.fn(function (this: { killed: boolean }) {
+      this.killed = true;
+      return true;
+    }),
+    once: vi.fn(),
+    on: vi.fn(),
+  }) as never),
+}));
+
+vi.mock('node:child_process', () => ({
+  execFile: childProcessMock.execFile,
+  spawn: childProcessMock.spawn,
+}));
+
+vi.mock('../../src/util/logger.js', () => ({
+  default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
 const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
   const runs: Array<{ prompt: unknown; options: Record<string, unknown>; closed: boolean }> = [];
