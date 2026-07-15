@@ -805,6 +805,7 @@
     "loading": "載入中…",
     "tab_quick": "快捷",
     "tab_files": "檔案",
+    "tab_machines": "受控節點",
     "confirm_delete": "確認刪除？"
   },
   "file_browser": {
@@ -2703,6 +2704,8 @@
     "offline": "離線",
     "exec_on": "已允許執行",
     "exec_off": "已禁止執行",
+    "rename_label": "受控節點名稱",
+    "rename_invalid": "請輸入 1–120 個字元的名稱，且不可包含控制字元。",
     "revoke": "撤銷",
     "revoke_confirm": "撤銷這台機器?撤銷後將無法再控制,需要重新註冊。"
   }

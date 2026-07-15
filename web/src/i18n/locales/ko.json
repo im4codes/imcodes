@@ -805,6 +805,7 @@
     "loading": "로딩 중…",
     "tab_quick": "빠른",
     "tab_files": "파일",
+    "tab_machines": "제어 노드",
     "confirm_delete": "이 항목을 삭제하시겠습니까?"
   },
   "file_browser": {
@@ -2702,6 +2703,8 @@
     "offline": "오프라인",
     "exec_on": "실행 허용됨",
     "exec_off": "실행 비활성화됨",
+    "rename_label": "제어 노드 이름",
+    "rename_invalid": "제어 문자를 제외한 1~120자의 이름을 입력하세요.",
     "revoke": "해지",
     "revoke_confirm": "이 머신을 해지하시겠습니까? 해지 후에는 제어할 수 없으며 다시 등록해야 합니다."
   }

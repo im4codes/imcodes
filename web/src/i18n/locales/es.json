@@ -805,6 +805,7 @@
     "loading": "Cargando…",
     "tab_quick": "Rápido",
     "tab_files": "Archivos",
+    "tab_machines": "Nodos",
     "confirm_delete": "¿Eliminar este elemento?"
   },
   "file_browser": {
@@ -2703,6 +2704,8 @@
     "offline": "Sin conexión",
     "exec_on": "Ejecución habilitada",
     "exec_off": "Ejecución deshabilitada",
+    "rename_label": "Nombre del nodo controlado",
+    "rename_invalid": "Introduce un nombre de 1 a 120 caracteres sin caracteres de control.",
     "revoke": "Revocar",
     "revoke_confirm": "¿Revocar esta máquina? Ya no se podrá controlar y deberá volver a registrarse."
   }

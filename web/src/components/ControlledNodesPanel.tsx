@@ -9,12 +9,14 @@ import {
   artifactSelectionKey,
   buildControlledNodeDownloadTargets,
   listAvailableExecutables,
+  renameMachine,
   revokeMachine,
   setMachineExecEnabled,
   type ControlledNodeArtifactMetadata,
   type ControlledNodeArtifactSelection,
   type ControlledNodeOs,
 } from '../api/machines.js';
+import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 
@@ -83,6 +85,8 @@ export function ControlledNodesPanel() {
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyServerId, setBusyServerId] = useState<string | null>(null);
+  const [editingServerId, setEditingServerId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
   const availableOses = useMemo(
@@ -133,6 +137,36 @@ export function ControlledNodesPanel() {
     setBusyServerId(serverId);
     try {
       await setMachineExecEnabled(serverId, next);
+      await refetch();
+    } catch {
+      setActionError(t('controlled_nodes.error_generic'));
+    } finally {
+      setBusyServerId(null);
+    }
+  };
+
+  const startRename = (serverId: string, displayName: string) => {
+    setActionError(null);
+    setEditingServerId(serverId);
+    setRenameValue(displayName);
+  };
+
+  const cancelRename = () => {
+    setEditingServerId(null);
+    setRenameValue('');
+  };
+
+  const onRename = async (serverId: string) => {
+    const displayName = normalizeMachineDisplayName(renameValue);
+    if (!displayName) {
+      setActionError(t('controlled_nodes.rename_invalid'));
+      return;
+    }
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await renameMachine(serverId, displayName);
+      cancelRename();
       await refetch();
     } catch {
       setActionError(t('controlled_nodes.error_generic'));
@@ -222,7 +256,37 @@ export function ControlledNodesPanel() {
               <span class="controlled-nodes-machine-rail" aria-hidden="true" />
               <div class="controlled-nodes-machine-info">
                 <div class="controlled-nodes-machine-heading">
-                  <span class="controlled-nodes-machine-name">{m.displayName}</span>
+                  {editingServerId === m.serverId ? (
+                    <div class="controlled-nodes-rename-form">
+                      <input
+                        class="controlled-nodes-rename-input"
+                        value={renameValue}
+                        maxLength={120}
+                        aria-label={t('controlled_nodes.rename_label')}
+                        onInput={(e) => setRenameValue((e.target as HTMLInputElement).value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') { e.preventDefault(); void onRename(m.serverId); }
+                          if (e.key === 'Escape') cancelRename();
+                        }}
+                      />
+                      <button
+                        type="button"
+                        class="controlled-nodes-rename-save"
+                        disabled={busyServerId === m.serverId}
+                        title={t('common.save')}
+                        onClick={() => { void onRename(m.serverId); }}
+                      >✓</button>
+                      <button
+                        type="button"
+                        class="controlled-nodes-rename-cancel"
+                        disabled={busyServerId === m.serverId}
+                        title={t('common.cancel')}
+                        onClick={cancelRename}
+                      >×</button>
+                    </div>
+                  ) : (
+                    <span class="controlled-nodes-machine-name">{m.displayName}</span>
+                  )}
                   <span class={`controlled-nodes-status ${m.online ? 'online' : 'offline'}`}>
                     <i aria-hidden="true" />
                     {m.online ? t('controlled_nodes.online') : t('controlled_nodes.offline')}
@@ -234,6 +298,13 @@ export function ControlledNodesPanel() {
                 </div>
               </div>
               <div class="controlled-nodes-machine-actions">
+                <button
+                  type="button"
+                  class="controlled-nodes-rename"
+                  disabled={busyServerId === m.serverId || editingServerId === m.serverId}
+                  title={t('common.rename')}
+                  onClick={() => startRename(m.serverId, m.displayName)}
+                >✎</button>
                 <button
                   type="button"
                   class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}

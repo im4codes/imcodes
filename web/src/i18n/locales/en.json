@@ -805,6 +805,7 @@
     "loading": "Loading…",
     "tab_quick": "Quick",
     "tab_files": "Files",
+    "tab_machines": "Nodes",
     "confirm_delete": "Delete this item?"
   },
   "file_browser": {
@@ -2703,6 +2704,8 @@
     "offline": "Offline",
     "exec_on": "Exec enabled",
     "exec_off": "Exec disabled",
+    "rename_label": "Controlled node name",
+    "rename_invalid": "Enter a name from 1 to 120 characters without control characters.",
     "revoke": "Revoke",
     "revoke_confirm": "Revoke this machine? It can no longer be controlled and must be re-enrolled."
   }

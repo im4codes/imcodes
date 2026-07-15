@@ -5188,6 +5188,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             sessionCwd={activeSession?.projectDir}
             onAppendPaths={appendToInput}
             onInsertAlias={insertAliasMarker}
+            machines={machineAll}
+            onInsertMachine={insertMachineMarker}
             anchorRef={quickWrapRef}
           />
         </div>

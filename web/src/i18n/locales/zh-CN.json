@@ -805,6 +805,7 @@
     "loading": "加载中…",
     "tab_quick": "快捷",
     "tab_files": "文件",
+    "tab_machines": "受控节点",
     "confirm_delete": "确认删除？"
   },
   "file_browser": {
@@ -2703,6 +2704,8 @@
     "offline": "离线",
     "exec_on": "已允许执行",
     "exec_off": "已禁止执行",
+    "rename_label": "受控节点名称",
+    "rename_invalid": "请输入 1–120 个字符的名称，且不能包含控制字符。",
     "revoke": "吊销",
     "revoke_confirm": "吊销这台机器?吊销后将无法再控制,需要重新注册。"
   }

@@ -14,6 +14,7 @@ import {
   type AliasReason,
 } from '@shared/alias-types.js';
 import type { WsClient } from '../ws-client.js';
+import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
 
 export interface QuickData {
@@ -419,6 +420,10 @@ interface Props {
   onAppendPaths?: (paths: string[]) => void;
   /** Insert a `;;(name)` alias marker into the composer (never the value). */
   onInsertAlias?: (name: string) => void;
+  /** Controlled nodes shown in the optional machine tab. */
+  machines?: readonly MachineListItem[];
+  /** Insert a stable `^^(refName)` marker into the composer. */
+  onInsertMachine?: (refName: string) => void;
   anchorRef?: RefObject<HTMLElement>;
 }
 
@@ -426,7 +431,7 @@ const HISTORY_PAGE_SIZE = 10;
 const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
-type QpTab = 'quick' | 'files' | 'alias';
+type QpTab = 'quick' | 'files' | 'alias' | 'machines';
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -444,7 +449,7 @@ export function QuickInputPanel({
   data, loaded,
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
-  ws, sessionCwd, onAppendPaths, onInsertAlias, anchorRef,
+  ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine, anchorRef,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -485,6 +490,11 @@ export function QuickInputPanel({
   useEffect(() => {
     if (open && activeTab === 'alias') refetchAliases();
   }, [open, activeTab, refetchAliases]);
+
+  // A removed/revoked last machine must not strand the panel on a hidden tab.
+  useEffect(() => {
+    if (activeTab === 'machines' && machines.length === 0) setActiveTab('quick');
+  }, [activeTab, machines.length]);
 
   useEffect(() => {
     if (!open || typeof window === 'undefined') return;
@@ -706,7 +716,7 @@ export function QuickInputPanel({
     <>
       <div class="qp-backdrop" onClick={onClose} />
       <div class="qp" ref={panelRef} style={panelStyle}>
-        {/* Tab bar — Quick + Alias always; Files only when a ws is available. */}
+        {/* Machine tab is present only when the account has controlled nodes. */}
         <div class="qp-tabs">
           <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
             ⚡ {t('quick_input.tab_quick')}
@@ -719,7 +729,41 @@ export function QuickInputPanel({
           <button class={`qp-tab${activeTab === 'alias' ? ' active' : ''}`} onClick={() => setActiveTab('alias')}>
             🔖 {t('alias.tab')}
           </button>
+          {machines.length > 0 && (
+            <button class={`qp-tab${activeTab === 'machines' ? ' active' : ''}`} onClick={() => setActiveTab('machines')}>
+              🖥 {t('quick_input.tab_machines')}
+            </button>
+          )}
         </div>
+
+        {/* Controlled-node tab — display names are mutable, ref names are stable. */}
+        {activeTab === 'machines' && machines.length > 0 && (
+          <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_machines')}>
+            <div class="qp-alias-hint">{t('machine.usage_hint')}</div>
+            {machines.map((machine) => (
+              <button
+                key={machine.serverId}
+                type="button"
+                class={`qp-machine-item${machine.online ? '' : ' is-offline'}`}
+                disabled={!machine.online || !onInsertMachine}
+                title={machine.online ? machine.displayName : t('machine.offline_hint')}
+                onClick={() => {
+                  if (!machine.online) return;
+                  onInsertMachine?.(machine.refName);
+                  onClose();
+                }}
+              >
+                <span class="qp-machine-item-main">
+                  <strong>{machine.displayName}</strong>
+                  <code>^^({machine.refName})</code>
+                </span>
+                <span class={`qp-machine-status ${machine.online ? 'is-online' : 'is-offline'}`}>
+                  {machine.online ? t('machine.online') : t('machine.offline')}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Files tab */}
         {activeTab === 'files' && ws && (

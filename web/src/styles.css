@@ -2215,6 +2215,55 @@ html.native-ios-mac .chat-dl-btn {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.controlled-nodes-rename-form {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+.controlled-nodes-rename-input {
+  min-width: 110px;
+  width: min(280px, 100%);
+  height: 30px;
+  padding: 5px 8px;
+  border: 1px solid rgba(34, 211, 238, 0.42);
+  border-radius: 6px;
+  outline: none;
+  background: rgba(2, 6, 23, 0.78);
+  color: #e2e8f0;
+  font: 650 12px/1.2 var(--imcodes-app-font-family);
+}
+.controlled-nodes-rename-input:focus {
+  border-color: #22d3ee;
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.13);
+}
+.controlled-nodes-rename-save,
+.controlled-nodes-rename-cancel,
+.controlled-nodes-rename {
+  display: inline-grid;
+  place-items: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid rgba(100, 116, 139, 0.28);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #94a3b8;
+  cursor: pointer;
+}
+.controlled-nodes-rename-save { border-color: rgba(45, 212, 191, 0.3); color: #5eead4; }
+.controlled-nodes-rename-cancel { color: #fda4af; }
+.controlled-nodes-rename:hover:not(:disabled),
+.controlled-nodes-rename-save:hover:not(:disabled),
+.controlled-nodes-rename-cancel:hover:not(:disabled) {
+  border-color: rgba(34, 211, 238, 0.55);
+  background: rgba(8, 145, 178, 0.15);
+  color: #cffafe;
+}
+.controlled-nodes-rename:disabled,
+.controlled-nodes-rename-save:disabled,
+.controlled-nodes-rename-cancel:disabled { cursor: not-allowed; opacity: 0.48; }
 .controlled-nodes-status {
   display: inline-flex;
   align-items: center;
@@ -4726,6 +4775,52 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: inset 0 -1px 0 rgba(34,211,238,0.32);
 }
 .qp-tab:hover:not(.active) { background: rgba(8,145,178,0.10); color: #bfdbfe; }
+.qp-machine-items {
+  display: grid;
+  gap: 7px;
+  min-height: 0;
+  padding: 10px;
+  overflow: auto;
+}
+.qp-machine-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid rgba(125, 211, 252, 0.16);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.66);
+  color: #e2e8f0;
+  text-align: left;
+  cursor: pointer;
+}
+.qp-machine-item:hover:not(:disabled) {
+  border-color: rgba(34, 211, 238, 0.48);
+  background: rgba(8, 145, 178, 0.12);
+}
+.qp-machine-item.is-offline,
+.qp-machine-item:disabled { cursor: not-allowed; opacity: 0.55; }
+.qp-machine-item-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.qp-machine-item-main strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qp-machine-item-main code { color: #67e8f9; font-size: 10px; }
+.qp-machine-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 700;
+}
+.qp-machine-status.is-online { color: #5eead4; }
+.qp-machine-status.is-offline { color: #94a3b8; }
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }

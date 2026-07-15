@@ -26,6 +26,7 @@ vi.mock('../src/hooks/useMachines.js', () => ({
 
 const setMachineExecEnabled = vi.fn(async () => {});
 const revokeMachine = vi.fn(async () => {});
+const renameMachine = vi.fn(async () => {});
 const listAvailableExecutables = vi.fn(async (): Promise<ControlledNodeAvailability> => ({
   available: ['win', 'mac', 'linux'],
   artifacts: [
@@ -40,6 +41,7 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
     ...actual,
     setMachineExecEnabled: (...a: unknown[]) => setMachineExecEnabled(...a),
     revokeMachine: (...a: unknown[]) => revokeMachine(...a),
+    renameMachine: (...a: unknown[]) => renameMachine(...a),
     listAvailableExecutables: () => listAvailableExecutables(),
   };
 });
@@ -212,6 +214,34 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(toggle!);
     await waitFor(() => expect(setMachineExecEnabled).toHaveBeenCalledWith('srv1', true));
     expect(refetch).toHaveBeenCalled();
+  });
+
+  it('renames only the mutable display name and refreshes the list', async () => {
+    machines = [machine({ serverId: 'srv-rename', refName: 'stable-ref', displayName: 'Old name' })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Old name'));
+
+    fireEvent.click(container.querySelector('.controlled-nodes-rename')!);
+    const input = container.querySelector('.controlled-nodes-rename-input') as HTMLInputElement;
+    expect(input.value).toBe('Old name');
+    fireEvent.input(input, { target: { value: 'New display name' } });
+    fireEvent.click(container.querySelector('.controlled-nodes-rename-save')!);
+
+    await waitFor(() => expect(renameMachine).toHaveBeenCalledWith('srv-rename', 'New display name'));
+    expect(refetch).toHaveBeenCalled();
+    expect(container.textContent).toContain('stable-ref');
+  });
+
+  it('rejects an invalid display name before calling the API', async () => {
+    machines = [machine({ serverId: 'srv-invalid', displayName: 'Old name' })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Old name'));
+    fireEvent.click(container.querySelector('.controlled-nodes-rename')!);
+    fireEvent.input(container.querySelector('.controlled-nodes-rename-input')!, { target: { value: '   ' } });
+    fireEvent.click(container.querySelector('.controlled-nodes-rename-save')!);
+
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.rename_invalid'));
+    expect(renameMachine).not.toHaveBeenCalled();
   });
 
   it('revoke asks for confirmation before calling the API', async () => {

@@ -174,6 +174,15 @@ export async function setMachineExecEnabled(serverId: string, enabled: boolean):
   });
 }
 
+/** Rename a controlled machine's render-only display name. */
+export async function renameMachine(serverId: string, displayName: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/display-name`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ displayName }),
+  });
+}
+
 /** Revoke a controlled machine (owner kill-switch): drops it and terminates its connection. */
 export async function revokeMachine(serverId: string): Promise<void> {
   await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/revoke`, { method: 'POST' });

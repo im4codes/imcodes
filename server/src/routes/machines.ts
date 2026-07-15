@@ -13,6 +13,10 @@ import {
   canonicalMachineOs,
   type MachineSummary,
 } from '../../../shared/remote-exec.js';
+import {
+  MACHINE_REASONS,
+  normalizeMachineDisplayName,
+} from '../../../shared/machine-reference.js';
 
 export const machinesRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -73,6 +77,36 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }
   return c.json({ machines });
+});
+
+// POST /api/machines/:serverId/display-name — owner-controlled render name.
+// `ref_name` remains immutable so existing ^^(refName) markers stay valid.
+machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({ displayName: z.string() }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const displayName = normalizeMachineDisplayName(parsed.data.displayName);
+  if (!displayName) return c.json({ error: MACHINE_REASONS.INVALID_DISPLAY_NAME }, 400);
+
+  const row = await c.env.DB.queryOne<{ previous_name: string | null }>(
+    `UPDATE servers SET display_name = $3
+       FROM (SELECT display_name AS previous_name FROM servers WHERE id = $1) prev
+      WHERE servers.id = $1 AND servers.user_id = $2 AND servers.node_role = $4 AND servers.revoked_at IS NULL
+      RETURNING prev.previous_name`,
+    [serverId, userId, displayName, NODE_ROLE.CONTROLLED],
+  );
+  if (!row) return c.json({ error: 'not_found' }, 404);
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: 'machine.rename',
+    ip,
+    details: { serverId, from: row.previous_name, to: displayName },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true, displayName });
 });
 
 // POST /api/machines/:serverId/revoke — owner kill-switch (10.3).

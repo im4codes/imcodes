@@ -805,6 +805,7 @@
     "loading": "読み込み中…",
     "tab_quick": "クイック",
     "tab_files": "ファイル",
+    "tab_machines": "管理ノード",
     "confirm_delete": "この項目を削除しますか？"
   },
   "file_browser": {
@@ -2702,6 +2703,8 @@
     "offline": "オフライン",
     "exec_on": "実行を許可",
     "exec_off": "実行を禁止",
+    "rename_label": "管理ノード名",
+    "rename_invalid": "制御文字を含まない 1～120 文字の名前を入力してください。",
     "revoke": "失効",
     "revoke_confirm": "このマシンを失効しますか?失効すると制御できなくなり、再登録が必要です。"
   }

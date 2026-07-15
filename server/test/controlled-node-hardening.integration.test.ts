@@ -14,6 +14,7 @@ import { enrollRoutes } from '../src/routes/enroll.js';
 import { machinesRoutes } from '../src/routes/machines.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE } from '../../shared/remote-exec.js';
+import { MACHINE_REASONS } from '../../shared/machine-reference.js';
 
 let db: Database;
 const hex = (n: number) => randomBytes(n).toString('hex');
@@ -132,6 +133,79 @@ describe('revocation kill-switch', () => {
       headers: { 'X-Server-Id': serverId, authorization: `Bearer ${nodeToken}` },
     });
     expect(after.status).toBe(401);
+  });
+});
+
+describe('owner-scoped machine rename', () => {
+  it('updates display_name while preserving the stable ref_name', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const owner = await fullCredential(userId);
+    const controlledId = `ctl_${hex(8)}`;
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
+       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux')`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+
+    const response = await app.request(`/api/machines/${controlledId}/display-name`, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': owner.serverId,
+        authorization: `Bearer ${owner.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ displayName: '  Office PC  ' }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, displayName: 'Office PC' });
+    expect(await db.queryOne<{ display_name: string; ref_name: string }>(
+      'SELECT display_name, ref_name FROM servers WHERE id = $1',
+      [controlledId],
+    )).toEqual({ display_name: 'Office PC', ref_name: 'stable-ref' });
+  });
+
+  it('rejects invalid names and machines owned by another account', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    await createUser(db, otherUserId);
+    const owner = await fullCredential(userId);
+    const otherOwner = await fullCredential(otherUserId);
+    const controlledId = `ctl_${hex(8)}`;
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
+       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux')`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+    const headers = {
+      'X-Server-Id': owner.serverId,
+      authorization: `Bearer ${owner.token}`,
+      'content-type': 'application/json',
+    };
+
+    for (const displayName of ['   ', `bad\u202ename`, 'x'.repeat(121)]) {
+      const response = await app.request(`/api/machines/${controlledId}/display-name`, {
+        method: 'POST', headers, body: JSON.stringify({ displayName }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: MACHINE_REASONS.INVALID_DISPLAY_NAME });
+    }
+
+    const denied = await app.request(`/api/machines/${controlledId}/display-name`, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': otherOwner.serverId,
+        authorization: `Bearer ${otherOwner.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ displayName: 'Hijacked' }),
+    });
+    expect(denied.status).toBe(404);
+    expect(await db.queryOne<{ display_name: string }>('SELECT display_name FROM servers WHERE id = $1', [controlledId]))
+      .toEqual({ display_name: 'Old name' });
   });
 });
 

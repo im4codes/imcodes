@@ -22,6 +22,7 @@ export const MACHINE_API_PATH = '/api/machines';
 /** Reason codes for machine reference resolution + exec targeting. */
 export const MACHINE_REASONS = {
   INVALID_NAME: 'machine_invalid_name',
+  INVALID_DISPLAY_NAME: 'machine_invalid_display_name',
   MACHINE_NOT_FOUND: 'machine_not_found',
   MACHINE_AMBIGUOUS: 'machine_ambiguous',
   MACHINE_OFFLINE: 'machine_offline',
@@ -118,7 +119,20 @@ export function buildResolvedMachines(
 
 // ── Server-derived identity (ref_name + display_name) ────────────────────────
 
-const CONTROL_BIDI_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+const CONTROL_BIDI_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const CONTROL_BIDI_GLOBAL_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
+/**
+ * Normalize an owner-supplied render-only machine name. The stable `ref_name`
+ * is deliberately not changed by rename operations, so existing `^^(name)`
+ * references remain valid.
+ */
+export function normalizeMachineDisplayName(raw: string): string | null {
+  const normalized = nfc(raw).trim();
+  if (!normalized || [...normalized].length > MACHINE_DISPLAY_NAME_MAX) return null;
+  if (CONTROL_BIDI_RE.test(normalized)) return null;
+  return normalized;
+}
 
 /** Sanitize an untrusted hostname to the `ref_name` allowlist (may be empty). */
 function slugifyHostname(hostname: string): string {
@@ -145,8 +159,8 @@ export function deriveRefName(hostname: string, serverId: string): string {
 
 /** Derive a render-only display name from untrusted hostname/os (control/bidi stripped). */
 export function deriveDisplayName(hostname: string, os: string): string {
-  const h = nfc(hostname).replace(CONTROL_BIDI_RE, '').trim();
-  const o = nfc(os).replace(CONTROL_BIDI_RE, '').trim();
+  const h = nfc(hostname).replace(CONTROL_BIDI_GLOBAL_RE, '').trim();
+  const o = nfc(os).replace(CONTROL_BIDI_GLOBAL_RE, '').trim();
   const combined = o ? `${h} (${o})` : h;
   return combined.slice(0, MACHINE_DISPLAY_NAME_MAX);
 }
