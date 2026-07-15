@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import WebSocket from 'ws';
@@ -971,8 +972,8 @@ export function browserExecutableCandidatesForTest(args: Record<string, unknown>
   return browserExecutableCandidates(args, platform);
 }
 
-export function browserLaunchArgsForTest(userDataDir: string, args: Record<string, unknown>, platform: BrowserPlatform, env: NodeJS.ProcessEnv): string[] {
-  return browserLaunchArgs(userDataDir, args, platform, env);
+export function browserLaunchArgsForTest(userDataDir: string, args: Record<string, unknown>, platform: BrowserPlatform, env: NodeJS.ProcessEnv, debugPort = 0): string[] {
+  return browserLaunchArgs(userDataDir, args, platform, env, debugPort);
 }
 
 function browserExecutableCandidates(args: Record<string, unknown>, platform: BrowserPlatform = process.platform): string[] {
@@ -1020,15 +1021,63 @@ async function firstExistingBrowser(args: Record<string, unknown>): Promise<stri
   throw new Error('browser_executable_not_found');
 }
 
-function browserLaunchArgs(userDataDir: string, args: Record<string, unknown>, platform: BrowserPlatform = process.platform, env: NodeJS.ProcessEnv = process.env): string[] {
+/**
+ * Reserve a concrete free loopback port for CDP.
+ *
+ * `--remote-debugging-port=0` makes Chrome pick a random port and report it
+ * ONLY through `<user-data-dir>/DevToolsActivePort`. A CONFINED browser (snap,
+ * flatpak, container) runs with a private /tmp mount namespace, so it writes
+ * that file inside its own view (e.g.
+ * `/tmp/snap-private-tmp/snap.chromium/tmp/<dir>/DevToolsActivePort`) while the
+ * launcher polls the host path — which never appears. Startup then always failed
+ * with `browser_debug_port_unavailable` even though the browser was healthy and
+ * listening. Pinning a known port removes that file dependency entirely.
+ */
+async function reserveFreePort(): Promise<number> {
+  return new Promise<number>((resolvePort, rejectPort) => {
+    const server = createServer();
+    server.once('error', rejectPort);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      server.close(() => (port ? resolvePort(port) : rejectPort(new Error('browser_debug_port_unavailable'))));
+    });
+  });
+}
+
+/**
+ * Drop the `HeadlessChrome` token headless Chrome puts in its User-Agent. Search
+ * engines and bot filters read it as an automation tell and serve a CAPTCHA
+ * instead of content. Rewriting it to `Chrome` keeps the REAL version string, so
+ * the UA stays accurate about the engine and never goes stale on browser upgrade.
+ */
+export function normalizeBrowserUserAgent(rawUserAgent: string): string {
+  return rawUserAgent.replace(/HeadlessChrome\//g, 'Chrome/');
+}
+
+function browserLaunchArgs(
+  userDataDir: string,
+  args: Record<string, unknown>,
+  platform: BrowserPlatform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  debugPort = 0,
+): string[] {
   const headless = args.headless === true
     || (platform === 'linux' && args.headless !== false && !env.DISPLAY && !env.WAYLAND_DISPLAY);
+  const explicitUserAgent = optionalStringArg(args, 'userAgent');
   const launchArgs = [
-    '--remote-debugging-port=0',
+    `--remote-debugging-port=${debugPort}`,
     `--user-data-dir=${userDataDir}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-background-networking',
+    // Drops the `navigator.webdriver` automation tell.
+    '--disable-blink-features=AutomationControlled',
+    // An explicit UA is known BEFORE launch, so pin it at the process level:
+    // there it covers every target and every request from the first byte,
+    // which a per-session CDP override cannot. Normalized either way so a
+    // caller-supplied headless UA still cannot reintroduce the tell.
+    ...(explicitUserAgent ? [`--user-agent=${normalizeBrowserUserAgent(explicitUserAgent)}`] : []),
   ];
   if (headless) launchArgs.splice(1, 0, '--headless=new');
   if (platform === 'linux') {
@@ -1095,45 +1144,118 @@ class BrowserUseController {
 
   private async start(args: Record<string, unknown>, timeoutMs: number): Promise<CdpClient> {
     const cdpEndpoint = optionalStringArg(args, 'cdpEndpoint');
-    if (cdpEndpoint) {
-      const client = new CdpClient(cdpEndpoint);
-      await client.connect(Math.min(timeoutMs, 30_000));
-      await client.call('Page.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
-      await client.call('Runtime.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
-      this.client = client;
-      return client;
-    }
+    if (cdpEndpoint) return this.attach(cdpEndpoint, args, timeoutMs);
 
     const browser = await firstExistingBrowser(args);
     this.userDataDir = await mkdtemp(join(tmpdir(), 'imcodes-browser-'));
-    const launchArgs = browserLaunchArgs(this.userDataDir, args);
-    this.child = spawn(browser, launchArgs, { windowsHide: true, stdio: 'ignore' });
-    this.child.once('exit', () => {
-      this.client?.close();
-      this.client = null;
-      this.child = null;
-    });
-    const portFile = join(this.userDataDir, 'DevToolsActivePort');
-    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
-    let port = '';
-    while (Date.now() < deadline) {
-      const text = await readFile(portFile, 'utf8').catch(() => '');
-      port = text.split(/\r?\n/)[0]?.trim() ?? '';
-      if (/^\d+$/.test(port)) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    try {
+      // Pin a known port instead of `--remote-debugging-port=0`; see
+      // `reserveFreePort` for why the DevToolsActivePort handshake is unusable
+      // for confined (snap/flatpak/container) browsers.
+      const port = await reserveFreePort();
+      const launchArgs = browserLaunchArgs(this.userDataDir, args, process.platform, process.env, port);
+      this.child = spawn(browser, launchArgs, { windowsHide: true, stdio: 'ignore' });
+      this.child.once('exit', () => {
+        this.client?.close();
+        this.client = null;
+        this.child = null;
+      });
+      const base = `http://127.0.0.1:${port}`;
+      const browserUserAgent = await this.waitForCdp(base, Date.now() + Math.min(timeoutMs, 30_000));
+      const target = await this.newPageTarget(base, optionalStringArg(args, 'url') ?? 'about:blank');
+      return await this.connectPage(target.webSocketDebuggerUrl, args, timeoutMs, browserUserAgent);
+    } catch (error) {
+      // NEVER leak the spawned browser tree: a failed startup previously left
+      // the whole chrome process group alive, holding its port and profile dir,
+      // and every retry stacked another one.
+      await this.close().catch(() => {});
+      throw error;
     }
-    if (!/^\d+$/.test(port)) throw new Error('browser_debug_port_unavailable');
-    const target = await this.newPageTarget(Number(port), optionalStringArg(args, 'url') ?? 'about:blank');
-    const client = new CdpClient(target.webSocketDebuggerUrl);
+  }
+
+  /** Attach to an already-running browser over CDP. */
+  private async attach(cdpEndpoint: string, args: Record<string, unknown>, timeoutMs: number): Promise<CdpClient> {
+    const base = `http://${new URL(cdpEndpoint).host}`;
+    const browserUserAgent = await this.waitForCdp(base, Date.now() + Math.min(timeoutMs, 10_000)).catch(() => '');
+    let endpoint = cdpEndpoint;
+    // A browser-level endpoint (`/devtools/browser/<id>`) carries only the
+    // Browser/Target domains — `Page.navigate` does not exist on it. Open a real
+    // page target so the page-level tools work against an attached browser.
+    if (/\/devtools\/browser\//.test(cdpEndpoint)) {
+      const target = await this.newPageTarget(base, optionalStringArg(args, 'url') ?? 'about:blank');
+      endpoint = target.webSocketDebuggerUrl;
+    }
+    return this.connectPage(endpoint, args, timeoutMs, browserUserAgent);
+  }
+
+  private async connectPage(
+    wsUrl: string,
+    args: Record<string, unknown>,
+    timeoutMs: number,
+    browserUserAgent: string,
+  ): Promise<CdpClient> {
+    const client = new CdpClient(wsUrl);
     await client.connect(Math.min(timeoutMs, 30_000));
     await client.call('Page.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
     await client.call('Runtime.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
+    await this.applyNormalUserAgent(client, args, browserUserAgent, timeoutMs);
     this.client = client;
     return client;
   }
 
-  private async newPageTarget(port: number, url: string): Promise<{ webSocketDebuggerUrl: string }> {
-    const response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
+  /**
+   * GUARANTEE a non-headless User-Agent on the live page, then VERIFY it.
+   *
+   * Headless Chrome advertises `HeadlessChrome/<v>`, which bot filters read as an
+   * automation tell — Google and DuckDuckGo both answer a CAPTCHA instead of
+   * content. Every step here is fail-closed on purpose:
+   *   - the UA source falls back to the page itself, so a `/json/version` that
+   *     omits the header cannot silently skip the override;
+   *   - the override is NOT swallowed — `Emulation` is the canonical domain and
+   *     `Network` its legacy alias, and both failing is a hard error;
+   *   - the result is read back from the page, so an override that reports
+   *     success but does not apply still fails loudly instead of leaving the
+   *     tell in place.
+   */
+  private async applyNormalUserAgent(
+    client: CdpClient,
+    args: Record<string, unknown>,
+    browserUserAgent: string,
+    timeoutMs: number,
+  ): Promise<void> {
+    const pageUserAgent = async (): Promise<string> => String(
+      await this.evalInPage(client, 'navigator.userAgent', timeoutMs).catch(() => '') ?? '',
+    );
+    const source = optionalStringArg(args, 'userAgent') ?? (browserUserAgent || await pageUserAgent());
+    const userAgent = normalizeBrowserUserAgent(source);
+    if (!userAgent) throw new Error('browser_user_agent_unavailable');
+    await client.call('Emulation.setUserAgentOverride', { userAgent }, Math.min(timeoutMs, 30_000))
+      .catch(() => client.call('Network.setUserAgentOverride', { userAgent }, Math.min(timeoutMs, 30_000)));
+    const effective = await pageUserAgent();
+    if (/headless/i.test(effective)) throw new Error(`browser_user_agent_override_failed:${effective}`);
+  }
+
+  /**
+   * Poll the CDP HTTP endpoint until the browser is listening, and return the
+   * User-Agent it reports. Replaces the DevToolsActivePort file handshake: the
+   * port is ours, so readiness is just "does /json/version answer".
+   */
+  private async waitForCdp(base: string, deadline: number): Promise<string> {
+    while (Date.now() < deadline) {
+      const version = await fetch(`${base}/json/version`)
+        .then(async (response) => (response.ok ? await response.json() as Record<string, unknown> : null))
+        .catch(() => null);
+      if (version) {
+        const userAgent = version['User-Agent'];
+        return typeof userAgent === 'string' ? userAgent : '';
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('browser_debug_port_unavailable');
+  }
+
+  private async newPageTarget(base: string, url: string): Promise<{ webSocketDebuggerUrl: string }> {
+    const response = await fetch(`${base}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
     if (!response.ok) throw new Error(`browser_target_failed:${response.status}`);
     const json = await response.json() as { webSocketDebuggerUrl?: unknown };
     if (typeof json.webSocketDebuggerUrl !== 'string') throw new Error('browser_target_missing_ws');

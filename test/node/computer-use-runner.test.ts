@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   browserExecutableCandidatesForTest,
   browserLaunchArgsForTest,
+  normalizeBrowserUserAgent,
   normalizeOpenComputerUseParsedResult,
   openComputerUseCallArgs,
   openComputerUseCandidateBinariesForTest,
@@ -109,5 +110,54 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(browserLaunchArgsForTest('/tmp/profile', { noSandbox: false }, 'linux', {})).not.toContain('--no-sandbox');
     expect(browserLaunchArgsForTest('/tmp/profile', {}, 'darwin', {})).not.toContain('--headless=new');
     expect(browserLaunchArgsForTest('/tmp/profile', { headless: true }, 'win32', {})).toContain('--headless=new');
+  });
+
+  it('pins the CDP port instead of relying on the DevToolsActivePort handshake', () => {
+    // `--remote-debugging-port=0` reports the chosen port ONLY through
+    // `<user-data-dir>/DevToolsActivePort`, which a confined browser (snap,
+    // flatpak, container) writes into its own private /tmp namespace — the
+    // launcher then polls a host path that never appears. Pinning a real port
+    // removes that dependency, so the arg must never be 0 again.
+    const args = browserLaunchArgsForTest('/tmp/profile', {}, 'linux', {}, 45123);
+    expect(args).toContain('--remote-debugging-port=45123');
+    expect(args).not.toContain('--remote-debugging-port=0');
+  });
+
+  it('drops the navigator.webdriver automation tell on every platform', () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      expect(browserLaunchArgsForTest('/tmp/profile', {}, platform, {}, 1234))
+        .toContain('--disable-blink-features=AutomationControlled');
+    }
+  });
+
+  it('pins an explicit user agent at launch, normalized, so no target can miss it', () => {
+    // Known before launch => set at the process level, where it covers every
+    // target/request from the first byte (a CDP override is per-session only).
+    expect(browserLaunchArgsForTest('/tmp/profile', { userAgent: 'Custom/1.0' }, 'linux', {}, 1))
+      .toContain('--user-agent=Custom/1.0');
+    // A caller-supplied headless UA must NOT be able to reintroduce the tell.
+    expect(browserLaunchArgsForTest('/tmp/profile', { userAgent: 'HeadlessChrome/150.0.0.0' }, 'linux', {}, 1))
+      .toContain('--user-agent=Chrome/150.0.0.0');
+    // Without an explicit UA the launch stays clean; the normalized browser UA
+    // is applied over CDP once the real version is known.
+    expect(browserLaunchArgsForTest('/tmp/profile', {}, 'linux', {}, 1).join(' ')).not.toContain('--user-agent=');
+  });
+});
+
+describe('computer use runner browser user agent', () => {
+  it('rewrites the HeadlessChrome automation tell while keeping the real version', () => {
+    expect(normalizeBrowserUserAgent(
+      'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36',
+    )).toBe(
+      'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+    );
+    // The version must survive verbatim — a hardcoded UA would go stale on upgrade.
+    expect(normalizeBrowserUserAgent('HeadlessChrome/151.2.3.4')).toBe('Chrome/151.2.3.4');
+  });
+
+  it('leaves an already-normal user agent untouched', () => {
+    const normal = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
+    expect(normalizeBrowserUserAgent(normal)).toBe(normal);
+    expect(normalizeBrowserUserAgent('')).toBe('');
   });
 });
