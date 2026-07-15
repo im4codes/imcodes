@@ -183,7 +183,14 @@ describe('memory MCP stdio server', () => {
       ]));
       for (const tool of listed.tools) {
         expect(tool.description).toBeTruthy();
+        // The protocol name already identifies the tool; repeating it as title
+        // costs prompt tokens without adding model-visible semantics.
+        expect(tool.title).toBeUndefined();
       }
+      // Provider tokenizers differ, so enforce the stable serialized payload
+      // size here. This keeps the fixed tools/list prompt near 5k tokens while
+      // allowing a small margin for intentional schema additions.
+      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(23_000);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {
