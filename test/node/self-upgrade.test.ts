@@ -13,6 +13,7 @@ import {
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
   startControlledNodeSelfUpgrade,
+  windowsControlledNodeUpgradeTaskXml,
 } from '../../src/node/self-upgrade.js';
 
 const dirs: string[] = [];
@@ -95,7 +96,7 @@ describe('controlled-node self-upgrade', () => {
         },
       });
     });
-    const spawned: Array<{ file: string; args: readonly string[] }> = [];
+    const scheduled: Array<{ taskName: string; taskXmlPath: string }> = [];
     const result = await startControlledNodeSelfUpgrade(credential, '2026.7.1', {
       fetchImpl: fetchImpl as unknown as typeof fetch,
       platform: 'win32',
@@ -104,11 +105,13 @@ describe('controlled-node self-upgrade', () => {
       journalPath,
       tmpdir: () => dir,
       now: () => 9,
-      spawnDetached: (file, args) => { spawned.push({ file, args }); },
+      scheduleWindowsUpgrade: (taskName, taskXmlPath) => { scheduled.push({ taskName, taskXmlPath }); },
     });
 
     expect(result).toMatchObject({ ok: true, targetVersion: '2026.7.1', artifactSha256: sha256 });
-    expect(spawned).toEqual([{ file: 'powershell.exe', args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', result.scriptPath!] }]);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0].taskName).toMatch(/^imcodes-node-upgrade-/);
+    expect(scheduled[0].taskXmlPath).toBe(join(dirname(result.scriptPath!), 'upgrade-task.xml'));
     const script = await readFile(result.scriptPath!, 'utf8');
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
@@ -116,6 +119,12 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('computer-use-helper');
     expect(script).toContain('Copy-Item -Recurse -Force -Path (Join-Path $srcHelper');
     expect(script).toContain('install-journal.json');
+    expect(script).toContain(`Unregister-ScheduledTask -TaskName '${scheduled[0].taskName}'`);
+    const taskXml = (await readFile(scheduled[0].taskXmlPath)).subarray(2).toString('utf16le');
+    expect(taskXml).toContain('<UserId>S-1-5-18</UserId>');
+    expect(taskXml).toContain('<Triggers />');
+    expect(taskXml).toContain('powershell.exe');
+    expect(taskXml).toContain(result.scriptPath!);
     const helperPath = join(dirname(result.scriptPath!), 'computer-use-helper', 'win32-x64', 'open-computer-use.exe');
     expect(await readFile(helperPath, 'utf8')).toBe('new open computer use helper');
     const nextJournal = JSON.parse(await readFile(join(dirname(result.scriptPath!), 'install-journal.json'), 'utf8')) as {
@@ -193,6 +202,13 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('*S-1-5-18:F');
     expect(script).toContain('*S-1-5-11:RX');
     expect(script).toContain('computer-use-helper');
+  });
+
+  it('escapes the one-shot upgrade script path in Task Scheduler XML', () => {
+    const xml = windowsControlledNodeUpgradeTaskXml('C:\\Windows\\Temp\\a&b<1>\\upgrade.ps1');
+    expect(xml).toContain('a&amp;b&lt;1&gt;');
+    expect(xml).toContain('<Triggers />');
+    expect(xml).toContain('<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>');
   });
 
   it.each([

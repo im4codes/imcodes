@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -16,7 +16,12 @@ import {
   type ControlledNodeOs,
 } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
-import { CONTROLLED_NODE_SERVICE, windowsComputerUseHelperAclCommands, windowsExecutableFileAclCommands } from './installer.js';
+import {
+  CONTROLLED_NODE_SERVICE,
+  encodeWindowsScheduledTaskXml,
+  windowsComputerUseHelperAclCommands,
+  windowsExecutableFileAclCommands,
+} from './installer.js';
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
 import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.js';
 
@@ -28,6 +33,7 @@ export interface ControlledNodeArtifactTarget {
 export interface ControlledNodeSelfUpgradeDeps {
   fetchImpl?: typeof fetch;
   spawnDetached?: (file: string, args: readonly string[], options: { windowsHide?: boolean }) => void;
+  scheduleWindowsUpgrade?: (taskName: string, taskXmlPath: string) => void;
   execPath?: string;
   platform?: NodeJS.Platform;
   arch?: NodeJS.Architecture;
@@ -182,6 +188,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   destinationPath: string;
   destinationManifestPath: string;
   destinationJournalPath?: string;
+  upgradeTaskName?: string;
 }): string {
   const helperDir = join(dirname(input.destinationPath), 'computer-use-helper');
   const exeAcl = windowsExecutableFileAclCommands(input.destinationPath)
@@ -190,13 +197,17 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   const helperAcl = windowsComputerUseHelperAclCommands(helperDir)
     .map(([path, ...args]) => `if (Test-Path ${psQuote(path)}) { & icacls ${psQuote(path)} ${args.map(psQuote).join(' ')} }`)
     .join('\r\n');
-  return `$ErrorActionPreference = 'Continue'\r\n`
+  const upgradeTaskCleanup = input.upgradeTaskName
+    ? `Unregister-ScheduledTask -TaskName ${psQuote(input.upgradeTaskName)} -Confirm:$false -ErrorAction SilentlyContinue\r\n`
+    : '';
+  return `$ErrorActionPreference = 'Stop'\r\n`
     + `Start-Sleep -Seconds 3\r\n`
     + `$task = ${psQuote(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
     + `$dst = ${psQuote(input.destinationPath)}\r\n`
     + `$src = ${psQuote(input.stagedArtifactPath)}\r\n`
     + `$dstManifest = ${psQuote(input.destinationManifestPath)}\r\n`
     + `$srcManifest = ${psQuote(input.stagedManifestPath)}\r\n`
+    + `try {\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + `Start-Sleep -Seconds 2\r\n`
     + `Get-CimInstance Win32_Process -Filter 'name="imcodes-node.exe"' | Where-Object { $_.CommandLine -like '*ProgramData*imcodes-node.exe*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
@@ -213,7 +224,40 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       : '')
     + exeAcl + `\r\n`
     + helperAcl + `\r\n`
-    + `Start-ScheduledTask -TaskName $task\r\n`;
+    + `} finally {\r\n`
+    + `Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
+    + upgradeTaskCleanup
+    + `}\r\n`;
+}
+
+function escapeXmlText(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+/**
+ * Run the replacement from a separate Task Scheduler job. A child PowerShell
+ * spawned by the main scheduled task remains in that task's Windows job and is
+ * killed when it stops the parent task, before it can replace the locked EXE.
+ */
+export function windowsControlledNodeUpgradeTaskXml(scriptPath: string): string {
+  const argumentsText = `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>IM.codes controlled node one-shot upgrade</Description></RegistrationInfo>
+  <Triggers />
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="System"><Exec><Command>powershell.exe</Command><Arguments>${escapeXmlText(argumentsText)}</Arguments></Exec></Actions>
+</Task>
+`;
 }
 
 export function buildPosixControlledNodeUpgradeScript(input: {
@@ -283,6 +327,21 @@ function defaultSpawnDetached(file: string, args: readonly string[], options: { 
   child.unref();
 }
 
+function defaultScheduleWindowsUpgrade(taskName: string, taskXmlPath: string): void {
+  const options = { windowsHide: true, stdio: 'ignore' as const };
+  execFileSync('schtasks.exe', ['/Create', '/TN', taskName, '/XML', taskXmlPath, '/F'], options);
+  try {
+    execFileSync('schtasks.exe', ['/Run', '/TN', taskName], options);
+  } catch (error) {
+    try {
+      execFileSync('schtasks.exe', ['/Delete', '/TN', taskName, '/F'], options);
+    } catch {
+      // Preserve the authoritative /Run failure; the triggerless task is inert.
+    }
+    throw error;
+  }
+}
+
 export async function startControlledNodeSelfUpgrade(
   credential: ControlledNodeCredential,
   rawTargetVersion: unknown,
@@ -321,6 +380,9 @@ export async function startControlledNodeSelfUpgrade(
   const scriptPath = platform === 'win32'
     ? join(updateDir, 'upgrade.ps1')
     : join(updateDir, 'upgrade.sh');
+  const windowsUpgradeTaskName = platform === 'win32'
+    ? `${CONTROLLED_NODE_SERVICE.WINDOWS_TASK}-upgrade-${randomUUID()}`
+    : undefined;
   const script = platform === 'win32'
     ? buildWindowsControlledNodeUpgradeScript({
       stagedArtifactPath: downloaded.artifactPath,
@@ -330,6 +392,7 @@ export async function startControlledNodeSelfUpgrade(
       destinationPath,
       destinationManifestPath,
       destinationJournalPath,
+      upgradeTaskName: windowsUpgradeTaskName,
     })
     : buildPosixControlledNodeUpgradeScript({
       platform: platform === 'darwin' ? 'darwin' : 'linux',
@@ -343,10 +406,13 @@ export async function startControlledNodeSelfUpgrade(
     });
   await writeFile(scriptPath, script, { mode: 0o700 });
   if (platform !== 'win32') await chmod(scriptPath, 0o700).catch(() => {});
-  const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
   if (platform === 'win32') {
-    spawnDetached('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { windowsHide: true });
+    const taskXmlPath = join(updateDir, 'upgrade-task.xml');
+    await writeFile(taskXmlPath, encodeWindowsScheduledTaskXml(windowsControlledNodeUpgradeTaskXml(scriptPath)));
+    const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? defaultScheduleWindowsUpgrade;
+    scheduleWindowsUpgrade(windowsUpgradeTaskName!, taskXmlPath);
   } else {
+    const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
     spawnDetached('/bin/sh', [scriptPath], {});
   }
   return {
