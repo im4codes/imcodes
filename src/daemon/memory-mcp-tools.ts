@@ -60,7 +60,7 @@ import {
   type ComputerUseResult,
 } from '../../shared/computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
-import { isValidMachineName, nfc } from '../../shared/machine-reference.js';
+import { isValidMachineName, isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -263,12 +263,16 @@ export type MachineExecToolSuccess = Record<string, unknown> & (
   | ({ status: 'ok'; outcome: 'spawn_error'; ok: false; exitCode: null; timedOut: false; error: string } & MachineExecTerminalFields)
 );
 
-const machineTargetRuntimeSchema = z.string().refine(isValidMachineName, {
-  message: 'must be a valid stable machine ref_name',
+const machineRefNameRuntimeSchema = z.string().refine(isValidMachineName, {
+  message: 'must be a valid bare stable machine ref_name',
+});
+
+const machineTargetRuntimeSchema = z.string().refine(isValidMachineTarget, {
+  message: 'must be a valid stable machine ref_name or complete ^^(ref_name) marker',
 });
 
 const machineSummaryShape = {
-  name: machineTargetRuntimeSchema,
+  name: machineRefNameRuntimeSchema,
   displayName: z.string().optional(),
   os: z.enum(ENROLLMENT_OSES).optional(),
   online: z.boolean(),
@@ -394,8 +398,8 @@ function stringArg(args: Record<string, unknown>, key: string): string | undefin
 }
 
 function machineArg(args: Record<string, unknown>): string | undefined {
-  const value = stringArg(args, 'machine');
-  return value && isValidMachineName(value) ? nfc(value) : undefined;
+  const value = args.machine;
+  return typeof value === 'string' ? normalizeMachineTarget(value) ?? undefined : undefined;
 }
 
 function numberArg(args: Record<string, unknown>, key: string): number | undefined {
@@ -1576,17 +1580,17 @@ const schemas = {
     includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Exact stable ref_name; use a known ^^(name) directly without list_machines preflight.'),
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker; no list_machines preflight when known.'),
     command: z.string().describe('One shell command.'),
     shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
     timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema,
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema,
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     overwrite: z.boolean().optional(),
@@ -1595,7 +1599,7 @@ const schemas = {
     topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Exact stable ref_name or local/localhost/self/this; do not preflight list_machines when known.'),
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this; do not preflight list_machines when known.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe('Method arguments.'),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),

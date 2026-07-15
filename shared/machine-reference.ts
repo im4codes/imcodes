@@ -12,8 +12,16 @@
  * characters `;():#/%` are excluded by omission) but allows a slightly longer key
  * so a sanitized hostname plus a short `serverId` suffix fits.
  */
-export const MACHINE_NAME_PATTERN = /^[\p{L}\p{N}._-]{1,40}$/u;
 export const MACHINE_REF_NAME_MAX = 40;
+const MACHINE_NAME_FRAGMENT = `[\\p{L}\\p{N}._-]{1,${MACHINE_REF_NAME_MAX}}`;
+export const MACHINE_NAME_PATTERN = new RegExp(`^${MACHINE_NAME_FRAGMENT}$`, 'u');
+/** Action-tool targets accept either a bare ref_name or its complete ^^(ref_name) marker. */
+export const MACHINE_TARGET_MAX = MACHINE_REF_NAME_MAX + 4;
+export const MACHINE_TARGET_PATTERN = new RegExp(
+  `^(?:${MACHINE_NAME_FRAGMENT}|\\^\\^\\(${MACHINE_NAME_FRAGMENT}\\))$`,
+  'u',
+);
+const MACHINE_TARGET_MARKER_PATTERN = new RegExp(`^\\^\\^\\((${MACHINE_NAME_FRAGMENT})\\)$`, 'u');
 export const MACHINE_DISPLAY_NAME_MAX = 120;
 
 /** Owner-scoped controllable-machine list endpoint (DB-backed presence, F1). */
@@ -37,6 +45,24 @@ export function nfc(input: string): string {
 /** True when `raw` is a valid machine `ref_name` (post-NFC). */
 export function isValidMachineName(raw: string): boolean {
   return MACHINE_NAME_PATTERN.test(nfc(raw));
+}
+
+/**
+ * Normalize an action-tool target to its bare stable ref_name.
+ *
+ * This deliberately accepts only a complete marker, never a marker embedded in
+ * surrounding text. List/output contracts continue to use bare ref_names only.
+ */
+export function normalizeMachineTarget(raw: string): string | null {
+  const normalized = nfc(raw);
+  if (isValidMachineName(normalized)) return normalized;
+  const marker = MACHINE_TARGET_MARKER_PATTERN.exec(normalized);
+  return marker && isValidMachineName(marker[1]) ? nfc(marker[1]) : null;
+}
+
+/** True when an action-tool target is a bare ref_name or a complete marker. */
+export function isValidMachineTarget(raw: string): boolean {
+  return normalizeMachineTarget(raw) !== null;
 }
 
 /** Build the reference marker a composer surface inserts (marker only, never a value). */

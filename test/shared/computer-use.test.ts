@@ -29,8 +29,8 @@ describe('computer use protocol', () => {
   it('uses known machine refs directly instead of prescribing list_machines preflight', () => {
     const overview = computerUseDocs('overview');
     const workflow = computerUseDocs('workflow');
-    expect(overview).toContain('pass name directly without calling list_machines first');
-    expect(workflow).toContain('use a known stable ref_name');
+    expect(overview).toContain('pass either form without calling list_machines first');
+    expect(workflow).toContain('pass either a known stable ref_name');
     expect(workflow).toContain('call list_machines only when no exact target is available');
     expect(workflow).not.toContain('list_machines to choose');
   });

@@ -133,9 +133,20 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
 
   it('tools/call exec_remote returns SDK-validated structuredContent (nonzero exit is still completed/ok)', async () => {
     const client = await connect(okDeps);
-    const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, arguments: { machine: 'win-1', command: 'whoami' } });
+    const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, arguments: { machine: '^^(win-1)', command: 'whoami' } });
     expect(res.isError).toBeFalsy();
     expect(res.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', ok: true, exitCode: 7 });
+    await client.close();
+  });
+
+  it('tools/call rejects malformed or prose-wrapped machine markers before dispatch', async () => {
+    const execRemote = vi.fn(okDeps.execRemote);
+    const client = await connect({ ...okDeps, execRemote });
+    for (const machine of [' ^^(win-1) ', 'run ^^(win-1)', '^^(na(me))', `^^(${'x'.repeat(41)})`]) {
+      const res = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE, arguments: { machine, command: 'whoami' } });
+      expect(res.isError).toBe(true);
+    }
+    expect(execRemote).not.toHaveBeenCalled();
     await client.close();
   });
 
@@ -145,7 +156,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     expect(docs.isError).toBeFalsy();
     expect(docs.structuredContent).toMatchObject({ status: 'ok', topic: 'tools' });
 
-    const call = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: { machine: 'win-1', tool: 'list_apps', arguments: {} } });
+    const call = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL, arguments: { machine: '^^(win-1)', tool: 'list_apps', arguments: {} } });
     expect(call.isError).toBeFalsy();
     expect(call.structuredContent).toMatchObject({ status: 'ok', outcome: 'completed', result: { ok: true, content: [{ text: 'apps' }] } });
 
@@ -160,14 +171,14 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     const client = await connect(okDeps);
     const sent = await client.callTool({
       name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
-      arguments: { machine: 'win-1', sourcePath: '/tmp/a.txt' },
+      arguments: { machine: '^^(win-1)', sourcePath: '/tmp/a.txt' },
     });
     expect(sent.isError).toBeFalsy();
     expect(sent.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 5, remotePath: '/var/lib/imcodes/uploads/a.txt' });
 
     const fetched = await client.callTool({
       name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
-      arguments: { machine: 'win-1', sourcePath: 'C:\\Temp\\a.txt', destinationPath: '/tmp/a.txt' },
+      arguments: { machine: '^^(win-1)', sourcePath: 'C:\\Temp\\a.txt', destinationPath: '/tmp/a.txt' },
     });
     expect(fetched.isError).toBeFalsy();
     expect(fetched.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 7, destinationPath: '/tmp/a.txt' });

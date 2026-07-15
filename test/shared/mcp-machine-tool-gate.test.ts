@@ -9,7 +9,12 @@ import {
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { NODE_ROLE, REMOTE_EXEC_SHELLS, REMOTE_EXEC_MAX_TIMEOUT_MS } from '../../shared/remote-exec.js';
-import { MACHINE_NAME_PATTERN, MACHINE_REF_NAME_MAX } from '../../shared/machine-reference.js';
+import {
+  MACHINE_NAME_PATTERN,
+  MACHINE_REF_NAME_MAX,
+  MACHINE_TARGET_MAX,
+  MACHINE_TARGET_PATTERN,
+} from '../../shared/machine-reference.js';
 
 describe('machine MCP tools join the contract surface (10.12)', () => {
   it('both tools are in the name list and have contracts', () => {
@@ -41,9 +46,13 @@ describe('machine MCP tools join the contract surface (10.12)', () => {
       const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
       const machine = contract.inputSchema.properties?.machine;
       expect(contract.description).toMatch(/without (calling )?list_machines|do not call list_machines/i);
-      expect(machine).toMatchObject({ minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source });
-      expect(machine?.description).toMatch(/exact stable|exact stable target/i);
+      expect(machine).toMatchObject({ minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source });
+      expect(machine?.description).toMatch(/bare stable ref_name/i);
+      expect(machine?.description).toMatch(/complete \^\^\(ref_name\) marker/i);
     }
+
+    const listMachine = list.outputSchema.properties?.machines?.items?.properties?.name;
+    expect(listMachine).toMatchObject({ maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source });
   });
 
   it('the shared error enum carries the machine reasons', () => {

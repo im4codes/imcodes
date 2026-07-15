@@ -42,8 +42,10 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(send).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
 
-    expect(await handlers[sendFile]({ machine: 'win', sourcePath: '/tmp/a' })).toMatchObject({ status: 'ok', remotePath: '/staging/a.txt', size: 5 });
-    expect(await handlers[fetchFile]({ machine: 'win', sourcePath: '/remote/a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ status: 'ok', destinationPath: '/tmp/a', size: 7 });
+    expect(await handlers[sendFile]({ machine: '^^(win)', sourcePath: '/tmp/a' })).toMatchObject({ status: 'ok', machine: 'win', remotePath: '/staging/a.txt', size: 5 });
+    expect(await handlers[fetchFile]({ machine: '^^(win)', sourcePath: '/remote/a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ status: 'ok', machine: 'win', destinationPath: '/tmp/a', size: 7 });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ machine: 'win' }));
+    expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ machine: 'win' }));
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ overwrite: true }));
   });
 
@@ -56,6 +58,9 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(await handlers[execRemote]({ machine: 'm', command: 'x', timeoutMs: -5 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(await handlers[execRemote]({ machine: 'm', command: 'x', timeoutMs: 999_999_999 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(await handlers[execRemote]({ machine: 'bad target', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: ' ^^(m) ', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: 'run ^^(m)', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: '^^(na(me))', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(machineDeps.execRemote).not.toHaveBeenCalled();
   });
 
@@ -87,7 +92,7 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
       },
     };
     const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
-    const r = await handlers[execRemote]({ machine: 'win', command: 'echo hi', shell: 'powershell', timeoutMs: 5000 });
+    const r = await handlers[execRemote]({ machine: '^^(win)', command: 'echo hi', shell: 'powershell', timeoutMs: 5000 });
     expect(r).toMatchObject({ status: 'ok', outcome: 'completed', ok: true, exitCode: 0, stdout: 'hi' });
   });
 
@@ -136,7 +141,7 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(await handlers[computerUseCall]({ machine: 'm', tool: 'list_apps', timeoutMs: 120_001 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(computerUse).not.toHaveBeenCalled();
 
-    expect(await handlers[computerUseCall]({ machine: 'm', tool: 'shell_session1', timeoutMs: 900_000 })).toMatchObject({ status: 'ok', outcome: 'completed' });
+    expect(await handlers[computerUseCall]({ machine: '^^(m)', tool: 'shell_session1', timeoutMs: 900_000 })).toMatchObject({ status: 'ok', outcome: 'completed' });
     expect(computerUse).toHaveBeenCalledWith(expect.objectContaining({ machine: 'm', tool: 'shell_session1', timeoutMs: 900_000 }));
     expect(await handlers[computerUseCall]({ machine: 'm', tool: 'shell_session1', timeoutMs: 900_001 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(computerUse).toHaveBeenCalledTimes(1);
