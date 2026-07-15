@@ -12,6 +12,7 @@ import {
   buildWindowsControlledNodeUpgradeScript,
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
+  scheduleWindowsControlledNodeUpgrade,
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
 } from '../../src/node/self-upgrade.js';
@@ -209,6 +210,27 @@ describe('controlled-node self-upgrade', () => {
     expect(xml).toContain('a&amp;b&lt;1&gt;');
     expect(xml).toContain('<Triggers />');
     expect(xml).toContain('<ExecutionTimeLimit>PT10M</ExecutionTimeLimit>');
+  });
+
+  it('registers and starts the one-shot task, deleting it if start fails', () => {
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    scheduleWindowsControlledNodeUpgrade('upgrade-ok', 'C:\\tmp\\upgrade.xml', (file, args) => {
+      calls.push({ file, args });
+    });
+    expect(calls).toEqual([
+      { file: 'schtasks.exe', args: ['/Create', '/TN', 'upgrade-ok', '/XML', 'C:\\tmp\\upgrade.xml', '/F'] },
+      { file: 'schtasks.exe', args: ['/Run', '/TN', 'upgrade-ok'] },
+    ]);
+
+    const failedCalls: Array<{ file: string; args: readonly string[] }> = [];
+    expect(() => scheduleWindowsControlledNodeUpgrade('upgrade-fail', 'C:\\tmp\\upgrade.xml', (file, args) => {
+      failedCalls.push({ file, args });
+      if (args[0] === '/Run') throw new Error('run failed');
+    })).toThrow('run failed');
+    expect(failedCalls.at(-1)).toEqual({
+      file: 'schtasks.exe',
+      args: ['/Delete', '/TN', 'upgrade-fail', '/F'],
+    });
   });
 
   it.each([

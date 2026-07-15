@@ -327,14 +327,19 @@ function defaultSpawnDetached(file: string, args: readonly string[], options: { 
   child.unref();
 }
 
-function defaultScheduleWindowsUpgrade(taskName: string, taskXmlPath: string): void {
-  const options = { windowsHide: true, stdio: 'ignore' as const };
-  execFileSync('schtasks.exe', ['/Create', '/TN', taskName, '/XML', taskXmlPath, '/F'], options);
+export function scheduleWindowsControlledNodeUpgrade(
+  taskName: string,
+  taskXmlPath: string,
+  runCommand: (file: string, args: readonly string[]) => void = (file, args) => {
+    execFileSync(file, [...args], { windowsHide: true, stdio: 'ignore' });
+  },
+): void {
+  runCommand('schtasks.exe', ['/Create', '/TN', taskName, '/XML', taskXmlPath, '/F']);
   try {
-    execFileSync('schtasks.exe', ['/Run', '/TN', taskName], options);
+    runCommand('schtasks.exe', ['/Run', '/TN', taskName]);
   } catch (error) {
     try {
-      execFileSync('schtasks.exe', ['/Delete', '/TN', taskName, '/F'], options);
+      runCommand('schtasks.exe', ['/Delete', '/TN', taskName, '/F']);
     } catch {
       // Preserve the authoritative /Run failure; the triggerless task is inert.
     }
@@ -409,7 +414,7 @@ export async function startControlledNodeSelfUpgrade(
   if (platform === 'win32') {
     const taskXmlPath = join(updateDir, 'upgrade-task.xml');
     await writeFile(taskXmlPath, encodeWindowsScheduledTaskXml(windowsControlledNodeUpgradeTaskXml(scriptPath)));
-    const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? defaultScheduleWindowsUpgrade;
+    const scheduleWindowsUpgrade = deps.scheduleWindowsUpgrade ?? scheduleWindowsControlledNodeUpgrade;
     scheduleWindowsUpgrade(windowsUpgradeTaskName!, taskXmlPath);
   } else {
     const spawnDetached = deps.spawnDetached ?? defaultSpawnDetached;
