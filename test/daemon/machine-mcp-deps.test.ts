@@ -100,6 +100,57 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(r).toMatchObject({ outcome: 'completed', result: { ok: true, content: [{ text: 'ran:get_app_state@srv-win' }] } });
   });
 
+
+  it('computer-use local target runs on the imcodes daemon host even when unbound', async () => {
+    const localComputerUse = vi.fn(async ({ tool }: { tool: string }) => ({
+      outcome: 'completed' as const,
+      result: {
+        correlationId: 'local-cu-12345678',
+        ok: true,
+        tool,
+        content: [{ type: 'text' as const, text: `local:${tool}` }],
+        durationMs: 4,
+      },
+    }));
+    const remoteComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => null,
+      computerUseCall: remoteComputerUse as never,
+      localComputerUseCall: localComputerUse as never,
+    });
+    const r = await deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' });
+    expect(localComputerUse).toHaveBeenCalledWith(expect.objectContaining({ tool: 'list_apps' }));
+    expect(remoteComputerUse).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ outcome: 'completed', result: { content: [{ text: 'local:list_apps' }] } });
+  });
+
+  it('computer-use local aliases include the daemon serverId and do not resolve through remote machines', async () => {
+    const localComputerUse = vi.fn(async ({ tool, arguments: args }: { tool: string; arguments?: Record<string, unknown> }) => ({
+      outcome: 'completed' as const,
+      result: {
+        correlationId: 'local-cu-abcdefgh',
+        ok: true,
+        tool,
+        content: [{ type: 'text' as const, text: `local:${String(args?.app ?? '')}` }],
+        durationMs: 5,
+      },
+    }));
+    const listMachines = vi.fn(async () => [m({ serverId: 'remote', refName: 'remote' })]);
+    const remoteComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines,
+      execRemote: async () => ({ outcome: 'completed' }),
+      computerUseCall: remoteComputerUse as never,
+      localComputerUseCall: localComputerUse as never,
+    });
+    const r = await deps.computerUseCall?.({ machine: creds.serverId, tool: 'get_app_state', arguments: { app: 'chrome' } });
+    expect(localComputerUse).toHaveBeenCalledWith(expect.objectContaining({ tool: 'get_app_state', arguments: { app: 'chrome' } }));
+    expect(listMachines).not.toHaveBeenCalled();
+    expect(remoteComputerUse).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ outcome: 'completed', result: { content: [{ text: 'local:chrome' }] } });
+  });
+
   it('offline target → exec_offline (retry-safe, not confused with a command failure)', async () => {
     const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'sleepy', online: false })], execRemote: exec });

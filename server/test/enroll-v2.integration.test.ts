@@ -89,6 +89,8 @@ beforeEach(async () => {
   for (const e of entries) {
     if (e.endsWith('.manifest.json')) {
       await rm(join(exeDir, e), { force: true });
+    } else if (e === 'computer-use-helper') {
+      await rm(join(exeDir, e), { recursive: true, force: true });
     }
   }
   await writeManifest('imcodes-node-linux', 'linux', 'x64');
@@ -1141,6 +1143,17 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(response.status).toBe(200);
     expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_BINARY));
     expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_BINARY);
+
+    const helperBytes = Buffer.from('FAKE_OPEN_COMPUTER_USE_HELPER');
+    await mkdir(join(exeDir, 'computer-use-helper', 'win32-x64'), { recursive: true });
+    await writeFile(join(exeDir, 'computer-use-helper', 'win32-x64', 'open-computer-use.exe'), helperBytes);
+    const helperResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64&asset=computer-use-helper`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(helperResponse.status).toBe(200);
+    expect(helperResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('open-computer-use.exe');
+    expect(helperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(helperBytes));
+    expect(Buffer.from(await helperResponse.arrayBuffer())).toEqual(helperBytes);
   });
 
   it('rejects full daemon tokens and platform mismatches', async () => {

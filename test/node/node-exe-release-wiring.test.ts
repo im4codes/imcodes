@@ -11,6 +11,8 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts');
     expect(workflow).toContain('imcodes-node-linux imcodes-node-macos imcodes-node.exe');
     expect(workflow).toContain('dist-node-exe/${{ matrix.artifact }}.manifest.json');
+    expect(workflow).toContain('dist-node-exe/computer-use-helper/**');
+    expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
   });
 
   it('copies the artifacts into the image and configures the serving directory', () => {
@@ -40,5 +42,16 @@ describe('controlled-node executable release wiring', () => {
     expect(buildScript).toContain('verifyOfficialNodeArtifact');
     expect(buildScript).not.toContain("sh('npx', ['-y', 'postject'");
     expect(packageJson.devDependencies?.postject).toBe('1.0.0-alpha.6');
+  });
+
+  it('self-hosts the Computer Use helper from a pinned npm package during CI builds', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as { devDependencies?: Record<string, string> };
+    const copyScript = readFileSync('scripts/copy-computer-use-helper.mjs', 'utf8');
+    const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
+
+    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.2.0');
+    expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
+    expect(copyScript).toContain('Open Computer Use.app');
+    expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
   });
 });

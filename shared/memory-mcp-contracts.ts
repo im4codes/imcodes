@@ -527,9 +527,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'Invoke typed Computer Use through controlled-node IPC. Use exec_remote for session-0/SYSTEM shell and shell_session1 for the active user. For GUI actions, read the relevant computer_use_docs topic, then get_app_state before acting. FULL nodes only.',
+    description: 'Invoke typed Computer Use either on this imcodes daemon host (machine=local/localhost/self/this) or through controlled-node IPC for a list_machines target. Use exec_remote for session-0/SYSTEM shell and shell_session1 for the active user. For element/index GUI actions, read computer_use_docs and call get_app_state first; known coordinate clicks can use the fast path directly. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Target machine ref_name from list_machines.'),
+      machine: stringSchema('Target machine ref_name from list_machines, or local/localhost/self/this for this imcodes daemon host.'),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
       arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes.`, additionalProperties: true },
       timeoutMs: numberSchema(`Optional timeout in ms, in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_MAX_TIMEOUT_MS }),

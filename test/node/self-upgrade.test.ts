@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
-import { CONTROLLED_NODE_ARTIFACT_HEADERS, CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from '../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_ARTIFACT_ASSETS, CONTROLLED_NODE_ARTIFACT_HEADERS, CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from '../../shared/controlled-node-artifacts.js';
 import {
   buildWindowsControlledNodeUpgradeScript,
   controlledNodeArtifactTarget,
@@ -35,6 +35,8 @@ describe('controlled-node self-upgrade', () => {
   it('builds the node-token artifact URL with serverId, os, and arch', () => {
     const url = controlledNodeArtifactUpgradeUrl(credential, { os: 'win', arch: 'x64' });
     expect(url).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64`);
+    const helperUrl = controlledNodeArtifactUpgradeUrl(credential, { os: 'win', arch: 'x64' }, CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER);
+    expect(helperUrl).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64&asset=computer-use-helper`);
   });
 
   it('downloads, verifies sha256, writes a staged artifact, and spawns a detached Windows upgrader', async () => {
@@ -42,6 +44,8 @@ describe('controlled-node self-upgrade', () => {
     dirs.push(dir);
     const bytes = Buffer.from('new controlled node exe');
     const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const helperBytes = Buffer.from('new open computer use helper');
+    const helperSha256 = createHash('sha256').update(helperBytes).digest('hex');
     const journalPath = join(dir, 'install-journal.json');
     await writeFile(journalPath, JSON.stringify({
       version: 1,
@@ -67,6 +71,16 @@ describe('controlled-node self-upgrade', () => {
     const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
       expect(url).toContain(CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH);
       expect(init?.headers).toMatchObject({ Authorization: 'Bearer secret-token', 'X-Server-Id': 'srv-1' });
+      if (url.includes('asset=computer-use-helper')) {
+        return new Response(helperBytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: helperSha256,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(helperBytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'open-computer-use.exe',
+          },
+        });
+      }
       return new Response(bytes, {
         status: 200,
         headers: {
@@ -94,7 +108,11 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
     expect(script).toContain('Copy-Item -Force $src $dst');
+    expect(script).toContain('computer-use-helper');
+    expect(script).toContain('Copy-Item -Recurse -Force -Path (Join-Path $srcHelper');
     expect(script).toContain('install-journal.json');
+    const helperPath = join(dirname(result.scriptPath!), 'computer-use-helper', 'win32-x64', 'open-computer-use.exe');
+    expect(await readFile(helperPath, 'utf8')).toBe('new open computer use helper');
     const nextJournal = JSON.parse(await readFile(join(dirname(result.scriptPath!), 'install-journal.json'), 'utf8')) as {
       updatedAt: number;
       stagedReceipt: { path: string; size: number; sha256: string; stagedIdentity: { size: number } };

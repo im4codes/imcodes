@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -48,6 +48,12 @@ function writeFixture(dir: string, overrides: Record<string, unknown> = {}) {
   const manifestPath = join(dir, `${fileName}.manifest.json`);
   writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
   return { artifactPath: join(dir, fileName), manifestPath };
+}
+
+function writeLinuxHelperFixture(dir: string): void {
+  const helperDir = join(dir, 'computer-use-helper', 'linux-x64');
+  mkdirSync(helperDir, { recursive: true });
+  writeFileSync(join(helperDir, 'open-computer-use'), 'helper');
 }
 
 function verify(manifestPath: string, dir: string): void {
@@ -114,10 +120,27 @@ describe('controlled-node executable artifact verification', () => {
   it('rejects a release set whose manifest commit differs from GITHUB_SHA', () => {
     const dir = tempDir();
     writeFixture(dir);
+    writeLinuxHelperFixture(dir);
     expect(() => execFileSync(
       process.execPath,
       [verifier, 'verify-set', dir, 'imcodes-node-linux'],
       { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'c'.repeat(40) } },
     )).toThrow();
+  });
+
+  it('requires the Computer Use helper sidecar in a release set', () => {
+    const dir = tempDir();
+    writeFixture(dir);
+    expect(() => execFileSync(
+      process.execPath,
+      [verifier, 'verify-set', dir, 'imcodes-node-linux'],
+      { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'a'.repeat(40) } },
+    )).toThrow(/Computer Use helper/);
+    writeLinuxHelperFixture(dir);
+    expect(() => execFileSync(
+      process.execPath,
+      [verifier, 'verify-set', dir, 'imcodes-node-linux'],
+      { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'a'.repeat(40) } },
+    )).not.toThrow();
   });
 });

@@ -5,6 +5,7 @@
 // ambiguous, exec-disabled, or offline target returns a typed shared MCP error
 // reason (never a hang, never a silent retarget). All I/O is injectable so the
 // resolution logic is unit-testable without disk or network.
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +13,8 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { execRemote as clientExecRemote, listMachines as clientListMachines, MachineControlPlaneError } from './machine-exec-client.js';
 import { computerUseCall as clientComputerUseCall } from './computer-use-client.js';
-import type { MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
+import { runComputerUseTool } from '../node/computer-use-runner.js';
+import type { ComputerUseToolResult, MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
 
 export interface DaemonCredential {
   serverUrl: string;
@@ -37,6 +39,25 @@ export interface DaemonMachineToolDepsOverrides {
   listMachines?: typeof clientListMachines;
   execRemote?: typeof clientExecRemote;
   computerUseCall?: typeof clientComputerUseCall;
+  localComputerUseCall?: (input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
+}
+
+const LOCAL_COMPUTER_USE_ALIASES = new Set(['local', 'localhost', 'self', 'this']);
+
+function isLocalComputerUseTarget(machine: string, creds: DaemonCredential | null): boolean {
+  const normalized = machine.trim().toLowerCase();
+  return LOCAL_COMPUTER_USE_ALIASES.has(normalized) || Boolean(creds?.serverId && machine === creds.serverId);
+}
+
+async function defaultLocalComputerUseCall(input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }): Promise<ComputerUseToolResult> {
+  if (input.signal?.aborted) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, error: 'computer use call aborted' };
+  const result = await runComputerUseTool({
+    correlationId: `local-${randomBytes(12).toString('hex')}`,
+    tool: input.tool,
+    ...(input.arguments ? { arguments: input.arguments } : {}),
+    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+  });
+  return { outcome: result.ok ? 'completed' : 'tool_error', result };
 }
 
 /** Build the FULL-node machine tool deps from the daemon's own credential. */
@@ -45,6 +66,7 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
   const list = overrides.listMachines ?? clientListMachines;
   const exec = overrides.execRemote ?? clientExecRemote;
   const computerUse = overrides.computerUseCall ?? clientComputerUseCall;
+  const localComputerUse = overrides.localComputerUseCall ?? defaultLocalComputerUseCall;
 
   const toSummary = (m: Awaited<ReturnType<typeof clientListMachines>>[number]): MachineSummaryForTool => ({
     name: m.refName,
@@ -106,6 +128,14 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
 
     async computerUseCall({ machine, tool, arguments: args, timeoutMs, signal }) {
       const creds = await load();
+      if (isLocalComputerUseTarget(machine, creds)) {
+        return localComputerUse({
+          tool,
+          ...(args ? { arguments: args } : {}),
+          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          ...(signal ? { signal } : {}),
+        });
+      }
       if (!creds) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
       let all: Awaited<ReturnType<typeof list>>;
       try {

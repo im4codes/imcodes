@@ -72,7 +72,12 @@ export function createControlledNodeRuntime(
     onOpen: () => {
       client.send({ type: 'heartbeat', daemonVersion: DAEMON_VERSION });
     },
-    onClose: () => { worker.abortAll(); computerUseWorker.abortAll(); },
+    onClose: () => {
+      worker.abortAll();
+      // Keep Computer Use warm across daemon websocket reconnects. The helper owns
+      // long-lived OCU/MCP and fast-click subprocesses after first use; closing it
+      // here would make every transient network reconnect pay the cold-start cost.
+    },
     onMessage: async (raw) => {
       let message: Record<string, unknown>;
       try {

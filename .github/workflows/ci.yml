@@ -11,6 +11,7 @@ on:
 env:
   NODE_VERSION_PRIMARY: '24'
   NODE_VERSION_SERVER: '22'
+  IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'
 
 jobs:
   # ── Lint ──────────────────────────────────────────────────────────────────
@@ -626,6 +627,7 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/computer-use-helper/**
           if-no-files-found: error
           retention-days: 30
 

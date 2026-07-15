@@ -117,6 +117,11 @@ async function main() {
 
   const { size } = await stat(outPath);
   const buildCommit = process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+  // Copy the platform Computer Use helper as a sidecar artifact when available.
+  // It is not injected into the SEA binary: the helper is an independently
+  // signed/native executable and should remain replaceable/verifiable.
+  sh(process.execPath, [join(root, 'scripts', 'copy-computer-use-helper.mjs'), '--node-exe']);
+
   const manifestPath = `${outPath}${NODE_EXE_MANIFEST_SUFFIX}`;
   const manifest = await createNodeExeManifest({
     artifactPath: outPath,

@@ -20,6 +20,7 @@ permissions:
 
 env:
   NODE_VERSION_PRIMARY: '24'
+  IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'
 
 jobs:
   build:
@@ -56,5 +57,6 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/computer-use-helper/**
           if-no-files-found: error
           retention-days: 30

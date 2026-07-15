@@ -1,7 +1,8 @@
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
-import { type FileHandle } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { lstat, open, type FileHandle } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { join } from 'node:path';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { randomHex, sha256Hex, encryptBotConfig, decryptBotConfig } from '../security/crypto.js';
@@ -12,6 +13,7 @@ import { NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '.
 import { deriveRefName, deriveDisplayName } from '../../../shared/machine-reference.js';
 import {
   isCanonicalControlledNodePair,
+  CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   isControlledNodeArch,
   isControlledNodeOs,
@@ -577,7 +579,72 @@ const NODE_ARTIFACT_QUERY = z.object({
   serverId: z.string().min(1).max(128),
   os: z.string(),
   arch: z.string(),
+  asset: z.enum([CONTROLLED_NODE_ARTIFACT_ASSETS.NODE, CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER])
+    .default(CONTROLLED_NODE_ARTIFACT_ASSETS.NODE),
 }).strict();
+
+function controlledNodeRuntimePlatform(os: ControlledNodeOs): 'win32' | 'darwin' | 'linux' {
+  if (os === 'win') return 'win32';
+  if (os === 'mac') return 'darwin';
+  return 'linux';
+}
+
+function controlledNodeComputerUseHelperFilename(os: ControlledNodeOs): string {
+  return os === 'win' ? 'open-computer-use.exe' : 'open-computer-use';
+}
+
+async function openComputerUseHelperArtifact(
+  dir: string,
+  os: ControlledNodeOs,
+  arch: ControlledNodeArch,
+): Promise<{
+  handle: FileHandle;
+  close: () => Promise<void>;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+} | null> {
+  const filename = controlledNodeComputerUseHelperFilename(os);
+  const path = join(dir, 'computer-use-helper', `${controlledNodeRuntimePlatform(os)}-${arch}`, filename);
+  let handle: FileHandle | null = null;
+  try {
+    const pathStat = await lstat(path);
+    if (!pathStat.isFile() || pathStat.isSymbolicLink()) return null;
+    handle = await open(path, 'r');
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size !== pathStat.size || stat.mtimeMs !== pathStat.mtimeMs || stat.ctimeMs !== pathStat.ctimeMs) {
+      await handle.close();
+      handle = null;
+      return null;
+    }
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < stat.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - position), position);
+      if (bytesRead <= 0) throw new Error('short_read');
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    let closed = false;
+    const pinned = handle;
+    handle = null;
+    return {
+      handle: pinned,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await pinned.close().catch(() => {});
+      },
+      filename,
+      sizeBytes: stat.size,
+      sha256: hash.digest('hex'),
+    };
+  } catch {
+    await handle?.close().catch(() => {});
+    return null;
+  }
+}
 
 /**
  * GET /api/enroll/v2/node-artifact — runtime self-upgrade download for an
@@ -597,9 +664,10 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     serverId: c.req.query('serverId') ?? c.req.header('X-Server-Id') ?? '',
     os: c.req.query('os') ?? '',
     arch: c.req.query('arch') ?? '',
+    asset: c.req.query('asset') ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
   });
   if (!parsed.success) return c.json({ error: 'invalid_query' }, 400);
-  const { serverId, os, arch } = parsed.data;
+  const { serverId, os, arch, asset } = parsed.data;
   if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isCanonicalControlledNodePair(os, arch)) {
     return c.json({ error: 'invalid_query' }, 400);
   }
@@ -625,6 +693,21 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
 
   const dir = process.env.IMCODES_NODE_EXE_DIR;
   if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER) {
+    const openedHelper = await openComputerUseHelperArtifact(dir, os, arch);
+    if (!openedHelper) return c.json({ error: 'computer_use_helper_not_built', os, arch }, 503);
+    c.header('Content-Length', String(openedHelper.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedHelper.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedHelper.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedHelper.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedHelper.filename);
+    return c.body(buildBareArtifactStream(openedHelper.handle, openedHelper.sizeBytes, openedHelper.close) as unknown as ReadableStream, 200);
+  }
   const v = await artifactCatalog.ensureVerified(dir, os, arch);
   if (!v.ok) return c.json({ error: 'executable_not_built', os, arch }, 503);
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});

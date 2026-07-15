@@ -79,6 +79,11 @@ export const CONTROLLED_NODE_MINT_ERRORS = {
 /** Controlled node runtime self-upgrade artifact endpoint (node-token authenticated). */
 export const CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH = '/api/enroll/v2/node-artifact' as const;
 
+export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
+  NODE: 'node',
+  COMPUTER_USE_HELPER: 'computer-use-helper',
+} as const;
+
 export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SHA256: 'x-imcodes-node-artifact-sha256',
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',

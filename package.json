@@ -24,7 +24,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs && node scripts/build-manifest.mjs",
+    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/copy-computer-use-helper.mjs --dist && node scripts/mark-bin-executable.mjs && node scripts/build-manifest.mjs",
     "prepack": "node scripts/strip-onnxruntime-gpu.mjs",
     "postpack": "node scripts/restore-package-json-after-pack.mjs",
     "dev": "tsx src/index.ts",
@@ -86,6 +86,7 @@
     "husky": "^9.1.7",
     "jsdom": "^28.1.0",
     "lint-staged": "^16.3.4",
+    "open-computer-use": "0.2.0",
     "postject": "1.0.0-alpha.6",
     "tsx": "^4.19.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",

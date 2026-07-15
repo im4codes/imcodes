@@ -18,6 +18,11 @@ const EXPECTED_OS_BY_ARTIFACT = new Map([
   ['imcodes-node-macos', 'darwin'],
   ['imcodes-node.exe', 'win32'],
 ]);
+const EXPECTED_HELPER_BY_ARTIFACT = new Map([
+  ['imcodes-node-linux', ['computer-use-helper', 'linux-x64', 'open-computer-use']],
+  ['imcodes-node-macos', ['computer-use-helper', 'darwin-arm64', 'open-computer-use']],
+  ['imcodes-node.exe', ['computer-use-helper', 'win32-x64', 'open-computer-use.exe']],
+]);
 
 export async function sha256File(path) {
   const hash = createHash('sha256');
@@ -157,6 +162,14 @@ export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNa
     if (toolchainKey !== expectedToolchain) throw new Error(`controlled-node artifacts were built with inconsistent toolchains: ${fileName}`);
     expectedCommit ??= manifest.build.commit;
     if (manifest.build.commit !== expectedCommit) throw new Error(`controlled-node artifact commit mismatch for ${fileName}: expected ${expectedCommit}, got ${manifest.build.commit}`);
+    const helperRelativePath = EXPECTED_HELPER_BY_ARTIFACT.get(fileName);
+    if (helperRelativePath) {
+      const helperPath = join(artifactDirectory, ...helperRelativePath);
+      const helper = await stat(helperPath).catch(() => null);
+      if (!helper?.isFile() || helper.size <= 0) {
+        throw new Error(`controlled-node Computer Use helper is missing or empty for ${fileName}: ${helperPath}`);
+      }
+    }
   }
 }
 

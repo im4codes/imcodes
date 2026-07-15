@@ -33,6 +33,7 @@ export const COMPUTER_USE_MAX_ARGUMENT_BYTES = 64 * 1024;
 export const COMPUTER_USE_MAX_TEXT_BYTES = 256 * 1024;
 export const COMPUTER_USE_MAX_IMAGE_BASE64_BYTES = 2 * 1024 * 1024;
 export const COMPUTER_USE_MAX_ERROR_BYTES = 8 * 1024;
+export const COMPUTER_USE_IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const;
 export const COMPUTER_USE_HTTP_PROTOCOL = 'imcodes.computer_use.http.v1' as const;
 export const COMPUTER_USE_HTTP_ENVELOPE_VERSION = 1 as const;
 export const COMPUTER_USE_HTTP_RESPONSE_MAX_BYTES =
@@ -123,7 +124,9 @@ function isContentItem(value: unknown): value is ComputerUseContentItem {
     if (typeof value.text !== 'string') return false;
     return utf8ByteLength(value.text) <= COMPUTER_USE_MAX_TEXT_BYTES;
   }
-  if (typeof value.data !== 'string' || value.mimeType !== 'image/png') return false;
+  if (typeof value.data !== 'string'
+    || typeof value.mimeType !== 'string'
+    || !(COMPUTER_USE_IMAGE_MIME_TYPES as readonly string[]).includes(value.mimeType)) return false;
   return utf8ByteLength(value.data) <= COMPUTER_USE_MAX_IMAGE_BASE64_BYTES;
 }
 
@@ -237,18 +240,18 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
   switch (topic) {
     case 'overview':
       return [
-        'Computer Use controls GUI apps on a controlled machine through a typed IPC helper running in the active user desktop session.',
+        'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
-        'Target machines are addressed by list_machines name/ref_name. Results are bounded text/image MCP-style content.',
+        'Target machines are addressed by list_machines name/ref_name; on full imcodes daemons, use machine=local/localhost/self/this to control the daemon host directly. Results are bounded text/image MCP-style content.',
       ].join('\n');
     case 'workflow':
       return [
         'Recommended workflow:',
-        '1. list_machines to choose an online execEnabled controlled node.',
+        '1. Use machine=local/localhost/self/this for the current imcodes daemon host, or list_machines to choose an online execEnabled controlled node.',
         '2. computer_use_docs for the relevant topic/tool details only.',
         '3. computer_use_call tool=list_apps to discover app ids.',
-        '4. computer_use_call tool=get_app_state before each UI action.',
-        '5. Prefer element/index based actions over coordinates when available; verify after each action.',
+        '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
+        '5. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
       ].join('\n');
     case 'tools':
       return [
@@ -258,7 +261,8 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'get_app_state: inspect one app/window accessibility tree.',
         'click, perform_secondary_action, scroll, drag: pointer/UI actions.',
         'type_text, press_key, set_value: keyboard/value actions.',
-        'Arguments are the upstream open-computer-use tool arguments; call get_app_state first to find app ids and element indexes.',
+        'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; pure coordinate click may skip state and uses a Windows fast path when possible.',
+        'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
       ].join('\n');
     case 'windows':
       return [

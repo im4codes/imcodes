@@ -51,6 +51,7 @@ import {
   COMPUTER_USE_MAX_TEXT_BYTES,
   COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
   COMPUTER_USE_MAX_ERROR_BYTES,
+  COMPUTER_USE_IMAGE_MIME_TYPES,
   computerUseDocs,
   type ComputerUseDocTopic,
   type ComputerUseToolName,
@@ -305,7 +306,7 @@ const machineExecDependencyResultSchema = z.discriminatedUnion('outcome', [
 
 const computerUseContentItemSchema = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('text'), text: boundedUtf8String(COMPUTER_USE_MAX_TEXT_BYTES) }),
-  z.strictObject({ type: z.literal('image'), data: boundedUtf8String(COMPUTER_USE_MAX_IMAGE_BASE64_BYTES), mimeType: z.literal('image/png') }),
+  z.strictObject({ type: z.literal('image'), data: boundedUtf8String(COMPUTER_USE_MAX_IMAGE_BASE64_BYTES), mimeType: z.enum(COMPUTER_USE_IMAGE_MIME_TYPES) }),
 ]);
 
 const computerUseResultSchema = z.strictObject({
@@ -1517,7 +1518,7 @@ const schemas = {
     topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
-    machine: z.string().describe('list_machines name/ref_name.'),
+    machine: z.string().describe('list_machines name/ref_name, or local/localhost/self/this for this imcodes daemon host.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe('Method arguments.'),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
