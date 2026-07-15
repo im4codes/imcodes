@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   browserExecutableCandidatesForTest,
   browserLaunchArgsForTest,
+  isFastWindowsCoordinatePointerActionForTest,
   normalizeBrowserUserAgent,
   normalizeOpenComputerUseParsedResult,
   openComputerUseCallArgs,
@@ -94,16 +95,35 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(openComputerUseEnv('type_text', { PATH: 'x' }, 'darwin')).toBeUndefined();
   });
 
-  it('makes the Windows fast coordinate-click process per-monitor DPI-aware before geometry calls', () => {
+  it('makes Windows fast coordinate pointer actions per-monitor DPI-aware before geometry calls', () => {
     const source = readFileSync('src/node/computer-use-runner.ts', 'utf8');
-    const setAwareness = source.indexOf('[void][ImcodesFastClick]::SetProcessDpiAwareness(2)');
+    const setAwareness = source.indexOf('[void][ImcodesFastPointer]::SetProcessDpiAwareness(2)');
     const ready = source.indexOf('[Console]::Out.WriteLine(\'{"ready":true}\')');
-    const windowRectUse = source.indexOf('[ImcodesFastClick]::GetWindowRect($p.MainWindowHandle');
+    const windowRectUse = source.indexOf('[ImcodesFastPointer]::GetWindowRect($p.MainWindowHandle');
 
     expect(source).toContain('[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int awareness);');
     expect(setAwareness).toBeGreaterThan(-1);
     expect(setAwareness).toBeLessThan(ready);
     expect(setAwareness).toBeLessThan(windowRectUse);
+    expect(source).toContain("action: 'drag'");
+    expect(source).toContain("if ([string]$payload.action -eq 'drag')");
+    expect(source).toContain('[ImcodesFastPointer]::SetCursorPos($x, $y)');
+    expect(source).toContain('[ImcodesFastPointer]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)');
+    expect(isFastWindowsCoordinatePointerActionForTest('drag', {
+      app: 'TabFlow64',
+      from_x: 500,
+      from_y: 437,
+      to_x: 500,
+      to_y: 395,
+    }, 'win32')).toBe(true);
+    expect(isFastWindowsCoordinatePointerActionForTest('drag', {
+      app: 'TabFlow64',
+      from_x: 500,
+      from_y: 437,
+      to_x: 500,
+      to_y: 395,
+      includeState: true,
+    }, 'win32')).toBe(true);
   });
 
   it('selects browser executables across Windows, macOS, and Linux with channel filtering', () => {

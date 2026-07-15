@@ -410,38 +410,53 @@ async function compressImageBase64(data: string, options: ComputerUseReturnOptio
 }
 
 
-function isFastWindowsCoordinateClick(tool: ComputerUseToolName, args: Record<string, unknown>): boolean {
-  return process.platform === 'win32'
-    && tool === 'click'
-    && typeof args.app === 'string'
-    && args.app.trim().length > 0
-    && typeof args.x === 'number'
-    && Number.isFinite(args.x)
-    && typeof args.y === 'number'
-    && Number.isFinite(args.y)
-    && args.element_index === undefined
-    && args.includeState !== true
-    && args.includeImage !== true;
+export function isFastWindowsCoordinatePointerActionForTest(
+  tool: ComputerUseToolName,
+  args: Record<string, unknown>,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== 'win32'
+    || typeof args.app !== 'string'
+    || !args.app.trim()) return false;
+  if (tool === 'click') {
+    return typeof args.x === 'number'
+      && Number.isFinite(args.x)
+      && typeof args.y === 'number'
+      && Number.isFinite(args.y)
+      && args.element_index === undefined;
+  }
+  if (tool === 'drag') {
+    return typeof args.from_x === 'number'
+      && Number.isFinite(args.from_x)
+      && typeof args.from_y === 'number'
+      && Number.isFinite(args.from_y)
+      && typeof args.to_x === 'number'
+      && Number.isFinite(args.to_x)
+      && typeof args.to_y === 'number'
+      && Number.isFinite(args.to_y);
+  }
+  return false;
 }
 
 
-type PendingFastClick = {
+type PendingFastPointerAction = {
   resolve: (ok: boolean) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 };
 
-class FastWindowsClickClient {
+class FastWindowsPointerClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private buffer = '';
   private nextId = 1;
-  private pending = new Map<number, PendingFastClick>();
+  private pending = new Map<number, PendingFastPointerAction>();
   private starting: Promise<void> | null = null;
 
   async click(args: Record<string, unknown>, timeoutMs: number): Promise<boolean> {
     await this.ensureStarted();
     const clickCountRaw = typeof args.click_count === 'number' ? args.click_count : args.clicks;
     return await this.request({
+      action: 'click',
       app: args.app,
       x: args.x,
       y: args.y,
@@ -452,8 +467,20 @@ class FastWindowsClickClient {
     }, timeoutMs);
   }
 
+  async drag(args: Record<string, unknown>, timeoutMs: number): Promise<boolean> {
+    await this.ensureStarted();
+    return await this.request({
+      action: 'drag',
+      app: args.app,
+      fromX: args.from_x,
+      fromY: args.from_y,
+      toX: args.to_x,
+      toY: args.to_y,
+    }, timeoutMs);
+  }
+
   close(): void {
-    this.rejectAll(new Error('fast_click_helper_closed'));
+    this.rejectAll(new Error('fast_pointer_helper_closed'));
     this.child?.kill();
     this.child = null;
     this.buffer = '';
@@ -474,7 +501,7 @@ $ErrorActionPreference = 'Stop'
 $src = @'
 using System;
 using System.Runtime.InteropServices;
-public static class ImcodesFastClick {
+public static class ImcodesFastPointer {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int awareness);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
@@ -487,7 +514,7 @@ Add-Type -TypeDefinition $src
 # OCU's Windows accessibility frames and screenshots use physical pixels.
 # Opt into per-monitor DPI coordinates before the first Win32 geometry call so
 # a non-zero window origin and the local OCU frame stay in the same space.
-try { [void][ImcodesFastClick]::SetProcessDpiAwareness(2) } catch {}
+try { [void][ImcodesFastPointer]::SetProcessDpiAwareness(2) } catch {}
 [Console]::Out.WriteLine('{"ready":true}')
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -500,22 +527,46 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     $p = $windows | Where-Object { $_.ProcessName -ieq $processName } | Select-Object -First 1
     if ($null -eq $p) { $p = $windows | Where-Object { $_.MainWindowTitle -like "*$app*" } | Select-Object -First 1 }
     if ($null -eq $p) { throw "window_not_found:$app" }
-    $r = New-Object ImcodesFastClick+RECT
-    if (-not [ImcodesFastClick]::GetWindowRect($p.MainWindowHandle, [ref]$r)) { throw 'get_window_rect_failed' }
-    [ImcodesFastClick]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+    $r = New-Object ImcodesFastPointer+RECT
+    if (-not [ImcodesFastPointer]::GetWindowRect($p.MainWindowHandle, [ref]$r)) { throw 'get_window_rect_failed' }
+    [ImcodesFastPointer]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
     Start-Sleep -Milliseconds 20
-    $screenX = $r.Left + [int][Math]::Round([double]$payload.x)
-    $screenY = $r.Top + [int][Math]::Round([double]$payload.y)
-    [ImcodesFastClick]::SetCursorPos($screenX, $screenY) | Out-Null
-    $down = 0x0002; $up = 0x0004
-    switch ([string]$payload.button) {
-      'right' { $down = 0x0008; $up = 0x0010 }
-      'middle' { $down = 0x0020; $up = 0x0040 }
-    }
-    for ($i = 0; $i -lt [int]$payload.clickCount; $i++) {
-      [ImcodesFastClick]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero)
-      [ImcodesFastClick]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero)
-      if ($i + 1 -lt [int]$payload.clickCount) { Start-Sleep -Milliseconds 80 }
+    if ([string]$payload.action -eq 'drag') {
+      $fromX = $r.Left + [int][Math]::Round([double]$payload.fromX)
+      $fromY = $r.Top + [int][Math]::Round([double]$payload.fromY)
+      $toX = $r.Left + [int][Math]::Round([double]$payload.toX)
+      $toY = $r.Top + [int][Math]::Round([double]$payload.toY)
+      [ImcodesFastPointer]::SetCursorPos($fromX, $fromY) | Out-Null
+      Start-Sleep -Milliseconds 100
+      $dragging = $false
+      try {
+        [ImcodesFastPointer]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+        $dragging = $true
+        Start-Sleep -Milliseconds 150
+        for ($i = 1; $i -le 16; $i++) {
+          $x = [int][Math]::Round($fromX + (($toX - $fromX) * $i / 16))
+          $y = [int][Math]::Round($fromY + (($toY - $fromY) * $i / 16))
+          [ImcodesFastPointer]::SetCursorPos($x, $y) | Out-Null
+          Start-Sleep -Milliseconds 30
+        }
+        Start-Sleep -Milliseconds 250
+      } finally {
+        if ($dragging) { [ImcodesFastPointer]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero) }
+      }
+    } else {
+      $screenX = $r.Left + [int][Math]::Round([double]$payload.x)
+      $screenY = $r.Top + [int][Math]::Round([double]$payload.y)
+      [ImcodesFastPointer]::SetCursorPos($screenX, $screenY) | Out-Null
+      $down = 0x0002; $up = 0x0004
+      switch ([string]$payload.button) {
+        'right' { $down = 0x0008; $up = 0x0010 }
+        'middle' { $down = 0x0020; $up = 0x0040 }
+      }
+      for ($i = 0; $i -lt [int]$payload.clickCount; $i++) {
+        [ImcodesFastPointer]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero)
+        [ImcodesFastPointer]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero)
+        if ($i + 1 -lt [int]$payload.clickCount) { Start-Sleep -Milliseconds 80 }
+      }
     }
     [Console]::Out.WriteLine(([pscustomobject]@{ id = $id; ok = $true } | ConvertTo-Json -Compress))
   } catch {
@@ -540,10 +591,10 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     });
     child.on('exit', (code, signal) => {
       if (this.child === child) this.child = null;
-      this.rejectAll(new Error(`fast_click_helper_exited:${code ?? signal ?? 'unknown'}`));
+      this.rejectAll(new Error(`fast_pointer_helper_exited:${code ?? signal ?? 'unknown'}`));
     });
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('fast_click_helper_ready_timeout')), 5_000);
+      const timer = setTimeout(() => reject(new Error('fast_pointer_helper_ready_timeout')), 5_000);
       timer.unref?.();
       const onReady = (chunk: string) => {
         if (!chunk.includes('"ready":true')) return;
@@ -557,12 +608,12 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 
   private request(payload: Record<string, unknown>, timeoutMs: number): Promise<boolean> {
     const child = this.child;
-    if (!child || child.killed || child.exitCode !== null) return Promise.reject(new Error('fast_click_helper_not_running'));
+    if (!child || child.killed || child.exitCode !== null) return Promise.reject(new Error('fast_pointer_helper_not_running'));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error('fast_click_timeout'));
+        reject(new Error('fast_pointer_action_timeout'));
       }, Math.min(Math.max(timeoutMs, 1_000), 10_000));
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer });
@@ -591,7 +642,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
       clearTimeout(pending.timer);
       this.pending.delete(parsed.id);
       if (parsed.ok === true) pending.resolve(true);
-      else pending.reject(new Error(typeof parsed.error === 'string' ? parsed.error : 'fast_click_failed'));
+      else pending.reject(new Error(typeof parsed.error === 'string' ? parsed.error : 'fast_pointer_action_failed'));
     }
   }
 
@@ -604,11 +655,11 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
   }
 }
 
-let fastClickClient: FastWindowsClickClient | null = null;
+let fastPointerClient: FastWindowsPointerClient | null = null;
 
-function runFastWindowsCoordinateClick(args: Record<string, unknown>, timeoutMs: number): Promise<boolean> {
-  fastClickClient ??= new FastWindowsClickClient();
-  return fastClickClient.click(args, timeoutMs);
+function runFastWindowsCoordinatePointerAction(tool: 'click' | 'drag', args: Record<string, unknown>, timeoutMs: number): Promise<boolean> {
+  fastPointerClient ??= new FastWindowsPointerClient();
+  return tool === 'drag' ? fastPointerClient.drag(args, timeoutMs) : fastPointerClient.click(args, timeoutMs);
 }
 
 
@@ -1403,19 +1454,40 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
   if (request.tool === 'shell_session1') return runShellSession1(request, timeoutMs, started);
   if (isBrowserUseTool(request.tool)) return runBrowserUseTool(request, timeoutMs, started);
 
-  if (isFastWindowsCoordinateClick(request.tool, argsObject)) {
+  if (isFastWindowsCoordinatePointerActionForTest(request.tool, argsObject)) {
+    let completed = false;
     try {
-      if (await runFastWindowsCoordinateClick(argsObject, timeoutMs)) {
-        return {
-          correlationId: request.correlationId,
-          ok: true,
-          tool: request.tool,
-          content: [{ type: 'text', text: 'click completed' }],
-          durationMs: Date.now() - started,
-        };
-      }
+      completed = await runFastWindowsCoordinatePointerAction(request.tool as 'click' | 'drag', argsObject, timeoutMs);
     } catch {
       // Fall back to open-computer-use for apps/windows that the fast Win32 path cannot target.
+    }
+    if (completed) {
+      const returnOptions = parseReturnOptions(request.tool, argsObject);
+      if (returnOptions.includeState || returnOptions.includeImage) {
+        try {
+          const snapshot = await callOpenComputerUseMcpTool('get_app_state', { app: argsObject.app }, timeoutMs);
+          const normalized = await normalizeContent(snapshot, returnOptions);
+          return {
+            correlationId: request.correlationId,
+            ok: true,
+            tool: request.tool,
+            content: normalized.content.length > 0
+              ? normalized.content
+              : [{ type: 'text', text: `${request.tool} completed` }],
+            durationMs: Date.now() - started,
+            ...(normalized.truncated ? { truncated: true } : {}),
+          };
+        } catch {
+          // The pointer action already completed; an optional snapshot failure must not replay it.
+        }
+      }
+      return {
+        correlationId: request.correlationId,
+        ok: true,
+        tool: request.tool,
+        content: [{ type: 'text', text: `${request.tool} completed` }],
+        durationMs: Date.now() - started,
+      };
     }
   }
 
