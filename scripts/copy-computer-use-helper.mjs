@@ -11,6 +11,7 @@
  * mutable PATH install. Missing helper is a warning for local dev unless
  * IMCODES_REQUIRE_COMPUTER_USE_HELPER=1.
  */
+import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -57,6 +58,32 @@ function findSource() {
   return null;
 }
 
+/**
+ * macOS: re-sign the copied helper ad-hoc.
+ *
+ * Upstream ships the darwin helper INSIDE a `Open Computer Use.app` bundle
+ * signed with a Developer ID + hardened runtime. That signature covers the
+ * bundle's `Info.plist` and `_CodeSignature/CodeResources`, so lifting the bare
+ * Mach-O out of the bundle (which is what we want — a flat helper dir) leaves
+ * those siblings behind and the signature no longer validates. With the
+ * hardened-runtime flag set, the kernel then SIGKILLs the process on exec:
+ * exit 137, no stdout, no stderr — the helper was simply DEAD on macOS.
+ *
+ * Replacing the now-invalid signature ad-hoc costs nothing: the upstream binary
+ * carries NO entitlements, and the bundle is not notarized (`spctl` rejects it
+ * as "Unnotarized Developer ID"), so there is no entitlement or Gatekeeper
+ * benefit to preserve — only a broken signature to drop. Ad-hoc CDHash is
+ * content-derived, so identical bytes keep a stable identity across rebuilds.
+ */
+function adhocResignDarwinBinary(binaryPath) {
+  if (process.platform !== 'darwin') return;
+  try {
+    execFileSync('codesign', ['--force', '--sign', '-', binaryPath], { stdio: 'pipe' });
+  } catch (error) {
+    throw new Error(`copy-computer-use-helper: ad-hoc codesign failed for ${binaryPath}: ${error.message}`);
+  }
+}
+
 function copySourceToDest(source, dest) {
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
@@ -65,12 +92,14 @@ function copySourceToDest(source, dest) {
     const rootBinary = join(source, helperBinaryName);
     if (existsSync(rootBinary) && statSync(rootBinary).isFile()) {
       cpSync(rootBinary, join(dest, helperBinaryName));
+      adhocResignDarwinBinary(join(dest, helperBinaryName));
       return;
     }
     cpSync(source, dest, { recursive: true });
     return;
   }
   cpSync(source, join(dest, helperBinaryName));
+  adhocResignDarwinBinary(join(dest, helperBinaryName));
 }
 
 const source = findSource();
