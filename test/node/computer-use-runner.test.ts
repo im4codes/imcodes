@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   browserExecutableCandidatesForTest,
@@ -91,6 +92,18 @@ describe('computer use runner open-computer-use CLI', () => {
     });
     expect(openComputerUseEnv('click', { PATH: 'x' }, 'win32')).toBeUndefined();
     expect(openComputerUseEnv('type_text', { PATH: 'x' }, 'darwin')).toBeUndefined();
+  });
+
+  it('makes the Windows fast coordinate-click process per-monitor DPI-aware before geometry calls', () => {
+    const source = readFileSync('src/node/computer-use-runner.ts', 'utf8');
+    const setAwareness = source.indexOf('[void][ImcodesFastClick]::SetProcessDpiAwareness(2)');
+    const ready = source.indexOf('[Console]::Out.WriteLine(\'{"ready":true}\')');
+    const windowRectUse = source.indexOf('[ImcodesFastClick]::GetWindowRect($p.MainWindowHandle');
+
+    expect(source).toContain('[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int awareness);');
+    expect(setAwareness).toBeGreaterThan(-1);
+    expect(setAwareness).toBeLessThan(ready);
+    expect(setAwareness).toBeLessThan(windowRectUse);
   });
 
   it('selects browser executables across Windows, macOS, and Linux with channel filtering', () => {

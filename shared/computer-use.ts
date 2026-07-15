@@ -301,6 +301,8 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Windows controlled nodes run the main service as SYSTEM/session 0, but GUI automation must run in the interactive user session.',
         'IM.codes starts a user-session helper with CreateProcessAsUser and talks to it over a private named-pipe IPC channel.',
         'The helper can inspect/control apps in the active desktop; session-0 services are not GUI automation targets.',
+        'Windows OCU frames and screenshots use physical pixels. At display scaling above 100%, they can be larger than DPI-virtualized dimensions reported by a DPI-unaware shell; use get_app_state frame coordinates directly rather than rescaling them from GetSystemMetrics output.',
+        'The Windows coordinate-click fast path is per-monitor DPI-aware so its window origin and OCU local frame remain in the same physical-pixel coordinate space.',
         'Use exec_remote for session-0/SYSTEM commands and computer_use_call tool=shell_session1 for user-session commands.',
       ].join('\n');
     case 'safety':

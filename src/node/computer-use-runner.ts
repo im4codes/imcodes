@@ -476,6 +476,7 @@ using System;
 using System.Runtime.InteropServices;
 public static class ImcodesFastClick {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int awareness);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
@@ -483,6 +484,10 @@ public static class ImcodesFastClick {
 }
 '@
 Add-Type -TypeDefinition $src
+# OCU's Windows accessibility frames and screenshots use physical pixels.
+# Opt into per-monitor DPI coordinates before the first Win32 geometry call so
+# a non-zero window origin and the local OCU frame stay in the same space.
+try { [void][ImcodesFastClick]::SetProcessDpiAwareness(2) } catch {}
 [Console]::Out.WriteLine('{"ready":true}')
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
