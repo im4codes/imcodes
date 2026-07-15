@@ -18,6 +18,8 @@ import {
 } from './remote-exec.js';
 import {
   COMPUTER_USE_DOC_TOPICS,
+  COMPUTER_USE_DRAG_DURATION_MAX_MS,
+  COMPUTER_USE_DRAG_DURATION_MIN_MS,
   COMPUTER_USE_MAX_ARGUMENT_BYTES,
   COMPUTER_USE_MAX_TIMEOUT_MS,
   COMPUTER_USE_MIN_TIMEOUT_MS,
@@ -578,7 +580,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({
       machine: stringSchema('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
-      arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes.`, additionalProperties: true },
+      arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`, additionalProperties: true },
       timeoutMs: numberSchema(`Optional timeout in ms. GUI/browser methods allow [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]; shell_session1 allows [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS }),
     }, ['machine', 'tool']),
     outputSchema: objectSchema({

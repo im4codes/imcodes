@@ -43,6 +43,8 @@ import {
 } from '../../shared/remote-exec.js';
 import {
   COMPUTER_USE_DOC_TOPICS,
+  COMPUTER_USE_DRAG_DURATION_MAX_MS,
+  COMPUTER_USE_DRAG_DURATION_MIN_MS,
   COMPUTER_USE_TOOLS,
   COMPUTER_USE_OUTCOMES,
   COMPUTER_USE_MIN_TIMEOUT_MS,
@@ -1601,7 +1603,7 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
     machine: machineTargetRuntimeSchema.describe('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this; do not preflight list_machines when known.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
-    arguments: z.record(z.string(), z.unknown()).optional().describe('Method arguments.'),
+    arguments: z.record(z.string(), z.unknown()).optional().describe(`Method arguments. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),
   }).superRefine((value, ctx) => {
     if (value.timeoutMs !== undefined && value.timeoutMs > computerUseMaxTimeoutMs(value.tool)) {

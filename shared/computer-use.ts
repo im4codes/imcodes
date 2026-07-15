@@ -45,6 +45,9 @@ export const COMPUTER_USE_MAX_ARGUMENT_BYTES = 64 * 1024;
 export const COMPUTER_USE_MAX_TEXT_BYTES = 256 * 1024;
 export const COMPUTER_USE_MAX_IMAGE_BASE64_BYTES = 2 * 1024 * 1024;
 export const COMPUTER_USE_MAX_ERROR_BYTES = 8 * 1024;
+/** Optional cursor travel duration for coordinate drag actions. */
+export const COMPUTER_USE_DRAG_DURATION_MIN_MS = 100;
+export const COMPUTER_USE_DRAG_DURATION_MAX_MS = 20_000;
 export const COMPUTER_USE_IMAGE_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const;
 export const COMPUTER_USE_HTTP_PROTOCOL = 'imcodes.computer_use.http.v1' as const;
 export const COMPUTER_USE_HTTP_ENVELOPE_VERSION = 1 as const;
@@ -280,7 +283,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'shell_session1: run a bounded shell command in the active logged-in user session through the IPC helper; its requested timeout may be 1,000..900,000 ms. For SYSTEM/session-0 shell use exec_remote instead.',
         'list_apps: enumerate controllable GUI apps.',
         'get_app_state: inspect one app/window accessibility tree.',
-        'click, perform_secondary_action, scroll, drag: pointer/UI actions.',
+        `click, perform_secondary_action, scroll, drag: pointer/UI actions. On Windows, coordinate drag accepts optional duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS} for cursor travel duration; omit it for normal speed.`,
         'type_text, press_key, set_value: keyboard/value actions.',
         'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
@@ -302,7 +305,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'IM.codes starts a user-session helper with CreateProcessAsUser and talks to it over a private named-pipe IPC channel.',
         'The helper can inspect/control apps in the active desktop; session-0 services are not GUI automation targets.',
         'Windows OCU frames and screenshots use physical pixels. At display scaling above 100%, they can be larger than DPI-virtualized dimensions reported by a DPI-unaware shell; use get_app_state frame coordinates directly rather than rescaling them from GetSystemMetrics output.',
-        'The Windows coordinate click/drag fast path is per-monitor DPI-aware so its window origin and OCU local frame remain in the same physical-pixel coordinate space.',
+        `The Windows coordinate click/drag fast path is per-monitor DPI-aware so its window origin and OCU local frame remain in the same physical-pixel coordinate space. Coordinate drag accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`,
         'Use exec_remote for session-0/SYSTEM commands and computer_use_call tool=shell_session1 for user-session commands.',
       ].join('\n');
     case 'safety':

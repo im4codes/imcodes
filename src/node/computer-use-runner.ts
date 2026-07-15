@@ -6,7 +6,10 @@ import { dirname, join, resolve } from 'node:path';
 import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
+  COMPUTER_USE_DRAG_DURATION_MAX_MS,
+  COMPUTER_USE_DRAG_DURATION_MIN_MS,
   COMPUTER_USE_MAX_ERROR_BYTES,
+  COMPUTER_USE_MAX_TIMEOUT_MS,
   COMPUTER_USE_MAX_TEXT_BYTES,
   COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
   COMPUTER_USE_MAX_ARGUMENT_BYTES,
@@ -123,6 +126,7 @@ const COMPUTER_USE_INTERNAL_ARG_KEYS = new Set([
   'imageFormat',
   'imageQuality',
   'imageMaxWidth',
+  'duration_ms',
 ]);
 
 function stripInternalArgs(args: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -476,6 +480,7 @@ class FastWindowsPointerClient {
       fromY: args.from_y,
       toX: args.to_x,
       toY: args.to_y,
+      durationMs: typeof args.duration_ms === 'number' ? args.duration_ms : 500,
     }, timeoutMs);
   }
 
@@ -543,11 +548,14 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         [ImcodesFastPointer]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
         $dragging = $true
         Start-Sleep -Milliseconds 150
-        for ($i = 1; $i -le 16; $i++) {
-          $x = [int][Math]::Round($fromX + (($toX - $fromX) * $i / 16))
-          $y = [int][Math]::Round($fromY + (($toY - $fromY) * $i / 16))
+        $durationMs = [int]$payload.durationMs
+        $steps = [int][Math]::Min(240, [Math]::Max(4, [Math]::Round($durationMs / 30)))
+        $stepDelayMs = [int][Math]::Max(1, [Math]::Round($durationMs / $steps))
+        for ($i = 1; $i -le $steps; $i++) {
+          $x = [int][Math]::Round($fromX + (($toX - $fromX) * $i / $steps))
+          $y = [int][Math]::Round($fromY + (($toY - $fromY) * $i / $steps))
           [ImcodesFastPointer]::SetCursorPos($x, $y) | Out-Null
-          Start-Sleep -Milliseconds 30
+          Start-Sleep -Milliseconds $stepDelayMs
         }
         Start-Sleep -Milliseconds 250
       } finally {
@@ -614,7 +622,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('fast_pointer_action_timeout'));
-      }, Math.min(Math.max(timeoutMs, 1_000), 10_000));
+      }, Math.min(Math.max(timeoutMs, COMPUTER_USE_MIN_TIMEOUT_MS), COMPUTER_USE_MAX_TIMEOUT_MS));
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer });
       try { child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`); }
@@ -1453,6 +1461,43 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
 
   if (request.tool === 'shell_session1') return runShellSession1(request, timeoutMs, started);
   if (isBrowserUseTool(request.tool)) return runBrowserUseTool(request, timeoutMs, started);
+
+  if (request.tool === 'drag' && argsObject.duration_ms !== undefined) {
+    const durationMs = argsObject.duration_ms;
+    if (process.platform !== 'win32') {
+      return {
+        correlationId: request.correlationId,
+        ok: false,
+        tool: request.tool,
+        content: [],
+        durationMs: Date.now() - started,
+        error: 'drag_duration_unsupported_platform',
+      };
+    }
+    if (typeof durationMs !== 'number'
+      || !Number.isInteger(durationMs)
+      || durationMs < COMPUTER_USE_DRAG_DURATION_MIN_MS
+      || durationMs > COMPUTER_USE_DRAG_DURATION_MAX_MS) {
+      return {
+        correlationId: request.correlationId,
+        ok: false,
+        tool: request.tool,
+        content: [],
+        durationMs: Date.now() - started,
+        error: 'invalid_drag_duration_ms',
+      };
+    }
+    if (durationMs + 2_000 > timeoutMs) {
+      return {
+        correlationId: request.correlationId,
+        ok: false,
+        tool: request.tool,
+        content: [],
+        durationMs: Date.now() - started,
+        error: 'drag_duration_exceeds_timeout',
+      };
+    }
+  }
 
   if (isFastWindowsCoordinatePointerActionForTest(request.tool, argsObject)) {
     let completed = false;

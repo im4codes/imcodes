@@ -28,6 +28,17 @@ describe('computer use runner open-computer-use CLI', () => {
     ]);
   });
 
+  it('keeps drag duration internal to the Windows pointer wrapper', () => {
+    expect(openComputerUseCallArgs('drag', '{"app":"explorer","from_x":10,"from_y":20,"to_x":30,"to_y":40,"duration_ms":4000}')).toEqual([
+      'call',
+      '--calls',
+      JSON.stringify([
+        { tool: 'get_app_state', args: { app: 'explorer', text_limit: 1_000, max_tree_nodes: 1_500, max_tree_depth: 80 } },
+        { tool: 'drag', args: { app: 'explorer', from_x: 10, from_y: 20, to_x: 30, to_y: 40 } },
+      ]),
+    ]);
+  });
+
   it('preflights element-index GUI actions in one process so element indexes are valid', () => {
     expect(openComputerUseCallArgs('set_value', '{"app":"msedge","element_index":"18","value":"about:blank"}')).toEqual([
       'call',
@@ -109,12 +120,14 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(source).toContain("if ([string]$payload.action -eq 'drag')");
     expect(source).toContain('[ImcodesFastPointer]::SetCursorPos($x, $y)');
     expect(source).toContain('[ImcodesFastPointer]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)');
+    expect(source).toContain('$stepDelayMs = [int][Math]::Max(1, [Math]::Round($durationMs / $steps))');
     expect(isFastWindowsCoordinatePointerActionForTest('drag', {
       app: 'TabFlow64',
       from_x: 500,
       from_y: 437,
       to_x: 500,
       to_y: 395,
+      duration_ms: 4000,
     }, 'win32')).toBe(true);
     expect(isFastWindowsCoordinatePointerActionForTest('drag', {
       app: 'TabFlow64',
