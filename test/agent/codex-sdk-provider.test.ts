@@ -3793,7 +3793,10 @@ describe('CodexSdkProvider', () => {
         turn: { id: 'turn-1', status: 'completed', error: null },
       },
     });
-    await flush();
+    // Completion performs asynchronous generated-image discovery before it
+    // notifies listeners. A single event-loop tick is not a reliable boundary
+    // under a loaded CI runner (notably Node 24).
+    await waitForCondition(() => completed.length === 1);
 
     expect(completed).toEqual(['done after compact']);
   });
