@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -119,6 +119,12 @@ async function downloadArtifact(input: {
   const manifestPath = `${artifactPath}.manifest.json`;
   await writeFile(artifactPath, bytes, { mode: 0o755 });
   if (process.platform !== 'win32') await chmod(artifactPath, 0o755).catch(() => {});
+  // Re-read what actually LANDED. The check above proves the download was
+  // intact in memory, not that those bytes survived the write — and the manifest
+  // below records `actualSha` as fact, so an unverified write lets a corrupted
+  // artifact ship with a manifest that vouches for it.
+  const landedSha = createHash('sha256').update(await readFile(artifactPath)).digest('hex');
+  if (landedSha !== actualSha) throw new Error('artifact_write_sha256_mismatch');
   await writeFile(manifestPath, `${JSON.stringify({
     schemaVersion: 1,
     artifact: {
@@ -278,7 +284,46 @@ export function buildPosixControlledNodeUpgradeScript(input: {
   const helperCopy = input.stagedComputerUseHelperDir
     ? `rm -rf ${shQuote(helperDir)}\nmkdir -p ${shQuote(helperDir)}\ncp -R ${shQuote(`${input.stagedComputerUseHelperDir}/.`)} ${shQuote(helperDir)}/ 2>/dev/null || true\nfind ${shQuote(helperDir)} -type f -name 'open-computer-use*' -exec chmod 755 {} \\; 2>/dev/null || true\n`
     : '';
-  const copy = `cp -f ${shQuote(input.stagedArtifactPath)} ${shQuote(input.destinationPath)}\ncp -f ${shQuote(input.stagedManifestPath)} ${shQuote(input.destinationManifestPath)} 2>/dev/null || true\n${helperCopy}${journalCopy}chmod 755 ${shQuote(input.destinationPath)}\n`;
+  // Publish the new executable through a temp file + rename(2), NEVER `cp -f`
+  // straight onto the destination.
+  //
+  // `cp -f` rewrites the EXISTING inode in place. macOS binds code-signing state
+  // to that inode, and the outgoing node's image may still be mapped, so an
+  // in-place overwrite leaves a file whose bytes no longer match the signature
+  // the kernel validated: every later exec is SIGKILLed with
+  // OS_REASON_CODESIGNING and launchd respawns it forever — a bricked node with
+  // no rollback (observed: 340 respawns, on-disk sha256 diverged from the
+  // manifest the upgrade had just verified). Linux fails the same write with
+  // ETXTBSY, which `set +e` then swallows into a silently skipped upgrade.
+  //
+  // rename(2) publishes a NEW inode atomically: the running image is untouched,
+  // and the landed file keeps the exact bytes (and signature) that were verified.
+  // It also makes rollback free — every check below runs BEFORE the rename, so
+  // any failure leaves the previous working binary in place and we simply
+  // restart it.
+  const pending = `${input.destinationPath}.new`;
+  // Fail-closed: refuse to publish a Mach-O the kernel would SIGKILL on exec.
+  // Scoped to actual Mach-O files because `codesign` is meaningless for anything
+  // else — on arm64 macOS every executable must carry at least an ad-hoc
+  // signature, so a Mach-O that fails this check is guaranteed to be unbootable.
+  const verify = input.platform === 'darwin'
+    ? `if file -b ${shQuote(pending)} 2>/dev/null | grep -q 'Mach-O'; then\n`
+      + `  codesign --verify ${shQuote(pending)} 2>/dev/null || { rm -f ${shQuote(pending)}; SKIP=1; }\n`
+      + `fi\n`
+    : '';
+  const copy = `SKIP=0\n`
+    + `cp -f ${shQuote(input.stagedArtifactPath)} ${shQuote(pending)} || SKIP=1\n`
+    + `chmod 755 ${shQuote(pending)} 2>/dev/null || true\n`
+    + verify
+    + `if [ "$SKIP" = "0" ]; then\n`
+    + `  mv -f ${shQuote(pending)} ${shQuote(input.destinationPath)} || SKIP=1\n`
+    + `fi\n`
+    + `if [ "$SKIP" = "0" ]; then\n`
+    + `  cp -f ${shQuote(input.stagedManifestPath)} ${shQuote(input.destinationManifestPath)} 2>/dev/null || true\n`
+    + `${helperCopy}${journalCopy}`.split('\n').filter(Boolean).map((line) => `  ${line}`).join('\n')
+    + (helperCopy || journalCopy ? '\n' : '')
+    + `fi\n`
+    + `rm -f ${shQuote(pending)} 2>/dev/null || true\n`;
   if (input.platform === 'linux') {
     return `#!/bin/sh\nset +e\nsleep 3\nsystemctl stop ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n${copy}systemctl start ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n`;
   }

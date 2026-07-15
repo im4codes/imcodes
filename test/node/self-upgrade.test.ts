@@ -268,8 +268,53 @@ describe('controlled-node self-upgrade', () => {
     });
     expect(script).toContain(stop);
     expect(script).toContain("cp -f '/tmp/update-");
-    expect(script).toContain("chmod 755 '/opt/imcodes-node/imcodes-node'");
     expect(script).toContain(start);
+
+    // The destination MUST be published by rename(2), never overwritten in
+    // place: `cp -f` rewrites the existing inode, and macOS binds code-signing
+    // state to it, so an in-place overwrite of the still-mapped running node
+    // leaves bytes that no longer match the validated signature — every exec is
+    // then SIGKILLed (OS_REASON_CODESIGNING) and launchd respawns forever.
+    expect(script).toContain("mv -f '/opt/imcodes-node/imcodes-node.new' '/opt/imcodes-node/imcodes-node'");
+    expect(script).toContain("cp -f '/tmp/update-" + platform + "/imcodes-node' '/opt/imcodes-node/imcodes-node.new'");
+    // The live binary is never a `cp` target.
+    expect(script).not.toContain("cp -f '/tmp/update-" + platform + "/imcodes-node' '/opt/imcodes-node/imcodes-node'");
+    // chmod applies to the pending file, before it is published.
+    expect(script).toContain("chmod 755 '/opt/imcodes-node/imcodes-node.new'");
+    // The manifest must not vouch for a binary that never got published.
+    expect(script.indexOf('mv -f')).toBeLessThan(script.indexOf('imcodes-node.manifest.json'));
+  });
+
+  it('refuses to publish a macOS binary the kernel would kill, and leaves the old one intact', () => {
+    const script = buildPosixControlledNodeUpgradeScript({
+      platform: 'darwin',
+      stagedArtifactPath: '/tmp/stage/imcodes-node-macos',
+      stagedManifestPath: '/tmp/stage/imcodes-node-macos.manifest.json',
+      destinationPath: '/opt/imcodes-node/imcodes-node-macos',
+      destinationManifestPath: '/opt/imcodes-node/imcodes-node-macos.manifest.json',
+    });
+    // Verify BEFORE the rename, so a bad artifact never becomes the live binary.
+    expect(script).toContain("codesign --verify '/opt/imcodes-node/imcodes-node-macos.new'");
+    expect(script).toContain("grep -q 'Mach-O'");
+    expect(script.indexOf('codesign --verify')).toBeLessThan(script.indexOf('mv -f'));
+    // A failed verify drops the pending file and skips publishing; the untouched
+    // previous binary is then simply bootstrapped back = free rollback.
+    expect(script).toContain("rm -f '/opt/imcodes-node/imcodes-node-macos.new'; SKIP=1");
+    expect(script).toContain('launchctl bootstrap system');
+  });
+
+  it('does not gate the linux upgrade on codesign (macOS-only tool)', () => {
+    const script = buildPosixControlledNodeUpgradeScript({
+      platform: 'linux',
+      stagedArtifactPath: '/tmp/stage/imcodes-node-linux',
+      stagedManifestPath: '/tmp/stage/imcodes-node-linux.manifest.json',
+      destinationPath: '/opt/imcodes-node/imcodes-node-linux',
+      destinationManifestPath: '/opt/imcodes-node/imcodes-node-linux.manifest.json',
+    });
+    expect(script).not.toContain('codesign');
+    // rename(2) still matters on linux: writing a running binary fails ETXTBSY,
+    // which `set +e` would otherwise swallow into a silently skipped upgrade.
+    expect(script).toContain("mv -f '/opt/imcodes-node/imcodes-node-linux.new' '/opt/imcodes-node/imcodes-node-linux'");
   });
 
   it.runIf(['win32', 'darwin', 'linux'].includes(process.platform))('executes the native replacement script against an isolated destination and service-manager stub', async () => {
