@@ -278,9 +278,10 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'browser':
       return [
         'Browser control uses Chrome DevTools Protocol (CDP), the mature browser automation protocol used by Chrome/Edge tooling, and is more deterministic for web pages than screen coordinates.',
-        'Use browser_open first with url. Optional arguments: executablePath, headless=true|false, cdpEndpoint to attach to an existing browser target websocket.',
+        'Use browser_open first with url. Optional arguments: channel=chrome|msedge|chromium, executablePath, headless=true|false, noSandbox=false, cdpEndpoint to attach to an existing browser target websocket.',
         'Then use browser_navigate, browser_snapshot, browser_click, browser_fill, browser_press, browser_evaluate, browser_close.',
-        'Selectors are Playwright selectors. For click/fill you may pass selector, text, label, placeholder, or role+name. Prefer stable selectors and roles over coordinates.',
+        'Selectors are CSS selectors. For click/fill you may pass selector or visible text. Prefer stable CSS selectors over coordinates.',
+        'Linux without DISPLAY/WAYLAND defaults to headless and uses no-sandbox/dev-shm-safe flags unless noSandbox=false is passed.',
         'browser_snapshot returns url/title plus bounded visible text and common links/buttons/inputs; call it on demand before choosing selectors.',
         'browser_evaluate runs JavaScript in the page, not a shell. Use it for read-only inspection by default; ask before submitting forms, purchases, destructive actions, or externally visible changes.',
       ].join('\n');

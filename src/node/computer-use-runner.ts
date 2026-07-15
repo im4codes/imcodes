@@ -965,21 +965,45 @@ class CdpClient {
   }
 }
 
-function browserExecutableCandidates(args: Record<string, unknown>): string[] {
+type BrowserPlatform = NodeJS.Platform;
+
+export function browserExecutableCandidatesForTest(args: Record<string, unknown>, platform: BrowserPlatform): string[] {
+  return browserExecutableCandidates(args, platform);
+}
+
+export function browserLaunchArgsForTest(userDataDir: string, args: Record<string, unknown>, platform: BrowserPlatform, env: NodeJS.ProcessEnv): string[] {
+  return browserLaunchArgs(userDataDir, args, platform, env);
+}
+
+function browserExecutableCandidates(args: Record<string, unknown>, platform: BrowserPlatform = process.platform): string[] {
   const explicit = optionalStringArg(args, 'executablePath') ?? process.env.IMCODES_BROWSER_EXE?.trim();
   if (explicit) return [explicit];
-  if (process.platform === 'win32') return [
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  const channel = optionalStringArg(args, 'channel')?.toLowerCase();
+  const wants = (name: 'chrome' | 'msedge' | 'chromium') => !channel
+    || channel === name
+    || (name === 'msedge' && channel === 'edge');
+  if (platform === 'win32') return [
+    ...(wants('msedge') ? [
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, 'Microsoft', 'Edge', 'Application', 'msedge.exe')] : []),
+    ] : []),
+    ...(wants('chrome') ? [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe')] : []),
+    ] : []),
   ];
-  if (process.platform === 'darwin') return [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  if (platform === 'darwin') return [
+    ...(wants('chrome') ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'] : []),
+    ...(wants('msedge') ? ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'] : []),
+    ...(wants('chromium') ? ['/Applications/Chromium.app/Contents/MacOS/Chromium'] : []),
   ];
-  return ['google-chrome', 'google-chrome-stable', 'chromium-browser', 'chromium', 'microsoft-edge'];
+  return [
+    ...(wants('chrome') ? ['google-chrome', 'google-chrome-stable', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable'] : []),
+    ...(wants('chromium') ? ['chromium-browser', 'chromium', '/usr/bin/chromium-browser', '/usr/bin/chromium'] : []),
+    ...(wants('msedge') ? ['microsoft-edge', 'microsoft-edge-stable', '/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable'] : []),
+  ];
 }
 
 async function firstExistingBrowser(args: Record<string, unknown>): Promise<string> {
@@ -994,6 +1018,25 @@ async function firstExistingBrowser(args: Record<string, unknown>): Promise<stri
     if (first) return first.trim();
   }
   throw new Error('browser_executable_not_found');
+}
+
+function browserLaunchArgs(userDataDir: string, args: Record<string, unknown>, platform: BrowserPlatform = process.platform, env: NodeJS.ProcessEnv = process.env): string[] {
+  const headless = args.headless === true
+    || (platform === 'linux' && args.headless !== false && !env.DISPLAY && !env.WAYLAND_DISPLAY);
+  const launchArgs = [
+    '--remote-debugging-port=0',
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-background-networking',
+  ];
+  if (headless) launchArgs.splice(1, 0, '--headless=new');
+  if (platform === 'linux') {
+    launchArgs.splice(1, 0, '--disable-dev-shm-usage');
+    if (args.noSandbox !== false) launchArgs.splice(1, 0, '--no-sandbox');
+  }
+  launchArgs.push('about:blank');
+  return launchArgs;
 }
 
 class BrowserUseController {
@@ -1063,15 +1106,7 @@ class BrowserUseController {
 
     const browser = await firstExistingBrowser(args);
     this.userDataDir = await mkdtemp(join(tmpdir(), 'imcodes-browser-'));
-    const launchArgs = [
-      '--remote-debugging-port=0',
-      `--user-data-dir=${this.userDataDir}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-networking',
-      'about:blank',
-    ];
-    if (args.headless === true) launchArgs.splice(1, 0, '--headless=new');
+    const launchArgs = browserLaunchArgs(this.userDataDir, args);
     this.child = spawn(browser, launchArgs, { windowsHide: true, stdio: 'ignore' });
     this.child.once('exit', () => {
       this.client?.close();

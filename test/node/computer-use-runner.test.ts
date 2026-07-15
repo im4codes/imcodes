@@ -1,6 +1,13 @@
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { normalizeOpenComputerUseParsedResult, openComputerUseCallArgs, openComputerUseCandidateBinariesForTest, openComputerUseEnv } from '../../src/node/computer-use-runner.js';
+import {
+  browserExecutableCandidatesForTest,
+  browserLaunchArgsForTest,
+  normalizeOpenComputerUseParsedResult,
+  openComputerUseCallArgs,
+  openComputerUseCandidateBinariesForTest,
+  openComputerUseEnv,
+} from '../../src/node/computer-use-runner.js';
 
 describe('computer use runner open-computer-use CLI', () => {
   it('uses the supported JSON argument form without unsupported timeout flags', () => {
@@ -83,5 +90,24 @@ describe('computer use runner open-computer-use CLI', () => {
     });
     expect(openComputerUseEnv('click', { PATH: 'x' }, 'win32')).toBeUndefined();
     expect(openComputerUseEnv('type_text', { PATH: 'x' }, 'darwin')).toBeUndefined();
+  });
+
+  it('selects browser executables across Windows, macOS, and Linux with channel filtering', () => {
+    expect(browserExecutableCandidatesForTest({}, 'win32').join('\n')).toContain('msedge.exe');
+    expect(browserExecutableCandidatesForTest({}, 'darwin').join('\n')).toContain('Google Chrome.app');
+    expect(browserExecutableCandidatesForTest({}, 'linux')).toEqual(expect.arrayContaining(['google-chrome', 'chromium', 'microsoft-edge']));
+    expect(browserExecutableCandidatesForTest({ channel: 'chromium' }, 'linux')).toEqual(expect.arrayContaining(['chromium-browser', 'chromium']));
+    expect(browserExecutableCandidatesForTest({ channel: 'chromium' }, 'linux')).not.toContain('google-chrome');
+  });
+
+  it('uses Linux-safe headless browser launch defaults without forcing headless on desktop platforms', () => {
+    expect(browserLaunchArgsForTest('/tmp/profile', {}, 'linux', {})).toEqual(expect.arrayContaining([
+      '--headless=new',
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+    ]));
+    expect(browserLaunchArgsForTest('/tmp/profile', { noSandbox: false }, 'linux', {})).not.toContain('--no-sandbox');
+    expect(browserLaunchArgsForTest('/tmp/profile', {}, 'darwin', {})).not.toContain('--headless=new');
+    expect(browserLaunchArgsForTest('/tmp/profile', { headless: true }, 'win32', {})).toContain('--headless=new');
   });
 });
