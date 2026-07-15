@@ -79,7 +79,13 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+  query: vi.fn(({ prompt: rawPrompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+    // The provider drives the SDK in streaming-input mode, so `prompt` is an
+    // AsyncIterable<SDKUserMessage> rather than a string. This mock stands in for
+    // the SDK, so it reads the user text the SDK would consume.
+    const prompt = typeof rawPrompt === 'string'
+      ? rawPrompt
+      : (((rawPrompt as { buffer?: Array<{ message?: { content?: unknown } }> })?.buffer?.[0]?.message?.content) as string ?? '');
     mocks.claudeRuns.push({ prompt, options });
     async function* gen() {
       if (prompt.includes('[transport-always-fail]')) {

@@ -80,6 +80,18 @@ export interface ActivityDiagnosticInput {
 export interface ProviderActiveWorkSnapshot {
   status?: ProviderSnapshotStatus;
   activeWorkCount: number;
+  /**
+   * How much of `activeWorkCount` is BACKGROUND work rather than turn work —
+   * work that outlives the settled turn and must not block new input. Today only
+   * the Claude SDK reports it (a Task subagent still running after the main turn
+   * returned): counting that as turn work made the runtime queue every message
+   * behind the subagent, which is why `/stop` used to be the only way through.
+   *
+   * Turn work is `activeWorkCount - backgroundWorkCount`, and only turn work
+   * gates dispatch. Omit the field (or 0) to keep the pre-existing behaviour —
+   * every other provider does, so their idle detection is unchanged.
+   */
+  backgroundWorkCount?: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
   /** Runtime-minted generation. Required for a clear snapshot to prove clean idle. */

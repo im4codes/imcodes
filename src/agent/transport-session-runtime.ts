@@ -1462,8 +1462,20 @@ export class TransportSessionRuntime implements SessionRuntime {
       const evaluation = evaluateProviderSnapshot(providerSnapshot, expectedGeneration);
       if (evaluation.blocking) {
         if (!this.shouldIgnoreZeroWorkProviderSnapshot(providerSnapshot, evaluation.state)) {
-          const count = Math.max(1, providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0);
-          add(evaluation.reason, count);
+          // Only TURN work gates dispatch. Background work (a Claude subagent
+          // still running after the main turn settled) outlives the turn, so
+          // counting it here made hasActiveTurnWork() queue every new message
+          // behind it. Providers that do not report backgroundWorkCount get
+          // `background === 0`, which reduces to the original expression — their
+          // blocking/idle behaviour is bit-for-bit unchanged.
+          const background = Math.max(0, providerSnapshot.backgroundWorkCount ?? 0);
+          const total = providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0;
+          const turnWork = Math.max(0, total - background);
+          if (turnWork > 0 || background === 0) {
+            add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
+          }
+          // Background work still surfaces its busy reasons so the UI can show
+          // the subagent running even though it no longer blocks input.
           for (const reason of providerSnapshot.busyReasons) {
             if (!busyReasons.includes(reason)) busyReasons.push(reason);
           }
