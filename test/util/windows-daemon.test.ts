@@ -44,6 +44,7 @@ vi.mock('node:child_process', () => ({
   execSync: vi.fn((cmd: string) => {
     state.execCalls.push(cmd);
     if (cmd.startsWith('taskkill ')) return '';
+    if (cmd.includes('schtasks /End')) return '';
     if (cmd.includes('schtasks /Run')) {
       if (!state.scheduledTaskRunOk) throw new Error('run failed');
       return '';
@@ -91,7 +92,7 @@ describe('restartWindowsDaemon', () => {
     expect(state.spawnCalls).toHaveLength(0);
   });
 
-  it('prefers VBS launcher over scheduled task', async () => {
+  it('prefers the supervised scheduled task over direct VBS', async () => {
     state.pidContents = ['', '100'];
     state.alivePids = new Set([100]);
     state.vbsExists = true;
@@ -99,12 +100,11 @@ describe('restartWindowsDaemon', () => {
 
     const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
     expect(restartWindowsDaemon()).toBe(true);
-    expect(state.spawnCalls[0].cmd).toBe('wscript');
-    // Should NOT have called schtasks since VBS succeeded
-    expect(state.execCalls.some(c => c.includes('schtasks /Run'))).toBe(false);
+    expect(state.spawnCalls).toHaveLength(0);
+    expect(state.execCalls).toContain('schtasks /Run /TN imcodes-daemon');
   });
 
-  it('falls back to scheduled task when VBS missing', async () => {
+  it('starts through the scheduled task when VBS is missing', async () => {
     state.pidContents = ['', '200'];
     state.alivePids = new Set([200]);
     state.scheduledTaskRunOk = true;
@@ -130,7 +130,7 @@ describe('restartWindowsDaemon', () => {
 
   it('kills existing daemon by PID before launching', async () => {
     state.pidContents = ['555', '666'];
-    state.alivePids = new Set([666]);
+    state.alivePids = new Set([555, 666]);
     state.vbsExists = true;
 
     const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
@@ -146,8 +146,9 @@ describe('restartWindowsDaemon', () => {
 
     const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
     expect(restartWindowsDaemon()).toBe(true);
-    // taskkill was attempted (and silently failed)
-    expect(state.execCalls).toContain('taskkill /f /pid 999');
+    // A stale PID is checked before taskkill, avoiding a needless Windows
+    // process-control call that can itself block on dead process trees.
+    expect(state.execCalls).not.toContain('taskkill /f /pid 999');
   });
 
   // ── PID wait logic ──

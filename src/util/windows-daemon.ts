@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const WINDOWS_DAEMON_TASK = 'imcodes-daemon';
+const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 function readDaemonPid(currentPid?: number): number | null {
   const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
@@ -50,7 +51,15 @@ export function killAllStaleWatchdogs(): void {
   if (process.platform !== 'win32') return;
   const pids = findStaleWatchdogPids();
   for (const pid of pids) {
-    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore', windowsHide: true }); } catch { /* already dead */ }
+    try {
+      // `/T` has hung indefinitely on real Task Scheduler VBS -> CMD -> Node
+      // trees. Kill the wrapper only; restartWindowsDaemon separately removes
+      // daemon processes after the wrapper can no longer respawn them.
+      execSync(`taskkill /f /pid ${pid}`, {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      });
+    } catch { /* already dead or bounded timeout */ }
   }
 }
 
@@ -81,7 +90,10 @@ function findStaleWatchdogPids(): number[] {
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      },
     );
     for (const line of out.split(/\r?\n/)) {
       const pid = parseInt(line.trim(), 10);
@@ -97,7 +109,10 @@ function findStaleWatchdogPids(): number[] {
   try {
     const out = execSync(
       'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      },
     );
     for (const line of out.split(/\r?\n/)) {
       const m = line.match(/^ProcessId=(\d+)/);
@@ -121,7 +136,10 @@ function tryStartVbsLauncher(): boolean {
 
 function tryStartScheduledTask(): boolean {
   try {
-    execSync(`schtasks /Run /TN ${WINDOWS_DAEMON_TASK}`, { stdio: 'ignore', windowsHide: true });
+    execSync(`schtasks /Run /TN ${WINDOWS_DAEMON_TASK}`, {
+      stdio: 'ignore', windowsHide: true,
+      timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+    });
     return true;
   } catch {
     return false;
@@ -175,7 +193,10 @@ function clearUpgradeLock(): boolean {
   try {
     execSync(
       `powershell -NoProfile -NonInteractive -Command "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath '${lockPath}'"`,
-      { stdio: 'ignore', windowsHide: true },
+      {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      },
     );
   } catch { /* ignore */ }
   return !existsSync(lockPath);
@@ -198,10 +219,15 @@ function clearUpgradeLock(): boolean {
  *  4. Wait for a new daemon PID. */
 export function restartWindowsDaemon(currentPid?: number): boolean {
   const previousPid = readDaemonPid(currentPid);
-  if (previousPid) {
+  if (previousPid && isPidAlive(previousPid)) {
     // Kill the daemon process. The watchdog loop will detect the exit and
     // restart it automatically (within ~5 seconds).
-    try { execSync(`taskkill /f /pid ${previousPid}`, { stdio: 'ignore', windowsHide: true }); } catch { /* not running */ }
+    try {
+      execSync(`taskkill /f /pid ${previousPid}`, {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      });
+    } catch { /* not running or bounded timeout */ }
   }
   // CRITICAL: also tree-kill any stale daemon-watchdog cmd.exe processes by
   // command-line pattern.  This handles the upgrade-from-bad-watchdog case
@@ -209,20 +235,24 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
   // "is not a recognized command" forever.  Without this kill, the new
   // watchdog we spawn below will race with the old one.
   killAllStaleWatchdogs();
+  // Killing only the wrapper avoids taskkill's `/T` deadlock. Remove any
+  // daemon child that survived as an orphan before starting the owned task.
+  killOrphanDaemonProcesses();
   // After killing all watchdogs and the daemon, any auto-upgrade that was
   // mid-flight is already broken — clear its lock so the new watchdog
   // doesn't park on it.  See clearUpgradeLock() doc for the full incident.
   clearUpgradeLock();
 
   // If no watchdog is running (e.g. first start after bind), launch one.
-  // Priority: VBS (always hidden) > scheduled task > startup shortcut.
+  // Priority: scheduled task (owns and supervises the watchdog) > direct VBS
+  // compatibility fallback > legacy Startup shortcut.
   // If a watchdog IS already running, it will restart the daemon on its own —
   // but launching a second VBS is harmless (the daemon lock prevents duplicates,
   // and the extra watchdog exits when it sees "already running").
   let triggered = false;
-  if (tryStartVbsLauncher()) {
+  if (tryStartScheduledTask()) {
     triggered = true;
-  } else if (tryStartScheduledTask()) {
+  } else if (tryStartVbsLauncher()) {
     triggered = true;
   } else if (tryStartStartupShortcut()) {
     triggered = true;
@@ -279,7 +309,10 @@ export function killOrphanDaemonProcesses(): boolean {
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      },
     );
     const orphanPids = out
       .split(/\r?\n/)
@@ -290,19 +323,28 @@ export function killOrphanDaemonProcesses(): boolean {
       // Try taskkill first (fast path).  Always pass windowsHide so no
       // console window flashes during the kill chain.
       try {
-        execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore', windowsHide: true });
+        execSync(`taskkill /f /pid ${pid}`, {
+          stdio: 'ignore', windowsHide: true,
+          timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+        });
         if (!isPidAlive(pid)) { killed = true; continue; }
       } catch { /* try next method */ }
       // Fallback: wmic delete (works against access-denied targets in some cases)
       try {
-        execSync(`wmic process where ProcessId=${pid} delete`, { stdio: 'ignore', windowsHide: true });
+        execSync(`wmic process where ProcessId=${pid} delete`, {
+          stdio: 'ignore', windowsHide: true,
+          timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+        });
         if (!isPidAlive(pid)) { killed = true; continue; }
       } catch { /* try next method */ }
       // Last resort: PowerShell Stop-Process
       try {
         execSync(
           `powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue"`,
-          { stdio: 'ignore', windowsHide: true },
+          {
+            stdio: 'ignore', windowsHide: true,
+            timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+          },
         );
         if (!isPidAlive(pid)) { killed = true; }
       } catch { /* gave up */ }
@@ -329,10 +371,8 @@ export function killOrphanDaemonProcesses(): boolean {
  *  Returns true if a daemon is alive at the end.  */
 export function ensureDaemonRunning(currentPid?: number): boolean {
   if (process.platform !== 'win32') return false;
-  // Step 1: kill orphan daemons holding the named-pipe lock
-  killOrphanDaemonProcesses();
-  // Step 2: kill any stale crash-looping watchdog cmd.exe processes
-  killAllStaleWatchdogs();
-  // Step 3: spawn a fresh hidden watchdog (VBS > schtask > startup shortcut)
+  // restartWindowsDaemon owns the complete ordered cleanup. Do not pre-run
+  // the same expensive CIM/taskkill probes here: the previous duplication
+  // made repair-watchdog take minutes and amplified any Windows command hang.
   return restartWindowsDaemon(currentPid);
 }

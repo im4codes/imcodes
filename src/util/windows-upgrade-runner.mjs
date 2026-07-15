@@ -62,7 +62,7 @@ import { basename, dirname, join } from 'node:path';
 const HOME = homedir();
 const LOCK = join(HOME, '.imcodes', 'upgrade.lock');
 const PIDFILE = join(HOME, '.imcodes', 'daemon.pid');
-const VBS_LAUNCHER = join(HOME, '.imcodes', 'daemon-launcher.vbs');
+const DAEMON_TASK = 'imcodes-daemon';
 
 const LOG_FILE = process.argv[2];
 const NPM_CMD = process.argv[3];
@@ -542,17 +542,24 @@ async function main() {
     log(`repair-watchdog warning: ${e?.message ?? e}`);
   }
 
-  // Step 8: Spawn new watchdog via VBS (preferred — runs hidden).
-  trace(8, 'pre-vbs-launch');
-  log('starting new watchdog via VBS');
-  if (existsSync(VBS_LAUNCHER)) {
-    spawn('wscript', [VBS_LAUNCHER], {
-      detached: true, stdio: 'ignore', windowsHide: true,
-    }).unref();
-    trace(8, 'post-vbs-launch');
-  } else {
-    log(`WARNING: VBS launcher not found at ${VBS_LAUNCHER}`);
-    trace(8, 'vbs-launcher-missing');
+  // Step 8: Ask Task Scheduler to own the replacement watchdog. The repair
+  // command normally starts it already; this idempotent /Run is a safety net.
+  // Never spawn VBS directly here: that creates an unmanaged watchdog which
+  // Task Scheduler cannot observe or recover after an external tree-kill.
+  trace(8, 'pre-scheduled-task-launch');
+  log('starting new watchdog via Task Scheduler');
+  try {
+    const taskStart = spawnSync('schtasks', ['/Run', '/TN', DAEMON_TASK], {
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', windowsHide: true,
+      timeout: FAST_CMD_TIMEOUT_MS,
+    });
+    trace(8, 'post-scheduled-task-launch', `exit=${taskStart.status}`);
+    if (taskStart.status !== 0) {
+      log(`scheduled task start warning [exit ${taskStart.status}]: ${(taskStart.stderr || '').trim()}`);
+    }
+  } catch (e) {
+    log(`scheduled task start warning: ${e?.message ?? e}`);
+    trace(8, 'scheduled-task-launch-failed');
   }
 
   // Step 9: Lock removed in `finally` — watchdog exits :wait_loop and

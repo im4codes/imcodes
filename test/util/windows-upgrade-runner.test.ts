@@ -143,7 +143,7 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
       "trace(6, 'pre-kill-watchdogs')",
       "trace(6, 'post-kill-watchdogs')",
       "trace(7, 'pre-repair-watchdog')",
-      "trace(8, 'pre-vbs-launch')",
+      "trace(8, 'pre-scheduled-task-launch')",
       "trace(10, 'pre-health-check')",
       "trace(99, 'main-exit-success')",
       "trace(99, 'main-exit-fatal')",
