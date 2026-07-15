@@ -34,6 +34,23 @@
       "generic": "Что-то пошло не так. Попробуйте ещё раз."
     }
   },
+  "machine": {
+    "feature_label": "Машина",
+    "category": "Машина",
+    "category_desc": "Вставить маркер целевой машины",
+    "empty": "Нет доступных машин",
+    "empty_hint": "Зарегистрируйте управляемый узел, чтобы отправлять ему команды маркером ^^(имя).",
+    "usage_hint": "Нажмите на машину, чтобы вставить её маркер ^^(имя). Введите ^ в поле ввода для автодополнения. Офлайн-машины выбрать нельзя.",
+    "no_results": "Нет машин, соответствующих запросу",
+    "search_placeholder": "Поиск машин",
+    "online": "В сети",
+    "offline": "Не в сети",
+    "offline_hint": "Не в сети — выбрать нельзя",
+    "error": {
+      "list_unavailable": "Машины ещё загружаются или не удалось загрузить. Повторите попытку через мгновение.",
+      "machine_unresolved_failclosed": "Не удалось определить эту машину, сообщение не отправлено."
+    }
+  },
   "common": {
     "cancel": "Отмена",
     "confirm": "Подтвердить",
@@ -610,6 +627,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -787,6 +805,7 @@
     "loading": "Загрузка…",
     "tab_quick": "Быстро",
     "tab_files": "Файлы",
+    "tab_machines": "Узлы",
     "confirm_delete": "Удалить этот элемент?"
   },
   "file_browser": {
@@ -828,7 +847,13 @@
     "upgrade_blocked_title": "Обновление заблокировано",
     "upgrade_blocked_p2p_active": "Team всё ещё выполняется. Остановите его перед обновлением daemon.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver всё ещё выполняется. Остановите его перед обновлением daemon.",
-    "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого."
+    "upgrade_blocked_master_compaction_active": "Выполняется сжатие сводной памяти. daemon обновится после его завершения.",
+    "upgrade_blocked_compression_active": "Выполняется сжатие памяти. daemon обновится после его завершения.",
+    "upgrade_blocked_transport_busy": "Transport session всё ещё выполняет turn. Дождитесь состояния idle перед обновлением daemon.",
+    "upgrade_blocked_session_busy": "В сессии ещё выполняется работа. Дождитесь состояния idle перед обновлением daemon.",
+    "upgrade_blocked_cooldown_active": "daemon недавно обновлялся. Автообновление повторится после периода ожидания.",
+    "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого.",
+    "upgrade_blocked_unknown": "daemon временно занят. Автообновление повторит попытку."
   },
   "discussion": {
     "role_critic": "Критик",
@@ -861,6 +886,7 @@
     "dir_required": "Рабочий каталог обязателен",
     "not_connected": "Не подключено к daemon",
     "daemon_offline": "Daemon не в сети — убедитесь, что imcodes daemon запущен",
+    "grok_prerequisite_error": "Grok Build недоступен: {{error}}",
     "start": "Запустить",
     "starting": "Запуск...",
     "timeout": "Истекло время ожидания запуска сессии. Проверьте журналы daemon.",
@@ -875,10 +901,10 @@
     "agent_type": "Тип агента",
     "agent_flavor_cli": "CLI: нативный интерфейс для тех, кто предпочитает оригинальный UI. В режиме чата нет стриминга.",
     "agent_flavor_sdk": "SDK: поддерживает стриминг и использует более простой интерфейс.",
-    "qwen_provider_hint": "Если нужен сторонний Coding Plan, выберите Qwen Code.",
-    "qwen_provider_selected_hint": "Qwen Code может использовать сторонние провайдеры Coding Plan с Anthropic-совместимым API через пресеты API Provider ниже.",
+    "qwen_provider_hint": "Если нужен сторонний Coding Plan, выберите Claude Code SDK.",
+    "qwen_provider_selected_hint": "Выбранный SDK может использовать сторонние провайдеры Coding Plan с Anthropic-совместимым API через пресеты API Provider ниже.",
     "custom_provider_sdk": "SDK пользовательского провайдера",
-    "custom_provider_sdk_help": "Использует транспорт Qwen SDK как слой совместимости; ниже выберите пресет API Provider.",
+    "custom_provider_sdk_help": "Использует транспорт Claude Code SDK как слой совместимости; ниже выберите пресет API Provider.",
     "custom_provider_preset": "Пресет пользовательского провайдера",
     "custom_provider_preset_required": "Выберите или добавьте пресет API Provider для SDK пользовательского провайдера.",
     "compatible_api_via_qwen": "Совместимый API (через Qwen)",
@@ -2312,6 +2338,7 @@
       "mcpProviderStatusHint": "MCP-статус сообщается отдельно от подключения провайдера.",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
@@ -2641,5 +2668,44 @@
     "weekOf": "Неделя {{date}}",
     "members": "По сессиям",
     "rangeAll": "Всё время"
+  },
+  "controlled_nodes": {
+    "title": "Управляемые узлы",
+    "short": "Узлы",
+    "add_title": "Добавить машину",
+    "os_win": "Скачать для Windows",
+    "os_mac": "Скачать для macOS",
+    "os_linux": "Скачать для Linux",
+    "download_target": "{{os}} ({{arch}})",
+    "no_executables": "На этом сервере нет доступных загрузок установщиков.",
+    "availability_error": "Не удалось загрузить доступность установщиков. Проверьте соединение и повторите попытку.",
+    "loading_availability": "Загрузка доступных установщиков…",
+    "loading_download": "Запуск загрузки…",
+    "download_error": "Загрузка не удалась. Попробуйте ещё раз.",
+    "download_popup_blocked": "Браузер заблокировал окно загрузки. Разрешите всплывающие окна для этого сайта и повторите попытку.",
+    "mint_executable_not_built": "Этот установщик пока недоступен на сервере.",
+    "mint_canonical_server_url_required": "URL сервера не настроен для загрузки управляемых узлов. Попросите администратора задать канонический публичный URL.",
+    "ticket_expired": "Ссылка для загрузки истекла. Начните новую загрузку.",
+    "ticket_expires_at": "Ссылка действительна до {{time}}",
+    "artifact_meta": "{{detail}}",
+    "usage_title": "Как использовать",
+    "usage_step1": "Скачайте исполняемый файл для ОS целевой машины.",
+    "usage_step2": "Запустите его один раз на этой машине с нужными правами (см. примечания по ОС ниже).",
+    "usage_step3": "Он автоматически зарегистрируется, установит автозапуск и появится ниже, когда будет в сети.",
+    "usage_win_run": "Запустите от имени администратора. Если появится SmartScreen, выберите Подробнее → Выполнить в любом случае.",
+    "usage_mac_run": "При первом запуске обойдите Gatekeeper: правый щелчок по приложению → Открыть, или выполните xattr -cr <путь>, затем откройте обычным способом.",
+    "usage_linux_run": "Сделайте файл исполняемым (chmod +x <файл>) и запустите один раз от root (sudo).",
+    "machines_title": "Ваши машины",
+    "refresh": "Обновить",
+    "error_generic": "Что-то пошло не так. Попробуйте ещё раз.",
+    "empty": "Управляемых узлов пока нет.",
+    "online": "В сети",
+    "offline": "Не в сети",
+    "exec_on": "Выполнение включено",
+    "exec_off": "Выполнение отключено",
+    "rename_label": "Имя управляемого узла",
+    "rename_invalid": "Введите имя длиной от 1 до 120 символов без управляющих символов.",
+    "revoke": "Отозвать",
+    "revoke_confirm": "Отозвать эту машину? Ею больше нельзя будет управлять, потребуется повторная регистрация."
   }
 }

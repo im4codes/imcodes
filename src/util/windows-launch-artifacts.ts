@@ -1,6 +1,6 @@
 import { writeFile, mkdir, stat, truncate } from 'fs/promises';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import path, { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
@@ -9,6 +9,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const TASK_NAME = 'imcodes-daemon';
+const TASK_WATCHDOG_INTERVAL = 'PT1M';
+const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 /** Sentinel file that tells the watchdog loop to pause.
  *  Created by the upgrade batch before npm install, deleted after restart. */
@@ -20,6 +22,140 @@ export interface LaunchPaths {
   watchdogPath: string;
   vbsPath: string;
   logPath: string;
+}
+
+function escapeXmlText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+function windowsTaskStartBoundary(now: Date): string {
+  const start = new Date(now.getTime());
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() + 1);
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`
+    + `T${pad(start.getHours())}:${pad(start.getMinutes())}:00`;
+}
+
+/** Resolve the account that owns the interactive daemon session. */
+export function resolveWindowsDaemonTaskUserId(
+  env: NodeJS.ProcessEnv = process.env,
+  currentIdentity: () => string = () => execFileSync('whoami', [], {
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: WINDOWS_COMMAND_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  }).trim(),
+): string {
+  try {
+    const identity = currentIdentity().trim();
+    if (identity) return identity;
+  } catch { /* use environment fallback */ }
+  const username = env.USERNAME?.trim() || env.USER?.trim();
+  if (!username) throw new Error('windows_daemon_task_user_unavailable');
+  const envDomain = env.USERDOMAIN?.trim();
+  // OpenSSH sessions on standalone Windows hosts commonly report
+  // USERDOMAIN=WORKGROUP. That is not a valid account authority and makes
+  // schtasks reject the XML. Prefer COMPUTERNAME for local accounts.
+  const domain = envDomain && envDomain.toUpperCase() !== 'WORKGROUP'
+    ? envDomain
+    : env.COMPUTERNAME?.trim() || envDomain;
+  return domain ? `${domain}\\${username}` : username;
+}
+
+/**
+ * Durable Task Scheduler definition for the per-user Windows daemon.
+ *
+ * Boot + logon cover normal startup. The one-minute trigger is intentional:
+ * Task Scheduler's RestartOnFailure does not fire when an externally killed
+ * child causes a wrapper to exit successfully. IgnoreNew makes each tick a
+ * no-op while the long-running watchdog is healthy, and starts a replacement
+ * within one minute when the complete task tree disappears.
+ */
+export function windowsDaemonScheduledTaskXml(
+  paths: LaunchPaths,
+  userId: string = resolveWindowsDaemonTaskUserId(),
+  now: Date = new Date(),
+): string {
+  const escapedUserId = escapeXmlText(userId);
+  const startBoundary = windowsTaskStartBoundary(now);
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>IM.codes daemon watchdog</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled></BootTrigger>
+    <LogonTrigger><Enabled>true</Enabled><UserId>${escapedUserId}</UserId></LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>${startBoundary}</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition><Interval>${TASK_WATCHDOG_INTERVAL}</Interval></Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>${escapedUserId}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>${TASK_WATCHDOG_INTERVAL}</Interval><Count>255</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wscript.exe</Command>
+      <Arguments>&quot;${escapeXmlText(paths.vbsPath)}&quot;</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`;
+}
+
+export function encodeWindowsDaemonScheduledTaskXml(xml: string): Buffer {
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, 'utf16le')]);
+}
+
+/** Replace legacy ONLOGON registrations with the durable task definition. */
+export function installWindowsScheduledTask(paths: LaunchPaths): boolean {
+  let taskDir: string | null = null;
+  try {
+    taskDir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-task-'));
+    const taskXmlPath = join(taskDir, 'imcodes-daemon.xml');
+    const xml = windowsDaemonScheduledTaskXml(paths);
+    writeFileSync(taskXmlPath, encodeWindowsDaemonScheduledTaskXml(xml), { mode: 0o600 });
+    execFileSync('schtasks', ['/Create', '/TN', TASK_NAME, '/XML', taskXmlPath, '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: WINDOWS_COMMAND_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (taskDir) {
+      try { rmSync(taskDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
 }
 
 /** Resolve all paths needed for the Windows daemon launch chain. */
@@ -212,11 +348,14 @@ export function encodeCmdAsUtf8Bom(content: string): Buffer {
  *  watchdog path (e.g. a username with Chinese characters) gets garbled
  *  and wscript can't find the .cmd file.
  *
- *  Also: `On Error Resume Next` ensures wscript NEVER pops up an error
- *  dialog (e.g. if the watchdog .cmd is missing).  Errors fail silently. */
+ *  WaitOnReturn MUST be true. Task Scheduler launches this VBS and needs the
+ *  wrapper to remain alive for the lifetime of daemon-watchdog.cmd; otherwise
+ *  the task reports success immediately and cannot supervise the watchdog.
+ *
+ *  `On Error Resume Next` ensures wscript NEVER pops up an error dialog. */
 export async function writeVbsLauncher(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.vbsPath), { recursive: true });
-  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${paths.watchdogPath}""", 0, False\r\n`;
+  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
   await writeFile(paths.vbsPath, encodeVbsAsUtf16(vbs));
 }
 
@@ -234,7 +373,10 @@ export function updateSchtasks(paths: LaunchPaths): boolean {
       'schtasks', '/Change',
       '/TN', TASK_NAME,
       '/TR', `wscript "${paths.vbsPath}"`,
-    ].join(' '), { stdio: 'ignore', windowsHide: true });
+    ].join(' '), {
+      stdio: 'ignore', windowsHide: true,
+      timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+    });
     return true;
   } catch {
     return false;
@@ -270,7 +412,10 @@ export async function regenerateAllArtifacts(): Promise<void> {
   const paths = resolveLaunchPaths();
   await writeWatchdogCmd(paths);
   await writeVbsLauncher(paths);
-  updateSchtasks(paths);
+  // Re-create the whole registration. `/Change /TR` preserves the legacy
+  // ONLOGON-only trigger and zero-restart settings, which is exactly the
+  // configuration that left real Windows hosts offline after watchdog death.
+  if (!installWindowsScheduledTask(paths)) updateSchtasks(paths);
   await rotateWatchdogLog(paths);
 }
 
@@ -293,7 +438,10 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      },
     );
     for (const line of out.split(/\r?\n/)) {
       const pid = parseInt(line.trim(), 10);
@@ -308,7 +456,10 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     try {
       const out = execSync(
         'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
-        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+        {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+          timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+        },
       );
       pids = out
         .split(/\r?\n/)
@@ -319,6 +470,14 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     } catch { /* both methods failed */ }
   }
   for (const pid of pids) {
-    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore', windowsHide: true }); } catch { /* already dead */ }
+    try {
+      // Do not use `/T` here. On real VBS -> CMD -> Node task trees Windows
+      // can block taskkill indefinitely while traversing the console/job
+      // descendants. The caller separately terminates daemon processes.
+      execSync(`taskkill /f /pid ${pid}`, {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      });
+    } catch { /* already dead or bounded timeout */ }
   }
 }

@@ -34,6 +34,23 @@
       "generic": "Algo salió mal. Inténtalo de nuevo."
     }
   },
+  "machine": {
+    "feature_label": "Máquina",
+    "category": "Máquina",
+    "category_desc": "Insertar un marcador de máquina de destino",
+    "empty": "No hay máquinas disponibles",
+    "empty_hint": "Registra un nodo controlado para enviarle comandos con un marcador ^^(nombre).",
+    "usage_hint": "Toca una máquina para insertar su marcador ^^(nombre). Escribe ^ en el redactor para autocompletar. Las máquinas sin conexión no se pueden seleccionar.",
+    "no_results": "Ninguna máquina coincide con tu búsqueda",
+    "search_placeholder": "Buscar máquinas",
+    "online": "En línea",
+    "offline": "Sin conexión",
+    "offline_hint": "Sin conexión — no se puede seleccionar",
+    "error": {
+      "list_unavailable": "Las máquinas aún se están cargando o no se pudieron cargar. Inténtalo de nuevo en un momento.",
+      "machine_unresolved_failclosed": "No se pudo resolver esta máquina y no se envió."
+    }
+  },
   "common": {
     "cancel": "Cancelar",
     "confirm": "Confirmar",
@@ -610,6 +627,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -787,6 +805,7 @@
     "loading": "Cargando…",
     "tab_quick": "Rápido",
     "tab_files": "Archivos",
+    "tab_machines": "Nodos",
     "confirm_delete": "¿Eliminar este elemento?"
   },
   "file_browser": {
@@ -828,7 +847,13 @@
     "upgrade_blocked_title": "Actualización bloqueada",
     "upgrade_blocked_p2p_active": "Team sigue en ejecución. Deténlo antes de actualizar el daemon.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver sigue en ejecución. Deténlo antes de actualizar el daemon.",
-    "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces."
+    "upgrade_blocked_master_compaction_active": "La compactación del resumen maestro de memoria sigue en curso. El daemon se actualizará cuando termine.",
+    "upgrade_blocked_compression_active": "La compresión de memoria sigue en curso. El daemon se actualizará cuando termine.",
+    "upgrade_blocked_transport_busy": "Una sesión de transporte sigue ejecutando un turno. Espera a que quede inactiva antes de actualizar el daemon.",
+    "upgrade_blocked_session_busy": "Una sesión todavía tiene trabajo activo. Espera a que quede inactiva antes de actualizar el daemon.",
+    "upgrade_blocked_cooldown_active": "El daemon se actualizó recientemente. La actualización automática volverá a intentarlo después del tiempo de espera.",
+    "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces.",
+    "upgrade_blocked_unknown": "El daemon está ocupado temporalmente. La actualización automática volverá a intentarlo."
   },
   "discussion": {
     "role_critic": "Crítico",
@@ -861,6 +886,7 @@
     "dir_required": "El directorio de trabajo es obligatorio",
     "not_connected": "No conectado al daemon",
     "daemon_offline": "El daemon está desconectado — verifica que imcodes daemon esté en ejecución",
+    "grok_prerequisite_error": "Grok Build no está disponible: {{error}}",
     "start": "Iniciar",
     "starting": "Iniciando...",
     "timeout": "Tiempo de espera agotado para iniciar la sesión. Revisa los registros del daemon.",
@@ -875,10 +901,10 @@
     "agent_type": "Tipo de agente",
     "agent_flavor_cli": "CLI: interfaz nativa para quienes prefieren la UI original. El modo chat no admite streaming.",
     "agent_flavor_sdk": "SDK: admite streaming y usa una interfaz más simple.",
-    "qwen_provider_hint": "Si necesitas un Coding Plan de terceros, elige Qwen Code.",
-    "qwen_provider_selected_hint": "Qwen Code puede usar proveedores externos de Coding Plan compatibles con Anthropic mediante los presets de API Provider de abajo.",
+    "qwen_provider_hint": "Si necesitas un Coding Plan de terceros, elige Claude Code SDK.",
+    "qwen_provider_selected_hint": "El SDK seleccionado puede usar proveedores externos de Coding Plan compatibles con Anthropic mediante los presets de API Provider de abajo.",
     "custom_provider_sdk": "SDK de proveedor personalizado",
-    "custom_provider_sdk_help": "Usa el transporte Qwen SDK como capa de compatibilidad y elige abajo un preset de API Provider.",
+    "custom_provider_sdk_help": "Usa el transporte Claude Code SDK como capa de compatibilidad y elige abajo un preset de API Provider.",
     "custom_provider_preset": "Preset de proveedor personalizado",
     "custom_provider_preset_required": "Elige o agrega un preset de API Provider para el SDK de proveedor personalizado.",
     "compatible_api_via_qwen": "API compatible (vía Qwen)",
@@ -2313,6 +2339,7 @@
       "mcpProviderStatusHint": "El estado específico de MCP se informa aparte de la conectividad del proveedor.",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
@@ -2642,5 +2669,44 @@
     "weekOf": "Semana del {{date}}",
     "members": "Por sesión",
     "rangeAll": "Todo el tiempo"
+  },
+  "controlled_nodes": {
+    "title": "Nodos controlados",
+    "short": "Nodos",
+    "add_title": "Añadir una máquina",
+    "os_win": "Descargar para Windows",
+    "os_mac": "Descargar para macOS",
+    "os_linux": "Descargar para Linux",
+    "download_target": "{{os}} ({{arch}})",
+    "no_executables": "Este servidor no muestra descargas de instaladores.",
+    "availability_error": "No se pudo cargar la disponibilidad de instaladores. Comprueba la conexión e inténtalo de nuevo.",
+    "loading_availability": "Cargando instaladores disponibles…",
+    "loading_download": "Iniciando descarga…",
+    "download_error": "La descarga falló. Inténtalo de nuevo.",
+    "download_popup_blocked": "El navegador bloqueó la ventana de descarga. Permite las ventanas emergentes de este sitio e inténtalo de nuevo.",
+    "mint_executable_not_built": "Este instalador aún no está disponible en el servidor.",
+    "mint_canonical_server_url_required": "La URL del servidor no está configurada para descargas de nodos controlados. Pide al administrador que establezca una URL pública canónica.",
+    "ticket_expired": "Este enlace de descarga ha caducado. Inicia una nueva descarga.",
+    "ticket_expires_at": "Enlace válido hasta {{time}}",
+    "artifact_meta": "{{detail}}",
+    "usage_title": "Cómo usar",
+    "usage_step1": "Descarga el ejecutable para el sistema operativo de la máquina de destino.",
+    "usage_step2": "Ejecútalo una vez en esa máquina con los privilegios necesarios (ver notas por SO abajo).",
+    "usage_step3": "Se registra automáticamente, instala el autoarranque y aparece abajo cuando está en línea.",
+    "usage_win_run": "Ejecuta como Administrador. Si aparece SmartScreen, elige Más información → Ejecutar de todos modos.",
+    "usage_mac_run": "En el primer arranque, evita Gatekeeper: clic derecho en la app → Abrir, o ejecuta: xattr -cr <ruta> y ábrela normalmente.",
+    "usage_linux_run": "Hazlo ejecutable (chmod +x <archivo>) y ejecútalo una vez como root (sudo).",
+    "machines_title": "Tus máquinas",
+    "refresh": "Actualizar",
+    "error_generic": "Algo salió mal. Inténtalo de nuevo.",
+    "empty": "Aún no hay nodos controlados.",
+    "online": "En línea",
+    "offline": "Sin conexión",
+    "exec_on": "Ejecución habilitada",
+    "exec_off": "Ejecución deshabilitada",
+    "rename_label": "Nombre del nodo controlado",
+    "rename_invalid": "Introduce un nombre de 1 a 120 caracteres sin caracteres de control.",
+    "revoke": "Revocar",
+    "revoke_confirm": "¿Revocar esta máquina? Ya no se podrá controlar y deberá volver a registrarse."
   }
 }

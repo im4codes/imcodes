@@ -3,6 +3,9 @@ import {
   UPGRADE_LOCK_FILE,
   encodeCmdAsUtf8Bom,
   encodeVbsAsUtf16,
+  encodeWindowsDaemonScheduledTaskXml,
+  resolveWindowsDaemonTaskUserId,
+  windowsDaemonScheduledTaskXml,
   writeVbsLauncher,
   writeWatchdogCmd,
 } from '../../src/util/windows-launch-artifacts.js';
@@ -369,7 +372,7 @@ describe('writeVbsLauncher', () => {
     await resetExistsSyncMock();
   });
 
-  it('runs watchdog CMD hidden (window style 0)', async () => {
+  it('runs watchdog CMD hidden and waits so Task Scheduler owns its lifetime', async () => {
     const paths = {
       nodeExe: '', imcodesScript: '', logPath: '',
       watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
@@ -382,7 +385,7 @@ describe('writeVbsLauncher', () => {
     expect(vbs).toContain('WshShell.Run');
     expect(vbs).toContain('daemon-watchdog.cmd');
     // Window style 0 = hidden
-    expect(vbs).toContain(', 0, False');
+    expect(vbs).toContain(', 0, True');
   });
 
   it('writes VBS as UTF-16 LE with BOM (required for non-ASCII paths)', async () => {
@@ -418,6 +421,50 @@ describe('writeVbsLauncher', () => {
     await writeVbsLauncher(paths);
     const vbs = written[paths.vbsPath];
     expect(vbs).toContain('On Error Resume Next');
+  });
+});
+
+describe('windowsDaemonScheduledTaskXml', () => {
+  const paths = {
+    nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+    imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+    watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+    vbsPath: 'C:\\Users\\X<&>\\.imcodes\\daemon-launcher.vbs',
+    logPath: 'C:\\Users\\X\\.imcodes\\watchdog.log',
+  };
+
+  it('registers boot, logon, recurring liveness, and restart recovery', () => {
+    const xml = windowsDaemonScheduledTaskXml(paths, 'DESKTOP\\user<&>', new Date(2026, 6, 15, 12, 26, 33));
+    expect(xml).toContain('<BootTrigger><Enabled>true</Enabled></BootTrigger>');
+    expect(xml).toContain('<LogonTrigger>');
+    expect(xml).toContain('<TimeTrigger>');
+    expect(xml).toContain('<Interval>PT1M</Interval>');
+    expect(xml).toContain('<StartWhenAvailable>true</StartWhenAvailable>');
+    expect(xml).toContain('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
+    expect(xml).toContain('<RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure>');
+    expect(xml).toContain('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>');
+    expect(xml).toContain('<LogonType>InteractiveToken</LogonType>');
+    expect(xml).toContain('DESKTOP\\user&lt;&amp;&gt;');
+    expect(xml).toContain('&quot;C:\\Users\\X&lt;&amp;&gt;\\.imcodes\\daemon-launcher.vbs&quot;');
+    expect(xml).toContain('<StartBoundary>2026-07-15T12:27:00</StartBoundary>');
+  });
+
+  it('encodes task XML as BOM-prefixed UTF-16LE', () => {
+    const xml = windowsDaemonScheduledTaskXml(paths, 'DESKTOP\\user');
+    const encoded = encodeWindowsDaemonScheduledTaskXml(xml);
+    expect([...encoded.subarray(0, 2)]).toEqual([0xff, 0xfe]);
+    expect(encoded.subarray(2).toString('utf16le')).toBe(xml);
+  });
+
+  it('uses whoami and never treats WORKGROUP as the account authority', () => {
+    expect(resolveWindowsDaemonTaskUserId(
+      { USERNAME: 'admin', USERDOMAIN: 'WORKGROUP', COMPUTERNAME: 'DESKTOP-1' },
+      () => 'desktop-1\\admin',
+    )).toBe('desktop-1\\admin');
+    expect(resolveWindowsDaemonTaskUserId(
+      { USERNAME: 'admin', USERDOMAIN: 'WORKGROUP', COMPUTERNAME: 'DESKTOP-1' },
+      () => { throw new Error('whoami unavailable'); },
+    )).toBe('DESKTOP-1\\admin');
   });
 });
 

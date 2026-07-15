@@ -137,8 +137,6 @@ function restartDaemon(): void {
   }
 }
 
-const TASK_NAME = 'imcodes-daemon';
-
 // writeWindowsWatchdogFiles now delegates to the centralized launch-artifacts module.
 async function writeWindowsWatchdogFiles(): Promise<void> {
   const { resolveLaunchPaths, writeWatchdogCmd, writeVbsLauncher, rotateWatchdogLog } = await import('../util/windows-launch-artifacts.js');
@@ -157,26 +155,17 @@ async function installWindowsStartup(): Promise<void> {
     try { await import('fs/promises').then((fs) => fs.unlink(join(startupDir, old))); } catch { /* ignore */ }
   }
 
-  // Use Task Scheduler: runs on logon via VBS launcher (hidden window).
-  // Create the task directly with the VBS command — do NOT create with a bare
-  // node command first then /Change, because /Change can fail silently, leaving
-  // a visible cmd.exe window on every login/restart.
-  const vbsPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
-  try {
-    execSync([
-      'schtasks', '/Create',
-      '/TN', TASK_NAME,
-      '/TR', `wscript "${vbsPath}"`,
-      '/SC', 'ONLOGON',
-      '/RL', 'HIGHEST',
-      '/F',
-    ].join(' '), { stdio: 'ignore' });
-  } catch {
+  // Replace legacy ONLOGON-only registrations with a durable Task Scheduler
+  // definition: boot + logon + one-minute liveness trigger, direct ownership
+  // of the waiting VBS/watchdog process, and failure restart policy.
+  const { installWindowsScheduledTask, resolveLaunchPaths } = await import('../util/windows-launch-artifacts.js');
+  const paths = resolveLaunchPaths();
+  if (!installWindowsScheduledTask(paths)) {
     // schtasks may require elevation — fall back to startup folder CMD
     console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
     await mkdir(startupDir, { recursive: true });
     const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
-    const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart "" /min wscript "${vbsPath}"\r\n`;
+    const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart "" /min wscript "${paths.vbsPath}"\r\n`;
     await writeFile(cmdPath, cmd, 'utf8');
     return;
   }
@@ -201,7 +190,7 @@ async function ensureServiceInstalled(): Promise<void> {
     console.log('\nDaemon installed as a systemd user service — starts automatically on login.');
   } else if (process.platform === 'win32') {
     await installWindowsStartup();
-    console.log('\nDaemon installed as a startup shortcut — starts automatically on login.');
+    console.log('\nDaemon installed as a scheduled watchdog — starts at boot/logon and self-recovers.');
     // Immediately start the daemon (don't wait for next login).  Use the
     // single reusable ensureDaemonRunning() that handles all edge cases:
     // orphan daemons holding the named pipe, crash-loop watchdogs, etc.
@@ -209,7 +198,7 @@ async function ensureServiceInstalled(): Promise<void> {
     if (ensureDaemonRunning(process.pid)) {
       console.log('Daemon started.');
     } else {
-      console.log('Note: Daemon will start on next login.');
+      console.log('Note: Daemon task installed but did not become healthy; run "imcodes repair-watchdog" as administrator.');
     }
   } else {
     console.log('\nRun "imcodes start" to start the daemon.');

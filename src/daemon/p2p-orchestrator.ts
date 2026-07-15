@@ -15,6 +15,7 @@ import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
+import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import {
   P2P_BASELINE_PROMPT,
   getLegacyExecutionRoundCount,
@@ -1105,27 +1106,7 @@ async function getOrRestoreP2pTransportRuntime(sessionName: string): Promise<Ret
 async function restoreP2pTransportRuntime(record: SessionRecord, reason: 'missing_runtime'): Promise<void> {
   logger.warn({ session: record.name, reason }, 'P2P: restoring transport runtime before prompt dispatch');
   await stopTransportRuntimeSession(record.name).catch(() => undefined);
-  await launchTransportSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: record.agentType as any,
-    projectDir: record.projectDir,
-    label: record.label,
-    description: record.description,
-    requestedModel: record.requestedModel,
-    effort: record.effort,
-    transportConfig: record.transportConfig,
-    ccPreset: (record.agentType === 'claude-code-sdk' || record.agentType === 'qwen') ? record.ccPreset : undefined,
-    ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
-    ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId } : {}),
-    ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-  });
+  await launchTransportSession(buildTransportResumeLaunchOpts(record));
 }
 
 function emitP2pTransportQueuedState(

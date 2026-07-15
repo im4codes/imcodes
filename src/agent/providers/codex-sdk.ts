@@ -1,5 +1,5 @@
 import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { getCodexHome, recentCodexSessionDirs, findCodexRolloutPathByUuid } from '../../util/codex-rollout-path.js';
@@ -12,6 +12,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderRolloutCompletionReconcileOptions,
   ProviderModelList,
   SessionConfig,
   SessionInfoUpdate,
@@ -135,7 +136,15 @@ const CODEX_RUNTIME_SUBAGENT_METHODS = new Set([
   'runtime/subagent/status',
 ]);
 
-const CODEX_TOOL_LIKE_ITEM_TYPES = new Set(['commandExecution', 'mcpToolCall']);
+const CODEX_TOOL_LIKE_ITEM_TYPES = new Set([
+  'commandExecution',
+  'mcpToolCall',
+  'customToolCall',
+  'custom_tool_call',
+  'customTool',
+  'custom_tool',
+]);
+const CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT = 2_000;
 type CodexAppServerDisconnectClass =
   | 'intentional_shutdown'
   | 'auth_refresh_restart'
@@ -171,6 +180,23 @@ const CODEX_RAW_CHECKLIST_POLL_WINDOW_MS = 20_000;
 // a few seconds. The read itself is still gated by CODEX_ROLLOUT_TASK_COMPLETE_SILENCE_MS
 // (so healthy, actively-streaming turns never touch the file).
 const CODEX_ROLLOUT_SETTLE_POLL_INTERVAL_MS = 2_000;
+// Store-driven health-poll BACKSTOP grace. The runtime also owns an independent
+// 2s poll with a 2s grace so a provider-side watcher teardown cannot leave a
+// false-working turn visible for a whole health cycle. This longer default is
+// retained for callers that do not carry the runtime's generation/ownership
+// evidence.
+const CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS = 90_000;
+// ROLLOUT-FIRST AUTHORITY: codex-core writes a terminal `task_complete{turn_id}`
+// to the thread's rollout the instant the model finishes a turn — empirically
+// ~2s BEFORE the process would even exit, and terminal in 2813/2813 sampled
+// turns. We attach a real-time `fs.watch` to that file so a dropped or absent
+// app-server `turn/completed` costs ~0ms instead of 60s+ (or forever on a hard
+// zombie). Unlike the legacy settle poll, this path has NO 60s silence gate and
+// does NOT depend on the heartbeat lease or any further app-server notification:
+// the kernel wakes us on the append, and the rollout record is authoritative
+// terminal evidence for that exact turn. The debounce only coalesces the burst
+// of change events that a single append can trigger.
+const CODEX_ROLLOUT_AUTHORITY_DEBOUNCE_MS = 40;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_INTERVAL_MS = 2_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS = 15 * 60_000;
 const CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS = 5_000;
@@ -180,6 +206,11 @@ interface CodexRawSpawnAgentCall {
   callId: string;
   args: Record<string, any>;
   startedAtMs: number;
+}
+
+interface CodexCustomToolLifecycle {
+  tool: ToolCallEvent;
+  terminal: boolean;
 }
 
 interface CodexTrackedSubagentThread {
@@ -674,6 +705,11 @@ interface CodexRolloutTaskCompleteEvidence {
   lastAgentMessage?: string;
 }
 
+interface CodexRolloutTerminalEvidence extends CodexRolloutTaskCompleteEvidence {
+  /** Wall-clock ms of the rollout `task_complete` wrapper timestamp, or null if unparseable. */
+  completedAtMs: number | null;
+}
+
 interface CodexActiveTurnLease {
   id: string;
   attemptId: number;
@@ -718,12 +754,21 @@ interface CodexSdkSessionState {
   activeTurnLease?: CodexActiveTurnLease;
   turnStartInFlight: boolean;
   runningCompact: boolean;
+  /** True only for a user-issued standalone `/compact` transport turn. */
+  compactCommandInFlight: boolean;
   currentMessageId: string | null;
   currentText: string;
   activeItemIds: Set<string>;
   activeToolItemIds: Set<string>;
   activeCompactionItemIds: Set<string>;
   openProviderToolCalls: Map<string, ToolCallEvent>;
+  /**
+   * Correlates custom tool lifecycle across both app-server surfaces:
+   * `item/started|completed` and `rawResponseItem/completed`. Newer Codex
+   * versions can expose either channel (and occasionally both), so call_id is
+   * the canonical identity and this map prevents duplicate timeline cards.
+   */
+  customToolLifecycleByCallId: Map<string, CodexCustomToolLifecycle>;
   runtimeSubagentStartedAtByKey: Map<string, number>;
   cancelled: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | null;
@@ -780,6 +825,14 @@ interface CodexSdkSessionState {
   rawChecklistPollTimer: ReturnType<typeof setTimeout> | null;
   rawChecklistPollUntil: number;
   rolloutSettlePollTimer: ReturnType<typeof setTimeout> | null;
+  /** ROLLOUT-FIRST AUTHORITY: real-time fs.watch on the thread's rollout file. */
+  rolloutAuthorityWatcher?: FSWatcher;
+  rolloutAuthorityWatchPath?: string;
+  /** Turn id the authority watcher is currently settling; re-armed when it changes. */
+  rolloutAuthorityTurnId?: string;
+  rolloutAuthorityDebounce?: ReturnType<typeof setTimeout>;
+  /** Guards the async path-resolution while (re)arming the authority watcher. */
+  rolloutAuthorityArmInFlight?: boolean;
   childSubagentRolloutStartedAt: number;
   childSubagentRolloutSeenIds: Set<string>;
   childSubagentRolloutCompletedIds: Set<string>;
@@ -1469,6 +1522,101 @@ function parseJsonRecord(value: unknown): Record<string, any> | undefined {
   }
 }
 
+function customToolOutputText(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (isRecord(parsed) || Array.isArray(parsed)) return customToolOutputText(parsed);
+      } catch {}
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => customToolOutputText(entry))
+      .filter((entry): entry is string => entry !== undefined);
+    return parts.length > 0 ? parts.join('\n') : undefined;
+  }
+  if (!isRecord(value)) return value === undefined || value === null ? undefined : String(value);
+
+  for (const key of ['text', 'output', 'content', 'value', 'message']) {
+    const text = customToolOutputText(value[key]);
+    if (text !== undefined) return text;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function customToolOutputRecords(value: unknown): Record<string, any>[] {
+  if (Array.isArray(value)) return value.flatMap((entry) => customToolOutputRecords(entry));
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return customToolOutputRecords(parsed);
+    } catch {
+      return [];
+    }
+  }
+  if (!isRecord(value)) return [];
+  const nested = [value.output, value.content, value.result, value.metadata]
+    .flatMap((entry) => customToolOutputRecords(entry));
+  return [value, ...nested];
+}
+
+function customToolTerminalFromOutput(item: Record<string, any>): {
+  status: Exclude<ToolCallEvent['status'], 'running'>;
+  terminalStatus: ToolTerminalStatus;
+  terminalReason: ToolTerminalReason;
+  output: string;
+} {
+  const rawOutput = item.output ?? item.result ?? item.content ?? item.error;
+  const output = customToolOutputText(rawOutput) ?? '';
+  const normalizedStatus = normalizeStatusName(meaningfulString(item.status));
+  const records = [
+    item,
+    ...customToolOutputRecords(rawOutput),
+    ...customToolOutputRecords(item.metadata),
+  ];
+  const cancelled = normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled'
+    || normalizedStatus === 'interrupted'
+    || normalizedStatus === 'aborted'
+    || records.some((record) => record.cancelled === true || record.canceled === true || record.interrupted === true)
+    || /^script (?:cancelled|canceled|interrupted|aborted)\b/im.test(output);
+  if (cancelled) {
+    return {
+      status: 'error',
+      terminalStatus: 'cancelled',
+      terminalReason: normalizedStatus === 'interrupted' ? 'provider_interrupted' : 'provider_cancelled',
+      output,
+    };
+  }
+
+  const failed = normalizedStatus === 'failed'
+    || normalizedStatus === 'error'
+    || normalizedStatus === 'errored'
+    || (item.error !== undefined && item.error !== null)
+    || records.some((record) => {
+      const exitCode = finiteNumber(record.exit_code) ?? finiteNumber(record.exitCode);
+      return record.is_error === true
+        || record.isError === true
+        || record.success === false
+        || (exitCode !== undefined && exitCode !== 0)
+        || (record.error !== undefined && record.error !== null);
+    })
+    || /^script failed\b/im.test(output);
+  return failed
+    ? { status: 'error', terminalStatus: 'errored', terminalReason: 'provider_error', output }
+    : { status: 'complete', terminalStatus: 'succeeded', terminalReason: 'provider_result', output };
+}
+
 function rawChecklistText(item: Record<string, unknown>): string | undefined {
   for (const key of ['content', 'step', 'text', 'title', 'task', 'description', 'name']) {
     const value = item[key];
@@ -1679,6 +1827,79 @@ function collabAgentToolFromItem(
   };
 }
 
+/**
+ * Surface a Codex CUSTOM tool call (e.g. the newer unified `exec` tool, whose
+ * rollout records are `custom_tool_call{name,input,call_id,status}`) as a
+ * timeline tool card. Older Codex shells arrived as `commandExecution`; the
+ * current binary drives shell/JS execution through a custom tool that lands in
+ * `toolFromItem`'s default branch and used to be dropped — so a turn doing all
+ * its work via `exec` showed NO tool updates in the UI. This maps any
+ * tool-call-shaped item (has an id, a name, and a call payload) to a tool card,
+ * so custom tools are visible regardless of the exact app-server item.type.
+ * Returns null for non-tool items (no name / no call payload), so structural
+ * items are never turned into spurious tool cards.
+ */
+function customToolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
+  void sessionId;
+  // call_id is shared by the raw-response and typed-item channels; item.id is
+  // channel-specific. Prefer call_id so both paths converge on one card.
+  const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+  const id = callId ?? meaningfulString(item.id);
+  const name = meaningfulString(item.name) ?? meaningfulString(item.tool);
+  if (!id || !name) return null;
+  const rawInput = item.input ?? item.arguments ?? item.command ?? item.script;
+  const hasCallShape = rawInput !== undefined
+    || meaningfulString(item.call_id) !== undefined
+    || meaningfulString(item.callId) !== undefined;
+  if (!hasCallShape) return null; // not a tool call — do not fabricate a card
+  const normalizedStatus = normalizeStatusName(meaningfulString(item.status));
+  const cancelled = normalizedStatus === 'cancelled'
+    || normalizedStatus === 'canceled'
+    || normalizedStatus === 'interrupted'
+    || normalizedStatus === 'aborted';
+  const status: ToolCallEvent['status'] = item.status === 'inProgress' || item.status === 'running' || lifecycle === 'started'
+    ? 'running'
+    : item.status === 'failed' || item.status === 'error' || item.status === 'errored' || cancelled
+      ? 'error'
+      : 'complete';
+  const input = typeof rawInput === 'string'
+    ? { command: rawInput }
+    : isRecord(rawInput)
+      ? rawInput
+      : rawInput !== undefined
+        ? { input: rawInput }
+        : {};
+  const rawOutput = item.output ?? item.aggregatedOutput ?? item.result;
+  const output = rawOutput === undefined
+    ? undefined
+    : typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput);
+  return {
+    id,
+    name,
+    status,
+    input,
+    ...(status !== 'running' && output !== undefined ? { output } : {}),
+    ...(status !== 'running' ? {
+      terminalStatus: cancelled ? 'cancelled' : status === 'complete' ? 'succeeded' : 'errored',
+      terminalReason: cancelled ? 'provider_cancelled' : status === 'complete' ? 'provider_result' : 'provider_error',
+      terminalSynthetic: false,
+      terminalSource: 'app_server_jsonrpc',
+      terminalDecisionReason: cancelled ? 'custom_tool_cancelled' : status === 'complete' ? 'custom_tool_result' : 'custom_tool_error',
+    } : {}),
+    detail: {
+      kind: 'customToolCall',
+      summary: name,
+      input,
+      ...(rawOutput !== undefined ? { output: rawOutput } : {}),
+      meta: {
+        status: item.status,
+        callId,
+      },
+      raw: item,
+    },
+  };
+}
+
 export function toolFromItem(sessionId: string, item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
   if (typeof item.type === 'string' && CODEX_RUNTIME_SUBAGENT_ITEM_TYPES.has(normalizeStatusName(item.type))) {
     return runtimeSubagentToolFromPayload(sessionId, item, lifecycle);
@@ -1845,8 +2066,18 @@ export function toolFromItem(sessionId: string, item: Record<string, any>, lifec
         detail: { kind: 'plan', summary: 'Plan', input, meta: {}, raw: item },
       };
     }
+    case 'customToolCall':
+    case 'custom_tool_call':
+    case 'customTool':
+    case 'custom_tool':
+    case 'localShellCall':
+    case 'local_shell_call':
+      return customToolFromItem(sessionId, item, lifecycle);
     default:
-      return null;
+      // Best-effort: surface any remaining tool-call-shaped item (id + name +
+      // call payload) so a not-yet-enumerated Codex tool type is still visible
+      // instead of silently dropped. Non-tool items return null here.
+      return customToolFromItem(sessionId, item, lifecycle);
   }
 }
 
@@ -2037,12 +2268,14 @@ export class CodexSdkProvider implements TransportProvider {
       activeTurnLease: undefined,
       turnStartInFlight: false,
       runningCompact: false,
+      compactCommandInFlight: false,
       currentMessageId: null,
       currentText: '',
       activeItemIds: new Set(),
       activeToolItemIds: new Set(),
       activeCompactionItemIds: new Set(),
       openProviderToolCalls: new Map(),
+      customToolLifecycleByCallId: new Map(),
       runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
       cancelled: false,
       cancelTimer: null,
@@ -2220,7 +2453,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.cancelled = true;
     this.clearActiveTurnLease(state);
     if (!state.threadId) return;
-    if (state.runningCompact) {
+    if (state.runningCompact && state.compactCommandInFlight) {
       const turnId = state.runningTurnId;
       if (turnId) {
         void this.request('turn/interrupt', {
@@ -2253,6 +2486,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.compactObserved = false;
     state.currentMessageId = null;
     state.currentText = '';
@@ -2297,6 +2531,9 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
+      state.runningCompact = false;
+      state.compactCommandInFlight = false;
+      state.compactObserved = false;
       this.clearActiveItemEvidence(state);
       this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
       this.clearRawChecklistPollTimer(state);
@@ -2323,6 +2560,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.compactObserved = false;
     state.currentMessageId = null;
     state.currentText = '';
@@ -2615,6 +2853,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearPendingSessionSystemTextUpdate(state);
       this.clearActiveTurnLease(state);
       state.runningCompact = true;
+      state.compactCommandInFlight = true;
       state.compactObserved = false;
       state.currentText = '';
       state.currentMessageId = null;
@@ -2641,6 +2880,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
       this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
+      state.compactCommandInFlight = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;
@@ -3038,6 +3278,159 @@ export class CodexSdkProvider implements TransportProvider {
     state.rolloutSettlePollTimer = null;
   }
 
+  // ROLLOUT-FIRST AUTHORITY — front-line, real-time turn-completion detection.
+  //
+  // Attaches an fs.watch to the running turn's rollout file so the terminal
+  // `task_complete{turn_id}` record settles the turn the instant it lands —
+  // independent of the app-server's `turn/completed`, the heartbeat lease, and
+  // the legacy 60s silence gate. Armed at the single activity choke-point
+  // (`refreshActiveTurnLease`), so every observed turn is covered; the immediate
+  // check on arm also self-heals a turn whose `task_complete` was already on disk
+  // (e.g. the app-server went silent, or the record landed between events).
+  private armRolloutAuthorityWatch(sessionId: string, state: CodexSdkSessionState, turnId: string | undefined): void {
+    if (!turnId || !state.threadId) return;
+    if (state.cancelled || state.runningCompact) return;
+    if (this.isClosedCodexTurn(state, turnId)) return;
+    // Already watching this exact turn — cheap no-op (called on every activity).
+    if (state.rolloutAuthorityWatcher && state.rolloutAuthorityTurnId === turnId) return;
+    if (state.rolloutAuthorityArmInFlight && state.rolloutAuthorityTurnId === turnId) return;
+    // New turn (or first arm): tear down any prior watcher and re-target.
+    this.disarmRolloutAuthorityWatch(state);
+    state.rolloutAuthorityTurnId = turnId;
+    state.rolloutAuthorityArmInFlight = true;
+    void (async () => {
+      try {
+        const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+        const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+        const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId!, { env });
+        const latest = this.sessions.get(sessionId);
+        // Turn rolled over or session gone while resolving the path.
+        if (!latest || latest.rolloutAuthorityTurnId !== turnId) return;
+        if (!rolloutPath) return; // file not resolvable yet; a later activity re-arms
+        latest.rawChecklistRolloutPath = rolloutPath;
+        let watcher: FSWatcher;
+        try {
+          watcher = watch(rolloutPath, { persistent: false }, () => {
+            this.scheduleRolloutAuthorityCheck(sessionId, CODEX_ROLLOUT_AUTHORITY_DEBOUNCE_MS);
+          });
+        } catch (err) {
+          logger.debug({ provider: this.id, sessionId, threadId: latest.threadId, turnId, rolloutPath, err }, 'Codex rollout authority watch failed to attach');
+          return;
+        }
+        const cur = this.sessions.get(sessionId);
+        if (!cur || cur.rolloutAuthorityTurnId !== turnId) {
+          try { watcher.close(); } catch { /* ignore */ }
+          return;
+        }
+        cur.rolloutAuthorityWatcher = watcher;
+        cur.rolloutAuthorityWatchPath = rolloutPath;
+        // Immediate check: the terminal record may already be on disk (post-restart
+        // zombie, or it landed before the watcher attached).
+        this.scheduleRolloutAuthorityCheck(sessionId, 0);
+      } finally {
+        const s = this.sessions.get(sessionId);
+        if (s) s.rolloutAuthorityArmInFlight = false;
+      }
+    })();
+  }
+
+  private scheduleRolloutAuthorityCheck(sessionId: string, delayMs: number): void {
+    const state = this.sessions.get(sessionId);
+    if (!state || !state.rolloutAuthorityTurnId) return;
+    if (state.rolloutAuthorityDebounce) return; // coalesce the append burst
+    state.rolloutAuthorityDebounce = setTimeout(() => {
+      const s = this.sessions.get(sessionId);
+      if (s) s.rolloutAuthorityDebounce = undefined;
+      void this.runRolloutAuthorityCheck(sessionId);
+    }, Math.max(0, delayMs));
+    state.rolloutAuthorityDebounce.unref?.();
+  }
+
+  private async runRolloutAuthorityCheck(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    const turnId = state.rolloutAuthorityTurnId ?? state.runningTurnId;
+    if (!turnId) return;
+    if (state.cancelled || state.runningCompact || this.isClosedCodexTurn(state, turnId)) {
+      this.disarmRolloutAuthorityWatch(state);
+      return;
+    }
+    // Shared with the legacy settle poll so only one rollout read runs at a time.
+    if (state.rolloutTaskCompleteCheckInFlight) return;
+    state.rolloutTaskCompleteCheckInFlight = true;
+    // Current turn's start wallclock — rejects a PRIOR turn's task_complete during
+    // the window before this turn's own task_started has been flushed to disk.
+    const turnStartedAtMs = state.activeTurnLease?.startedAtMs ?? state.activeTurnLease?.turnStartInFlightAtMs ?? null;
+    try {
+      // Fast path — UNCHANGED behavior/timing: settle when the tracked turn's own
+      // task_complete is on disk. Keeping this first preserves the exact prior
+      // code path (and timing) for every healthy turn.
+      let evidence: CodexRolloutTaskCompleteEvidence | null = await this.rolloutTailReportsTaskComplete(state, turnId);
+      let settledTurnId = turnId;
+      let desync = false;
+      if (!evidence) {
+        // Desync fallback: the tracked turnId no longer matches the turn_id
+        // codex-core actually wrote (turn/start result missing / late / wrong id),
+        // so the turnId-scoped match above never fires even though task_complete
+        // is durably on disk — the exact case that used to strand a finished turn
+        // as "working" forever. The rollout file is already session-scoped, so
+        // judge liveness by the tail's LAST lifecycle marker and settle when the
+        // terminal task_complete was written at/after this turn started (the
+        // start-time guard rejects a stale prior turn's completion).
+        const terminal = await this.rolloutTailReportsTerminalTaskComplete(state);
+        if (
+          terminal
+          && terminal.turnId !== turnId
+          && turnStartedAtMs != null
+          && terminal.completedAtMs != null
+          && terminal.completedAtMs >= turnStartedAtMs
+        ) {
+          evidence = terminal;
+          settledTurnId = terminal.turnId;
+          desync = true;
+        }
+      }
+      if (!evidence) return;
+      const latest = this.sessions.get(sessionId);
+      if (!latest) return;
+      if (latest.cancelled || latest.runningCompact || this.isClosedCodexTurn(latest, settledTurnId)) return;
+      // A missing turn/start RPC response can leave startTurn() awaiting forever;
+      // record the terminal turn so a very late response cannot re-run it.
+      if (latest.turnStartInFlight) latest.terminalDuringTurnStartIds.add(settledTurnId);
+      if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
+        latest.currentMessageId = `${settledTurnId}:rollout-task-complete`;
+        latest.currentText = evidence.lastAgentMessage;
+      }
+      logger.warn({
+        provider: this.id,
+        sessionId,
+        ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
+        threadId: latest.threadId,
+        turnId: settledTurnId,
+        ...(desync ? { trackedTurnId: turnId, desyncSettle: true } : {}),
+      }, 'Codex rollout task_complete observed via real-time watch; settling turn from authoritative rollout evidence');
+      await this.completeTurn(sessionId, latest, settledTurnId, 'rollout_task_complete');
+    } catch (err) {
+      logger.debug({ provider: this.id, sessionId, threadId: state.threadId, turnId, err }, 'Codex rollout authority check failed');
+    } finally {
+      const s = this.sessions.get(sessionId);
+      if (s) s.rolloutTaskCompleteCheckInFlight = false;
+    }
+  }
+
+  private disarmRolloutAuthorityWatch(state: CodexSdkSessionState): void {
+    if (state.rolloutAuthorityWatcher) {
+      try { state.rolloutAuthorityWatcher.close(); } catch { /* ignore */ }
+      state.rolloutAuthorityWatcher = undefined;
+    }
+    if (state.rolloutAuthorityDebounce) {
+      clearTimeout(state.rolloutAuthorityDebounce);
+      state.rolloutAuthorityDebounce = undefined;
+    }
+    state.rolloutAuthorityWatchPath = undefined;
+    state.rolloutAuthorityTurnId = undefined;
+  }
+
   private clearChildSubagentRolloutPollTimer(state: CodexSdkSessionState): void {
     if (state.childSubagentRolloutTimer) clearTimeout(state.childSubagentRolloutTimer);
     state.childSubagentRolloutTimer = null;
@@ -3148,6 +3541,72 @@ export class CodexSdkProvider implements TransportProvider {
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
     if (state.cancelled) return true;
+    if (item.type === 'custom_tool_call') {
+      const tool = customToolFromItem(sessionId, item, 'started');
+      if (!tool) return false;
+      const turnId = readParamTurnId(params) ?? state.runningTurnId;
+      this.recordStrongActivity(sessionId, state, turnId);
+      this.emitTrackedProviderToolCall(sessionId, state, {
+        ...tool,
+        ...(turnId ? { turnId } : {}),
+      });
+      return true;
+    }
+
+    if (item.type === 'custom_tool_call_output') {
+      const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+      if (!callId) return false;
+      let prior = state.customToolLifecycleByCallId.get(callId)?.tool;
+      if (!prior) {
+        // A reconnect/version skew can deliver the result without its matching
+        // call notification. Emit a minimal running snapshot first so the
+        // transport relay has a card to terminate instead of an orphan result.
+        this.emitTrackedProviderToolCall(sessionId, state, {
+          id: callId,
+          name: meaningfulString(item.name) ?? 'custom_tool',
+          status: 'running',
+          detail: {
+            kind: 'customToolCall',
+            summary: meaningfulString(item.name) ?? 'custom_tool',
+            meta: { callId, status: 'running', synthesizedFromOutput: true },
+            raw: item,
+          },
+        });
+        prior = state.customToolLifecycleByCallId.get(callId)?.tool;
+      }
+      const terminal = customToolTerminalFromOutput(item);
+      const turnId = readParamTurnId(params) ?? state.runningTurnId;
+      this.recordStrongActivity(sessionId, state, turnId);
+      const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
+      const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+      this.emitTrackedProviderToolCall(sessionId, state, {
+        id: callId,
+        name: prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
+        status: terminal.status,
+        ...(prior?.input !== undefined ? { input: prior.input } : {}),
+        output: terminal.output,
+        terminalStatus: terminal.terminalStatus,
+        terminalReason: terminal.terminalReason,
+        terminalSynthetic: false,
+        terminalSource: 'app_server_jsonrpc',
+        terminalDecisionReason: terminal.terminalReason,
+        ...(turnId ? { turnId } : {}),
+        detail: {
+          kind: 'customToolCall',
+          summary: priorDetail?.summary ?? prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
+          ...(prior?.input !== undefined ? { input: prior.input } : {}),
+          output: item.output ?? item.result ?? item.content,
+          meta: {
+            ...priorMeta,
+            callId,
+            status: item.status ?? terminal.terminalStatus,
+          },
+          raw: item,
+        },
+      });
+      return true;
+    }
+
     if (item.type === 'function_call') {
       const name = meaningfulString(item.name);
       const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
@@ -3485,6 +3944,12 @@ export class CodexSdkProvider implements TransportProvider {
       if (!closedTurn) this.trackCodexTurnItemActivity(sessionId, state, method, item);
 
       if (item.type === 'contextCompaction') {
+        // `contextCompaction` also occurs automatically INSIDE an ordinary
+        // model turn. Only a raw `/compact` send sets compactCommandInFlight.
+        // An inline compaction must keep the parent turn/dispatch alive; treating
+        // its item completion as a standalone transport completion produces a
+        // false idle while Codex immediately continues with more tool calls.
+        if (!state.runningCompact) state.compactCommandInFlight = false;
         state.runningCompact = true;
         state.compactObserved = true;
         this.clearCompactSettleTimer(state);
@@ -3599,6 +4064,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.closeOpenProviderToolCalls(sessionId, state, 'error', 'errored', 'app_server_failed');
         this.clearStatus(sessionId, state);
         state.runningCompact = false;
+        state.compactCommandInFlight = false;
         state.compactObserved = false;
         state.runningTurnId = undefined;
         state.turnStartInFlight = false;
@@ -3620,6 +4086,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearCompactTimers(state);
         this.clearRawChecklistPollTimer(state);
         state.runningCompact = false;
+        state.compactCommandInFlight = false;
         state.compactObserved = false;
         if (!state.runningTurnId && state.cancelled) {
           state.cancelled = false;
@@ -3639,8 +4106,11 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (state.runningCompact) {
-        this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
-        return;
+        if (state.compactCommandInFlight) {
+          this.completeCompact(sessionId, state, typeof turn.id === 'string' ? turn.id : undefined);
+          return;
+        }
+        this.completeInlineContextCompaction(sessionId, state, turnId);
       }
 
       if (state.cancelled) {
@@ -3681,6 +4151,11 @@ export class CodexSdkProvider implements TransportProvider {
     terminalReason: ToolTerminalReason = 'app_server_completed',
   ): Promise<void> {
     this.clearIdleSettleTimer(state);
+    this.clearCompactTimers(state);
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.compactObserved = false;
+    state.deferredCompactSettleTurnId = undefined;
     this.clearActiveTurnLease(state);
     this.clearCancelTimer(state);
     this.queueRawChecklistHistoryScan(sessionId, state);
@@ -3752,6 +4227,7 @@ export class CodexSdkProvider implements TransportProvider {
     const lease = state.activeTurnLease;
     if (lease?.heartbeatTimer) clearTimeout(lease.heartbeatTimer);
     this.clearRolloutSettlePoll(state);
+    this.disarmRolloutAuthorityWatch(state);
     state.activeTurnLease = undefined;
   }
 
@@ -3795,6 +4271,10 @@ export class CodexSdkProvider implements TransportProvider {
     } else {
       lease.lastWeakActivityAtMs = now;
     }
+    // ROLLOUT-FIRST: attach the authoritative real-time watch before the legacy
+    // heartbeat/poll fallbacks. The watch settles a dropped/absent
+    // `turn/completed` in ~0ms; the poll/heartbeat remain only as belt-and-suspenders.
+    this.armRolloutAuthorityWatch(sessionId, state, options.turnId ?? lease.turnId ?? state.runningTurnId);
     this.scheduleHeartbeat(sessionId, state, lease);
     this.armRolloutSettlePoll(sessionId, state);
   }
@@ -4215,6 +4695,174 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
+  /**
+   * Store-driven settle BACKSTOP (rollout is authority). When the persisted
+   * session state still says a codex turn is running but the rollout tail proves
+   * the turn already reached `task_complete`, settle it — WITHOUT requiring the
+   * per-turn rollout settle timer/fs.watch to still be armed and WITHOUT
+   * requiring `state.runningTurnId` to have been re-observed by a live
+   * notification. This closes the gap where a lost `turn/completed`, a disarmed
+   * rollout watch, or a `runningTurnId` desync leaves a finished turn "working"
+   * forever — a state neither the 2s primary settle poll nor the 12-minute
+   * active-turn watchdog can clear (both need a live, matching active turn).
+   *
+   * Called from the always-on daemon health poll, so it is independent of the
+   * per-turn timers that can be torn down mid-flight. Returns true iff it
+   * settled a turn. It fires for the exact tracked turn, or for the guarded
+   * orphan shape where no newer dispatch/turn owns the runtime state. Both
+   * paths drive the normal completion callback while protecting a different or
+   * newly starting turn from stale rollout evidence.
+   */
+  async settleCompletedTurnFromRolloutBackstop(
+    sessionId: string,
+    opts: ProviderRolloutCompletionReconcileOptions = {},
+  ): Promise<boolean> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return false;
+    if (state.cancelled || state.runningCompact) return false;
+    const evidence = await this.rolloutTailReportsTerminalTaskComplete(state);
+    if (!evidence) return false;
+    // Never race the 2s primary settle path: only act once the terminal record
+    // has been durable for the grace window.
+    const minAge = opts.minCompleteAgeMs ?? CODEX_ROLLOUT_TERMINAL_BACKSTOP_MIN_AGE_MS;
+    const now = opts.nowMs ?? Date.now();
+    if (evidence.completedAtMs != null && now - evidence.completedAtMs < minAge) return false;
+    // Re-read after the await; a newer turn may have genuinely started.
+    const latest = this.sessions.get(sessionId);
+    if (!latest || latest.cancelled || latest.runningCompact) return false;
+    // Normally settle only while the provider still believes THIS exact turn is
+    // in-flight. There is one additional zombie shape: app-server loses the
+    // terminal notification after leaving tool items open, then clears the turn
+    // identity. In that state the rollout tail is terminal, there is no current
+    // turn/start to protect, and the only provider "work" is orphaned tool
+    // evidence. Treat that evidence as stale and let completeTurn close it.
+    //
+    // Do NOT generalize this to every missing runningTurnId. During context
+    // bootstrap a fresh dispatch can briefly have no provider turn identity, and
+    // the rollout may still end with the previous turn's task_complete. An
+    // active runtime dispatch is eligible only when it crossed provider.send(),
+    // its generation still matches the provider generation, and orphaned tool
+    // evidence remains. That distinguishes the observed same-generation zombie
+    // from both a healthy pre-start window and a genuinely newer dispatch.
+    const activeWork = this.getCurrentTurnWorkState(latest);
+    const trackedTurnId = latest.runningTurnId ?? latest.activeTurnLease?.turnId;
+    const turnStartInFlightAtMs = latest.activeTurnLease?.turnStartInFlightAtMs;
+    const terminalBelongsToInFlightStart =
+      latest.turnStartInFlight
+      && latest.runningTurnId === undefined
+      && turnStartInFlightAtMs != null
+      && evidence.completedAtMs != null
+      && evidence.completedAtMs >= turnStartInFlightAtMs;
+    const providerStillRunningThisTurn =
+      latest.runningTurnId === evidence.turnId
+      || latest.activeTurnLease?.turnId === evidence.turnId
+      || terminalBelongsToInFlightStart;
+    const runtimeOwnsMatchingStartedDispatch =
+      opts.runtimeHasActiveDispatchOwnership === true
+      && opts.runtimeActiveDispatchProviderStarted === true
+      && sameActivityGeneration(opts.runtimeActivityGeneration, latest.runtimeActivityGeneration);
+    const terminalWithMatchingRuntimeDispatch =
+      trackedTurnId === undefined
+      && !latest.turnStartInFlight
+      && activeWork.activeToolCount > 0
+      && runtimeOwnsMatchingStartedDispatch;
+    const terminalWithNoRuntimeDispatch =
+      trackedTurnId === undefined
+      && !latest.turnStartInFlight
+      && opts.runtimeHasNoDispatchOwnership === true;
+    if (
+      !providerStillRunningThisTurn
+      && !terminalWithMatchingRuntimeDispatch
+      && !terminalWithNoRuntimeDispatch
+    ) return false;
+    if (this.isClosedCodexTurn(latest, evidence.turnId)) return false;
+    if (evidence.lastAgentMessage && latest.currentText !== evidence.lastAgentMessage) {
+      latest.currentMessageId = `${evidence.turnId}:rollout-backstop`;
+      latest.currentText = evidence.lastAgentMessage;
+    }
+    logger.warn({
+      provider: this.id,
+      sessionId,
+      ...(latest.imcodesSessionName ? { sessionName: latest.imcodesSessionName } : {}),
+      threadId: latest.threadId,
+      turnId: evidence.turnId,
+      completedAtMs: evidence.completedAtMs,
+      ageMs: evidence.completedAtMs != null ? Math.max(0, now - evidence.completedAtMs) : null,
+      ...(terminalWithMatchingRuntimeDispatch
+        ? {
+            matchingRuntimeDispatchRecovered: true,
+            orphanedToolCount: activeWork.activeToolCount,
+            activityGeneration: normalizeActivityGeneration(latest.runtimeActivityGeneration),
+          }
+        : {}),
+      ...(terminalWithNoRuntimeDispatch ? { noRuntimeDispatchRecovered: true } : {}),
+    }, 'Codex store-driven backstop: rollout proves the running turn is complete; settling the zombie turn from rollout evidence');
+    await this.completeTurn(sessionId, latest, evidence.turnId, 'rollout_task_complete');
+    return true;
+  }
+
+  /**
+   * Reads the tail of the thread's rollout looking for the LAST turn-lifecycle
+   * marker. `task_started` (with no later completion) => a turn is in flight;
+   * `task_complete` / `turn_aborted` => the turn is closed. Deriving terminality
+   * from the last marker needs no in-memory turnId and is immune to a lost
+   * `turn/completed` notification or a `runningTurnId` desync. Returns the
+   * terminal `task_complete` evidence (with its wall-clock completion time) iff
+   * the tail's last marker is a `task_complete`, else null.
+   */
+  private async rolloutTailReportsTerminalTaskComplete(state: CodexSdkSessionState): Promise<CodexRolloutTerminalEvidence | null> {
+    if (!state.threadId) return null;
+    const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
+    const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
+    const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
+    if (!rolloutPath) return null;
+    state.rawChecklistRolloutPath = rolloutPath;
+    let fh: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fh = await open(rolloutPath, 'r');
+      const { size } = await fh.stat();
+      const start = Math.max(0, size - CODEX_ROLLOUT_TASK_COMPLETE_TAIL_BYTES);
+      if (start >= size) return null;
+      const buffer = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await fh.read(buffer, 0, buffer.length, start);
+      if (bytesRead <= 0) return null;
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      let terminal: CodexRolloutTerminalEvidence | null = null;
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        // Cheap pre-filter before JSON.parse — only the three lifecycle markers matter.
+        if (!trimmed.includes('task_started') && !trimmed.includes('task_complete') && !trimmed.includes('turn_aborted')) continue;
+        let record: Record<string, unknown>;
+        try { record = JSON.parse(trimmed) as Record<string, unknown>; } catch { continue; }
+        const payload = isRecord(record.payload) ? record.payload : record;
+        const type = payload.type;
+        if (type === 'task_complete') {
+          const turnId = meaningfulString(payload.turn_id) ?? meaningfulString(payload.turnId);
+          if (!turnId) { terminal = null; continue; }
+          const parsed = meaningfulString(record.timestamp) ? Date.parse(String(record.timestamp)) : NaN;
+          const lastAgentMessage = readRolloutTaskCompleteMessage(payload as Record<string, any>);
+          terminal = {
+            turnId,
+            ...(lastAgentMessage ? { lastAgentMessage } : {}),
+            completedAtMs: Number.isFinite(parsed) ? parsed : null,
+          };
+        } else if (type === 'task_started' || type === 'turn_aborted') {
+          // A start (or abort) AFTER the last task_complete means the completed
+          // turn is no longer the tail state: a new turn is running, or the tail
+          // ended on an abort with nothing to settle here. Either way, not terminal.
+          terminal = null;
+        }
+      }
+      return terminal;
+    } catch (err) {
+      logger.debug({ provider: this.id, threadId: state.threadId, rolloutPath, err }, 'Codex rollout terminal tail read failed');
+      return null;
+    } finally {
+      if (fh) await fh.close().catch(() => {});
+    }
+  }
+
   private emitSdkTurnLost(
     sessionId: string,
     state: CodexSdkSessionState,
@@ -4348,12 +4996,43 @@ export class CodexSdkProvider implements TransportProvider {
     });
   }
 
+  private completeInlineContextCompaction(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    turnId?: string,
+  ): void {
+    this.clearCompactTimers(state);
+    this.clearStatus(sessionId, state);
+    state.runningCompact = false;
+    state.compactCommandInFlight = false;
+    state.deferredCompactSettleTurnId = undefined;
+    state.compactObserved = false;
+    for (const itemId of state.activeCompactionItemIds) state.activeItemIds.delete(itemId);
+    state.activeCompactionItemIds.clear();
+
+    // Auto-compaction is an item INSIDE the current model turn, not a transport
+    // turn completion. Keep all parent turn identity/text/tool ownership intact
+    // and re-arm terminal authority now that the inline compact phase is over.
+    const activeTurnId = turnId ?? state.runningTurnId;
+    if (!state.cancelled && activeTurnId) {
+      state.runningTurnId = activeTurnId;
+      this.recordStrongActivity(sessionId, state, activeTurnId);
+      this.armRawChecklistPolling(sessionId, state);
+      this.armChildSubagentRolloutPolling(sessionId, state);
+    }
+  }
+
   private completeCompact(sessionId: string, state: CodexSdkSessionState, turnId?: string): void {
+    if (!state.compactCommandInFlight) {
+      this.completeInlineContextCompaction(sessionId, state, turnId);
+      return;
+    }
     this.clearCancelTimer(state);
     this.clearActiveTurnLease(state);
     this.clearCompactTimers(state);    this.clearRawChecklistPollTimer(state);
     this.clearStatus(sessionId, state);
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.deferredCompactSettleTurnId = undefined;
     this.clearActiveItemEvidence(state);
     state.runningTurnId = undefined;
@@ -4533,6 +5212,9 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private emitTrackedProviderToolCall(sessionId: string, state: CodexSdkSessionState, tool: ToolCallEvent): void {
+    const dedupedTool = this.dedupeCustomToolLifecycle(state, tool);
+    if (!dedupedTool) return;
+    tool = dedupedTool;
     const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
     if (tool.status === 'running' && !backgroundedSubagent) {
       state.openProviderToolCalls.set(tool.id, tool);
@@ -4550,6 +5232,59 @@ export class CodexSdkProvider implements TransportProvider {
         tool.terminalReason ?? (tool.status === 'complete' ? 'provider_result' : 'provider_error'),
         tool.id,
       );
+    }
+  }
+
+  private dedupeCustomToolLifecycle(state: CodexSdkSessionState, tool: ToolCallEvent): ToolCallEvent | null {
+    const detail = isRecord(tool.detail) ? tool.detail : undefined;
+    if (detail?.kind !== 'customToolCall') return tool;
+    const meta = isRecord(detail.meta) ? detail.meta : undefined;
+    const callId = meaningfulString(meta?.callId) ?? meaningfulString(tool.id);
+    if (!callId) return tool;
+
+    const priorLifecycle = state.customToolLifecycleByCallId.get(callId);
+    if (priorLifecycle?.terminal) return null;
+    const prior = priorLifecycle?.tool;
+    const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
+    const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+    const mergedDetail = {
+      ...(priorDetail ?? {}),
+      ...detail,
+      kind: 'customToolCall',
+      ...(tool.input !== undefined || prior?.input !== undefined ? { input: tool.input ?? prior?.input } : {}),
+      meta: { ...priorMeta, ...meta, callId },
+    };
+    const normalizedTool: ToolCallEvent = {
+      ...(prior ?? {}),
+      ...tool,
+      id: callId,
+      name: tool.name || prior?.name || 'custom_tool',
+      ...(tool.input !== undefined || prior?.input !== undefined ? { input: tool.input ?? prior?.input } : {}),
+      detail: mergedDetail,
+    };
+
+    // The same logical start can arrive once as a typed item and once as a raw
+    // response item. Retain whichever snapshot is richer, but emit only once.
+    if (tool.status === 'running' && priorLifecycle) {
+      state.customToolLifecycleByCallId.set(callId, { tool: normalizedTool, terminal: false });
+      state.openProviderToolCalls.set(callId, normalizedTool);
+      return null;
+    }
+
+    state.customToolLifecycleByCallId.set(callId, {
+      tool: normalizedTool,
+      terminal: tool.status !== 'running',
+    });
+    this.pruneCustomToolLifecycleCache(state);
+    return normalizedTool;
+  }
+
+  private pruneCustomToolLifecycleCache(state: CodexSdkSessionState): void {
+    if (state.customToolLifecycleByCallId.size <= CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT) return;
+    for (const [callId, lifecycle] of state.customToolLifecycleByCallId) {
+      if (!lifecycle.terminal) continue;
+      state.customToolLifecycleByCallId.delete(callId);
+      if (state.customToolLifecycleByCallId.size <= CODEX_CUSTOM_TOOL_LIFECYCLE_CACHE_LIMIT) return;
     }
   }
 
@@ -4657,6 +5392,15 @@ export class CodexSdkProvider implements TransportProvider {
       ...(detail ? { detail } : {}),
     };
     state.openProviderToolCalls.delete(toolId);
+    const customDetail = isRecord(terminalTool.detail) ? terminalTool.detail : undefined;
+    const customMeta = isRecord(customDetail?.meta) ? customDetail.meta : undefined;
+    if (customDetail?.kind === 'customToolCall') {
+      const callId = meaningfulString(customMeta?.callId) ?? meaningfulString(toolId);
+      if (callId) {
+        state.customToolLifecycleByCallId.set(callId, { tool: terminalTool, terminal: true });
+        this.pruneCustomToolLifecycleCache(state);
+      }
+    }
     for (const cb of this.toolCallCallbacks) cb(sessionId, terminalTool);
   }
 
@@ -4677,6 +5421,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRawChecklistPollTimer(state);    this.clearStatus(sessionId, state);
     this.rememberTerminatedCompactTurn(state, state.runningTurnId);
     state.runningCompact = false;
+    state.compactCommandInFlight = false;
     state.runningTurnId = undefined;
     state.turnStartInFlight = false;
     state.compactObserved = false;
@@ -4763,9 +5508,21 @@ export class CodexSdkProvider implements TransportProvider {
     state.compactHardTimer = setTimeout(() => {
       if (!this.sessions.has(sessionId)) return;
       if (!state.runningCompact) return;
+      if (!state.compactCommandInFlight) {
+        logger.warn({
+          provider: this.id,
+          sessionId,
+          ...(state.imcodesSessionName ? { sessionName: state.imcodesSessionName } : {}),
+          threadId: state.threadId,
+          turnId: state.runningTurnId,
+        }, 'Codex inline context compaction exceeded compact timeout; resuming parent turn without emitting completion');
+        this.completeInlineContextCompaction(sessionId, state, state.runningTurnId);
+        return;
+      }
       this.clearCompactTimers(state);      this.clearStatus(sessionId, state);
       this.rememberTerminatedCompactTurn(state, state.runningTurnId);
       state.runningCompact = false;
+      state.compactCommandInFlight = false;
       state.runningTurnId = undefined;
       state.turnStartInFlight = false;
       state.compactObserved = false;

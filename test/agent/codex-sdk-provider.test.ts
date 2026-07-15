@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 
+// Keep a native event-loop yield available after individual tests install
+// fake timers. Rollout checks perform real filesystem I/O, which must get a
+// chance to complete while virtual provider timers are advanced.
+const realSetImmediate = setImmediate;
+
 const childProcessMock = vi.hoisted(() => {
   type Request = { id?: number; method?: string; params?: Record<string, any> };
   type ChildRecord = {
@@ -285,6 +290,20 @@ async function advanceFakeTimersUntil(
     await vi.advanceTimersByTimeAsync(stepMs);
   }
   throw new Error('Timed out waiting for fake-timer condition');
+}
+
+async function advanceFakeTimersWithRealIoUntil(
+  check: () => boolean,
+  timeoutMs = 20_000,
+  stepMs = 100,
+): Promise<void> {
+  const steps = Math.max(1, Math.ceil(timeoutMs / stepMs));
+  for (let i = 0; i <= steps; i += 1) {
+    if (check()) return;
+    await vi.advanceTimersByTimeAsync(stepMs);
+    await new Promise<void>((resolve) => realSetImmediate(resolve));
+  }
+  throw new Error('Timed out waiting for fake-timer condition with real I/O');
 }
 
 async function writeCodexAuthFile(codexHome: string, version: number): Promise<void> {
@@ -1279,6 +1298,232 @@ describe('CodexSdkProvider', () => {
         summary: 'Plan',
       },
     });
+  });
+
+  it('correlates raw custom tool calls and outputs into one complete lifecycle', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-custom-tool', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-raw-custom-tool', 'run a command');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'custom_tool_call',
+          id: 'ctc-1',
+          status: 'completed',
+          call_id: 'call-custom-1',
+          name: 'exec',
+          input: 'const r = await tools.exec_command({cmd:"pwd"}); text(r.output);',
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'custom_tool_call_output',
+          call_id: 'call-custom-1',
+          output: [
+            { type: 'input_text', text: 'Script completed' },
+            { type: 'input_text', text: '/tmp/project' },
+          ],
+        },
+      },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({
+      id: 'call-custom-1',
+      name: 'exec',
+      status: 'running',
+    });
+    expect(tools[1]).toMatchObject({
+      id: 'call-custom-1',
+      name: 'exec',
+      status: 'complete',
+      output: 'Script completed\n/tmp/project',
+      terminalStatus: 'succeeded',
+      terminalReason: 'provider_result',
+      terminalSynthetic: false,
+    });
+  });
+
+  it('terminates failed, cancelled, and output-less raw custom tools', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-raw-custom-terminal', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-raw-custom-terminal', 'run tools');
+    const child = childProcessMock.children[0];
+
+    const emitCall = (callId: string) => child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call', call_id: callId, name: 'exec', input: `run ${callId}` },
+      },
+    });
+    const emitOutput = (callId: string, output: Record<string, unknown>) => child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call_output', call_id: callId, ...output },
+      },
+    });
+
+    emitCall('call-failed');
+    emitOutput('call-failed', { output: JSON.stringify({ output: 'boom', metadata: { exit_code: 2 } }) });
+    emitCall('call-cancelled');
+    emitOutput('call-cancelled', { status: 'cancelled' });
+    emitCall('call-empty');
+    emitOutput('call-empty', {});
+    await flush();
+
+    expect(tools.filter((tool) => tool.status !== 'running')).toMatchObject([
+      {
+        id: 'call-failed',
+        status: 'error',
+        output: 'boom',
+        terminalStatus: 'errored',
+        terminalReason: 'provider_error',
+      },
+      {
+        id: 'call-cancelled',
+        status: 'error',
+        output: '',
+        terminalStatus: 'cancelled',
+        terminalReason: 'provider_cancelled',
+      },
+      {
+        id: 'call-empty',
+        status: 'complete',
+        output: '',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+      },
+    ]);
+  });
+
+  it('deduplicates a custom tool lifecycle exposed on raw and typed item channels', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-custom-tool-dedupe', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-custom-tool-dedupe', 'run once');
+    const child = childProcessMock.children[0];
+    const item = {
+      id: 'typed-item-1',
+      type: 'custom_tool_call',
+      call_id: 'call-shared-1',
+      name: 'exec',
+      input: 'run once',
+    };
+
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item },
+    });
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { ...item, status: 'inProgress' } },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call_output', call_id: 'call-shared-1', output: 'done' },
+      },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { ...item, status: 'completed', output: 'done' } },
+    });
+    await flush();
+
+    expect(tools).toHaveLength(2);
+    expect(tools.map((tool) => [tool.id, tool.status])).toEqual([
+      ['call-shared-1', 'running'],
+      ['call-shared-1', 'complete'],
+    ]);
+  });
+
+  it('synthesizes an output-only custom call and closes a call whose output never arrives', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-custom-tool-missing-half', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-custom-tool-missing-half', 'run partial tools');
+    const child = childProcessMock.children[0];
+
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call_output', call_id: 'call-output-only', name: 'exec', output: 'recovered' },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'custom_tool_call', call_id: 'call-no-output', name: 'exec', input: 'run and disappear' },
+      },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } },
+    });
+    await flush();
+
+    expect(tools.map((tool) => ({
+      id: tool.id,
+      status: tool.status,
+      output: tool.output,
+      terminalStatus: tool.terminalStatus,
+      terminalReason: tool.terminalReason,
+      terminalSynthetic: tool.terminalSynthetic,
+    }))).toMatchObject([
+      { id: 'call-output-only', status: 'running' },
+      {
+        id: 'call-output-only',
+        status: 'complete',
+        output: 'recovered',
+        terminalStatus: 'succeeded',
+        terminalReason: 'provider_result',
+        terminalSynthetic: false,
+      },
+      { id: 'call-no-output', status: 'running' },
+      {
+        id: 'call-no-output',
+        status: 'complete',
+        output: 'completed',
+        terminalStatus: 'succeeded',
+        terminalReason: 'app_server_completed',
+        terminalSynthetic: true,
+      },
+    ]);
   });
 
   it('surfaces codex>=0.139 native turn/plan/updated events as checklist tool events (new+old compatible)', async () => {
@@ -2549,11 +2794,92 @@ describe('CodexSdkProvider', () => {
       });
       child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
       expect(completed).toEqual(['Done']);
       expect(provider.getSessionDiagnostics('route-idle-settles')).toMatchObject({ runningTurnId: null });
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('ROLLOUT-FIRST: self-heals a turn whose task_complete is already on disk — no idle hint, no 60s gate', async () => {
+    // Simulates the hard zombie / post-restart case: the durable rollout ALREADY
+    // records task_complete for the running turn, but the app-server sends no
+    // turn/completed and no thread/status idle hint at all. The real-time
+    // authority watch (armed at turn start) runs its immediate on-arm check and
+    // settles from the rollout — WITHOUT any app-server notification and WITHOUT
+    // waiting out the legacy 60s silence gate.
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-authority-heal-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-authority-heal', cwd: '/tmp/project' });
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+      // task_complete is durably on disk BEFORE the turn even becomes active.
+      await writeCodexRolloutFile(codexHome, 'thread-1', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done' },
+        },
+      ]);
+
+      await provider.send('route-rollout-authority-heal', 'hello');
+
+      // No idle/status/completed hint is ever emitted. The turn still settles.
+      await waitForCondition(() => completed.length === 1);
+      expect(completed).toEqual(['Done']);
+      expect(provider.getSessionDiagnostics('route-rollout-authority-heal')).toMatchObject({ runningTurnId: null });
+      await provider.disconnect();
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('ROLLOUT-FIRST: settles in real time when task_complete is appended mid-turn (fs.watch, no idle hint)', async () => {
+    // The turn is genuinely running (rollout has no terminal record yet); the
+    // authority watch attaches to the file. When codex-core later appends
+    // task_complete, the kernel wakes the watcher and the turn settles at once —
+    // no thread/status idle hint, no turn/completed notification.
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-rollout-authority-live-'));
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-rollout-authority-live', cwd: '/tmp/project' });
+
+      const completed: string[] = [];
+      provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+      // File exists (so the watcher can attach) but has no terminal record yet.
+      const rolloutPath = await writeCodexRolloutFile(codexHome, 'thread-1', [
+        { timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: 'thread-1' } },
+      ]);
+
+      await provider.send('route-rollout-authority-live', 'hello');
+      await waitForCondition(
+        () => provider.getSessionDiagnostics('route-rollout-authority-live')?.runningTurnId === 'turn-1',
+      );
+      expect(completed).toEqual([]);
+
+      // Core appends the terminal record; the watcher fires and settles.
+      await appendFile(
+        rolloutPath,
+        `${JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-1', last_agent_message: 'Done live' },
+        })}\n`,
+      );
+
+      await waitForCondition(() => completed.length === 1);
+      expect(completed).toEqual(['Done live']);
+      expect(provider.getSessionDiagnostics('route-rollout-authority-live')).toMatchObject({ runningTurnId: null });
       await provider.disconnect();
     } finally {
       await rm(codexHome, { recursive: true, force: true });
@@ -3404,6 +3730,75 @@ describe('CodexSdkProvider', () => {
     expect(completed).toEqual(['Codex context compacted.']);
     await provider.send('route-compact-item', 'after item compact');
     expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('keeps an ordinary turn running when automatic context compaction completes inline', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-inline-auto-compact', cwd: '/tmp/project' });
+
+    const completed: string[] = [];
+    const statuses: Array<string | null> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onStatus?.((_sid, status) => statuses.push(status.status));
+
+    await provider.send('route-inline-auto-compact', 'do a long task');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'auto-compact-item', type: 'contextCompaction' },
+      },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'auto-compact-item', type: 'contextCompaction' },
+      },
+    });
+    await flush();
+
+    expect(statuses).toContain('compacting');
+    expect(completed).toEqual([]);
+    expect(provider.getSessionDiagnostics('route-inline-auto-compact')).toMatchObject({
+      active: true,
+      runningTurnId: 'turn-1',
+      runningCompact: false,
+      activeCompactionItemCount: 0,
+    });
+    expect(provider.getActiveWorkSnapshot('route-inline-auto-compact')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
+
+    // Same parent turn continues producing output after compaction. Only its
+    // eventual turn/completed may settle the transport runtime.
+    child.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'answer-after-compact', type: 'agentMessage', text: 'done after compact' },
+      },
+    });
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null },
+      },
+    });
+    // Completion performs asynchronous generated-image discovery before it
+    // notifies listeners. A single event-loop tick is not a reliable boundary
+    // under a loaded CI runner (notably Node 24).
+    await waitForCondition(() => completed.length === 1);
+
+    expect(completed).toEqual(['done after compact']);
   });
 
   it('ignores duplicate compact turn completion without scanning stale generated images', async () => {
@@ -4339,9 +4734,7 @@ describe('CodexSdkProvider', () => {
       });
       child.emits({ method: 'thread/status/changed', params: { threadId: 'thread-1', turnId: 'turn-1', status: 'idle' } });
 
-      for (let i = 0; i < 200 && !(completed.length === 1 && tools.length === 2); i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1 && tools.length === 2);
       expect(completed).toEqual(['Done.']);
       expect(tools).toEqual([
         expect.objectContaining({ id: 'ws-idle-only', name: 'WebSearch', status: 'running', input: { query: '(other)' } }),
@@ -4648,9 +5041,7 @@ describe('CodexSdkProvider', () => {
       // few seconds later — long before the ~20s heartbeat or the 30-min last
       // resort. Advance in small async steps so the real fs read resolves under
       // fake timers.
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]).toMatchObject({ role: 'assistant', status: 'complete' });
@@ -4716,9 +5107,7 @@ describe('CodexSdkProvider', () => {
         },
       ]);
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('durable final while start response is missing');
@@ -4791,9 +5180,7 @@ describe('CodexSdkProvider', () => {
         },
       }]);
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('new turn completed normally');
@@ -4899,9 +5286,7 @@ describe('CodexSdkProvider', () => {
           },
         },
       ]);
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('now the durable final answer exists');
@@ -4951,9 +5336,7 @@ describe('CodexSdkProvider', () => {
       // evidence instead of leaving the runtime active until stop+continue.
       state!.activeTurnLease = undefined;
 
-      for (let i = 0; i < 200 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
 
       expect(completed).toHaveLength(1);
       expect(completed[0]?.content).toBe('durable rollout final answer');

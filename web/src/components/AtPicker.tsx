@@ -2,7 +2,7 @@
  * AtPicker — dropdown autocomplete for @-mentions.
  * Two-step: first pick category (Files / Agents), then search/select within that category.
  */
-import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { ServerMessage } from '../ws-client.js';
 import {
@@ -14,6 +14,7 @@ import {
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { useAliases } from '../hooks/useAliases.js';
+import { useMachines } from '../hooks/useMachines.js';
 
 interface SessionEntry {
   name: string;
@@ -45,19 +46,21 @@ interface AtPickerProps {
   onSelectDelegateAgent: (session: string) => void;
   /** Insert the `;;(name)` marker for the chosen alias (never the value). */
   onSelectAlias?: (name: string) => void;
+  /** Insert the `^^(refName)` marker for the chosen machine (marker only). */
+  onSelectMachine?: (refName: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
   p2pConfig?: P2pSavedConfig | null;
   onClose: () => void;
-  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases') => void;
+  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines') => void;
   visible: boolean;
 }
 
-type Category = 'choose' | 'files' | 'agents' | 'team' | 'aliases';
+type Category = 'choose' | 'files' | 'agents' | 'team' | 'aliases' | 'machines';
 
-/** Number of rows in the category chooser (files, team, agents, aliases). */
-const CHOOSER_ROW_COUNT = 4;
+/** Number of rows in the category chooser (files, team, agents, aliases, machines). */
+const CHOOSER_ROW_COUNT = 5;
 
 const DEBOUNCE_MS = 200;
 
@@ -159,6 +162,7 @@ export function AtPicker({
   onSelectFile,
   onSelectDelegateAgent,
   onSelectAlias,
+  onSelectMachine,
   onLaunchTeam,
   onClose,
   onStageChange,
@@ -169,6 +173,10 @@ export function AtPicker({
   // Alias list is filtered by the same inline query (name + description) the
   // rest of the picker uses. Selecting one inserts its `;;(name)` marker only.
   const { filtered: aliasResults } = useAliases(category === 'aliases' ? query : undefined);
+  // Machine list, filtered by the same inline query. Selecting an ONLINE machine
+  // inserts its `^^(refName)` marker; offline machines are shown but not
+  // selectable (skipped in nav + no-op click).
+  const { filtered: machineResults } = useMachines(category === 'machines' ? query : undefined);
   const [fileResults, setFileResults] = useState<Array<{ path: string; basename: string; dir: string }>>([]);
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [teamRoundsIdx, setTeamRoundsIdx] = useState(0);
@@ -263,20 +271,25 @@ export function AtPicker({
     return unsub;
   }, [wsClient]);
 
-  // Reset when visibility or category changes
-  useEffect(() => {
+  // These resets must finish in the opening commit. A passive effect can run
+  // after the user has already pressed the first Arrow/Enter, reverting that
+  // real interaction and making the picker appear to need two key presses.
+  useLayoutEffect(() => {
+    if (!visible) return;
+    setCategory('choose');
     setHighlightIdx(0);
-  }, [query, visible, category]);
-
-  // Reset to category chooser when picker opens
-  useEffect(() => {
-    if (visible) {
-      setCategory('choose');
-      setFileResults([]);
-    }
+    setFileResults([]);
   }, [visible]);
 
-  useEffect(() => {
+  // Category transitions set their own intended highlight (including the
+  // previous chooser row when navigating back). Only a changed search query
+  // should snap the current result list to its first row.
+  useLayoutEffect(() => {
+    if (!visible) return;
+    setHighlightIdx(0);
+  }, [query, visible]);
+
+  useLayoutEffect(() => {
     if (!visible) return;
     onStageChange?.(category);
   }, [visible, category, onStageChange]);
@@ -296,6 +309,7 @@ export function AtPicker({
           e.preventDefault(); e.stopPropagation();
           if (highlightIdx === 1) { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }
           else if (highlightIdx === 3) { setCategory('aliases'); setHighlightIdx(0); }
+          else if (highlightIdx === 4) { setCategory('machines'); setHighlightIdx(0); }
           else { setCategory(highlightIdx === 0 ? 'files' : 'agents'); setHighlightIdx(0); }
           return;
         }
@@ -312,6 +326,33 @@ export function AtPicker({
           e.preventDefault(); e.stopPropagation();
           const a = aliasResults[highlightIdx];
           if (a) onSelectAlias?.(a.name);
+          return;
+        }
+        return;
+      }
+
+      // Machines: ↑↓ move (skipping offline), Enter/Tab insert the highlighted
+      // ONLINE marker. Offline machines are shown but non-selectable.
+      if (category === 'machines') {
+        const onlineIdx = machineResults.reduce<number[]>((acc, m, i) => {
+          if (m.online) acc.push(i);
+          return acc;
+        }, []);
+        const step = (h: number, dir: 1 | -1): number => {
+          if (onlineIdx.length === 0) return h;
+          const pos = onlineIdx.indexOf(h);
+          if (pos === -1) return dir === 1 ? onlineIdx[0] : onlineIdx[onlineIdx.length - 1];
+          return onlineIdx[(pos + dir + onlineIdx.length) % onlineIdx.length];
+        };
+        if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(4); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); if (onlineIdx.length > 0) setHighlightIdx((h) => step(h, -1)); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); if (onlineIdx.length > 0) setHighlightIdx((h) => step(h, 1)); return; }
+        if ((e.key === 'Enter' || e.key === 'Tab') && onlineIdx.length > 0) {
+          e.preventDefault(); e.stopPropagation();
+          // Snap an offline/out-of-range highlight to the first online row.
+          const effIdx = machineResults[highlightIdx]?.online ? highlightIdx : onlineIdx[0];
+          const m = machineResults[effIdx];
+          if (m) onSelectMachine?.(m.refName);
           return;
         }
         return;
@@ -363,14 +404,22 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, delegateAgents, aliasResults, teamRoundsIdx, teamComboOptions, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onLaunchTeam],
+    [visible, category, highlightIdx, fileResults, delegateAgents, aliasResults, machineResults, teamRoundsIdx, teamComboOptions, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onLaunchTeam],
   );
 
-  useEffect(() => {
+  // Keep one capture listener for the lifetime of the open picker. Rebinding a
+  // document listener after every highlight change leaves a passive-effect gap
+  // where SessionControls already suppresses the key but the picker cannot act
+  // on it. That made the first/rapid Arrow and Enter presses appear dead.
+  const handleKeyDownRef = useRef(handleKeyDown);
+  handleKeyDownRef.current = handleKeyDown;
+
+  useLayoutEffect(() => {
     if (!visible) return;
-    document.addEventListener('keydown', handleKeyDown, true);
-    return () => document.removeEventListener('keydown', handleKeyDown, true);
-  }, [visible, handleKeyDown]);
+    const listener = (event: KeyboardEvent) => handleKeyDownRef.current(event);
+    document.addEventListener('keydown', listener, true);
+    return () => document.removeEventListener('keydown', listener, true);
+  }, [visible]);
 
   // Scroll highlighted item into view
   useEffect(() => {
@@ -425,6 +474,16 @@ export function AtPicker({
           <span style={{ fontWeight: 500 }}>{t('alias.category')}</span>
           <span style={dimStyle}>{t('alias.category_desc')}</span>
         </div>
+        <div
+          data-hl={highlightIdx === 4 ? 'true' : undefined}
+          style={highlightIdx === 4 ? categoryHighlightStyle : categoryStyle}
+          onClick={() => { setCategory('machines'); setHighlightIdx(0); }}
+          onMouseEnter={() => setHighlightIdx(4)}
+        >
+          <span style={{ fontSize: 16 }}>🖥️</span>
+          <span style={{ fontWeight: 500 }}>{t('machine.category')}</span>
+          <span style={dimStyle}>{t('machine.category_desc')}</span>
+        </div>
       </div>
     );
   }
@@ -454,6 +513,57 @@ export function AtPicker({
             >
               <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{a.name}</span>
               {a.description ? <span style={dimStyle}>{a.description}</span> : null}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  // ── Machines list ── Offline machines are shown but non-selectable.
+  if (category === 'machines') {
+    // Keep the visible highlight on a selectable (online) row.
+    const firstOnline = machineResults.findIndex((m) => m.online);
+    const effHighlight = machineResults[highlightIdx]?.online ? highlightIdx : firstOnline;
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(4); }}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>
+          {t('machine.category')} {query ? `— "${query}"` : ''}
+        </div>
+        {machineResults.length === 0 && (
+          <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
+            {query ? t('machine.no_results') : t('machine.empty')}
+          </div>
+        )}
+        {machineResults.map((m, idx) => {
+          const hl = idx === effHighlight;
+          const selectable = m.online;
+          return (
+            <div
+              key={m.serverId}
+              data-hl={hl ? 'true' : undefined}
+              aria-disabled={selectable ? undefined : 'true'}
+              style={{
+                ...(hl ? itemHighlightStyle : itemStyle),
+                ...(selectable ? {} : { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 }),
+              }}
+              onClick={() => { if (selectable) onSelectMachine?.(m.refName); }}
+              onMouseEnter={() => { if (selectable) setHighlightIdx(idx); }}
+            >
+              <span
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: '50%',
+                  flexShrink: 0,
+                  background: m.online ? '#22c55e' : '#64748b',
+                }}
+                title={m.online ? undefined : t('machine.offline')}
+              />
+              <span style={{ fontWeight: 500, color: selectable ? '#e2e8f0' : '#64748b' }}>{m.displayName}</span>
+              <span style={dimStyle}>{m.refName}</span>
+              {!m.online && <span style={dimStyle}>{t('machine.offline_hint')}</span>}
             </div>
           );
         })}

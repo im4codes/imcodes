@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import {
   MEMORY_FEATURE_FLAGS,
   MEMORY_FEATURE_FLAGS_BY_NAME,
@@ -18,9 +19,50 @@ import {
   buildMcpErrorResult,
   MEMORY_MCP_CAPS,
   pickAllowedMcpArgs,
+  advertisedMcpToolNames,
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import {
+  NODE_ROLE,
+  ENROLLMENT_OSES,
+  REMOTE_EXEC_OUTCOMES,
+  REMOTE_EXEC_MIN_TIMEOUT_MS,
+  REMOTE_EXEC_SHELLS,
+  REMOTE_EXEC_MAX_COMMAND_BYTES,
+  REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  REMOTE_EXEC_MAX_ERROR_BYTES,
+  REMOTE_EXEC_MAX_TIMEOUT_MS,
+  MACHINE_LIST_MAX_ITEMS,
+  utf8ByteLength,
+  type NodeRole,
+  type EnrollmentOs,
+  type RemoteExecShell,
+  type RemoteExecOutcome,
+  type RemoteExecOutputChunk,
+} from '../../shared/remote-exec.js';
+import {
+  COMPUTER_USE_DOC_TOPICS,
+  COMPUTER_USE_DRAG_DURATION_MAX_MS,
+  COMPUTER_USE_DRAG_DURATION_MIN_MS,
+  COMPUTER_USE_TOOLS,
+  COMPUTER_USE_OUTCOMES,
+  COMPUTER_USE_MIN_TIMEOUT_MS,
+  COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+  COMPUTER_USE_MAX_ARGUMENT_BYTES,
+  COMPUTER_USE_MAX_TEXT_BYTES,
+  COMPUTER_USE_MAX_IMAGE_BASE64_BYTES,
+  COMPUTER_USE_MAX_ERROR_BYTES,
+  COMPUTER_USE_IMAGE_MIME_TYPES,
+  computerUseDocs,
+  computerUseMaxTimeoutMs,
+  type ComputerUseDocTopic,
+  type ComputerUseToolName,
+  type ComputerUseOutcome,
+  type ComputerUseResult,
+} from '../../shared/computer-use.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
+import { isValidMachineName, isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -58,7 +100,11 @@ import {
 } from './alias-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
-export type MemoryMcpToolHandler = (input?: unknown) => Promise<ToolResult> | ToolResult;
+export interface MemoryMcpToolContext {
+  signal?: AbortSignal;
+  onProgress?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
+}
+export type MemoryMcpToolHandler = (input?: unknown, context?: MemoryMcpToolContext) => Promise<ToolResult> | ToolResult;
 type MemoryMcpSearch = (query: MemorySearchQuery) => Promise<MemoryMcpSearchResult> | MemoryMcpSearchResult;
 type MemoryMcpListSummaries = (query: {
   namespace?: MemorySearchQuery['namespace'];
@@ -116,7 +162,202 @@ export interface MemoryMcpToolDeps {
   cronUpdate?: typeof cronMcpUpdate;
   cronDelete?: typeof cronMcpDelete;
   cronList?: typeof cronMcpList;
+  /**
+   * Machine remote-exec tools (list_machines / exec_remote). Absent on a node
+   * that cannot control machines — the handlers then return a typed
+   * feature-disabled error rather than throwing. The production default is
+   * wired in `mergeDefaultToolDeps` (relays via the daemon's own credential).
+   */
+  machineDeps?: MachineToolDeps;
+  /**
+   * The node's own role. Only FULL nodes advertise the machine tools; a
+   * controlled node excludes them from its tool surface (10.12). Defaults to
+   * FULL — a controlled node structurally never starts this MCP server anyway,
+   * so this is the explicit belt-and-suspenders gate the spec requires.
+   */
+  nodeRole?: NodeRole;
 }
+
+/** One machine in the `list_machines` result (agent-facing, ref_name-keyed). */
+export interface MachineSummaryForTool {
+  name: string;
+  displayName?: string;
+  os?: EnrollmentOs;
+  online: boolean;
+  execEnabled: boolean;
+  /** Node role — always `controlled` for controllable machines (spec: list returns role). */
+  role: typeof NODE_ROLE.CONTROLLED;
+}
+
+/** The end-to-end outcome of `exec_remote`, preserving the discriminated union. */
+export interface MachineExecToolResult {
+  outcome: RemoteExecOutcome;
+  ok?: boolean;
+  exitCode?: number | null;
+  stdout?: string;
+  stderr?: string;
+  timedOut?: boolean;
+  truncated?: boolean;
+  durationMs?: number;
+  error?: string;
+  /** Set when the target is unusable — surfaced as a typed shared MCP error reason. */
+  reason?: MCPErrorReason;
+}
+
+export interface ComputerUseToolResult {
+  outcome: ComputerUseOutcome;
+  result?: ComputerUseResult;
+  reason?: MCPErrorReason;
+  error?: string;
+}
+
+export type MachineFileToolResult =
+  | { ok: true; size: number; attachmentId: string; remotePath?: string; destinationPath?: string }
+  | { ok: false; reason: MCPErrorReason; error?: string };
+
+export interface MachineToolDeps {
+  listMachines: (input: { includeOffline?: boolean }) => Promise<MachineSummaryForTool[]> | MachineSummaryForTool[];
+  execRemote: (input: {
+    machine: string;
+    command: string;
+    shell?: RemoteExecShell;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    onOutput?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
+  }) => Promise<MachineExecToolResult> | MachineExecToolResult;
+  sendFileToMachine?: (input: {
+    machine: string;
+    sourcePath: string;
+    signal?: AbortSignal;
+  }) => Promise<MachineFileToolResult> | MachineFileToolResult;
+  fetchFileFromMachine?: (input: {
+    machine: string;
+    sourcePath: string;
+    destinationPath: string;
+    overwrite?: boolean;
+    signal?: AbortSignal;
+  }) => Promise<MachineFileToolResult> | MachineFileToolResult;
+  computerUseCall?: (input: {
+    machine: string;
+    tool: ComputerUseToolName;
+    arguments?: Record<string, unknown>;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
+}
+
+export interface MachineListToolSuccess extends Record<string, unknown> {
+  status: 'ok';
+  machines: MachineSummaryForTool[];
+}
+
+interface MachineExecTerminalFields {
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  durationMs: number;
+}
+
+export type MachineExecToolSuccess = Record<string, unknown> & (
+  | { status: 'ok'; outcome: 'not_dispatched' | 'dispatched_no_result' }
+  | ({ status: 'ok'; outcome: 'completed'; ok: true; exitCode: number; timedOut: false } & MachineExecTerminalFields)
+  | ({ status: 'ok'; outcome: 'node_timeout'; ok: false; exitCode: null; timedOut: true; error: string } & MachineExecTerminalFields)
+  | ({ status: 'ok'; outcome: 'spawn_error'; ok: false; exitCode: null; timedOut: false; error: string } & MachineExecTerminalFields)
+);
+
+const machineRefNameRuntimeSchema = z.string().refine(isValidMachineName, {
+  message: 'must be a valid bare stable machine ref_name',
+});
+
+const machineTargetRuntimeSchema = z.string().refine(isValidMachineTarget, {
+  message: 'must be a valid stable machine ref_name or complete ^^(ref_name) marker',
+});
+
+const machineSummaryShape = {
+  name: machineRefNameRuntimeSchema,
+  displayName: z.string().optional(),
+  os: z.enum(ENROLLMENT_OSES).optional(),
+  online: z.boolean(),
+  execEnabled: z.boolean(),
+  role: z.literal(NODE_ROLE.CONTROLLED),
+} as const;
+
+const machineSummaryRuntimeSchema: z.ZodType<MachineSummaryForTool> = z.strictObject(machineSummaryShape);
+const machineListDependencyResultSchema = z.array(machineSummaryRuntimeSchema).max(MACHINE_LIST_MAX_ITEMS);
+
+const boundedUtf8String = (maxBytes: number) => z.string().refine(
+  (value) => utf8ByteLength(value) <= maxBytes,
+  { message: `must be at most ${maxBytes} UTF-8 bytes` },
+);
+
+const mcpReasonSchema = z.enum(Object.values(MCP_ERROR_REASONS) as [MCPErrorReason, ...MCPErrorReason[]]);
+const machineExecDependencyTerminalBase = {
+  stdout: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+  stderr: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+  truncated: z.boolean(),
+  durationMs: z.number().int().safe().nonnegative(),
+} as const;
+const machineExecDependencyResultSchema = z.discriminatedUnion('outcome', [
+  z.strictObject({
+    outcome: z.literal('not_dispatched'),
+    reason: mcpReasonSchema.optional(),
+    error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).optional(),
+  }),
+  z.strictObject({ outcome: z.literal('dispatched_no_result') }),
+  z.strictObject({
+    ...machineExecDependencyTerminalBase,
+    outcome: z.literal('completed'),
+    ok: z.literal(true),
+    exitCode: z.number().int().safe(),
+    timedOut: z.literal(false),
+  }),
+  z.strictObject({
+    ...machineExecDependencyTerminalBase,
+    outcome: z.literal('node_timeout'),
+    ok: z.literal(false),
+    exitCode: z.null(),
+    timedOut: z.literal(true),
+    error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).refine((value) => value.length > 0),
+  }),
+  z.strictObject({
+    ...machineExecDependencyTerminalBase,
+    outcome: z.literal('spawn_error'),
+    ok: z.literal(false),
+    exitCode: z.null(),
+    timedOut: z.literal(false),
+    error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).refine((value) => value.length > 0),
+  }),
+]).superRefine((result, ctx) => {
+  if (result.outcome === 'not_dispatched' && result.error !== undefined && result.reason === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'not_dispatched error requires a typed reason' });
+  }
+});
+
+const computerUseContentItemSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('text'), text: boundedUtf8String(COMPUTER_USE_MAX_TEXT_BYTES) }),
+  z.strictObject({ type: z.literal('image'), data: boundedUtf8String(COMPUTER_USE_MAX_IMAGE_BASE64_BYTES), mimeType: z.enum(COMPUTER_USE_IMAGE_MIME_TYPES) }),
+]);
+
+const computerUseResultSchema = z.strictObject({
+  correlationId: z.string().min(8).max(128),
+  ok: z.boolean(),
+  tool: z.enum(COMPUTER_USE_TOOLS),
+  content: z.array(computerUseContentItemSchema),
+  durationMs: z.number().int().safe().nonnegative(),
+  error: boundedUtf8String(COMPUTER_USE_MAX_ERROR_BYTES).optional(),
+  timedOut: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+}).superRefine((result, ctx) => {
+  if (result.ok && result.error !== undefined) ctx.addIssue({ code: 'custom', message: 'ok result forbids error' });
+  if (!result.ok && result.error === undefined) ctx.addIssue({ code: 'custom', message: 'failed result requires error' });
+});
+
+const computerUseDependencyResultSchema = z.discriminatedUnion('outcome', [
+  z.strictObject({ outcome: z.literal('not_dispatched'), reason: mcpReasonSchema.optional(), error: boundedUtf8String(COMPUTER_USE_MAX_ERROR_BYTES).optional() }),
+  z.strictObject({ outcome: z.literal('dispatched_no_result') }),
+  z.strictObject({ outcome: z.literal('completed'), result: computerUseResultSchema }),
+  z.strictObject({ outcome: z.literal('tool_error'), result: computerUseResultSchema }),
+]);
 
 function readBooleanEnv(value: string | undefined): boolean | undefined {
   if (value == null) return undefined;
@@ -156,6 +397,11 @@ function error(reason: MCPErrorReason, message?: string): ToolResult {
 function stringArg(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function machineArg(args: Record<string, unknown>): string | undefined {
+  const value = args.machine;
+  return typeof value === 'string' ? normalizeMachineTarget(value) ?? undefined : undefined;
 }
 
 function numberArg(args: Record<string, unknown>, key: string): number | undefined {
@@ -1038,15 +1284,161 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if ('status' in cronOptions) return cronOptions;
       return cronDelete(id, cronOptions) as unknown as Promise<ToolResult>;
     },
+    [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: async (input) => {
+      if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['includeOffline']);
+      const includeOffline = boolArg(args, 'includeOffline') ?? false;
+      // Unbound → FEATURE_DISABLED; a real control-plane failure
+      // (transport/http/malformed) → CONTROL_PLANE_UNAVAILABLE. Never a silent
+      // empty "no machines" list. Kept consistent with the exec path.
+      let machines: MachineSummaryForTool[];
+      try {
+        machines = await deps.machineDeps.listMachines({ includeOffline });
+      } catch (err) {
+        const kind = (err as { kind?: string }).kind;
+        const reason = kind === 'unbound' ? MCP_ERROR_REASONS.FEATURE_DISABLED : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+        return error(reason, err instanceof Error ? err.message : 'machine control plane unavailable');
+      }
+      const parsedMachines = machineListDependencyResultSchema.safeParse(machines);
+      if (!parsedMachines.success) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine control plane returned a malformed machine list');
+      }
+      const success: MachineListToolSuccess = { status: 'ok', machines: parsedMachines.data };
+      return success;
+    },
+    [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: async (input, context) => {
+      if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs']);
+      const machine = machineArg(args);
+      const command = stringArg(args, 'command');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name');
+      if (!command) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command is required');
+      if (utf8ByteLength(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `command must be at most ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes`);
+      }
+      const shellRaw = stringArg(args, 'shell');
+      if (shellRaw && !(REMOTE_EXEC_SHELLS as readonly string[]).includes(shellRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `shell must be one of ${REMOTE_EXEC_SHELLS.join(', ')}`);
+      }
+      const timeoutMs = numberArg(args, 'timeoutMs');
+      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < REMOTE_EXEC_MIN_TIMEOUT_MS || timeoutMs > REMOTE_EXEC_MAX_TIMEOUT_MS)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}]`);
+      }
+      const injectedResult = await deps.machineDeps.execRemote({
+        machine,
+        command,
+        ...(shellRaw ? { shell: shellRaw as RemoteExecShell } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+        ...(context?.onProgress ? { onOutput: context.onProgress } : {}),
+      });
+      const parsedResult = machineExecDependencyResultSchema.safeParse(injectedResult);
+      if (!parsedResult.success) {
+        // The request may already have reached the controlled node. Never turn
+        // an untrusted/malformed post-dispatch result into a retry-safe error.
+        const indeterminate: MachineExecToolSuccess = { status: 'ok', outcome: 'dispatched_no_result' };
+        return indeterminate;
+      }
+      const result = parsedResult.data;
+      // A typed reason means the target was unusable (offline/unknown/ambiguous/
+      // disabled) — surface it as a shared MCP error, never an ad-hoc string.
+      if (result.outcome === 'not_dispatched' && result.reason) return error(result.reason, result.error);
+      const success = result.outcome === 'not_dispatched'
+        ? { status: 'ok', outcome: result.outcome } as MachineExecToolSuccess
+        : { status: 'ok', ...result } as MachineExecToolSuccess;
+      return success;
+    },
+    [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: async (input, context) => {
+      if (!deps.machineDeps?.sendFileToMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath']);
+      const machine = machineArg(args);
+      const sourcePath = stringArg(args, 'sourcePath');
+      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name and sourcePath are required');
+      if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'sourcePath is too long');
+      const result = await deps.machineDeps.sendFileToMachine({
+        machine,
+        sourcePath,
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      if (!result.remotePath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
+      return { status: 'ok', machine, remotePath: result.remotePath, attachmentId: result.attachmentId, size: result.size };
+    },
+    [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: async (input, context) => {
+      if (!deps.machineDeps?.fetchFileFromMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath', 'destinationPath', 'overwrite']);
+      const machine = machineArg(args);
+      const sourcePath = stringArg(args, 'sourcePath');
+      const destinationPath = stringArg(args, 'destinationPath');
+      const overwrite = boolArg(args, 'overwrite') ?? false;
+      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name, sourcePath, and destinationPath are required');
+      if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES || utf8ByteLength(destinationPath) > FILE_TRANSFER_PATH_MAX_BYTES) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'file path is too long');
+      }
+      const result = await deps.machineDeps.fetchFileFromMachine({
+        machine,
+        sourcePath,
+        destinationPath,
+        overwrite,
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      if (!result.destinationPath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
+      return { status: 'ok', machine, destinationPath: result.destinationPath, attachmentId: result.attachmentId, size: result.size };
+    },
+    [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['topic']);
+      const topicRaw = stringArg(args, 'topic');
+      if (!topicRaw || !(COMPUTER_USE_DOC_TOPICS as readonly string[]).includes(topicRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `topic must be one of ${COMPUTER_USE_DOC_TOPICS.join(', ')}`);
+      }
+      return { status: 'ok', topic: topicRaw, text: computerUseDocs(topicRaw as ComputerUseDocTopic) };
+    },
+    [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: async (input, context) => {
+      if (!deps.machineDeps?.computerUseCall) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'computer use control is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['machine', 'tool', 'arguments', 'timeoutMs']);
+      const machine = machineArg(args);
+      const toolRaw = stringArg(args, 'tool');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name or local alias');
+      if (!toolRaw || !(COMPUTER_USE_TOOLS as readonly string[]).includes(toolRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `tool must be one of ${COMPUTER_USE_TOOLS.join(', ')}`);
+      }
+      const toolArgs = args.arguments === undefined ? undefined : args.arguments;
+      if (toolArgs !== undefined && (typeof toolArgs !== 'object' || toolArgs === null || Array.isArray(toolArgs))) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'arguments must be an object');
+      }
+      if (toolArgs !== undefined && utf8ByteLength(JSON.stringify(toolArgs)) > COMPUTER_USE_MAX_ARGUMENT_BYTES) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `arguments must be at most ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes`);
+      }
+      const timeoutMs = numberArg(args, 'timeoutMs');
+      const maxTimeoutMs = computerUseMaxTimeoutMs(toolRaw as ComputerUseToolName);
+      if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > maxTimeoutMs)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `timeoutMs must be an integer in [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${maxTimeoutMs}] for ${toolRaw}`);
+      }
+      const injectedResult = await deps.machineDeps.computerUseCall({
+        machine,
+        tool: toolRaw as ComputerUseToolName,
+        ...(toolArgs !== undefined ? { arguments: toolArgs as Record<string, unknown> } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      const parsedResult = computerUseDependencyResultSchema.safeParse(injectedResult);
+      if (!parsedResult.success) return { status: 'ok', outcome: 'dispatched_no_result' };
+      const result = parsedResult.data;
+      if (result.outcome === 'not_dispatched' && result.reason) return error(result.reason, result.error);
+      return result.outcome === 'not_dispatched' || result.outcome === 'dispatched_no_result'
+        ? { status: 'ok', outcome: result.outcome }
+        : { status: 'ok', outcome: result.outcome, result: result.result };
+    },
   });
 }
 
 function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const wrapped = {} as Record<MemoryMcpToolName, MemoryMcpToolHandler>;
   for (const name of MEMORY_MCP_TOOL_NAME_LIST) {
-    wrapped[name] = async (input?: unknown) => {
+    wrapped[name] = async (input?: unknown, context?: MemoryMcpToolContext) => {
       try {
-        return await handlers[name](input);
+        return await handlers[name](input, context);
       } catch (err) {
         return sanitizeCaughtError(err);
       }
@@ -1065,142 +1457,276 @@ function toolResult(result: ToolResult): CallToolResult {
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
-    query: z.string().describe('Required text query to search for. Results include sourceLookup values for get_memory_sources when more detail is needed.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Optional maximum hit count.'),
+    query: z.string().describe('Text query; hits include sourceLookup for expansion.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Maximum hits.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: z.object({
-    projectionClass: z.enum(['recent_summary', 'durable_memory_candidate']).optional().describe('Optional processed summary class. Defaults to recent_summary.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Optional maximum summary count.'),
+    projectionClass: z.enum(['recent_summary', 'durable_memory_candidate']).optional().describe('Summary class; defaults to recent_summary.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Maximum summaries.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
-    projectionId: z.string().optional().describe('Projection id returned by search_memory for a relevant projection hit.'),
-    observationId: z.string().optional().describe('Observation id returned by search_memory for a relevant observation hit.'),
-    ref: z.string().optional().describe('Compact ref returned by search_memory or startup memory, such as obs:abc123 or proj:abc123.'),
-    kind: z.enum(['projection', 'observation']).optional().describe('Optional source lookup kind copied from search_memory.sourceLookup.'),
+    projectionId: z.string().optional().describe('Projection hit id from search_memory.'),
+    observationId: z.string().optional().describe('Observation hit id from search_memory.'),
+    ref: z.string().optional().describe('Compact search/startup ref (obs:… or proj:…).'),
+    kind: z.enum(['projection', 'observation']).optional().describe('Kind from sourceLookup.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id for the memory to archive.'),
-    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+    projectionId: z.string().optional().describe('Projection id to archive.'),
+    ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id for the archived memory to restore.'),
-    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+    projectionId: z.string().optional().describe('Projection id to restore.'),
+    ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id for the memory to permanently delete.'),
-    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
+    projectionId: z.string().optional().describe('Projection id to delete.'),
+    ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id for the memory to update.'),
-    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
-    text: z.string().describe('Replacement memory summary text.'),
+    projectionId: z.string().optional().describe('Projection id to update.'),
+    ref: z.string().optional().describe('Compact proj: ref.'),
+    text: z.string().describe('Replacement summary.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: z.object({
-    projectionId: z.string().optional().describe('Projection id for the memory receiving feedback.'),
-    ref: z.string().optional().describe('Compact projection ref such as proj:abc123.'),
-    feedback: z.enum(['not_relevant', 'relevant']).describe('not_relevant archives; relevant records a positive hit.'),
-    reason: z.string().optional().describe('Optional short human-readable feedback reason.'),
+    projectionId: z.string().optional().describe('Projection id.'),
+    ref: z.string().optional().describe('Compact proj: ref.'),
+    feedback: z.enum(['not_relevant', 'relevant']).describe('Archive or strengthen ranking.'),
+    reason: z.string().optional().describe('Short audit reason.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
-    content: z.string().describe('Observation text to persist as a candidate memory.'),
-    tags: z.array(z.string()).optional().describe('Optional short tags.'),
-    turnId: z.string().optional().describe('Optional source turn or event id.'),
-    idempotencyKey: z.string().optional().describe('Optional retry key.'),
+    content: z.string().describe('Durable fact or decision.'),
+    tags: z.array(z.string()).optional().describe('Short tags.'),
+    turnId: z.string().optional().describe('Source turn/event id.'),
+    idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE]: z.object({
-    text: z.string().describe('Preference text to persist.'),
-    idempotencyKey: z.string().optional().describe('Optional retry key.'),
+    text: z.string().describe('Stable preference text.'),
+    idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
-    query: z.string().optional().describe('Optional case-insensitive target/display-label filter, for example "cc", "codex", "reviewer", or a session label mentioned when the user asks to involve another agent.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Optional result limit. Returns only sendable sibling sessions in the caller project; the caller itself and stopped sessions are excluded.'),
+    query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().describe('Exact sibling target from send_list_targets. The caller session is not a valid target; if send_list_targets returns no items, direct send_message cannot succeed.'),
-    message: z.string().describe('Complete task/request text to send when inviting another session to audit, review, discuss, plan, implement, verify, or answer a question.'),
-    files: z.array(z.string()).optional().describe('Project-root file path references; no bytes are transferred.'),
-    reply: z.boolean().optional().describe('Ask target to reply to the caller session. Set true for audit/review requests or discussion invites that should report back.'),
-    broadcast: z.boolean().optional().describe('Broadcast within the caller project. Use only when the user asks every/all available sessions, not for a singular named peer.'),
-    idempotencyKey: z.string().optional().describe('Retry key for accepted send replay.'),
+    target: z.string().describe('Exact send_list_targets target; never the caller.'),
+    message: z.string().describe('Complete task/request and expected output.'),
+    files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
+    reply: z.boolean().optional().describe('Request a reply/report.'),
+    broadcast: z.boolean().optional().describe('Only when the user asks every/all sessions.'),
+    idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
     clone: z.object({
-      kind: z.literal(EXECUTION_CLONE_KIND).describe('Must be "execution_clone".'),
-      ephemeral: z.literal(true).describe('Must be true — execution clones are always ephemeral.'),
-      parentRunId: z.string().min(1).describe('Non-empty id of the parent run that owns this clone.'),
-      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES).describe('Execution entry-point stage creating the clone.'),
-    }).strict().optional().describe('Optional execution-clone request. When present, the message is routed to a freshly created ephemeral clone of the target template, not the target directly; the result includes clone.target. broadcast is not allowed.'),
+      kind: z.literal(EXECUTION_CLONE_KIND).describe('Clone kind.'),
+      ephemeral: z.literal(true).describe('Always true.'),
+      parentRunId: z.string().min(1).describe('Owning parent run id.'),
+      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES).describe('Creating parent stage.'),
+    }).strict().optional().describe('Route to a new ephemeral target clone; returns clone.target; forbids broadcast.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
-    target: z.string().describe('Exact execution-clone session name returned by the original clone send (result.clone.target).'),
-    idempotencyKey: z.string().optional().describe('Optional retry key for accepted destroy replay.'),
+    target: z.string().describe('Exact result.clone.target.'),
+    idempotencyKey: z.string().optional().describe('Accepted-destroy replay key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
-    target: z.string().optional().describe('Exact sibling target from send_list_targets to force-stop. Required unless broadcast is true. The caller session is not a valid target.'),
-    broadcast: z.boolean().optional().describe('Force-stop every sendable sibling session in the caller project.'),
-    idempotencyKey: z.string().optional().describe('Retry key for accepted stop replay.'),
+    target: z.string().optional().describe('Exact sibling target; required unless broadcast.'),
+    broadcast: z.boolean().optional().describe('Stop all sendable siblings.'),
+    idempotencyKey: z.string().optional().describe('Accepted-stop replay key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: z.object({
-    cronExpr: z.string().describe(`Cron expression accepted by the cron service. The next two runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`),
-    message: z.string().describe('Prompt or instruction delivered directly to the runtime-bound current session.'),
-    name: z.string().optional().describe('Optional job name; defaults to a short name derived from the message.'),
-    timezone: z.string().optional().describe('Optional cron timezone for schedule evaluation only.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional absolute expiration timestamp or ISO string with an explicit offset or Z suffix.'),
+    cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum interval.`),
+    message: z.string().describe('Message to this session.'),
+    name: z.string().optional().describe('Job name; derived from message by default.'),
+    timezone: z.string().optional().describe('Schedule timezone.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms or explicit-offset ISO expiration.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: z.object({
-    id: z.string().describe('Current-session cron job id returned by creation or injected into a wake-up prompt.'),
-    cronExpr: z.string().optional().describe(`Optional replacement cron expression with at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes between runs.`),
-    message: z.string().optional().describe('Optional replacement prompt delivered to the current session on future runs.'),
-    name: z.string().optional().describe('Optional replacement human-readable task name.'),
-    timezone: z.string().optional().describe('Optional replacement cron schedule timezone.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional replacement absolute expiration timestamp or explicit-offset ISO string.'),
+    id: z.string().describe('Current-session job id.'),
+    cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
+    message: z.string().optional().describe('Replacement wake-up message.'),
+    name: z.string().optional().describe('Replacement name.'),
+    timezone: z.string().optional().describe('Replacement timezone.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO expiration.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: z.object({
-    id: z.string().optional().describe('Exact current-session cron job id returned by creation or listing.'),
-    name: z.string().optional().describe('Exact unique current-session cron job name to cancel.'),
-    all: z.boolean().optional().describe('Explicitly cancel every cron job targeting the current session.'),
+    id: z.string().optional().describe('Exact current-session job id.'),
+    name: z.string().optional().describe('Exact unique current-session job name.'),
+    all: z.boolean().optional().describe('Cancel every current-session job.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
-    name: z.string().describe('Cron job name.'),
-    cronExpr: z.string().describe(`Cron expression accepted by the cron service. The next two runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart; every-minute expressions such as "* * * * *" are rejected.`),
-    projectName: z.string().optional().describe('Project name; defaults to caller project when available.'),
-    targetRole: z.string().optional().describe('Source role for the scheduled job row when targetSessionName is omitted; defaults to the project brain session.'),
-    targetSessionName: z.string().nullable().optional().describe('Optional direct source session for the job row. Send action targets are resolved as siblings of this source session; the source cannot send to itself.'),
-    action: z.record(z.string(), z.unknown()).describe('Structured send action with shape { type: "send", target, message, reply?, broadcast?, idempotencyKey? }. The target is resolved at execution time from the scheduled source session selected by targetSessionName or targetRole.'),
-    timezone: z.string().optional().describe('Optional cron timezone for schedule evaluation only. It does not affect expiresAt parsing.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional absolute expiration time as epoch milliseconds or an ISO string with an explicit offset or Z suffix, capped at 90 days. It prevents future dispatches after that instant but does not retract already dispatched messages.'),
+    name: z.string().describe('Job name.'),
+    cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum; every-minute schedules are invalid.`),
+    projectName: z.string().optional().describe('Project; defaults to caller project.'),
+    targetRole: z.string().optional().describe('Source role; defaults to project brain.'),
+    targetSessionName: z.string().nullable().optional().describe('Source session; target resolves among its siblings and cannot be itself.'),
+    action: z.record(z.string(), z.unknown()).describe('Send action: {type:"send", target, message, reply?, broadcast?, idempotencyKey?}.'),
+    timezone: z.string().optional().describe('Schedule timezone only.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/offset-ISO, ≤90 days; affects future sends only.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: z.object({
-    projectName: z.string().optional().describe('Optional project filter.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Optional page size clamped to 100.'),
+    projectName: z.string().optional().describe('Project filter.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Page size.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: z.object({
-    id: z.string().describe('Cron job id.'),
-    name: z.string().optional().describe('Optional replacement job name.'),
-    cronExpr: z.string().optional().describe(`Optional replacement cron expression. The next two runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`),
-    projectName: z.string().optional().describe('Optional replacement project name.'),
-    targetRole: z.string().optional().describe('Optional replacement source role when targetSessionName is omitted.'),
-    targetSessionName: z.string().nullable().optional().describe('Optional replacement direct source session. Send action targets are resolved as siblings of this source session.'),
-    action: z.record(z.string(), z.unknown()).optional().describe('Optional replacement structured send action; non-send actions are rejected for MCP writes.'),
-    timezone: z.string().optional().describe('Optional replacement cron timezone for schedule evaluation only. It does not affect expiresAt parsing.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Optional replacement absolute expiration time as epoch milliseconds or an ISO string with an explicit offset or Z suffix. It prevents future dispatches after that instant but does not retract already dispatched messages.'),
+    id: z.string().describe('Job id.'),
+    name: z.string().optional().describe('Replacement name.'),
+    cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
+    projectName: z.string().optional().describe('Replacement project.'),
+    targetRole: z.string().optional().describe('Replacement source role.'),
+    targetSessionName: z.string().nullable().optional().describe('Replacement source session; target resolves among its siblings.'),
+    action: z.record(z.string(), z.unknown()).optional().describe('Replacement send action; other action types are rejected.'),
+    timezone: z.string().optional().describe('Replacement schedule timezone only.'),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO; affects future sends only.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
-    id: z.string().describe('Cron job id to delete.'),
+    id: z.string().describe('Job id.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
+    includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker; no list_machines preflight when known.'),
+    command: z.string().describe('One shell command.'),
+    shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
+    timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
+    sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
+    sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    overwrite: z.boolean().optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
+    topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
+    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this; do not preflight list_machines when known.'),
+    tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
+    arguments: z.record(z.string(), z.unknown()).optional().describe(`Method arguments. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`),
+    timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),
+  }).superRefine((value, ctx) => {
+    if (value.timeoutMs !== undefined && value.timeoutMs > computerUseMaxTimeoutMs(value.tool)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['timeoutMs'], message: `timeoutMs exceeds the maximum for ${value.tool}` });
+    }
   }),
 } as const;
 
-export function listMemoryMcpToolDescriptors() {
-  return MEMORY_MCP_TOOL_NAME_LIST.map((name) => MEMORY_MCP_TOOL_CONTRACTS[name]);
+/**
+ * Output schemas for the machine tools ONLY. Registering these publishes the
+ * shape to the SDK, which validates non-error `structuredContent` against them —
+ * catching field/nullable/outcome drift between the shared descriptor and the
+ * runtime result. `exitCode` is nullable (signal/spawn failures have no code).
+ */
+const machineExecToolOutputRuntimeSchema = z.strictObject({
+  status: z.literal('ok'),
+  outcome: z.enum(REMOTE_EXEC_OUTCOMES),
+  ok: z.boolean().optional(),
+  exitCode: z.number().int().safe().nullable().optional(),
+  stdout: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES).optional(),
+  stderr: boundedUtf8String(REMOTE_EXEC_MAX_OUTPUT_BYTES).optional(),
+  timedOut: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+  durationMs: z.number().int().safe().nonnegative().optional(),
+  error: boundedUtf8String(REMOTE_EXEC_MAX_ERROR_BYTES).optional(),
+}).superRefine((result, ctx) => {
+  const fields = ['ok', 'exitCode', 'stdout', 'stderr', 'timedOut', 'truncated', 'durationMs'] as const;
+  const hasAny = fields.some((field) => result[field] !== undefined) || result.error !== undefined;
+  if (result.outcome === 'not_dispatched' || result.outcome === 'dispatched_no_result') {
+    if (hasAny) ctx.addIssue({ code: 'custom', message: `${result.outcome} forbids command result fields` });
+    return;
+  }
+  if (!fields.every((field) => result[field] !== undefined)) {
+    ctx.addIssue({ code: 'custom', message: `${result.outcome} requires every command result field` });
+    return;
+  }
+  if (result.outcome === 'completed') {
+    if (result.ok !== true || result.exitCode === null || result.timedOut !== false || result.error !== undefined) {
+      ctx.addIssue({ code: 'custom', message: 'completed result fields are inconsistent' });
+    }
+    return;
+  }
+  if (result.ok !== false || result.exitCode !== null || typeof result.error !== 'string' || result.error.length === 0) {
+    ctx.addIssue({ code: 'custom', message: `${result.outcome} result fields are inconsistent` });
+    return;
+  }
+  if ((result.outcome === 'node_timeout') !== (result.timedOut === true)) {
+    ctx.addIssue({ code: 'custom', message: `${result.outcome} timedOut field is inconsistent` });
+  }
+});
+
+const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>> = {
+  [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
+    status: z.literal('ok'),
+    machines: z.array(machineSummaryRuntimeSchema).max(MACHINE_LIST_MAX_ITEMS),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: machineExecToolOutputRuntimeSchema,
+  [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
+    status: z.literal('ok'),
+    machine: z.string().min(1),
+    remotePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    attachmentId: z.string().min(1).max(128),
+    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
+    status: z.literal('ok'),
+    machine: z.string().min(1),
+    destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
+    attachmentId: z.string().min(1).max(128),
+    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
+    status: z.literal('ok'),
+    topic: z.enum(COMPUTER_USE_DOC_TOPICS),
+    text: z.string(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
+    status: z.literal('ok'),
+    outcome: z.enum(COMPUTER_USE_OUTCOMES),
+    result: computerUseResultSchema.optional(),
+  }).superRefine((value, ctx) => {
+    if ((value.outcome === 'completed' || value.outcome === 'tool_error') !== (value.result !== undefined)) {
+      ctx.addIssue({ code: 'custom', message: 'computer_use_call outcome/result mismatch' });
+    }
+  }),
+} as const;
+
+/** Descriptors advertised for a node of the given role (controlled excludes FULL-only tools). */
+export function listMemoryMcpToolDescriptors(role: NodeRole = NODE_ROLE.FULL) {
+  return advertisedMcpToolNames(role).map((name) => MEMORY_MCP_TOOL_CONTRACTS[name]);
 }
 
 export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): void {
   const handlers = createMemoryMcpToolHandlers(caller, deps);
-  for (const name of MEMORY_MCP_TOOL_NAME_LIST) {
+  // Role-gate the advertised surface: a controlled node never registers the
+  // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).
+  for (const name of advertisedMcpToolNames(deps.nodeRole ?? NODE_ROLE.FULL)) {
     const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
+    const outputSchema = machineToolOutputSchemas[name];
     server.registerTool(name, {
-      title: name,
       description: contract.description,
       inputSchema: schemas[name],
-    }, async (args: unknown) => toolResult(await handlers[name](args)));
+      // Machine tools publish an output schema so the SDK validates structuredContent
+      // shape/nullable/outcome against the shared descriptor (catches drift).
+      ...(outputSchema ? { outputSchema } : {}),
+    }, async (args: unknown, extra: RequestHandlerExtra<ServerRequest, ServerNotification>) => {
+      const progressToken = extra._meta?.progressToken;
+      const context: MemoryMcpToolContext = { signal: extra.signal };
+      if (name === MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE && progressToken !== undefined) {
+        context.onProgress = async (chunk) => {
+          if (extra.signal.aborted) return;
+          await extra.sendNotification({
+            method: 'notifications/progress',
+            params: {
+              progressToken,
+              progress: chunk.seq + 1,
+              message: `[${chunk.stream}] ${chunk.chunk}`,
+            },
+          }).catch(() => {});
+        };
+      }
+      return toolResult(await handlers[name](args, context));
+    });
   }
 }
 
@@ -1236,30 +1762,30 @@ const ALIAS_MCP_TOOL_NAME_LIST: readonly AliasMcpToolName[] = [
 
 const ALIAS_MCP_TOOL_DESCRIPTIONS: Readonly<Record<AliasMcpToolName, string>> = {
   [ALIAS_MCP_TOOLS.RESOLVE]:
-    'Resolve one alias name to its current exact value from the user\'s precise, server-stored alias store (distinct from memory: an alias is the user\'s own literal text, not a recall-ranked memory). Read-only and user-scoped to the bound owner. Returns found:false with alias_not_found for an unknown name — it never errors on a missing name. To create or edit use save_alias; to remove use delete_alias; to discover/search names use list_aliases.',
+    'Resolve an exact user-scoped alias value by case-sensitive NFC name; distinct from memory. Unknown names return found:false with alias_not_found. Use list_aliases, save_alias, or delete_alias for other operations.',
   [ALIAS_MCP_TOOLS.LIST]:
-    'List the bound owner user\'s alias METADATA ONLY (name, optional description, tags, timestamps) from the precise, server-stored alias store (separate from memory search/recall). Pass an optional `query` to search by literal substring over name+description; omit it to list all. It deliberately does NOT return alias values — use resolve_alias to get one name\'s current value. User-scoped. Use it to discover which alias names exist before resolve_alias / save_alias / delete_alias.',
+    'Search or list user-scoped alias METADATA ONLY (name, description, tags, timestamps); values are excluded. Use resolve_alias for one value.',
   [ALIAS_MCP_TOOLS.SAVE]:
-    'Create or edit (upsert) one alias for the bound owner user: name -> exact value, plus optional description and tags. Keyed on the NFC name, so saving an existing name OVERWRITES its value/description/tags. The server validates authoritatively (name: letters/digits/._- up to 20 code points; value: non-empty, up to 500 code points, no NUL; description up to 200; tags: up to 10 items, up to 30 chars each, no control characters) and rejects invalid input with a reason code. The value is used verbatim when the user later inserts the alias as a ;;(name) marker, so avoid control/ANSI characters. Returns the saved alias metadata; it never echoes the value back.',
+    'Upsert a user-scoped alias name to an exact value with optional metadata. Existing names overwrite; server validation is authoritative. The value is inserted verbatim later and omitted from the response.',
   [ALIAS_MCP_TOOLS.DELETE]:
-    'Delete one alias by name for the bound owner user. Returns deleted:true on success, or deleted:false with alias_not_found when no such name exists (that is not an error). User-scoped — only the bound owner\'s aliases are affected.',
+    'Delete a user-scoped alias by name. Missing names return deleted:false with alias_not_found, not an error.',
 } as const;
 
 const aliasSchemas: Record<AliasMcpToolName, z.ZodTypeAny> = {
   [ALIAS_MCP_TOOLS.RESOLVE]: z.object({
-    name: z.string().describe('Exact alias name to resolve (NFC, case-sensitive). Returns the current value, or a not-found result for an unknown name.'),
+    name: z.string().describe('Case-sensitive NFC alias name.'),
   }),
   [ALIAS_MCP_TOOLS.LIST]: z.object({
-    query: z.string().optional().describe('Optional literal substring to search over alias name + description (NFC). Omit to list all.'),
+    query: z.string().optional().describe('Literal NFC name/description substring.'),
   }),
   [ALIAS_MCP_TOOLS.SAVE]: z.object({
-    name: z.string().describe('Alias name (NFC, case-sensitive; letters/digits/._- up to 20 code points). Saving an existing name overwrites it.'),
-    value: z.string().describe('Exact value the alias resolves to (non-empty, up to 500 code points, no NUL). Used verbatim when inserted as a ;;(name) marker.'),
-    description: z.string().optional().describe('Optional human-readable description (up to 200 code points).'),
-    tags: z.array(z.string()).optional().describe('Optional tags (up to 10, each up to 30 chars, no control characters).'),
+    name: z.string().describe('NFC letters/digits/._-, ≤20 code points; overwrites existing.'),
+    value: z.string().describe('Exact inserted value; nonempty, ≤500 code points, no NUL.'),
+    description: z.string().optional().describe('Description, ≤200 code points.'),
+    tags: z.array(z.string()).optional().describe('≤10 tags, each ≤30 chars, no controls.'),
   }),
   [ALIAS_MCP_TOOLS.DELETE]: z.object({
-    name: z.string().describe('Exact alias name to delete (NFC, case-sensitive). A missing name returns deleted:false, not an error.'),
+    name: z.string().describe('Case-sensitive NFC alias name.'),
   }),
 };
 
@@ -1341,7 +1867,6 @@ export function registerAliasMcpTools(server: McpServer, caller: McpRuntimeCalle
   const handlers = createAliasMcpToolHandlers(caller, deps);
   for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
     server.registerTool(name, {
-      title: name,
       description: ALIAS_MCP_TOOL_DESCRIPTIONS[name],
       inputSchema: aliasSchemas[name],
     }, async (args: unknown) => toolResult(await handlers[name](args)));

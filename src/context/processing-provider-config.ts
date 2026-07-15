@@ -38,6 +38,24 @@ export async function resolveProcessingProviderSessionConfig(
           ...(presetConfig.model ?? model ? { agentId: presetConfig.model ?? model } : {}),
         };
       }
+      case 'claude-code-sdk': {
+        // Native Claude Code SDK path: the preset's ANTHROPIC_BASE_URL/API_KEY/
+        // pinned ANTHROPIC_MODEL env is applied directly (no OpenAI-compat
+        // settings shim). resolvePresetEnv already pins ANTHROPIC_MODEL.
+        const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+        const env = await resolvePresetEnv(preset);
+        const resolvedModel = env['ANTHROPIC_MODEL']?.trim() || model;
+        return {
+          cacheKey: JSON.stringify({
+            backend: selection.backend,
+            preset,
+            model: resolvedModel ?? null,
+            env,
+          }),
+          ...(Object.keys(env).length > 0 ? { env } : {}),
+          ...(resolvedModel ? { agentId: resolvedModel } : {}),
+        };
+      }
     }
   }
 

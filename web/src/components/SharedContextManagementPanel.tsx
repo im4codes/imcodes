@@ -1388,6 +1388,7 @@ function getMemoryRecordClassLabel(
 const MCP_PROVIDER_LABEL_KEY: Record<MemoryMcpProviderId, string> = {
   'claude-code-sdk': 'sharedContext.management.mcpProviderClaudeSdk',
   'gemini-sdk': 'sharedContext.management.mcpProviderGeminiAcp',
+  'grok-sdk': 'sharedContext.management.mcpProviderGrokAcp',
   'kimi-sdk': 'sharedContext.management.mcpProviderKimiAcp',
   'copilot-sdk': 'sharedContext.management.mcpProviderCopilotSdk',
   'codex-sdk': 'sharedContext.management.mcpProviderCodexSdk',

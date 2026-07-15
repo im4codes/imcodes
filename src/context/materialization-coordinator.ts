@@ -296,9 +296,14 @@ export class MaterializationCoordinator {
     const job = await client.run<ContextJobRecord>(
       'enqueueContextJob', [target, jobType, trigger, now],
     );
-    await client.run<void>(
-      'updateContextJob', [job.id, 'running', { attemptIncrement: true, now }],
-    );
+    const claimed = await client.run<boolean>('claimContextJob', [job.id, now]);
+    if (!claimed) {
+      // Another overlapping poll pass already owns this exact job. Returning
+      // before the staged-event read is essential: compressor inputs capture
+      // their event array when queued, so queue serialization alone cannot
+      // prevent the same batch from being processed repeatedly.
+      return { replicationQueued: false };
+    }
     // Heavy reads run in the worker when warm (staged events can be large), off
     // the daemon main thread; in-process fallback when not ready.
     const allEvents = await client.run<LocalContextEvent[]>(

@@ -601,6 +601,33 @@ describe('QuickInputPanel history scope', () => {
     expect(commandPills).toContain('/compact');
     expect(commandPills).not.toContain('/thinking');
   });
+
+  it('uses capability-safe Grok commands without exposing unsupported thinking controls', () => {
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="grok-sdk"
+        sessionName="session-grok"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const commands = Array.from(document.querySelectorAll('.qp-section-header + .qp-pills .qp-pill-default')).map((el) => el.textContent?.trim());
+    expect(commands).toEqual(expect.arrayContaining(['/compact', '/clear', '/model']));
+    expect(commands).not.toContain('/thinking');
+  });
 });
 
 describe('useQuickData persistence guard', () => {

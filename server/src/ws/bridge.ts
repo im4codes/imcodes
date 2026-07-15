@@ -20,10 +20,27 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { resolvePendingExec, resolvePendingExecChunk, abandonPriorGenerations } from './machine-exec-registry.js';
+import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
+import {
+  NODE_ROLE,
+  REMOTE_EXEC_MAX_ERROR_BYTES,
+  REMOTE_EXEC_MAX_OUTPUT_BYTES,
+  validateMachineExecChunkFrame,
+  validateMachineExecResultFrame,
+  type NodeRole,
+} from '../../../shared/remote-exec.js';
+import { validateComputerUseResultFrame } from '../../../shared/computer-use.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
-import { FILE_TRANSFER_MSG } from '../../../shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_MSG,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+  FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  validateControlledFileTransferResponse,
+} from '../../../shared/transport/file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
@@ -259,6 +276,19 @@ function buildSubsessionQueueRelay(msg: Record<string, unknown>): Partial<{
   return relay;
 }
 const MAX_BROWSER_PAYLOAD = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
+/**
+ * Conservative upper bound for the result envelope on the JSON wire. A single
+ * UTF-8 control byte can expand to a six-byte `\u00XX` escape, so transport
+ * headroom must be based on escaped JSON rather than only decoded field bytes.
+ */
+export const MACHINE_EXEC_RESULT_MAX_WIRE_BYTES =
+  (REMOTE_EXEC_MAX_OUTPUT_BYTES * 2 + REMOTE_EXEC_MAX_ERROR_BYTES) * 6 + 64 * 1024;
+/**
+ * Global inbound WS ceiling. 16 MiB remains above the existing ~10 MiB
+ * fs.write envelope and worst-case escaped exec-result envelope, while removing
+ * ws's much wider 100 MiB default pre-parse allocation surface.
+ */
+export const SERVER_WS_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024;
 const MAX_PENDING_MEMORY_MANAGEMENT_REQUESTS_PER_SOCKET = 32;
 // Desktop with pinned panels + many sessions can fire 60+ subscribe/repo/repo
 // detect / fs.git_status / chat.subscribe / ping messages on initial connect.
@@ -1056,6 +1086,19 @@ export class WsBridge {
   private static instances = new Map<string, WsBridge>();
 
   private daemonWs: WebSocket | null = null;
+  /** Bumped on every new daemon connection; binds pending MACHINE_EXEC results to a generation. */
+  private daemonGeneration = 0;
+
+  /** Count of inbound frames dropped from CONTROLLED nodes by the 10.2 allowlist (diagnostics/tests). */
+  static controlledInboundDropped = 0;
+  /** Count of malformed/oversized MACHINE_EXEC_RESULT frames rejected before pending-RPC resolution. */
+  static invalidMachineExecResultsDropped = 0;
+  /** Count of malformed/oversized MACHINE_EXEC_CHUNK frames rejected before pending-RPC delivery. */
+  static invalidMachineExecChunksDropped = 0;
+  /** Count of malformed/oversized COMPUTER_USE_RESULT frames rejected before pending-RPC resolution. */
+  static invalidComputerUseResultsDropped = 0;
+  /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
+  private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
   private daemonVersion: string | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
@@ -1109,6 +1152,8 @@ export class WsBridge {
   private providerStatus = new Map<string, boolean>();
   /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
   private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
+  /** Auth-advertised file-transfer capabilities for a CONTROLLED node socket. */
+  private controlledFileTransferCapabilities = new Set<string>();
   /** Latest sanitized OpenSpec Auto Deliver projections; protocol routing waits for shared message constants. */
   private openspecAutoDeliverProjectionCache = new OpenSpecAutoDeliverProjectionCache();
   private pendingOpenSpecAutoDeliverRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout>; requestId: string; sessionName?: string; messageType: string }>();
@@ -2336,7 +2381,14 @@ export class WsBridge {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
+    // New connection generation: abandon any pending exec bound to a prior
+    // generation (they resolve as indeterminate) so a reconnect never delivers a
+    // stale result to a new waiter (10.6).
+    this.daemonGeneration++;
+    abandonPriorGenerations(this.serverId, this.daemonGeneration);
+    abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
+    this.controlledFileTransferCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
     // for a different `ws`) auth.
@@ -2353,6 +2405,13 @@ export class WsBridge {
     ws.on('message', async (data, isBinary) => {
       // Handle binary raw PTY frames
       if (isBinary) {
+        // Binary PTY data is a FULL-daemon capability. Never route unauthenticated
+        // bytes, and never let a CONTROLLED credential bypass the text-frame
+        // allowlist by switching WebSocket opcode.
+        if (!this.authenticated || this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          if (this.authenticated) WsBridge.controlledInboundDropped++;
+          return;
+        }
         this.routeBinaryFrame(data as Buffer);
         return;
       }
@@ -2396,10 +2455,10 @@ export class WsBridge {
         this.authPromise = new Promise<void>((res) => { resolveAuth = res; });
 
         const tokenHash = sha256Hex(msg.token);
-        let server: { token_hash: string; user_id?: string } | null = null;
+        let server: { token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null } | null = null;
         try {
-          server = await db.queryOne<{ token_hash: string; user_id?: string }>(
-            'SELECT token_hash, user_id FROM servers WHERE id = $1',
+          server = await db.queryOne<{ token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null }>(
+            'SELECT token_hash, user_id, node_role, revoked_at FROM servers WHERE id = $1',
             [this.serverId],
           );
         } catch (err) {
@@ -2416,6 +2475,28 @@ export class WsBridge {
           return;
         }
 
+        // A revoked credential is denied at the WS entry point too (10.3).
+        if (server.revoked_at != null) {
+          logger.warn({ serverId: this.serverId }, 'Daemon auth rejected: revoked');
+          ws.close(4003, 'revoked');
+          resolveAuth();
+          this.authPromise = null;
+          return;
+        }
+
+        // node_role is authoritative from the DB; any client-declared `nodeRole`
+        // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
+        // presence/heartbeat + MACHINE_EXEC_RESULT surface.
+        this.daemonNodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+        this.controlledFileTransferCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+          ? new Set(
+              (Array.isArray(msg.capabilities) ? msg.capabilities : [])
+                .filter((capability): capability is string =>
+                  capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
+                  || capability === FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY
+                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY),
+            )
+          : new Set();
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
@@ -2428,7 +2509,9 @@ export class WsBridge {
         updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
-        if (typeof server.user_id === 'string' && server.user_id.trim()) {
+        // Full-daemon-only traffic (memory feature config) is NOT pushed to a
+        // controlled node — it is a restricted presence/exec-result surface (10.2).
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && typeof server.user_id === 'string' && server.user_id.trim()) {
           try {
             this.sendMemoryFeatureConfigApply(await this.readUserMemoryFeatureFlags(server.user_id));
           } catch (err) {
@@ -2497,6 +2580,10 @@ export class WsBridge {
           try {
             const parsed = JSON.parse(queued) as { type?: string };
             if (parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe') continue;
+            // MACHINE_EXEC is never replayed — a one-shot SYSTEM command must not
+            // execute on a fresh generation after the relay gave up (10.6).
+            if (parsed.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC) continue;
+            if (parsed.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) continue;
             if (parsed.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
               this.requestDaemonUpgrade({
                 targetVersion: (parsed as { targetVersion?: unknown }).targetVersion,
@@ -2545,8 +2632,82 @@ export class WsBridge {
         return;
       }
 
+      // 10.2 — a CONTROLLED node's WS is a strict allowlist surface: it may ONLY
+      // deliver exec results and heartbeats. Every other inbound frame is dropped
+      // here BEFORE it can reach `relayToBrowsers` or the push dispatch below, so a
+      // compromised controlled node cannot inject browser timeline messages or
+      // trigger APNs/FCM. Client-declared role is irrelevant — `daemonNodeRole` is
+      // DB-authoritative (set during auth).
+      if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {
+          if (!this.resolveValidatedMachineExecChunk(msg)) {
+            WsBridge.controlledInboundDropped++;
+          }
+          return;
+        }
+        if (msg.type === DAEMON_MSG.MACHINE_EXEC_RESULT) {
+          if (!this.resolveValidatedMachineExecResult(msg)) {
+            WsBridge.controlledInboundDropped++;
+          }
+          return;
+        }
+        if (msg.type === DAEMON_MSG.COMPUTER_USE_RESULT) {
+          if (!this.resolveValidatedComputerUseResult(msg)) {
+            WsBridge.controlledInboundDropped++;
+          }
+          return;
+        }
+        const fileTransfer = validateControlledFileTransferResponse(msg);
+        if (fileTransfer.ok) {
+          const value = fileTransfer.value as unknown as Record<string, unknown>;
+          const requestId = typeof value.uploadId === 'string'
+            ? value.uploadId
+            : typeof value.downloadId === 'string'
+              ? value.downloadId
+              : typeof value.requestId === 'string'
+                ? value.requestId
+                : null;
+          const resolved = requestId
+            ? value.type === FILE_TRANSFER_MSG.UPLOAD_PROGRESS
+              ? this.notifyFileTransferProgress(requestId, value)
+              : this.resolveFileTransfer(requestId, value)
+            : false;
+          if (!resolved) WsBridge.controlledInboundDropped++;
+          return;
+        }
+        if (msg.type === 'heartbeat') {
+          const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
+          if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
+          updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
+            logger.error({ err }, 'Failed to update heartbeat'),
+          );
+          try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+          return;
+        }
+        WsBridge.controlledInboundDropped++;
+        return;
+      }
+
       if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
         this.handleDaemonP2pWorkflowHello(msg);
+        return;
+      }
+
+      // A controlled node's exec result — deliver to the pending relay request,
+      // bound to this connection's (serverId, generation). Unmatched/forged
+      // correlationIds are dropped by the registry (10.6). FULL daemons can
+      // still return this compatibility frame, but cross the exact same schema
+      // trust boundary before registry resolution.
+      if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {
+        this.resolveValidatedMachineExecChunk(msg);
+        return;
+      }
+      if (msg.type === DAEMON_MSG.MACHINE_EXEC_RESULT) {
+        this.resolveValidatedMachineExecResult(msg);
+        return;
+      }
+      if (msg.type === DAEMON_MSG.COMPUTER_USE_RESULT) {
+        this.resolveValidatedComputerUseResult(msg);
         return;
       }
 
@@ -2632,6 +2793,7 @@ export class WsBridge {
         }
         this.providerStatus.clear();
         this.daemonP2pWorkflowCapabilities = null;
+        this.controlledFileTransferCapabilities.clear();
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
@@ -5639,6 +5801,7 @@ export class WsBridge {
 
     const result = this.daemonUpgradeCoordinator.retryAutoAfterBlocked({
       retryDelayMs,
+      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
       send: (message) => this.sendDirectToDaemon(message),
@@ -5679,6 +5842,7 @@ export class WsBridge {
     return this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
       source: input.source ?? 'manual',
+      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: input.isStillCurrent,
       send: (message) => this.sendDirectToDaemon(message),
@@ -5687,6 +5851,7 @@ export class WsBridge {
 
   private flushPendingDaemonUpgrade(ws: WebSocket): void {
     const result = this.daemonUpgradeCoordinator.flushPending({
+      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: () => this.daemonWs === ws && this.authenticated,
       send: (message) => this.sendDirectToDaemon(message),
@@ -5727,16 +5892,67 @@ export class WsBridge {
       this.authenticated = false;
       this.authPromise = null;
       this.daemonP2pWorkflowCapabilities = null;
+      this.controlledFileTransferCapabilities.clear();
+    }
+  }
+
+  /**
+   * Non-queueing, generation-bound send for `MACHINE_EXEC` (10.6). A one-shot
+   * SYSTEM/root command MUST NEVER be buffered and replayed on a later connection
+   * (that would execute it after the relay already reported an indeterminate
+   * outcome). It is written to the socket ONLY when the connection is live and its
+   * generation still matches the one the pending-RPC was bound to; otherwise it is
+   * dropped and the caller reports `not_dispatched`.
+   */
+  trySendMachineExec(frameJson: string, expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    try {
+      this.daemonWs.send(frameJson);
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to send MACHINE_EXEC');
+      return 'send_failed';
+    }
+  }
+
+  /** Non-queueing, generation-bound send for typed Computer Use calls. */
+  trySendComputerUse(frameJson: string, expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    try {
+      this.daemonWs.send(frameJson);
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to send COMPUTER_USE');
+      return 'send_failed';
     }
   }
 
   sendToDaemon(message: string): void {
     const parsed = this.parseJsonObject(message);
-    if (parsed?.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
+    const parsedType = parsed?.type;
+    if (parsedType === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
       this.requestDaemonUpgrade({
-        targetVersion: parsed.targetVersion,
+        targetVersion: parsed?.targetVersion,
         source: 'manual',
       });
+      return;
+    }
+    // MACHINE_EXEC / COMPUTER_USE are dispatched ONLY via generation-bound,
+    // non-queueing methods. They must NEVER traverse this generic path (which queues
+    // when offline → late replay on a new generation, and is not generation-bound
+    // even when connected). Drop it UNCONDITIONALLY so no caller can bypass
+    // `trySendMachineExec`, whether the daemon is connected or not.
+    if (
+      parsedType === DAEMON_COMMAND_TYPES.MACHINE_EXEC
+      || parsedType === DAEMON_COMMAND_TYPES.COMPUTER_USE
+      || parsedType === FILE_TRANSFER_MSG.UPLOAD_FETCH
+      || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
+      || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
+      || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
+    ) {
+      logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
     }
     if (this.daemonWs && this.authenticated) {
@@ -5761,6 +5977,39 @@ export class WsBridge {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Validate an untrusted daemon exec-result envelope before it can touch the
+   * generation-bound pending registry. This keeps malformed, oversized and
+   * identity-injecting frames out of the HTTP/audit completion path.
+   */
+  private resolveValidatedMachineExecResult(message: Record<string, unknown>): boolean {
+    const validated = validateMachineExecResultFrame(message);
+    if (!validated.ok) {
+      WsBridge.invalidMachineExecResultsDropped++;
+      return false;
+    }
+    return resolvePendingExec(this.serverId, this.daemonGeneration, validated.value);
+  }
+
+  /** Validate and generation-bind one live stdout/stderr fragment. */
+  private resolveValidatedMachineExecChunk(message: Record<string, unknown>): boolean {
+    const validated = validateMachineExecChunkFrame(message);
+    if (!validated.ok) {
+      WsBridge.invalidMachineExecChunksDropped++;
+      return false;
+    }
+    return resolvePendingExecChunk(this.serverId, this.daemonGeneration, validated.value);
+  }
+
+  private resolveValidatedComputerUseResult(message: Record<string, unknown>): boolean {
+    const validated = validateComputerUseResultFrame(message);
+    if (!validated.ok) {
+      WsBridge.invalidComputerUseResultsDropped++;
+      return false;
+    }
+    return resolvePendingComputerUse(this.serverId, this.daemonGeneration, validated.value);
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {
@@ -6012,6 +6261,11 @@ export class WsBridge {
     this.sendToDaemon(JSON.stringify(message));
   }
 
+  /** Current daemon connection generation (binds pending MACHINE_EXEC results). */
+  daemonConnectionGeneration(): number {
+    return this.daemonGeneration;
+  }
+
   sendPreviewRequestBodyChunk(requestId: string, payload: Uint8Array): void {
     if (!this.daemonWs || !this.authenticated) throw new Error(PREVIEW_ERROR.DAEMON_OFFLINE);
     this.daemonWs.send(packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.REQUEST_BODY, requestId, payload));
@@ -6034,7 +6288,9 @@ export class WsBridge {
     timeoutMs: number,
     onProgress?: (msg: Record<string, unknown>) => void,
   ): Promise<Record<string, unknown>> {
-    if (!this.isDaemonConnected()) {
+    const socket = this.daemonWs;
+    const generation = this.daemonGeneration;
+    if (!socket || !this.authenticated || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('daemon_offline'));
     }
     return new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -6046,7 +6302,15 @@ export class WsBridge {
       this.pendingFileTransfers.set(requestId, { resolve, reject, timer, onProgress });
 
       try {
-        this.daemonWs!.send(JSON.stringify(message));
+        if (
+          this.daemonWs !== socket
+          || this.daemonGeneration !== generation
+          || !this.authenticated
+          || socket.readyState !== WebSocket.OPEN
+        ) {
+          throw new Error('daemon_generation_changed');
+        }
+        socket.send(JSON.stringify(message));
       } catch (err) {
         this.pendingFileTransfers.delete(requestId);
         clearTimeout(timer);
@@ -7050,6 +7314,9 @@ export class WsBridge {
     // P2P workflow launch freshness continues to use
     // getDaemonP2pWorkflowCapabilities(now).
     if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      return this.controlledFileTransferCapabilities.has(capability);
+    }
     return this.daemonP2pWorkflowCapabilities?.capabilities.includes(capability) ?? false;
   }
 

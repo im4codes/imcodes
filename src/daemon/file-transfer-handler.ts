@@ -3,7 +3,7 @@
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
 import { createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { mkdir, writeFile, readFile, readdir, stat, unlink, realpath as fsRealpath } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, readdir, stat, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -13,6 +13,7 @@ import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_MSG,
+  FILE_PATH_HANDLE_ERROR,
   type AttachmentRef,
   type FileUploadRequest,
   type FileUploadFetchRequest,
@@ -24,12 +25,18 @@ import {
   type FileDownloadDone,
   type FileDownloadStreamReady,
   type FileDownloadError,
+  validateFilePathHandleRequest,
+  type FilePathHandleErrorReason,
 } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import type { ServerLink } from './server-link.js';
 import { validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
+
+/** Minimal reusable sender boundary implemented by both ServerLink and the thin node runtime. */
+export interface FileTransferSender {
+  send(message: unknown): unknown;
+}
 
 /** Upload directory — ~/.imcodes/uploads (persists across reboots, unlike /tmp). */
 const UPLOAD_DIR = path.join(homedir(), '.imcodes', 'uploads');
@@ -55,6 +62,9 @@ interface AttachmentEntry {
   size?: number;
   createdAt: number;
   expiresAt: number;
+  /** Local-handle identity prevents path replacement between mint and read. */
+  device?: number;
+  inode?: number;
 }
 
 interface DownloadTarget {
@@ -98,7 +108,7 @@ function sanitizeLocalDownloadError(err: unknown): LocalDownloadErrorMessage {
 }
 
 function sendDownloadError(
-  serverLink: ServerLink,
+  serverLink: FileTransferSender,
   downloadId: string,
   attachmentId: string,
   entry: AttachmentEntry | undefined,
@@ -118,7 +128,7 @@ function sendDownloadError(
 
 async function resolveDownloadTarget(
   attachmentId: string,
-  serverLink: ServerLink,
+  serverLink: FileTransferSender,
   downloadId: string,
 ): Promise<DownloadTarget | null> {
   const entry = attachmentRegistry.get(attachmentId);
@@ -157,9 +167,19 @@ async function resolveDownloadTarget(
     return null;
   }
 
-  const readPath = entry.source === 'local'
-    ? await validateProjectFilePath(entry.daemonPath)
-    : resolved;
+  if (entry.source === 'local') {
+    const current = await lstat(entry.daemonPath);
+    if (current.isSymbolicLink() || !current.isFile()) throw new Error('download_failed');
+    if ((entry.device !== undefined && current.dev !== entry.device)
+      || (entry.inode !== undefined && current.ino !== entry.inode)
+      // Overlay/container filesystems can immediately reuse an inode when a
+      // path is unlinked and recreated. Preserve the minted size as an
+      // additional identity component so that replacement still fails closed.
+      || (entry.size !== undefined && current.size !== entry.size)) {
+      throw new Error('download_failed');
+    }
+  }
+  const readPath = entry.source === 'local' ? await validateProjectFilePath(entry.daemonPath) : resolved;
   const fileStat = await stat(readPath);
   if (!fileStat.isFile()) throw new Error('download_failed');
 
@@ -188,7 +208,7 @@ async function finalizeUploadedFile(params: {
   mime?: string;
   resolved: string;
   size: number;
-  serverLink: ServerLink;
+  serverLink: FileTransferSender;
 }): Promise<void> {
   const { uploadId, filename, originalName, mime, resolved, size, serverLink } = params;
 
@@ -230,7 +250,7 @@ async function finalizeUploadedFile(params: {
   logger.info({ uploadId, filename, size }, 'File upload complete');
 }
 
-function sendUploadError(serverLink: ServerLink, uploadId: string, filename: string | undefined, err: unknown): void {
+function sendUploadError(serverLink: FileTransferSender, uploadId: string, filename: string | undefined, err: unknown): void {
   const errMsg = err instanceof Error ? err.message : String(err);
   logger.error({ uploadId, filename, err }, 'File upload failed');
   const response: FileUploadError = {
@@ -241,7 +261,7 @@ function sendUploadError(serverLink: ServerLink, uploadId: string, filename: str
   serverLink.send(response);
 }
 
-function sendUploadProgress(serverLink: ServerLink, uploadId: string, loaded: number, total: number): void {
+function sendUploadProgress(serverLink: FileTransferSender, uploadId: string, loaded: number, total: number): void {
   const response: FileUploadProgress = {
     type: 'file.upload_progress',
     uploadId,
@@ -260,7 +280,9 @@ async function fetchRelayUpload(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await fetch(downloadUrl);
+      const response = await fetch(downloadUrl, {
+        signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
+      });
       if (!response.ok) {
         throw new Error(`relay_fetch_${response.status}`);
       }
@@ -367,7 +389,7 @@ async function recoverRegistry(): Promise<void> {
 
 // ── Upload ──────────────────────────────────────────────────────────────────
 
-export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadRequest;
   const { uploadId, filename, originalName, mime, content } = msg;
 
@@ -402,7 +424,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
   }
 }
 
-export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadFetchRequest;
   const { uploadId, filename, originalName, mime, downloadUrl } = msg;
 
@@ -444,7 +466,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
  * inline round-trip is far faster than the relay's PUT + readiness handshake
  * (repo rule: never copy code).
  */
-async function sendInlineDownload(serverLink: ServerLink, downloadId: string, target: DownloadTarget): Promise<void> {
+async function sendInlineDownload(serverLink: FileTransferSender, downloadId: string, target: DownloadTarget): Promise<void> {
   const buffer = await readFile(target.readPath);
   const response: FileDownloadDone = {
     type: 'file.download_done',
@@ -457,7 +479,7 @@ async function sendInlineDownload(serverLink: ServerLink, downloadId: string, ta
   serverLink.send(response);
 }
 
-export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileDownload(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileDownloadRequest;
   const { downloadId, attachmentId } = msg;
   let target: DownloadTarget | null = null;
@@ -471,7 +493,7 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
   }
 }
 
-export async function handleFileDownloadStream(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+export async function handleFileDownloadStream(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileDownloadStreamRequest;
   const { downloadId, attachmentId, uploadUrl } = msg;
   let target: DownloadTarget | null = null;
@@ -512,6 +534,7 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       headers,
       body: createReadStream(target.readPath) as never,
       duplex: 'half',
+      signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
     } as RequestInit & { duplex: 'half' });
     if (!response.ok) {
       throw new Error(`relay_upload_${response.status}`);
@@ -543,14 +566,15 @@ export function lookupAttachmentById(id: string): AttachmentEntry | undefined {
 
 /**
  * Register a controlled, short-lived path handle for an already validated
- * project file. The handle points at the current path and is not an immutable
- * content snapshot.
+ * project file. The handle binds the path's filesystem identity; replacement or
+ * symbolic-link substitution invalidates it before any bytes are read.
  */
 export function createProjectFileHandleFromValidatedPath(
   validatedRealPath: ValidatedRealPath,
   originalName: string,
   mime?: string,
   size?: number,
+  identity?: { device: number; inode: number },
 ): AttachmentRef {
   const daemonPath = String(validatedRealPath);
   const validated = validateCanonicalRealPath(daemonPath);
@@ -568,6 +592,7 @@ export function createProjectFileHandleFromValidatedPath(
     size,
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS,
+    ...(identity ? { device: identity.device, inode: identity.inode } : {}),
   });
 
   return {
@@ -621,6 +646,53 @@ export async function tryCreateProjectFileHandle(
   } catch {
     logger.debug({ event: 'try_create_project_file_handle_skipped' }, 'Skipped unsafe local project file download handle');
     return null;
+  }
+}
+
+function stablePathHandleError(err: unknown): FilePathHandleErrorReason {
+  const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined;
+  if (code === 'ENOENT' || code === 'ENOTDIR') return FILE_PATH_HANDLE_ERROR.NOT_FOUND;
+  const message = err instanceof Error ? err.message : '';
+  if (message === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH) return FILE_PATH_HANDLE_ERROR.FORBIDDEN_PATH;
+  if (message === FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE) return FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE;
+  if (message === 'not_regular_file' || message === 'symbolic_link') return FILE_PATH_HANDLE_ERROR.NOT_REGULAR_FILE;
+  return FILE_PATH_HANDLE_ERROR.HANDLE_FAILED;
+}
+
+/** Controlled-node explicit-path registration; bytes still use the existing download path. */
+export async function handleFilePathHandle(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const parsed = validateFilePathHandleRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) sender.send({ type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR, requestId, error: FILE_PATH_HANDLE_ERROR.INVALID_PATH });
+    return;
+  }
+  try {
+    const requested = path.resolve(parsed.value.path);
+    const requestedStat = await lstat(requested);
+    if (requestedStat.isSymbolicLink()) throw new Error('symbolic_link');
+    if (!requestedStat.isFile()) throw new Error('not_regular_file');
+    if (requestedStat.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
+    }
+    const validated = await validateProjectFilePath(requested).catch((err) => {
+      if (isNotFoundError(err)) throw err;
+      throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
+    });
+    const attachment = createProjectFileHandleFromValidatedPath(
+      validated,
+      path.basename(requested),
+      undefined,
+      requestedStat.size,
+      { device: requestedStat.dev, inode: requestedStat.ino },
+    );
+    sender.send({ type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE, requestId: parsed.value.requestId, attachment });
+  } catch (err) {
+    sender.send({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR,
+      requestId: parsed.value.requestId,
+      error: stablePathHandleError(err),
+    });
   }
 }
 

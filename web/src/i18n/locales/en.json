@@ -34,6 +34,23 @@
       "generic": "Something went wrong. Please try again."
     }
   },
+  "machine": {
+    "feature_label": "Machine",
+    "category": "Machine",
+    "category_desc": "Insert a machine target marker",
+    "empty": "No machines available",
+    "empty_hint": "Enroll a controlled node to send it commands with a ^^(name) marker.",
+    "usage_hint": "Tap a machine to insert its ^^(name) marker. Type ^ in the composer to autocomplete. Offline machines can't be selected.",
+    "no_results": "No machines match your search",
+    "search_placeholder": "Search machines",
+    "online": "Online",
+    "offline": "Offline",
+    "offline_hint": "Offline — cannot be selected",
+    "error": {
+      "list_unavailable": "Machines are still loading or failed to load. Please try again in a moment.",
+      "machine_unresolved_failclosed": "This machine could not be resolved and was not sent."
+    }
+  },
   "common": {
     "cancel": "Cancel",
     "confirm": "Confirm",
@@ -610,6 +627,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -787,6 +805,7 @@
     "loading": "Loading…",
     "tab_quick": "Quick",
     "tab_files": "Files",
+    "tab_machines": "Nodes",
     "confirm_delete": "Delete this item?"
   },
   "file_browser": {
@@ -828,8 +847,13 @@
     "upgrade_blocked_title": "Upgrade blocked",
     "upgrade_blocked_p2p_active": "Team is still running. Stop it before upgrading the daemon.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver is still running. Stop it before upgrading the daemon.",
+    "upgrade_blocked_master_compaction_active": "Memory master-summary compaction is still running. The daemon will upgrade after it finishes.",
+    "upgrade_blocked_compression_active": "Memory compression is still running. The daemon will upgrade after it finishes.",
     "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon.",
-    "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then."
+    "upgrade_blocked_session_busy": "A session still has active work. Wait until it goes idle before upgrading the daemon.",
+    "upgrade_blocked_cooldown_active": "The daemon was upgraded recently. Automatic upgrade will retry after the cooldown.",
+    "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then.",
+    "upgrade_blocked_unknown": "The daemon is temporarily busy. Automatic upgrade will retry."
   },
   "discussion": {
     "role_critic": "Critic",
@@ -862,6 +886,7 @@
     "dir_required": "Working directory is required",
     "not_connected": "Not connected to daemon",
     "daemon_offline": "Daemon is offline — check that imcodes daemon is running",
+    "grok_prerequisite_error": "Grok Build is unavailable: {{error}}",
     "start": "Start",
     "starting": "Starting...",
     "timeout": "Timed out waiting for session to start. Check daemon logs.",
@@ -876,10 +901,10 @@
     "agent_type": "Agent type",
     "agent_flavor_cli": "CLI: native interface for users who prefer the original UI. Chat mode does not support streaming.",
     "agent_flavor_sdk": "SDK: supports streaming and uses a simpler UI.",
-    "qwen_provider_hint": "Need third-party Coding Plan support? Choose Qwen Code.",
-    "qwen_provider_selected_hint": "Qwen Code can use Anthropic-compatible third-party Coding Plan providers through the API Provider presets below.",
+    "qwen_provider_hint": "Need third-party Coding Plan support? Choose Claude Code SDK.",
+    "qwen_provider_selected_hint": "The selected SDK can use Anthropic-compatible third-party Coding Plan providers through the API Provider presets below.",
     "custom_provider_sdk": "Custom provider SDK",
-    "custom_provider_sdk_help": "Use the Qwen SDK transport as the compatibility layer, then choose an API Provider preset below.",
+    "custom_provider_sdk_help": "Use the Claude Code SDK transport as the compatibility layer, then choose an API Provider preset below.",
     "custom_provider_preset": "Custom provider preset",
     "custom_provider_preset_required": "Choose or add an API Provider preset for the custom provider SDK.",
     "compatible_api_via_qwen": "Compatible API (via Qwen)",
@@ -2314,6 +2339,7 @@
       "mcpProviderStatusHint": "MCP-specific status is reported separately from provider connectivity.",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
@@ -2643,5 +2669,44 @@
     "weekOf": "Week of {{date}}",
     "members": "By session",
     "rangeAll": "All time"
+  },
+  "controlled_nodes": {
+    "title": "Controlled Nodes",
+    "short": "Nodes",
+    "add_title": "Add a machine",
+    "os_win": "Download for Windows",
+    "os_mac": "Download for macOS",
+    "os_linux": "Download for Linux",
+    "download_target": "{{os}} ({{arch}})",
+    "no_executables": "No installer downloads are listed for this server.",
+    "availability_error": "Could not load installer availability. Check your connection and try again.",
+    "loading_availability": "Loading available installers…",
+    "loading_download": "Starting download…",
+    "download_error": "Download failed. Please try again.",
+    "download_popup_blocked": "Your browser blocked the download window. Allow pop-ups for this site and try again.",
+    "mint_executable_not_built": "This installer is not available on the server yet.",
+    "mint_canonical_server_url_required": "The server URL is not configured for controlled-node downloads. Ask your administrator to set a canonical public URL.",
+    "ticket_expired": "This download link has expired. Start a new download.",
+    "ticket_expires_at": "Link valid until {{time}}",
+    "artifact_meta": "{{detail}}",
+    "usage_title": "How to use",
+    "usage_step1": "Download the executable for the target machine's OS.",
+    "usage_step2": "Run it once on that machine with the required privileges (see OS notes below).",
+    "usage_step3": "It auto-enrolls, installs boot autostart, and appears below when online.",
+    "usage_win_run": "Run as Administrator. If SmartScreen appears, choose More info → Run anyway.",
+    "usage_mac_run": "On first launch, bypass Gatekeeper: right-click the app → Open, or run: xattr -cr <path> then open normally.",
+    "usage_linux_run": "Make it executable (chmod +x <file>) and run once as root (sudo).",
+    "machines_title": "Your machines",
+    "refresh": "Refresh",
+    "error_generic": "Something went wrong. Please try again.",
+    "empty": "No controlled nodes yet.",
+    "online": "Online",
+    "offline": "Offline",
+    "exec_on": "Exec enabled",
+    "exec_off": "Exec disabled",
+    "rename_label": "Controlled node name",
+    "rename_invalid": "Enter a name from 1 to 120 characters without control characters.",
+    "revoke": "Revoke",
+    "revoke_confirm": "Revoke this machine? It can no longer be controlled and must be re-enrolled."
   }
 }

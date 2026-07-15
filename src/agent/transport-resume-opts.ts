@@ -2,6 +2,14 @@ import type { LaunchOpts } from './session-manager.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
 
+/** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
+export function usesProviderResumeId(agentType: string | undefined): boolean {
+  return agentType === 'cursor-headless'
+    || agentType === 'copilot-sdk'
+    || agentType === 'kimi-sdk'
+    || agentType === 'grok-sdk';
+}
+
 /**
  * Build the LaunchOpts that RESUME a transport session's existing conversation
  * from its persisted record — threading the provider resume ids back so the
@@ -30,7 +38,7 @@ export function buildTransportResumeLaunchOpts(record: SessionRecord): LaunchOpt
     // Thread resume ids back so the provider reuses the same conversation.
     ...(record.agentType === 'claude-code-sdk' && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
     ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
-    ...((record.agentType === 'cursor-headless' || record.agentType === 'copilot-sdk' || record.agentType === 'kimi-sdk') && record.providerResumeId
+    ...(usesProviderResumeId(record.agentType) && record.providerResumeId
       ? { providerResumeId: record.providerResumeId } : {}),
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.agentType === 'qwen' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),

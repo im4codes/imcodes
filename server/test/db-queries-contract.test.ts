@@ -12,6 +12,26 @@ function makeDb() {
 }
 
 describe('db queries contracts', () => {
+  it('keeps controlled nodes out of full server listings while preserving legacy rows', async () => {
+    const db = makeDb();
+    db.query
+      .mockResolvedValueOnce([
+        { id: 'full-owned', node_role: 'full' },
+        { id: 'controlled-owned', node_role: 'controlled' },
+        { id: 'legacy-owned', node_role: null },
+      ])
+      .mockResolvedValueOnce([
+        { id: 'controlled-team', node_role: 'controlled' },
+        { id: 'legacy-team' },
+      ]);
+
+    await expect(queries.getFullServersByUserId(db, 'user-1')).resolves.toEqual([
+      { id: 'full-owned', node_role: 'full' },
+      { id: 'legacy-owned', node_role: null },
+      { id: 'legacy-team' },
+    ]);
+  });
+
   it('bounds and classifies session text tail cache items', () => {
     const many = Array.from({ length: queries.SESSION_TEXT_TAIL_CACHE_LIMIT + 5 }, (_, index) => ({
       eventId: `evt-${index.toString().padStart(3, '0')}`,

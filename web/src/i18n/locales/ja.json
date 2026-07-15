@@ -34,6 +34,23 @@
       "generic": "問題が発生しました。もう一度お試しください。"
     }
   },
+  "machine": {
+    "feature_label": "マシン",
+    "category": "マシン",
+    "category_desc": "対象マシンのマーカーを挿入",
+    "empty": "利用可能なマシンがありません",
+    "empty_hint": "制御対象ノードを登録すると、^^(名前) マーカーでコマンドを送信できます。",
+    "usage_hint": "マシンをタップすると ^^(名前) マーカーが挿入されます。入力欄で ^ を入力すると補完されます。オフラインのマシンは選択できません。",
+    "no_results": "検索に一致するマシンがありません",
+    "search_placeholder": "マシンを検索",
+    "online": "オンライン",
+    "offline": "オフライン",
+    "offline_hint": "オフライン — 選択できません",
+    "error": {
+      "list_unavailable": "マシンを読み込み中か、読み込みに失敗しました。しばらくしてからもう一度お試しください。",
+      "machine_unresolved_failclosed": "このマシンを解決できなかったため送信されませんでした。"
+    }
+  },
   "common": {
     "cancel": "キャンセル",
     "confirm": "確認",
@@ -610,6 +627,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -787,6 +805,7 @@
     "loading": "読み込み中…",
     "tab_quick": "クイック",
     "tab_files": "ファイル",
+    "tab_machines": "管理ノード",
     "confirm_delete": "この項目を削除しますか？"
   },
   "file_browser": {
@@ -828,7 +847,13 @@
     "upgrade_blocked_title": "アップグレードはブロックされました",
     "upgrade_blocked_p2p_active": "Team がまだ実行中です。daemon をアップグレードする前に停止してください。",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver がまだ実行中です。daemon をアップグレードする前に停止してください。",
-    "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。"
+    "upgrade_blocked_master_compaction_active": "メモリのマスター要約圧縮が実行中です。完了後に daemon をアップグレードします。",
+    "upgrade_blocked_compression_active": "メモリ圧縮が実行中です。完了後に daemon をアップグレードします。",
+    "upgrade_blocked_transport_busy": "transport session が turn を実行中です。idle になってから daemon をアップグレードしてください。",
+    "upgrade_blocked_session_busy": "セッションに実行中の処理があります。idle になってから daemon をアップグレードしてください。",
+    "upgrade_blocked_cooldown_active": "daemon は最近アップグレードされました。クールダウン後に自動アップグレードを再試行します。",
+    "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。",
+    "upgrade_blocked_unknown": "daemon は一時的にビジーです。自動アップグレードを再試行します。"
   },
   "discussion": {
     "role_critic": "批評家",
@@ -861,6 +886,7 @@
     "dir_required": "作業ディレクトリは必須です",
     "not_connected": "Daemonに接続されていません",
     "daemon_offline": "Daemonがオフラインです — imcodes daemonが実行中か確認してください",
+    "grok_prerequisite_error": "Grok Build は利用できません：{{error}}",
     "start": "開始",
     "starting": "起動中...",
     "timeout": "セッションの起動待ちがタイムアウトしました。Daemonのログを確認してください。",
@@ -875,10 +901,10 @@
     "agent_type": "エージェント種別",
     "agent_flavor_cli": "CLI: 元のUIを好む人向けのネイティブ画面です。チャットモードはストリーミング非対応です。",
     "agent_flavor_sdk": "SDK: ストリーミング対応で、よりシンプルなUIです。",
-    "qwen_provider_hint": "サードパーティの Coding Plan を使うなら、Qwen Code を選択してください。",
-    "qwen_provider_selected_hint": "Qwen Code は、下の API Provider プリセット経由で Anthropic 互換のサードパーティ Coding Plan プロバイダーを利用できます。",
+    "qwen_provider_hint": "サードパーティの Coding Plan を使うなら、Claude Code SDK を選択してください。",
+    "qwen_provider_selected_hint": "選択した SDK は、下の API Provider プリセット経由で Anthropic 互換のサードパーティ Coding Plan プロバイダーを利用できます。",
     "custom_provider_sdk": "カスタムプロバイダー SDK",
-    "custom_provider_sdk_help": "Qwen SDK トランスポートを互換レイヤーとして使い、下で API Provider プリセットを選択します。",
+    "custom_provider_sdk_help": "Claude Code SDK トランスポートを互換レイヤーとして使い、下で API Provider プリセットを選択します。",
     "custom_provider_preset": "カスタムプロバイダープリセット",
     "custom_provider_preset_required": "カスタムプロバイダー SDK には API Provider プリセットを選択または追加してください。",
     "compatible_api_via_qwen": "互換 API（Qwen 経由）",
@@ -2312,6 +2338,7 @@
       "mcpProviderStatusHint": "MCP 固有の状態はプロバイダー接続とは別に報告されます。",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
@@ -2641,5 +2668,44 @@
     "weekOf": "{{date}} の週",
     "members": "セッション別",
     "rangeAll": "全期間"
+  },
+  "controlled_nodes": {
+    "title": "被制御ノード",
+    "short": "ノード",
+    "add_title": "マシンを追加",
+    "os_win": "Windows 版をダウンロード",
+    "os_mac": "macOS 版をダウンロード",
+    "os_linux": "Linux 版をダウンロード",
+    "download_target": "{{os}}（{{arch}}）",
+    "no_executables": "このサーバーにはインストーラーのダウンロードが表示されていません。",
+    "availability_error": "インストーラーの利用可否を読み込めませんでした。接続を確認して再試行してください。",
+    "loading_availability": "利用可能なインストーラーを読み込み中…",
+    "loading_download": "ダウンロードを開始しています…",
+    "download_error": "ダウンロードに失敗しました。もう一度お試しください。",
+    "download_popup_blocked": "ブラウザがダウンロードウィンドウをブロックしました。このサイトのポップアップを許可して再試行してください。",
+    "mint_executable_not_built": "このインストーラーはサーバーでまだ利用できません。",
+    "mint_canonical_server_url_required": "被制御ノードのダウンロード用にサーバー URL が設定されていません。管理者に正規の公開 URL の設定を依頼してください。",
+    "ticket_expired": "このダウンロードリンクの有効期限が切れました。新しいダウンロードを開始してください。",
+    "ticket_expires_at": "リンクの有効期限: {{time}}",
+    "artifact_meta": "{{detail}}",
+    "usage_title": "使い方",
+    "usage_step1": "対象マシンの OS に合わせた実行ファイルをダウンロードします。",
+    "usage_step2": "そのマシンで必要な権限で一度実行します(下記の OS 別の注意を参照)。",
+    "usage_step3": "自動的に登録され、起動時の自動起動が設定され、オンラインになると下に表示されます。",
+    "usage_win_run": "管理者として実行してください。SmartScreen が表示されたら「詳細情報」→「実行」を選択します。",
+    "usage_mac_run": "初回起動時は Gatekeeper を回避: アプリを右クリック→開く、または xattr -cr <パス> を実行してから通常に開きます。",
+    "usage_linux_run": "実行権限を付与(chmod +x <ファイル>)し、root で一度実行します(sudo)。",
+    "machines_title": "あなたのマシン",
+    "refresh": "更新",
+    "error_generic": "問題が発生しました。もう一度お試しください。",
+    "empty": "被制御ノードはまだありません。",
+    "online": "オンライン",
+    "offline": "オフライン",
+    "exec_on": "実行を許可",
+    "exec_off": "実行を禁止",
+    "rename_label": "管理ノード名",
+    "rename_invalid": "制御文字を含まない 1～120 文字の名前を入力してください。",
+    "revoke": "失効",
+    "revoke_confirm": "このマシンを失効しますか?失効すると制御できなくなり、再登録が必要です。"
   }
 }

@@ -17,12 +17,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'gemini-sdk' | 'kimi-sdk';
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk';
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk';
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk';
 }
 
 /** Fetch and cache the list of available models for a transport agent type.
@@ -37,6 +37,7 @@ export function useTransportModels(
 ): TransportModelState & { refresh: () => void } {
   const [state, setState] = useState<TransportModelState>({ models: [], loading: false });
   const pendingRequestId = useRef<string | null>(null);
+  const catalogAgentType = useRef<string | undefined | null>(agentType);
   const wsConnected = !!ws?.connected;
 
   const fetchModels = useCallback(
@@ -47,7 +48,14 @@ export function useTransportModels(
       }
       const requestId = `models-${Math.random().toString(36).slice(2)}-${Date.now()}`;
       pendingRequestId.current = requestId;
-      setState((prev) => ({ ...prev, loading: true, error: undefined }));
+      // Clear only when the picker actually changes provider. Reconnects and
+      // repeated refreshes for the same provider keep the last good catalog
+      // visible until its replacement arrives.
+      const providerChanged = catalogAgentType.current !== agentType;
+      catalogAgentType.current = agentType;
+      setState((prev) => providerChanged
+        ? { models: [], loading: true }
+        : { ...prev, loading: true, error: undefined });
       try {
         ws.send({
           type: 'transport.list_models',
@@ -71,6 +79,7 @@ export function useTransportModels(
     if (!supportsDynamicTransportModels(agentType)) {
       setState({ models: [], loading: false });
       pendingRequestId.current = null;
+      catalogAgentType.current = agentType;
       return;
     }
 
@@ -101,7 +110,9 @@ export function useTransportModels(
       });
     });
 
-    if (wsConnected) fetchModels(false);
+    // Grok has no safe hardcoded model roster and its connect-time ACP probe
+    // is also the authoritative binary/authentication prerequisite check.
+    if (wsConnected) fetchModels(agentType === 'grok-sdk');
     return unsub;
   }, [ws, wsConnected, agentType, fetchModels]);
 

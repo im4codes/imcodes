@@ -1,0 +1,81 @@
+# Build the self-contained controlled-node executable on a per-OS matrix and
+# publish the binaries as artifacts (controlled-node-remote-exec 7.3).
+#
+# Node SEA produces a binary for the HOST platform only, so each OS gets its own
+# matrix job (win/macos/linux). `scripts/build-node-exe.mjs` downloads the
+# OFFICIAL static node for the target and injects the SEA blob; the runner's node
+# only runs esbuild + the build script. The produced binaries are uploaded as
+# workflow artifacts (the "hosting" for a deploy step that populates the server's
+# IMCODES_NODE_EXE_DIR, which the /api/enroll/executable route streams from).
+name: build-node-exe
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: Runtime version advertised by the node and matched by the server
+        required: true
+        type: string
+  push:
+    tags:
+      - 'node-exe-v*'
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION_PRIMARY: '24'
+  IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: imcodes-node-linux
+          - os: macos-latest
+            artifact: imcodes-node-macos
+          - os: windows-latest
+            artifact: imcodes-node.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+      - name: Install dependencies
+        run: npm ci
+      # Fail the build if the thin entry pulls in a native/unbundlable dep — a
+      # SEA binary must be self-contained (guards the same invariant the local
+      # `check:node-exe-deps` script enforces).
+      - name: Verify node-exe has no native deps
+        run: npm run check:node-exe-deps
+      - name: Resolve controlled-node runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.build_version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-exe-v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "invalid controlled-node build version: $VERSION" >&2
+            exit 1
+          fi
+          echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Build controlled-node executable
+        run: npm run build:node-exe
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist-node-exe/${{ matrix.artifact }}
+            dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/computer-use-helper/**
+          if-no-files-found: error
+          retention-days: 30

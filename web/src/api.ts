@@ -130,8 +130,7 @@ export async function buildAttachmentDownloadUrl(serverId: string, attachmentId:
   const encodedServerId = encodeURIComponent(serverId);
   const encodedAttachmentId = encodeURIComponent(attachmentId);
   const baseUrl = _baseUrl || window.location.origin;
-  const isNativeRuntime = !!(globalThis as Record<string, unknown>).Capacitor;
-  if (!isNativeRuntime) {
+  if (!isNative()) {
     return `${baseUrl}/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download`;
   }
   const tokenRes = await apiFetch(`/api/server/${encodedServerId}/uploads/${encodedAttachmentId}/download-token`, { method: 'POST' });
@@ -1499,8 +1498,7 @@ export async function uploadFile(
 export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
   // Native: skip blob fetch — WebViews can't reliably trigger downloads from blob URLs.
   // Get a one-time token and open in system browser which handles save natively.
-  const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
-  if (isNative) {
+  if (isNative()) {
     const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId);
     const { Browser } = await import('@capacitor/browser');
     await Browser.open({ url: downloadUrl });
@@ -1533,6 +1531,78 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/**
+ * Synchronously pre-open an isolated desktop download window while the user
+ * gesture is still active. Call this at click entry before any await.
+ */
+export function beginControlledNodeDesktopDownload(): Window {
+  // Including `noopener` in windowFeatures makes some browsers deliberately
+  // return null even when the tab opens, which is indistinguishable from a
+  // blocked popup. Open first while the gesture is active, then sever opener.
+  const opened = window.open('about:blank', '_blank');
+  if (!opened) throw new Error('popup_blocked');
+  opened.opener = null;
+  return opened;
+}
+
+export interface ControlledNodeDownloadOptions {
+  /** Desktop window opened synchronously at click time via {@link beginControlledNodeDesktopDownload}. */
+  desktopWindow?: Window | null;
+}
+
+/**
+ * Start a controlled-node executable download for the selected (os, arch).
+ * Desktop: navigate a pre-opened window after mint (caller must pre-open).
+ * Native: mint first, then open the system browser. No blob buffering.
+ */
+/** Map mint/download failures to controlled_nodes i18n keys. */
+export function controlledNodeDownloadErrorKey(err: unknown): string {
+  if (err instanceof Error && err.message === 'popup_blocked') {
+    return 'controlled_nodes.download_popup_blocked';
+  }
+  if (err instanceof ApiError) {
+    switch (err.code) {
+      case 'executable_not_built':
+        return 'controlled_nodes.mint_executable_not_built';
+      case 'canonical_server_url_required':
+        return 'controlled_nodes.mint_canonical_server_url_required';
+      case 'invalid_or_expired_ticket':
+        return 'controlled_nodes.ticket_expired';
+      default:
+        break;
+    }
+    if (err.body.includes('executable_not_built')) return 'controlled_nodes.mint_executable_not_built';
+    if (err.body.includes('canonical_server_url_required')) return 'controlled_nodes.mint_canonical_server_url_required';
+    if (err.body.includes('invalid_or_expired_ticket')) return 'controlled_nodes.ticket_expired';
+  }
+  return 'controlled_nodes.download_error';
+}
+
+export async function downloadControlledNodeExecutable(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  opts: ControlledNodeDownloadOptions = {},
+): Promise<import('./api/machines.js').ControlledNodeExecutableTicket> {
+  const { mintControlledNodeExecutableTicket, buildControlledNodeBootstrapUrl } = await import('./api/machines.js');
+  const nativeRuntime = isNative();
+  const desktopWindow = !nativeRuntime ? (opts.desktopWindow ?? null) : null;
+  if (!nativeRuntime && !desktopWindow) throw new Error('desktop_window_required');
+
+  try {
+    const ticket = await mintControlledNodeExecutableTicket(selection);
+    const url = buildControlledNodeBootstrapUrl(ticket.ticket);
+    if (nativeRuntime) {
+      const { Browser } = await import('@capacitor/browser');
+      await Browser.open({ url });
+      return ticket;
+    }
+    desktopWindow!.location.href = url;
+    return ticket;
+  } catch (err) {
+    if (desktopWindow && !desktopWindow.closed) desktopWindow.close();
+    throw err;
+  }
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string): Promise<void> {

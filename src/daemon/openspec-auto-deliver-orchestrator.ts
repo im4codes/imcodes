@@ -98,6 +98,9 @@ import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js'
  */
 const AUTO_DELIVER_IMPLEMENTATION_STAGE: ExecutionCloneParentStage = 'auto_deliver_implementation';
 
+const AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION =
+  'Run reasonable local validation for the touched code when available. Use all applicable testing tools and already-authorized test devices/environments available to you to test implementation completeness, including focused unit, integration, end-to-end, and real-device checks where relevant and safe. Do not expand authorization or access new devices without user approval. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands, devices/environments, and outcomes, or explain why validation could not run.';
+
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;
 
@@ -209,6 +212,12 @@ interface AutoDeliverRun {
   specAuditRepairRound: number;
   implementationAuditRepairRound: number;
   taskStats: OpenSpecAutoDeliverTaskStats;
+  /** Skippable-task allowance accepted from the completed implementation marker:
+   *  the count of unchecked tasks that are external / deployment-only /
+   *  authorization-gated / explicitly deferred. Final acceptance may PASS while
+   *  up to this many tasks remain unchecked — those external gates are surfaced
+   *  as deferred follow-ups, never auto-checked, so they cannot block delivery. */
+  acceptedSkippableTaskCount?: number;
   terminalReason?: string;
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
@@ -317,6 +326,7 @@ const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTime
 const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
 const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
@@ -795,6 +805,7 @@ function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExec
     marker.summary,
     marker.changedFiles?.length ? `changedFiles=${marker.changedFiles.join(',')}` : undefined,
     marker.tests?.length ? `tests=${marker.tests.join(',')}` : undefined,
+    `skippableTaskCount=${marker.skippableTaskCount ?? 0}`,
   ].filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'implementation_reported',
@@ -804,6 +815,27 @@ function recordImplementationMarkerEvidence(run: AutoDeliverRun, marker: P2pExec
     ...(run.activeCommandId ? { command: run.activeCommandId } : {}),
     stale: false,
   }]);
+}
+
+function implementationMarkerTaskGate(
+  marker: P2pExecutionMarker,
+  taskStats: OpenSpecAutoDeliverTaskStats,
+): { accepted: boolean; allowed: number } {
+  const allowed = marker.skippableTaskCount ?? 0;
+  return { accepted: taskStats.unchecked <= allowed, allowed };
+}
+
+async function dispatchImplementationTaskGateReminder(
+  run: AutoDeliverRun,
+  allowed: number,
+): Promise<void> {
+  const projection = await dispatchImplementationMarkerReminder(
+    run,
+    `implementation_tasks_exceed_marker_skip_allowance:unchecked=${run.taskStats.unchecked}:allowed=${allowed}`,
+  );
+  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+  }
 }
 
 function elapsedLimitExceeded(run: AutoDeliverRun): boolean {
@@ -1335,7 +1367,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
     'All relative file paths in this prompt are relative to that project root.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
-    'Run reasonable local validation for the touched code when available. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
+    AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
     '',
     'Remaining tasks:',
     remainingBlock,
@@ -1353,7 +1385,10 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
 function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
   const active = run.activeImplementationMarker;
   if (!active) return 'Implementation completion marker: unavailable.';
-  const completedMarker = stringifyP2pExecutionMarker(buildP2pExecutionMarker(active.spec, 'completed')).trimEnd();
+  const completedMarker = stringifyP2pExecutionMarker({
+    ...buildP2pExecutionMarker(active.spec, 'completed'),
+    skippableTaskCount: 0,
+  }).trimEnd();
   const failedMarker = stringifyP2pExecutionMarker({
     ...buildP2pExecutionMarker(active.spec, 'failed'),
     error: 'short reason',
@@ -1361,8 +1396,10 @@ function buildImplementationCompletionMarkerBlock(run: AutoDeliverRun): string {
   return [
     'Implementation completion marker (required):',
     `- After you have completed implementation, tasks.md updates, and reasonable validation, write this exact JSON marker to: ${active.markerPath}`,
-    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. Do not write the marker before doing the work.',
-    '- Use the failed marker only when external input or an unrecoverable blocker prevents further implementation. If work is merely incomplete, keep working and overwrite any old failed marker with the completed marker after finishing.',
+    '- Keep runId, cycleIndex, cycleTotal, nonce, and status exactly as shown. The sole required value to calculate before writing is skippableTaskCount: set it to the exact number of currently unchecked tasks that are external, deployment-only, authorization-gated, or explicitly deferred; keep it 0 when every unchecked task is still implementable. Do not write the marker before doing the work.',
+    '- The orchestrator re-reads tasks.md and accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount. A completed marker cannot bypass more unchecked tasks than it explicitly declares.',
+    '- When code/tests are complete and only external, deployment-only, authorization-gated, or explicitly deferred tasks remain, you MUST write the completed marker with the matching skippableTaskCount. Do NOT write a failed marker for those tasks.',
+    '- Use the failed marker only for an unrecoverable implementation/infrastructure failure that prevents an honest completed handoff. A failed marker terminates Auto Deliver as needs_human and is not retried. If implementable work is merely incomplete, keep working and do not write either marker yet.',
     '- Idling without this marker does not count as implementation completion; Auto Deliver will keep the run in implementation until the marker is present and valid.',
     '',
     'Completed marker:',
@@ -1462,6 +1499,9 @@ async function advanceAfterCompletedImplementationMarker(
   marker: P2pExecutionMarker,
 ): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
+  // Carry the accepted external/deferred allowance forward so final acceptance
+  // can PASS with these gates still unchecked instead of re-blocking on them.
+  run.acceptedSkippableTaskCount = marker.skippableTaskCount ?? 0;
   recordImplementationMarkerEvidence(run, marker);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
@@ -1482,7 +1522,7 @@ async function advanceAfterCompletedImplementationMarker(
   await startAuditRepairStageFailClosed(run, 'implementation_audit_repair');
 }
 
-async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: string): Promise<void> {
+function handleFailedImplementationMarker(run: AutoDeliverRun, reason: string): void {
   run.evidence = mergeEvidence(run.evidence, [{
     source: 'implementation_reported',
     summary: `Implementation completion marker reported failure: ${reason}`,
@@ -1492,15 +1532,19 @@ async function handleFailedImplementationMarker(run: AutoDeliverRun, reason: str
   clearImplementationMarkerPollTimer(run.runId);
   clearImplementationAwaitingDispatchIdleTimer(run.runId);
   settleImplementationRuntimeFromMarker(run, `openspec-auto-deliver-implementation-marker-failed:${reason}`);
-  const projection = await dispatchImplementationMarkerReminder(run, `implementation_marker_failed:${reason}`);
-  if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-  }
+  terminalizeAndSend(run, 'needs_human', `implementation_marker_failed:${reason}`);
 }
 
 async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promise<void> {
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId || !run.activeImplementationMarker) return;
   if (enforceElapsedLimit(run)) return;
+
+  const markerState = await readImplementationCompletionMarker(run);
+  if (!markerState.ok && markerState.failedByAgent) {
+    await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
@@ -1514,20 +1558,20 @@ async function advanceAfterImplementationMarkerPoll(run: AutoDeliverRun): Promis
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
+  if (markerState.ok) {
+    const taskGate = implementationMarkerTaskGate(markerState.marker, run.taskStats);
+    if (taskGate.accepted) {
+      await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+      return;
+    }
+    await dispatchImplementationTaskGateReminder(run, taskGate.allowed);
+    return;
+  }
   if (run.taskStats.unchecked > 0) {
     scheduleImplementationMarkerPoll(run);
     return;
   }
 
-  const markerState = await readImplementationCompletionMarker(run);
-  if (markerState.ok) {
-    await advanceAfterCompletedImplementationMarker(run, markerState.marker);
-    return;
-  }
-  if (markerState.failedByAgent) {
-    await handleFailedImplementationMarker(run, markerState.reason);
-    return;
-  }
   const activeMarker = run.activeImplementationMarker;
   if (!activeMarker) return;
   const markerAgeMs = Date.now() - activeMarker.createdAt;
@@ -1555,8 +1599,9 @@ function buildImplementationMarkerReminderPrompt(run: AutoDeliverRun, reason: st
     `Reason: ${reason}`,
     '',
     'Do not start an audit report. Continue from the current implementation state and finish the required code, test, and tasks.md work.',
-    'Run the appropriate validation for the files you touched. If validation fails, fix the failure and validate again.',
-    'Write the completed marker only after the implementation is genuinely finished and validated. Use a failed marker only for external input or unrecoverable blockers; incomplete checklist work means continue implementing, not stop.',
+    AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION,
+    'If validation fails, fix the failure and validate again.',
+    'Write the completed marker only after the implementation is genuinely finished and validated. If only external, deployment-only, authorization-gated, or explicitly deferred tasks remain, write completed with their exact skippableTaskCount; do not write failed. Use failed only for an unrecoverable implementation/infrastructure failure; incomplete implementable work means continue without writing a marker.',
     'A false idle without this marker is not completion; Auto Deliver will keep the run in implementation.',
     '',
     buildImplementationCompletionMarkerBlock(run),
@@ -1822,7 +1867,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     '- repair_completion.previous_items_complete must answer whether ALL previous required_changes, unchecked/falsely-complete tasks, repair scorecard gates, and repair task checklist/fallback plan items are now completed.',
     '- Use status="incomplete" and previous_items_complete=false when the prior repair checklist was not fully completed; list exact unfinished prior items in incomplete_items.',
     '- Use status="complete" and previous_items_complete=true only when the prior repair checklist is complete. If the checklist is complete but new or deeper issues still make the score low, put those new issues in required_changes.',
-    '- Use status="blocked" only for external blockers that cannot be repaired in this repository; list blockers in blocked_items.',
+    '- Use status="blocked" ONLY when NO in-repo repair remains and progress is impossible without external action (deployment, authorization, CI/release, physical hardware/device evidence). If ANY remaining gap is fixable or testable in this repository, use status="incomplete" — even if you also list genuinely external items in blocked_items.',
+    '- blocked_items are surfaced to the human but do NOT by themselves stop the automated repair loop: while incomplete_items remain, Auto Deliver keeps repairing the fixable work and only hands off to a human once nothing fixable is left. Never park a repairable/testable gap in blocked_items to force a stop; put it in incomplete_items.',
     '- Fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     '',
     'Write exactly one raw JSON object to the authoritative result file path above. Do not wrap the file content in Markdown fences.',
@@ -1831,7 +1877,7 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     `Verdict scope for this final ${specStage ? 'specification' : 'implementation'} acceptance audit:`,
     passScope,
     reworkScope,
-    '- BLOCKED only for external blockers that cannot be repaired in this repository.',
+    '- BLOCKED (status="blocked") only when NO in-repo repair remains; a fixable/testable gap is REWORK/incomplete, not blocked, even if external items are also listed in blocked_items.',
     scoreScope,
     '',
     'Scoring discipline:',
@@ -1844,7 +1890,8 @@ function buildPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun, metadata: Ope
     specStage
       ? '- For spec-stage scoring, tests means testability of requirements, scenarios, and acceptance criteria. If OpenSpec validation was not run after repair, cap spec, tasks, tests, and risk at 7 even if the text looks clean.'
       : '- For implementation-stage scoring, tests means actual test coverage plus executed validation. If product validation was not run after repair, cap implementation and risk at 7 and cap tests at 6 even if the code looks plausible.',
-    '- If any previous finding remains unresolved or only unverified, verdict must be REWORK and the affected module score must be 5 or lower.',
+    '- External / deployment-only / authorization-gated / physical-hardware / real-reboot / CI-release gates that are CORRECTLY kept unchecked-and-deferred are accepted deferrals, NOT defects: do not lower any module score for them, do not treat their unverifiability as an unresolved finding, and do not make the verdict REWORK because of them. Score only the in-repo work that CAN be verified here; surface the deferred external gates in evidence/blocked_items so a human can complete them. A run whose only remaining gaps are these accepted external gates should PASS.',
+    '- If any previous finding remains unresolved or only unverified — and it is fixable or verifiable IN THIS REPOSITORY — verdict must be REWORK and the affected module score must be 5 or lower. (This does NOT apply to the accepted external/deferred gates above.)',
     '- Evidence that only restates the prompt, promises future work, or cites the Team discussion without inspecting repaired files is insufficient for PASS.',
     '',
     'The top-level auto_deliver object must exactly equal this metadata object:',
@@ -2494,7 +2541,7 @@ function buildAuthoritativeResultSchemaHints(includeAutoDeliverNesting: boolean)
     `Each evidence entry requires fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_REQUIRED_FIELDS.join(', ')}; optional fields: ${OPENSPEC_AUTO_DELIVER_EVIDENCE_OPTIONAL_FIELDS.join(', ')}.`,
     'Final acceptance audits must include repair_completion with fields: status, previous_items_complete, completed_items, incomplete_items, blocked_items, summary.',
     'evidence.source is informational only; use any useful label, or "none" when no label is available.',
-    'PASS must leave unchecked_tasks and required_changes empty.',
+    'PASS must leave required_changes empty. PASS may leave the external / deployment-only / authorization-gated / explicitly-deferred tasks unchecked (they are accepted deferrals, surfaced as follow-ups, not defects): do NOT list those in unchecked_tasks or required_changes, and do NOT lower any module score for them — record them in evidence (and blocked_items) instead. unchecked_tasks must contain only genuinely IMPLEMENTABLE work that still remains; if any such implementable work remains, the verdict is REWORK, not PASS.',
   ];
 }
 
@@ -2695,8 +2742,15 @@ function repairSummaryText(repairs: OpenSpecAutoDeliverRepairSummary[]): string 
 function validateFinalPass(run: AutoDeliverRun, verdict: OpenSpecAutoDeliverVerdictPayload, changedFiles: string[] = []): string | null {
   if (verdict.verdict !== 'PASS') return null;
   if (run.taskStats.total <= 0) return 'tasks_missing_checkboxes';
-  if (run.taskStats.unchecked > 0) return 'audit_pass_with_unchecked_tasks';
-  if (verdict.unchecked_tasks.length > 0) return 'audit_pass_with_reported_unchecked_tasks';
+  // External / deployment-only / authorization-gated / explicitly-deferred tasks
+  // that the completed implementation marker declared skippable are accepted
+  // deferrals: PASS may leave up to that many tasks unchecked so real-world
+  // release/verification gates never block delivery. They stay unchecked (never
+  // auto-closed) and are surfaced as follow-ups. Only IMPLEMENTABLE unchecked
+  // work beyond the allowance blocks a PASS.
+  const allowedSkip = run.acceptedSkippableTaskCount ?? 0;
+  if (run.taskStats.unchecked > allowedSkip) return 'audit_pass_with_unchecked_tasks';
+  if (verdict.unchecked_tasks.length > allowedSkip) return 'audit_pass_with_reported_unchecked_tasks';
   if (verdict.required_changes.length > 0) return 'audit_pass_with_required_changes';
   const repairedFiles = new Set(verdict.repairs_applied.flatMap((repair) => repair.files));
   const uncoveredChangedFiles = changedFiles.filter((file) => !repairedFiles.has(file));
@@ -2916,14 +2970,19 @@ type RepairCompletionDecision = 'complete' | 'incomplete' | 'blocked' | 'unknown
 function repairCompletionDecision(verdict: OpenSpecAutoDeliverVerdictPayload): RepairCompletionDecision {
   const completion = verdict.repair_completion;
   if (!completion) return 'unknown';
-  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
-  if (
-    completion.status === 'incomplete'
+  // In-repo fixable work takes PRIORITY over external blockers. The auditor uses
+  // blocked_items to surface external blockers (deploy/CI/hardware/authorization)
+  // for the human while STILL asking for a REWORK of the locally-fixable gaps in
+  // incomplete_items. A non-empty blocked_items list alone MUST NOT hard-stop the
+  // run — doing so throws away the auto-repair round for work that can actually be
+  // fixed here (the exact `status:incomplete + blocked_items:[…]` → needs_human
+  // over-trigger). Only a run with NO fixable work left and genuine blockers is
+  // handed to a human.
+  const hasFixableWork = completion.status === 'incomplete'
     || completion.previous_items_complete === false
-    || completion.incomplete_items.length > 0
-  ) {
-    return 'incomplete';
-  }
+    || completion.incomplete_items.length > 0;
+  if (hasFixableWork) return 'incomplete';
+  if (completion.status === 'blocked' || completion.blocked_items.length > 0) return 'blocked';
   if (completion.status === 'complete' && completion.previous_items_complete === true) return 'complete';
   return 'unknown';
 }
@@ -3438,6 +3497,13 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
   if (run.status !== 'implementation_task_loop' || !run.activeCommandId) return;
   if (run.activeImplementationPromptAwaitingDispatch) return;
   if (enforceElapsedLimit(run)) return;
+
+  const markerState = await readImplementationCompletionMarker(run);
+  if (!markerState.ok && markerState.failedByAgent) {
+    await handleFailedImplementationMarker(run, markerState.reason);
+    return;
+  }
+
   try {
     run.taskStats = await readTaskStatsForRun(run);
   } catch {
@@ -3453,20 +3519,20 @@ async function advanceAfterImplementationIdle(run: AutoDeliverRun): Promise<void
     send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
     return;
   }
-  if (run.taskStats.unchecked <= 0) {
-    const markerState = await readImplementationCompletionMarker(run);
-    if (!markerState.ok) {
-      if (markerState.failedByAgent) {
-        await handleFailedImplementationMarker(run, markerState.reason);
-        return;
-      }
-      const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
-      if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
-        send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
-      }
+  if (markerState.ok) {
+    const taskGate = implementationMarkerTaskGate(markerState.marker, run.taskStats);
+    if (taskGate.accepted) {
+      await advanceAfterCompletedImplementationMarker(run, markerState.marker);
       return;
     }
-    await advanceAfterCompletedImplementationMarker(run, markerState.marker);
+    await dispatchImplementationTaskGateReminder(run, taskGate.allowed);
+    return;
+  }
+  if (run.taskStats.unchecked <= 0) {
+    const projection = await dispatchImplementationMarkerReminder(run, markerState.reason);
+    if (isOpenSpecAutoDeliverTerminalStage(projection.status)) {
+      send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+    }
     return;
   }
   const projection = await dispatchImplementationMarkerReminder(run, 'implementation_tasks_still_unchecked');
@@ -3494,6 +3560,43 @@ async function advanceAfterPostRepairAcceptanceAuditIdle(
 ): Promise<void> {
   if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   if (enforceElapsedLimit(run)) return;
+  const active = run.activeAcceptanceAudit;
+  const activeCommandId = run.activeCommandId;
+  const advanceKey = `${run.runId}:${active.attemptId}`;
+  const existingAdvance = acceptanceAuditAdvancesInFlight.get(advanceKey);
+  if (existingAdvance) {
+    await existingAdvance;
+    // A result-file poll deliberately avoids dispatching a repair prompt. If a
+    // real idle arrives while that weaker observation is in flight, replay the
+    // idle after the poll only when the same command is still active. Successful
+    // consumption or a repair dispatch changes the active audit/command and
+    // therefore does not run twice.
+    if (
+      (options.allowResultFileRepairPrompt ?? true)
+      && run.activeAcceptanceAudit?.attemptId === active.attemptId
+      && run.activeCommandId === activeCommandId
+      && run.status === active.stage
+    ) {
+      await advanceAfterPostRepairAcceptanceAuditIdle(run, options);
+    }
+    return;
+  }
+  const advance = advanceAfterPostRepairAcceptanceAuditIdleOnce(run, options);
+  acceptanceAuditAdvancesInFlight.set(advanceKey, advance);
+  try {
+    await advance;
+  } finally {
+    if (acceptanceAuditAdvancesInFlight.get(advanceKey) === advance) {
+      acceptanceAuditAdvancesInFlight.delete(advanceKey);
+    }
+  }
+}
+
+async function advanceAfterPostRepairAcceptanceAuditIdleOnce(
+  run: AutoDeliverRun,
+  options: { allowResultFileRepairPrompt?: boolean },
+): Promise<void> {
+  if (!run.activeAcceptanceAudit || run.status !== run.activeAcceptanceAudit.stage || !run.activeCommandId) return;
   const allowResultFileRepairPrompt = options.allowResultFileRepairPrompt ?? true;
   const active = run.activeAcceptanceAudit;
   const metadata = acceptanceAuditMetadataFromActive(run, active);
@@ -3972,6 +4075,7 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   promptIdleAdvanceTimers.clear();
   for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
   acceptanceResultFilePollTimers.clear();
+  acceptanceAuditAdvancesInFlight.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }

@@ -7,6 +7,11 @@ export interface EnvConfig {
 
   // Secrets
   JWT_SIGNING_KEY: string;
+  /**
+   * Symmetric secret used for platform bot credentials and controlled-node
+   * download tickets. Reusing this established key keeps existing deployments
+   * upgrade-compatible without introducing another required secret.
+   */
   BOT_ENCRYPTION_KEY: string;
 
   // GitHub OAuth (optional — disables GitHub login if absent)

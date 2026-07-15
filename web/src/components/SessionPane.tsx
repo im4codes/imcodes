@@ -15,7 +15,7 @@ import { UsageFooter } from './UsageFooter.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
 import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../thinking-utils.js';
-import { hasActiveTimelineTurn } from '../timeline-running.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.js';
 import { recordCost } from '../cost-tracker.js';
 import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
@@ -267,6 +267,7 @@ export function SessionPane({
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
+  const pendingUserSend = useMemo(() => hasPendingUserSend(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(timelineEvents), [timelineEvents]);
   const timelineLastEventTs =
@@ -500,6 +501,7 @@ export function SessionPane({
           statusText={statusText}
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
+          pendingUserSend={pendingUserSend}
           transportActivityDetail={transportActivityDetail}
           sessionError={session.error}
           now={thinkingNow}

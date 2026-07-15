@@ -11,6 +11,7 @@ on:
 env:
   NODE_VERSION_PRIMARY: '24'
   NODE_VERSION_SERVER: '22'
+  IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'
 
 jobs:
   # ── Lint ──────────────────────────────────────────────────────────────────
@@ -319,7 +320,12 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+      # The cross-layer suite intentionally executes daemon MCP code as well as
+      # server code, so both dependency trees must be present in this job.
+      - run: ./scripts/ci-npm-ci.sh .
       - run: ./scripts/ci-npm-ci.sh server
       - name: Warm DB test container image
         shell: bash
@@ -582,15 +588,83 @@ jobs:
 
           exit "${publish_status}"
 
+  # ── Controlled-node executables for the production image ─────────────────
+
+  release_version:
+    name: Resolve release version
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve one version for server and all native node artifacts
+        id: version
+        run: |
+          set -euo pipefail
+          COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
+          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
+            APP_VERSION="$(date -u +%Y).$(date -u +%-m).${COMMIT_COUNT}-dev.${GITHUB_RUN_NUMBER}"
+          else
+            APP_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
+          fi
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+
+  controlled-node-executables:
+    name: Controlled Node Executable (${{ matrix.key }})
+    needs: [release_version]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ${{ matrix.runner }}
+    env:
+      IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: linux
+            runner: ubuntu-latest
+            artifact: imcodes-node-linux
+          - key: macos
+            runner: macos-latest
+            artifact: imcodes-node-macos
+          - key: windows
+            runner: windows-latest
+            artifact: imcodes-node.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - name: Install dependencies
+        shell: bash
+        run: ./scripts/ci-npm-ci.sh .
+      - name: Verify thin-node dependency boundary
+        run: npm run check:node-exe-deps
+      - name: Build controlled-node executable
+        run: npm run build:node-exe
+      - name: Upload controlled-node executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: controlled-node-${{ matrix.key }}
+          path: |
+            dist-node-exe/${{ matrix.artifact }}
+            dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/computer-use-helper/**
+          if-no-files-found: error
+          retention-days: 30
+
   # ── Build & push Docker image ─────────────────────────────────────────────
 
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, server-tests, server-db-tests, e2e-tests]
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     outputs:
-      npm_version: ${{ steps.version_meta.outputs.npm_version }}
+      npm_version: ${{ needs.release_version.outputs.app_version }}
     permissions:
       contents: write
       packages: write
@@ -600,6 +674,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history needed for git rev-list --count
+
+      - name: Download controlled-node executables
+        uses: actions/download-artifact@v4
+        with:
+          pattern: controlled-node-*
+          path: server/controlled-node-artifacts
+          merge-multiple: true
+
+      - name: Verify controlled-node executable set
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: >-
+          node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
+          imcodes-node-linux imcodes-node-macos imcodes-node.exe
 
       - name: Get build timestamp
         id: ts
@@ -648,18 +736,6 @@ jobs:
           echo "version=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
           echo "app_version=$(date -u +%Y.%-m).${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve publish version
-        id: version_meta
-        run: |
-          set -euo pipefail
-          COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
-            NPM_VERSION="$(date -u +%Y).$(date -u +%-m).${COMMIT_COUNT}-dev.${GITHUB_RUN_NUMBER}"
-          else
-            NPM_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
-          fi
-          echo "npm_version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
-
       # Build the image into the local docker daemon first so we can smoke-test
       # it BEFORE pushing. Without this step, an image whose Node process
       # crashes on startup (e.g. ERR_MODULE_NOT_FOUND from a missing prod dep)
@@ -674,7 +750,7 @@ jobs:
           build-args: |
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
-            APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+            APP_VERSION=${{ needs.release_version.outputs.app_version }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -691,8 +767,12 @@ jobs:
           # other top-level eval failure surfaces here, before the image ships.
           docker run --rm --entrypoint node imcodes-smoke:test \
             -e "import('./dist/server/src/index.js').then(() => { console.log('OK: image loads cleanly'); process.exit(0); }).catch(e => { console.error('FAIL:', e.message); console.error(e.stack); process.exit(1); })"
+          docker run --rm --entrypoint node imcodes-smoke:test \
+            scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
+            imcodes-node-linux imcodes-node-macos imcodes-node.exe
 
       - name: Build and push (cache hit — only pushes layers)
+        id: build_push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -702,11 +782,34 @@ jobs:
           build-args: |
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
-            APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+            APP_VERSION=${{ needs.release_version.outputs.app_version }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
+
+      - name: Write immutable release metadata
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+          IMAGE_REPOSITORY: ${{ env.IMAGE }}
+          IMAGE_DIGEST: ${{ steps.build_push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_REPOSITORY" == ghcr.io/*/* ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p release-metadata
+          printf 'COMMIT_SHA=%s\nIMAGE_REPOSITORY=%s\nIMAGE_DIGEST=%s\n' \
+            "$COMMIT_SHA" "$IMAGE_REPOSITORY" "$IMAGE_DIGEST" \
+            > release-metadata/release.env
+
+      - name: Upload immutable release metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-metadata
+          path: release-metadata/release.env
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Create git tag
         id: git_tag
@@ -715,7 +818,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git fetch --tags
-          NPM_VERSION="${{ steps.version_meta.outputs.npm_version }}"
+          NPM_VERSION="${{ needs.release_version.outputs.app_version }}"
           GIT_TAG="v${NPM_VERSION}"
           # Skip if this exact tag already exists (idempotent)
           if ! git rev-parse "$GIT_TAG" >/dev/null 2>&1; then

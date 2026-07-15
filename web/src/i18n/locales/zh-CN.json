@@ -34,6 +34,23 @@
       "generic": "出错了，请重试。"
     }
   },
+  "machine": {
+    "feature_label": "机器",
+    "category": "机器",
+    "category_desc": "插入目标机器标记",
+    "empty": "暂无可用机器",
+    "empty_hint": "注册一个被控节点后，即可用 ^^(名称) 标记向其发送命令。",
+    "usage_hint": "点按机器即可插入其 ^^(名称) 标记。在输入框中输入 ^ 可自动补全。离线机器无法选择。",
+    "no_results": "没有匹配的机器",
+    "search_placeholder": "搜索机器",
+    "online": "在线",
+    "offline": "离线",
+    "offline_hint": "离线 — 无法选择",
+    "error": {
+      "list_unavailable": "机器列表仍在加载或加载失败，请稍后重试。",
+      "machine_unresolved_failclosed": "无法解析该机器，未发送。"
+    }
+  },
   "common": {
     "cancel": "取消",
     "confirm": "确认",
@@ -610,6 +627,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -787,6 +805,7 @@
     "loading": "加载中…",
     "tab_quick": "快捷",
     "tab_files": "文件",
+    "tab_machines": "受控节点",
     "confirm_delete": "确认删除？"
   },
   "file_browser": {
@@ -828,8 +847,13 @@
     "upgrade_blocked_title": "升级已阻止",
     "upgrade_blocked_p2p_active": "团队 仍在运行。请先停止，再升级 daemon。",
     "upgrade_blocked_auto_deliver_active": "自动交付仍在运行。请先停止，再升级 daemon。",
+    "upgrade_blocked_master_compaction_active": "记忆主摘要正在压缩，完成后将自动升级 daemon。",
+    "upgrade_blocked_compression_active": "记忆压缩正在运行，完成后将自动升级 daemon。",
     "upgrade_blocked_transport_busy": "还有 transport session 正在 turn 中。等它回到 idle 再升级 daemon。",
-    "upgrade_blocked_toolchain_unavailable": "daemon 主机上的 Node 已丢失（工具链被删除）。请重新安装 Node——在此之前自动升级已禁用。"
+    "upgrade_blocked_session_busy": "仍有会话正在执行任务。等它回到 idle 再升级 daemon。",
+    "upgrade_blocked_cooldown_active": "daemon 最近刚完成升级，冷却结束后会自动重试。",
+    "upgrade_blocked_toolchain_unavailable": "daemon 主机上的 Node 已丢失（工具链被删除）。请重新安装 Node——在此之前自动升级已禁用。",
+    "upgrade_blocked_unknown": "daemon 暂时繁忙，稍后会自动重试升级。"
   },
   "discussion": {
     "role_critic": "批判者",
@@ -862,6 +886,7 @@
     "dir_required": "工作目录不能为空",
     "not_connected": "未连接到 daemon",
     "daemon_offline": "Daemon 离线 — 请确认 imcodes daemon 正在运行",
+    "grok_prerequisite_error": "Grok Build 当前不可用：{{error}}",
     "start": "启动",
     "starting": "启动中...",
     "timeout": "等待会话启动超时，请检查 daemon 日志。",
@@ -876,10 +901,10 @@
     "agent_type": "Agent 类型",
     "agent_flavor_cli": "CLI：适合喜欢原生界面的用户。聊天模式不支持流式输出。",
     "agent_flavor_sdk": "SDK：支持流式输出，界面更简洁。",
-    "qwen_provider_hint": "需要接入第三方 Coding Plan？请选择 Qwen Code。",
-    "qwen_provider_selected_hint": "Qwen Code 可以通过下方 API Provider 预设接入兼容 Anthropic 的第三方 Coding Plan 服务。",
+    "qwen_provider_hint": "需要接入第三方 Coding Plan？请选择 Claude Code SDK。",
+    "qwen_provider_selected_hint": "所选 SDK 可以通过下方 API Provider 预设接入兼容 Anthropic 的第三方 Coding Plan 服务。",
     "custom_provider_sdk": "自定义供应商 SDK",
-    "custom_provider_sdk_help": "使用 Qwen SDK 作为兼容层，并在下方选择 API Provider 预设。",
+    "custom_provider_sdk_help": "使用 Claude Code SDK 作为兼容层，并在下方选择 API Provider 预设。",
     "custom_provider_preset": "自定义供应商预设",
     "custom_provider_preset_required": "请先选择或新增一个 API Provider 预设，再启动自定义供应商 SDK。",
     "compatible_api_via_qwen": "兼容 API（通过 Qwen）",
@@ -2314,6 +2339,7 @@
       "mcpProviderStatusHint": "MCP 专用状态会独立于 provider 连接状态上报。",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
@@ -2643,5 +2669,44 @@
     "weekOf": "{{date}} 当周",
     "members": "按会话",
     "rangeAll": "全部时间"
+  },
+  "controlled_nodes": {
+    "title": "被控节点",
+    "short": "节点",
+    "add_title": "添加机器",
+    "os_win": "下载 Windows 版",
+    "os_mac": "下载 macOS 版",
+    "os_linux": "下载 Linux 版",
+    "download_target": "{{os}}（{{arch}}）",
+    "no_executables": "此服务器未列出可下载的安装程序。",
+    "availability_error": "无法加载安装程序可用性,请检查网络后重试。",
+    "loading_availability": "正在加载可用安装程序…",
+    "loading_download": "正在开始下载…",
+    "download_error": "下载失败,请重试。",
+    "download_popup_blocked": "浏览器阻止了下载窗口,请允许此站点的弹出窗口后重试。",
+    "mint_executable_not_built": "服务器上尚无此安装程序。",
+    "mint_canonical_server_url_required": "服务器未配置被控节点下载所需的公开 URL,请联系管理员设置规范地址。",
+    "ticket_expired": "下载链接已过期,请重新下载。",
+    "ticket_expires_at": "链接有效期至 {{time}}",
+    "artifact_meta": "{{detail}}",
+    "usage_title": "使用方法",
+    "usage_step1": "根据目标机器的系统下载对应的可执行文件。",
+    "usage_step2": "在该机器上以所需权限运行一次(见下方各系统说明)。",
+    "usage_step3": "它会自动注册、安装开机自启,上线后即显示在下方。",
+    "usage_win_run": "以管理员身份运行。若出现 SmartScreen,选择“更多信息”→“仍要运行”。",
+    "usage_mac_run": "首次启动需绕过 Gatekeeper:右键应用→打开,或执行 xattr -cr <路径> 后正常打开。",
+    "usage_linux_run": "添加可执行权限(chmod +x <文件>)并以 root 运行一次(sudo)。",
+    "machines_title": "你的机器",
+    "refresh": "刷新",
+    "error_generic": "出错了,请重试。",
+    "empty": "还没有被控节点。",
+    "online": "在线",
+    "offline": "离线",
+    "exec_on": "已允许执行",
+    "exec_off": "已禁止执行",
+    "rename_label": "受控节点名称",
+    "rename_invalid": "请输入 1–120 个字符的名称，且不能包含控制字符。",
+    "revoke": "吊销",
+    "revoke_confirm": "吊销这台机器?吊销后将无法再控制,需要重新注册。"
   }
 }

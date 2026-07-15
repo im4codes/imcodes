@@ -6,6 +6,7 @@ import type {
   ShareTarget,
 } from '../../../shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
+import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
 import { deleteTokenUsageFactsForServer } from './token-usage-queries.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -41,6 +42,8 @@ export interface DbServer {
   shared_context_runtime_config?: Record<string, unknown> | string | null;
   bound_with_key_id: string | null;
   created_at: number;
+  /** Missing/null is a legacy full daemon; only the explicit controlled role is passive. */
+  node_role?: NodeRole | null;
 }
 
 export interface DbChannelBinding {
@@ -335,11 +338,12 @@ export async function createServer(
   name: string,
   tokenHash: string,
   keyId?: string,
+  nodeRole: NodeRole = NODE_ROLE.FULL,
 ): Promise<DbServer> {
   const now = Date.now();
   await db.execute(
-    'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-    [id, userId, name, tokenHash, 'offline', now, keyId ?? null],
+    'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id, node_role) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+    [id, userId, name, tokenHash, 'offline', now, keyId ?? null, nodeRole],
   );
   return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, bound_with_key_id: keyId ?? null, created_at: now };
 }
@@ -520,6 +524,12 @@ export async function getServersByUserId(db: Database, userId: string): Promise<
     }
   }
   return servers;
+}
+
+/** General server-navigation surfaces must never expose passive controlled nodes. */
+export async function getFullServersByUserId(db: Database, userId: string): Promise<DbServer[]> {
+  const servers = await getServersByUserId(db, userId);
+  return servers.filter((server) => server.node_role !== NODE_ROLE.CONTROLLED);
 }
 
 // ── Channel bindings ──────────────────────────────────────────────────────

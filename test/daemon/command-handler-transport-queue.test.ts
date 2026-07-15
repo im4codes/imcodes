@@ -1108,6 +1108,62 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('starts a fresh grok-sdk main session with the requested model', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: '/proj',
+      agentType: 'grok-sdk',
+      requestedModel: 'grok-build',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      agentType: 'grok-sdk',
+      projectDir: '/proj',
+      fresh: true,
+      requestedModel: 'grok-build',
+    }));
+  });
+
+  it('dispatches /clear as a fresh grok-sdk relaunch without the old resume id', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'grok-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      providerSessionId: 'route-grok-old',
+      providerResumeId: 'resume-grok-old',
+      requestedModel: 'grok-build',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-grok-old',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-grok' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'grok-sdk',
+      projectDir: '/proj',
+      requestedModel: 'grok-build',
+      fresh: true,
+    }));
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('providerResumeId');
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-grok', status: 'accepted' });
+  });
+
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -2423,6 +2479,28 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('force-connects grok-sdk for live model discovery', async () => {
+    const listModels = vi.fn().mockResolvedValue({ models: [{ id: 'grok-build' }], defaultModel: 'grok-build' });
+    getProviderMock.mockReturnValue(undefined);
+    ensureProviderConnectedMock.mockResolvedValue({ listModels });
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'grok-sdk', requestId: 'grok-models', force: true }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'grok-models'
+    )));
+
+    expect(ensureProviderConnectedMock).toHaveBeenCalledWith('grok-sdk', {});
+    expect(listModels).toHaveBeenCalledWith(true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'grok-sdk',
+      requestId: 'grok-models',
+      models: [{ id: 'grok-build' }],
+      defaultModel: 'grok-build',
+    }));
+  });
+
   it('does not auto-connect qoder-sdk for forced transport.list_models', async () => {
     getProviderMock.mockReturnValue(undefined);
 
@@ -2960,6 +3038,33 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'error', error: 'provider bootstrap failed' }),
       expect.objectContaining({ source: 'daemon' }),
     );
+  });
+
+  it('starts a fresh grok-sdk sub-session with exact parent project identity', async () => {
+    getSessionMock.mockImplementation((name: string) => name === 'deck_parent_brain'
+      ? { name, projectName: 'parent-project' }
+      : undefined);
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'grok_child',
+      sessionType: 'grok-sdk',
+      cwd: '/tmp/project',
+      parentSession: 'deck_parent_brain',
+      requestedModel: 'grok-build',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_grok_child',
+      projectName: 'parent-project',
+      agentType: 'grok-sdk',
+      projectDir: '/tmp/project',
+      parentSession: 'deck_parent_brain',
+      requestedModel: 'grok-build',
+      fresh: true,
+      userCreated: true,
+    }));
   });
 
   it('tracks supervision task intents while offline so Auto still follows the resent turn', async () => {
@@ -3805,6 +3910,76 @@ describe('handleWebCommand transport queue behavior', () => {
       activeModel: 'moonshot-v1-auto,thinking',
       modelDisplay: 'moonshot-v1-auto,thinking',
     }));
+  });
+
+  it('switches model for grok-sdk transport sessions via /model', async () => {
+    const setAgentId = vi.fn();
+    getProviderMock.mockReturnValue({
+      listModels: vi.fn().mockResolvedValue({
+        models: [{ id: 'grok-build' }, { id: 'grok-build-fast' }],
+        defaultModel: 'grok-build',
+        isAuthenticated: true,
+      }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'grok-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'grok-build',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-grok',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model grok-build-fast',
+      commandId: 'cmd-model-grok',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).toHaveBeenCalledWith('grok-build-fast');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'grok-build-fast',
+      activeModel: 'grok-build-fast',
+      modelDisplay: 'grok-build-fast',
+    }));
+  });
+
+  it('rejects an unadvertised grok-sdk model without mutating the session', async () => {
+    const setAgentId = vi.fn();
+    getProviderMock.mockReturnValue({
+      listModels: vi.fn().mockResolvedValue({ models: [{ id: 'grok-build' }], isAuthenticated: true }),
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'grok-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-grok', setAgentId });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model invented-model',
+      commandId: 'cmd-model-grok-invalid',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(setAgentId).not.toHaveBeenCalled();
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'command.ack',
+      expect.objectContaining({ status: 'error', error: 'Unknown Grok model: invented-model' }),
+    );
   });
 
   it('switches model for cursor-headless transport sessions via /model', async () => {

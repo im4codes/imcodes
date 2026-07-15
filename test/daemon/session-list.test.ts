@@ -179,7 +179,7 @@ describe('buildSessionList', () => {
     expect(store.getSession('deck_codex_stable_brain')?.quotaLabel).toBe('5h 22% 1h10m 4/6 14:40 · 7d 44% 1d04h 4/8 15:48');
   });
 
-  it('derives transport running state from runtime but queue entries from SQLite authority', async () => {
+  it('derives a permission-waiting transport as running but queue entries from SQLite authority', async () => {
     const store = await import('../../src/store/session-store.js');
     store.upsertSession({
       name: 'deck_qwen_busy_brain',
@@ -196,7 +196,7 @@ describe('buildSessionList', () => {
       updatedAt: Date.now(),
     });
     getTransportRuntimeMock.mockReturnValue({
-      getStatus: () => 'streaming',
+      getStatus: () => 'permission',
       pendingMessages: ['queued second'],
       pendingEntries: [{ clientMessageId: 'msg-2', text: 'queued second' }],
     });

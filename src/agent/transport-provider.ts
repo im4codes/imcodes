@@ -29,6 +29,7 @@ import {
   type SdkTurnLostRecoveryMetadata as SharedSdkTurnLostRecoveryMetadata,
   type SdkTurnLostRecoveryPhase as SharedSdkTurnLostRecoveryPhase,
   type SdkTurnLostReplayDecision as SharedSdkTurnLostReplayDecision,
+  type ActivityGeneration,
   type ProviderActiveWorkSnapshot,
 } from '../../shared/session-activity-types.js';
 
@@ -363,6 +364,30 @@ export interface ProviderStatusUpdate {
   status: string | null;
   /** Human-readable label shown in the footer/status line. Null clears the label. */
   label?: string | null;
+}
+
+/** Evidence passed from a transport runtime to a provider rollout backstop. */
+export interface ProviderRolloutCompletionReconcileOptions {
+  /** Minimum age of terminal rollout evidence before recovery may settle it. */
+  minCompleteAgeMs?: number;
+  /** Injectable wall clock for deterministic health-poll tests. */
+  nowMs?: number;
+  /**
+   * True only when the runtime still exposes an in-progress status but owns no
+   * send/dispatch entries. This lets a provider distinguish an orphaned UI
+   * state from a healthy pre-start/bootstrap window.
+   */
+  runtimeHasNoDispatchOwnership?: boolean;
+  /** Runtime generation that currently owns the visible activity state. */
+  runtimeActivityGeneration?: ActivityGeneration;
+  /** True while the runtime still owns a send/dispatch for that generation. */
+  runtimeHasActiveDispatchOwnership?: boolean;
+  /**
+   * True only after the active runtime dispatch crossed into provider.send().
+   * This excludes the healthy context-bootstrap window before a new provider
+   * turn has actually started.
+   */
+  runtimeActiveDispatchProviderStarted?: boolean;
 }
 
 /** Provider-reported token/context usage update. */

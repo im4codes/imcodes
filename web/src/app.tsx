@@ -66,6 +66,7 @@ import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
 import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
+import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
@@ -91,6 +92,11 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
+import {
+  daemonUpgradeBlockedToastKey,
+  shouldShowDaemonUpgradeBlockedToast,
+  type DaemonUpgradeBlockedToastState,
+} from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import {
@@ -1206,6 +1212,7 @@ export function App() {
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<AppToast[]>([]);
+  const lastUpgradeBlockedToastRef = useRef<DaemonUpgradeBlockedToastState | null>(null);
   const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
   const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
   const appUpdateRequiredRef = useRef(false);
@@ -1593,6 +1600,7 @@ export function App() {
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
+  const [showControlledNodes, setShowControlledNodes] = useState(false);
   const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
   const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
   const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
@@ -1600,6 +1608,14 @@ export function App() {
   const [userDisplayName, setUserDisplayName] = useState<string | null>(null);
   const [username, setUsername] = useState<string | null>(null);
   const [userHasPassword, setUserHasPassword] = useState(false);
+
+  const openControlledNodes = useCallback(() => {
+    ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+      kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+      serverId: selectedServerId ?? undefined,
+    }, { bringToFront: true });
+    setShowControlledNodes(true);
+  }, [ensureDesktopWindow, selectedServerId]);
 
   // Fetch current user info on auth
   useEffect(() => {
@@ -2031,6 +2047,17 @@ export function App() {
       removeDesktopWindow(DESKTOP_WINDOW_IDS.sharedContextManagement);
     }
   }, [showSharedContextManagement, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showControlledNodes) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
+        kind: DESKTOP_WINDOW_KINDS.controlledNodes,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes);
+    }
+  }, [showControlledNodes, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   useEffect(() => {
     if (showSharedContextDiagnostics) {
@@ -3419,13 +3446,10 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        const message = msg.reason === 'toolchain_unavailable'
-          ? trans('toast.upgrade_blocked_toolchain_unavailable')
-          : msg.reason === 'transport_busy'
-            ? trans('toast.upgrade_blocked_transport_busy')
-            : msg.reason === 'auto_deliver_active'
-              ? trans('toast.upgrade_blocked_auto_deliver_active')
-            : trans('toast.upgrade_blocked_p2p_active');
+        const now = Date.now();
+        if (!shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) return;
+        lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
+        const message = trans(daemonUpgradeBlockedToastKey(msg.reason));
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
           id,
@@ -4684,6 +4708,13 @@ export function App() {
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
+              <button
+                class="btn"
+                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
+                onClick={openControlledNodes}
+              >
+                {trans('controlled_nodes.title')}
+              </button>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"
@@ -4904,6 +4935,16 @@ export function App() {
                   <div class="mobile-server-menu">
                     <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
                       ← Home
+                    </button>
+                    <button
+                      class="mobile-server-menu-item mobile-server-menu-controlled-nodes"
+                      onClick={() => {
+                        setShowMobileServerMenu(false);
+                        openControlledNodes();
+                      }}
+                    >
+                      <span aria-hidden="true">🖥</span>
+                      <span>{trans('controlled_nodes.title')}</span>
                     </button>
                     {isNative() && (
                       <button class="mobile-server-menu-item mobile-server-menu-change" onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}>
@@ -5737,6 +5778,20 @@ export function App() {
                 source: session.name === activeSession ? 'active_session' as const : 'recent_session' as const,
               }))}
           />
+        </FloatingPanel>
+      )}
+      {showControlledNodes && (
+        <FloatingPanel
+          id="controlled-nodes"
+          title={trans('controlled_nodes.title')}
+          onClose={() => setShowControlledNodes(false)}
+          defaultW={860}
+          defaultH={680}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.controlledNodes, 5100)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.controlledNodes)}
+          className="controlled-nodes-floating-panel"
+        >
+          <ControlledNodesPanel />
         </FloatingPanel>
       )}
 

@@ -51,6 +51,14 @@ export function csrfMiddleware() {
     // is not accessible to JS, providing equivalent CSRF protection.
     if (path === '/api/auth/refresh') { await next(); return; }
 
+    // Controlled-node downloads are authorized exclusively by a short-lived,
+    // high-entropy ticket in the request body (or Bearer header), never by the
+    // browser session cookie. The bootstrap bridge uses a plain HTML form so
+    // the browser can stream the executable without buffering it in the SPA;
+    // forms cannot attach the double-submit CSRF header and some isolated
+    // browser windows send `Origin: null`. The ticket remains the sole gate.
+    if (path === '/api/enroll/v2/download') { await next(); return; }
+
     // Bearer auth (API key, daemon, CLI) skips CSRF — not a browser session
     const authHeader = c.req.header('Authorization');
     if (authHeader?.startsWith('Bearer ')) { await next(); return; }

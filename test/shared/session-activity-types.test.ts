@@ -6,6 +6,7 @@ import {
   hasProviderActiveWork,
   isCodexLifecycleTerminalMetadata,
   isAuthoritativeCleanIdlePayload,
+  isWorkingSessionState,
   reduceTimelineActivity,
   toPrivacySafeLifecycleMetadata,
 } from '../../shared/session-activity-types.js';
@@ -29,6 +30,19 @@ const authoritativeIdlePayload = {
 } as const;
 
 describe('session activity shared contract', () => {
+  it('treats permission waits as foreground work, but terminal states as inactive', () => {
+    for (const state of ['running', 'queued', 'streaming', 'thinking', 'tool_running', 'permission']) {
+      expect(isWorkingSessionState(state)).toBe(true);
+    }
+    for (const state of ['idle', 'error', 'stopped', 'stopping', 'unknown', null, undefined]) {
+      expect(isWorkingSessionState(state)).toBe(false);
+    }
+
+    expect(reduceTimelineActivity([
+      { type: 'session.state', payload: { state: 'permission' } },
+    ])).toMatchObject({ active: true });
+  });
+
   it('requires generation and zero blocking counts for authoritative clean idle', () => {
     expect(isAuthoritativeCleanIdlePayload(authoritativeIdlePayload)).toBe(true);
     expect(isAuthoritativeCleanIdlePayload(authoritativeIdlePayload, { scope: 'session', sessionName: 'deck_test', generation: 1 })).toBe(true);

@@ -7,7 +7,7 @@ import {
 } from '../../shared/memory-mcp-errors.js';
 
 describe('memory MCP error reasons', () => {
-  it('pins the exact ordered MVP reason set', () => {
+  it('pins the exact ordered reason set (incl. machine remote-exec reasons)', () => {
     expect(Object.values(MCP_ERROR_REASONS)).toEqual([
       'invalid_namespace',
       'feature_disabled',
@@ -18,6 +18,14 @@ describe('memory MCP error reasons', () => {
       'validation_failed',
       'rate_limited',
       'internal_error',
+      // Machine remote-exec (list_machines / exec_remote) — controlled-node-remote-exec 10.12.
+      'machine_not_found',
+      'machine_ambiguous',
+      'exec_offline',
+      'exec_disabled',
+      // A bound daemon's machine control plane (list/exec API) is unreachable or
+      // returned an unusable response — distinct from "no machines"/"not found".
+      'control_plane_unavailable',
     ] satisfies MCPErrorReason[]);
   });
 
@@ -26,6 +34,7 @@ describe('memory MCP error reasons', () => {
       'feature_disabled',
       'projection_unavailable',
       'rate_limited',
+      'control_plane_unavailable',
     ]);
     for (const reason of Object.values(MCP_ERROR_REASONS)) {
       expect(isRecoverableMcpErrorReason(reason)).toBe(RECOVERABLE_MCP_ERROR_REASONS.has(reason));

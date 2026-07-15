@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasActiveTimelineTurn, isRunningTimelineEvent } from '../src/timeline-running.js';
+import { hasActiveTimelineTurn, hasPendingUserSend, isRunningTimelineEvent } from '../src/timeline-running.js';
 
 const authoritativeIdlePayload = {
   state: 'idle',
@@ -16,6 +16,19 @@ const authoritativeIdlePayload = {
 };
 
 describe('isRunningTimelineEvent', () => {
+  it('recognizes only unresolved optimistic user sends as immediate client activity', () => {
+    expect(hasPendingUserSend([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'user.message', payload: { text: 'just sent', pending: true, commandId: 'cmd-1' } },
+    ] as any)).toBe(true);
+    expect(hasPendingUserSend([
+      { type: 'user.message', payload: { text: 'failed', pending: false, failed: true, commandId: 'cmd-2' } },
+    ] as any)).toBe(false);
+    expect(hasPendingUserSend([
+      { type: 'user.message', payload: { text: 'confirmed', pending: false, commandId: 'cmd-3' } },
+    ] as any)).toBe(false);
+  });
+
   it('treats assistant.thinking as a running signal', () => {
     expect(isRunningTimelineEvent({ type: 'assistant.thinking' } as any)).toBe(true);
   });
@@ -50,6 +63,14 @@ describe('isRunningTimelineEvent', () => {
       { type: 'session.state', payload: { state: 'running' } },
       { type: 'user.message', payload: { text: 'sent first', pending: false, commandId: 'cmd-1' } },
       { type: 'command.ack', payload: { ok: true, commandId: 'cmd-1' } },
+    ] as any)).toBe(true);
+  });
+
+  it('keeps a permission-waiting turn active instead of presenting false idle', () => {
+    expect(hasActiveTimelineTurn([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'session.state', payload: { state: 'permission' } },
+      { type: 'command.ack', payload: { ok: true } },
     ] as any)).toBe(true);
   });
 

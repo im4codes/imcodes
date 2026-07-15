@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -348,7 +348,10 @@ describe('file-transfer local handle hardening', () => {
       done.serverLink as never,
     );
 
-    expect(fetchMock).toHaveBeenCalledWith('https://relay.example/upload-staged/upload-fetch?token=reusable');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://relay.example/upload-staged/upload-fetch?token=reusable',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(done.sent).toContainEqual(expect.objectContaining({
       type: 'file.upload_progress',
       uploadId: 'upload-fetch',
@@ -388,10 +391,70 @@ describe('file-transfer local handle hardening', () => {
     );
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenNthCalledWith(2, 'https://relay.example/upload-staged/upload-fetch-retry?token=reusable');
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'https://relay.example/upload-staged/upload-fetch-retry?token=reusable',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(done.sent).toContainEqual(expect.objectContaining({
       type: 'file.upload_done',
       uploadId: 'upload-fetch-retry',
     }));
+  });
+
+  it('creates a short-lived handle for one explicit regular path', async () => {
+    const filePath = path.join(rootDir, 'report.txt');
+    await writeFile(filePath, 'hello');
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const done = createServerLinkMock();
+
+    await transfer.handleFilePathHandle({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE,
+      requestId: 'path-handle-1',
+      path: filePath,
+    }, done.serverLink);
+
+    expect(done.sent).toEqual([expect.objectContaining({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: 'path-handle-1',
+      attachment: expect.objectContaining({ daemonPath: await realpath(filePath), size: 5, downloadable: true }),
+    })]);
+  });
+
+  it('rejects symlinks and sensitive credential paths without echoing the path', async () => {
+    const target = path.join(rootDir, 'target.txt');
+    const linked = path.join(rootDir, 'linked.txt');
+    await writeFile(target, 'hello');
+    await symlink(target, linked);
+    const deniedDir = path.join(fakeHome, '.ssh');
+    const denied = path.join(deniedDir, 'id_rsa');
+    await mkdir(deniedDir, { recursive: true });
+    await writeFile(denied, 'secret');
+    const transfer = await loadFileTransferHandler(fakeHome);
+
+    for (const [requestId, filePath, expected] of [
+      ['path-symlink', linked, 'not_regular_file'],
+      ['path-sensitive', denied, 'forbidden_path'],
+    ] as const) {
+      const result = createServerLinkMock();
+      await transfer.handleFilePathHandle({ type: FILE_TRANSFER_MSG.PATH_HANDLE, requestId, path: filePath }, result.serverLink);
+      expect(result.sent).toEqual([{ type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR, requestId, error: expected }]);
+      expect(JSON.stringify(result.sent)).not.toContain(filePath);
+    }
+  });
+
+  it('invalidates a local handle when its path is replaced before download', async () => {
+    const filePath = path.join(rootDir, 'replace-me.txt');
+    await writeFile(filePath, 'first');
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const minted = createServerLinkMock();
+    await transfer.handleFilePathHandle({ type: FILE_TRANSFER_MSG.PATH_HANDLE, requestId: 'path-replace', path: filePath }, minted.serverLink);
+    const attachmentId = (minted.sent[0] as { attachment: { id: string } }).attachment.id;
+    await unlink(filePath);
+    await writeFile(filePath, 'second');
+
+    const downloaded = createServerLinkMock();
+    await transfer.handleFileDownload({ type: FILE_TRANSFER_MSG.DOWNLOAD, downloadId: 'download-replace', attachmentId }, downloaded.serverLink);
+    expect(downloaded.sent).toEqual([{ type: FILE_TRANSFER_MSG.DOWNLOAD_ERROR, downloadId: 'download-replace', message: 'download_failed' }]);
   });
 });

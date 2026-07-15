@@ -7,7 +7,7 @@
  * Only assistant.text, user.message, and session.state=idle end thinking.
  * Tool calls, status updates, and other events are skipped (don't end thinking).
  */
-import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
+import { isAuthoritativeCleanIdlePayload, isWorkingSessionState, reduceTimelineActivity } from '../../shared/session-activity-types.js';
 
 const THINKING_SKIP_TYPES = new Set([
   'agent.status',
@@ -116,7 +116,7 @@ export function getTailSessionState(
 }
 
 export function isRunningSessionState(sessionState: string | undefined): boolean {
-  return sessionState === 'running' || sessionState === 'queued';
+  return isWorkingSessionState(sessionState);
 }
 
 export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {

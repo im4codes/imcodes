@@ -6,6 +6,7 @@ import {
   selectSessionHasLiveQueue,
   type TransportQueueReducerState,
 } from '../../shared/transport-queue-reducer.js';
+import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 
 export type SessionLiveStatusMode =
   | 'idle'
@@ -25,6 +26,8 @@ export interface SessionLiveStatusInput {
   activeThinking?: boolean;
   activeToolCall?: boolean;
   activeTransportTurn?: boolean;
+  /** Current browser has an unresolved optimistic user send. */
+  pendingUserSend?: boolean;
   statusText?: string | null;
   transportActivityDetail?: string | null;
   sessionError?: string | null;
@@ -45,7 +48,7 @@ export interface SessionLiveStatus {
 }
 
 export function isRunningSessionState(sessionState: string | null | undefined): boolean {
-  return sessionState === 'running' || sessionState === 'queued';
+  return isWorkingSessionState(sessionState);
 }
 
 export function isStoppingSessionState(sessionState: string | null | undefined): boolean {
@@ -107,6 +110,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   const isAgentless = input.isAgentless === true;
   const activeThinking = input.activeThinking === true;
   const activeToolCall = input.activeToolCall === true;
+  const pendingUserSend = input.pendingUserSend === true;
   const hasLiveQueue = input.transportQueueState ? selectSessionHasLiveQueue(input.transportQueueState) : false;
   const activeTransportTurn = input.activeTransportTurn === true || hasLiveQueue;
   const stopRequested = input.stopRequested === true;
@@ -133,7 +137,11 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
   const cancelFeedback = reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
   const compactFeedback = reason === SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT;
   const stopping = stopRequested || isStoppingSessionState(state) || cancelFeedback;
-  const running = isRunningSessionState(state);
+  // A local optimistic send is real, current dispatch ownership. Surface it
+  // immediately instead of leaving the footer asleep until the daemon's live
+  // running event completes a network/history round trip. This is deliberately
+  // separate from generic thinking/tool tail evidence, which may be stale.
+  const running = isRunningSessionState(state) || pendingUserSend;
   const busy = stopping || running || activeThinking || activeToolCall || activeTransportTurn;
   const resultLike = isResultStatusText(statusText);
 

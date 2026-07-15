@@ -80,6 +80,7 @@ type AgentType =
   | "opencode"
   | "gemini"
   | "gemini-sdk"
+  | "grok-sdk"
   | "kimi-sdk"
   | "openclaw"
   | "qwen";
@@ -196,8 +197,8 @@ export function NewSessionDialog({
     setError("");
     setPresetError("");
     if (enabled) {
-      if (agentType !== "qwen") setLastUnlockedAgentType(agentType);
-      setAgentType("qwen");
+      if (agentType !== "claude-code-sdk") setLastUnlockedAgentType(agentType);
+      setAgentType("claude-code-sdk");
       return;
     }
     setAgentType(lastUnlockedAgentType);
@@ -391,7 +392,7 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (agentType !== "qwen") setAgentType("qwen");
+    if (agentType !== "claude-code-sdk") setAgentType("claude-code-sdk");
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [agentType, ccPreset, ccPresets, customProviderSdk]);
 
@@ -452,7 +453,7 @@ export function NewSessionDialog({
       });
     } else {
       const extra: Record<string, unknown> = {};
-      if (ccPreset && (agentType === "claude-code" || agentType === "qwen"))
+      if (ccPreset && (agentType === "claude-code" || agentType === "claude-code-sdk" || agentType === "qwen"))
         extra.ccPreset = ccPreset;
       if (ccInitPrompt.trim() && agentType === "claude-code")
         extra.ccInitPrompt = ccInitPrompt.trim();
@@ -462,6 +463,7 @@ export function NewSessionDialog({
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
           || agentType === "gemini-sdk"
+          || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
           || agentType === "qwen") &&
         requestedModel.trim()
@@ -487,7 +489,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "kimi-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -503,7 +505,7 @@ export function NewSessionDialog({
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
-  const supportsCcPreset = agentType === "claude-code" || agentType === "qwen";
+  const supportsCcPreset = agentType === "claude-code" || agentType === "claude-code-sdk" || agentType === "qwen";
   const providerPresetLabel = customProviderSdk
     ? t("new_session.custom_provider_preset")
     : agentType === "qwen"
@@ -515,6 +517,7 @@ export function NewSessionDialog({
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
     || agentType === "gemini-sdk"
+    || agentType === "grok-sdk"
     || agentType === "kimi-sdk"
     || (agentType === "qwen" && !!selectedCcPreset);
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
@@ -525,9 +528,9 @@ export function NewSessionDialog({
     if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
-      return agentType === "gemini-sdk"
-        ? mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds)
-        : dynamicModelIds;
+      if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
+      if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
+      return dynamicModelIds;
     }
     if (agentType === "qwen") return qwenPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
@@ -544,10 +547,12 @@ export function NewSessionDialog({
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
       const stored = loadCodexModelPreference();
       if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      const fallback = CODEX_SDK_MODEL_FALLBACK[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
         return transportModels.defaultModel;
       }
-      return trimmed;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [agentType, modelSuggestions, transportModels.defaultModel]);
 
@@ -794,7 +799,7 @@ export function NewSessionDialog({
                 : t("new_session.agent_flavor_sdk")}
             </div>
           )}
-          <QwenCodingPlanHint selected={agentType === "qwen"} />
+          <QwenCodingPlanHint selected={customProviderSdk || agentType === "qwen"} />
         </div>
 
         {thinkingLevels.length > 0 && (
@@ -881,6 +886,11 @@ export function NewSessionDialog({
                   <option key={model} value={model} />
                 ))}
               </datalist>
+            )}
+            {agentType === "grok-sdk" && transportModels.error && (
+              <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
+                {t("new_session.grok_prerequisite_error", { error: transportModels.error })}
+              </div>
             )}
           </div>
         )}

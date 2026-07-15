@@ -36,7 +36,15 @@ const mocks = vi.hoisted(() => {
   const runtimes = new Map<string, { getStatus: () => string; sending: boolean; pendingCount: number }>();
   const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
   const writeCalls: Array<{ path: string; data: string }> = [];
-  return { store, runtimes, spawnCalls, writeCalls };
+  let compressionState = { active: false, activeCount: 0, queued: 0, idle: true };
+  return {
+    store,
+    runtimes,
+    spawnCalls,
+    writeCalls,
+    getCompressionState: () => compressionState,
+    setCompressionState: (next: typeof compressionState) => { compressionState = next; },
+  };
 });
 
 // ── Module mocks ──────────────────────────────────────────────────────────
@@ -222,6 +230,16 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({
   BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })),
 }));
 
+vi.mock('../../src/context/summary-compressor.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/context/summary-compressor.js')>();
+  return {
+    ...actual,
+    getCompressionQueueState: vi.fn(() => mocks.getCompressionState()),
+    stopAcceptingCompression: vi.fn(),
+    resumeAcceptingCompression: vi.fn(),
+  };
+});
+
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -284,6 +302,7 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     mocks.store.clear();
     mocks.runtimes.clear();
     mocks.spawnCalls.length = 0;
+    mocks.setCompressionState({ active: false, activeCount: 0, queued: 0, idle: true });
   });
 
   afterEach(() => {
@@ -447,6 +466,17 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
   // ── Empty-state baseline: a clean daemon proceeds ──────────────────────
 
   it("proceeds with no transport sessions and no P2P runs", async () => {
+    const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
+    await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});
+
+    expect(getBlockedMessage(serverLink)).toBeUndefined();
+    expect(mocks.spawnCalls.length).toBeGreaterThan(0);
+  });
+
+  it('proceeds while memory compression is active and queued', async () => {
+    mocks.setCompressionState({ active: true, activeCount: 1, queued: 81, idle: false });
+
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
     handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
     await waitForCondition(() => mocks.spawnCalls.length > 0, 5000).catch(() => {});

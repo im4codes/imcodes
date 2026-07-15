@@ -6,8 +6,8 @@ import type { Context, Next } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
-import { getServerById } from '../db/queries.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
+import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -15,6 +15,10 @@ interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
+  /** Set when the credential is a daemon server-token; the machine's node role. */
+  nodeRole?: NodeRole;
+  /** Set when the credential is a daemon server-token; its server id. */
+  serverId?: string;
 }
 
 /**
@@ -41,11 +45,18 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   // Allows the daemon to call REST endpoints without a user JWT.
   const daemonServerId = c.req.header('X-Server-Id');
   if (daemonServerId) {
-    const server = await getServerById(c.env.DB, daemonServerId);
+    // Read node_role + revoked_at authoritatively from the DB (never from the
+    // client). A revoked credential is denied everywhere; a `controlled` node's
+    // role is carried so the guards below default-deny it on control APIs (10.2).
+    const server = await c.env.DB.queryOne<{
+      token_hash: string; user_id: string; node_role: string | null; revoked_at: number | null;
+    }>('SELECT token_hash, user_id, node_role, revoked_at FROM servers WHERE id = $1', [daemonServerId]);
     if (!server) return null;
     const tokenHash = sha256Hex(token);
     if (tokenHash !== server.token_hash) return null;
-    return { userId: server.user_id, role: 'owner' as Role };
+    if (server.revoked_at != null) return null; // revoked → denied everywhere (10.3)
+    const nodeRole: NodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+    return { userId: server.user_id, role: 'owner' as Role, nodeRole, serverId: daemonServerId };
   }
 
   // Try API key lookup (deck_ prefix)
@@ -114,10 +125,17 @@ export function requireAuth() {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const auth = await resolveAuth(c);
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    // Global default-deny: a controlled-node credential may ONLY reach the WS
+    // presence/heartbeat + MACHINE_EXEC_RESULT surface, never a normal REST API (10.2).
+    if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
+      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+    }
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
     if (auth.keyId) c.set('keyId' as never, auth.keyId);
+    if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);
+    if (auth.serverId) c.set('authServerId' as never, auth.serverId);
     await next();
   };
 }
@@ -133,6 +151,9 @@ export function requireRole(minRole: Role) {
   return async (c: Context<{ Bindings: Env }>, next: Next): Promise<Response | void> => {
     const auth = await resolveAuth(c);
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
+      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+    }
 
     if (!canPerform(auth.role, minPerm)) {
       return c.json({ error: 'forbidden', required: minRole, actual: auth.role }, 403);

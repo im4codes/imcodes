@@ -812,6 +812,16 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
   // hook adds CLI flags that cause exit code 1 in one-shot compression mode.
   // SDK query() handles subprocess lifecycle and subscription auth correctly.
   if (selection.backend === 'claude-code-sdk') {
+    // Apply a CC preset's third-party endpoint env (ANTHROPIC_BASE_URL/API_KEY/
+    // pinned model) so memory compression honors the configured provider
+    // instead of silently falling back to the default Anthropic endpoint.
+    const preset = selection.preset?.trim();
+    if (preset) {
+      const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+      const presetEnv = await resolvePresetEnv(preset);
+      const presetModel = presetEnv['ANTHROPIC_MODEL']?.trim() || selection.model?.trim() || undefined;
+      return sendViaSdkQuery(prompt, presetEnv, presetModel);
+    }
     return sendViaSdkQuery(prompt);
   }
 
@@ -859,7 +869,7 @@ async function sendToProvider(selection: CompressionBackendSelection, prompt: st
  * Strips CLAUDECODE env to avoid nested-session detection.
  * SDK manages subprocess lifecycle and subscription auth.
  */
-async function sendViaSdkQuery(prompt: string): Promise<string> {
+async function sendViaSdkQuery(prompt: string, presetEnv?: Record<string, string>, presetModel?: string): Promise<string> {
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
   const abortController = new AbortController();
   let timedOut = false;
@@ -881,6 +891,10 @@ async function sendViaSdkQuery(prompt: string): Promise<string> {
         maxTurns: 1,
         pathToClaudeCodeExecutable,
         abortController,
+        // CLAUDECODE is already stripped from process.env above, so the merged
+        // env is safe to forward; preset vars override the default endpoint.
+        ...(presetEnv && Object.keys(presetEnv).length > 0 ? { env: { ...process.env, ...presetEnv } } : {}),
+        ...(presetModel ? { model: presetModel } : {}),
       },
     }) as AsyncIterable<unknown> & { close?: () => void };
     for await (const msg of stream) {

@@ -34,6 +34,23 @@
       "generic": "문제가 발생했습니다. 다시 시도해 주세요."
     }
   },
+  "machine": {
+    "feature_label": "머신",
+    "category": "머신",
+    "category_desc": "대상 머신 마커 삽입",
+    "empty": "사용 가능한 머신이 없습니다",
+    "empty_hint": "제어 대상 노드를 등록하면 ^^(이름) 마커로 명령을 보낼 수 있습니다.",
+    "usage_hint": "머신을 탭하면 ^^(이름) 마커가 삽입됩니다. 입력창에 ^ 를 입력하면 자동 완성됩니다. 오프라인 머신은 선택할 수 없습니다.",
+    "no_results": "검색과 일치하는 머신이 없습니다",
+    "search_placeholder": "머신 검색",
+    "online": "온라인",
+    "offline": "오프라인",
+    "offline_hint": "오프라인 — 선택할 수 없음",
+    "error": {
+      "list_unavailable": "머신을 아직 불러오는 중이거나 불러오지 못했습니다. 잠시 후 다시 시도하세요.",
+      "machine_unresolved_failclosed": "이 머신을 확인할 수 없어 전송되지 않았습니다."
+    }
+  },
   "common": {
     "cancel": "취소",
     "confirm": "확인",
@@ -610,6 +627,7 @@
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
       "gemini_sdk": "Gemini SDK",
+      "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
     },
     "agentGroup": {
@@ -787,6 +805,7 @@
     "loading": "로딩 중…",
     "tab_quick": "빠른",
     "tab_files": "파일",
+    "tab_machines": "제어 노드",
     "confirm_delete": "이 항목을 삭제하시겠습니까?"
   },
   "file_browser": {
@@ -828,7 +847,13 @@
     "upgrade_blocked_title": "업그레이드 차단됨",
     "upgrade_blocked_p2p_active": "Team가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
     "upgrade_blocked_auto_deliver_active": "Auto Deliver가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요.",
-    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다."
+    "upgrade_blocked_master_compaction_active": "메모리 마스터 요약 압축이 실행 중입니다. 완료되면 daemon이 업그레이드됩니다.",
+    "upgrade_blocked_compression_active": "메모리 압축이 실행 중입니다. 완료되면 daemon이 업그레이드됩니다.",
+    "upgrade_blocked_transport_busy": "transport session이 turn을 실행 중입니다. idle 상태가 된 뒤 daemon을 업그레이드하세요.",
+    "upgrade_blocked_session_busy": "세션에 아직 활성 작업이 있습니다. idle 상태가 된 뒤 daemon을 업그레이드하세요.",
+    "upgrade_blocked_cooldown_active": "daemon이 최근 업그레이드되었습니다. 대기 시간이 끝나면 자동 업그레이드를 다시 시도합니다.",
+    "upgrade_blocked_toolchain_unavailable": "daemon 호스트에 Node가 없습니다(툴체인 제거됨). Node를 다시 설치하세요. 그 전까지 자동 업그레이드가 비활성화됩니다.",
+    "upgrade_blocked_unknown": "daemon이 일시적으로 사용 중입니다. 자동 업그레이드를 다시 시도합니다."
   },
   "discussion": {
     "role_critic": "비평가",
@@ -861,6 +886,7 @@
     "dir_required": "작업 디렉토리는 필수입니다",
     "not_connected": "Daemon에 연결되지 않음",
     "daemon_offline": "Daemon이 오프라인입니다 — imcodes daemon이 실행 중인지 확인하세요",
+    "grok_prerequisite_error": "Grok Build를 사용할 수 없습니다: {{error}}",
     "start": "시작",
     "starting": "시작 중...",
     "timeout": "세션 시작 대기 시간 초과. Daemon 로그를 확인하세요.",
@@ -875,10 +901,10 @@
     "agent_type": "에이전트 유형",
     "agent_flavor_cli": "CLI: 원래 UI를 선호하는 사용자를 위한 네이티브 인터페이스입니다. 채팅 모드는 스트리밍을 지원하지 않습니다.",
     "agent_flavor_sdk": "SDK: 스트리밍을 지원하고 더 단순한 UI를 사용합니다.",
-    "qwen_provider_hint": "서드파티 Coding Plan이 필요하면 Qwen Code를 선택하세요.",
-    "qwen_provider_selected_hint": "Qwen Code는 아래 API Provider 프리셋을 통해 Anthropic 호환 서드파티 Coding Plan 제공자를 사용할 수 있습니다.",
+    "qwen_provider_hint": "서드파티 Coding Plan이 필요하면 Claude Code SDK를 선택하세요.",
+    "qwen_provider_selected_hint": "선택한 SDK는 아래 API Provider 프리셋을 통해 Anthropic 호환 서드파티 Coding Plan 제공자를 사용할 수 있습니다.",
     "custom_provider_sdk": "사용자 지정 공급자 SDK",
-    "custom_provider_sdk_help": "Qwen SDK 전송을 호환 계층으로 사용하고 아래에서 API Provider 프리셋을 선택합니다.",
+    "custom_provider_sdk_help": "Claude Code SDK 전송을 호환 계층으로 사용하고 아래에서 API Provider 프리셋을 선택합니다.",
     "custom_provider_preset": "사용자 지정 공급자 프리셋",
     "custom_provider_preset_required": "사용자 지정 공급자 SDK에는 API Provider 프리셋을 선택하거나 추가해야 합니다.",
     "compatible_api_via_qwen": "호환 API(Qwen 경유)",
@@ -2312,6 +2338,7 @@
       "mcpProviderStatusHint": "MCP 전용 상태는 provider 연결 상태와 별도로 보고됩니다.",
       "mcpProviderClaudeSdk": "Claude SDK",
       "mcpProviderGeminiAcp": "Gemini ACP",
+      "mcpProviderGrokAcp": "Grok ACP",
       "mcpProviderKimiAcp": "Kimi ACP",
       "mcpProviderCopilotSdk": "Copilot SDK",
       "mcpProviderCodexSdk": "Codex SDK",
@@ -2641,5 +2668,44 @@
     "weekOf": "{{date}} 주",
     "members": "세션별",
     "rangeAll": "전체 기간"
+  },
+  "controlled_nodes": {
+    "title": "제어 노드",
+    "short": "노드",
+    "add_title": "머신 추가",
+    "os_win": "Windows용 다운로드",
+    "os_mac": "macOS용 다운로드",
+    "os_linux": "Linux용 다운로드",
+    "download_target": "{{os}} ({{arch}})",
+    "no_executables": "이 서버에 나열된 설치 파일 다운로드가 없습니다.",
+    "availability_error": "설치 파일 사용 가능 여부를 불러오지 못했습니다. 연결을 확인한 후 다시 시도하세요.",
+    "loading_availability": "사용 가능한 설치 파일 불러오는 중…",
+    "loading_download": "다운로드 시작 중…",
+    "download_error": "다운로드에 실패했습니다. 다시 시도하세요.",
+    "download_popup_blocked": "브라우저가 다운로드 창을 차단했습니다. 이 사이트의 팝업을 허용한 후 다시 시도하세요.",
+    "mint_executable_not_built": "이 설치 파일은 서버에서 아직 사용할 수 없습니다.",
+    "mint_canonical_server_url_required": "제어 노드 다운로드를 위한 서버 URL이 구성되지 않았습니다. 관리자에게 정식 공개 URL 설정을 요청하세요.",
+    "ticket_expired": "다운로드 링크가 만료되었습니다. 새 다운로드를 시작하세요.",
+    "ticket_expires_at": "링크 유효 기간: {{time}}",
+    "artifact_meta": "{{detail}}",
+    "usage_title": "사용 방법",
+    "usage_step1": "대상 머신의 OS에 맞는 실행 파일을 다운로드하세요.",
+    "usage_step2": "해당 머신에서 필요한 권한으로 한 번 실행하세요(아래 OS별 안내 참고).",
+    "usage_step3": "자동으로 등록되고 부팅 자동 시작이 설치되며, 온라인이 되면 아래에 표시됩니다.",
+    "usage_win_run": "관리자 권한으로 실행하세요. SmartScreen이 나타나면 추가 정보 → 실행을 선택하세요.",
+    "usage_mac_run": "첫 실행 시 Gatekeeper 우회: 앱을 우클릭 → 열기, 또는 xattr -cr <경로> 실행 후 일반적으로 엽니다.",
+    "usage_linux_run": "실행 권한 부여(chmod +x <파일>) 후 root로 한 번 실행하세요(sudo).",
+    "machines_title": "내 머신",
+    "refresh": "새로고침",
+    "error_generic": "문제가 발생했습니다. 다시 시도하세요.",
+    "empty": "아직 제어 노드가 없습니다.",
+    "online": "온라인",
+    "offline": "오프라인",
+    "exec_on": "실행 허용됨",
+    "exec_off": "실행 비활성화됨",
+    "rename_label": "제어 노드 이름",
+    "rename_invalid": "제어 문자를 제외한 1~120자의 이름을 입력하세요.",
+    "revoke": "해지",
+    "revoke_confirm": "이 머신을 해지하시겠습니까? 해지 후에는 제어할 수 없으며 다시 등록해야 합니다."
   }
 }

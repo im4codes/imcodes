@@ -103,6 +103,11 @@ COPY --from=builder /app/server/src/db/migrations ./dist/server/src/db/migration
 # Copy web static files
 COPY --from=builder /app/web/dist ./web/dist
 
+# Controlled-node SEA binaries are built on their native OS runners, merged by
+# CI, and copied into the production image for the versioned v2 ticket/download flow.
+COPY server/controlled-node-artifacts/ ./controlled-node-executables/
+COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs
+
 # Copy landing page
 COPY landing/ ./landing/
 
@@ -117,5 +122,6 @@ ENV APP_VERSION=${APP_VERSION}
 ENV WEB_DIST_PATH=/app/web/dist
 ENV LANDING_DIST_PATH=/app/landing
 ENV UPDATES_DIST_PATH=/app/updates
+ENV IMCODES_NODE_EXE_DIR=/app/controlled-node-executables
 
 CMD ["node", "dist/server/src/index.js"]

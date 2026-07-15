@@ -27,6 +27,7 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
+import { isWorkingSessionState } from '@shared/session-activity-types.js';
 
 interface Props {
   serverId?: string | null;
@@ -98,7 +99,7 @@ function splitChildren(children: SubSession[]): {
 // ── State dot ────────────────────────────────────────────────────────────────
 function StateDot({ state }: { state: string }) {
   let color: string;
-  if (state === 'running' || state === 'queued') color = '#4ade80';
+  if (isWorkingSessionState(state)) color = '#4ade80';
   else if (state === 'idle') color = '#64748b';
   else if (state === 'stopping') color = '#f59e0b';
   else if (state === 'stopped' || state === 'error') color = '#ef4444';

@@ -45,6 +45,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'cursor-headless',
   'opencode',
   'gemini-sdk',
+  'grok-sdk',
   'gemini',
   'qwen',
   'openclaw',

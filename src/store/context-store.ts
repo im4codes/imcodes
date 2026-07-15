@@ -3202,6 +3202,27 @@ export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobT
 }
 
 /**
+ * Atomically claim a pending materialization job for execution.
+ *
+ * `enqueueContextJob` intentionally coalesces pending/running rows for the same
+ * target. Overlapping poll passes can therefore receive the same job. Only the
+ * caller that wins this pending -> running transition may read staged events
+ * and invoke the compressor; every later caller observes `false` and stops.
+ */
+export function claimContextJob(jobId: string, now = Date.now()): boolean {
+  const database = ensureDb();
+  const result = database.prepare(`
+    UPDATE context_jobs
+    SET status = 'running',
+        updated_at = ?,
+        error = NULL,
+        attempt_count = attempt_count + 1
+    WHERE id = ? AND status = 'pending'
+  `).run(now, jobId) as { changes?: number };
+  return (result.changes ?? 0) === 1;
+}
+
+/**
  * Transaction-free body of {@link updateContextJob}: updates a context job row
  * directly on `database` with NO ensureDb. This function does not itself open a
  * transaction (the public wrapper did not either).

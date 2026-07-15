@@ -125,7 +125,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     return preset;
   };
   const selectType = (nextType: string) => {
-    if (customProviderSdk && nextType !== 'qwen') return;
+    if (customProviderSdk && nextType !== 'claude-code-sdk') return;
     setType(nextType);
     if (!customProviderSdk) setLastUnlockedType(nextType);
     setPresetError('');
@@ -134,8 +134,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     setCustomProviderSdk(enabled);
     setPresetError('');
     if (enabled) {
-      if (type !== 'qwen') setLastUnlockedType(type);
-      setType('qwen');
+      if (type !== 'claude-code-sdk') setLastUnlockedType(type);
+      setType('claude-code-sdk');
       return;
     }
     setType(lastUnlockedType);
@@ -238,7 +238,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (type !== 'qwen') setType('qwen');
+    if (type !== 'claude-code-sdk') setType('claude-code-sdk');
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
@@ -293,9 +293,9 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
+    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -311,7 +311,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           : type === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : [];
-  const supportsCcPreset = type === 'claude-code' || type === 'qwen';
+  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen';
   const providerPresetLabel = customProviderSdk
     ? t('new_session.custom_provider_preset')
     : type === 'qwen'
@@ -319,13 +319,15 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       : t('new_session.api_provider');
   const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
   const transportModels = useTransportModels(ws, dynamicModelsAgentType);
-  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     type === 'qwen' && selectedCcPreset
       ? qwenPresetModels
     : transportModels.models.length > 0
       ? (type === 'gemini-sdk'
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === 'codex-sdk'
+          ? mergeModelSuggestions(CODEX_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
       : type === 'codex-sdk'
         ? [...CODEX_SDK_MODEL_SUGGESTIONS]
@@ -347,10 +349,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       if (trimmed && (modelSuggestions.length === 0 || modelSuggestions.includes(trimmed))) return trimmed;
       const stored = loadCodexModelPreference();
       if (stored && (modelSuggestions.length === 0 || modelSuggestions.includes(stored))) return stored;
+      const fallback = CODEX_SDK_MODEL_SUGGESTIONS[0];
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(fallback)) return fallback;
       if (transportModels.defaultModel && (modelSuggestions.length === 0 || modelSuggestions.includes(transportModels.defaultModel))) {
         return transportModels.defaultModel;
       }
-      return trimmed;
+      return modelSuggestions[0] ?? fallback;
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
@@ -375,7 +379,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                       <button
                         key={choice.id}
                         class={`subsession-type-btn${type === choice.id ? ' active' : ''}`}
-                        disabled={customProviderSdk && choice.id !== 'qwen'}
+                        disabled={customProviderSdk && choice.id !== 'claude-code-sdk'}
                         onClick={() => selectType(choice.id)}
                       >
                         <span>{choice.icon}</span> {getSessionAgentLabel(t, choice)}
@@ -432,7 +436,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 {t('new_session.custom_provider_sdk_help')}
               </div>
             </div>
-            <QwenCodingPlanHint selected={type === 'qwen'} />
+            <QwenCodingPlanHint selected={customProviderSdk || type === 'qwen'} />
           </div>
 
           {/* Script command (only for script type) */}
@@ -746,6 +750,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                     <option key={model} value={model} />
                   ))}
                 </datalist>
+              )}
+              {type === 'grok-sdk' && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.grok_prerequisite_error', { error: transportModels.error })}
+                </div>
               )}
             </div>
           )}

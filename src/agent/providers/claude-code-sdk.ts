@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { query, type PermissionMode, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { stripLeakedThink } from '../../util/strip-leaked-think.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
   TransportProvider,
@@ -61,6 +62,7 @@ const RESULT_COMPLETION_FALLBACK_MS = 5_000;
 const CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT = 2;
 const CONNECTION_CLOSED_CONTINUE_PROMPT = 'continue';
 const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
+const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
 // routine; the Cron* tools manage them) that bypass IM.codes entirely. We
@@ -159,6 +161,75 @@ interface ClaudeSdkSessionState {
   subagentTasks: Map<string, ClaudeTaskState>;
   emittedSubagentStates: Map<string, string>;
   lastStatusSignature: string | null;
+  /** Streaming-input channel for the live query (see SdkInputQueue). Lets a new
+   *  user message reach a query that is still open while only subagents run —
+   *  the single-shot `prompt: string` form could never accept one. */
+  inputQueue?: SdkInputQueue;
+}
+
+/**
+ * Push-based `AsyncIterable<SDKUserMessage>` for the Agent SDK's streaming-input
+ * mode (`query({ prompt: <asyncIterable> })`).
+ *
+ * WHY: with `prompt: string` the SDK closes its input after the single message,
+ * so `send()` had to reject with "already busy" whenever a query was still open.
+ * A Task subagent runs INSIDE the parent query, and closeSettledBackgroundQuery
+ * deliberately keeps that query open while subagents are active — so the exact
+ * window where the main agent is idle-but-waiting was also the window where no
+ * message could get in. This queue keeps the input channel open so a message can
+ * be pushed into the live query instead of being rejected (or forcing a close(),
+ * which would kill the subagents with it).
+ *
+ * The queue is never auto-ended: query teardown stays owned by the existing
+ * lifecycle (closeSettledBackgroundQuery / cancel / endSession), so single-shot
+ * behaviour is unchanged for turns that have no subagents.
+ */
+class SdkInputQueue implements AsyncIterable<SDKUserMessage> {
+  private readonly buffer: SDKUserMessage[] = [];
+  private pendingResolve: ((result: IteratorResult<SDKUserMessage>) => void) | null = null;
+  private ended = false;
+
+  push(text: string): void {
+    const message = {
+      type: 'user',
+      message: { role: 'user', content: text },
+      parent_tool_use_id: null,
+    } as SDKUserMessage;
+    const resolve = this.pendingResolve;
+    if (resolve) {
+      this.pendingResolve = null;
+      resolve({ value: message, done: false });
+      return;
+    }
+    this.buffer.push(message);
+  }
+
+  /** Close the input channel; the SDK ends the query once it drains. */
+  end(): void {
+    if (this.ended) return;
+    this.ended = true;
+    const resolve = this.pendingResolve;
+    if (resolve) {
+      this.pendingResolve = null;
+      resolve({ value: undefined as unknown as SDKUserMessage, done: true });
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    for (;;) {
+      const buffered = this.buffer.shift();
+      if (buffered) {
+        yield buffered;
+        continue;
+      }
+      if (this.ended) return;
+      const next = await new Promise<IteratorResult<SDKUserMessage>>((resolve) => {
+        this.pendingResolve = resolve;
+      });
+      if (next.done) return;
+      yield next.value;
+    }
+  }
 }
 
 interface ClaudeUsageSnapshot {
@@ -233,6 +304,12 @@ function makeMessageId(state: ClaudeSdkSessionState): string {
 
 function normalizeStatusName(status: string | undefined): string {
   return (status ?? '').replace(/[_\s-]+/g, '').toLowerCase();
+}
+
+function appendClaudeAuthRecoveryGuidance(message: string): string {
+  if (!/failed to authenticate|invalid authentication credentials|(?:api error:\s*)?401\b/i.test(message)) return message;
+  if (message.includes(CLAUDE_AUTH_RECOVERY_GUIDANCE)) return message;
+  return `${message}\n\n${CLAUDE_AUTH_RECOVERY_GUIDANCE}`;
 }
 
 function getSubagentStaleWithoutTerminalMs(): number {
@@ -452,6 +529,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return {
       status: 'current',
       activeWorkCount: activeToolCount + blockingSubagentCount + (backgroundActive ? 1 : 0),
+      // Subagent-only window: the main turn already settled and the query is held
+      // open ONLY for the subagents. They are real work (activeWorkCount above
+      // stays truthful, and closeSettledBackgroundQuery still needs it), but they
+      // are NOT turn work — reporting them here lets the runtime dispatch a new
+      // message instead of queueing it behind the subagent.
+      backgroundWorkCount: waitingForTaskNotification ? blockingSubagentCount : 0,
       activeToolCount,
       busyReasons,
       activityGeneration: state.runtimeActivityGeneration,
@@ -539,6 +622,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Claude SDK session: ${sessionId}`, false);
     }
     if (state.currentQuery) {
+      // Subagent-only idle: the main turn already settled and the query is being
+      // held open ONLY because subagents are still running (see
+      // closeSettledBackgroundQuery). The user sees an idle agent, so a message
+      // must get through — delivering it into the live query's streaming input
+      // is the only way that does not close the query and kill those subagents.
+      if (state.inputQueue && this.isSubagentOnlyIdle(state)) {
+        const queued = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+        state.runtimeActivityGeneration = queued.activityGeneration;
+        state.inputQueue.push(queued.assembledMessage);
+        return;
+      }
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Claude SDK session is already busy', true);
     }
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
@@ -661,7 +755,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       });
     };
 
-    const q = query({ prompt, options: options as any });
+    // Streaming-input mode: the first user message is pushed into a queue that
+    // stays open, so a later send() can reach this same query while it is still
+    // running subagents. Query teardown is unchanged (closeSettledBackgroundQuery
+    // / cancel / endSession still own it), so turns without subagents behave
+    // exactly as they did with the old `prompt: string` form.
+    const inputQueue = new SdkInputQueue();
+    inputQueue.push(prompt);
+    state.inputQueue = inputQueue;
+    const q = query({ prompt: inputQueue, options: options as any });
     const turnGeneration = ++state.turnGeneration;
     state.currentQuery = q;
     void this.consumeQuery(
@@ -749,6 +851,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         this.emitError(sessionId, pendingError);
       }
     }
+  }
+
+  // Third-party Anthropic-compatible reasoning models (e.g. MiniMax via a preset
+  // ANTHROPIC_BASE_URL) leak `<think>…</think>` into the assistant text. Strip it
+  // only for those sessions; real Claude uses proper thinking blocks and never
+  // puts `<think>` in text, so this leaves first-party output untouched.
+  private shouldStripLeakedThink(state: ClaudeSdkSessionState): boolean {
+    const base = state.env?.['ANTHROPIC_BASE_URL'];
+    return typeof base === 'string' && base.trim().length > 0;
   }
 
   private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage): void {
@@ -867,7 +978,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         const delta: MessageDelta = {
           messageId,
           type: 'text',
-          delta: state.currentText,
+          delta: this.shouldStripLeakedThink(state) ? stripLeakedThink(state.currentText) : state.currentText,
           role: 'assistant',
         };
         for (const cb of this.deltaCallbacks) cb(sessionId, delta);
@@ -915,7 +1026,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
         };
       }
-      const text = collectAssistantText(msg);
+      const rawAssistantText = appendClaudeAuthRecoveryGuidance(collectAssistantText(msg));
+      const text = this.shouldStripLeakedThink(state) ? stripLeakedThink(rawAssistantText) : rawAssistantText;
       const runtimeSubagentPayload = parseRuntimeSubagentTag(text);
       if (runtimeSubagentPayload) {
         this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
@@ -1012,9 +1124,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           : [];
         // Real claude-agent-sdk failures sometimes omit errors[] and expose the
         // only useful reason in the immediately preceding assistant diagnostic.
-        const details = sdkErrors.length > 0
+        const details = appendClaudeAuthRecoveryGuidance(sdkErrors.length > 0
           ? sdkErrors.join('; ')
-          : (state.currentText.trim() || 'Claude execution failed');
+          : (state.currentText.trim() || 'Claude execution failed'));
         const connectionClosed = this.isConnectionClosedMidResponseError(details);
         state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, connectionClosed, msg);
         if (connectionClosed) {
@@ -1037,7 +1149,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         sessionId,
         kind: 'text',
         role: 'assistant',
-        content: success.result,
+        content: typeof success.result === 'string' && this.shouldStripLeakedThink(state) ? stripLeakedThink(success.result) : success.result,
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
@@ -1489,6 +1601,22 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
     return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+  }
+
+  /**
+   * True when the main agent has settled its turn and the query is still open
+   * ONLY because subagents are running — the window closeSettledBackgroundQuery
+   * deliberately holds the query open for. From the user's side the agent looks
+   * idle, so `send()` treats this as sendable and pushes into the live query's
+   * streaming input rather than rejecting with "already busy".
+   *
+   * Deliberately provider-local: it reads Claude-SDK state only and never
+   * touches the shared runtime, so no other provider's idle detection can move.
+   */
+  private isSubagentOnlyIdle(state: ClaudeSdkSessionState): boolean {
+    if (!state.completed) return false; // main turn still producing
+    if (state.cancelled) return false;
+    return this.activeClaudeSubagentTasks(state).length > 0;
   }
 
   private closeSettledBackgroundQuery(sessionId: string, state: ClaudeSdkSessionState, reason: string): boolean {
@@ -1949,7 +2077,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private normalizeError(err: unknown): ProviderError {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = appendClaudeAuthRecoveryGuidance(err instanceof Error ? err.message : String(err));
     if (/ENOENT|not found|spawn .*claude/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Claude binary not found: ${message}`, false, err);
     }

@@ -16,6 +16,34 @@ describe('session-live-status', () => {
     expect(isRunningSessionState('running')).toBe(true);
   });
 
+  it('shows running immediately for a current optimistic send without trusting stale tail activity', () => {
+    const status = deriveSessionLiveStatus({
+      sessionState: 'idle',
+      pendingUserSend: true,
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: false,
+    });
+    expect(status.mode).toBe('running');
+    expect(status.visualMode).toBe('running');
+    expect(status.busy).toBe(true);
+    expect(status.sweep).toBe(true);
+
+    expect(deriveSessionLiveStatus({
+      sessionState: 'idle',
+      pendingUserSend: false,
+      activeTransportTurn: true,
+    }).visualMode).toBe('idle');
+  });
+
+  it('treats a permission wait as busy rather than idle', () => {
+    const status = deriveSessionLiveStatus({ sessionState: 'permission' });
+    expect(isRunningSessionState('permission')).toBe(true);
+    expect(status.mode).toBe('running');
+    expect(status.busy).toBe(true);
+    expect(status.sweep).toBe(true);
+  });
+
   it('prioritizes live tool and thinking signals over idle snapshots', () => {
     expect(deriveSessionLiveStatus({ sessionState: 'idle', activeToolCall: true }).mode).toBe('tool');
     expect(deriveSessionLiveStatus({ sessionState: 'idle', activeThinking: true }).mode).toBe('thinking');

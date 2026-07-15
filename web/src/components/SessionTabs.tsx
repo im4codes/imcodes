@@ -6,6 +6,7 @@ import { formatLabel } from '../format-label.js';
 import { getAgentBadgeConfig } from '../agent-display.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { isWorkingSessionState } from '@shared/session-activity-types.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -455,7 +456,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         const isBrain = s.role === 'brain';
         const isPinned = pinned.has(s.name);
         const hasAlert = idleAlerts?.has(s.name) ?? false;
-        const stateClass = s.state === 'running' || s.state === 'queued' ? 'busy' : s.state === 'idle' ? 'idle' : '';
+        const stateClass = isWorkingSessionState(s.state) ? 'busy' : s.state === 'idle' ? 'idle' : '';
         const classes = ['tab', isBrain ? 'brain' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;
 

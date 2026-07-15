@@ -174,6 +174,29 @@ describe('SessionSettingsDialog supervision', () => {
     }));
   });
 
+  it('offers GPT-5.6 in the Auto supervision model picker', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
+    changeSelect(screen.getAllByRole('combobox')[4]!, 'codex-sdk');
+    const modelSelect = screen.getAllByRole('combobox')[5] as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(modelSelect.options, (option) => option.value)).toContain('gpt-5.6');
+    });
+  });
+
   it('shows audit mode selection and persists the audit config', async () => {
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'claude-code-sdk',

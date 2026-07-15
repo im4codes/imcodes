@@ -36,6 +36,8 @@ interface UpgradeState {
 export interface RequestDaemonUpgradeInput {
   targetVersion?: unknown;
   source: DaemonUpgradeSource;
+  /** Controlled nodes consume image-embedded native artifacts, not npm. */
+  skipPublicationGate?: boolean;
   isDaemonReady: () => boolean;
   isStillCurrent?: () => boolean;
   send: (message: Record<string, unknown>) => void;
@@ -284,6 +286,11 @@ export class DaemonUpgradeCoordinator {
     input: RequestDaemonUpgradeInput,
     now: number,
   ): RequestDaemonUpgradeResult | null {
+    if (input.skipPublicationGate) {
+      state.publicationResumeInput = null;
+      state.publicationCallbackRegistered = false;
+      return null;
+    }
     state.publicationResumeInput = input;
     const publication = this.publicationGate.ensurePublished(
       state.targetVersion,

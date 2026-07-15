@@ -35,6 +35,14 @@ describe('shared-context-runtime-config', () => {
     expect(result.backupContextModel).toBe(getDefaultSharedContextModelForBackend('codex-sdk'));
   });
 
+  it('accepts GPT-5.6 for Codex-backed memory processing', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.6',
+    });
+    expect(result.primaryContextModel).toBe('gpt-5.6');
+  });
+
   it('keeps a configured backup backend by filling its default model when the model is omitted', () => {
     const result = normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'claude-code-sdk',
@@ -80,12 +88,23 @@ describe('shared-context-runtime-config', () => {
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
       primaryContextPreset: 'Should Not Persist',
-      backupContextBackend: 'claude-code-sdk',
+      backupContextBackend: 'openclaw',
       backupContextModel: 'haiku',
       backupContextPreset: 'Also Ignored',
     });
     expect(result.primaryContextPreset).toBeUndefined();
     expect(result.backupContextPreset).toBeUndefined();
+  });
+
+  it('keeps preset selections for claude-code-sdk (third-party CC SDK)', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'MiniMax-M3',
+      primaryContextPreset: 'minimax',
+    });
+    expect(result.primaryContextBackend).toBe('claude-code-sdk');
+    expect(result.primaryContextPreset).toBe('minimax');
+    expect(result.primaryContextModel).toBe('MiniMax-M3');
   });
 
   it('omits sdk fields when not provided', () => {

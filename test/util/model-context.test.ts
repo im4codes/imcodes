@@ -2,6 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { inferContextWindow, resolveContextWindow } from '../../src/util/model-context.js';
 
 describe('model context inference', () => {
+  it('maps GPT-5.6 aliases and variants to API input-budget 922k context', () => {
+    expect(inferContextWindow('gpt-5.6')).toBe(922_000);
+    expect(inferContextWindow('gpt-5.6-sol')).toBe(922_000);
+  });
+
   it('maps GPT-5.5 family to API input-budget 922k context', () => {
     expect(inferContextWindow('gpt-5.5')).toBe(922_000);
     expect(inferContextWindow('gpt5.5')).toBe(922_000);

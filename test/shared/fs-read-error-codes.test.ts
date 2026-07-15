@@ -22,6 +22,9 @@ import {
 const PRODUCTION_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx']);
 const ALLOWED_NON_FS_READ_LITERAL_FILES = new Map<string, ReadonlySet<string>>([
   ['server/src/routes/file-transfer.ts', new Set(['file_too_large'])],
+  // Machine-exec owns a separate versioned HTTP protocol whose
+  // `invalid_request` reason is unrelated to the fs-read wire contract.
+  ['server/src/routes/machine-exec.ts', new Set(['invalid_request'])],
   ['server/src/routes/session-mgmt.ts', new Set(['invalid_request', 'internal_error'])],
   ['server/src/routes/terminal.ts', new Set(['internal_error'])],
   ['server/src/ws/bridge.ts', new Set(['invalid_request'])],

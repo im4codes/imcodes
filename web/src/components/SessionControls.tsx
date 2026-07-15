@@ -17,6 +17,10 @@ import { AtPicker } from './AtPicker.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
+import { useMachines } from '../hooks/useMachines.js';
+import { insertMachineMarkerAtCaret } from '../util/machine-insert.js';
+import { buildMachineSendExtra } from '../util/machine-send.js';
+import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
@@ -932,7 +936,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
-  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases'>('choose');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode' | 'team' | 'aliases' | 'machines'>('choose');
   const atJustClosedRef = useRef(false);
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
@@ -944,6 +948,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `;name` never opens the inline alias picker (paste must not trigger).
   const aliasPasteSuppressRef = useRef(false);
+  // Inline `^` machine autocomplete — mirrors the inline `;` alias trigger, but
+  // for a `^^(name)` machine target marker. Offline machines are shown but
+  // non-selectable (skipped in nav + no-op select).
+  const [machinePickerOpen, setMachinePickerOpen] = useState(false);
+  const [machineQuery, setMachineQuery] = useState('');
+  const [machineHighlightIdx, setMachineHighlightIdx] = useState(0);
+  const machineJustClosedRef = useRef(false);
+  // Set for the input event immediately following a paste so pasted text ending
+  // in `^name` never opens the inline machine picker (paste must not trigger).
+  const machinePasteSuppressRef = useRef(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [thinkingOpen, setThinkingOpen] = useState(false);
@@ -988,6 +1002,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
   }, [queuedHiddenStorageKey]);
   const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<LocalQueuedTransportEntry[] | null>(null);
+  // Queue mutations are overlaid on top of the latest authoritative snapshot.
+  // Keep removals as explicit tombstones: representing a deletion only by
+  // omitting the item from `optimisticQueuedEntries` is insufficient when
+  // another queued item remains, because the render merge starts from the
+  // (temporarily stale) authoritative snapshot and would add the deleted item
+  // straight back. This was visible as "delete does nothing" with 2+ queued
+  // messages even though the daemon and SQLite deletion had succeeded.
+  const [optimisticallyRemovedQueuedIds, setOptimisticallyRemovedQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
@@ -1117,19 +1139,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     // Authoritative override: a message that reached the timeline is delivered,
     // so drop it from the queue even if a stale daemon snapshot still lists it.
-    if (settledQueuedIds.size === 0 && timelineSettledQueuedIds.size === 0) return merged;
+    if (
+      settledQueuedIds.size === 0
+      && timelineSettledQueuedIds.size === 0
+      && optimisticallyRemovedQueuedIds.size === 0
+    ) return merged;
     const filtered = merged.filter((entry) => (
       !settledQueuedIds.has(entry.clientMessageId)
       && !timelineSettledQueuedIds.has(entry.clientMessageId)
+      && !optimisticallyRemovedQueuedIds.has(entry.clientMessageId)
     ));
     return filtered.length === merged.length ? merged : filtered;
-  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, settledQueuedIds, timelineSettledQueuedIds]);
+  }, [incomingQueuedTransportEntries, optimisticQueuedEntries, optimisticallyRemovedQueuedIds, settledQueuedIds, timelineSettledQueuedIds]);
 
   // Settled ids and optimistic queue overlays are scoped to the active session.
   // Reset the local overlay on switch; canonical session/app state remains
   // responsible for retaining or clearing authoritative pending entries.
   useEffect(() => {
     setSettledQueuedIds(new Set());
+    setOptimisticallyRemovedQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
     setRealtimeQueueOverride(null);
     lastRealtimeEmptyQueueSnapshotRef.current = null;
@@ -1179,6 +1207,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     error: aliasError,
     refetch: refetchAliases,
   } = useAliases(aliasQuery);
+  // Shared machine data — feeds compose-time resolution on send (the out-of-band
+  // `resolvedMachines` hint) and the inline `^` autocomplete. `machineFiltered`
+  // is the refName+displayName filtered view for the current inline query;
+  // `machineAll` is the full list used to resolve markers at send time. Unlike
+  // aliases there is NO fail-closed gate: an unresolved `^^(name)` marker is left
+  // literal (a visible hint the server re-validates), so no loaded/error state is
+  // needed here.
+  const {
+    machines: machineAll,
+    filtered: machineFiltered,
+  } = useMachines(machineQuery);
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
@@ -1437,8 +1476,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
   const isCursorHeadless = activeSession?.agentType === 'cursor-headless';
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
+  const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isKimiSdk;
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isGrokSdk || isKimiSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1475,12 +1515,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (isKimiSdk) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
+    if (isGrokSdk) {
+      return dynamicTransportModels.models.map((m) => m.id);
+    }
     return [];
   }, [
     dynamicTransportModels.models,
     isCopilot,
     isCursorHeadless,
     isGeminiSdk,
+    isGrokSdk,
     isKimiSdk,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
@@ -1750,6 +1794,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           entries,
           version: patch.transportPendingMessageVersion,
         });
+        // Once an authoritative snapshot no longer contains an optimistically
+        // removed id, its deletion is fully reconciled and the tombstone can be
+        // discarded. Keep tombstones that are still present in a stale/equal
+        // snapshot so those cards cannot flash back into the UI.
+        const authoritativeIds = new Set(entries.map((entry) => entry.clientMessageId));
+        setOptimisticallyRemovedQueuedIds((prev) => {
+          if (prev.size === 0) return prev;
+          const next = new Set([...prev].filter((id) => authoritativeIds.has(id)));
+          return next.size === prev.size ? prev : next;
+        });
         if (entries.length === 0) {
           lastRealtimeEmptyQueueSnapshotRef.current = {
             sessionName: snapshotSessionName,
@@ -1814,6 +1868,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
         if (msg.status === 'error' || msg.status === 'conflict') {
           if (rollback) {
+            if (rollback.type === 'undo') {
+              setOptimisticallyRemovedQueuedIds((prev) => {
+                if (!prev.has(rollback.entry.clientMessageId)) return prev;
+                const next = new Set(prev);
+                next.delete(rollback.entry.clientMessageId);
+                return next;
+              });
+            }
             setOptimisticQueuedEntries((prev) => {
               const source = prev ?? realtimeQueueStateRef.current.incomingQueuedTransportEntries;
               if (rollback.type === 'edit') {
@@ -2193,6 +2255,40 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       el.focus();
     }
     insertAliasMarkerAtCaret(name);
+    const nextText = el ? readComposerElementText(el) : '';
+    setHasText(!!nextText.trim());
+    publishComposerText(nextText);
+    syncMobileComposerMetrics();
+  }, [publishComposerText, syncMobileComposerMetrics]);
+
+  /**
+   * Insert a `^^(refName)` machine marker at the caret via the shared helper
+   * (marker only; never resolves; never sends), mirroring `insertAliasMarker`.
+   * When the inline `^query` fragment is still present at the end of the composer
+   * (the inline `^` autocomplete path), it is stripped first so we don't leave a
+   * stray `^dep` before the inserted marker. Used by both the inline picker and
+   * the `@machine` category.
+   */
+  const insertMachineMarker = useCallback((refName: string) => {
+    const el = divRef.current;
+    if (el) {
+      const current = readComposerElementText(el);
+      // Strip a trailing inline `^query` fragment (the inline `^` autocomplete
+      // path), keeping any boundary whitespace. When no such fragment is present
+      // (the `@machine` path), the text is unchanged.
+      const stripped = stripInlineMachineTrigger(current);
+      setComposerElementText(el, stripped);
+      try {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+      } catch { /* jsdom lacks Selection API */ }
+      el.focus();
+    }
+    insertMachineMarkerAtCaret(refName);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
@@ -3043,8 +3139,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return null;
     }
     Object.assign(extra, buildAliasSendExtra(composerBody, aliasAll));
+    // Compose-time machine resolution (out-of-band `resolvedMachines` hint).
+    // Resolved against the user's own composed body only (parity with aliases).
+    // No fail-closed gate: an unresolved `^^(name)` marker stays literal/visible
+    // and is simply not resolved — the server re-validates every serverId.
+    Object.assign(extra, buildMachineSendExtra(composerBody, machineAll));
     return { text, extra, ...(delegation ? { delegation } : {}) };
-  }, [activeSession, aliasAll, aliasError, aliasLoaded, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, refetchAliases, rootSession, sessions, showSendWarning, subSessions, t]);
+  }, [activeSession, aliasAll, aliasError, aliasLoaded, machineAll, applySavedP2pConfigSelection, attachments, pendingDelegateTarget, executionRouting.enabled, executionRouting.templateSessionName, executionRouting.limits, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, refetchAliases, rootSession, sessions, showSendWarning, subSessions, t]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -3077,8 +3178,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return null;
     }
     Object.assign(extra, buildAliasSendExtra(cleanText, aliasAll));
+    // Compose-time machine resolution — same contract as buildSendPayload, no
+    // fail-closed gate (unresolved markers stay literal).
+    Object.assign(extra, buildMachineSendExtra(cleanText, machineAll));
     return { text: cleanText, extra };
-  }, [activeSession, aliasAll, aliasError, aliasLoaded, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, refetchAliases, sessions, showSendWarning, subSessions, t]);
+  }, [activeSession, aliasAll, aliasError, aliasLoaded, machineAll, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, refetchAliases, sessions, showSendWarning, subSessions, t]);
 
   const makeCommandId = useCallback(() => (
     globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -3136,6 +3240,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const escapeKeyboardOwnerOpen = atPickerOpen
     || aliasPickerOpen
+    || machinePickerOpen
     || quickOpen
     || modelOpen
     || autoOpen
@@ -3411,6 +3516,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     if (!mutationCommandId) return;
     queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
+    setOptimisticallyRemovedQueuedIds((prev) => {
+      if (prev.has(entry.clientMessageId)) return prev;
+      return new Set([...prev, entry.clientMessageId]);
+    });
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? incomingQueuedTransportEntries;
       return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
@@ -3630,7 +3739,63 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     }
 
+    // When the inline `^` machine picker is open, it owns Enter/Tab/Arrow/Escape,
+    // mirroring the alias picker. OFFLINE machines are shown but non-selectable:
+    // Arrow navigation skips them and Enter/Tab only accepts an online row.
+    if (machinePickerOpen) {
+      // Indices of the currently selectable (online) rows, in list order.
+      const onlineIdx = machineFiltered.reduce<number[]>((acc, m, i) => {
+        if (m.online) acc.push(i);
+        return acc;
+      }, []);
+      const stepMachine = (h: number, dir: 1 | -1): number => {
+        if (onlineIdx.length === 0) return h;
+        const pos = onlineIdx.indexOf(h);
+        if (pos === -1) return dir === 1 ? onlineIdx[0] : onlineIdx[onlineIdx.length - 1];
+        return onlineIdx[(pos + dir + onlineIdx.length) % onlineIdx.length];
+      };
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (onlineIdx.length > 0) setMachineHighlightIdx((h) => stepMachine(h, 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (onlineIdx.length > 0) setMachineHighlightIdx((h) => stepMachine(h, -1));
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setMachinePickerOpen(false);
+        setMachineQuery('');
+        return;
+      }
+      if ((e.key === 'Tab' || e.key === 'Enter') && onlineIdx.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        // Insert the highlighted row when it is online; otherwise snap to the
+        // first online row so an offline highlight never accidentally sends.
+        const effIdx = machineFiltered[machineHighlightIdx]?.online ? machineHighlightIdx : onlineIdx[0];
+        const chosen = machineFiltered[effIdx];
+        setMachinePickerOpen(false);
+        setMachineQuery('');
+        machineJustClosedRef.current = true;
+        setTimeout(() => { machineJustClosedRef.current = false; }, 150);
+        if (chosen) insertMachineMarker(chosen.refName);
+        return;
+      }
+    }
+
     if (e.key === 'Escape' && handleTransportEscapeCancel(e)) {
+      return;
+    }
+
+    // Block Enter right after the machine picker closes (the same Enter that
+    // accepted a row must not also send).
+    if (e.key === 'Enter' && machineJustClosedRef.current) {
+      e.preventDefault();
+      machineJustClosedRef.current = false;
       return;
     }
 
@@ -3850,9 +4015,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     // `execCommand('insertText')` fires a native `input` event; flag it so the
-    // inline `;` alias trigger is skipped for this paste-driven input (paste
-    // must never open the alias picker).
+    // inline `;` alias and `^` machine triggers are skipped for this paste-driven
+    // input (paste must never open either picker).
     aliasPasteSuppressRef.current = true;
+    machinePasteSuppressRef.current = true;
     document.execCommand('insertText', false, text);
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
@@ -5022,6 +5188,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             sessionCwd={activeSession?.projectDir}
             onAppendPaths={appendToInput}
             onInsertAlias={insertAliasMarker}
+            machines={machineAll}
+            onInsertMachine={insertMachineMarker}
             anchorRef={quickWrapRef}
           />
         </div>
@@ -5187,6 +5355,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               insertAliasMarker(name);
             }}
+            onSelectMachine={(refName) => {
+              // @machine → strip the trailing `@query` fragment, then insert the
+              // `^^(refName)` marker via the shared helper (marker only).
+              const text = divRef.current ? readComposerElementText(divRef.current) : '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              if (divRef.current) setComposerElementText(divRef.current, before);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              insertMachineMarker(refName);
+            }}
             p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
@@ -5232,6 +5420,75 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             })}
           </div>
         )}
+
+        {/* Inline `^` machine autocomplete dropdown. Mirrors the alias dropdown;
+            owns Enter/Tab/Arrow/Escape via handleKeyDown while open. Offline
+            machines are shown but dimmed + non-selectable (skipped in nav and a
+            no-op on select) — the marker is a visible hint, the server
+            re-validates the target. */}
+        {machinePickerOpen && activeSession && (() => {
+          // Keep the rendered highlight on a selectable (online) row: if the
+          // stored highlight lands on an offline machine (or is out of range),
+          // fall back to the first online row so the picker never visibly
+          // highlights something the user cannot pick.
+          const firstOnline = machineFiltered.findIndex((m) => m.online);
+          const effHighlight = machineFiltered[machineHighlightIdx]?.online ? machineHighlightIdx : firstOnline;
+          return (
+            <div class="controls-machine-picker" role="listbox" aria-label={t('machine.category')} style={aliasPickerContainerStyle}>
+              <div style={aliasPickerGroupLabelStyle}>
+                {t('machine.category')} {machineQuery ? `— "${machineQuery}"` : ''}
+              </div>
+              {machineFiltered.length === 0 && (
+                <div style={aliasPickerEmptyStyle}>
+                  {machineQuery ? t('machine.no_results') : t('machine.empty')}
+                </div>
+              )}
+              {machineFiltered.map((m, idx) => {
+                const hl = idx === effHighlight;
+                const selectable = m.online;
+                return (
+                  <div
+                    key={m.serverId}
+                    role="option"
+                    aria-selected={hl ? 'true' : 'false'}
+                    aria-disabled={selectable ? undefined : 'true'}
+                    data-machine-ref={m.refName}
+                    data-machine-online={m.online ? 'true' : 'false'}
+                    data-hl={hl ? 'true' : undefined}
+                    style={{
+                      ...(hl ? aliasPickerItemHighlightStyle : aliasPickerItemStyle),
+                      ...(selectable ? {} : { color: '#64748b', cursor: 'not-allowed', opacity: 0.65 }),
+                    }}
+                    // Use mousedown so selecting doesn't blur the composer first.
+                    // Offline machines are non-selectable — the handler is a no-op.
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      if (!selectable) return;
+                      setMachinePickerOpen(false);
+                      setMachineQuery('');
+                      insertMachineMarker(m.refName);
+                    }}
+                    onMouseEnter={() => { if (selectable) setMachineHighlightIdx(idx); }}
+                  >
+                    <span
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: '50%',
+                        flexShrink: 0,
+                        background: m.online ? '#22c55e' : '#64748b',
+                      }}
+                      title={m.online ? undefined : t('machine.offline')}
+                    />
+                    <span style={{ fontWeight: 500, color: selectable ? '#e2e8f0' : '#64748b' }}>{m.displayName}</span>
+                    <span style={aliasPickerDimStyle}>{m.refName}</span>
+                    {!m.online && <span style={aliasPickerDimStyle}>{t('machine.offline_hint')}</span>}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
 
         {/*
           contenteditable div — iOS does NOT show the password/keychain autofill bar
@@ -5332,6 +5589,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               } else if (aliasPickerOpen) {
                 setAliasPickerOpen(false);
                 setAliasQuery('');
+              }
+
+              // Inline `^` machine autocomplete. Independent of the `@`/`;`
+              // triggers. Suppressed during IME composition and on the input
+              // event immediately following a paste (both must not open it).
+              const machinePasteSuppressed = machinePasteSuppressRef.current;
+              machinePasteSuppressRef.current = false;
+              const machineTrigger = (imeComposingRef.current || machinePasteSuppressed)
+                ? null
+                : matchInlineMachineTrigger(text);
+              if (machineTrigger !== null && !doubleAt) {
+                setMachineQuery(machineTrigger);
+                setMachineHighlightIdx(0);
+                setMachinePickerOpen(true);
+              } else if (machinePickerOpen) {
+                setMachinePickerOpen(false);
+                setMachineQuery('');
               }
             }}
             onKeyDown={handleKeyDown}

@@ -50,6 +50,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
   });
 
   it('defaults to claude-code-sdk and renders transport/process groups separately', () => {
@@ -120,7 +121,10 @@ describe('StartSubSessionDialog', () => {
     fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.6',
+      thinking: 'high',
+    });
   });
 
   it('locks sub-session cwd to the current directory', () => {
@@ -167,6 +171,31 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('replaces the Claude default with GPT-5.6 when switching to codex-sdk', async () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+    const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    await waitFor(() => expect(modelInput.value).toBe('gpt-5.6'));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'gpt-5.6',
+      thinking: 'high',
+    });
+  });
+
   it('starts qoder-sdk sub-sessions without proof-gated model or thinking extras', () => {
     const onStart = vi.fn();
     render(
@@ -209,7 +238,7 @@ describe('StartSubSessionDialog', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('does not show CC preset controls for claude-code-sdk sub-sessions', () => {
+  it('shows CC preset controls and passes preset for claude-code-sdk sub-sessions (default)', () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -234,7 +263,20 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    expect(screen.queryByText('api_provider')).toBeNull();
+    // Default sub-session type is claude-code-sdk, which now runs third-party CC presets via the CC SDK transport.
+    expect(screen.getByText('api_provider')).toBeDefined();
+
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    presetSelect!.value = 'MiniMax';
+    fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith(
+      'claude-code-sdk', undefined, '/tmp', undefined,
+      expect.objectContaining({ ccPreset: 'MiniMax' }),
+    );
   });
 
   it('shows the qwen provider-specific hint for qwen sub-sessions', async () => {
@@ -302,7 +344,7 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('custom provider SDK locks sub-sessions to qwen and passes the selected preset', async () => {
+  it('custom provider SDK locks sub-sessions to claude-code-sdk and passes the selected preset', async () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -334,17 +376,15 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /qwen/i }).className).toContain('active'));
+    await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
     expect((screen.getByRole('button', { name: /codex_sdk/i }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
       ccPreset: 'MiniMax',
-      requestedModel: 'MiniMax-M2.7',
-      thinking: 'high',
-    });
+    }));
   });
 
   it('shows a toast when qwen sub-session preset JSON is copied to the clipboard', async () => {
@@ -509,6 +549,29 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'moonshot-v1-auto,thinking',
+    });
+  });
+
+  it('passes a dynamically selected model for grok-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /grok_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'grok-build' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('grok-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'grok-build',
     });
   });
 

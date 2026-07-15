@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
   archiveMemory,
+  claimContextJob,
   deleteMemory,
   clearDirtyTarget,
   enqueueContextJob,
@@ -227,6 +228,14 @@ describe('context-store', () => {
       pendingJobId: first.id,
       lastTrigger: 'idle',
     }));
+  });
+
+  it('allows a materialization job to be claimed exactly once', () => {
+    recordContextEvent({ target, eventType: 'user.turn', createdAt: 10 });
+    const job = enqueueContextJob(target, 'materialize_session', 'threshold', 30);
+
+    expect(claimContextJob(job.id, 40)).toBe(true);
+    expect(claimContextJob(job.id, 50)).toBe(false);
   });
 
   it('estimates staged token upper bound without hydrating staged event rows', () => {

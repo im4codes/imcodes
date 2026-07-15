@@ -86,6 +86,7 @@ export const CONTEXT_STORE_L1_OPS = [
   // writes / mutations
   'recordContextEvent',
   'enqueueContextJob',
+  'claimContextJob',
   'updateContextJob',
   'deleteStagedEventsByIds',
   'deleteTentativeProjections',

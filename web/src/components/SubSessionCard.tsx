@@ -32,6 +32,8 @@ import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
+import { useMachines } from '../hooks/useMachines.js';
+import { buildMachineSendExtra } from '../util/machine-send.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -45,6 +47,7 @@ const TYPE_ICON: Record<string, string> = {
   'qwen': '千',
   'gemini': '♊',
   'gemini-sdk': '♊',
+  'grok-sdk': '𝕏',
   'kimi-sdk': '月',
   'shell': '🐚',
   'script': '🔄',
@@ -129,6 +132,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // (audit finding Cx1-2). The value map rides out-of-band in `extra`; markers
   // in the text are never expanded client-side.
   const { aliases: aliasAll, loaded: aliasLoaded, error: aliasError } = useAliases();
+  // Shared machine data so the compact card resolves `^^(name)` markers to the
+  // out-of-band `resolvedMachines` hint the same way SessionControls does. No
+  // fail-closed gate (unlike aliases): an unresolved marker stays literal.
+  const { machines: machineAll } = useMachines();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const [timelineHydrated, setTimelineHydrated] = useState(() => isOpen || isFocused === true);
@@ -242,10 +249,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       return;
     }
     const aliasExtra = buildAliasSendExtra(text, aliasAll);
+    // Machine resolution rides alongside the alias map. No fail-closed check:
+    // an unresolved `^^(name)` marker is left literal (the server re-validates).
+    const machineExtra = buildMachineSendExtra(text, machineAll);
     const commandId = globalThis.crypto?.randomUUID?.()
       ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     try {
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, ...aliasExtra, commandId });
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, ...aliasExtra, ...machineExtra, commandId });
       requestActiveTimelineRefreshAfterUserAction();
     } catch (err) {
       console.warn('sub-session send failed; preserving draft for retry', err);
@@ -262,7 +272,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     }
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, ws, connected, sub.sessionName, forceFollowLatest]);
+  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in

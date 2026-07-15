@@ -87,7 +87,10 @@ export function getDefaultSharedContextModelForBackend(backend: SharedContextRun
 }
 
 export function doesSharedContextBackendSupportPresets(backend: SharedContextRuntimeBackend | null | undefined): boolean {
-  return backend === 'qwen';
+  // Anthropic-compatible third-party presets (ANTHROPIC_BASE_URL/API_KEY/MODEL)
+  // run either through the Qwen OpenAI-compat transport or natively on the
+  // Claude Code SDK. The CC SDK path is preferred (it strips leaked <think>).
+  return backend === 'qwen' || backend === 'claude-code-sdk';
 }
 
 export function isKnownSharedContextModelForBackend(
@@ -99,7 +102,12 @@ export function isKnownSharedContextModelForBackend(
   if (!trimmed) return false;
   switch (backend) {
     case 'claude-code-sdk':
-      return CLAUDE_CODE_MODEL_IDS.includes(trimmed as typeof CLAUDE_CODE_MODEL_IDS[number]);
+      // A preset pins the model its third-party endpoint serves (e.g.
+      // MiniMax-M3), which won't be in the built-in Claude model list — accept
+      // any non-empty model when a preset is active, mirroring the qwen case.
+      return preset?.trim()
+        ? true
+        : CLAUDE_CODE_MODEL_IDS.includes(trimmed as typeof CLAUDE_CODE_MODEL_IDS[number]);
     case 'codex-sdk':
       return CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number]);
     case 'qwen':

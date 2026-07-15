@@ -9,6 +9,7 @@ import {
   type McpRuntimeCaller,
 } from './memory-mcp-caller.js';
 import { registerAliasMcpTools, registerMemoryMcpTools, type MemoryMcpToolDeps } from './memory-mcp-tools.js';
+import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
 import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
@@ -80,6 +81,11 @@ async function postHookSend(port: number, body: Record<string, unknown>, hookPat
 export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps): MemoryMcpToolDeps {
   return {
     ...toolDeps,
+    // FULL-node machine tools relay through the daemon's own bound credential.
+    // An injected override (tests) wins; otherwise the daemon default is used.
+    // This stdio MCP server only runs on FULL nodes, so the tools are advertised
+    // (a controlled node never starts it — see registerMemoryMcpTools gate).
+    machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps(),
     sendDeps: {
       ...toolDeps.sendDeps,
       // Production stdio MCP consults the daemon's static capability

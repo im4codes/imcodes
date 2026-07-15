@@ -1,6 +1,6 @@
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
-import { isAuthoritativeCleanIdlePayload, reduceTimelineActivity } from '../../shared/session-activity-types.js';
+import { isAuthoritativeCleanIdlePayload, isWorkingSessionState, reduceTimelineActivity } from '../../shared/session-activity-types.js';
 
 const RUNNING_TIMELINE_EVENT_TYPES = new Set<TimelineEvent['type']>([
   'assistant.thinking',
@@ -61,6 +61,18 @@ export function isPendingUserMessageTimelineEvent(
   return event.type === 'user.message' && event.payload?.pending === true;
 }
 
+/**
+ * Client-owned dispatch evidence used for immediate send feedback. Unlike a
+ * stale thinking/tool tail, an unresolved optimistic user message represents
+ * work the current browser has actually submitted and is still tracking.
+ */
+export function hasPendingUserSend(events: TimelineTailEvent[]): boolean {
+  return events.some((event) => (
+    isPendingUserMessageTimelineEvent(event)
+    && event.payload?.failed !== true
+  ));
+}
+
 export function hasActiveTimelineTurn(
   events: TimelineTailEvent[],
 ): boolean {
@@ -73,7 +85,7 @@ export function hasActiveTimelineTurn(
     }
     if (event.type === 'session.state') {
       const state = String(event.payload?.state ?? '');
-      return state === 'running' || state === 'queued';
+      return isWorkingSessionState(state);
     }
     if (isPendingUserMessageTimelineEvent(event)) continue;
     if (event.type === 'user.message') {

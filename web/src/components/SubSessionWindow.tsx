@@ -18,7 +18,7 @@ import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
-import { hasActiveTimelineTurn } from '../timeline-running.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../timeline-running.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
@@ -302,6 +302,7 @@ export function SubSessionWindow({
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
   const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
+  const pendingUserSend = useMemo(() => hasPendingUserSend(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
   const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
@@ -993,6 +994,7 @@ export function SubSessionWindow({
           statusText={statusText}
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
+          pendingUserSend={pendingUserSend}
           transportActivityDetail={transportActivityDetail}
           sessionError={sessionInfo?.error}
           now={thinkingNow}

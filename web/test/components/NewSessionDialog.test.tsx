@@ -105,18 +105,19 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 9)).toEqual([
+    expect(options.slice(0, 10)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
       'copilot-sdk',
       'cursor-headless',
       'gemini-sdk',
+      'grok-sdk',
       'kimi-sdk',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(9)).toEqual([
+    expect(options.slice(10)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -400,17 +401,22 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     agentTypeSelect.value = 'codex-sdk';
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
+    await waitFor(() => {
+      const modelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
+      expect(modelSelect.value).toBe('gpt-5.6');
+    });
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[1], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'codex-sdk',
+      requestedModel: 'gpt-5.6',
       thinking: 'high',
     }));
   });
 
-  it('does not show CC preset controls for claude-code-sdk', () => {
+  it('shows CC preset controls and submits preset for claude-code-sdk (default)', () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -424,7 +430,23 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    expect(screen.queryByText('api_provider')).toBeNull();
+    // Default agent type is claude-code-sdk, which now runs third-party CC presets via the CC SDK transport.
+    expect(screen.getByText('api_provider')).toBeDefined();
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options ?? []).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    presetSelect!.value = 'MiniMax';
+    fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+    }));
   });
 
   it('shows CC preset controls and submits preset for qwen', async () => {
@@ -469,7 +491,7 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('custom provider SDK locks the main-session agent to qwen and uses a preset', async () => {
+  it('custom provider SDK locks the main-session agent to claude-code-sdk and uses a preset', async () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -491,7 +513,7 @@ describe('NewSessionDialog', () => {
     const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(agentTypeSelect.value).toBe('qwen'));
+    await waitFor(() => expect(agentTypeSelect.value).toBe('claude-code-sdk'));
     expect(agentTypeSelect.disabled).toBe(true);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
 
@@ -500,10 +522,8 @@ describe('NewSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'qwen',
+      agentType: 'claude-code-sdk',
       ccPreset: 'MiniMax',
-      requestedModel: 'MiniMax-M2.7',
-      thinking: 'high',
     }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'custom-provider-sdk',
@@ -765,5 +785,59 @@ describe('NewSessionDialog', () => {
       agentType: 'kimi-sdk',
       requestedModel: 'moonshot-v1-auto,thinking',
     }));
+  });
+
+  it('uses dynamically discovered grok-sdk models when starting a session', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'grok-sdk' } });
+
+    await waitFor(() => expect(ws.send.mock.calls.some((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'grok-sdk'
+    ))).toBe(true));
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'grok-sdk'
+    ))?.[0];
+    expect(request).toMatchObject({ force: true });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'grok-sdk',
+      requestId: request?.requestId,
+      models: [{ id: 'grok-build', name: 'Grok Build' }],
+      defaultModel: 'grok-build',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'grok-build' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'grok-build' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'grok-sdk',
+      requestedModel: 'grok-build',
+    }));
+  });
+
+  it('shows an actionable Grok prerequisite error returned by the daemon', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'grok-sdk' } });
+    await waitFor(() => expect(ws.send.mock.calls.some((call) => call[0]?.agentType === 'grok-sdk')).toBe(true));
+    const request = ws.send.mock.calls.find((call) => call[0]?.agentType === 'grok-sdk')?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'grok-sdk',
+      requestId: request?.requestId,
+      models: [],
+      isAuthenticated: false,
+      error: 'Grok authentication is required. Run `grok login`.',
+    }));
+    expect((await screen.findByRole('alert')).textContent).toContain('grok_prerequisite_error');
   });
 });

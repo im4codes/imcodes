@@ -1,4 +1,7 @@
 export const OPENAI_CONTEXT_WINDOWS = {
+  // GPT-5.6 Sol has a 1,050,000-token total context window and 128,000 max
+  // output tokens. As with GPT-5.5, this fallback is its prompt/input budget.
+  GPT_56: 922_000,
   // OpenAI's API model table lists gpt-5.5 with a 1,050,000-token
   // total context window and 128,000 max output tokens. The generic UI meter
   // tracks prompt/input occupancy, so the API-style fallback input budget is
@@ -37,6 +40,10 @@ function isGpt55Model(model: string): boolean {
   return /^gpt[-_ ]?5\.5(?:$|[-_.\s(])/.test(model);
 }
 
+function isGpt56Model(model: string): boolean {
+  return /^gpt[-_ ]?5\.6(?:$|[-_.\s(])/.test(model);
+}
+
 function isGpt54Model(model: string): boolean {
   return /^gpt[-_ ]?5\.4(?:$|[-_.\s(])/.test(model);
 }
@@ -46,6 +53,7 @@ export function inferContextWindow(model?: string | null): number | undefined {
   const m = model?.toLowerCase().trim();
   if (!m) return undefined;
 
+  if (isGpt56Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_56;
   if (isGpt55Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_55;
   if (isGpt54Model(m)) return OPENAI_CONTEXT_WINDOWS.GPT_54;
 

@@ -35,6 +35,16 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  REMOTE_EXEC_MAX_CHUNK_BYTES,
+  REMOTE_EXEC_MAX_ERROR_BYTES,
+  REMOTE_EXEC_MAX_OUTPUT_BYTES,
+} from '../../shared/remote-exec.js';
+import {
+  cancelPendingExec,
+  machineExecRegistryStats,
+  registerPendingExec,
+} from '../src/ws/machine-exec-registry.js';
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────────
 
@@ -135,9 +145,13 @@ function packFrame(sessionName: string, payload: Buffer): Buffer {
 
 // ── Mock DB ────────────────────────────────────────────────────────────────────
 
-function makeDb(tokenHash: string) {
+function makeDb(tokenHash: string, nodeRole: 'full' | 'controlled' = 'full') {
   const db = {
-    queryOne: async () => ({ token_hash: tokenHash }),
+    queryOne: async () => ({
+      token_hash: tokenHash,
+      node_role: nodeRole,
+      revoked_at: null,
+    }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
     exec: async () => {},
@@ -440,6 +454,22 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+    });
+
+    it('sends controlled-node artifact upgrades without waiting for npm publication', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.7.1234-dev.5'))).toBe(true);
     });
 
     it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {
@@ -946,6 +976,173 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(daemonWs.sentStrings.some((s) => s.includes('daemon.upgrade'))).toBe(false);
+    });
+
+    it('drops MACHINE_EXEC sent via generic sendToDaemon even when the daemon is connected (no bypass of trySendMachineExec)', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      // Generic path must NEVER carry a one-shot exec — connected or not.
+      bridge.sendToDaemon(JSON.stringify({ type: 'machine.exec', correlationId: 'c1', command: 'id' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((s) => s.includes('machine.exec'))).toBe(false);
+
+      // The generation-bound send DOES deliver it on the current generation…
+      const gen = bridge.daemonConnectionGeneration();
+      expect(bridge.trySendMachineExec(JSON.stringify({ type: 'machine.exec', correlationId: 'c2', command: 'id' }), gen)).toBe('sent');
+      expect(daemonWs.sentStrings.some((s) => s.includes('"correlationId":"c2"'))).toBe(true);
+
+      // …but refuses a stale generation (would be a late cross-generation exec).
+      daemonWs.sent.length = 0;
+      expect(bridge.trySendMachineExec(JSON.stringify({ type: 'machine.exec', correlationId: 'c3', command: 'id' }), gen + 1)).toBe('generation_changed');
+      expect(daemonWs.sentStrings.some((s) => s.includes('"correlationId":"c3"'))).toBe(false);
+    });
+
+    it('trySendMachineExec reports offline (never queues) when the daemon is not connected', () => {
+      const bridge = WsBridge.get(serverId);
+      expect(bridge.trySendMachineExec(JSON.stringify({ type: 'machine.exec', correlationId: 'c4', command: 'id' }), 0)).toBe('offline');
+    });
+  });
+
+  describe('machine exec result trust boundary', () => {
+    async function setupResultBridge(nodeRole: 'full' | 'controlled') {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash', nodeRole), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(true);
+      return { bridge, daemonWs, generation: bridge.daemonConnectionGeneration() };
+    }
+
+    const validResult = (correlationId: string, overrides: Record<string, unknown> = {}) => ({
+      type: DAEMON_MSG.MACHINE_EXEC_RESULT,
+      correlationId,
+      ok: true,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+      durationMs: 1,
+      ...overrides,
+    });
+
+    const validChunk = (correlationId: string, overrides: Record<string, unknown> = {}) => ({
+      type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
+      correlationId,
+      seq: 0,
+      stream: 'stdout',
+      chunk: 'hello',
+      ...overrides,
+    });
+
+    it('delivers valid CONTROLLED chunks in order before the terminal result', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const correlationId = 'valid-live-output';
+      const chunks: Array<{ seq: number; stream: string; chunk: string }> = [];
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000, (chunk) => chunks.push(chunk));
+
+      daemonWs.emit('message', JSON.stringify(validChunk(correlationId, { chunk: 'first' })));
+      daemonWs.emit('message', JSON.stringify(validChunk(correlationId, { seq: 1, stream: 'stderr', chunk: 'warn' })));
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, { stdout: 'first', stderr: 'warn' })));
+
+      await expect(pending).resolves.toMatchObject({ ok: true, stdout: 'first', stderr: 'warn' });
+      expect(chunks).toEqual([
+        { seq: 0, stream: 'stdout', chunk: 'first' },
+        { seq: 1, stream: 'stderr', chunk: 'warn' },
+      ]);
+    });
+
+    it('drops malformed and oversized CONTROLLED chunks without settling the pending exec', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const invalidFrames = [
+        validChunk('bad-seq', { seq: -1 }),
+        validChunk('bad-stream', { stream: 'combined' }),
+        validChunk('empty-chunk', { chunk: '' }),
+        validChunk('large-chunk', { chunk: 'x'.repeat(REMOTE_EXEC_MAX_CHUNK_BYTES + 1) }),
+        validChunk('identity-field', { userId: 'forged-user' }),
+      ];
+      const invalidBefore = WsBridge.invalidMachineExecChunksDropped;
+      const controlledBefore = WsBridge.controlledInboundDropped;
+
+      for (const frame of invalidFrames) {
+        const correlationId = frame.correlationId;
+        const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+        daemonWs.emit('message', JSON.stringify(frame));
+        await flushAsync();
+        expect(cancelPendingExec(correlationId)).toBe(true);
+        await expect(pending).resolves.toBeNull();
+      }
+
+      expect(WsBridge.invalidMachineExecChunksDropped - invalidBefore).toBe(invalidFrames.length);
+      expect(WsBridge.controlledInboundDropped - controlledBefore).toBe(invalidFrames.length);
+    });
+
+    it('drops malformed, oversized, and identity-injecting CONTROLLED results before pending resolution', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const invalidFrames = [
+        validResult('bad-types', { ok: 'true' }),
+        validResult('bad-exit-code', { exitCode: 0.5 }),
+        validResult('bad-stdout-type', { stdout: 7 }),
+        validResult('bad-duration', { durationMs: -1 }),
+        validResult('bad-timeout-flag', { timedOut: 'false' }),
+        validResult('large-stdout', { stdout: 'x'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES + 1) }),
+        validResult('large-stderr', { stderr: 'x'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES + 1) }),
+        validResult('large-error', { ok: false, exitCode: null, error: 'x'.repeat(REMOTE_EXEC_MAX_ERROR_BYTES + 1) }),
+        validResult('identity-field', { serverId: 'attacker-selected-target' }),
+      ];
+      const invalidBefore = WsBridge.invalidMachineExecResultsDropped;
+      const controlledBefore = WsBridge.controlledInboundDropped;
+
+      for (const frame of invalidFrames) {
+        const correlationId = frame.correlationId;
+        const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+        const inFlightBefore = machineExecRegistryStats().inFlight;
+        daemonWs.emit('message', JSON.stringify(frame));
+        await flushAsync();
+
+        // Invalid bytes never settle/remove the HTTP pending RPC. Clean it up
+        // explicitly so the test does not leak a minute-long timer.
+        expect(machineExecRegistryStats().inFlight).toBe(inFlightBefore);
+        expect(cancelPendingExec(correlationId)).toBe(true);
+        await expect(pending).resolves.toBeNull();
+      }
+
+      expect(WsBridge.invalidMachineExecResultsDropped - invalidBefore).toBe(invalidFrames.length);
+      expect(WsBridge.controlledInboundDropped - controlledBefore).toBe(invalidFrames.length);
+    });
+
+    it('accepts a valid CONTROLLED result at the exact stdout/stderr byte boundary', async () => {
+      const { daemonWs, generation } = await setupResultBridge('controlled');
+      const correlationId = 'valid-byte-boundary';
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, {
+        stdout: 'a'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+        stderr: 'b'.repeat(REMOTE_EXEC_MAX_OUTPUT_BYTES),
+        truncated: true,
+      })));
+
+      const result = await pending;
+      expect(Buffer.byteLength(result?.stdout ?? '', 'utf8')).toBe(REMOTE_EXEC_MAX_OUTPUT_BYTES);
+      expect(Buffer.byteLength(result?.stderr ?? '', 'utf8')).toBe(REMOTE_EXEC_MAX_OUTPUT_BYTES);
+      expect(result?.truncated).toBe(true);
+    });
+
+    it('applies the same validator to FULL-node compatibility results', async () => {
+      const { daemonWs, generation } = await setupResultBridge('full');
+      const correlationId = 'full-invalid-result';
+      const pending = registerPendingExec(serverId, correlationId, generation, 60_000);
+      const invalidBefore = WsBridge.invalidMachineExecResultsDropped;
+
+      daemonWs.emit('message', JSON.stringify(validResult(correlationId, { userId: 'forged-user' })));
+      await flushAsync();
+
+      expect(WsBridge.invalidMachineExecResultsDropped).toBe(invalidBefore + 1);
+      expect(cancelPendingExec(correlationId)).toBe(true);
+      await expect(pending).resolves.toBeNull();
     });
   });
 

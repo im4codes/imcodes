@@ -30,8 +30,19 @@ const sdkMock = vi.hoisted(() => {
   let waitForClose = false;
   let interruptNeverResolves = false;
   const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
-  const query = vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-    const run = { prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
+  // The provider drives the SDK in streaming-input mode, so `prompt` is an
+  // AsyncIterable<SDKUserMessage>, not a string — that is what lets a message
+  // reach a query still running subagents. This mock stands in for the SDK, so it
+  // resolves the queue to the user text the SDK would read, keeping `run.prompt`
+  // a string for every assertion below.
+  const readPromptText = (prompt: unknown): string => {
+    if (typeof prompt === 'string') return prompt;
+    const buffered = (prompt as { buffer?: Array<{ message?: { content?: unknown } }> })?.buffer?.[0];
+    const content = buffered?.message?.content;
+    return typeof content === 'string' ? content : '';
+  };
+  const query = vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+    const run = { prompt: readPromptText(prompt), options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
     async function* gen() {
       for (const message of nextMessages) yield message;
@@ -60,6 +71,7 @@ const sdkMock = vi.hoisted(() => {
   return {
     query,
     runs,
+    readPromptText,
     setNextMessages(messages: any[]) { nextMessages = messages; },
     setWaitForClose(value: boolean) { waitForClose = value; },
     setInterruptNeverResolves(value: boolean) { interruptNeverResolves = value; },
@@ -444,8 +456,8 @@ describe('ClaudeCodeSdkProvider', () => {
     };
 
     sdkMock.query
-      .mockImplementationOnce(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-        sdkMock.runs.push({ prompt, options, closed: false, interrupted: false });
+      .mockImplementationOnce(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+        sdkMock.runs.push({ prompt: sdkMock.readPromptText(prompt), options, closed: false, interrupted: false });
         return makeIterator([
           {
             type: 'result',
@@ -456,8 +468,8 @@ describe('ClaudeCodeSdkProvider', () => {
           },
         ]);
       })
-      .mockImplementationOnce(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-        sdkMock.runs.push({ prompt, options, closed: false, interrupted: false });
+      .mockImplementationOnce(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
+        sdkMock.runs.push({ prompt: sdkMock.readPromptText(prompt), options, closed: false, interrupted: false });
         return makeIterator([
           { type: 'system', subtype: 'init', session_id: 'session-missing', model: 'claude-sonnet-4-6' },
           { type: 'result', session_id: 'session-missing', subtype: 'success', is_error: false, result: 'ACK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
@@ -516,9 +528,20 @@ describe('ClaudeCodeSdkProvider', () => {
       iterator.stopTask = async (taskId: string) => { run.stoppedTasks.push(taskId); };
       return { run, iterator };
     };
-    const queueRun = (messages: any[], waitForClose: boolean) => ({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+    // The provider now drives the SDK in streaming-input mode, so `prompt` is an
+    // AsyncIterable<SDKUserMessage> rather than a string (this is what lets a
+    // message reach a query that is still running subagents). This mock stands in
+    // for the SDK, so it resolves the queue to the user text the SDK would read —
+    // keeping `run.prompt` a string for the assertions below.
+    const readPromptText = (prompt: unknown): string => {
+      if (typeof prompt === 'string') return prompt;
+      const buffered = (prompt as { buffer?: Array<{ message?: { content?: unknown } }> })?.buffer?.[0];
+      const content = buffered?.message?.content;
+      return typeof content === 'string' ? content : '';
+    };
+    const queueRun = (messages: any[], waitForClose: boolean) => ({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
       const { run, iterator } = makeIterator(messages, waitForClose);
-      run.prompt = prompt;
+      run.prompt = readPromptText(prompt);
       run.options = options;
       sdkMock.runs.push(run);
       return iterator;
@@ -555,6 +578,44 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs.slice(1).every((run) => run.options.resume === 'session-connection-retry')).toBe(true);
     expect(completed).toEqual(['Recovered answer']);
     expect(errors).toEqual([]);
+  });
+
+  it('tells users to logout, fully exit, and login again after a 401', async () => {
+    const authError = 'Failed to authenticate. API Error: 401 Invalid authentication credentials';
+    sdkMock.setNextMessages([
+      {
+        type: 'assistant',
+        session_id: 'session-auth-guidance',
+        message: { content: [{ type: 'text', text: authError }] },
+      },
+      {
+        type: 'result',
+        session_id: 'session-auth-guidance',
+        subtype: 'error',
+        is_error: true,
+        errors: [authError],
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-auth-guidance', cwd: '/tmp/project' });
+    const deltas: string[] = [];
+    const errors: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onError((_sid, error) => errors.push(error.message));
+
+    await provider.send('route-auth-guidance', 'hello');
+    await flush();
+
+    for (const message of [...deltas, ...errors]) {
+      expect(message).toContain(authError);
+      expect(message).toContain('run `/logout`');
+      expect(message).toContain('fully exit Claude Code');
+      expect(message).toContain('run `/login`');
+    }
+    expect(deltas).toHaveLength(1);
+    expect(errors).toHaveLength(1);
   });
 
   it('stops after two auto-continues and emits a recoverable terminal error', async () => {

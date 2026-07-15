@@ -21,6 +21,7 @@ import { getSession, upsertSession, listSessions } from '../store/session-store.
 import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
+import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
 import { dispatchHookSend } from './send-tool.js';
 import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
 
@@ -181,7 +182,7 @@ export function resolveTarget(from: string, to: string): ResolveResult {
   }
 
   // Determine siblings: sessions sharing the same parent or project (exclude stopped)
-  const siblings = allSessions.filter((s) => {
+  const allSiblings = allSessions.filter((s) => {
     if (s.name === fromRecord.name) return false; // exclude self
     if (s.state === 'stopped') return false; // exclude stopped sessions
     // Sub-sessions: match by parentSession
@@ -191,6 +192,10 @@ export function resolveTarget(from: string, to: string): ResolveResult {
     // Main sessions: match by projectName
     return s.projectName === fromRecord.projectName || s.parentSession === from;
   });
+  // Target discovery and every ordinary send mode must mirror what users can
+  // identify. Raw legacy workers hidden by the frontend are internal sessions,
+  // not user-addressable conversation targets.
+  const siblings = allSiblings.filter(isDiscoverableInterAgentSession);
 
   const availableNames = siblings.map((s) => s.label || s.name);
 
@@ -498,7 +503,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const from = parsed.from || '';
         const fromRecord = from ? getSession(from) : null;
         const allSess = listSessions();
-        const siblings = fromRecord
+        const siblings = (fromRecord
           ? allSess.filter((s) => {
               if (s.name === from) return false;
               if (s.state === 'stopped') return false;
@@ -507,7 +512,8 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
               }
               return s.projectName === fromRecord.projectName || s.parentSession === from;
             })
-          : allSess.filter((s) => s.state !== 'stopped');
+          : allSess.filter((s) => s.state !== 'stopped'))
+          .filter(isDiscoverableInterAgentSession);
         const sessions = siblings.map((s) => ({
           name: s.name,
           label: s.label || undefined,
@@ -591,6 +597,11 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
           if (!runtime) {
             return { name: record.name, state: record.state, live: false };
           }
+          // Reconcile the observable state before projecting it. An idle
+          // runtime can still have provider-owned work (or a queued dispatch)
+          // when a provider status callback arrived out of order; the runtime
+          // promotes that state to tool_running / starts the drain here.
+          runtime.drainPendingIfIdle?.('sessions-live');
           const status = runtime.getStatus();
           const state = status === 'idle' ? 'idle' : status === 'error' ? 'error' : 'running';
           if (record.state !== state && record.state !== 'stopped') {

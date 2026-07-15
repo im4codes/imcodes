@@ -87,9 +87,9 @@ function makeMemDb() {
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-      if (s.includes('select token_hash, user_id from servers where id = $1')) {
+      if (s.includes('select token_hash, user_id') && s.includes('from servers where id = $1')) {
         const row = servers.get(params[0] as string);
-        return (row ? { token_hash: row.token_hash, user_id: row.user_id } : null) as T | null;
+        return (row ? { token_hash: row.token_hash, user_id: row.user_id, node_role: 'full', revoked_at: null } : null) as T | null;
       }
       if (s.includes('select team_id, user_id from servers where id = $1')) {
         const row = servers.get(params[0] as string);

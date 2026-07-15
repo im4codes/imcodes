@@ -38,6 +38,8 @@ interface Props {
   activeToolCall?: boolean;
   /** Whether the current timeline tail still has an active transport turn. */
   activeTimelineTurn?: boolean;
+  /** Whether this browser is still tracking an unresolved optimistic send. */
+  pendingUserSend?: boolean;
   /** Safe transport activity/error detail extracted from session.state payloads. */
   transportActivityDetail?: string | null;
   /** Session-list error reason when no timeline error detail is present. */
@@ -64,7 +66,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, wsClient, connected }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, wsClient, connected }: Props) {
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 
@@ -102,6 +104,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     activeThinking: !!activeThinkingTs,
     activeToolCall: !!activeToolCall,
     activeTransportTurn: !!activeTimelineTurn,
+    pendingUserSend: !!pendingUserSend,
     statusText,
     transportActivityDetail,
     sessionError,

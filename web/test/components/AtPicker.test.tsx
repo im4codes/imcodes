@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
+import { useLayoutEffect } from 'preact/hooks';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
@@ -31,6 +32,17 @@ async function flush() {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
   }
+}
+
+function PressKeyDuringOpeningLayout({ keyName }: { keyName: string }) {
+  useLayoutEffect(() => {
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: keyName,
+      bubbles: true,
+      cancelable: true,
+    }));
+  }, [keyName]);
+  return null;
 }
 
 describe('AtPicker', () => {
@@ -96,6 +108,87 @@ describe('AtPicker', () => {
 
     expect(filesLabel.closest('div')?.getAttribute('data-hl')).toBe('true');
     expect(agentsLabel.closest('div')?.getAttribute('data-hl')).toBeNull();
+  });
+
+  it('keeps one synchronous keyboard listener while rapid navigation updates the highlight', () => {
+    const addSpy = vi.spyOn(document, 'addEventListener');
+    const removeSpy = vi.spyOn(document, 'removeEventListener');
+    try {
+      renderPicker();
+
+      fireEvent.keyDown(document, { key: 'ArrowDown' });
+      fireEvent.keyDown(document, { key: 'ArrowDown' });
+      fireEvent.keyDown(document, { key: 'Enter' });
+
+      expect(screen.getByText('brain')).toBeDefined();
+      expect(addSpy.mock.calls.filter(([type]) => type === 'keydown')).toHaveLength(1);
+
+      cleanup();
+      expect(removeSpy.mock.calls.filter(([type]) => type === 'keydown')).toHaveLength(1);
+    } finally {
+      addSpy.mockRestore();
+      removeSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ['ArrowDown', 'team'],
+    ['ArrowUp', '🖥️'],
+  ])('applies the first %s pressed immediately after the picker mounts', (keyName, highlightedText) => {
+    const wsClient = {
+      connected: true,
+      send: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    };
+
+    const { container } = render(
+      <>
+        <AtPicker
+          query=""
+          sessions={[]}
+          rootSession="deck_proj_brain"
+          wsClient={wsClient as any}
+          projectDir="/tmp/proj"
+          onSelectFile={vi.fn()}
+          onSelectAgent={vi.fn()}
+          onSelectDelegateAgent={vi.fn()}
+          onClose={vi.fn()}
+          visible
+        />
+        <PressKeyDuringOpeningLayout keyName={keyName} />
+      </>,
+    );
+
+    expect(container.querySelector('[data-hl="true"]')?.textContent).toContain(highlightedText);
+  });
+
+  it('applies Enter when it is the first key pressed after mount', () => {
+    const wsClient = {
+      connected: true,
+      send: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    };
+
+    render(
+      <>
+        <AtPicker
+          query=""
+          sessions={[]}
+          rootSession="deck_proj_brain"
+          wsClient={wsClient as any}
+          projectDir="/tmp/proj"
+          onSelectFile={vi.fn()}
+          onSelectAgent={vi.fn()}
+          onSelectDelegateAgent={vi.fn()}
+          onClose={vi.fn()}
+          visible
+        />
+        <PressKeyDuringOpeningLayout keyName="Enter" />
+      </>,
+    );
+
+    expect(screen.queryByText('team')).toBeNull();
+    expect(screen.getByText(/type_to_search/)).toBeDefined();
   });
 
   it('shows current main-session group agents and disables the current session', () => {

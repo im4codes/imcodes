@@ -24,7 +24,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/mark-bin-executable.mjs && node scripts/build-manifest.mjs",
+    "postbuild": "node scripts/copy-worker-bootstraps.mjs && node scripts/copy-computer-use-helper.mjs --dist && node scripts/mark-bin-executable.mjs && node scripts/build-manifest.mjs",
     "prepack": "node scripts/strip-onnxruntime-gpu.mjs",
     "postpack": "node scripts/restore-package-json-after-pack.mjs",
     "dev": "tsx src/index.ts",
@@ -37,16 +37,21 @@
     "test:e2e": "vitest run --project e2e",
     "test:integration": "vitest run --workspace vitest.integration.config.ts",
     "test:preview-dist": "node scripts/run-preview-dist-smoke.mjs",
+    "test:grok-acp-smoke": "node scripts/smoke-grok-acp.mjs",
+    "test:grok-auth-smoke": "tsx scripts/smoke-grok-sdk-auth.ts",
     "test:coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=html --coverage.reporter=json --coverage.reporter=json-summary --testTimeout=120000 --hookTimeout=120000 --teardownTimeout=60000 --minWorkers=1 --maxWorkers=4 --project daemon --project web --project server && node scripts/write-coverage-summary.mjs && node scripts/check-coverage-thresholds.mjs",
     "coverage:summary": "node scripts/write-coverage-summary.mjs",
     "coverage:check": "node scripts/check-coverage-thresholds.mjs",
     "test:watch": "vitest",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
+    "typecheck:legacy": "tsc6 --noEmit",
     "trace:daemon": "node scripts/trace-daemon-latency.mjs",
     "prepublishOnly": "npm run build && npm run test:unit && npm run test:server && npm run test:web",
     "prepare": "husky",
-    "bench:memory": "tsx bench/memory-pipeline.bench.ts"
+    "bench:memory": "tsx bench/memory-pipeline.bench.ts",
+    "build:node-exe": "node scripts/build-node-exe.mjs",
+    "check:node-exe-deps": "node scripts/check-node-exe-deps.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.20.0",
@@ -70,6 +75,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
@@ -80,8 +86,10 @@
     "husky": "^9.1.7",
     "jsdom": "^28.1.0",
     "lint-staged": "^16.3.4",
+    "open-computer-use": "0.2.0",
+    "postject": "1.0.0-alpha.6",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vitest": "^2.1.0"
   },
   "lint-staged": {
