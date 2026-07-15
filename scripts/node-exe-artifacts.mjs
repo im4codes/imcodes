@@ -23,6 +23,14 @@ const EXPECTED_HELPER_BY_ARTIFACT = new Map([
   ['imcodes-node-macos', ['computer-use-helper', 'darwin-arm64', 'open-computer-use']],
   ['imcodes-node.exe', ['computer-use-helper', 'win32-x64', 'open-computer-use.exe']],
 ]);
+const BUILD_VERSION_RE = /^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/;
+
+export function normalizeNodeExeBuildVersion(value) {
+  if (typeof value !== 'string' || !BUILD_VERSION_RE.test(value.trim())) {
+    throw new Error('invalid controlled-node build version');
+  }
+  return value.trim();
+}
 
 export async function sha256File(path) {
   const hash = createHash('sha256');
@@ -62,6 +70,7 @@ export async function createNodeExeManifest({
   nodeArchiveSha256,
   postjectVersion,
   buildCommit,
+  buildVersion,
 }) {
   if (!SUPPORTED_PLATFORMS.has(os)) throw new Error(`unsupported manifest os: ${os}`);
   if (!SUPPORTED_ARCHES.has(arch)) throw new Error(`unsupported manifest arch: ${arch}`);
@@ -70,6 +79,7 @@ export async function createNodeExeManifest({
   if (typeof nodeArchiveSha256 !== 'string' || !SHA256_RE.test(nodeArchiveSha256)) throw new Error('invalid Node archive SHA-256');
   if (typeof postjectVersion !== 'string' || postjectVersion.length === 0) throw new Error('invalid postject version');
   if (typeof buildCommit !== 'string' || !/^[a-f0-9]{7,64}$/.test(buildCommit.trim())) throw new Error('invalid build commit');
+  const normalizedBuildVersion = normalizeNodeExeBuildVersion(buildVersion);
 
   const file = await stat(artifactPath);
   if (!file.isFile()) throw new Error(`artifact is not a regular file: ${artifactPath}`);
@@ -90,6 +100,7 @@ export async function createNodeExeManifest({
     },
     build: {
       commit: buildCommit.trim(),
+      version: normalizedBuildVersion,
     },
   };
 }
@@ -117,6 +128,7 @@ function assertManifestShape(value, manifestPath) {
   if (typeof toolchain.nodeArchiveSha256 !== 'string' || !SHA256_RE.test(toolchain.nodeArchiveSha256)) fail('toolchain.nodeArchiveSha256 is invalid');
   if (typeof toolchain.postjectVersion !== 'string' || toolchain.postjectVersion.length === 0) fail('toolchain.postjectVersion is invalid');
   if (!build || typeof build !== 'object' || Array.isArray(build) || typeof build.commit !== 'string' || !/^[a-f0-9]{7,64}$/.test(build.commit.trim())) fail('build.commit is invalid');
+  if (typeof build.version !== 'string' || !BUILD_VERSION_RE.test(build.version.trim())) fail('build.version is invalid');
   return value;
 }
 
@@ -146,6 +158,8 @@ export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNa
   const seen = new Set();
   let expectedToolchain;
   let expectedCommit = process.env.GITHUB_SHA?.trim();
+  let expectedVersion = process.env.IMCODES_BUILD_VERSION?.trim() || process.env.APP_VERSION?.trim();
+  if (expectedVersion) expectedVersion = normalizeNodeExeBuildVersion(expectedVersion);
   for (const fileName of expectedFileNames) {
     if (basename(fileName) !== fileName || seen.has(fileName)) throw new Error(`invalid or duplicate expected artifact: ${fileName}`);
     seen.add(fileName);
@@ -162,6 +176,8 @@ export async function verifyNodeExeManifestSet(artifactDirectory, expectedFileNa
     if (toolchainKey !== expectedToolchain) throw new Error(`controlled-node artifacts were built with inconsistent toolchains: ${fileName}`);
     expectedCommit ??= manifest.build.commit;
     if (manifest.build.commit !== expectedCommit) throw new Error(`controlled-node artifact commit mismatch for ${fileName}: expected ${expectedCommit}, got ${manifest.build.commit}`);
+    expectedVersion ??= manifest.build.version;
+    if (manifest.build.version !== expectedVersion) throw new Error(`controlled-node artifact version mismatch for ${fileName}: expected ${expectedVersion}, got ${manifest.build.version}`);
     const helperRelativePath = EXPECTED_HELPER_BY_ARTIFACT.get(fileName);
     if (helperRelativePath) {
       const helperPath = join(artifactDirectory, ...helperRelativePath);

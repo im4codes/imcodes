@@ -86,7 +86,8 @@ async function downloadArtifact(input: {
   fetchImpl: typeof fetch;
   asset?: typeof CONTROLLED_NODE_ARTIFACT_ASSETS[keyof typeof CONTROLLED_NODE_ARTIFACT_ASSETS];
   expectedFileName?: string;
-}): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string }> {
+  expectedVersion?: string;
+}): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
   const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
     headers: {
@@ -99,12 +100,14 @@ async function downloadArtifact(input: {
   const filename = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME) || basename(defaultStagedExecutablePath());
   if (input.expectedFileName && basename(filename) !== input.expectedFileName) throw new Error('artifact_filename_mismatch');
   const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const versionHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
   const bytes = Buffer.from(await response.arrayBuffer());
   const actualSha = createHash('sha256').update(bytes).digest('hex');
   if (actualSha !== expectedSha.toLowerCase()) throw new Error('artifact_sha256_mismatch');
   const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : bytes.length;
   if (!Number.isSafeInteger(expectedSize) || expectedSize !== bytes.length) throw new Error('artifact_size_mismatch');
+  if (input.expectedVersion && versionHeader !== input.expectedVersion) throw new Error('artifact_version_mismatch');
   const artifactPath = join(input.dir, basename(filename));
   const manifestPath = `${artifactPath}.manifest.json`;
   await writeFile(artifactPath, bytes, { mode: 0o755 });
@@ -118,9 +121,19 @@ async function downloadArtifact(input: {
       size: bytes.length,
       sha256: actualSha,
     },
-    build: { source: 'controlled-node-self-upgrade' },
+    build: {
+      source: 'controlled-node-self-upgrade',
+      ...(versionHeader ? { version: versionHeader } : {}),
+    },
   }, null, 2)}\n`, { mode: 0o644 });
-  return { artifactPath, manifestPath, sha256: actualSha, sizeBytes: bytes.length, filename: basename(filename) };
+  return {
+    artifactPath,
+    manifestPath,
+    sha256: actualSha,
+    sizeBytes: bytes.length,
+    filename: basename(filename),
+    ...(versionHeader ? { version: versionHeader } : {}),
+  };
 }
 
 function controlledNodePlatformArchKey(target: ControlledNodeArtifactTarget): string {
@@ -285,7 +298,13 @@ export async function startControlledNodeSelfUpgrade(
 
   const tempRoot = deps.tmpdir?.() ?? tmpdir();
   const updateDir = await mkdtemp(join(tempRoot, 'imcodes-node-upgrade-'));
-  const downloaded = await downloadArtifact({ credential, target, dir: updateDir, fetchImpl });
+  const downloaded = await downloadArtifact({
+    credential,
+    target,
+    dir: updateDir,
+    fetchImpl,
+    ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
+  });
   const helper = await downloadComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
   const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
   const destinationManifestPath = `${destinationPath}.manifest.json`;

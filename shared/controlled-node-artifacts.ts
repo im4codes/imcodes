@@ -88,6 +88,7 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SHA256: 'x-imcodes-node-artifact-sha256',
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',
   FILENAME: 'x-imcodes-node-artifact-filename',
+  VERSION: 'x-imcodes-node-artifact-version',
 } as const;
 
 export function controlledNodeArtifactKey(os: ControlledNodeOs, arch: ControlledNodeArch): string {

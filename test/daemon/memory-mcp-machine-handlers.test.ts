@@ -55,6 +55,7 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(await handlers[execRemote]({ machine: 'm', command: 'x', shell: 'zsh' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(await handlers[execRemote]({ machine: 'm', command: 'x', timeoutMs: -5 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(await handlers[execRemote]({ machine: 'm', command: 'x', timeoutMs: 999_999_999 })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(await handlers[execRemote]({ machine: 'bad target', command: 'x' })).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
     expect(machineDeps.execRemote).not.toHaveBeenCalled();
   });
 

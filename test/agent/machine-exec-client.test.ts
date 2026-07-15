@@ -203,6 +203,7 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], bogus: 1 }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], os: 'solaris' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeRole: 'full' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
+    await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], refName: 'bad target' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     const tooMany = Array.from({ length: MACHINE_LIST_MAX_ITEMS + 1 }, (_v, i) => ({ ...items[0], serverId: `s${i}`, refName: `r${i}` }));
     await expect(listMachines({ ...opts, fetchImpl: list200(tooMany) })).rejects.toBeInstanceOf(MachineControlPlaneError);
   });

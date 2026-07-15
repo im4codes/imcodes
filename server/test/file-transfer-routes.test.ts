@@ -59,10 +59,13 @@ vi.mock('../src/security/crypto.js', () => ({
 
 import { fileTransferRoutes } from '../src/routes/file-transfer.js';
 
-function makeApp(): Hono {
+function makeApp(serverUrl = 'http://localhost'): Hono {
   const app = new Hono();
   app.use('/*', async (c, next) => {
-    (c as never as { env: { DB: unknown } }).env = { DB: { queryOne: queryOneMock } };
+    (c as never as { env: { DB: unknown; SERVER_URL: string } }).env = {
+      DB: { queryOne: queryOneMock },
+      SERVER_URL: serverUrl,
+    };
     return next();
   });
   app.route('/api/server', fileTransferRoutes);
@@ -88,6 +91,21 @@ describe('file-transfer upload route', () => {
         downloadable: true,
       },
     });
+  });
+
+  it('uses canonical SERVER_URL for the controlled-node staged download callback', async () => {
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+
+    const response = await makeApp('https://im.codes').request('http://internal-pod:3000/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(response.status).toBe(200);
+    const message = sendFileTransferRequestMock.mock.calls[0]?.[1] as { downloadUrl: string };
+    expect(new URL(message.downloadUrl).origin).toBe('https://im.codes');
   });
 
   it('mints an explicit-path handle only for a FULL source and capable controlled target', async () => {
@@ -409,6 +427,24 @@ describe('file-transfer download route', () => {
     isDaemonConnectedMock.mockReturnValue(true);
     hasDaemonCapabilityMock.mockReturnValue(true);
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+  });
+
+  it('uses canonical SERVER_URL for the controlled-node staged upload callback', async () => {
+    sendFileTransferRequestMock.mockResolvedValueOnce({
+      type: 'file.download_done',
+      content: Buffer.from('hello').toString('base64'),
+      mime: 'text/plain',
+      filename: 'hello.txt',
+    });
+
+    const response = await makeApp('https://im.codes').request(
+      'http://internal-pod:3000/api/server/srv-1/uploads/abc123/download',
+      { headers: { Authorization: 'Bearer test' } },
+    );
+
+    expect(response.status).toBe(200);
+    const message = sendFileTransferRequestMock.mock.calls[0]?.[1] as { uploadUrl: string };
+    expect(new URL(message.uploadUrl).origin).toBe('https://im.codes');
   });
 
   it('starts the browser download when the daemon PUT starts even if bridge ready never resolves', async () => {

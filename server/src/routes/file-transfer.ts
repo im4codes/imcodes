@@ -156,15 +156,19 @@ async function persistStagedUpload(file: File, filePath: string): Promise<number
   return fileStat.size;
 }
 
-function buildStagedUploadUrl(requestUrl: string, serverId: string, uploadId: string, token: string): string {
-  const url = new URL(requestUrl);
+function buildRelayUrl(requestUrl: string, configuredServerUrl: string | undefined): URL {
+  return configuredServerUrl?.trim() ? new URL(configuredServerUrl) : new URL(requestUrl);
+}
+
+function buildStagedUploadUrl(requestUrl: string, configuredServerUrl: string | undefined, serverId: string, uploadId: string, token: string): string {
+  const url = buildRelayUrl(requestUrl, configuredServerUrl);
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/upload-staged/${encodeURIComponent(uploadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
 }
 
-function buildStagedDownloadUrl(requestUrl: string, serverId: string, downloadId: string, token: string): string {
-  const url = new URL(requestUrl);
+function buildStagedDownloadUrl(requestUrl: string, configuredServerUrl: string | undefined, serverId: string, downloadId: string, token: string): string {
+  const url = buildRelayUrl(requestUrl, configuredServerUrl);
   url.pathname = `/api/server/${encodeURIComponent(serverId)}/download-staged/${encodeURIComponent(downloadId)}`;
   url.search = `token=${encodeURIComponent(token)}`;
   return url.toString();
@@ -239,7 +243,7 @@ async function attemptStreamedDownload(
     type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
     downloadId,
     attachmentId,
-    uploadUrl: buildStagedDownloadUrl(c.req.url, serverId, downloadId, token),
+    uploadUrl: buildStagedDownloadUrl(c.req.url, c.env.SERVER_URL, serverId, downloadId, token),
   };
   void bridge.sendFileTransferRequest(
     downloadId,
@@ -657,7 +661,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       originalName: file.name || undefined,
       mime: file.type || undefined,
       size: file.size,
-      downloadUrl: buildStagedUploadUrl(c.req.url, serverId, uploadId, token),
+      downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
     };
   } else {
     uploadMsg = {

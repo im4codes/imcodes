@@ -32,6 +32,7 @@ import {
   type MachineExecHttpEnvelope,
   type MachineSummary,
 } from '../../shared/remote-exec.js';
+import { isValidMachineName } from '../../shared/machine-reference.js';
 
 export interface ExecRemoteOptions {
   serverUrl: string;
@@ -248,7 +249,7 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
   for (const key of Object.keys(m)) if (!MACHINE_LIST_ITEM_KEYS.has(key)) return false;
   if (typeof m.serverId !== 'string' || m.serverId.length === 0
     || typeof m.name !== 'string' || m.name.length === 0
-    || typeof m.refName !== 'string' || m.refName.length === 0
+    || typeof m.refName !== 'string' || !isValidMachineName(m.refName)
     || typeof m.displayName !== 'string') return false;
   if (typeof m.online !== 'boolean' || typeof m.execEnabled !== 'boolean') return false;
   if (m.nodeRole !== NODE_ROLE.CONTROLLED) return false;

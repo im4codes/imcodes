@@ -590,10 +590,35 @@ jobs:
 
   # ── Controlled-node executables for the production image ─────────────────
 
+  release_version:
+    name: Resolve release version
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve one version for server and all native node artifacts
+        id: version
+        run: |
+          set -euo pipefail
+          COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
+          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
+            APP_VERSION="$(date -u +%Y).$(date -u +%-m).${COMMIT_COUNT}-dev.${GITHUB_RUN_NUMBER}"
+          else
+            APP_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
+          fi
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+
   controlled-node-executables:
     name: Controlled Node Executable (${{ matrix.key }})
+    needs: [release_version]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ${{ matrix.runner }}
+    env:
+      IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -636,10 +661,10 @@ jobs:
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, server-tests, server-db-tests, e2e-tests, controlled-node-executables]
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     outputs:
-      npm_version: ${{ steps.version_meta.outputs.npm_version }}
+      npm_version: ${{ needs.release_version.outputs.app_version }}
     permissions:
       contents: write
       packages: write
@@ -658,6 +683,8 @@ jobs:
           merge-multiple: true
 
       - name: Verify controlled-node executable set
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
         run: >-
           node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
           imcodes-node-linux imcodes-node-macos imcodes-node.exe
@@ -709,18 +736,6 @@ jobs:
           echo "version=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
           echo "app_version=$(date -u +%Y.%-m).${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve publish version
-        id: version_meta
-        run: |
-          set -euo pipefail
-          COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
-            NPM_VERSION="$(date -u +%Y).$(date -u +%-m).${COMMIT_COUNT}-dev.${GITHUB_RUN_NUMBER}"
-          else
-            NPM_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
-          fi
-          echo "npm_version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
-
       # Build the image into the local docker daemon first so we can smoke-test
       # it BEFORE pushing. Without this step, an image whose Node process
       # crashes on startup (e.g. ERR_MODULE_NOT_FOUND from a missing prod dep)
@@ -735,7 +750,7 @@ jobs:
           build-args: |
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
-            APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+            APP_VERSION=${{ needs.release_version.outputs.app_version }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -767,7 +782,7 @@ jobs:
           build-args: |
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
-            APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+            APP_VERSION=${{ needs.release_version.outputs.app_version }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -803,7 +818,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git fetch --tags
-          NPM_VERSION="${{ steps.version_meta.outputs.npm_version }}"
+          NPM_VERSION="${{ needs.release_version.outputs.app_version }}"
           GIT_TAG="v${NPM_VERSION}"
           # Skip if this exact tag already exists (idempotent)
           if ! git rev-parse "$GIT_TAG" >/dev/null 2>&1; then

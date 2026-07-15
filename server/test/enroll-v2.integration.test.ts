@@ -58,7 +58,7 @@ async function writeManifest(
       nodeArchiveSha256: 'a'.repeat(64),
       postjectVersion: '1.0.0-alpha.6',
     },
-    build: { commit: 'a'.repeat(40) },
+    build: { commit: 'a'.repeat(40), version: '2026.7.1234-dev.5' },
   }));
 }
 
@@ -214,6 +214,29 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 
   it('fails closed when the sidecar manifest is missing', async () => {
     await rm(join(exeDir, 'imcodes-node-linux.manifest.json'), { force: true });
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const r = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(r.status).toBe(503);
+  });
+
+  it('fails closed when the sidecar manifest omits the runtime build version', async () => {
+    await writeFile(join(exeDir, 'imcodes-node-linux.manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        fileName: 'imcodes-node-linux',
+        os: 'linux',
+        arch: 'x64',
+        size: FAKE_BINARY.length,
+        sha256: sha256(FAKE_BINARY),
+      },
+      build: { commit: 'a'.repeat(40) },
+    }));
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -1142,6 +1165,7 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     });
     expect(response.status).toBe(200);
     expect(response.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(FAKE_BINARY));
+    expect(response.headers.get('x-imcodes-node-artifact-version')).toBe('2026.7.1234-dev.5');
     expect(Buffer.from(await response.arrayBuffer())).toEqual(FAKE_BINARY);
 
     const helperBytes = Buffer.from('FAKE_OPEN_COMPUTER_USE_HELPER');

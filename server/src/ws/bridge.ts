@@ -5801,6 +5801,7 @@ export class WsBridge {
 
     const result = this.daemonUpgradeCoordinator.retryAutoAfterBlocked({
       retryDelayMs,
+      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
       send: (message) => this.sendDirectToDaemon(message),
@@ -5841,6 +5842,7 @@ export class WsBridge {
     return this.daemonUpgradeCoordinator.request({
       targetVersion: input.targetVersion,
       source: input.source ?? 'manual',
+      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: input.isStillCurrent,
       send: (message) => this.sendDirectToDaemon(message),
@@ -5849,6 +5851,7 @@ export class WsBridge {
 
   private flushPendingDaemonUpgrade(ws: WebSocket): void {
     const result = this.daemonUpgradeCoordinator.flushPending({
+      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
       isStillCurrent: () => this.daemonWs === ws && this.authenticated,
       send: (message) => this.sendDirectToDaemon(message),

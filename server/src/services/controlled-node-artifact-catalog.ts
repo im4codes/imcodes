@@ -17,6 +17,7 @@ import {
   type ControlledNodeArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
+import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../../shared/daemon-upgrade.js';
 import type { Database } from '../db/client.js';
 
 export type SupportedOs = ControlledNodeOs;
@@ -36,6 +37,7 @@ export interface ArtifactDescriptor {
   filename: string;
   sizeBytes: number;
   sha256: string;
+  version: string;
   /** Manifest + artifact identity + expected digest cache key. */
   fingerprint: string;
   mtimeMs: number;
@@ -131,7 +133,11 @@ async function probeArtifact(
     if (!manifestStat.isFile()
       || !sameIdentity(fileIdentity(manifestPathStat), fileIdentity(manifestStat))) return null;
     const manifestText = await manifestHandle.readFile('utf8');
-    const raw = JSON.parse(manifestText) as { schemaVersion?: unknown; artifact?: Record<string, unknown> };
+    const raw = JSON.parse(manifestText) as {
+      schemaVersion?: unknown;
+      artifact?: Record<string, unknown>;
+      build?: Record<string, unknown>;
+    };
     if (raw.schemaVersion !== 1 || !raw.artifact || typeof raw.artifact !== 'object') return null;
     const artifact = raw.artifact;
     if (artifact.fileName !== filename || artifact.arch !== arch) return null;
@@ -140,6 +146,13 @@ async function probeArtifact(
     if (mappedOs !== os) return null;
     if (typeof artifact.size !== 'number' || !Number.isSafeInteger(artifact.size) || artifact.size <= 0) return null;
     if (typeof artifact.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(artifact.sha256)) return null;
+    let version: string;
+    try {
+      version = normalizeDaemonUpgradeTargetVersion(raw.build?.version);
+    } catch {
+      return null;
+    }
+    if (version === DAEMON_UPGRADE_TARGET_LATEST) return null;
     const identity = fileIdentity(artifactStat);
     const manifestDigest = createHash('sha256').update(manifestText, 'utf8').digest('hex');
     const fingerprint = [
@@ -153,6 +166,7 @@ async function probeArtifact(
       manifestStat.mtimeMs,
       manifestDigest,
       artifact.sha256.toLowerCase(),
+      version,
     ].join(':');
     return {
       expectedSha256: artifact.sha256.toLowerCase(),
@@ -161,6 +175,7 @@ async function probeArtifact(
         arch,
         filename,
         sizeBytes: artifact.size,
+        version,
         fingerprint,
         mtimeMs: identity.mtimeMs,
         identity,

@@ -10,7 +10,12 @@
 name: build-node-exe
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: Runtime version advertised by the node and matched by the server
+        required: true
+        type: string
   push:
     tags:
       - 'node-exe-v*'
@@ -48,6 +53,20 @@ jobs:
       # `check:node-exe-deps` script enforces).
       - name: Verify node-exe has no native deps
         run: npm run check:node-exe-deps
+      - name: Resolve controlled-node runtime version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.build_version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#node-exe-v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "invalid controlled-node build version: $VERSION" >&2
+            exit 1
+          fi
+          echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"
       - name: Build controlled-node executable
         run: npm run build:node-exe
       - name: Upload executable artifact

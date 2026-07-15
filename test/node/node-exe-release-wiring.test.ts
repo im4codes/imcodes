@@ -13,6 +13,14 @@ describe('controlled-node executable release wiring', () => {
     expect(workflow).toContain('dist-node-exe/${{ matrix.artifact }}.manifest.json');
     expect(workflow).toContain('dist-node-exe/computer-use-helper/**');
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
+    expect(workflow).toContain('IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}');
+    expect(workflow).toContain('APP_VERSION=${{ needs.release_version.outputs.app_version }}');
+  });
+
+  it('exposes the embedded runtime version without bootstrapping or installing', () => {
+    const entry = readFileSync('src/node/index.ts', 'utf8');
+    expect(entry).toContain("process.argv[2] === '--version'");
+    expect(entry).toContain('process.stdout.write(`${DAEMON_VERSION}\\n`)');
   });
 
   it('copies the artifacts into the image and configures the serving directory', () => {
@@ -40,6 +48,11 @@ describe('controlled-node executable release wiring', () => {
 
     expect(buildScript).toContain("const OFFICIAL_NODE_DIST = 'https://nodejs.org/dist'");
     expect(buildScript).toContain('verifyOfficialNodeArtifact');
+    expect(buildScript).toContain('await downloadFile(`${OFFICIAL_NODE_DIST}/${NODE_VERSION}/SHASUMS256.txt`');
+    expect(buildScript).not.toContain("sh('curl'");
+    expect(buildScript).toContain("process.env.IMCODES_BUILD_VERSION?.trim() || packageVersion");
+    expect(buildScript).toContain("'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion)");
+    expect(buildScript).not.toContain("'process.env.IMCODES_BUILD_VERSION': JSON.stringify(packageVersion)");
     expect(buildScript).not.toContain("sh('npx', ['-y', 'postject'");
     expect(packageJson.devDependencies?.postject).toBe('1.0.0-alpha.6');
   });
@@ -53,5 +66,6 @@ describe('controlled-node executable release wiring', () => {
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
     expect(copyScript).toContain('Open Computer Use.app');
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
+    expect(workflow).toContain('echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"');
   });
 });

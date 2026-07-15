@@ -42,6 +42,7 @@ function writeFixture(dir: string, overrides: Record<string, unknown> = {}) {
     },
     build: {
       commit: 'a'.repeat(40),
+      version: '2026.7.1234-dev.5',
     },
     ...overrides,
   };
@@ -142,5 +143,23 @@ describe('controlled-node executable artifact verification', () => {
       [verifier, 'verify-set', dir, 'imcodes-node-linux'],
       { stdio: 'pipe', env: { ...process.env, GITHUB_SHA: 'a'.repeat(40) } },
     )).not.toThrow();
+  });
+
+  it('rejects a release set whose runtime version differs from the server version', () => {
+    const dir = tempDir();
+    writeFixture(dir);
+    writeLinuxHelperFixture(dir);
+    expect(() => execFileSync(
+      process.execPath,
+      [verifier, 'verify-set', dir, 'imcodes-node-linux'],
+      {
+        stdio: 'pipe',
+        env: {
+          ...process.env,
+          GITHUB_SHA: 'a'.repeat(40),
+          IMCODES_BUILD_VERSION: '2026.7.9999-dev.5',
+        },
+      },
+    )).toThrow(/version mismatch/);
   });
 });

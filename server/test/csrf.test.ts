@@ -6,8 +6,8 @@ import { csrfMiddleware } from '../src/security/csrf.js';
 
 const env = {
   NODE_ENV: 'production',
-  SERVER_URL: 'https://imc.zhinet.work',
-  ALLOWED_ORIGINS: 'https://imc.zhinet.work',
+  SERVER_URL: 'https://im.codes',
+  ALLOWED_ORIGINS: 'https://im.codes',
 } as Env;
 
 function buildCsrfTestApp() {

@@ -20,6 +20,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   createNodeExeManifest,
+  normalizeNodeExeBuildVersion,
   verifyOfficialNodeArtifact,
   writeNodeExeManifest,
   NODE_EXE_MANIFEST_SUFFIX,
@@ -41,6 +42,12 @@ const workDir = join(tmpdir(), `imcodes-node-build-${platform}-${arch}`);
 
 function sh(file, args, opts = {}) { return execFileSync(file, args, { stdio: 'inherit', ...opts }); }
 
+async function downloadFile(url, destination, redirect = 'follow') {
+  const response = await fetch(url, { redirect });
+  if (!response.ok) throw new Error(`download failed (${response.status}) for ${url}`);
+  await writeFile(destination, Buffer.from(await response.arrayBuffer()));
+}
+
 async function ensureOfficialNode() {
   const nodePlatform = platform === 'win32' ? 'win' : platform; // darwin|linux|win
   const dirName = `node-${NODE_VERSION}-${nodePlatform}-${arch}`;
@@ -58,10 +65,10 @@ async function ensureOfficialNode() {
   // The mirror is only a byte source. Trust is anchored to the official
   // nodejs.org SHASUMS256 entry for the exact archive on every build, including
   // cache hits. A corrupted cache or mirror response therefore fails closed.
-  sh('curl', ['-fsSL', `${OFFICIAL_NODE_DIST}/${NODE_VERSION}/SHASUMS256.txt`, '-o', shasumsPath]);
+  await downloadFile(`${OFFICIAL_NODE_DIST}/${NODE_VERSION}/SHASUMS256.txt`, shasumsPath, 'error');
   if (!existsSync(archivePath)) {
     await rm(archiveTemp, { force: true });
-    sh('curl', ['-fsSL', `${MIRROR}/${NODE_VERSION}/${archiveName}`, '-o', archiveTemp]);
+    await downloadFile(`${MIRROR}/${NODE_VERSION}/${archiveName}`, archiveTemp);
     await rename(archiveTemp, archivePath);
   }
   const nodeArchiveSha256 = await verifyOfficialNodeArtifact(archivePath, archiveName, await readFile(shasumsPath, 'utf8'));
@@ -83,12 +90,13 @@ async function main() {
   // 2. Bundle the thin entry to a single CJS file.
   const packageJson = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   const packageVersion = typeof packageJson.version === 'string' ? packageJson.version : '0.0.0';
+  const buildVersion = normalizeNodeExeBuildVersion(process.env.IMCODES_BUILD_VERSION?.trim() || packageVersion);
   const bundlePath = join(workDir, 'app.cjs');
   await build({
     entryPoints: [join(root, 'src/node/index.ts')],
     bundle: true, platform: 'node', format: 'cjs', outfile: bundlePath,
     external: ['bufferutil', 'utf8-validate'],
-    define: { 'process.env.IMCODES_BUILD_VERSION': JSON.stringify(packageVersion) },
+    define: { 'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion) },
     logLevel: 'info',
   });
 
@@ -132,6 +140,7 @@ async function main() {
     nodeArchiveSha256,
     postjectVersion,
     buildCommit,
+    buildVersion,
   });
   await writeNodeExeManifest(manifest, manifestPath);
   console.log(`\n✅ built ${outName} (${(size / 1048576).toFixed(1)} MB) at ${outPath}`);

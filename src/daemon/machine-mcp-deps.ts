@@ -2,9 +2,10 @@
 // exec_remote). The stdio MCP process has no ServerLink; it relays through the
 // daemon's own bound credential (~/.imcodes/server.json) using the source-side
 // machine-exec-client. Name→serverId resolution is FAIL-CLOSED: an unknown,
-// ambiguous, exec-disabled, or offline target returns a typed shared MCP error
-// reason (never a hang, never a silent retarget). All I/O is injectable so the
-// resolution logic is unit-testable without disk or network.
+// ambiguous or exec-disabled target returns a typed shared MCP error. DB-backed
+// `online` is advisory and MUST NOT block dispatch; each target route performs
+// the authoritative live-socket check. All I/O is injectable so the resolution
+// logic is unit-testable without disk or network.
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -106,12 +107,17 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
     if (matches.length > 1) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` } };
     const target = matches[0]!;
     if (!target.execEnabled) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `machine control is disabled for "${machine}"` } };
-    if (!target.online) return { ok: false, result: { ok: false, reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: `machine "${machine}" is offline` } };
     return { ok: true, creds, targetServerId: target.serverId };
   };
 
   const fileFailure = (err: unknown): MachineFileToolResult => {
     if (err instanceof MachineControlPlaneError) {
+      if (err.message === 'daemon_offline') {
+        return { ok: false, reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: 'machine is offline' };
+      }
+      if (err.message === 'exec_disabled') {
+        return { ok: false, reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: 'machine control is disabled' };
+      }
       const validationErrors = new Set([
         FS_GENERIC_ERROR_CODES.INVALID_REQUEST,
         FILE_PATH_HANDLE_ERROR.INVALID_PATH,
@@ -167,7 +173,6 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
       const target = matches[0]!;
       if (!target.execEnabled) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `remote exec is disabled for "${machine}"` };
-      if (!target.online) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: `machine "${machine}" is offline` };
       return exec({
         serverUrl: creds.serverUrl,
         sourceServerId: creds.serverId,
@@ -245,7 +250,6 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
       if (matches.length > 1) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_AMBIGUOUS, error: `more than one machine named "${machine}"` };
       const target = matches[0]!;
       if (!target.execEnabled) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_DISABLED, error: `machine control is disabled for "${machine}"` };
-      if (!target.online) return { outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: `machine "${machine}" is offline` };
       return computerUse({
         serverUrl: creds.serverUrl,
         sourceServerId: creds.serverId,

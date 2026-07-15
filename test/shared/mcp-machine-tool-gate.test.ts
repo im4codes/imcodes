@@ -9,6 +9,7 @@ import {
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { NODE_ROLE, REMOTE_EXEC_SHELLS, REMOTE_EXEC_MAX_TIMEOUT_MS } from '../../shared/remote-exec.js';
+import { MACHINE_NAME_PATTERN, MACHINE_REF_NAME_MAX } from '../../shared/machine-reference.js';
 
 describe('machine MCP tools join the contract surface (10.12)', () => {
   it('both tools are in the name list and have contracts', () => {
@@ -24,6 +25,25 @@ describe('machine MCP tools join the contract surface (10.12)', () => {
     const timeout = c.inputSchema.properties?.timeoutMs;
     expect(shell?.enum).toEqual([...REMOTE_EXEC_SHELLS]);
     expect(timeout?.maximum).toBe(REMOTE_EXEC_MAX_TIMEOUT_MS);
+  });
+
+  it('treats list_machines as discovery only and publishes bounded direct ref_name inputs', () => {
+    const list = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MACHINES];
+    expect(list.description).toContain('do not call it as a preflight');
+    expect(list.description).toContain('advisory availability');
+
+    for (const name of [
+      MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
+      MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
+      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+    ] as const) {
+      const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
+      const machine = contract.inputSchema.properties?.machine;
+      expect(contract.description).toMatch(/without (calling )?list_machines|do not call list_machines/i);
+      expect(machine).toMatchObject({ minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source });
+      expect(machine?.description).toMatch(/exact stable|exact stable target/i);
+    }
   });
 
   it('the shared error enum carries the machine reasons', () => {

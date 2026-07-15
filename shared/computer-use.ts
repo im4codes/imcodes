@@ -261,13 +261,13 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
-        'Target machines are addressed by list_machines name/ref_name; on full imcodes daemons, use machine=local/localhost/self/this to control the daemon host directly. Results are bounded text/image MCP-style content.',
+        'Target controlled machines use their stable ref_name. When the message already contains ^^(name), pass name directly without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
         'Browser-specific control is available through Playwright-backed browser_* tools and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
         'Recommended workflow:',
-        '1. Use machine=local/localhost/self/this for the current imcodes daemon host, or list_machines to choose an online execEnabled controlled node.',
+        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, use a known stable ref_name or the name inside ^^(name) directly; call list_machines only when no exact target is available or the user asks for status.',
         '2. computer_use_docs for the relevant topic/tool details only.',
         '3. computer_use_call tool=list_apps to discover app ids.',
         '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',

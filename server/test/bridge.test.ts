@@ -456,6 +456,22 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
     });
 
+    it('sends controlled-node artifact upgrades without waiting for npm publication', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.7.1234-dev.5'))).toBe(true);
+    });
+
     it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';

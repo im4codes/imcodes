@@ -60,6 +60,7 @@ import {
   type ComputerUseResult,
 } from '../../shared/computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
+import { isValidMachineName, nfc } from '../../shared/machine-reference.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
@@ -262,8 +263,12 @@ export type MachineExecToolSuccess = Record<string, unknown> & (
   | ({ status: 'ok'; outcome: 'spawn_error'; ok: false; exitCode: null; timedOut: false; error: string } & MachineExecTerminalFields)
 );
 
+const machineTargetRuntimeSchema = z.string().refine(isValidMachineName, {
+  message: 'must be a valid stable machine ref_name',
+});
+
 const machineSummaryShape = {
-  name: z.string(),
+  name: machineTargetRuntimeSchema,
   displayName: z.string().optional(),
   os: z.enum(ENROLLMENT_OSES).optional(),
   online: z.boolean(),
@@ -386,6 +391,11 @@ function error(reason: MCPErrorReason, message?: string): ToolResult {
 function stringArg(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function machineArg(args: Record<string, unknown>): string | undefined {
+  const value = stringArg(args, 'machine');
+  return value && isValidMachineName(value) ? nfc(value) : undefined;
 }
 
 function numberArg(args: Record<string, unknown>, key: string): number | undefined {
@@ -1293,9 +1303,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: async (input, context) => {
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
       const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs']);
-      const machine = stringArg(args, 'machine');
+      const machine = machineArg(args);
       const command = stringArg(args, 'command');
-      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine is required');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name');
       if (!command) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command is required');
       if (utf8ByteLength(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `command must be at most ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes`);
@@ -1335,9 +1345,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: async (input, context) => {
       if (!deps.machineDeps?.sendFileToMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
       const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath']);
-      const machine = stringArg(args, 'machine');
+      const machine = machineArg(args);
       const sourcePath = stringArg(args, 'sourcePath');
-      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine and sourcePath are required');
+      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name and sourcePath are required');
       if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'sourcePath is too long');
       const result = await deps.machineDeps.sendFileToMachine({
         machine,
@@ -1351,11 +1361,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: async (input, context) => {
       if (!deps.machineDeps?.fetchFileFromMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
       const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath', 'destinationPath', 'overwrite']);
-      const machine = stringArg(args, 'machine');
+      const machine = machineArg(args);
       const sourcePath = stringArg(args, 'sourcePath');
       const destinationPath = stringArg(args, 'destinationPath');
       const overwrite = boolArg(args, 'overwrite') ?? false;
-      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine, sourcePath, and destinationPath are required');
+      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name, sourcePath, and destinationPath are required');
       if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES || utf8ByteLength(destinationPath) > FILE_TRANSFER_PATH_MAX_BYTES) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'file path is too long');
       }
@@ -1381,9 +1391,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: async (input, context) => {
       if (!deps.machineDeps?.computerUseCall) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'computer use control is not available on this node');
       const args = pickAllowedMcpArgs(input, ['machine', 'tool', 'arguments', 'timeoutMs']);
-      const machine = stringArg(args, 'machine');
+      const machine = machineArg(args);
       const toolRaw = stringArg(args, 'tool');
-      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine is required');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name or local alias');
       if (!toolRaw || !(COMPUTER_USE_TOOLS as readonly string[]).includes(toolRaw)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `tool must be one of ${COMPUTER_USE_TOOLS.join(', ')}`);
       }
@@ -1563,20 +1573,20 @@ const schemas = {
     id: z.string().describe('Job id.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
-    includeOffline: z.boolean().optional().describe('Include offline machines; default false.'),
+    includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
-    machine: z.string().describe('list_machines name/ref_name.'),
+    machine: machineTargetRuntimeSchema.describe('Exact stable ref_name; use a known ^^(name) directly without list_machines preflight.'),
     command: z.string().describe('One shell command.'),
     shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
     timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
-    machine: z.string().min(1),
+    machine: machineTargetRuntimeSchema,
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
-    machine: z.string().min(1),
+    machine: machineTargetRuntimeSchema,
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     overwrite: z.boolean().optional(),
@@ -1585,7 +1595,7 @@ const schemas = {
     topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
-    machine: z.string().describe('list_machines name/ref_name, or local/localhost/self/this for this imcodes daemon host.'),
+    machine: machineTargetRuntimeSchema.describe('Exact stable ref_name or local/localhost/self/this; do not preflight list_machines when known.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe('Method arguments.'),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),

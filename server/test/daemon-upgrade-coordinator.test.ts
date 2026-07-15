@@ -114,6 +114,32 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     expect(sent).toHaveLength(1);
   });
 
+  it('bypasses npm publication for controlled-node image artifacts', () => {
+    const probe = vi.fn<[], Promise<DaemonUpgradePublicationProbeResult>>()
+      .mockResolvedValue({ status: 'missing', statusCode: 404 });
+    const coordinator = new DaemonUpgradeCoordinator(new DaemonUpgradePublicationGate({
+      probe: async () => probe(),
+      retryDelaysMs: [100],
+    }));
+    const sent: Record<string, unknown>[] = [];
+
+    const result = coordinator.request({
+      targetVersion: '2026.7.1234-dev.5',
+      source: 'manual',
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      send: (message) => sent.push(message),
+    });
+
+    expect(result.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toEqual([{
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      upgradeId: expect.any(String),
+      targetVersion: '2026.7.1234-dev.5',
+    }]);
+    expect(probe).not.toHaveBeenCalled();
+  });
+
   it('retries the current auto upgrade after a transient daemon block without 15-minute suppression', async () => {
     vi.useFakeTimers();
     const coordinator = new DaemonUpgradeCoordinator();

@@ -26,6 +26,7 @@ import {
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import { MACHINE_NAME_PATTERN, MACHINE_REF_NAME_MAX } from './machine-reference.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -183,6 +184,7 @@ type JsonSchema = {
   readonly maximum?: number;
   readonly minLength?: number;
   readonly maxLength?: number;
+  readonly pattern?: string;
   readonly maxItems?: number;
   readonly anyOf?: readonly JsonSchema[];
 };
@@ -477,9 +479,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
     description:
-      'List caller-account controlled machines with presence. Use returned name (ref_name) with exec_remote; offline machines require includeOffline. FULL nodes only.',
+      'Discover ref_names or inspect advisory availability; do not call it as a preflight when an exact ref_name or ^^(name) is known. Action routes check live state. FULL nodes only.',
     inputSchema: objectSchema({
-      includeOffline: booleanSchema('Include offline machines in the result (default false — the agent-facing list excludes offline).'),
+      includeOffline: booleanSchema('Include offline and exec-disabled machines; default false. Presence is advisory.'),
     }),
     outputSchema: objectSchema({
       status: stringSchema('Always ok for a successful result.', { enum: ['ok'] }),
@@ -488,10 +490,10 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         description: 'Controllable machines for the account.',
         maxItems: MACHINE_LIST_MAX_ITEMS,
         items: objectSchema({
-          name: stringSchema('Unique server-derived ref_name — the key for exec_remote and ^^(name) markers.'),
+          name: stringSchema('Stable ref_name for machine tools and ^^(name).', { minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source }),
           displayName: stringSchema('Render-only display name (sanitized).'),
           os: stringSchema('Canonical OS (win | mac | linux); advisory, absent if unknown.', { enum: [...ENROLLMENT_OSES] }),
-          online: booleanSchema('DB-backed presence: whether the node is currently connected.'),
+          online: booleanSchema('Advisory DB-heartbeat presence.'),
           execEnabled: booleanSchema('Whether remote exec is enabled for this machine.'),
           role: stringSchema('Node role; always "controlled" for controllable machines.', { enum: [NODE_ROLE.CONTROLLED] }),
         }, ['name', 'online', 'execEnabled', 'role']),
@@ -501,9 +503,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
     description:
-      'Run one shell command on a list_machines name. Progress can stream, but the final result is authoritative. not_dispatched means it did not run and is retry-safe; dispatched_no_result means it may have run, so never auto-retry non-idempotent commands. Offline/unknown/ambiguous targets return typed reasons. FULL nodes only.',
+      'Run one command on an exact ref_name; use ^^(name) directly without list_machines. not_dispatched is retry-safe; dispatched_no_result may have run, so never auto-retry non-idempotent work. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Target machine ref_name from list_machines.'),
+      machine: stringSchema('Exact stable ref_name, including ^^(name).', { minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source }),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
       shell: stringSchema(`Optional shell; one of ${REMOTE_EXEC_SHELLS.join(', ')}.`, { enum: [...REMOTE_EXEC_SHELLS] }),
       timeoutMs: numberSchema(`Optional timeout in ms; defaults to ${REMOTE_EXEC_DEFAULT_TIMEOUT_MS}, in [${REMOTE_EXEC_MIN_TIMEOUT_MS}, ${REMOTE_EXEC_MAX_TIMEOUT_MS}].`, { minimum: REMOTE_EXEC_MIN_TIMEOUT_MS, maximum: REMOTE_EXEC_MAX_TIMEOUT_MS }),
@@ -523,9 +525,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
-    description: 'Send one explicit regular file from this FULL daemon host to a list_machines controlled node. Reuses the protected attachment upload path; directories, symlinks, and sensitive credential directories are rejected. FULL nodes only.',
+    description: 'Send one regular file to an exact controlled-machine ref_name. Use ^^(name) directly without list_machines. Unsafe file types and credential paths are rejected. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Target machine ref_name from list_machines.'),
+      machine: stringSchema('Exact stable ref_name, including ^^(name).', { minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source }),
       sourcePath: stringSchema(`Explicit local regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes and ${FILE_TRANSFER_LIMITS.MAX_FILE_SIZE} file bytes.`),
     }, ['machine', 'sourcePath']),
     outputSchema: objectSchema({
@@ -538,9 +540,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
-    description: 'Fetch one explicit regular file from a list_machines controlled node into an explicit path on this FULL daemon host. Uses a short-lived attachment handle and atomic destination commit; overwrite defaults false. FULL nodes only.',
+    description: 'Fetch one regular file from an exact controlled-machine ref_name. Use ^^(name) directly without list_machines. Destination commit is atomic; overwrite defaults false. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Target machine ref_name from list_machines.'),
+      machine: stringSchema('Exact stable ref_name, including ^^(name).', { minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source }),
       sourcePath: stringSchema(`Explicit controlled-node regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
       destinationPath: stringSchema(`Explicit local destination path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
       overwrite: booleanSchema('Replace an existing regular destination file; default false.'),
@@ -567,9 +569,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: {
     name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-    description: 'Invoke typed Computer Use either on this imcodes daemon host (machine=local/localhost/self/this) or through controlled-node IPC for a list_machines target. Use exec_remote for session-0/SYSTEM shell and shell_session1 for the active user. For element/index GUI actions, read computer_use_docs and call get_app_state first; known coordinate clicks can use the fast path directly. FULL nodes only.',
+    description: 'Use typed Computer Use on local aliases or an exact ref_name; use ^^(name) without list_machines. exec_remote is session-0/SYSTEM; shell_session1 is active-user. Read docs/get_app_state for indexed GUI actions. FULL nodes only.',
     inputSchema: objectSchema({
-      machine: stringSchema('Target machine ref_name from list_machines, or local/localhost/self/this for this imcodes daemon host.'),
+      machine: stringSchema('Exact stable ref_name/^^(name), or local/localhost/self/this.', { minLength: 1, maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source }),
       tool: stringSchema(`Typed method name; one of ${COMPUTER_USE_TOOLS.join(', ')}.`, { enum: [...COMPUTER_USE_TOOLS] }),
       arguments: { type: 'object', description: `JSON object arguments for the selected method, up to ${COMPUTER_USE_MAX_ARGUMENT_BYTES} UTF-8 bytes.`, additionalProperties: true },
       timeoutMs: numberSchema(`Optional timeout in ms. GUI/browser methods allow [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_MAX_TIMEOUT_MS}]; shell_session1 allows [${COMPUTER_USE_MIN_TIMEOUT_MS}, ${COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS}].`, { minimum: COMPUTER_USE_MIN_TIMEOUT_MS, maximum: COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS }),

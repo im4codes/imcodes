@@ -2,8 +2,13 @@
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createControlledNodeRuntime } from './runtime.js';
+import { DAEMON_VERSION } from '../util/version.js';
 
 async function main(): Promise<void> {
+  if (process.argv[2] === '--version') {
+    process.stdout.write(`${DAEMON_VERSION}\n`);
+    return;
+  }
   if (process.argv[2] === '--computer-use-helper') {
     const pipeFlag = process.argv.indexOf('--pipe');
     const pipe = pipeFlag >= 0 ? process.argv[pipeFlag + 1] : undefined;

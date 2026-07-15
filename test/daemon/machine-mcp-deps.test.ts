@@ -151,11 +151,11 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(r).toMatchObject({ outcome: 'completed', result: { content: [{ text: 'local:chrome' }] } });
   });
 
-  it('offline target → exec_offline (retry-safe, not confused with a command failure)', async () => {
-    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+  it('DB-heartbeat offline is advisory; the authoritative exec route decides live availability', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'not_dispatched' as const, reason: MCP_ERROR_REASONS.EXEC_OFFLINE, error: 'target socket is offline' }));
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => creds, listMachines: async () => [m({ refName: 'sleepy', online: false })], execRemote: exec });
     expect(await deps.execRemote({ machine: 'sleepy', command: 'x' })).toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
-    expect(exec).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'x', command: 'x' }));
   });
 
   it('resolves ref_name → serverId and forwards to the client, preserving the outcome', async () => {
@@ -184,13 +184,29 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     });
 
     expect(await deps.sendFileToMachine?.({ machine: 'missing', sourcePath: '/tmp/a' })).toMatchObject({ ok: false, reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
-    expect(await deps.fetchFileFromMachine?.({ machine: 'offline', sourcePath: 'C:\\a', destinationPath: '/tmp/a' })).toMatchObject({ ok: false, reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+    expect(await deps.fetchFileFromMachine?.({ machine: 'offline', sourcePath: 'C:\\a', destinationPath: '/tmp/offline-a' })).toMatchObject({ ok: true, destinationPath: '/tmp/offline-a' });
     expect(sendFile).not.toHaveBeenCalled();
-    expect(fetchFile).not.toHaveBeenCalled();
+    expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-offline', destinationPath: '/tmp/offline-a' }));
 
     expect(await deps.sendFileToMachine?.({ machine: 'win-1', sourcePath: '/tmp/a' })).toMatchObject({ ok: true, remotePath: '/staging/a.txt' });
     expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', sourcePath: '/tmp/a', sourceServerId: 's1' }));
     expect(await deps.fetchFileFromMachine?.({ machine: 'win-1', sourcePath: 'C:\\a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ ok: true, destinationPath: '/tmp/a' });
     expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', sourcePath: 'C:\\a', destinationPath: '/tmp/a', overwrite: true }));
+  });
+
+  it('maps the authoritative file route offline response after advisory presence allowed dispatch', async () => {
+    const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
+    const sendFile = vi.fn(async () => { throw new MachineControlPlaneError('http_status', 'daemon_offline'); });
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [m({ serverId: 'srv-stale', refName: 'stale', online: false })],
+      sendFileToMachine: sendFile as never,
+    });
+
+    expect(await deps.sendFileToMachine?.({ machine: 'stale', sourcePath: '/tmp/a' })).toMatchObject({
+      ok: false,
+      reason: MCP_ERROR_REASONS.EXEC_OFFLINE,
+    });
+    expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-stale' }));
   });
 });
