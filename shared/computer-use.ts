@@ -12,6 +12,14 @@ export const COMPUTER_USE_TOOLS = [
   'press_key',
   'set_value',
   'shell_session1',
+  'browser_open',
+  'browser_navigate',
+  'browser_snapshot',
+  'browser_click',
+  'browser_fill',
+  'browser_press',
+  'browser_evaluate',
+  'browser_close',
 ] as const;
 
 export type ComputerUseToolName = (typeof COMPUTER_USE_TOOLS)[number];
@@ -20,6 +28,7 @@ export const COMPUTER_USE_DOC_TOPICS = [
   'overview',
   'workflow',
   'tools',
+  'browser',
   'windows',
   'safety',
 ] as const;
@@ -243,6 +252,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
         'Target machines are addressed by list_machines name/ref_name; on full imcodes daemons, use machine=local/localhost/self/this to control the daemon host directly. Results are bounded text/image MCP-style content.',
+        'Browser-specific control is available through Playwright-backed browser_* tools and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
@@ -252,6 +262,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         '3. computer_use_call tool=list_apps to discover app ids.',
         '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
         '5. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
+        '6. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
       ].join('\n');
     case 'tools':
       return [
@@ -263,6 +274,15 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'type_text, press_key, set_value: keyboard/value actions.',
         'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
+      ].join('\n');
+    case 'browser':
+      return [
+        'Browser control uses Chrome DevTools Protocol (CDP), the mature browser automation protocol used by Chrome/Edge tooling, and is more deterministic for web pages than screen coordinates.',
+        'Use browser_open first with url. Optional arguments: executablePath, headless=true|false, cdpEndpoint to attach to an existing browser target websocket.',
+        'Then use browser_navigate, browser_snapshot, browser_click, browser_fill, browser_press, browser_evaluate, browser_close.',
+        'Selectors are Playwright selectors. For click/fill you may pass selector, text, label, placeholder, or role+name. Prefer stable selectors and roles over coordinates.',
+        'browser_snapshot returns url/title plus bounded visible text and common links/buttons/inputs; call it on demand before choosing selectors.',
+        'browser_evaluate runs JavaScript in the page, not a shell. Use it for read-only inspection by default; ask before submitting forms, purchases, destructive actions, or externally visible changes.',
       ].join('\n');
     case 'windows':
       return [

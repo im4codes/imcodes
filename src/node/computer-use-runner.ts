@@ -1,6 +1,8 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { access } from 'node:fs/promises';
+import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import WebSocket from 'ws';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
   COMPUTER_USE_MAX_ERROR_BYTES,
@@ -826,6 +828,397 @@ async function runShellSession1(request: ComputerUseRequest, timeoutMs: number, 
   };
 }
 
+const BROWSER_USE_TOOLS = new Set<string>([
+  'browser_open',
+  'browser_navigate',
+  'browser_snapshot',
+  'browser_click',
+  'browser_fill',
+  'browser_press',
+  'browser_evaluate',
+  'browser_close',
+]);
+
+function isBrowserUseTool(tool: string): boolean {
+  return BROWSER_USE_TOOLS.has(tool);
+}
+
+function optionalStringArg(args: Record<string, unknown>, key: string): string | undefined {
+  const value = args[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function truncateJsonText(value: unknown, maxBytes: number = COMPUTER_USE_MAX_TEXT_BYTES): { text: string; truncated: boolean } {
+  let text: string;
+  try { text = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+  catch { text = String(value); }
+  const truncated = truncateUtf8(text, maxBytes);
+  return { text: truncated.value, truncated: truncated.truncated };
+}
+
+interface CdpResponse { id?: number; result?: unknown; error?: { message?: string; data?: string } }
+interface CdpEvent { method?: string; params?: unknown }
+
+type CdpPending = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+class CdpClient {
+  private ws: WebSocket | null = null;
+  private nextId = 1;
+  private pending = new Map<number, CdpPending>();
+  private eventWaiters: Array<{ method: string; resolve: () => void; timer: ReturnType<typeof setTimeout> }> = [];
+
+  constructor(private readonly endpoint: string) {}
+
+  async connect(timeoutMs: number): Promise<void> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(this.endpoint);
+      const timer = setTimeout(() => {
+        ws.close();
+        reject(new Error('browser_cdp_connect_timeout'));
+      }, timeoutMs);
+      timer.unref?.();
+      ws.once('open', () => {
+        clearTimeout(timer);
+        this.ws = ws;
+        ws.on('message', (data) => this.onMessage(String(data)));
+        ws.on('close', () => this.rejectAll(new Error('browser_cdp_closed')));
+        ws.on('error', (error) => this.rejectAll(error instanceof Error ? error : new Error(String(error))));
+        resolve();
+      });
+      ws.once('error', (error) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+
+  call(method: string, params: Record<string, unknown> = {}, timeoutMs: number = 30_000): Promise<unknown> {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error('browser_cdp_not_connected'));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`browser_cdp_timeout:${method}`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
+      ws.send(JSON.stringify({ id, method, params }), (error) => {
+        if (!error) return;
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      });
+    });
+  }
+
+  waitForEvent(method: string, timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+      this.eventWaiters.push({ method, resolve: () => { clearTimeout(timer); resolve(); }, timer });
+    });
+  }
+
+  close(): void {
+    this.ws?.close();
+    this.ws = null;
+    this.rejectAll(new Error('browser_cdp_closed'));
+  }
+
+  private onMessage(raw: string): void {
+    let message: CdpResponse & CdpEvent;
+    try { message = JSON.parse(raw) as CdpResponse & CdpEvent; } catch { return; }
+    if (typeof message.id === 'number') {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pending.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error.message || message.error.data || 'browser_cdp_error'));
+      else pending.resolve(message.result);
+      return;
+    }
+    if (message.method) {
+      const waiters = this.eventWaiters.splice(0);
+      for (const waiter of waiters) {
+        if (waiter.method === message.method) waiter.resolve();
+        else this.eventWaiters.push(waiter);
+      }
+    }
+  }
+
+  private rejectAll(error: Error): void {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    for (const waiter of this.eventWaiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+  }
+}
+
+function browserExecutableCandidates(args: Record<string, unknown>): string[] {
+  const explicit = optionalStringArg(args, 'executablePath') ?? process.env.IMCODES_BROWSER_EXE?.trim();
+  if (explicit) return [explicit];
+  if (process.platform === 'win32') return [
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ];
+  if (process.platform === 'darwin') return [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  ];
+  return ['google-chrome', 'google-chrome-stable', 'chromium-browser', 'chromium', 'microsoft-edge'];
+}
+
+async function firstExistingBrowser(args: Record<string, unknown>): Promise<string> {
+  const candidates = browserExecutableCandidates(args);
+  for (const candidate of candidates) {
+    if (candidate.includes('/') || candidate.includes('\\')) {
+      if (await fileExists(candidate)) return candidate;
+      continue;
+    }
+    const proc = await execFileBounded(process.platform === 'win32' ? 'where' : 'which', [candidate], 2_000);
+    const first = proc.stdout.split(/\r?\n/).find((line) => line.trim());
+    if (first) return first.trim();
+  }
+  throw new Error('browser_executable_not_found');
+}
+
+class BrowserUseController {
+  private child: ChildProcess | null = null;
+  private userDataDir: string | null = null;
+  private client: CdpClient | null = null;
+  private starting: Promise<CdpClient> | null = null;
+
+  async run(tool: ComputerUseToolName, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
+    if (tool === 'browser_close') {
+      await this.close();
+      return { content: [{ type: 'text', text: 'browser closed' }] };
+    }
+    const client = await this.ensureClient(args, timeoutMs);
+    if (tool === 'browser_open' || tool === 'browser_navigate') {
+      const url = optionalStringArg(args, 'url');
+      if (tool === 'browser_navigate' && !url) throw new Error('url_required');
+      if (url) await this.navigate(client, url, timeoutMs);
+      return this.snapshot(client, args, timeoutMs);
+    }
+    if (tool === 'browser_snapshot') return this.snapshot(client, args, timeoutMs);
+    if (tool === 'browser_click') {
+      await this.evalInPage(client, this.selectorScript(args, 'click'), timeoutMs);
+      return { content: [{ type: 'text', text: 'browser_click completed' }] };
+    }
+    if (tool === 'browser_fill') {
+      if (typeof args.value !== 'string') throw new Error('value_required');
+      await this.evalInPage(client, this.selectorScript(args, 'fill'), timeoutMs);
+      return { content: [{ type: 'text', text: 'browser_fill completed' }] };
+    }
+    if (tool === 'browser_press') {
+      const key = optionalStringArg(args, 'key');
+      if (!key) throw new Error('key_required');
+      const selector = optionalStringArg(args, 'selector');
+      if (selector) await this.evalInPage(client, this.selectorScript(args, 'focus'), timeoutMs);
+      await client.call('Input.dispatchKeyEvent', { type: 'keyDown', key }, Math.min(timeoutMs, 30_000));
+      await client.call('Input.dispatchKeyEvent', { type: 'keyUp', key }, Math.min(timeoutMs, 30_000));
+      return { content: [{ type: 'text', text: 'browser_press completed' }] };
+    }
+    if (tool === 'browser_evaluate') {
+      const script = optionalStringArg(args, 'script');
+      if (!script) throw new Error('script_required');
+      const result = await this.evalInPage(client, script, timeoutMs);
+      const output = truncateJsonText(result);
+      return { content: [{ type: 'text', text: output.text }], ...(output.truncated ? { truncated: true } : {}) };
+    }
+    throw new Error(`unsupported_browser_tool:${tool}`);
+  }
+
+  private async ensureClient(args: Record<string, unknown>, timeoutMs: number): Promise<CdpClient> {
+    if (this.client) return this.client;
+    if (this.starting) return this.starting;
+    this.starting = this.start(args, timeoutMs);
+    try { return await this.starting; } finally { this.starting = null; }
+  }
+
+  private async start(args: Record<string, unknown>, timeoutMs: number): Promise<CdpClient> {
+    const cdpEndpoint = optionalStringArg(args, 'cdpEndpoint');
+    if (cdpEndpoint) {
+      const client = new CdpClient(cdpEndpoint);
+      await client.connect(Math.min(timeoutMs, 30_000));
+      await client.call('Page.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
+      await client.call('Runtime.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
+      this.client = client;
+      return client;
+    }
+
+    const browser = await firstExistingBrowser(args);
+    this.userDataDir = await mkdtemp(join(tmpdir(), 'imcodes-browser-'));
+    const launchArgs = [
+      '--remote-debugging-port=0',
+      `--user-data-dir=${this.userDataDir}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      'about:blank',
+    ];
+    if (args.headless === true) launchArgs.splice(1, 0, '--headless=new');
+    this.child = spawn(browser, launchArgs, { windowsHide: true, stdio: 'ignore' });
+    this.child.once('exit', () => {
+      this.client?.close();
+      this.client = null;
+      this.child = null;
+    });
+    const portFile = join(this.userDataDir, 'DevToolsActivePort');
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    let port = '';
+    while (Date.now() < deadline) {
+      const text = await readFile(portFile, 'utf8').catch(() => '');
+      port = text.split(/\r?\n/)[0]?.trim() ?? '';
+      if (/^\d+$/.test(port)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!/^\d+$/.test(port)) throw new Error('browser_debug_port_unavailable');
+    const target = await this.newPageTarget(Number(port), optionalStringArg(args, 'url') ?? 'about:blank');
+    const client = new CdpClient(target.webSocketDebuggerUrl);
+    await client.connect(Math.min(timeoutMs, 30_000));
+    await client.call('Page.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
+    await client.call('Runtime.enable', {}, Math.min(timeoutMs, 30_000)).catch(() => {});
+    this.client = client;
+    return client;
+  }
+
+  private async newPageTarget(port: number, url: string): Promise<{ webSocketDebuggerUrl: string }> {
+    const response = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
+    if (!response.ok) throw new Error(`browser_target_failed:${response.status}`);
+    const json = await response.json() as { webSocketDebuggerUrl?: unknown };
+    if (typeof json.webSocketDebuggerUrl !== 'string') throw new Error('browser_target_missing_ws');
+    return { webSocketDebuggerUrl: json.webSocketDebuggerUrl };
+  }
+
+  private async navigate(client: CdpClient, url: string, timeoutMs: number): Promise<void> {
+    const wait = client.waitForEvent('Page.loadEventFired', Math.min(timeoutMs, 30_000));
+    await client.call('Page.navigate', { url }, Math.min(timeoutMs, 30_000));
+    await wait;
+  }
+
+  private async evalInPage(client: CdpClient, expression: string, timeoutMs: number): Promise<unknown> {
+    const result = await client.call('Runtime.evaluate', {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      timeout: Math.min(timeoutMs, 30_000),
+    }, Math.min(timeoutMs, 30_000)) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string } };
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'browser_evaluate_failed');
+    return result.result?.value ?? result.result?.description ?? null;
+  }
+
+  private selectorScript(args: Record<string, unknown>, action: 'click' | 'fill' | 'focus'): string {
+    const selector = optionalStringArg(args, 'selector');
+    const text = optionalStringArg(args, 'text');
+    const value = typeof args.value === 'string' ? args.value : '';
+    const exact = args.exact === true;
+    const selectorJson = JSON.stringify(selector ?? null);
+    const textJson = JSON.stringify(text ?? null);
+    const valueJson = JSON.stringify(value);
+    return `(() => {
+      const selector = ${selectorJson};
+      const text = ${textJson};
+      const exact = ${JSON.stringify(exact)};
+      const value = ${valueJson};
+      function visible(el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+      let el = selector ? document.querySelector(selector) : null;
+      if (!el && text) {
+        const all = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],label,*'));
+        el = all.find((candidate) => {
+          const t = (candidate.innerText || candidate.textContent || candidate.getAttribute('aria-label') || candidate.getAttribute('placeholder') || '').trim();
+          return visible(candidate) && (exact ? t === text : t.includes(text));
+        }) || null;
+      }
+      if (!el) throw new Error('element_not_found');
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      el.focus?.();
+      if (${JSON.stringify(action)} === 'click') { el.click(); return true; }
+      if (${JSON.stringify(action)} === 'fill') {
+        el.value = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+      return true;
+    })()`;
+  }
+
+  private async snapshot(client: CdpClient, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
+    const textLimitRaw = args.textLimit;
+    const textLimit = typeof textLimitRaw === 'number' && Number.isFinite(textLimitRaw)
+      ? Math.min(Math.max(Math.round(textLimitRaw), 1_000), COMPUTER_USE_MAX_TEXT_BYTES)
+      : 32_000;
+    const result = await this.evalInPage(client, `(() => {
+      const elements = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"]')).slice(0, 80).map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        text: (el.innerText || el.textContent || '').trim().slice(0, 160),
+        aria: el.getAttribute('aria-label') || '',
+        role: el.getAttribute('role') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        type: el.getAttribute('type') || '',
+        id: el.id || '',
+        name: el.getAttribute('name') || '',
+        href: el.href || '',
+      }));
+      return { url: location.href, title: document.title, visibleText: (document.body?.innerText || '').slice(0, ${textLimit}), elements };
+    })()`, timeoutMs);
+    const output = truncateJsonText(result);
+    return { content: [{ type: 'text', text: output.text }], ...(output.truncated ? { truncated: true } : {}) };
+  }
+
+  async close(): Promise<void> {
+    this.client?.close();
+    this.client = null;
+    this.child?.kill();
+    this.child = null;
+    const dir = this.userDataDir;
+    this.userDataDir = null;
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+const browserUseController = new BrowserUseController();
+
+async function runBrowserUseTool(request: ComputerUseRequest, timeoutMs: number, started: number): Promise<ComputerUseResult> {
+  try {
+    const result = await browserUseController.run(request.tool, request.arguments ?? {}, timeoutMs);
+    return {
+      correlationId: request.correlationId,
+      ok: true,
+      tool: request.tool,
+      content: result.content,
+      durationMs: Date.now() - started,
+      ...(result.truncated ? { truncated: true } : {}),
+    };
+  } catch (error) {
+    const normalized = normalizeError(error instanceof Error ? error.message : String(error));
+    return {
+      correlationId: request.correlationId,
+      ok: false,
+      tool: request.tool,
+      content: [],
+      durationMs: Date.now() - started,
+      error: normalized.error,
+      ...(normalized.truncated ? { truncated: true } : {}),
+    };
+  }
+}
+
 export async function runComputerUseTool(request: ComputerUseRequest): Promise<ComputerUseResult> {
   const started = Date.now();
   const timeoutMs = Math.min(Math.max(request.timeoutMs ?? COMPUTER_USE_DEFAULT_TIMEOUT_MS, COMPUTER_USE_MIN_TIMEOUT_MS), COMPUTER_USE_MAX_TIMEOUT_MS);
@@ -843,6 +1236,7 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
   }
 
   if (request.tool === 'shell_session1') return runShellSession1(request, timeoutMs, started);
+  if (isBrowserUseTool(request.tool)) return runBrowserUseTool(request, timeoutMs, started);
 
   if (isFastWindowsCoordinateClick(request.tool, argsObject)) {
     try {
