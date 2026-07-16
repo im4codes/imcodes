@@ -9,6 +9,7 @@ import { PassThrough, Writable } from 'node:stream';
 // fake timers. Rollout checks perform real filesystem I/O, which must get a
 // chance to complete while virtual provider timers are advanced.
 const realSetImmediate = setImmediate;
+const realSetTimeout = setTimeout;
 
 const childProcessMock = vi.hoisted(() => {
   type Request = { id?: number; method?: string; params?: Record<string, any> };
@@ -301,7 +302,14 @@ async function advanceFakeTimersWithRealIoUntil(
   for (let i = 0; i <= steps; i += 1) {
     if (check()) return;
     await vi.advanceTimersByTimeAsync(stepMs);
+    // A single setImmediate can race through hundreds of virtual polling
+    // intervals in only a few milliseconds, especially under Node 24 CI,
+    // before the rollout reader's real multi-step filesystem work completes.
+    // Give libuv a small amount of real time as well as an event-loop turn;
+    // this remains bounded (and usually exits after the first poll) while
+    // preventing a fake-time-only false timeout under suite-wide I/O load.
     await new Promise<void>((resolve) => realSetImmediate(resolve));
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 5));
   }
   throw new Error('Timed out waiting for fake-timer condition with real I/O');
 }
