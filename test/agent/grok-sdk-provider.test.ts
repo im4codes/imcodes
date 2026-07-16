@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { GrokSdkProvider } from '../../src/agent/providers/grok-sdk.js';
-import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import {
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
 
 function attachRoute(provider: GrokSdkProvider, routeId = 'grok-route') {
   const acpSessionId = `acp-${routeId}`;
@@ -54,6 +59,7 @@ describe('GrokSdkProvider contract', () => {
       multiTurn: true,
       attachments: false,
       reasoningEffort: false,
+      backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
       compact: {
         execution: 'slash-command',
         providerCommand: '/compact',
@@ -61,6 +67,64 @@ describe('GrokSdkProvider contract', () => {
       },
     });
     expect((provider as any).profile.args).toEqual(['--no-auto-update', 'agent', 'stdio']);
+  });
+
+  it('normalizes Grok background-subagent lifecycle events for parent wake', () => {
+    const provider = new GrokSdkProvider();
+    const { acpSessionId } = attachRoute(provider, 'grok-subagent-wake');
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sessionId, tool) => tools.push(tool));
+
+    (provider as any).handleSessionUpdate({
+      sessionId: acpSessionId,
+      update: {
+        sessionUpdate: 'subagent_notification',
+        subagent: {
+          agent_path: 'grok-child-1',
+          status: 'running',
+          is_backgrounded: true,
+        },
+      },
+    });
+    (provider as any).handleSessionUpdate({
+      sessionId: acpSessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: 'grok-child-terminal',
+        content: {
+          type: 'text',
+          text: '<subagent_notification>{"agent_path":"grok-child-1","status":{"completed":"done"},"is_backgrounded":true}</subagent_notification>',
+        },
+      },
+    });
+
+    expect(tools).toHaveLength(2);
+    expect(tools[0]).toMatchObject({
+      status: 'running',
+      detail: {
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.GROK_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT,
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          backgrounded: true,
+        },
+      },
+    });
+    expect(tools[1]).toMatchObject({
+      id: tools[0]?.id,
+      status: 'complete',
+      output: 'done',
+      detail: {
+        meta: {
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+          backgrounded: true,
+        },
+      },
+    });
   });
 
   it('bridges permission options and applies a session-scoped response', async () => {

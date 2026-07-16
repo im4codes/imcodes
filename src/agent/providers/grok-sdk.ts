@@ -3,6 +3,10 @@ import type { ProviderConfig } from '../transport-provider.js';
 import { PROVIDER_ERROR_CODES } from '../transport-provider.js';
 import { normalizeTransportCwd } from '../transport-paths.js';
 import { KimiSdkProvider, type AcpCliProviderProfile } from './kimi-sdk.js';
+import {
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+} from '../../../shared/sdk-subagent-status.js';
 
 const GROK_PROFILE: AcpCliProviderProfile = {
   id: 'grok-sdk',
@@ -21,6 +25,11 @@ const GROK_PROFILE: AcpCliProviderProfile = {
   },
   probeOnConnect: true,
   privacySafeErrors: true,
+  runtimeSubagent: {
+    provider: SDK_SUBAGENT_PROVIDERS.GROK_SDK,
+    providerKind: SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT,
+    action: 'grok-runtime-subagent',
+  },
 };
 
 /**

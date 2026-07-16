@@ -637,7 +637,7 @@ program
   .option('--all', 'Broadcast to all sibling sessions')
   .option('--type <agentType>', 'Target by agent type instead of label')
   .option('--list', 'List available sibling sessions')
-  .option('--reply', 'Ask the target to send its response back')
+  .option('--reply', 'Route the target response back automatically; no polling needed')
   .option('--no-reply', 'Disable automatic reply instruction (default)')
   .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean }) => {
     const { detectSenderSession } = await import('./util/detect-session.js');

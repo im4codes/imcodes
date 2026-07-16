@@ -207,6 +207,7 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
     '',
     'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above, and require a reply. Prefer the available send_message tool with reply enabled when present; otherwise use:',
     `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
+    'A reply-enabled send already routes the delegate response back into this session as a normal incoming message. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for the reply to arrive.',
     '',
     'If the user selected or mentioned multiple @ delegates, split the work into separate per-delegate briefs, dispatch each one independently with reply required, and track/report each delegate result separately.',
     '',

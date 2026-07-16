@@ -83,6 +83,7 @@ import type {
   RemoteSessionInfo,
 } from '../transport-provider.js';
 import {
+  BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
   SESSION_OWNERSHIP,
@@ -98,6 +99,14 @@ import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activit
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
+import {
+  buildGenericRuntimeSubagentTool,
+  isSdkRuntimeSubagentEventName,
+  parseSdkRuntimeSubagentTag,
+  startsWithSdkRuntimeSubagentTag,
+  type SdkSubagentProvider,
+  type SdkSubagentProviderKind,
+} from '../../../shared/sdk-subagent-status.js';
 
 const KIMI_BIN = 'kimi';
 /** Kimi ACP currently advertises one mode named `default`. */
@@ -114,6 +123,11 @@ export interface AcpCliProviderProfile {
   loadFailure: 'fresh' | 'error';
   probeOnConnect?: boolean;
   privacySafeErrors?: boolean;
+  runtimeSubagent?: {
+    provider: SdkSubagentProvider;
+    providerKind: SdkSubagentProviderKind;
+    action: string;
+  };
 }
 
 const KIMI_PROFILE: AcpCliProviderProfile = {
@@ -237,6 +251,9 @@ export class KimiSdkProvider implements TransportProvider {
       attachments: false,
       reasoningEffort: false,
       contextSupport: 'degraded-message-side-context-mapping',
+      backgroundSubagentWake: profile.runtimeSubagent
+        ? BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME
+        : BACKGROUND_SUBAGENT_WAKE_MODES.UNSUPPORTED,
       compact: profile.compact,
     };
   }
@@ -1006,6 +1023,11 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.replaying) {
       return;
     }
+    const updateRecord = update as unknown as Record<string, unknown>;
+    if (this.profile.runtimeSubagent && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
+      this.emitRuntimeSubagentNotification(routeId, state, updateRecord);
+      return;
+    }
     const turnScopedUpdate = update.sessionUpdate === 'agent_message_chunk'
       || update.sessionUpdate === 'agent_thought_chunk'
       || update.sessionUpdate === 'tool_call'
@@ -1085,6 +1107,14 @@ export class KimiSdkProvider implements TransportProvider {
   ): void {
     const chunkText = extractTextFromContent(update.content);
     if (!chunkText) return;
+    const runtimeSubagentPayload = this.profile.runtimeSubagent
+      ? parseSdkRuntimeSubagentTag(chunkText)
+      : null;
+    if (runtimeSubagentPayload) {
+      this.emitRuntimeSubagentNotification(sessionId, state, runtimeSubagentPayload);
+      return;
+    }
+    if (this.profile.runtimeSubagent && startsWithSdkRuntimeSubagentTag(chunkText)) return;
     this.clearStatus(sessionId, state);
 
     // ACP has a `messageId` field on each chunk. When it changes we start a
@@ -1106,6 +1136,26 @@ export class KimiSdkProvider implements TransportProvider {
       role: 'assistant',
     };
     for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+  }
+
+  private emitRuntimeSubagentNotification(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    payload: Record<string, unknown>,
+  ): void {
+    const runtimeSubagent = this.profile.runtimeSubagent;
+    if (!runtimeSubagent) return;
+    const tool = buildGenericRuntimeSubagentTool({
+      sessionId,
+      provider: runtimeSubagent.provider,
+      providerKind: runtimeSubagent.providerKind,
+      providerLabel: this.profile.displayName,
+      action: runtimeSubagent.action,
+      payload,
+      fallbackModel: state.model,
+    });
+    if (!tool) return;
+    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
   private handleToolCall(

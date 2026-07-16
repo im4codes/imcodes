@@ -144,6 +144,18 @@ export type ProviderCompactCompletion =
   | 'none';
 export type ProviderCompactCancellation = 'provider-cancel' | 'local-cancel' | 'timeout-only' | 'none';
 
+export const BACKGROUND_SUBAGENT_WAKE_MODES = {
+  /** The provider keeps the parent turn/query alive and delivers child terminals itself. */
+  NATIVE: 'native',
+  /** IM.codes must start a hidden continuation turn after an idle parent receives a child terminal. */
+  RUNTIME: 'runtime',
+  /** No reliable background-subagent terminal channel is available. */
+  UNSUPPORTED: 'unsupported',
+} as const;
+
+export type BackgroundSubagentWakeMode =
+  typeof BACKGROUND_SUBAGENT_WAKE_MODES[keyof typeof BACKGROUND_SUBAGENT_WAKE_MODES];
+
 export interface ProviderCompactCapability {
   /** How this provider executes the `/compact` control command. */
   execution: ProviderCompactExecution;
@@ -184,6 +196,8 @@ export interface ProviderCapabilities {
   contextSupport?: ProviderSupportClass;
   /** Provider-specific `/compact` execution support. */
   compact?: ProviderCompactCapability;
+  /** How a completed background subagent re-enters an already-idle parent session. */
+  backgroundSubagentWake?: BackgroundSubagentWakeMode;
 }
 
 /**
