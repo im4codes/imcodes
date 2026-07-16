@@ -16,6 +16,7 @@ import type {
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
+  BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
   SESSION_OWNERSHIP,
@@ -571,6 +572,7 @@ export class QwenProvider implements TransportProvider {
     reasoningEffort: true,
     supportedEffortLevels: QWEN_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
+    backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
     compact: {
       execution: 'slash-command',
       providerCommand: QWEN_COMPACT_SLASH_COMMAND,

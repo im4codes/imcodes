@@ -31,6 +31,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('openspec status --change "<name>" --json');
     expect(prompt).toContain('@@all(discuss) <message>');
     expect(prompt).toContain('imcodes send --list');
+    expect(prompt).toContain('imcodes send --reply "<label-or-session-name>" "<message>"');
+    expect(prompt).toContain('do not poll session state, logs, transcripts, or the target');
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {

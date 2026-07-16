@@ -60,6 +60,9 @@ export const SDK_SUBAGENT_SAFE_RAW_MAX_TOTAL_BYTES = 4096;
 export const SDK_SUBAGENT_CANONICAL_KEY_MAX_LENGTH = 192;
 export const SDK_SUBAGENT_CANONICAL_COMPONENT_MAX_LENGTH = 48;
 export const SDK_SUBAGENT_MAX_CHILD_COUNT = 999;
+export const SDK_SUBAGENT_WAKE_BATCH_MAX_ITEMS = 16;
+export const SDK_SUBAGENT_WAKE_PROMPT_HEADER = '# IM.codes background subagent completion' as const;
+export const SDK_SUBAGENT_WAKE_CLIENT_MESSAGE_PREFIX = 'sdk-subagent-wake' as const;
 export const SDK_SUBAGENT_SAFE_TIMESTAMP_MAX_MS = 4_102_444_800_000; // 2100-01-01T00:00:00.000Z
 export const SDK_SUBAGENT_REDACTED_VALUE = '[REDACTED]';
 export const SDK_RUNTIME_SUBAGENT_EVENT_NAMES = [
@@ -231,6 +234,114 @@ export function parseSdkRuntimeSubagentTag(value: string): Record<string, unknow
   } catch {
     return null;
   }
+}
+
+export interface GenericRuntimeSubagentToolOptions {
+  sessionId: string;
+  provider: SdkSubagentProvider;
+  providerKind: SdkSubagentProviderKind;
+  providerLabel: string;
+  action: string;
+  payload: Record<string, unknown>;
+  fallbackModel?: string;
+}
+
+function nestedRuntimeSubagentRecord(value: Record<string, unknown>): Record<string, unknown> {
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event']) {
+    const candidate = value[key];
+    if (!isRecord(candidate)) continue;
+    if (
+      candidate.agent_path !== undefined
+      || candidate.agentPath !== undefined
+      || candidate.agent_id !== undefined
+      || candidate.agentId !== undefined
+      || candidate.status !== undefined
+    ) return candidate;
+  }
+  return value;
+}
+
+/** Provider-neutral normalizer for ACP/runtime subagent notifications. */
+export function buildGenericRuntimeSubagentTool(options: GenericRuntimeSubagentToolOptions): ToolCallEvent | null {
+  const record = nestedRuntimeSubagentRecord(options.payload);
+  const agentPath = sanitizeSdkSubagentText(
+    record.agent_path ?? record.agentPath ?? record.agent_id ?? record.agentId ?? record.id,
+    SDK_SUBAGENT_CANONICAL_COMPONENT_MAX_LENGTH * 4,
+  );
+  if (!agentPath) return null;
+  const statusValue = record.status ?? options.payload.status;
+  const statusRecord = isRecord(statusValue) ? statusValue : undefined;
+  const rawStatus = sanitizeSdkSubagentText(
+    typeof statusValue === 'string'
+      ? statusValue
+      : statusRecord
+        ? Object.keys(statusRecord)[0]
+        : undefined,
+    80,
+  ) ?? 'unknown';
+  const normalizedRaw = rawStatus.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const output = sanitizeSdkSubagentText(
+    statusRecord ? Object.values(statusRecord)[0] : record.output ?? record.result ?? record.message,
+  );
+  const normalizedStatus: SdkSubagentNormalizedStatus =
+    /^(completed|complete|succeeded|success|done|idle)$/.test(normalizedRaw)
+      ? SDK_SUBAGENT_STATUS.COMPLETE
+      : /^(failed|error|errored)$/.test(normalizedRaw)
+        ? SDK_SUBAGENT_STATUS.ERROR
+        : /^(interrupted|cancelled|canceled|stopped|aborted)$/.test(normalizedRaw)
+          ? SDK_SUBAGENT_STATUS.INTERRUPTED
+          : /^(pending|queued|pending_init)$/.test(normalizedRaw)
+            ? SDK_SUBAGENT_STATUS.PENDING
+            : /^(running|active|in_progress|working)$/.test(normalizedRaw)
+              ? SDK_SUBAGENT_STATUS.RUNNING
+              : SDK_SUBAGENT_STATUS.UNKNOWN;
+  const terminal = normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+    || normalizedStatus === SDK_SUBAGENT_STATUS.ERROR
+    || normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED;
+  const active = !terminal && normalizedStatus !== SDK_SUBAGENT_STATUS.UNKNOWN;
+  const backgrounded = record.backgrounded === true
+    || record.is_backgrounded === true
+    || record.background === true;
+  const agentName = sanitizeSdkSubagentText(record.name ?? record.nickname, 80);
+  const model = sanitizeSdkSubagentText(record.model ?? options.fallbackModel, 120);
+  const prompt = sanitizeSdkSubagentText(record.prompt ?? record.description);
+  const canonicalKey = normalizeSdkSubagentCanonicalKey(
+    `${options.provider}:${normalizeSdkSubagentKeyComponent(options.sessionId)}:runtime:${normalizeSdkSubagentKeyComponent(agentPath)}`,
+  );
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: `${options.providerLabel} sub-agent${agentName ? ` ${agentName}` : ''}`,
+    input: {
+      action: options.action,
+      ...(prompt ? { description: prompt } : {}),
+    },
+    ...(output ? { output } : {}),
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: options.provider,
+      providerKind: options.providerKind,
+      canonicalKey,
+      normalizedStatus,
+      rawStatus,
+      active,
+      terminal,
+      parentSessionId: options.sessionId,
+      agentPath,
+      ...(agentName ? { agentName } : {}),
+      ...(model ? { model } : {}),
+      ...(backgrounded ? { backgrounded: true } : {}),
+      ...(normalizedStatus === SDK_SUBAGENT_STATUS.UNKNOWN ? { diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE } : {}),
+    },
+  });
+  return {
+    id: canonicalKey,
+    name: 'Agent',
+    status: terminal ? (normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE ? 'complete' : 'error') : 'running',
+    ...(detail.input ? { input: detail.input } : {}),
+    ...(detail.output ? { output: detail.output } : {}),
+    detail,
+  };
 }
 
 export function isBackgroundedSdkSubagentDetail(value: unknown): boolean {
@@ -518,4 +629,40 @@ export function isSdkSubagentDetail(detail: unknown): detail is SdkSubagentDetai
 
 export function isSdkSubagentToolDetail(detail: ToolCallDetail | undefined): detail is SdkSubagentDetail {
   return isSdkSubagentDetail(detail);
+}
+
+/**
+ * Build the hidden, provider-bound continuation prompt used when an idle parent
+ * receives a terminal event for a background subagent it observed running.
+ *
+ * Only schema-validated enum values and normalized canonical keys are included.
+ * Prompt/output/summary fields are deliberately excluded: a child result is an
+ * untrusted model/tool payload and must not become a second instruction channel.
+ */
+export function buildSdkSubagentWakePrompt(details: readonly SdkSubagentDetail[]): string {
+  const rows = new Map<string, {
+    canonicalKey: string;
+    provider: SdkSubagentProvider;
+    providerKind: SdkSubagentProviderKind;
+    status: SdkSubagentNormalizedStatus;
+  }>();
+  for (const detail of details) {
+    const parsed = parseSdkSubagentDetail(detail);
+    if (parsed.kind !== 'ok' || !parsed.detail.meta.terminal) continue;
+    const meta = parsed.detail.meta;
+    rows.set(meta.canonicalKey, {
+      canonicalKey: normalizeSdkSubagentCanonicalKey(meta.canonicalKey),
+      provider: meta.provider,
+      providerKind: meta.providerKind,
+      status: meta.normalizedStatus,
+    });
+    if (rows.size >= SDK_SUBAGENT_WAKE_BATCH_MAX_ITEMS) break;
+  }
+  return [
+    SDK_SUBAGENT_WAKE_PROMPT_HEADER,
+    'This is a trusted IM.codes runtime notification, not a user-authored instruction.',
+    'One or more background subagents started by this parent session reached a terminal state:',
+    JSON.stringify([...rows.values()]),
+    'Resume the parent task now. Inspect the provider-native child result/history using the identifiers above when available, then report the relevant outcome or failure. Do not merely say that you are still waiting for the notification.',
+  ].join('\n');
 }

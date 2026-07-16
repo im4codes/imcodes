@@ -4,7 +4,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
-import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -50,7 +50,11 @@ import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } fr
 import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import {
+  buildSdkSubagentWakePrompt,
   isBackgroundedSdkSubagentTool,
+  isSdkSubagentToolDetail,
+  SDK_SUBAGENT_WAKE_CLIENT_MESSAGE_PREFIX,
+  type SdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
 import { type MemorySearchResultItem } from '../context/memory-search.js';
 import { searchLocalMemorySemanticFrontOfTurn } from '../context/memory-recall-client.js';
@@ -445,6 +449,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _nextDispatchId = 0;
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
+  private readonly _activeBackgroundSubagents = new Set<string>();
+  private readonly _pendingBackgroundSubagentWake = new Map<string, SdkSubagentDetail>();
+  private _backgroundSubagentWakeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly _locallyCancelledDispatchIds = new Set<number>();
   private readonly _locallyCancelledActivityGenerations = new Set<string>();
   private _currentActivityGenerationLocallyCancelled = false;
@@ -1492,8 +1499,16 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private recordToolActivity(tool: Pick<ToolCallEvent, 'id' | 'name' | 'status' | 'detail'>): void {
-    if (isBackgroundedSdkSubagentTool(tool)) {
+    const sdkSubagentDetail = isSdkSubagentToolDetail(tool.detail) ? tool.detail : undefined;
+    const trackedBackgroundTerminal = Boolean(
+      sdkSubagentDetail?.meta.terminal
+      && this._activeBackgroundSubagents.has(sdkSubagentDetail.meta.canonicalKey),
+    );
+    if (isBackgroundedSdkSubagentTool(tool) || trackedBackgroundTerminal) {
       this._openTools.delete(tool.id);
+      if (sdkSubagentDetail) {
+        this.recordBackgroundSubagentLifecycle(sdkSubagentDetail);
+      }
       if (this._pendingMessages.length > 0 && !this._sending && !this._activeTurn) {
         this.drainPendingIfNoActiveTurn(`backgrounded-sdk-subagent-${tool.status}`);
       }
@@ -1515,6 +1530,62 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.setStatus('idle');
       }
     }
+  }
+
+  private recordBackgroundSubagentLifecycle(detail: SdkSubagentDetail): void {
+    if (this.provider.capabilities.backgroundSubagentWake !== BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME) return;
+    const key = detail.meta.canonicalKey;
+    if (detail.meta.active && !detail.meta.terminal) {
+      this._activeBackgroundSubagents.add(key);
+      return;
+    }
+    if (!detail.meta.terminal || !this._activeBackgroundSubagents.delete(key)) return;
+
+    // If a foreground turn is active, the parent is already awake and the
+    // provider-native turn owns the child terminal. Injecting another turn here
+    // would duplicate the report. The wake bridge is only for the exact gap the
+    // user sees: parent already idle, child terminal arrives out-of-band.
+    if (this.hasActiveTurnWork()) return;
+    this._pendingBackgroundSubagentWake.set(key, detail);
+    this.scheduleBackgroundSubagentWake();
+  }
+
+  private scheduleBackgroundSubagentWake(): void {
+    if (this._backgroundSubagentWakeTimer || this._pendingBackgroundSubagentWake.size === 0) return;
+    this._backgroundSubagentWakeTimer = setTimeout(() => {
+      this._backgroundSubagentWakeTimer = null;
+      if (!this._providerSessionId || this._pendingBackgroundSubagentWake.size === 0) return;
+      // A user/provider turn that started during the debounce means the parent
+      // is already awake. Consume the notification rather than queueing a
+      // duplicate synthetic turn behind the live one.
+      if (this.hasActiveTurnWork()) {
+        this._pendingBackgroundSubagentWake.clear();
+        return;
+      }
+      const details = [...this._pendingBackgroundSubagentWake.values()];
+      this._pendingBackgroundSubagentWake.clear();
+      const prompt = buildSdkSubagentWakePrompt(details);
+      const clientMessageId = `${SDK_SUBAGENT_WAKE_CLIENT_MESSAGE_PREFIX}:${randomUUID()}`;
+      try {
+        const result = this.send(prompt, clientMessageId, undefined, undefined, {
+          queuePlacement: 'front',
+          // The continuation is runtime-authored control context, not a human
+          // chat message. Keep it out of both visible timeline and local user
+          // history while still delivering it to the provider-owned session.
+          timelineCommitted: true,
+          historyCommitted: true,
+        });
+        logger.info({
+          sessionKey: this.sessionKey,
+          provider: this.provider.id,
+          childCount: details.length,
+          delivery: result,
+        }, 'transport runtime woke idle parent for background subagent terminal');
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, provider: this.provider.id }, 'transport runtime failed to wake idle parent for background subagent terminal');
+      }
+    }, 25);
+    this._backgroundSubagentWakeTimer.unref?.();
   }
 
   private isInProgressStatus(status: AgentStatus): boolean {
@@ -1850,6 +1921,10 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   async kill(options: { preserveTransportQueue?: boolean } = {}): Promise<void> {
     this.stopCodexRolloutBackstop();
+    if (this._backgroundSubagentWakeTimer) clearTimeout(this._backgroundSubagentWakeTimer);
+    this._backgroundSubagentWakeTimer = null;
+    this._activeBackgroundSubagents.clear();
+    this._pendingBackgroundSubagentWake.clear();
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
 

@@ -199,6 +199,8 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('Do not send the raw user task by itself.');
     expect(prompt).toContain('imcodes send --reply "deck_repo_w1"');
     expect(prompt).not.toContain('imcodes send --no-reply "deck_repo_w1"');
+    expect(prompt).toContain('do not poll the delegate, session status, logs, or transcripts');
+    expect(prompt).toContain('normal incoming message');
     expect(prompt).toContain('multiple @ delegates');
     expect(prompt).toContain('separate per-delegate briefs');
     expect(prompt).toContain('each delegate result separately');

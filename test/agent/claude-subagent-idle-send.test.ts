@@ -543,6 +543,163 @@ describe('claude-code-sdk — sending while only a subagent runs', () => {
     await runtime.kill();
   });
 
+  it('keeps the retained query open so a terminal task notification can wake the parent agent', async () => {
+    let resolveTaskFinished!: (message: unknown) => void;
+    let resolveWokenTerminal!: (message: unknown) => void;
+    const taskFinished = new Promise((resolve) => { resolveTaskFinished = resolve; });
+    const wokenTerminal = new Promise((resolve) => { resolveWokenTerminal = resolve; });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: SESSION, model: 'claude-sonnet-4-6' },
+      {
+        type: 'system', subtype: 'task_notification', session_id: SESSION,
+        task_id: 'task-wakes-parent', tool_use_id: 'tool-wakes-parent', description: 'Background task',
+      },
+      {
+        type: 'assistant', session_id: SESSION, parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Parent idle while child runs.' }], stop_reason: 'end_turn' },
+      },
+      taskFinished,
+      {
+        type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'message-task-wake-parent' } },
+      },
+      {
+        type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+        event: {
+          type: 'content_block_delta', index: 0,
+          delta: { type: 'text_delta', text: 'Child finished; parent woke and reported it.' },
+        },
+      },
+      wokenTerminal,
+      {
+        // Some SDK versions also flush the full assistant frame after the
+        // stream terminal. It must not duplicate the already-settled wake reply.
+        type: 'assistant', session_id: SESSION, parent_tool_use_id: null,
+        message: {
+          content: [{ type: 'text', text: 'Child finished; parent woke and reported it.' }],
+          stop_reason: 'end_turn',
+        },
+      },
+    ]);
+    const provider = new ClaudeCodeSdkProvider();
+    const runtime = new TransportSessionRuntime(provider, 'deck_runtime_task_notification_wake');
+    await provider.connect({ binaryPath: 'claude' });
+    await runtime.initialize({
+      sessionKey: 'route-runtime-task-notification-wake',
+      sessionName: 'deck_runtime_task_notification_wake',
+      cwd: '/tmp/project',
+      resumeId: SESSION,
+      startupMemoryAlreadyInjected: true,
+    } as never);
+
+    expect(runtime.send('/start-background-child', 'runtime-task-wake-start')).toBe('sent');
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+    expect(provider.getActiveWorkSnapshot('route-runtime-task-notification-wake')?.backgroundWorkCount).toBe(1);
+
+    resolveTaskFinished({
+      type: 'system', subtype: 'task_notification', session_id: SESSION,
+      task_id: 'task-wakes-parent', tool_use_id: 'tool-wakes-parent',
+      status: 'completed', summary: 'Background task finished', output_file: '/tmp/task-wakes-parent.output',
+    });
+    await vi.waitFor(() => expect(
+      provider.getSessionDiagnostics('route-runtime-task-notification-wake')?.completed,
+    ).toBe(false));
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+    expect(provider.getSessionDiagnostics('route-runtime-task-notification-wake')?.currentQueryActive).toBe(true);
+    expect(provider.getSessionDiagnostics('route-runtime-task-notification-wake')?.currentTextLength).toBe(44);
+
+    resolveWokenTerminal({
+      type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+      event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    });
+    await vi.waitFor(() => expect(runtime.getHistory().filter((message) => message.role === 'assistant').map((message) => message.content)).toEqual([
+      'Parent idle while child runs.',
+      'Child finished; parent woke and reported it.',
+    ]));
+    expect(runtime.getStatus()).toBe('idle');
+    expect(sdkMock.runs[0]?.closed).toBe(true);
+    expect(provider.getSessionDiagnostics('route-runtime-task-notification-wake')?.currentQueryActive).toBe(false);
+    await runtime.kill();
+  });
+
+  it('falls back to one retained-query wake for duplicate stale terminals that emit no native continuation', async () => {
+    let resolveTaskStale!: (message: unknown) => void;
+    let resolveFallbackAssistant!: (message: unknown) => void;
+    const taskStale = new Promise((resolve) => { resolveTaskStale = resolve; });
+    const fallbackAssistant = new Promise((resolve) => { resolveFallbackAssistant = resolve; });
+    const staleNotification = {
+      type: 'system', subtype: 'task_notification', session_id: SESSION,
+      task_id: 'task-stale-no-native-wake', tool_use_id: 'tool-stale-no-native-wake',
+      status: 'stale', summary: 'Background task became stale', output_file: '/tmp/task-stale.output',
+    };
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: SESSION, model: 'claude-sonnet-4-6' },
+      {
+        type: 'system', subtype: 'task_notification', session_id: SESSION,
+        task_id: 'task-stale-no-native-wake', tool_use_id: 'tool-stale-no-native-wake',
+        description: 'Background task that will become stale',
+      },
+      {
+        type: 'assistant', session_id: SESSION, parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Parent idle before stale terminal.' }], stop_reason: 'end_turn' },
+      },
+      taskStale,
+      // Provider replay of the identical terminal must not arm a second wake.
+      staleNotification,
+      // A delayed full frame from the already-settled predecessor is not proof
+      // that the task notification woke a new assistant continuation.
+      {
+        type: 'assistant', session_id: SESSION, parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Parent idle before stale terminal.' }], stop_reason: 'end_turn' },
+      },
+      fallbackAssistant,
+      {
+        type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+        event: {
+          type: 'content_block_delta', index: 0,
+          delta: { type: 'text_delta', text: 'Parent reported stale child once.' },
+        },
+      },
+      {
+        type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+    ]);
+    const provider = new ClaudeCodeSdkProvider();
+    const runtime = new TransportSessionRuntime(provider, 'deck_runtime_task_stale_fallback');
+    await provider.connect({ binaryPath: 'claude' });
+    await runtime.initialize({
+      sessionKey: 'route-runtime-task-stale-fallback',
+      sessionName: 'deck_runtime_task_stale_fallback',
+      cwd: '/tmp/project',
+      resumeId: SESSION,
+      startupMemoryAlreadyInjected: true,
+    } as never);
+
+    expect(runtime.send('/start-stale-background-child', 'runtime-task-stale-start')).toBe('sent');
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+    resolveTaskStale(staleNotification);
+
+    await vi.waitFor(() => {
+      const fallbacks = queuedTexts(sdkMock.runs[0]?.prompt)
+        .filter((text) => text.includes('# IM.codes background task completion'));
+      expect(fallbacks).toHaveLength(1);
+    }, { timeout: 3_000 });
+    expect(provider.getSessionDiagnostics('route-runtime-task-stale-fallback')?.completed).toBe(false);
+
+    resolveFallbackAssistant({
+      type: 'stream_event', session_id: SESSION, parent_tool_use_id: null,
+      event: { type: 'message_start', message: { id: 'message-stale-fallback' } },
+    });
+    await vi.waitFor(() => expect(runtime.getHistory().filter((message) => message.role === 'assistant').map((message) => message.content)).toEqual([
+      'Parent idle before stale terminal.',
+      'Parent reported stale child once.',
+    ]));
+    expect(runtime.getStatus()).toBe('idle');
+    expect(sdkMock.runs[0]?.closed).toBe(true);
+    await runtime.kill();
+  });
+
   it('keeps the real runtime stably idle after a terminal foreground with no subagent or result', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: SESSION, model: 'claude-sonnet-4-6' },

@@ -1408,7 +1408,7 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
-  it('closes the retained background-task query after a stopped task notification settles active work', async () => {
+  it('keeps a stopped-task notification alive until the retained parent reports it', async () => {
     sdkMock.setWaitForClose(true);
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-route-subagent-stopped-notification', model: 'claude-sonnet-4-6' },
@@ -1421,7 +1421,10 @@ describe('ClaudeCodeSdkProvider', () => {
         tool_use_id: 'tool-use-stopped-notification',
         description: 'Run a background task that stops after the foreground result',
       },
-      { type: 'result', session_id: 'session-route-subagent-stopped-notification', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      {
+        type: 'assistant', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: 'Foreground done' }], stop_reason: 'end_turn' },
+      },
       {
         type: 'system',
         subtype: 'task_notification',
@@ -1430,6 +1433,26 @@ describe('ClaudeCodeSdkProvider', () => {
         task_id: 'task-stopped-notification',
         status: 'stopped',
         summary: 'Background task stopped',
+      },
+      {
+        type: 'user', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        origin: { kind: 'task-notification' },
+        message: { role: 'user', content: 'The background task stopped.' },
+      },
+      {
+        type: 'stream_event', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'message-stopped-task-wake' } },
+      },
+      {
+        type: 'stream_event', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        event: {
+          type: 'content_block_delta', index: 0,
+          delta: { type: 'text_delta', text: 'Stopped task reported to parent' },
+        },
+      },
+      {
+        type: 'stream_event', session_id: 'session-route-subagent-stopped-notification', parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
       },
     ]);
 
@@ -1450,7 +1473,7 @@ describe('ClaudeCodeSdkProvider', () => {
 
     await vi.waitFor(() => {
       expect(sdkMock.runs[0]?.closed).toBe(true);
-      expect(completed.map((msg) => msg.content)).toEqual(['Foreground done']);
+      expect(completed.map((msg) => msg.content)).toEqual(['Foreground done', 'Stopped task reported to parent']);
     });
     expect(provider.getActiveWorkSnapshot('route-subagent-stopped-notification')).toMatchObject({
       activeWorkCount: 0,

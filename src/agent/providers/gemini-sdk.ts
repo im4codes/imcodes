@@ -85,6 +85,7 @@ import type {
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
+  BACKGROUND_SUBAGENT_WAKE_MODES,
   CONNECTION_MODES,
   normalizeProviderPayload,
   SESSION_OWNERSHIP,
@@ -414,6 +415,7 @@ export class GeminiSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
     compact: {
       execution: 'unsupported',
       verified: true,
