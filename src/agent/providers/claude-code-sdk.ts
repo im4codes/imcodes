@@ -154,6 +154,11 @@ interface ClaudeSdkSessionState {
   runtimeActivityGeneration?: ActivityGeneration;
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
   resultCompletionGeneration?: number;
+  /** Once a foreground turn settles while subagents remain active, the SDK
+   * query is retained only to carry later user input and task notifications.
+   * In this mode top-level terminal assistant messages, rather than trailing
+   * success `result` frames, are the visible foreground completion boundary. */
+  retainedSubagentMode: boolean;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   runtimeAgentToolCalls: Map<string, { canonicalKey: string; agentPath: string; agentName?: string; model?: string; prompt?: string; startedAtMs: number }>;
   runtimeSubagentStartedAtByKey: Map<string, number>;
@@ -173,7 +178,7 @@ interface ClaudeSdkSessionState {
  *
  * WHY: with `prompt: string` the SDK closes its input after the single message,
  * so `send()` had to reject with "already busy" whenever a query was still open.
- * A Task subagent runs INSIDE the parent query, and closeSettledBackgroundQuery
+ * A Task subagent runs INSIDE the parent query, and closeSettledQueryIfNoSubagents
  * deliberately keeps that query open while subagents are active — so the exact
  * window where the main agent is idle-but-waiting was also the window where no
  * message could get in. This queue keeps the input channel open so a message can
@@ -181,7 +186,7 @@ interface ClaudeSdkSessionState {
  * which would kill the subagents with it).
  *
  * The queue is never auto-ended: query teardown stays owned by the existing
- * lifecycle (closeSettledBackgroundQuery / cancel / endSession), so single-shot
+ * lifecycle (closeSettledQueryIfNoSubagents / cancel / endSession), so single-shot
  * behaviour is unchanged for turns that have no subagents.
  */
 class SdkInputQueue implements AsyncIterable<SDKUserMessage> {
@@ -461,6 +466,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       turnGeneration: existing?.turnGeneration ?? 0,
       resultCompletionTimer: null,
       resultCompletionGeneration: undefined,
+      retainedSubagentMode: false,
       toolCalls: new Map(),
       runtimeAgentToolCalls: new Map(),
       runtimeSubagentStartedAtByKey: existing?.runtimeSubagentStartedAtByKey ?? new Map(),
@@ -502,6 +508,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       pendingError: Boolean(state.pendingError),
       resultCompletionFallbackArmed: Boolean(state.resultCompletionTimer),
       resultCompletionGeneration: state.resultCompletionGeneration ?? null,
+      retainedSubagentMode: state.retainedSubagentMode,
       turnGeneration: state.turnGeneration,
       toolCallCount: state.toolCalls.size,
       runtimeAgentToolCallCount: state.runtimeAgentToolCalls.size,
@@ -531,7 +538,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       activeWorkCount: activeToolCount + blockingSubagentCount + (backgroundActive ? 1 : 0),
       // Subagent-only window: the main turn already settled and the query is held
       // open ONLY for the subagents. They are real work (activeWorkCount above
-      // stays truthful, and closeSettledBackgroundQuery still needs it), but they
+      // stays truthful, and closeSettledQueryIfNoSubagents still needs it), but they
       // are NOT turn work — reporting them here lets the runtime dispatch a new
       // message instead of queueing it behind the subagent.
       backgroundWorkCount: waitingForTaskNotification ? blockingSubagentCount : 0,
@@ -624,12 +631,18 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (state.currentQuery) {
       // Subagent-only idle: the main turn already settled and the query is being
       // held open ONLY because subagents are still running (see
-      // closeSettledBackgroundQuery). The user sees an idle agent, so a message
+      // closeSettledQueryIfNoSubagents). The user sees an idle agent, so a message
       // must get through — delivering it into the live query's streaming input
       // is the only way that does not close the query and kill those subagents.
       if (state.inputQueue && this.isSubagentOnlyIdle(state)) {
         const queued = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
         state.runtimeActivityGeneration = queued.activityGeneration;
+        // This is a new visible foreground turn inside the retained query.
+        state.completed = false;
+        state.currentMessageId = null;
+        state.currentText = '';
+        state.pendingComplete = undefined;
+        state.pendingError = undefined;
         state.inputQueue.push(queued.assembledMessage);
         return;
       }
@@ -675,6 +688,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.pendingComplete = undefined;
     state.pendingError = undefined;
     this.clearResultCompletionFallback(state);
+    state.retainedSubagentMode = false;
     state.toolCalls.clear();
     state.runtimeAgentToolCalls.clear();
     state.emittedToolStates.clear();
@@ -757,7 +771,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     // Streaming-input mode: the first user message is pushed into a queue that
     // stays open, so a later send() can reach this same query while it is still
-    // running subagents. Query teardown is unchanged (closeSettledBackgroundQuery
+    // running subagents. Query teardown is unchanged (closeSettledQueryIfNoSubagents
     // / cancel / endSession still own it), so turns without subagents behave
     // exactly as they did with the old `prompt: string` form.
     const inputQueue = new SdkInputQueue();
@@ -789,7 +803,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     let pendingError: ProviderError | null = null;
     try {
       for await (const msg of q) {
-        this.handleMessage(sessionId, state, msg);
+        this.handleMessage(sessionId, state, msg, turnGeneration);
       }
       if (!pendingError && state.pendingError) {
         pendingError = state.pendingError;
@@ -802,9 +816,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true, err)
         : (state.pendingError ?? this.normalizeError(err));
     } finally {
-      if (state.turnGeneration === turnGeneration) {
-        this.clearResultCompletionFallback(state);
-      }
+      // A terminal assistant callback can make the runtime idle and allow a new
+      // query to start before this closed iterator reaches finally. Never let a
+      // stale iterator clear the newer turn's state.
+      if (state.turnGeneration !== turnGeneration) return;
+      this.clearResultCompletionFallback(state);
+      state.retainedSubagentMode = false;
       state.currentQuery = null;
       state.currentChild = null;
       const pendingComplete = state.pendingComplete;
@@ -862,7 +879,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return typeof base === 'string' && base.trim().length > 0;
   }
 
-  private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage): void {
+  private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage, turnGeneration: number): void {
+    // A closed SDK iterator may still flush buffered frames after the runtime
+    // has already started a resumed query. Those frames belong to the old turn
+    // and must never mutate or complete the new one.
+    if (state.turnGeneration !== turnGeneration) return;
     if ('session_id' in msg && typeof msg.session_id === 'string' && msg.session_id) {
       state.resumeId = msg.session_id;
       this.emitSessionInfo(sessionId, {
@@ -1017,6 +1038,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
 
     if (msg.type === 'assistant') {
+      const isTopLevelMessage = !('parent_tool_use_id' in msg) || msg.parent_tool_use_id == null;
       const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
       if (assistantUsage && typeof assistantUsage === 'object') {
         state.lastAssistantUsage = {
@@ -1033,6 +1055,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         this.emitClaudeRuntimeSubagentSnapshot(sessionId, state, runtimeSubagentPayload);
         return;
       }
+      const hasToolBlock = Array.isArray(msg.message.content)
+        && msg.message.content.some((block) => this.isToolBlock(block));
       if (Array.isArray(msg.message.content)) {
         for (const block of msg.message.content) {
           if (this.isToolBlock(block)) {
@@ -1066,6 +1090,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         }
       } else {
         state.currentText = text;
+      }
+      const stopReason = msg.message.stop_reason;
+      const isTerminalForegroundStop = typeof stopReason === 'string'
+        && stopReason !== 'tool_use'
+        && stopReason !== 'pause_turn';
+      if (isTopLevelMessage && !hasToolBlock && isTerminalForegroundStop) {
+        this.completeTerminalAssistantForeground(sessionId, state);
       }
       return;
     }
@@ -1115,7 +1146,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (msg.type === 'result') {
       if ((msg as { origin?: { kind?: string } }).origin?.kind === 'task-notification') {
         state.started = true;
-        this.closeSettledBackgroundQuery(sessionId, state, 'task-notification-result');
+        this.closeSettledQueryIfNoSubagents(sessionId, state, 'task-notification-result');
+        return;
+      }
+      // A terminal frame that trails an already-completed foreground cannot be
+      // another completion. Failures for an active follow-up still flow through
+      // below because send() resets completed=false before pushing its input.
+      if (state.completed) {
+        state.started = true;
         return;
       }
       if (msg.is_error) {
@@ -1140,10 +1178,22 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         }
         return;
       }
+      // A retained streaming query can emit delayed success results for any
+      // foreground turn it has already delivered. The result frame has no turn
+      // identity, so using it as another completion signal creates cross-turn
+      // races. While a child remains active, the top-level terminal assistant
+      // message is the sole success boundary; result frames are metadata-only.
+      // Keep this rule after the last child drains too: without a turn id, a
+      // delayed result from the predecessor cannot safely complete the current
+      // follow-up.
+      if (state.retainedSubagentMode) {
+        state.started = true;
+        return;
+      }
+      const success = msg as any;
       state.started = true;
       state.completed = true;
       const messageId = makeMessageId(state);
-      const success = msg as any;
       state.pendingComplete = {
         id: messageId,
         sessionId,
@@ -1192,6 +1242,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // later inject task-notification follow-up messages. Do not close it
         // here: deliver the foreground result to IM.codes, but keep listening
         // so task_notification can terminalize the background row.
+        state.retainedSubagentMode = true;
         for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
         return;
       }
@@ -1210,6 +1261,38 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       state.resultCompletionTimer = null;
     }
     state.resultCompletionGeneration = undefined;
+  }
+
+  private completeTerminalAssistantForeground(sessionId: string, state: ClaudeSdkSessionState): void {
+    if (!state.currentQuery || state.completed || state.cancelled) return;
+    if (state.toolCalls.size > 0) return;
+    const hasActiveSubagents = this.activeClaudeSubagentTasks(state).length > 0;
+    const content = state.currentText.trim();
+
+    state.started = true;
+    state.completed = true;
+    state.retainedSubagentMode = hasActiveSubagents;
+    const completed: AgentMessage = {
+      id: makeMessageId(state),
+      sessionId,
+      kind: 'text',
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: {
+        ...(state.model ? { model: state.model } : {}),
+        ...(state.lastAssistantUsage ? { usage: state.lastAssistantUsage } : {}),
+        resumeId: state.resumeId,
+        completionBoundary: 'assistant-terminal',
+      },
+    };
+    state.currentMessageId = null;
+    state.currentText = '';
+    if (!hasActiveSubagents) {
+      this.closeSettledQueryIfNoSubagents(sessionId, state, 'foreground-terminal-without-subagents');
+    }
+    for (const cb of this.completeCallbacks) cb(sessionId, completed);
   }
 
   private resolvePermissionMode(): PermissionMode {
@@ -1301,7 +1384,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
 
     if (task.terminal) {
-      this.closeSettledBackgroundQuery(sessionId, state, `task-${task.rawStatus ?? task.normalizedStatus}`);
+      this.closeSettledQueryIfNoSubagents(sessionId, state, `task-${task.rawStatus ?? task.normalizedStatus}`);
     }
     this.emitClaudeSubagentSnapshot(sessionId, state, task);
   }
@@ -1605,7 +1688,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   /**
    * True when the main agent has settled its turn and the query is still open
-   * ONLY because subagents are running — the window closeSettledBackgroundQuery
+   * ONLY because subagents are running — the window closeSettledQueryIfNoSubagents
    * deliberately holds the query open for. From the user's side the agent looks
    * idle, so `send()` treats this as sendable and pushes into the live query's
    * streaming input rather than rejecting with "already busy".
@@ -1616,15 +1699,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private isSubagentOnlyIdle(state: ClaudeSdkSessionState): boolean {
     if (!state.completed) return false; // main turn still producing
     if (state.cancelled) return false;
+    if (!state.retainedSubagentMode) return false;
     return this.activeClaudeSubagentTasks(state).length > 0;
   }
 
-  private closeSettledBackgroundQuery(sessionId: string, state: ClaudeSdkSessionState, reason: string): boolean {
+  private closeSettledQueryIfNoSubagents(sessionId: string, state: ClaudeSdkSessionState, reason: string): boolean {
     if (!state.currentQuery) return false;
     if (!state.completed) return false;
     if (this.activeClaudeSubagentTasks(state).length > 0) return false;
 
     this.clearResultCompletionFallback(state);
+    state.retainedSubagentMode = false;
     const q = state.currentQuery;
     state.currentQuery = null;
     try { q.close(); } catch {}
@@ -1634,7 +1719,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       provider: this.id,
       sessionId,
       reason,
-    }, 'Claude SDK background query settled; closing retained task-notification listener');
+    }, 'Claude SDK settled query has no active subagents; closing query');
     return true;
   }
 
