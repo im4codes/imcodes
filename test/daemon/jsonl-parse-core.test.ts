@@ -60,6 +60,29 @@ describe('jsonl-parse-core', () => {
     expect(typesOf(emits)).toEqual(['assistant.text', 'usage.update']);
   });
 
+  it('suppresses the Claude resume synthetic seed assistant line', () => {
+    const ctx = createParseContext();
+    const line = jsonlLine({
+      type: 'assistant',
+      timestamp: '2026-04-24T00:00:00.000Z',
+      message: {
+        id: 'msg_seed',
+        model: '<synthetic>',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'No response requested.' }],
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    });
+
+    const { emits } = parseLines(ctx, {
+      sessionName: 's1',
+      items: [{ line, lineByteOffset: 0 }],
+      presetContextWindow: 200_000,
+    });
+
+    expect(emits).toEqual([]);
+  });
+
   it('emits assistant.thinking for thinking blocks', () => {
     const ctx = createParseContext();
     const line = jsonlLine({

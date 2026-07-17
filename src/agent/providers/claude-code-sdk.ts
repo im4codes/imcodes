@@ -38,6 +38,7 @@ import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { CLAUDE_SYNTHETIC_SEED_TEXT } from '../../shared/claude-synthetic-seed.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -152,6 +153,10 @@ interface ClaudeSdkSessionState {
   rateLimits?: Record<string, ClaudeRateLimitInfo>;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
+  currentPayload?: ProviderContextPayload;
+  currentAllowResumeFallback?: boolean;
+  currentStartedAsResume?: boolean;
+  currentConnectionClosedRetriesRemaining?: number;
   turnGeneration: number;
   runtimeActivityGeneration?: ActivityGeneration;
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
@@ -470,6 +475,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       lastAssistantUsage: existing?.lastAssistantUsage,
       rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
+      currentPayload: undefined,
+      currentAllowResumeFallback: undefined,
+      currentStartedAsResume: undefined,
+      currentConnectionClosedRetriesRemaining: undefined,
       turnGeneration: existing?.turnGeneration ?? 0,
       resultCompletionTimer: null,
       taskNotificationWakeTimer: null,
@@ -699,6 +708,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
+    state.currentPayload = payload;
+    state.currentAllowResumeFallback = allowResumeFallback;
     this.clearResultCompletionFallback(state);
     this.clearTaskNotificationWake(state);
     state.retainedSubagentMode = false;
@@ -717,6 +728,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const prompt = systemParts.hasSplitSystemText
       ? composeMessageSideProviderPrompt(payload, { includeSessionSystemText: false })
       : payload.assembledMessage;
+    const startedAsResume = state.started;
+    state.currentStartedAsResume = startedAsResume;
+    state.currentConnectionClosedRetriesRemaining = connectionClosedRetriesRemaining;
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -726,7 +740,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       includePartialMessages: true,
       agentProgressSummaries: false,
       forwardSubagentText: false,
-      ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
+      ...(startedAsResume ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
@@ -799,6 +813,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       q,
       payload,
       allowResumeFallback,
+      startedAsResume,
       turnGeneration,
       connectionClosedRetriesRemaining,
     );
@@ -810,6 +825,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     q: ReturnType<typeof query>,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    startedAsResume: boolean,
     turnGeneration: number,
     connectionClosedRetriesRemaining: number,
   ): Promise<void> {
@@ -841,11 +857,30 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       const pendingComplete = state.pendingComplete;
       state.pendingComplete = undefined;
       state.pendingError = undefined;
+      state.currentPayload = undefined;
+      state.currentAllowResumeFallback = undefined;
+      state.currentStartedAsResume = undefined;
+      state.currentConnectionClosedRetriesRemaining = undefined;
       state.currentMessageId = null;
       state.currentText = '';
       if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
         state.started = false;
         logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
+        await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
+        return;
+      }
+      if (pendingComplete && allowResumeFallback && startedAsResume && this.isNoResponseRequestedResumeArtifact(state, pendingComplete)) {
+        const previousResumeId = state.resumeId;
+        state.started = false;
+        state.resumeId = randomUUID();
+        logger.warn(
+          { provider: this.id, sessionId, previousResumeId, freshResumeId: state.resumeId },
+          'Claude SDK resumed turn returned the synthetic no-response artifact; retrying with a fresh session',
+        );
+        this.emitSessionInfo(sessionId, {
+          resumeId: state.resumeId,
+          ...(state.model ? { model: state.model } : {}),
+        });
         await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
         return;
       }
@@ -891,6 +926,46 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private shouldStripLeakedThink(state: ClaudeSdkSessionState): boolean {
     const base = state.env?.['ANTHROPIC_BASE_URL'];
     return typeof base === 'string' && base.trim().length > 0;
+  }
+
+  private isNoResponseRequestedResumeArtifact(state: ClaudeSdkSessionState, message: AgentMessage): boolean {
+    if (message.kind !== 'text') return false;
+    return this.isNoResponseRequestedTextArtifact(state, message.content, message.metadata?.usage as ClaudeUsageSnapshot | undefined);
+  }
+
+  private isNoResponseRequestedTextArtifact(state: ClaudeSdkSessionState, content: string, usage?: ClaudeUsageSnapshot): boolean {
+    if (!this.shouldStripLeakedThink(state)) return false;
+    if (content.trim() !== CLAUDE_SYNTHETIC_SEED_TEXT) return false;
+    if (usage && typeof usage.output_tokens === 'number' && usage.output_tokens > 8) return false;
+    return true;
+  }
+
+  private retryNoResponseRequestedResumeArtifact(sessionId: string, state: ClaudeSdkSessionState, reason: string): void {
+    const payload = state.currentPayload;
+    if (!payload || !state.currentAllowResumeFallback || !state.currentStartedAsResume) return;
+    const connectionRetries = state.currentConnectionClosedRetriesRemaining ?? CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT;
+    const previousResumeId = state.resumeId;
+    try { state.currentQuery?.close(); } catch {}
+    this.terminateChild(state);
+    state.currentQuery = null;
+    state.currentChild = null;
+    state.pendingComplete = undefined;
+    state.pendingError = undefined;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.completed = false;
+    state.cancelled = false;
+    state.started = false;
+    state.resumeId = randomUUID();
+    logger.warn(
+      { provider: this.id, sessionId, previousResumeId, freshResumeId: state.resumeId, reason },
+      'Claude SDK resumed turn returned the synthetic no-response artifact; retrying with a fresh session',
+    );
+    this.emitSessionInfo(sessionId, {
+      resumeId: state.resumeId,
+      ...(state.model ? { model: state.model } : {}),
+    });
+    void this.startQuery(sessionId, state, payload, false, connectionRetries);
   }
 
   private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage, turnGeneration: number): void {
@@ -1314,6 +1389,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (state.toolCalls.size > 0) return;
     const hasActiveSubagents = this.activeClaudeSubagentTasks(state).length > 0;
     const content = state.currentText.trim();
+    if (this.isNoResponseRequestedTextArtifact(state, content, state.lastAssistantUsage)) {
+      this.retryNoResponseRequestedResumeArtifact(sessionId, state, 'assistant-terminal');
+      return;
+    }
 
     state.started = true;
     state.completed = true;

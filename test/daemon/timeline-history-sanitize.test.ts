@@ -27,6 +27,27 @@ function event(overrides: Partial<TimelineEvent>): TimelineEvent {
 }
 
 describe('timeline history transport sanitization', () => {
+  it('filters already-persisted Claude synthetic seed assistant text from history payloads', () => {
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'synthetic-seed',
+        type: 'assistant.text',
+        payload: { text: 'No response requested.', streaming: false },
+      }),
+      event({
+        eventId: 'real-response',
+        type: 'assistant.text',
+        ts: 2,
+        seq: 2,
+        payload: { text: 'real response', streaming: false },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.eventId).toBe('real-response');
+    expect(result.events[0]?.payload.text).toBe('real response');
+  });
+
   it('preserves full chat text and streaming typewriter updates in history payloads', () => {
     const userText = `user:${'u'.repeat(80 * 1024)}`;
     const streamingText = `typing:${'t'.repeat(80 * 1024)}`;

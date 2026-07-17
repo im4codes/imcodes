@@ -13,6 +13,7 @@ import {
   isSdkTurnLostRecoveryPhase,
   sanitizeSdkTurnLostRecoveryMetadata,
 } from '../agent/transport-provider.js';
+import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
 import logger from '../util/logger.js';
 
 const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
@@ -64,6 +65,7 @@ function sessionFile(sessionId: string): string {
 
 function shouldKeepTransportHistoryEvent(event: Record<string, unknown>): boolean {
   if (event.hidden === true) return false;
+  if (isClaudeSyntheticSeedAssistantTextEvent(event)) return false;
   const type = typeof event.type === 'string' ? event.type : '';
   if (type === 'tool.call') return readToolCallId(event) !== null;
   if (type === 'agent.status') {

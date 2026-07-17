@@ -27,6 +27,7 @@ vi.mock('node:child_process', () => ({
 
 const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
+  let nextMessageBatches: any[][] | null = null;
   let waitForClose = false;
   let interruptNeverResolves = false;
   const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
@@ -44,8 +45,9 @@ const sdkMock = vi.hoisted(() => {
   const query = vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
     const run = { prompt: readPromptText(prompt), options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
+    const messages = nextMessageBatches?.shift() ?? nextMessages;
     async function* gen() {
-      for (const message of nextMessages) yield message;
+      for (const message of messages) yield message;
       if (waitForClose && !run.closed) {
         await new Promise<void>((resolve) => {
           run.resolveClose = resolve;
@@ -72,7 +74,8 @@ const sdkMock = vi.hoisted(() => {
     query,
     runs,
     readPromptText,
-    setNextMessages(messages: any[]) { nextMessages = messages; },
+    setNextMessages(messages: any[]) { nextMessages = messages; nextMessageBatches = null; },
+    setNextMessageBatches(batches: any[][]) { nextMessageBatches = batches.map((batch) => [...batch]); },
     setWaitForClose(value: boolean) { waitForClose = value; },
     setInterruptNeverResolves(value: boolean) { interruptNeverResolves = value; },
   };
@@ -995,6 +998,65 @@ describe('ClaudeCodeSdkProvider', () => {
 
     expect(deltas).toEqual(['STREAM_OK']);
     expect(completed).toEqual(['STREAM_OK']);
+  });
+
+  it('retries third-party resumed sessions fresh when Claude returns the no-response seed artifact', async () => {
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'system', subtype: 'init', session_id: 'old-session', model: 'MiniMax-M3' },
+        {
+          type: 'assistant',
+          session_id: 'old-session',
+          message: {
+            content: [{ type: 'text', text: 'No response requested.' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0 },
+          },
+        },
+        {
+          type: 'result',
+          session_id: 'old-session',
+          subtype: 'success',
+          is_error: false,
+          result: 'No response requested.',
+          usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0 },
+        },
+      ],
+      [
+        { type: 'system', subtype: 'init', session_id: 'fresh-session', model: 'MiniMax-M3' },
+        { type: 'assistant', session_id: 'fresh-session', message: { content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn' } },
+        { type: 'result', session_id: 'fresh-session', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-minimax-resume',
+      cwd: '/tmp/project',
+      resumeId: 'old-session',
+      skipCreate: true,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    });
+
+    const completed: string[] = [];
+    const resumeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onSessionInfo((_sid, info) => {
+      if (info.resumeId) resumeIds.push(info.resumeId);
+    });
+
+    await provider.send('route-minimax-resume', 'hello');
+    await flush();
+    await flush();
+
+    expect(sdkMock.runs).toHaveLength(2);
+    expect(sdkMock.runs[0]?.options.resume).toBe('old-session');
+    expect(sdkMock.runs[1]?.options.sessionId).toEqual(expect.any(String));
+    expect(sdkMock.runs[1]?.options.sessionId).not.toBe('old-session');
+    expect(sdkMock.runs[1]?.prompt).toBe('hello');
+    expect(completed).toEqual(['OK']);
+    expect(resumeIds).toContain('fresh-session');
   });
 
   it('builds tool input from input_json_delta events', async () => {

@@ -11,6 +11,7 @@ import {
   buildSdkSubagentTimelinePayload,
   parseSdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
+import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
 
 export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
 export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -480,6 +481,7 @@ export function sanitizeTimelineHistoryEventsForTransport(
   const maxResponseBytes = Math.max(64 * 1024, Math.trunc(options.maxResponseBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES));
   const dedupedByEventId = new Map<string, TimelineEvent>();
   for (const event of events) {
+    if (isClaudeSyntheticSeedAssistantTextEvent(event as unknown as Record<string, unknown>)) continue;
     const current = dedupedByEventId.get(event.eventId);
     if (!current || isNewerTimelineEvent(event, current)) dedupedByEventId.set(event.eventId, event);
   }
