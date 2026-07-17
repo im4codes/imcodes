@@ -316,6 +316,68 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('ignores the audit turn idle when it arrives after fallback settlement starts finalization', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'implementation is complete but repository finalization remains',
+        confidence: 0.9,
+        nextAction: 'Commit and push the audited changes.',
+      })
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'post-audit finalization completed',
+        confidence: 0.95,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-delayed-audit-idle',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-delayed-audit-idle', 'implement the feature');
+    completeTurn('Implementation is complete; commit and push remain.');
+    await waitForRunPhase('auditing');
+    const priorPassCount = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'peer_audit.result' && event.payload.outcome === 'pass').length;
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'Task: independent audit\nResult: PASS with evidence.',
+      allowDuplicate: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `PASS with evidence.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+      streaming: false,
+    });
+    await Promise.resolve();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+    // This is the trailing idle for the audit turn, delivered after the
+    // assistant-text fallback has already dispatched finalization. It must
+    // not evaluate the PASS text as finalization output or terminate the run.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+    completeTurn('Committed and pushed the audited changes.');
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await Promise.resolve();
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    const results = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'peer_audit.result');
+    expect(results.filter((event) => event.payload.outcome === 'pass')).toHaveLength(priorPassCount + 1);
+  });
+
   it('cancels an in-flight orchestrated audit exactly once when supervision is stopped', async () => {
     const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();

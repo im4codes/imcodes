@@ -94,6 +94,12 @@ interface ActiveTaskRunState {
   auditStartedAt?: number;
   auditReplyObserved: boolean;
   auditDeadlineTimer?: NodeJS.Timeout;
+  // When a reply-backed audit settles from the assistant-text fallback (that
+  // is, before the provider emits the trailing idle for the audit turn), the
+  // deferred finalization/rework prompt may already be dispatched by the time
+  // that old idle arrives. Ignore exactly that pre-activity idle so it cannot
+  // terminate or evaluate the newly-started phase with stale audit output.
+  ignoreIdleUntilPostAuditTurnActivity?: boolean;
   deferredFinalization?: {
     reason: string;
     nextAction: string;
@@ -705,6 +711,7 @@ class SupervisionAutomation {
       this.latestAssistantTexts.set(event.sessionId, { text, sequence });
       const run = this.activeRuns.get(event.sessionId);
       if (!run) return;
+      run.ignoreIdleUntilPostAuditTurnActivity = false;
       run.lastAssistantText = text;
       run.sawAssistantOutput = true;
       // A retained/background transport can emit the final assistant result
@@ -721,7 +728,7 @@ class SupervisionAutomation {
         queueMicrotask(() => {
           const latest = this.activeRuns.get(event.sessionId);
           if (!latest || latest.generation !== generation || latest.phase !== 'auditing' || !latest.auditReplyObserved) return;
-          this.handleOrchestratedAuditCompletion(latest);
+          this.handleOrchestratedAuditCompletion(latest, { settledWithoutIdle: true });
         });
       }
       return;
@@ -751,8 +758,15 @@ class SupervisionAutomation {
         return;
       }
       if (!run) return;
+      if (state && state !== 'idle') {
+        run.ignoreIdleUntilPostAuditTurnActivity = false;
+      }
       if (state === 'idle' && (run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {
         if (!run.sawAssistantOutput) {
+          if (run.ignoreIdleUntilPostAuditTurnActivity) {
+            run.ignoreIdleUntilPostAuditTurnActivity = false;
+            return;
+          }
           this.failClosedMissingCompletion(run.sessionName);
           this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
           return;
@@ -1021,7 +1035,10 @@ class SupervisionAutomation {
     });
   }
 
-  private handleOrchestratedAuditCompletion(current: ActiveTaskRunState): void {
+  private handleOrchestratedAuditCompletion(
+    current: ActiveTaskRunState,
+    options: { settledWithoutIdle?: boolean } = {},
+  ): void {
     if (current.phase !== 'auditing' || !current.auditReplyObserved || !current.lastAssistantText) return;
     const verdict = parsePeerAuditOrchestratedResult(current.lastAssistantText);
     if (!verdict) {
@@ -1036,6 +1053,7 @@ class SupervisionAutomation {
       current.auditAttemptId = undefined;
       if (current.deferredFinalization) {
         current.phase = 'finalizing';
+        current.ignoreIdleUntilPostAuditTurnActivity = options.settledWithoutIdle === true;
         current.evaluating = false;
         current.terminalState = undefined;
         void this.dispatchContinue(current, current.deferredFinalization);
@@ -1061,6 +1079,7 @@ class SupervisionAutomation {
     }
     const reworkBrief = buildReworkBrief(current, findings);
     current.phase = 'execution';
+    current.ignoreIdleUntilPostAuditTurnActivity = options.settledWithoutIdle === true;
     current.evaluating = false;
     current.sawAssistantOutput = false;
     current.auditReplyObserved = false;
