@@ -185,15 +185,18 @@ function classifyContinueBucket(decision: { nextAction?: string; gap?: string; r
   return text.slice(0, 120);
 }
 
-const REPOSITORY_FINALIZATION_ACTION_RE = /\b(?:git\s+(?:add|commit|push)|commit|push|stage|staging|提交|推送|暂存)\b/iu;
-const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|audit|review|deploy|release|restart|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|审计|审核|部署|发布|重启)\b/iu;
+const REPOSITORY_FINALIZATION_ACTION_RE = /(?:\b(?:git\s+(?:add|commit|push)|commit|push|stage|staging)\b|提交|推送|暂存)/iu;
+const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|deploy|release|restart)\b|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|部署|发布|重启)/iu;
 
 /**
  * `supervised_audit` must review the implementation before repository
  * finalization. Only hold an action whose imperative next step is purely
  * stage/commit/push work. Any instruction that also asks for tests, fixes,
  * implementation, build, deployment, or another substantive mutation stays
- * in the normal pre-audit continue loop.
+ * in the normal pre-audit continue loop. Audit/review words are deliberately
+ * not substantive here: "commit after peer-audit PASS" describes the gate
+ * this function is deciding to start, rather than work the target session
+ * must perform before that gate.
  */
 function isRepositoryFinalizationOnly(decision: { nextAction?: string }): decision is { nextAction: string } {
   const action = decision.nextAction?.trim();

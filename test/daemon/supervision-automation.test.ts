@@ -442,6 +442,34 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
+  it('starts peer audit when commit-only finalization is qualified by audit-pass wording', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '实现和验证均已完成，只剩仓库收尾',
+      confidence: 0.9,
+      gap: '存在未提交的代码变更',
+      nextAction: '在 peer-audit PASS 后处理未提交变更并执行 git add、commit 和 push。',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-qualified-commit', 'implement the feature', snapshot);
+    beginRun('cmd-audit-qualified-commit', 'implement the feature');
+    completeTurn('实现与测试均已完成，当前改动尚未提交。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(auditPrompt).toContain('imcodes send --reply');
+    expect(auditPrompt).not.toContain('Complete only the remaining substantive implementation or validation work');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: '在 peer-audit PASS 后处理未提交变更并执行 git add、commit 和 push。',
+      },
+    });
+  });
+
   it('never releases held commit and push when peer audit requests REWORK', async () => {
     const snapshot = await seedSession('supervised_audit', false, 1);
     mockSupervisionDecide.mockResolvedValueOnce({
@@ -508,6 +536,28 @@ describe('SupervisionAutomation', () => {
     expect(continuePrompt).toContain('Complete only the remaining substantive implementation or validation work');
     expect(continuePrompt).toContain('Do not stage, commit, or push');
     expect(continuePrompt).not.toContain('Run the focused tests, fix failures, then commit and push.');
+  });
+
+  it('keeps Chinese substantive work in the pre-audit loop when commit is also mentioned', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '提交前仍有失败的验证项',
+      confidence: 0.8,
+      nextAction: '先运行测试并修复失败，再执行 git commit 和 push。',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-chinese-tests-before-audit', 'implement the feature', snapshot);
+    beginRun('cmd-chinese-tests-before-audit', 'implement the feature');
+    completeTurn('实现存在，但验证仍未完成。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(continuePrompt).toContain('Complete only the remaining substantive implementation or validation work');
+    expect(continuePrompt).not.toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
   it('auto-continues a supervised run when the completion decision returns continue', async () => {
