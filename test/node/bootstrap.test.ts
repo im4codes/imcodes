@@ -239,7 +239,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     expect(deps.phases).toEqual(['service_registered', 'service_start_requested']);
   });
 
-  it('first run uses the same verified source for trailer, staging, cleanup, then starts stable service', async () => {
+  it('first run stages a trailer-free service copy while preserving the reusable source installer', async () => {
     const order: string[] = [];
     const source = makeSource({
       readEnrollmentBlobWithRange: vi.fn(async () => { order.push('trailer'); return TRAILER; }),
@@ -259,12 +259,13 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     });
     const result = await bootstrapControlledNodeWithDisposition(deps);
     expect(result).toMatchObject({ credential: CRED, disposition: 'handoff_complete' });
-    expect(order).toEqual(['elevate', 'trailer', 'prepare', 'identity', 'stage', 'redeem', 'persist', 'cleanup', 'install', 'inspect', 'start']);
+    expect(order).toEqual(['elevate', 'trailer', 'prepare', 'identity', 'stage', 'redeem', 'persist', 'install', 'inspect', 'start']);
     expect(source.stageTrailerFreeExecutable).toHaveBeenCalledWith('/tmp/staged/imcodes-node', TRAILER.trailerStart);
-    expect(source.cleanupEnrollmentSource).toHaveBeenCalledWith(TRAILER.trailerStart, TRAILER.trailerLength);
+    expect(source.cleanupEnrollmentSource).not.toHaveBeenCalled();
     expect(source.close).toHaveBeenCalledOnce();
     expect(deps.phases).toEqual(['elevated', 'credential_prepared', 'files_staged', 'enrolled', 'service_registered', 'service_start_requested']);
     expect(result.journal.stagedReceipt).toEqual(STAGED_RECEIPT);
+    expect(result.journal.cleanupStatus).toBe('skipped');
     expect(result.journal.serviceReceipt).toEqual(SERVICE_RECEIPT);
     expect(result.journal.serviceStartRequestedAt).toBe(123);
   });

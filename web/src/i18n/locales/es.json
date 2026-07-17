@@ -2684,6 +2684,7 @@
     "usage_step1": "Descarga el ejecutable para el sistema operativo de la máquina de destino.",
     "usage_step2": "Ejecútalo una vez en esa máquina con los privilegios necesarios (ver notas por SO abajo).",
     "usage_step3": "Se registra automáticamente, instala el autoarranque y aparece abajo cuando está en línea.",
+    "usage_step4": "Puedes guardar o copiar el instalador para registrar otras máquinas. El enlace de descarga caduca; el paquete descargado no.",
     "usage_win_run": "Ejecuta como Administrador. Si aparece SmartScreen, elige Más información → Ejecutar de todos modos.",
     "usage_mac_run": "En el primer arranque, evita Gatekeeper: clic derecho en la app → Abrir, o ejecuta: xattr -cr <ruta> y ábrela normalmente.",
     "usage_linux_run": "Hazlo ejecutable (chmod +x <archivo>) y ejecútalo una vez como root (sudo).",

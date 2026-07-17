@@ -308,7 +308,6 @@ async function ensureEnrolled(
   journal: InstallJournal,
   trailerRange: EnrollmentTrailerRange,
   identity: PendingInstallIdentity,
-  source: VerifiedEnrollmentSource,
 ): Promise<{ journal: InstallJournal; credential: ControlledNodeCredential }> {
   const existing = await deps.loadCredential();
   if (existing) return { journal, credential: existing };
@@ -338,14 +337,13 @@ async function ensureEnrolled(
     throw new Error(`controlled node redeemed enrollment but could not persist its credential (${message}); retry with same install identity`);
   }
 
-  let cleanupStatus = journal.cleanupStatus;
-  if (!recovering || !cleanupStatus || cleanupStatus === 'pending') {
-    cleanupStatus = await source.cleanupEnrollmentSource(
-      trailerRange.trailerStart,
-      trailerRange.trailerLength,
-    );
-    if (cleanupStatus === 'failed') deps.warn('source enrollment trailer cleanup failed (best-effort privacy only)');
-  }
+  // The downloaded package is a permanent multi-use installer. Preserve its
+  // reusable trailer after successful enrollment; only the protected stable
+  // service copy is trailer-free. Existing journals keep their historical
+  // cleanup observation, while new installs record an intentional skip.
+  const cleanupStatus = journal.cleanupStatus && journal.cleanupStatus !== 'pending'
+    ? journal.cleanupStatus
+    : 'skipped';
 
   journal = await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
     now: deps.now,
@@ -535,7 +533,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
 
     journal = await ensureExecutableStaged(deps, journal, trailerRange, source);
 
-    const enrolled = await ensureEnrolled(deps, journal, trailerRange, identity, source);
+    const enrolled = await ensureEnrolled(deps, journal, trailerRange, identity);
     journal = enrolled.journal;
     const credential = enrolled.credential;
 

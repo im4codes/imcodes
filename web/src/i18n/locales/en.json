@@ -2684,6 +2684,7 @@
     "usage_step1": "Download the executable for the target machine's OS.",
     "usage_step2": "Run it once on that machine with the required privileges (see OS notes below).",
     "usage_step3": "It auto-enrolls, installs boot autostart, and appears below when online.",
+    "usage_step4": "Keep or copy the installer to enroll other machines. The download link expires; the downloaded package does not.",
     "usage_win_run": "Run as Administrator. If SmartScreen appears, choose More info → Run anyway.",
     "usage_mac_run": "On first launch, bypass Gatekeeper: right-click the app → Open, or run: xattr -cr <path> then open normally.",
     "usage_linux_run": "Make it executable (chmod +x <file>) and run once as root (sudo).",

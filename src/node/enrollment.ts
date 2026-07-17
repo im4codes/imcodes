@@ -622,8 +622,10 @@ export async function copyCleanExecutable(
 }
 
 /**
- * Best-effort privacy cleanup of the downloaded source executable's trailer.
- * Failure (e.g. locked running image on Windows) is surfaced, not swallowed.
+ * Legacy/manual best-effort privacy cleanup of a source executable's trailer.
+ * The current product bootstrap deliberately does not call this because a
+ * downloaded installer is permanent and reusable. Failure (e.g. a locked
+ * running image on Windows) is surfaced, not swallowed.
  */
 export async function cleanupEnrollmentSource(
   sourcePath: string,
@@ -644,7 +646,8 @@ export async function cleanupEnrollmentSource(
 }
 
 /**
- * Best-effort token burn (D-A privacy cleanup only, NOT a security boundary).
+ * Legacy/manual token burn, NOT a security boundary. Current reusable
+ * installers are preserved by the product bootstrap.
  * Prefer {@link cleanupEnrollmentSource} when the exact trailer range is known.
  */
 export async function burnEnrollmentBlob(executablePath = process.execPath): Promise<void> {

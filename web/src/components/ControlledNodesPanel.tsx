@@ -384,7 +384,12 @@ export function ControlledNodesPanel() {
           <h3>{t('controlled_nodes.usage_title')}</h3>
         </div>
         <ol class="controlled-nodes-usage">
-          {[t('controlled_nodes.usage_step1'), t('controlled_nodes.usage_step2'), t('controlled_nodes.usage_step3')]
+          {[
+            t('controlled_nodes.usage_step1'),
+            t('controlled_nodes.usage_step2'),
+            t('controlled_nodes.usage_step3'),
+            t('controlled_nodes.usage_step4'),
+          ]
             .map((step, index) => (
               <li key={index}>
                 <span aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
