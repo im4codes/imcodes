@@ -75,6 +75,10 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
         }
       : {}
   )),
+  getPresetAvailableModelIds: vi.fn((preset: { env?: Record<string, string>; defaultModel?: string }) => [
+    preset.env?.ANTHROPIC_MODEL,
+    preset.defaultModel,
+  ].filter((model): model is string => typeof model === 'string' && model.length > 0)),
   getCachedPresetContextWindow: vi.fn((name: string) => (
     name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
   )),
@@ -1115,6 +1119,39 @@ describe('sdk transport flow e2e', () => {
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
     expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+  });
+
+  it('accepts the preset-pinned model through /model on claude-code-sdk preset sessions', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'ccsdk minimax model',
+      dir: '/tmp/ccsdk-minimax-model-e2e',
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => !!mocks.store.get('deck_ccsdk_minimax_model_brain'));
+
+    const sessionName = 'deck_ccsdk_minimax_model_brain';
+    handleWebCommand({ type: 'session.send', session: sessionName, text: '/model MiniMax-M2.7', commandId: 'cmd-ccsdk-minimax-model' }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.emitted.some((e) => (
+      e.session === sessionName
+      && e.type === 'assistant.text'
+      && e.payload.text === 'Switched model to MiniMax-M2.7'
+    )));
+
+    const record = mocks.store.get(sessionName);
+    const usage = mocks.emitted.filter((e) => e.session === sessionName && e.type === 'usage.update' && e.payload.model === 'MiniMax-M2.7').at(-1);
+    expect(record?.modelDisplay).toBe('MiniMax-M2.7');
+    expect(record?.activeModel).toBe('MiniMax-M2.7');
+    expect(usage?.payload.contextWindow).toBe(200000);
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      status: 'error',
+    }));
   });
 
   it('persists and applies cc presets for claude-code-sdk sub-sessions', async () => {

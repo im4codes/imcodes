@@ -359,7 +359,7 @@ function isTextEntryKeyboardOwner(node: EventTarget | Node | null | undefined): 
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
-type ModelChoice = 'fable' | 'opus[1M]' | 'sonnet' | 'haiku';
+type ModelChoice = string;
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 const IME_ESCAPE_CANCEL_GRACE_MS = 800;
@@ -1546,6 +1546,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
     ? genericTransportModel
     : (genericTransportModel ?? codexModel);
+  const claudePresetModel = activeSession?.agentType === 'claude-code-sdk' && activeSession.ccPreset
+    ? (resolveEffectiveSessionModel(activeSession, detectedModel) ?? null)
+    : null;
+  const displayedClaudeModel = claudePresetModel ?? model;
+  const claudeModelSuggestions = claudePresetModel
+    ? [claudePresetModel]
+    : CLAUDE_CODE_MODEL_IDS;
   const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
     && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
@@ -4587,20 +4594,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               class="shortcut-btn"
               onClick={() => setModelOpen((o) => !o)}
               disabled={disabled}
-              title={model ? `Model: ${model}` : 'Model: Unknown — tap to select'}
-              style={{ color: model ? '#a78bfa' : '#6b7280', fontSize: 10 }}
+              title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
+              style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}
             >
-              {model ?? 'unknown'}
+              {displayedClaudeModel ?? 'unknown'}
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {CLAUDE_CODE_MODEL_IDS.map((m) => (
+                {claudeModelSuggestions.map((m) => (
                   <button
                     key={m}
-                    class={`menu-item ${model === m ? 'menu-item-active' : ''}`}
+                    class={`menu-item ${displayedClaudeModel === m ? 'menu-item-active' : ''}`}
                     onClick={() => handleModelSelect(m)}
                   >
-                    {model === m ? '● ' : '○ '}{m.charAt(0).toUpperCase() + m.slice(1)}
+                    {displayedClaudeModel === m ? '● ' : '○ '}{m.charAt(0).toUpperCase() + m.slice(1)}
                   </button>
                 ))}
               </div>

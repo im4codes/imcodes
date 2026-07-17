@@ -3907,7 +3907,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (record?.agentType === 'claude-code-sdk' && modelMatch) {
         const requestedModel = modelMatch[1];
-        const selectedModel = normalizeClaudeCodeModelId(requestedModel);
+        let presetContextWindow = record.presetContextWindow;
+        let selectedModel: string | undefined;
+        if (record.ccPreset) {
+          const { getPreset, getPresetAvailableModelIds, getPresetTransportOverrides } = await import('./cc-presets.js');
+          const preset = await getPreset(record.ccPreset);
+          const presetModels = preset ? getPresetAvailableModelIds(preset) : [];
+          selectedModel = presetModels.find((model) => model === requestedModel);
+          if (!presetContextWindow) {
+            presetContextWindow = (await getPresetTransportOverrides(record.ccPreset)).contextWindow;
+          }
+        } else {
+          selectedModel = normalizeClaudeCodeModelId(requestedModel);
+        }
         if (!selectedModel) {
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
@@ -3930,7 +3942,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: selectedModel, contextWindow: resolveContextWindow(undefined, selectedModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'usage.update', {
+          model: selectedModel,
+          contextWindow: resolveContextWindow(presetContextWindow, selectedModel),
+        }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', {
           text: `Switched model to ${selectedModel}`,
           streaming: false,

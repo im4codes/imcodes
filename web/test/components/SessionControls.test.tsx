@@ -4140,6 +4140,28 @@ afterEach(() => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
+  it('shows the preset model for claude-code-sdk sessions instead of stale local opus', () => {
+    localStorage.setItem('imcodes-model', 'opus[1M]');
+
+    render(<SessionControls
+      ws={makeWs() as any}
+      activeSession={makeSession({
+        name: 'deck_sub_minimax',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        ccPreset: 'minimax',
+        requestedModel: 'MiniMax-M3',
+        activeModel: 'MiniMax-M3',
+        modelDisplay: 'MiniMax-M3',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^MiniMax-M3$/i }));
+    expect(screen.getByRole('button', { name: /^● MiniMax-M3$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /opus/i })).toBeNull();
+  });
+
   it('shows level control for qwen and sends /thinking', () => {
     const ws = makeWs();
     render(<SessionControls
