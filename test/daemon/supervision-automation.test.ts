@@ -158,6 +158,30 @@ async function seedSession(
   return snapshot;
 }
 
+function recreateReviewer(label = 'Replacement reviewer') {
+  removeSession('deck_sub_reviewer');
+  upsertSession({
+    name: 'deck_sub_reviewer',
+    label,
+    projectName: 'supervision',
+    role: 'w1',
+    agentType: 'claude-code-sdk',
+    runtimeType: 'transport',
+    providerId: 'claude-code-sdk',
+    providerSessionId: 'provider-session-replacement',
+    activeModel: 'claude-sonnet-4-6',
+    projectDir: projectDir!,
+    state: 'idle',
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  const reviewer = getSession('deck_sub_reviewer');
+  if (!reviewer?.sessionInstanceId) throw new Error('replacement reviewer identity was not created');
+  return reviewer;
+}
+
 function completeTurn(text = 'done') {
   timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
     text,
@@ -250,6 +274,48 @@ describe('SupervisionAutomation', () => {
     ]));
   });
 
+  it('settles a reply-backed PASS immediately without a later idle edge or false timeout', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-pass-without-idle',
+        'implement the feature',
+        snapshot,
+      );
+      beginRun('cmd-pass-without-idle', 'implement the feature');
+      completeTurn('implemented the feature');
+      await waitForRunPhase('auditing');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.auditAttemptId).toBeTruthy();
+      const priorResultCount = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+        event.type === 'peer_audit.result').length;
+
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: 'Task: independent audit\nResult: PASS with evidence.',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: `PASS with evidence.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+        streaming: false,
+      });
+      await Promise.resolve();
+
+      // Intentionally do not emit session.state=idle. The final assistant
+      // boundary must settle the audit and disarm the six-minute deadline.
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS);
+
+      const results = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+        event.type === 'peer_audit.result').slice(priorResultCount);
+      expect(results.filter((event) => event.payload.outcome === 'pass')).toHaveLength(1);
+      expect(results.filter((event) => event.payload.outcome === 'timeout')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('cancels an in-flight orchestrated audit exactly once when supervision is stopped', async () => {
     const snapshot = await seedSession('supervised_audit');
     supervisionAutomation.init();
@@ -332,24 +398,7 @@ describe('SupervisionAutomation', () => {
 
   it('fails closed instead of delegating when the configured auditor fingerprint is stale', async () => {
     const snapshot = await seedSession('supervised_audit');
-    removeSession('deck_sub_reviewer');
-    upsertSession({
-      name: 'deck_sub_reviewer',
-      label: 'Replacement reviewer',
-      projectName: 'supervision',
-      role: 'w1',
-      agentType: 'claude-code-sdk',
-      runtimeType: 'transport',
-      providerId: 'claude-code-sdk',
-      providerSessionId: 'provider-session-replacement',
-      activeModel: 'claude-sonnet-4-6',
-      projectDir: projectDir!,
-      state: 'idle',
-      restarts: 0,
-      restartTimestamps: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
+    recreateReviewer();
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stale-auditor', 'implement the feature', snapshot);
@@ -368,6 +417,50 @@ describe('SupervisionAutomation', () => {
         }),
       }),
     ]));
+  });
+
+  it('uses the authoritative repaired auditor fingerprint when an in-flight snapshot is stale', async () => {
+    const staleSnapshot = await seedSession('supervised_audit');
+    const replacement = recreateReviewer('Repaired reviewer');
+    const repairedSnapshot = normalizeSessionSupervisionSnapshot({
+      ...staleSnapshot,
+      auditTargetSessionName: replacement.name,
+      auditTargetFingerprint: {
+        sessionInstanceId: replacement.sessionInstanceId,
+        normalizedModelId: 'claude-sonnet-4-6',
+        providerFamily: 'anthropic',
+      },
+    });
+    const audited = getSession('deck_supervision_brain');
+    if (!audited) throw new Error('audited session was not created');
+    upsertSession({
+      ...audited,
+      transportConfig: { ...audited.transportConfig, supervision: repairedSnapshot },
+      updatedAt: Date.now(),
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-repaired-auditor',
+      'implement the feature',
+      staleSnapshot,
+    );
+    beginRun('cmd-repaired-auditor', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(50);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: {
+        auditTargetSessionName: replacement.name,
+        auditTargetFingerprint: {
+          sessionInstanceId: replacement.sessionInstanceId,
+        },
+      },
+    });
   });
 
   it('holds commit and push until PASS and allows multi-turn finalization without a second audit', async () => {

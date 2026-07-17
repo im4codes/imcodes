@@ -80,6 +80,7 @@ interface ActiveTaskRunState {
   sessionName: string;
   commandId: string;
   snapshot: SessionSupervisionSnapshot;
+  hasLiveSnapshotUpdate: boolean;
   userText: string;
   phase: TaskRunPhase;
   continueLoops: number;
@@ -526,6 +527,7 @@ class SupervisionAutomation {
     const active = this.activeRuns.get(sessionName);
     if (active) {
       active.snapshot = snapshot;
+      active.hasLiveSnapshotUpdate = true;
     }
     const pending = this.pendingTaskIntents.get(sessionName);
     if (pending) {
@@ -644,6 +646,7 @@ class SupervisionAutomation {
       sessionName,
       commandId,
       snapshot,
+      hasLiveSnapshotUpdate: false,
       userText: text,
       phase: 'execution',
       continueLoops: 0,
@@ -704,6 +707,23 @@ class SupervisionAutomation {
       if (!run) return;
       run.lastAssistantText = text;
       run.sawAssistantOutput = true;
+      // A retained/background transport can emit the final assistant result
+      // without producing another session.state=idle edge afterwards. Waiting
+      // exclusively for that edge leaves the audit deadline armed even after
+      // this session has reported a reply-backed PASS/REWORK, which later
+      // creates a false timeout result. Defer the fallback to a microtask so a
+      // normal adjacent idle edge keeps the existing ordering (important when
+      // PASS starts finalization or REWORK queues another turn); if no edge is
+      // emitted, the final assistant payload settles the audit and disarms the
+      // deadline. The generation/phase guard makes the two paths exactly-once.
+      if (run.phase === 'auditing' && run.auditReplyObserved) {
+        const generation = run.generation;
+        queueMicrotask(() => {
+          const latest = this.activeRuns.get(event.sessionId);
+          if (!latest || latest.generation !== generation || latest.phase !== 'auditing' || !latest.auditReplyObserved) return;
+          this.handleOrchestratedAuditCompletion(latest);
+        });
+      }
       return;
     }
 
@@ -890,9 +910,23 @@ class SupervisionAutomation {
     this.emitAutomationNote(current.sessionName, '⏳ Auto is asking this session to prepare and delegate the peer audit. Commit/push is paused until PASS.', 'supervision-audit');
 
     const record = getSession(current.sessionName);
-    const targetName = current.snapshot.auditTargetSessionName;
+    // The task-run snapshot can predate a target repair performed while the
+    // task is still running. Re-read the daemon-authoritative persisted
+    // configuration at the audit boundary so a repaired fingerprint is not
+    // rejected as a false stale target. A genuinely stale persisted
+    // fingerprint still fails closed below.
+    const authoritativeSnapshot = record
+      ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
+      : null;
+    const latestSnapshot = current.hasLiveSnapshotUpdate ? current.snapshot : authoritativeSnapshot;
+    const automaticSnapshot = latestSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      ? latestSnapshot
+      : null;
+    if (automaticSnapshot) current.snapshot = automaticSnapshot;
+
+    const targetName = automaticSnapshot?.auditTargetSessionName;
     const target = targetName ? getSession(targetName) : undefined;
-    const configuredFingerprint = current.snapshot.auditTargetFingerprint;
+    const configuredFingerprint = automaticSnapshot?.auditTargetFingerprint;
     const transportRuntime = getTransportRuntime(current.sessionName);
     const targetStillMatches = Boolean(
       target
@@ -902,6 +936,15 @@ class SupervisionAutomation {
       && resolvePeerAuditProviderFamily(target) === configuredFingerprint.providerFamily,
     );
     if (!record || !targetName || !target || !targetStillMatches || !transportRuntime) {
+      logger.warn({
+        session: current.sessionName,
+        hasRecord: Boolean(record),
+        hasAutomaticSnapshot: Boolean(automaticSnapshot),
+        hasTargetName: Boolean(targetName),
+        hasTarget: Boolean(target),
+        targetStillMatches,
+        hasTransportRuntime: Boolean(transportRuntime),
+      }, 'Automatic audit preflight could not resolve authoritative configuration');
       this.emitOrchestratedAuditResult(current, 'invalid_configuration', 'invalid_configuration');
       this.emitWarning(current.sessionName, 'Automation peer audit could not resolve the current session or configured auditor. Manual review is required.');
       this.finishRun(current.sessionName, 'needs_input');
