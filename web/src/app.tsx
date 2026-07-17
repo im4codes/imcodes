@@ -166,6 +166,7 @@ import { shouldUseIosMacTextScale } from './native-platform.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
+import { resolveQuickAgentDelegationModel } from './quick-agent-delegation-model.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
@@ -4498,10 +4499,27 @@ export function App() {
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
-  const subSessionsSlim = useMemo(() =>
-    subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
-    [subSessions]
-  );
+  const quickDelegationSessions = useMemo(() => sessions.map((session) => {
+    const effectiveModel = resolveQuickAgentDelegationModel(
+      session,
+      detectedModels.get(session.name),
+    );
+    return effectiveModel && effectiveModel !== session.activeModel
+      ? { ...session, activeModel: effectiveModel }
+      : session;
+  }), [detectedModels, sessions]);
+  const subSessionsSlim = useMemo(() => subSessions.map((session) => ({
+    sessionName: session.sessionName,
+    type: session.type,
+    label: session.label,
+    state: session.state,
+    parentSession: session.parentSession,
+    activeModel: resolveQuickAgentDelegationModel(
+      session,
+      detectedModels.get(session.sessionName),
+      subUsages.get(session.sessionName)?.model,
+    ),
+  })), [detectedModels, subSessions, subUsages]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
     const sub = subSessionId
@@ -5162,7 +5180,7 @@ export function App() {
                 serverId={selectedServerId ?? ''}
                 onPendingQuestion={surfaceAskQuestionFromHistory}
                 session={s}
-                sessions={sessions}
+                sessions={quickDelegationSessions}
                 subSessions={subSessionsSlim}
                 ws={wsRef.current}
                 connected={connected}
@@ -5390,7 +5408,7 @@ export function App() {
                 detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
-                sessions={sessions}
+                sessions={quickDelegationSessions}
                 allSubSessions={subSessionsSlim}
                 p2pSessionLabels={p2pSessionLabels}
                 onSubTransportConfigSaved={(subId, transportConfig) => updateSubLocal(subId, { transportConfig })}
@@ -6009,7 +6027,7 @@ export function App() {
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
-              sessions={sessions}
+              sessions={quickDelegationSessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
               detectedModelHint={detectedModels.get(sub.sessionName)}

@@ -26,8 +26,7 @@ import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
 import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
-import { resolveEffectiveSessionModel } from '@shared/session-model.js';
-import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
+import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
 import {
   createSubSessionEntryGestureController,
   type SubSessionEntryGestureController,
@@ -215,8 +214,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
-  const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, usage?.model);
-  const effectiveModel = resolveEffectiveSessionModel(sub, detectedModel, usage?.model, legacyCodexModel);
+  const effectiveModel = resolveQuickAgentDelegationModel(sub, detectedModel, usage?.model);
   const model = bestModelLabel(effectiveModel, usage?.model);
   let ctxPct = 0;
   if (usage) {
