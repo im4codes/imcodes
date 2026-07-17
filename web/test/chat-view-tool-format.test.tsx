@@ -206,6 +206,45 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.queryByText(/\(other\)/)).toBeNull();
   });
 
+  it('drops the cryptic "(other)" token when a reasoning-model web search reports no query', () => {
+    // Real codex payload: `web_search_end` with query:"" + action:{type:'other'}
+    // on both the call and the result — the query is withheld, so there is
+    // nothing to show and the row must not leak the raw "(other)" enum.
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:websearch-other:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'WebSearch',
+          input: { query: '(other)' },
+          detail: {
+            kind: 'webSearch',
+            summary: '(other)',
+            input: { query: '(other)', action: { type: 'other' } },
+            meta: { actionType: 'other' },
+          },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:websearch-other:result',
+        type: 'tool.result',
+        payload: {
+          detail: {
+            kind: 'webSearch',
+            summary: '(other)',
+            input: { query: '(other)', action: { type: 'other' } },
+            meta: { actionType: 'other' },
+          },
+        },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('WebSearch')).toBeDefined();
+    expect(screen.queryByText(/\(other\)/)).toBeNull();
+  });
+
   it('shows a single timestamp on the final merged tool row', () => {
     const events = [
       makeEvent({

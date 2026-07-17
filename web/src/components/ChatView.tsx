@@ -458,8 +458,16 @@ function pickMergedToolInput(
   callInput: string,
   resultInput: string,
 ): string {
-  if (toolName === 'WebSearch' && resultInput) {
-    if (!callInput || isGenericWebSearchLabel(callInput)) return resultInput;
+  if (toolName === 'WebSearch') {
+    const callGeneric = !callInput || isGenericWebSearchLabel(callInput);
+    const resultGeneric = !resultInput || isGenericWebSearchLabel(resultInput);
+    // Reasoning-model web search sometimes reports `action: { type: 'other' }`
+    // with an empty query — codex/OpenAI withholds the actual query, so there
+    // is nothing to show. Drop the cryptic "(other)" token and render a bare
+    // "WebSearch" row instead of leaking the raw enum to the user.
+    if (callGeneric && resultGeneric) return '';
+    if (callGeneric) return resultInput;
+    return callInput;
   }
   return callInput || resultInput;
 }
