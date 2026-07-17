@@ -429,6 +429,7 @@ export function SubSessionWindow({
               ? 'error'
               : 'idle',
     projectDir: sub.cwd ?? undefined,
+    ccPreset: sub.ccPresetId ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,

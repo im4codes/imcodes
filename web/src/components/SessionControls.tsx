@@ -1546,12 +1546,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
     ? genericTransportModel
     : (genericTransportModel ?? codexModel);
-  const claudePresetModel = activeSession?.agentType === 'claude-code-sdk' && activeSession.ccPreset
+  const claudeSessionModel = activeSession?.agentType === 'claude-code-sdk'
     ? (resolveEffectiveSessionModel(activeSession, detectedModel) ?? null)
     : null;
-  const displayedClaudeModel = claudePresetModel ?? model;
-  const claudeModelSuggestions = claudePresetModel
-    ? [claudePresetModel]
+  const claudePinnedModel = claudeSessionModel && (
+    !!activeSession?.ccPreset
+    || !normalizeClaudeCodeModelId(claudeSessionModel)
+  )
+    ? claudeSessionModel
+    : null;
+  const displayedClaudeModel = claudePinnedModel ?? model;
+  const claudeModelSuggestions = claudePinnedModel
+    ? [claudePinnedModel]
     : CLAUDE_CODE_MODEL_IDS;
   const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
     && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
