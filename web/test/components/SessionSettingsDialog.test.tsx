@@ -321,7 +321,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised_audit');
     await waitFor(() => {
-      expect(screen.getByTestId('peer-audit-settings-confirmed').textContent).toContain('Peer');
+      expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('Peer');
     });
     expect(screen.getByText('maxAuditLoops')).toBeDefined();
 
@@ -347,7 +347,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('requires reconfirmation when the daemon reports a changed target fingerprint', async () => {
+  it('accepts the daemon-authoritative changed target fingerprint without a redundant confirmation', async () => {
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'claude-code-sdk',
       model: CLAUDE_CODE_MODEL_IDS[0],
@@ -386,12 +386,8 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    await waitFor(() => expect(screen.getByTestId('peer-audit-settings-confirm')).toBeDefined());
-    expect(screen.queryByTestId('peer-audit-settings-confirmed')).toBeNull();
-    expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(true);
-
-    fireEvent.click(screen.getByTestId('peer-audit-settings-confirm'));
-    await waitFor(() => expect(screen.getByTestId('peer-audit-settings-confirmed').textContent).toContain('gpt-5.7'));
+    await waitFor(() => expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('gpt-5.7'));
+    expect(screen.queryByTestId('peer-audit-settings-confirm')).toBeNull();
   });
 
   it('prefills from saved supervisor defaults when available', async () => {

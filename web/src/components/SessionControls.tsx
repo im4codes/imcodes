@@ -1,12 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
-import { PeerAuditAuditorChooser } from '../peerAudit/PeerAuditAuditorChooser.js';
-import { usePeerAuditController } from '../peerAudit/usePeerAuditController.js';
-import type {
-  PeerAuditAdapter,
-  PeerAuditRememberedTarget,
-} from '../peerAudit/types.js';
-import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
-import { createStubPeerAuditAdapter } from '../peerAudit/stubAdapter.js';
+import type { PeerAuditRememberedTarget } from '../peerAudit/types.js';
 import { resolvePeerAuditNormalizedModelId, resolvePeerAuditProviderFamily } from '@shared/peer-audit.js';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -23,6 +16,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
@@ -973,6 +967,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
+  const [quickDelegationError, setQuickDelegationError] = useState<string | null>(null);
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -1477,26 +1472,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
   const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
-  /**
-   * Peer Audit requires daemon-authoritative identity (sessionInstanceId +
-   * runtimeEpoch) sourced from session_list / subsession.sync. Until the
-   * projection exposes those fields, Peer Audit MUST be disabled — never
-   * substitute session name as identity.
-   *
-   * Main and sub-session projections both carry these fields. The fallback
-   * lookup exists only for callers whose compact session projection has not
-   * arrived yet; absence still hides the control rather than guessing.
-   */
   const auditedSubSession = subSessionId
     ? subSessions?.find((session) => session.sessionName === activeSession?.name)
     : undefined;
   const auditedIdentitySource = auditedSubSession ?? activeSession;
-  const auditedSessionIdentity = useMemo<null | {
-    sessionInstanceId: string;
-    runtimeEpoch: string;
-  }>(() => auditedIdentitySource?.sessionInstanceId && auditedIdentitySource.runtimeEpoch
-    ? { sessionInstanceId: auditedIdentitySource.sessionInstanceId, runtimeEpoch: auditedIdentitySource.runtimeEpoch }
-    : null, [auditedIdentitySource?.sessionInstanceId, auditedIdentitySource?.runtimeEpoch]);
   const auditedSessionName = activeSession?.name ?? null;
   const auditedModel = useMemo(() => auditedIdentitySource ? {
     normalizedModelId: resolvePeerAuditNormalizedModelId({
@@ -1547,30 +1526,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && auditedModel.providerFamily !== 'unknown'
     && rememberedTarget.normalizedModelId !== auditedModel.normalizedModelId,
   );
-  const peerAuditAdapter = useMemo<PeerAuditAdapter>(
-    () => ws ? createWsPeerAuditAdapter(ws) : createStubPeerAuditAdapter(),
-    [ws],
-  );
-  const peerAuditApi = usePeerAuditController({
-    adapter: peerAuditAdapter,
-    auditedSessionIdentity,
-    auditedSessionName,
-    auditedModel,
-    rememberedTarget,
-    hasUserConsentedTo: (fingerprint) => localStorage.getItem(`peerAuditConsent:${auditedSessionName}`) === fingerprint,
-    recordUserConsent: (fingerprint) => localStorage.setItem(`peerAuditConsent:${auditedSessionName}`, fingerprint),
-  });
-  // Open the chooser/result flow when the icon button is clicked.
-  useEffect(() => {
-    if (peerAuditOpen && peerAuditApi.state.kind === 'idle' && auditedSessionIdentity && auditedSessionName) {
-      peerAuditApi.start({
-        auditedSessionName,
-        auditedSessionIdentity,
-        rememberedTarget,
-        auditedModel,
-      });
-    }
-  }, [peerAuditOpen, peerAuditApi]);
   const canQuickControlSupervision = !!(
     activeSession
     && serverId
@@ -2666,6 +2621,43 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+  const quickDelegationCandidates = useMemo<QuickAgentDelegationCandidate[]>(() => {
+    const activeProject = activeSession?.project?.trim();
+    if (!activeProject) return [];
+    const projectMainSessions = new Set(
+      (sessions ?? [])
+        .filter((session) => session.project === activeProject)
+        .map((session) => session.name),
+    );
+    if (rootSession) projectMainSessions.add(rootSession);
+    const byName = new Map<string, QuickAgentDelegationCandidate>();
+    const add = (candidate: QuickAgentDelegationCandidate) => {
+      if (candidate.sessionName === activeSession?.name) return;
+      if (candidate.agentType === 'shell' || candidate.agentType === 'script') return;
+      if (!byName.has(candidate.sessionName)) byName.set(candidate.sessionName, candidate);
+    };
+    for (const session of sessions ?? []) {
+      if (session.project !== activeProject) continue;
+      add({
+        sessionName: session.name,
+        agentType: session.agentType,
+        label: session.label,
+        model: resolveEffectiveSessionModel(session),
+        state: session.state,
+      });
+    }
+    for (const session of subSessions ?? []) {
+      if (!session.parentSession || !projectMainSessions.has(session.parentSession)) continue;
+      add({
+        sessionName: session.sessionName,
+        agentType: session.type,
+        label: session.label,
+        model: resolveEffectiveSessionModel(session),
+        state: session.state,
+      });
+    }
+    return [...byName.values()];
+  }, [activeSession?.name, activeSession?.project, rootSession, sessions, subSessions]);
 
   // ── Dedicated execution routing preference ──────────────────────────────
   // Reads the SHARED preference (the same one Team Settings edits). Generic
@@ -3483,11 +3475,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return commandId;
   }, [activeSession, ws]);
 
-  const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
-    if (!activeSession) return;
-    if (uploading) {
+  const finalizeSend = useCallback((
+    payload: PendingSendPayload,
+    options?: { clearComposer?: boolean; programmaticDelegation?: boolean },
+  ): 'accepted' | 'rejected' => {
+    if (!activeSession) return 'rejected';
+    if (uploading && !options?.programmaticDelegation) {
       showSendWarning(t('upload.uploading'));
-      return;
+      return 'rejected';
     }
     const isP2pSend = (
       Array.isArray(payload.extra.p2pAtTargets) && payload.extra.p2pAtTargets.length > 0
@@ -3519,11 +3514,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
     if (effectiveRuntimeType === 'transport' && !isP2pSend && !isDelegationSend && payload.text.trim() === '/stop') {
       showStopFeedback();
-      if (!cancelActiveTransportTurn()) return;
+      if (!cancelActiveTransportTurn()) return 'rejected';
       if (options?.clearComposer) clearComposerState();
-      return;
+      return 'accepted';
     }
-    if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
+    if (editingQueuedMessageId && effectiveRuntimeType === 'transport' && !options?.programmaticDelegation) {
       const previousEntry = queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId);
       let mutationCommandId: string | false = false;
       try {
@@ -3531,9 +3526,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           clientMessageId: editingQueuedMessageId,
           text: payload.text,
         });
-        if (!mutationCommandId) return;
+        if (!mutationCommandId) return 'rejected';
       } catch {
-        return;
+        return 'rejected';
       }
       if (previousEntry) {
         queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'edit', entry: previousEntry });
@@ -3550,16 +3545,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (options?.clearComposer) {
         clearComposerState();
       }
-      return;
+      return 'accepted';
     }
-    quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     const commandId = makeCommandId();
     let localFailure: string | undefined;
     try {
-      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return;
+      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return 'rejected';
     } catch (err) {
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
+    if (!localFailure) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
       && transportSendShouldQueue
       && !isP2pSend
@@ -3581,7 +3576,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     // Snapshot attachments before clearComposer wipes them so the optimistic
     // bubble surfaces the same badges the confirmed message will.
-    const attachmentSnapshot = attachments.length > 0
+    const attachmentSnapshot = !options?.programmaticDelegation && attachments.length > 0
       ? attachments.map((a) => ({
           id: a.path,
           daemonPath: a.path,
@@ -3600,6 +3595,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (options?.clearComposer) {
       clearComposerState();
     }
+    return localFailure ? 'rejected' : 'accepted';
   }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
@@ -3730,6 +3726,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleSend = useCallback(() => {
     requestSend(buildSendPayload(), { clearComposer: true });
   }, [buildSendPayload, requestSend]);
+
+  const handleQuickAgentDelegationDispatch = useCallback((input: {
+    sessionName: string;
+    label: string;
+    task: string;
+  }) => {
+    const task = input.task.trim();
+    if (!task) {
+      setQuickDelegationError(t('delegation.warning_empty_task'));
+      return;
+    }
+    if (isDelegationUnsupportedControlText(task)) {
+      setQuickDelegationError(t('delegation.warning_control_command'));
+      return;
+    }
+    setQuickDelegationError(null);
+    const outcome = finalizeSend({
+      text: buildAgentDelegationOrchestrationPrompt({
+        targetSession: input.sessionName,
+        targetLabel: input.label,
+        task,
+      }),
+      extra: {},
+      delegation: {
+        targetSession: input.sessionName,
+        targetLabel: input.label,
+        task,
+      },
+    }, { programmaticDelegation: true });
+    if (outcome === 'accepted') {
+      setPeerAuditOpen(false);
+      return;
+    }
+    setQuickDelegationError(t('peerAuditQuick.sendFailed'));
+  }, [finalizeSend, t]);
 
   const handleDirectComboSelect = useCallback((mode: string, roundsOverride?: number) => {
     setP2pOpen(false);
@@ -4432,35 +4463,34 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           })}
         </div>}
 
-        {/* Peer Audit quick action — must remain visible while Auto is off and
-            shares the supervision-target gate so it never appears for non-target
-            sessions. Auto's mode/color dot is intentionally untouched below.
-            The icon is hidden entirely until authoritative sessionInstanceId +
-            runtimeEpoch are present (no name fallback). */}
+        {/* Quick peer delegation reuses the ordinary @agent orchestration path.
+            It stays separate from automatic supervision state and remains
+            visible while Auto is off. */}
         {canQuickControlSupervision && (
           <div class="shortcuts-model shortcuts-model-supervision" ref={autoRef}>
-            {auditedSessionIdentity && (
-              <button
-                class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"
-                data-testid="peer-audit-icon"
-                onClick={() => setPeerAuditOpen(true)}
-                disabled={disabled || peerAuditOpen}
-                title={t('peerAuditQuick.tooltip')}
-                aria-label={t('peerAuditQuick.iconLabel')}
-                aria-haspopup="dialog"
+            <button
+              class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"
+              data-testid="peer-audit-icon"
+              onClick={() => {
+                setQuickDelegationError(null);
+                setPeerAuditOpen(true);
+              }}
+              disabled={disabled || peerAuditOpen}
+              title={t('peerAuditQuick.tooltip')}
+              aria-label={t('peerAuditQuick.iconLabel')}
+              aria-haspopup="dialog"
+            >
+              <svg
+                class="shortcut-btn-peer-audit-icon"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
               >
-                <svg
-                  class="shortcut-btn-peer-audit-icon"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <circle cx="10.5" cy="10.5" r="6.5" />
-                  <path d="m15.3 15.3 4.2 4.2" />
-                  <path d="m7.7 10.6 1.8 1.8 3.8-4" />
-                </svg>
-              </button>
-            )}
+                <circle cx="10.5" cy="10.5" r="6.5" />
+                <path d="m15.3 15.3 4.2 4.2" />
+                <path d="m7.7 10.6 1.8 1.8 3.8-4" />
+              </svg>
+            </button>
             <button
               class="shortcut-btn shortcut-btn-auto"
               onClick={() => setAutoOpen((open) => !open)}
@@ -4515,13 +4545,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           </div>
         )}
 
-        {peerAuditOpen && auditedSessionIdentity && auditedSessionName && typeof document !== 'undefined' && createPortal(
+        {peerAuditOpen && auditedSessionName && typeof document !== 'undefined' && createPortal(
           <div
             class="peer-audit-overlay"
             data-testid="peer-audit-overlay"
             role="presentation"
             onClick={(e) => {
-              if (e.target === e.currentTarget) setPeerAuditOpen(false);
+              if (e.target === e.currentTarget) {
+                setQuickDelegationError(null);
+                setPeerAuditOpen(false);
+              }
             }}
           >
             <div
@@ -4529,49 +4562,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               data-testid="peer-audit-modal"
               role="dialog"
               aria-modal="true"
-              aria-busy={peerAuditApi.state.kind === 'starting' || peerAuditApi.state.kind === 'pending' ? 'true' : 'false'}
             >
-              {peerAuditApi.state.kind === 'pending' && (
-                <div data-testid="peer-audit-pending" aria-live="polite">
-                  {t(`peerAuditQuick.pending_${peerAuditApi.state.phase}`, { defaultValue: t('peerAuditQuick.pending') })}
-                  <button type="button" onClick={() => peerAuditApi.cancelPending()}>
-                    {t('peerAuditQuick.cancel_pending')}
-                  </button>
-                </div>
-              )}
-              {peerAuditApi.state.kind === 'result' && (
-                <div data-testid="peer-audit-result" aria-live="polite">
-                  <h3>{t('peerAuditResult.title')}</h3>
-                  <div>{t('peerAuditResult.attributionAuditor', { auditor: peerAuditApi.state.auditorLabel })}</div>
-                  <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(peerAuditApi.state.elapsedMs / 1000) })}</div>
-                  <div>{t(`peerAuditQuick.result_${peerAuditApi.state.verdict.toLowerCase()}`)}</div>
-                  <button type="button" onClick={() => { peerAuditApi.acknowledgeResult(); setPeerAuditOpen(false); }}>
-                    {t('peerAuditQuick.acknowledge')}
-                  </button>
-                </div>
-              )}
-              {peerAuditApi.state.kind === 'error' && (
-                <div data-testid="peer-audit-error" aria-live="polite">
-                  <div>{t('peerAuditQuick.result_error', { message: peerAuditApi.state.message })}</div>
-                  <button type="button" onClick={() => { peerAuditApi.acknowledgeResult(); setPeerAuditOpen(false); }}>
-                    {t('peerAuditQuick.acknowledge')}
-                  </button>
-                </div>
-              )}
-              {(peerAuditApi.state.kind === 'idle'
-                || peerAuditApi.state.kind === 'loading'
-                || peerAuditApi.state.kind === 'chooser'
-                || peerAuditApi.state.kind === 'consent'
-                || peerAuditApi.state.kind === 'starting') && (
-                <PeerAuditAuditorChooser
-                  api={peerAuditApi}
-                  onClose={() => {
-                    if (peerAuditApi.state.kind === 'chooser') peerAuditApi.cancelChooser();
-                    if (peerAuditApi.state.kind === 'consent') peerAuditApi.cancelConsent();
-                    setPeerAuditOpen(false);
-                  }}
-                />
-              )}
+              <QuickAgentDelegationDialog
+                currentSessionName={auditedSessionName}
+                candidates={quickDelegationCandidates}
+                error={quickDelegationError}
+                onClose={() => {
+                  setQuickDelegationError(null);
+                  setPeerAuditOpen(false);
+                }}
+                onDispatch={handleQuickAgentDelegationDispatch}
+              />
             </div>
           </div>,
           document.body,

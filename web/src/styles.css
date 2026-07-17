@@ -5408,6 +5408,8 @@ button.peer-audit-chooser-row[aria-pressed="true"] {
 }
 
 .peer-audit-chooser-row-meta {
+  justify-content: space-between;
+  gap: 8px;
   color: #94a3b8;
   font-size: 11px;
 }
@@ -5438,6 +5440,53 @@ button.peer-audit-chooser-row[aria-pressed="true"] {
   margin-top: 2px;
 }
 
+.quick-agent-delegation-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+button.quick-agent-delegation-preset {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.72);
+  color: #cbd5e1;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.quick-agent-delegation-preset.active {
+  border-color: #22d3ee;
+  background: rgba(8, 145, 178, 0.2);
+  color: #f8fafc;
+}
+
+.quick-agent-delegation-custom {
+  box-sizing: border-box;
+  width: 100%;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  border-radius: 10px;
+  outline: none;
+  background: rgba(15, 23, 42, 0.78);
+  color: #f8fafc;
+  font: inherit;
+  line-height: 1.5;
+}
+
+.quick-agent-delegation-custom:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.24);
+}
+
+.quick-agent-delegation-state {
+  flex: 0 0 auto;
+  color: #f59e0b;
+}
+
 .peer-audit-chooser-actions button,
 .peer-audit-modal > [data-testid="peer-audit-pending"] button,
 .peer-audit-modal > [data-testid="peer-audit-result"] button,
@@ -5460,6 +5509,10 @@ button.peer-audit-chooser-row[aria-pressed="true"] {
     max-height: min(78dvh, 680px);
     padding: 16px;
     border-radius: 16px;
+  }
+
+  .quick-agent-delegation-presets {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .peer-audit-chooser-list {

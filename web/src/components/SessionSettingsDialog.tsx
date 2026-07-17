@@ -33,7 +33,6 @@ import {
 import {
   PEER_AUDIT_PROMPT_VERSION,
   resolvePeerAuditNormalizedModelId,
-  resolvePeerAuditProviderFamily,
   type PeerAuditCandidateList,
 } from '@shared/peer-audit.js';
 import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
@@ -521,7 +520,6 @@ export function SessionSettingsDialog({
   runtimeEpoch,
   activeModel,
   requestedModel,
-  providerId,
   parentSession,
   ws,
   onClose,
@@ -552,10 +550,6 @@ export function SessionSettingsDialog({
     sessionInstanceId && runtimeEpoch ? 'loading' : 'waiting_authority',
   );
   const [peerAuditCandidateRefreshToken, setPeerAuditCandidateRefreshToken] = useState(0);
-  // A persisted fingerprint is only a claim until the daemon candidate list
-  // confirms the exact live name/instance/model/provider tuple.
-  const [peerAuditTargetConfirmed, setPeerAuditTargetConfirmed] = useState(false);
-  const peerAuditExplicitConfirmationRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -570,8 +564,6 @@ export function SessionSettingsDialog({
     setAgentType(type);
     setSupervision(initialSupervision);
     setPeerAuditTargetName(initialSupervision.auditTargetSessionName ?? null);
-    peerAuditExplicitConfirmationRef.current = null;
-    setPeerAuditTargetConfirmed(false);
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
 
   useEffect(() => {
@@ -604,34 +596,6 @@ export function SessionSettingsDialog({
     });
     return () => { cancelled = true; };
   }, [ws, sessionName, sessionInstanceId, runtimeEpoch, initialSupervision.auditTargetSessionName, peerAuditCandidateRefreshToken]);
-
-  useEffect(() => {
-    if (!peerAuditCandidateList || !peerAuditTargetName) {
-      setPeerAuditTargetConfirmed(false);
-      return;
-    }
-    const candidate = peerAuditCandidateList.candidates.find((item) => item.name === peerAuditTargetName);
-    const persisted = initialSupervision.auditTargetFingerprint;
-    const candidateFingerprint = candidate ? JSON.stringify({
-      sessionInstanceId: candidate.sessionInstanceId,
-      normalizedModelId: candidate.normalizedModelId,
-      providerFamily: candidate.providerFamily,
-    }) : null;
-    setPeerAuditTargetConfirmed(Boolean(
-      (candidate?.eligible && candidateFingerprint === peerAuditExplicitConfirmationRef.current)
-      || (candidate?.eligible
-      && persisted
-      && initialSupervision.auditTargetSessionName === candidate.name
-      && persisted.sessionInstanceId === candidate.sessionInstanceId
-      && persisted.normalizedModelId === candidate.normalizedModelId
-      && persisted.providerFamily === candidate.providerFamily)
-    ));
-  }, [
-    initialSupervision.auditTargetFingerprint,
-    initialSupervision.auditTargetSessionName,
-    peerAuditCandidateList,
-    peerAuditTargetName,
-  ]);
 
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
@@ -735,6 +699,7 @@ export function SessionSettingsDialog({
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const selectedPeerAuditCandidate = peerAuditCandidateList?.candidates.find((candidate) => candidate.name === peerAuditTargetName);
+  const peerAuditTargetConfirmed = Boolean(selectedPeerAuditCandidate?.eligible);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
     ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
     : null;
@@ -749,14 +714,9 @@ export function SessionSettingsDialog({
     ].filter(Boolean).join(' · ')
     : null;
   const auditedPeerModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
-  const auditedPeerProvider = resolvePeerAuditProviderFamily({ providerId, agentType: type });
   const selectedPeerIsSameModel = Boolean(selectedPeerAuditCandidate
     && auditedPeerModel !== 'unknown'
     && selectedPeerAuditCandidate.normalizedModelId === auditedPeerModel);
-  const selectedPeerIsCrossProvider = Boolean(selectedPeerAuditCandidate
-    && auditedPeerProvider !== 'unknown'
-    && selectedPeerAuditCandidate.providerFamily !== 'unknown'
-    && selectedPeerAuditCandidate.providerFamily !== auditedPeerProvider);
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
   const supervisionPresetEntry = ccPresets.find((p) => p.name === (typeof supervision.preset === 'string' ? supervision.preset.trim() : ''));
   const supervisionPresetModelOptions = getPresetModelOptions(ccPresets, supervision.preset);
@@ -1347,15 +1307,6 @@ export function SessionSettingsDialog({
                         selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
                         onSelect={(candidate) => {
                           setPeerAuditTargetName(candidate.name);
-                          peerAuditExplicitConfirmationRef.current = null;
-                          const persisted = initialSupervision.auditTargetFingerprint;
-                          setPeerAuditTargetConfirmed(Boolean(
-                            persisted
-                            && initialSupervision.auditTargetSessionName === candidate.name
-                            && persisted.sessionInstanceId === candidate.sessionInstanceId
-                            && persisted.normalizedModelId === candidate.normalizedModelId
-                            && persisted.providerFamily === candidate.providerFamily
-                          ));
                         }}
                       />
                     ) : (
@@ -1384,38 +1335,8 @@ export function SessionSettingsDialog({
                       {t('peerAuditQuick.disposition.sent_unrevocable')}
                     </div>
                   )}
-                  {selectedPeerAuditCandidate && !peerAuditTargetConfirmed && (
-                    <div style={{ marginTop: 8 }}>
-                      <div style={{ color: '#94a3b8', fontSize: 11, marginBottom: 6 }}>
-                        {selectedPeerAuditVisibleIdentity}
-                      </div>
-                      {selectedPeerIsCrossProvider && (
-                        <div style={{ color: '#fbbf24', fontSize: 11, marginBottom: 6 }}>
-                          {t('peerAuditQuick.consentBody', { auditor: selectedPeerAuditDisplayLabel })}
-                        </div>
-                      )}
-                      <button
-                        type="button"
-                        class="btn btn-secondary"
-                        onClick={() => {
-                          peerAuditExplicitConfirmationRef.current = JSON.stringify({
-                            sessionInstanceId: selectedPeerAuditCandidate.sessionInstanceId,
-                            normalizedModelId: selectedPeerAuditCandidate.normalizedModelId,
-                            providerFamily: selectedPeerAuditCandidate.providerFamily,
-                          });
-                          setPeerAuditTargetConfirmed(true);
-                        }}
-                        data-testid="peer-audit-settings-confirm"
-                      >
-                        {t('peerAuditQuick.consentConfirm', { auditor: selectedPeerAuditDisplayLabel })}
-                      </button>
-                      <div style={{ color: '#94a3b8', fontSize: 11, marginTop: 6 }}>
-                        {t('peerAuditQuick.selectionWillPersist')}
-                      </div>
-                    </div>
-                  )}
-                  {selectedPeerAuditCandidate && peerAuditTargetConfirmed && (
-                    <div style={{ color: '#34d399', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-settings-confirmed">
+                  {selectedPeerAuditCandidate && (
+                    <div style={{ color: '#34d399', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-settings-selected">
                       {selectedPeerAuditVisibleIdentity}
                     </div>
                   )}

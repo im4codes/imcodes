@@ -150,6 +150,18 @@ describe('Peer Audit UI slice', () => {
       'peerAuditQuick.iconLabel',
       'peerAuditQuick.tooltip',
       'peerAuditQuick.chooserTitle',
+      'peerAuditQuick.delegationDescription',
+      'peerAuditQuick.unknownModel',
+      'peerAuditQuick.busy',
+      'peerAuditQuick.unavailable',
+      'peerAuditQuick.sendFailed',
+      'peerAuditQuick.modeLabel',
+      'peerAuditQuick.mode.audit',
+      'peerAuditQuick.mode.discussion',
+      'peerAuditQuick.mode.brainstorm',
+      'peerAuditQuick.mode.custom',
+      'peerAuditQuick.customPlaceholder',
+      'peerAuditQuick.dispatch',
       'peerAuditQuick.consentTitle',
       'peerAuditQuick.consentBody',
       'peerAuditQuick.consentConfirm',
@@ -207,7 +219,8 @@ describe('Peer Audit UI slice', () => {
     it('does not introduce new peerAuditQuick top-level keys outside the v1 set', () => {
       const top = Object.keys(en.peerAuditQuick as Record<string, unknown>);
       const EXPECTED = [
-        'iconLabel', 'tooltip', 'chooserTitle', 'consentTitle', 'consentBody',
+        'iconLabel', 'tooltip', 'chooserTitle', 'delegationDescription', 'unknownModel', 'busy', 'unavailable', 'sendFailed',
+        'modeLabel', 'mode', 'customPlaceholder', 'dispatch', 'consentTitle', 'consentBody',
         'consentConfirm', 'selectionWillPersist', 'noCandidate', 'candidateLoad', 'ineligibleCollapsed', 'providerBadge',
         'chooserReason', 'self_target', 'not_direct_child', 'cross_project', 'execution_clone',
         'not_reply_capable', 'wrong_state', 'disposition',

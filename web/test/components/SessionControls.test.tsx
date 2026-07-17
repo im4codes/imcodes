@@ -471,6 +471,7 @@ afterEach(() => {
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     patchSessionMock.mockResolvedValue(undefined);
     patchSubSessionMock.mockResolvedValue(undefined);
+    sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         return JSON.stringify({
@@ -4787,6 +4788,236 @@ afterEach(() => {
     expect(peer.textContent).toBe('');
     expect(peer.querySelector('svg.shortcut-btn-peer-audit-icon')).not.toBeNull();
     expect(peer.parentElement?.classList.contains('shortcuts-model-supervision')).toBe(true);
+  });
+
+  it('quick audit reuses ordinary @agent orchestration without baseline or cross-provider gates', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          sessionInstanceId: undefined,
+          runtimeEpoch: undefined,
+          state: 'idle',
+          transportConfig: { supervision: { mode: 'off' } },
+        })}
+        sessions={[]}
+        subSessions={[{
+          sessionName: 'deck_sub_reviewer',
+          type: 'claude-code-sdk',
+          label: 'Reviewer',
+          state: 'idle',
+          parentSession: 'deck_proj_brain',
+          activeModel: 'claude-opus-4-7',
+        }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    expect(screen.getByTestId('quick-agent-delegation-dialog')).toBeDefined();
+    expect(screen.getByText('Reviewer')).toBeDefined();
+    expect(screen.getByText('claude-opus-4-7')).toBeDefined();
+    expect(document.body.textContent).not.toContain('baseline_no_result');
+    expect(document.body.textContent).not.toContain('consentTitle');
+
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.sessionName).toBe('deck_proj_brain');
+    expect(sent.text).toContain('You are the current session orchestrator for an agent delegation.');
+    expect(sent.text).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(sent.text).toContain('independently audit this session\'s most recent work');
+    expect(sent.text).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(ws.send.mock.calls.some(([message]) => message?.type === 'peer_audit.quick_start')).toBe(false);
+    expect(ws.sendSessionCommand.mock.calls.some(([, payload]) => payload?.delegateTarget)).toBe(false);
+  });
+
+  it('quick delegation bypasses queued-message editing instead of rewriting the queued row', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          project: 'proj',
+          role: 'brain',
+          state: 'running',
+          transportPendingMessages: ['queued original'],
+          transportPendingMessageEntries: [{ clientMessageId: 'queued-1', text: 'queued original' }],
+        })}
+        sessions={[]}
+        subSessions={[{
+          sessionName: 'deck_sub_reviewer', type: 'claude-code-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain', activeModel: 'opus',
+        }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+    expect((screen.getByRole('textbox') as HTMLDivElement).textContent).toBe('queued original');
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.edit_queued_message' }));
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect((screen.getByRole('textbox') as HTMLDivElement).textContent).toBe('queued original');
+    expect(screen.getByText(/queued · edit/i)).toBeDefined();
+  });
+
+  it('keeps the Quick dialog open with an inline error when dispatch is rejected locally', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementationOnce(() => { throw new Error('ws failed'); });
+    sendSessionViaHttpMock.mockImplementationOnce(() => { throw new Error('http failed'); });
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+    expect(screen.getByTestId('quick-agent-delegation-dialog')).toBeDefined();
+    expect(screen.getByTestId('quick-agent-delegation-error').textContent).toBe('sendFailed');
+  });
+
+  it('rejects custom session-control text inside Quick without closing or sending', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByText('custom'));
+    fireEvent.input(screen.getByTestId('quick-agent-delegation-custom'), { target: { value: '/stop check this' } });
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+    expect(screen.getByTestId('quick-agent-delegation-error').textContent).toBe('warning_control_command');
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
+  it('limits Quick candidates to the current project, excludes self and shell/script, and de-duplicates names', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        sessions={[
+          makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain', label: 'Self' }),
+          makeTransportSession({ name: 'deck_proj_w1', project: 'proj', role: 'w1', label: 'Project peer' }),
+          makeTransportSession({ name: 'deck_other_brain', project: 'other', role: 'brain', label: 'Other project' }),
+          makeSession({ name: 'deck_proj_shell', project: 'proj', agentType: 'shell', label: 'Shell' }),
+        ]}
+        subSessions={[
+          { sessionName: 'deck_sub_child', type: 'codex-sdk', label: 'Child', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_sibling', type: 'claude-code-sdk', label: 'Sibling child', state: 'running', parentSession: 'deck_proj_w1' },
+          { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'Other child', state: 'idle', parentSession: 'deck_other_brain' },
+          { sessionName: 'deck_proj_w1', type: 'codex-sdk', label: 'Duplicate peer', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const dialog = screen.getByTestId('quick-agent-delegation-dialog');
+    expect(within(dialog).getAllByTestId('quick-agent-delegation-candidate')).toHaveLength(3);
+    expect(dialog.textContent).toContain('Project peer');
+    expect(dialog.textContent).toContain('Child');
+    expect(dialog.textContent).toContain('Sibling child');
+    expect(dialog.textContent).not.toContain('Self');
+    expect(dialog.textContent).not.toContain('Shell');
+    expect(dialog.textContent).not.toContain('Other project');
+    expect(dialog.textContent).not.toContain('Other child');
+    expect(dialog.textContent).not.toContain('Duplicate peer');
+    expect(dialog.textContent).toContain('busy');
+  });
+
+  it('fails closed with an empty Quick candidate list when project authority is missing', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: '' })}
+        sessions={[makeTransportSession({ name: 'deck_other_brain', project: 'other', label: 'Other' })]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    expect(screen.getByTestId('quick-agent-delegation-empty')).toBeDefined();
+    expect(screen.queryByTestId('quick-agent-delegation-candidate')).toBeNull();
+  });
+
+  it('does not consume composer text, quotes, or attachments during Quick delegation', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/quick-proof.png' } });
+    const ws = makeWs();
+    const onRemoveQuote = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quotes={['quoted context']}
+        onRemoveQuote={onRemoveQuote}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'draft stays here';
+    fireEvent.input(input);
+    const file = new File(['png'], 'quick-proof.png', { type: 'image/png' });
+    fireEvent.drop(input, { dataTransfer: { files: [file], types: ['Files'], dropEffect: 'copy' } });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('quick-proof.png'));
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    expect(input.textContent).toBe('draft stays here');
+    expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('quick-proof.png');
+    expect(onRemoveQuote).not.toHaveBeenCalled();
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).not.toContain('quoted context');
+    expect(sent.text).not.toContain('/tmp/quick-proof.png');
+  });
+
+  it('allows Quick delegation while an unrelated composer upload is still in flight', async () => {
+    let resolveUpload: ((value: { attachment: { daemonPath: string } }) => void) | null = null;
+    uploadFileMock.mockImplementationOnce(() => new Promise((resolve) => { resolveUpload = resolve; }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const file = new File(['pending'], 'pending.txt', { type: 'text/plain' });
+    fireEvent.drop(input, { dataTransfer: { files: [file], types: ['Files'], dropEffect: 'copy' } });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+    expect(gatherSendCalls(ws)).toHaveLength(1);
+    expect(screen.queryByTestId('quick-agent-delegation-error')).toBeNull();
+
+    await act(async () => {
+      resolveUpload?.({ attachment: { daemonPath: '/tmp/pending.txt' } });
+      await flushAsync();
+    });
   });
 
   it('opens Settings instead of inferring an auditor when enabling audit mode', async () => {

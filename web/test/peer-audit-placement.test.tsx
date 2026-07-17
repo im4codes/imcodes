@@ -1,11 +1,11 @@
 /**
- * SessionControls DOM placement smoke test.
+ * Static migration guards for the SessionControls Quick shortcut.
  *
- * Verifies the Peer Audit shortcut renders immediately before the Auto
- * shortcut and shares its visibility gate (canQuickControlSupervision). It
- * does NOT mount the full SessionControls — instead, it inspects the source
- * file for the deterministic DOM structure so the test is independent of the
- * component's many internal hooks.
+ * These checks intentionally do NOT claim runtime behavior coverage. Real
+ * placement, visibility, dialog dispatch, candidate scope, and error behavior
+ * are mounted in components/SessionControls.test.tsx and
+ * quick-agent-delegation.test.tsx. This file only prevents accidental source
+ * reintroduction of the removed peer-audit-controller Quick path.
  *
  * @vitest-environment jsdom
  */
@@ -17,7 +17,7 @@ import { join } from 'node:path';
 const SRC = join(__dirname, '..', 'src', 'components', 'SessionControls.tsx');
 const source = readFileSync(SRC, 'utf8');
 
-describe('SessionControls DOM placement (source-level)', () => {
+describe('SessionControls Quick static migration guards', () => {
   it('renders shortcut-btn-peer-audit immediately before shortcut-btn-auto', () => {
     const peerIdx = source.indexOf('shortcut-btn-peer-audit');
     const autoIdx = source.indexOf('shortcut-btn-auto');
@@ -42,24 +42,9 @@ describe('SessionControls DOM placement (source-level)', () => {
     expect(peerGateIdx).toBeLessThan(autoBtnIdx);
   });
 
-  it('Peer Audit icon is also gated on authoritative identity (no name fallback)', () => {
-    // The icon div must check BOTH canQuickControlSupervision AND
-    // auditedSessionIdentity. The auditedSessionIdentity constant is
-    // produced from sessionInstanceId + runtimeEpoch sourced from
-    // session_list / subsession.sync — never from session name.
-    const peerBtnIdx = source.indexOf('shortcut-btn-peer-audit');
-    const before = source.slice(Math.max(0, peerBtnIdx - 400), peerBtnIdx);
-    expect(before).toContain('canQuickControlSupervision');
-    expect(before).toContain('auditedSessionIdentity');
-  });
-
-  it('forbids name-as-identity construction (auditedSessionIdentity is null until projection exposes it)', () => {
-    // The sessionName substitution that previously built sessionInstanceId from
-    // session name MUST NOT exist. We assert by absence of the
-    // `sessionInstanceId: subSessionId` / `sessionInstanceId: activeSession.name`
-    // patterns the previous edit removed.
-    expect(source).not.toMatch(/sessionInstanceId:\s*subSessionId/);
-    expect(source).not.toMatch(/sessionInstanceId:\s*activeSession\?\.name/);
+  it('does not reintroduce the old Quick peer-audit controller call', () => {
+    expect(source).toContain('QuickAgentDelegationDialog');
+    expect(source).not.toContain('peerAuditApi.start');
   });
 
   it('Peer Audit icon is the immediate button sibling before Auto inside autoRef', () => {
@@ -81,23 +66,4 @@ describe('SessionControls DOM placement (source-level)', () => {
     expect(source).toContain('quickSupervisionMode === SUPERVISION_MODE.SUPERVISED');
   });
 
-  it('exposes the chooser overlay at peer-audit-overlay / peer-audit-modal test ids', () => {
-    expect(source).toContain("createPortal(\n          <div\n            class=\"peer-audit-overlay\"");
-    expect(source).toContain('document.body,');
-    expect(source).toContain('data-testid="peer-audit-overlay"');
-    expect(source).toContain('data-testid="peer-audit-modal"');
-    expect(source).toContain('data-testid="peer-audit-pending"');
-    expect(source).toContain('data-testid="peer-audit-result"');
-    expect(source).toContain('data-testid="peer-audit-error"');
-  });
-
-  it('chooser component exposes peer-audit-chooser / peer-audit-chooser-row test ids', () => {
-    const chooserPath = join(__dirname, '..', 'src', 'peerAudit', 'PeerAuditAuditorChooser.tsx');
-    const chooser = readFileSync(chooserPath, 'utf8');
-    expect(chooser).toContain('data-testid="peer-audit-chooser"');
-    expect(chooser).toContain('data-testid="peer-audit-chooser-row"');
-    expect(chooser).toContain('data-testid="peer-audit-chooser-loading"');
-    expect(chooser).toContain('data-testid="peer-audit-chooser-consent"');
-    expect(chooser).toContain('data-testid="peer-audit-chooser-empty"');
-  });
 });
