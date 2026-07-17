@@ -347,6 +347,40 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
+  it('opens directly in audit mode and focuses the auditor picker when requested from Auto', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="claude-code-sdk"
+        ws={makePeerAuditWs() as any}
+        sessionInstanceId="brain-instance-1"
+        runtimeEpoch="brain-runtime-1"
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'claude-code-sdk',
+            model: CLAUDE_CODE_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+          },
+        }}
+        openIntent={{ supervisionMode: 'supervised_audit', focus: 'peer-audit-target' }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const modeSelect = screen.getAllByRole('combobox')[3] as HTMLSelectElement;
+    expect(modeSelect.value).toBe('supervised_audit');
+    const targetSection = screen.getByTestId('session-supervision-peer-target-section');
+    await waitFor(() => expect(document.activeElement).toBe(targetSection));
+    await waitFor(() => expect(screen.getByTestId('peer-audit-chooser-row')).toBeDefined());
+  });
+
   it('accepts the daemon-authoritative changed target fingerprint without a redundant confirmation', async () => {
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'claude-code-sdk',

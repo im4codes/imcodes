@@ -101,6 +101,10 @@ import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
 } from '@shared/agent-delegation.js';
+import {
+  SESSION_SETTINGS_FOCUS,
+  type SessionSettingsOpenIntent,
+} from '../session-settings-open-intent.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -119,7 +123,7 @@ interface Props {
   /** Called when Rename is selected in the menu. */
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
-  onSettings?: () => void;
+  onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   /** Called when Share is selected in the send-adjacent more menu. */
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   /** Whether the active session tab is pinned. */
@@ -2145,6 +2149,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
     if (!activeSession || !serverId || !canQuickControlSupervision) return;
 
+    const openSettingsForMode = () => {
+      setAutoOpen(false);
+      onSettings?.(nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        ? {
+            supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+            focus: SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET,
+          }
+        : undefined);
+    };
+
     if (nextMode === SUPERVISION_MODE.OFF) {
       const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, { mode: SUPERVISION_MODE.OFF });
       try {
@@ -2157,8 +2171,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     if (hasInvalidSupervisionConfig) {
-      setAutoOpen(false);
-      onSettings?.();
+      openSettingsForMode();
       return;
     }
 
@@ -2166,8 +2179,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // current remembered peer. A name-only/stale/same-session fingerprint is
     // repair UI, not authority to silently enable automatic auditing.
     if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !rememberedTargetIsLocallyUsable) {
-      setAutoOpen(false);
-      onSettings?.();
+      openSettingsForMode();
       return;
     }
 
@@ -2177,13 +2189,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } else {
       const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
       if (!defaults) {
-        setAutoOpen(false);
-        onSettings?.();
+        openSettingsForMode();
         return;
       }
       if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-        setAutoOpen(false);
-        onSettings?.();
+        openSettingsForMode();
         return;
       }
       nextSnapshot = {

@@ -38,6 +38,10 @@ import {
 import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
 import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
 import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
+import {
+  SESSION_SETTINGS_FOCUS,
+  type SessionSettingsOpenIntent,
+} from '../session-settings-open-intent.js';
 
 interface Props {
   serverId: string;
@@ -57,6 +61,7 @@ interface Props {
   activeModel?: string | null;
   requestedModel?: string | null;
   providerId?: string | null;
+  openIntent?: SessionSettingsOpenIntent;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
    * to `cc.presets.list_response` and renders a preset picker for qwen
@@ -521,6 +526,7 @@ export function SessionSettingsDialog({
   activeModel,
   requestedModel,
   parentSession,
+  openIntent,
   ws,
   onClose,
   onSaved,
@@ -532,9 +538,13 @@ export function SessionSettingsDialog({
     [transportConfig],
   );
   const initialSupervision = useMemo<SupervisionDraft>(() => {
-    if (!hasPersistedSupervision) return { mode: 'off' };
-    return readSupervisionSnapshotFromTransportConfig(transportConfig);
-  }, [hasPersistedSupervision, transportConfig]);
+    const persisted = hasPersistedSupervision
+      ? readSupervisionSnapshotFromTransportConfig(transportConfig)
+      : { mode: 'off' as const };
+    return openIntent?.supervisionMode
+      ? { ...persisted, mode: openIntent.supervisionMode }
+      : persisted;
+  }, [hasPersistedSupervision, openIntent?.supervisionMode, transportConfig]);
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
@@ -550,6 +560,7 @@ export function SessionSettingsDialog({
     sessionInstanceId && runtimeEpoch ? 'loading' : 'waiting_authority',
   );
   const [peerAuditCandidateRefreshToken, setPeerAuditCandidateRefreshToken] = useState(0);
+  const peerAuditTargetRef = useRef<HTMLDivElement>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -601,6 +612,14 @@ export function SessionSettingsDialog({
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
   const isAuditMode = supervision.mode === 'supervised_audit';
   const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport);
+
+  useEffect(() => {
+    if (openIntent?.focus !== SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET || !isAuditMode) return;
+    const target = peerAuditTargetRef.current;
+    if (!target) return;
+    target.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+    target.focus({ preventScroll: true });
+  }, [isAuditMode, openIntent?.focus]);
 
   // Subscribe to `cc.presets.list_response` for as long as the dialog is
   // mounted with a valid `ws`. We fire the list request once on mount and
@@ -1312,7 +1331,11 @@ export function SessionSettingsDialog({
                   />
                 </div>
 
-                <div>
+                <div
+                  ref={peerAuditTargetRef}
+                  tabIndex={-1}
+                  data-testid="session-supervision-peer-target-section"
+                >
                   <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
                     {t('peerAuditQuick.chooserTitle')}
                   </div>

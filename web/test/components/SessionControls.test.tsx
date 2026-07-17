@@ -5142,7 +5142,10 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
-    await waitFor(() => expect(onSettings).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onSettings).toHaveBeenCalledWith({
+      supervisionMode: 'supervised_audit',
+      focus: 'peer-audit-target',
+    }));
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
