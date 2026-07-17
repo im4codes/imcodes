@@ -12,7 +12,6 @@ export interface QuickAgentDelegationCandidate {
   agentType: string;
   label?: string | null;
   model?: string | null;
-  state: string;
   /** Enabled member of the current root session's saved Team configuration. */
   teamMember?: boolean;
 }
@@ -28,8 +27,6 @@ interface QuickAgentDelegationDialogProps {
 const QUICK_TARGET_STORAGE_KEY = 'quickAgentDelegationTargets:v1';
 const QUICK_TARGET_STORAGE_LIMIT = 32;
 const INTERNAL_SESSION_TOKEN_RE = /(?:^|[^a-z0-9])deck_[a-z0-9_-]+/i;
-const UNAVAILABLE_STATES = new Set(['stopped', 'error', 'unknown']);
-
 function opaqueSessionKey(value: string): string {
   let hash = 14_695_981_039_346_656_037n;
   for (let i = 0; i < value.length; i += 1) {
@@ -125,7 +122,7 @@ export function QuickAgentDelegationDialog({
   const task = buildQuickAgentDelegationTask(preset, customTask);
 
   const dispatch = (candidate: QuickAgentDelegationCandidate) => {
-    if (!task || UNAVAILABLE_STATES.has(candidate.state)) return;
+    if (!task) return;
     rememberTarget(currentSessionName, candidate.sessionName);
     onDispatch({
       sessionName: candidate.sessionName,
@@ -176,14 +173,13 @@ export function QuickAgentDelegationDialog({
             const typeLabel = getAutoSessionLabelPrefix(candidate.agentType);
             const displayLabel = candidateLabels.get(candidate.sessionName) ?? visibleCandidateLabel(candidate);
             const model = candidate.model?.trim() || t('peerAuditQuick.unknownModel');
-            const unavailable = UNAVAILABLE_STATES.has(candidate.state);
             return (
               <li key={candidate.sessionName}>
                 <button
                   type="button"
                   class="peer-audit-chooser-row"
                   data-testid="quick-agent-delegation-candidate"
-                  disabled={!task || unavailable}
+                  disabled={!task}
                   onClick={() => dispatch(candidate)}
                 >
                   <span class="peer-audit-chooser-row-main">
@@ -204,9 +200,6 @@ export function QuickAgentDelegationDialog({
                   </span>
                   <span class="peer-audit-chooser-row-meta">
                     <span class="peer-audit-chooser-row-model">{model}</span>
-                    {unavailable
-                      ? <span class="quick-agent-delegation-state unavailable">{t('peerAuditQuick.unavailable')}</span>
-                      : candidate.state !== 'idle' && <span class="quick-agent-delegation-state">{t('peerAuditQuick.busy')}</span>}
                   </span>
                 </button>
               </li>

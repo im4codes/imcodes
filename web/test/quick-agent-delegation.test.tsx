@@ -19,14 +19,12 @@ describe('QuickAgentDelegationDialog', () => {
       agentType: 'claude-code-sdk',
       label: null,
       model: 'claude-opus-4-7',
-      state: 'idle',
     },
     {
       sessionName: 'deck_sub_reviewer',
       agentType: 'codex-sdk',
       label: 'Reviewer',
       model: 'gpt-5.6',
-      state: 'running',
       teamMember: true,
     },
   ];
@@ -113,14 +111,14 @@ describe('QuickAgentDelegationDialog', () => {
     expect(onDispatch.mock.calls[0]?.[0].task).toContain(expectedText);
   });
 
-  it('sanitizes embedded internal ids and disables unavailable sessions', () => {
+  it('sanitizes embedded internal ids without applying lifecycle-state policy', () => {
     const onDispatch = vi.fn();
     render(
       <QuickAgentDelegationDialog
         currentSessionName="deck_project_brain"
         candidates={[
-          { sessionName: 'deck_sub_one', agentType: 'codex-sdk', label: 'note deck_sub_secret', model: 'gpt-5.6', state: 'idle' },
-          { sessionName: 'deck_sub_two', agentType: 'codex-sdk', label: null, model: 'gpt-5.6', state: 'stopped' },
+          { sessionName: 'deck_sub_one', agentType: 'codex-sdk', label: 'note deck_sub_secret', model: 'gpt-5.6' },
+          { sessionName: 'deck_sub_two', agentType: 'codex-sdk', label: null, model: 'gpt-5.6' },
         ]}
         error="send failed"
         onClose={vi.fn()}
@@ -133,8 +131,10 @@ describe('QuickAgentDelegationDialog', () => {
     const rows = screen.getAllByTestId('quick-agent-delegation-candidate') as HTMLButtonElement[];
     expect(rows[0]!.textContent).toContain('Cx 1');
     expect(rows[1]!.textContent).toContain('Cx 2');
-    expect(rows[1]!.disabled).toBe(true);
+    expect(rows.every((row) => !row.disabled)).toBe(true);
     fireEvent.click(rows[1]!);
-    expect(onDispatch).not.toHaveBeenCalled();
+    expect(onDispatch).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_sub_two',
+    }));
   });
 });

@@ -2645,7 +2645,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         agentType: session.agentType,
         label: session.label,
         model: resolveEffectiveSessionModel(session),
-        state: session.state,
         teamMember: quickDelegationTeamMembers.has(session.name),
       });
     }
@@ -2656,7 +2655,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         agentType: session.type,
         label: session.label,
         model: resolveEffectiveSessionModel(session),
-        state: session.state,
         teamMember: quickDelegationTeamMembers.has(session.sessionName),
       });
     }

@@ -4790,7 +4790,7 @@ afterEach(() => {
     expect(peer.parentElement?.classList.contains('shortcuts-model-supervision')).toBe(true);
   });
 
-  it('quick audit reuses ordinary @agent orchestration without baseline or cross-provider gates', () => {
+  it('quick audit reuses ordinary @agent orchestration without local state gating', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -4809,7 +4809,7 @@ afterEach(() => {
           sessionName: 'deck_sub_reviewer',
           type: 'claude-code-sdk',
           label: 'Reviewer',
-          state: 'idle',
+          state: 'unknown',
           parentSession: 'deck_proj_brain',
           activeModel: 'claude-opus-4-7',
         }]}
@@ -4943,7 +4943,31 @@ afterEach(() => {
     expect(dialog.textContent).not.toContain('Other project');
     expect(dialog.textContent).not.toContain('Other child');
     expect(dialog.textContent).not.toContain('Duplicate child');
-    expect(dialog.textContent).toContain('busy');
+  });
+
+  it('keeps stopped, error, unknown, and busy lifecycle snapshots selectable for manual Quick delegation', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[
+          { sessionName: 'deck_sub_stopped', type: 'codex-sdk', label: 'Stopped snapshot', state: 'stopped', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_error', type: 'claude-code-sdk', label: 'Error snapshot', state: 'error', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_unknown', type: 'codex-sdk', label: 'Unknown snapshot', state: 'unknown', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_busy', type: 'claude-code-sdk', label: 'Busy snapshot', state: 'running', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const dialog = screen.getByTestId('quick-agent-delegation-dialog');
+    const rows = within(dialog).getAllByTestId('quick-agent-delegation-candidate') as HTMLButtonElement[];
+    expect(rows).toHaveLength(4);
+    expect(rows.every((row) => !row.disabled)).toBe(true);
+    expect(dialog.textContent).not.toContain('busy');
+    expect(dialog.textContent).not.toContain('unavailable');
+    expect(dialog.textContent).not.toContain('statePending');
   });
 
   it('offers the owning main session and direct siblings when Quick starts from a sub-session', () => {
