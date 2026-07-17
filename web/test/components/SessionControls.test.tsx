@@ -4786,6 +4786,7 @@ afterEach(() => {
     expect(peer.getAttribute('aria-label')).toBeTruthy();
     expect(peer.textContent).toBe('');
     expect(peer.querySelector('svg.shortcut-btn-peer-audit-icon')).not.toBeNull();
+    expect(peer.parentElement?.classList.contains('shortcuts-model-supervision')).toBe(true);
   });
 
   it('opens Settings instead of inferring an auditor when enabling audit mode', async () => {

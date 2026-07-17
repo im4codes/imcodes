@@ -82,6 +82,8 @@ describe('SessionControls DOM placement (source-level)', () => {
   });
 
   it('exposes the chooser overlay at peer-audit-overlay / peer-audit-modal test ids', () => {
+    expect(source).toContain("createPortal(\n          <div\n            class=\"peer-audit-overlay\"");
+    expect(source).toContain('document.body,');
     expect(source).toContain('data-testid="peer-audit-overlay"');
     expect(source).toContain('data-testid="peer-audit-modal"');
     expect(source).toContain('data-testid="peer-audit-pending"');

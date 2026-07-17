@@ -346,6 +346,7 @@ html.native-ios-mac .chat-dl-btn {
 .shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; padding-left: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
+.shortcuts-model-supervision { display: inline-flex; align-items: center; gap: 4px; }
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
 .session-ctx-label { font-size: 10px; color: #7b8797; white-space: nowrap; }
 .session-ctx-bar { position: relative; width: 60px; height: 5px; background: rgba(15,23,42,0.92); border: 1px solid rgba(125,211,252,0.14); border-radius: 999px; overflow: hidden; box-shadow: inset 0 0 8px rgba(0,0,0,0.42), 0 0 10px rgba(34,211,238,0.06); }
@@ -488,8 +489,8 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-chooser-btn-hint { font-size: 11px; color: #94a3b8; }
 .chat-tool-chooser-btn-developer:hover { border-color: #60a5fa; }
 .chat-tool-chooser-footnote { font-size: 10px; color: #64748b; margin-top: 10px; }
-.shortcut-btn-auto { display: inline-flex; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
-.shortcut-btn-peer-audit { display: inline-flex; width: 28px; height: 26px; align-items: center; justify-content: center; padding: 0; color: #8ea3ba; }
+.shortcut-btn-auto { display: inline-flex; height: 26px; box-sizing: border-box; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
+.shortcut-btn-peer-audit { height: 26px; box-sizing: border-box; color: #8ea3ba; }
 .shortcut-btn-peer-audit-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
 .shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; }
 .shortcut-btn-auto-label { letter-spacing: 0.01em; }
@@ -5264,7 +5265,7 @@ html.native-ios-mac .chat-dl-btn {
 .peer-audit-overlay {
   position: fixed;
   inset: 0;
-  z-index: 12000;
+  z-index: 2147483647;
   display: flex;
   align-items: center;
   justify-content: center;

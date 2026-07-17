@@ -4438,10 +4438,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             The icon is hidden entirely until authoritative sessionInstanceId +
             runtimeEpoch are present (no name fallback). */}
         {canQuickControlSupervision && (
-          <div class="shortcuts-model" ref={autoRef}>
+          <div class="shortcuts-model shortcuts-model-supervision" ref={autoRef}>
             {auditedSessionIdentity && (
               <button
-                class="shortcut-btn shortcut-btn-peer-audit"
+                class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"
                 data-testid="peer-audit-icon"
                 onClick={() => setPeerAuditOpen(true)}
                 disabled={disabled || peerAuditOpen}
@@ -4515,7 +4515,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           </div>
         )}
 
-        {peerAuditOpen && auditedSessionIdentity && auditedSessionName && (
+        {peerAuditOpen && auditedSessionIdentity && auditedSessionName && typeof document !== 'undefined' && createPortal(
           <div
             class="peer-audit-overlay"
             data-testid="peer-audit-overlay"
@@ -4573,7 +4573,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 />
               )}
             </div>
-          </div>
+          </div>,
+          document.body,
         )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
