@@ -22,6 +22,15 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: vi.fn(),
 }));
 
+// Toggle a structured-watcher on a per-session basis. When true, onRawData
+// deliberately does NOT update lastRawAt (idle is watcher-driven), which is the
+// exact path where the bootstrap guard must fall back to lastStreamRawAt.
+const jsonlWatcherMock = vi.hoisted(() => ({ isWatching: vi.fn((_s: string) => false) }));
+vi.mock('../../src/daemon/jsonl-watcher.js', async (importActual) => {
+  const actual = await importActual<typeof import('../../src/daemon/jsonl-watcher.js')>();
+  return { ...actual, isWatching: jsonlWatcherMock.isWatching };
+});
+
 import { capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, startPipePaneStream, sessionExists } from '../../src/agent/tmux.js';
 import { getSession } from '../../src/store/session-store.js';
 import { TerminalStreamer } from '../../src/daemon/terminal-streamer.js';
@@ -56,6 +65,7 @@ describe('TerminalStreamer — snapshot behavior', () => {
     mockGetPaneId.mockResolvedValue('%1');
     mockSessionExists.mockResolvedValue(true);
     mockGetSession.mockReturnValue({ paneId: '%1' });
+    jsonlWatcherMock.isWatching.mockReturnValue(false);
 
     // Mock startPipePaneStream to return a no-op stream (never emits data)
     const noopStream = { on: vi.fn(), destroy: vi.fn() };
@@ -368,6 +378,188 @@ describe('TerminalStreamer — snapshot behavior', () => {
     await vi.advanceTimersByTimeAsync(1_500);
 
     expect(stalled).toHaveBeenCalledWith('blank_snapshot_no_raw');
+  });
+
+  it('signals bootstrap stall as snapshot_failed when the snapshot throws (e.g. tmux pane is gone)', async () => {
+    const stalled = vi.fn();
+    // Real prod failure: `tmux capture-pane ... can't find pane`. Before the
+    // fix this left the surface blank forever because snapshotWasBlank stayed
+    // false and the stall watch was never armed.
+    mockCapture.mockRejectedValue(new Error("can't find pane: missing-pane-session"));
+
+    streamer.subscribe({
+      sessionName: 'missing-pane-session',
+      send: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    expect(stalled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(stalled).toHaveBeenCalledWith('snapshot_failed');
+  });
+
+  it('repaints and does NOT restart when a failed snapshot recovers by the deadline (transient error, healthy shell)', async () => {
+    const stalled = vi.fn();
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    // First capture throws (transient tmux hiccup), but the pane is alive: the
+    // deadline re-probe succeeds. A healthy idle shell must be repainted, never
+    // restarted (which would cost the user their shell state).
+    mockCapture
+      .mockRejectedValueOnce(new Error("can't find pane: transient-session"))
+      .mockResolvedValue('recovered0\nrecovered1\nrecovered2\nrecovered3');
+
+    streamer.subscribe({
+      sessionName: 'transient-recover-session',
+      send: (d) => received.push(d),
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(stalled).not.toHaveBeenCalled();
+    // The re-probe painted the recovered screen.
+    const repaint = received.find((d) => d.fullFrame && d.lines.some(([, l]) => l.includes('recovered')));
+    expect(repaint).toBeDefined();
+  });
+
+  it('does not signal bootstrap stall when raw bytes arrive after a failed snapshot', async () => {
+    const stalled = vi.fn();
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event)!.push(cb);
+      }),
+      destroy: vi.fn(),
+    };
+    mockStartPipe.mockResolvedValue({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+    mockCapture.mockRejectedValue(new Error("can't find pane: failed-then-raw"));
+
+    streamer.subscribe({
+      sessionName: 'failed-then-raw-session',
+      send: () => {},
+      sendRaw: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    listeners.get('data')?.forEach((cb) => cb(Buffer.from('$ ')));
+
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(stalled).not.toHaveBeenCalled();
+  });
+
+  it('does not clobber live raw that arrives during the async deadline re-probe capture', async () => {
+    const stalled = vi.fn();
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event)!.push(cb);
+      }),
+      destroy: vi.fn(),
+    };
+    mockStartPipe.mockResolvedValue({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+
+    // First paint fails → arm. The re-probe capture is held pending so a live
+    // raw byte can land mid-capture; the stale frame must NOT be sent after it.
+    let resolveReprobe!: (raw: string) => void;
+    const reprobeCapture = new Promise<string>((r) => { resolveReprobe = r; });
+    mockCapture
+      .mockRejectedValueOnce(new Error("can't find pane: race-session"))
+      .mockReturnValueOnce(reprobeCapture);
+
+    streamer.subscribe({
+      sessionName: 'race-session',
+      send: (d) => received.push(d),
+      sendRaw: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    // Fire the deadline; the re-probe now parks on the pending capture.
+    await vi.advanceTimersByTimeAsync(1_500);
+    // Live byte arrives while the capture is still in flight.
+    listeners.get('data')?.forEach((cb) => cb(Buffer.from('live')));
+    // Capture finally resolves with a now-stale screen.
+    resolveReprobe('stale0\nstale1\nstale2\nstale3');
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(stalled).not.toHaveBeenCalled();
+    // The stale fullFrame must have been suppressed (raw is authoritative).
+    const staleFrame = received.find((d) => d.fullFrame && d.lines.some(([, l]) => l.includes('stale')));
+    expect(staleFrame).toBeUndefined();
+  });
+
+  it('does not clobber live raw during the re-probe for a structured-watcher session (lastRawAt is not updated there)', async () => {
+    // Codex/Gemini tmux sessions have a watcher, so onRawData deliberately does
+    // NOT bump lastRawAt — only lastStreamRawAt. The bootstrap guard must use the
+    // latter, otherwise the stale re-probe frame clobbers live output here.
+    jsonlWatcherMock.isWatching.mockImplementation((s: string) => s === 'watcher-race-session');
+
+    const stalled = vi.fn();
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, []);
+        listeners.get(event)!.push(cb);
+      }),
+      destroy: vi.fn(),
+    };
+    mockStartPipe.mockResolvedValue({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+
+    let resolveReprobe!: (raw: string) => void;
+    const reprobeCapture = new Promise<string>((r) => { resolveReprobe = r; });
+    mockCapture
+      .mockRejectedValueOnce(new Error("can't find pane: watcher-race-session"))
+      .mockReturnValueOnce(reprobeCapture);
+
+    streamer.subscribe({
+      sessionName: 'watcher-race-session',
+      send: (d) => received.push(d),
+      sendRaw: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(1_500);
+    listeners.get('data')?.forEach((cb) => cb(Buffer.from('live')));
+    resolveReprobe('stale0\nstale1\nstale2\nstale3');
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(stalled).not.toHaveBeenCalled();
+    const staleFrame = received.find((d) => d.fullFrame && d.lines.some(([, l]) => l.includes('stale')));
+    expect(staleFrame).toBeUndefined();
+  });
+
+  it('signals snapshot_failed when startPipe leaves no live pipe and the deadline capture still fails (pane gone)', async () => {
+    const stalled = vi.fn();
+    // First paint succeeds (non-blank), so only pipeStartFailed arms the watch:
+    // startPipePaneStream rejects → startPipe registers no PipeState.
+    mockCapture
+      .mockResolvedValueOnce('a\nb\nc\nd')
+      .mockRejectedValue(new Error("can't find pane: pipe-start-failed"));
+    mockStartPipe.mockRejectedValue(new Error('startPipePaneStream failed'));
+
+    streamer.subscribe({
+      sessionName: 'pipe-start-failed-session',
+      send: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    expect(stalled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(stalled).toHaveBeenCalledWith('snapshot_failed');
   });
 
   it('does not signal bootstrap stall when raw bytes arrive after a blank snapshot', async () => {

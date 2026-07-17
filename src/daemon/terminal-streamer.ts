@@ -87,7 +87,7 @@ export interface StreamSubscriber {
   /** Send a control message (e.g. terminal.stream_reset). */
   sendControl?: (msg: { type: string; [key: string]: unknown }) => void;
   sendHistory?: (history: TerminalHistory) => void;
-  onBootstrapStalled?: (reason: 'blank_snapshot_no_raw') => void;
+  onBootstrapStalled?: (reason: 'blank_snapshot_no_raw' | 'snapshot_failed') => void;
   onError?: (err: Error) => void;
 }
 
@@ -149,8 +149,15 @@ export class TerminalStreamer {
   private pipeStopGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private static readonly PIPE_STOP_GRACE_MS = 30_000;
 
-  // Idle detection
+  // Idle detection. NOTE: lastRawAt is only updated for sessions WITHOUT a
+  // structured watcher (idle/running is driven by hooks/JSONL for CC/Codex/…),
+  // so it is NOT a reliable "any raw arrived" signal. The bootstrap-stall guard
+  // must use lastStreamRawAt below, which is bumped on every forwarded byte.
   private lastRawAt = new Map<string, number>();
+  // Bumped unconditionally whenever raw bytes are forwarded to subscribers,
+  // regardless of structured-watcher state. Used by the bootstrap re-probe to
+  // avoid clobbering live output with a stale/blank fullFrame.
+  private lastStreamRawAt = new Map<string, number>();
   private idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private idleState = new Map<string, boolean>();
 
@@ -267,35 +274,12 @@ export class TerminalStreamer {
       }
     }
 
-    // 1. Take snapshot
-    let snapshotWasBlank = false;
-    try {
-      const size = await this.getSize(sessionName);
-      const raw = await capturePaneVisible(sessionName);
-      snapshotWasBlank = isBlankTerminalSnapshot(raw);
-      const lines = raw.split('\n').slice(0, size.rows);
-      while (lines.length < size.rows) lines.push('');
-
-      const diff: TerminalDiff = {
-        sessionName,
-        timestamp: Date.now(),
-        lines: lines.map((l, i) => [i, l] as [number, string]),
-        cols: size.cols,
-        rows: size.rows,
-        frameSeq: this.nextFrameSeq(sessionName),
-        fullFrame: true,
-        snapshotRequested: false,
-        scrolled: false,
-        newLineCount: 0,
-      };
-
-      // Check subscriber is still active
-      if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
-      subscriber.send(diff);
-    } catch (err) {
-      logger.warn({ sessionName, err }, 'Snapshot failed during subscribe');
-      // Continue — raw stream may still recover state
-    }
+    // 1. Take snapshot. A thrown capture (e.g. tmux "can't find pane") is NOT a
+    //    blank snapshot; it is treated as 'failed' so the deadline re-probe
+    //    below can decide between repaint and restart.
+    const firstSnapshot = await this.captureAndSendSnapshot(sessionName, subscriber);
+    const snapshotWasBlank = firstSnapshot === 'blank';
+    const snapshotFailed = firstSnapshot === 'failed';
 
     // ConPTY: replay raw screen buffer after snapshot for accurate terminal state
     if (BACKEND === 'conpty') {
@@ -330,23 +314,98 @@ export class TerminalStreamer {
       })();
     }
 
-    // 4. Start pipe if this was the first subscriber
+    // 4. Start pipe if this was the first subscriber. startPipe never rejects for
+    //    a dead pane — it swallows startPipePaneStream failures internally and
+    //    schedules a rebind (or returns on a missing paneId). So detect "no live
+    //    pipe was registered" instead of relying on a throw, and let the deadline
+    //    re-probe below decide whether that means a genuinely-gone pane.
     const bootstrapWatchStartedAt = Date.now();
+    let pipeStartFailed = false;
     if (!hasPipe && this.subscribers.get(sessionName)?.has(subscriber)) {
       await this.startPipe(sessionName, 0);
+      pipeStartFailed = BACKEND !== 'conpty'
+        && !isTransportSessionName(sessionName)
+        && !this.pipes.has(sessionName);
     }
 
+    // Arm a bounded bootstrap watch whenever the first paint was blank, the
+    // capture threw, or no live pipe came up. Arming is deliberately liberal:
+    // the authority is the deadline RE-PROBE, not this initial guess. That
+    // fixes two failure modes at once:
+    //   - transient capture/pipe error on a live idle shell → re-probe succeeds
+    //     → repaint and DO NOT restart (never cost a healthy shell its state).
+    //   - genuinely-gone pane → re-probe still fails → restart shell/script.
     if (
-      snapshotWasBlank
+      (snapshotWasBlank || snapshotFailed || pipeStartFailed)
       && subscriber.onBootstrapStalled
       && this.subscribers.get(sessionName)?.has(subscriber)
     ) {
       setTimeout(() => {
-        if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
-        const lastRawAt = this.lastRawAt.get(sessionName) ?? 0;
-        if (lastRawAt >= bootstrapWatchStartedAt) return;
-        subscriber.onBootstrapStalled?.('blank_snapshot_no_raw');
+        void (async () => {
+          if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
+          if ((this.lastStreamRawAt.get(sessionName) ?? 0) >= bootstrapWatchStartedAt) return;
+          // Re-probe: a live pane repaints and cancels the restart; only a
+          // still-failing capture proves the pane is genuinely gone. Pass the
+          // watch start as the raw guard so a byte arriving during the async
+          // capture suppresses the now-stale frame instead of clobbering it
+          // (at this point lastStreamRawAt is known < bootstrapWatchStartedAt).
+          const probe = await this.captureAndSendSnapshot(sessionName, subscriber, bootstrapWatchStartedAt);
+          if (probe === 'sent') return;
+          if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
+          if ((this.lastStreamRawAt.get(sessionName) ?? 0) >= bootstrapWatchStartedAt) return;
+          subscriber.onBootstrapStalled?.(probe === 'failed' ? 'snapshot_failed' : 'blank_snapshot_no_raw');
+        })();
       }, BLANK_BOOTSTRAP_STALL_MS);
+    }
+  }
+
+  /**
+   * Capture the visible pane and push it to a subscriber as a full-frame
+   * snapshot. Returns 'sent' (live, non-blank), 'blank' (live but empty), or
+   * 'failed' (capture threw, e.g. tmux "can't find pane"). Used both for the
+   * first paint on subscribe and for the bootstrap-stall deadline re-probe.
+   */
+  private async captureAndSendSnapshot(
+    sessionName: string,
+    subscriber: StreamSubscriber,
+    rawGuardSince?: number,
+  ): Promise<'sent' | 'blank' | 'failed'> {
+    try {
+      const size = await this.getSize(sessionName);
+      const raw = await capturePaneVisible(sessionName);
+      const blank = isBlankTerminalSnapshot(raw);
+      // Deadline re-probe has no snapshot barrier (unlike the first paint, which
+      // buffers raw via subState.snapshotPending). If live raw bytes arrived
+      // while we were awaiting the capture, they are NEWER than this frame and
+      // were already forwarded to the subscriber; emitting a stale fullFrame now
+      // would overwrite them and regress the screen. The raw itself proves the
+      // pane is alive, so report 'sent' without sending the frame.
+      if (rawGuardSince !== undefined && (this.lastStreamRawAt.get(sessionName) ?? 0) >= rawGuardSince) {
+        return 'sent';
+      }
+      const lines = raw.split('\n').slice(0, size.rows);
+      while (lines.length < size.rows) lines.push('');
+
+      const diff: TerminalDiff = {
+        sessionName,
+        timestamp: Date.now(),
+        lines: lines.map((l, i) => [i, l] as [number, string]),
+        cols: size.cols,
+        rows: size.rows,
+        frameSeq: this.nextFrameSeq(sessionName),
+        fullFrame: true,
+        snapshotRequested: false,
+        scrolled: false,
+        newLineCount: 0,
+      };
+
+      if (!this.subscribers.get(sessionName)?.has(subscriber)) return blank ? 'blank' : 'sent';
+      subscriber.send(diff);
+      return blank ? 'blank' : 'sent';
+    } catch (err) {
+      logger.warn({ sessionName, err }, 'Snapshot failed during subscribe');
+      // Continue — raw stream may still recover state
+      return 'failed';
     }
   }
 
@@ -383,6 +442,7 @@ export class TerminalStreamer {
       void this.stopPipe(sessionName);
       this.clearIdleTimer(sessionName);
       this.lastRawAt.delete(sessionName);
+      this.lastStreamRawAt.delete(sessionName);
       this.idleState.delete(sessionName);
       this.sizeCache.delete(sessionName);
       this.frameSeqs.delete(sessionName);
@@ -494,6 +554,7 @@ export class TerminalStreamer {
     this.retryTimers.clear();
     this.pipeStopGraceTimers.clear();
     this.lastRawAt.clear();
+    this.lastStreamRawAt.clear();
     this.idleTimers.clear();
     this.idleState.clear();
     this.sizeCache.clear();
@@ -705,6 +766,11 @@ export class TerminalStreamer {
 
   private onRawData(sessionName: string, data: Buffer): void {
     const hasStructuredWatcher = isWatching(sessionName) || isCodexWatching(sessionName) || isGeminiWatching(sessionName);
+
+    // Unconditional stream-activity stamp for the bootstrap re-probe guard. Must
+    // be set for structured-watcher sessions too (their raw is still forwarded
+    // to subscribers below), unlike lastRawAt which is idle-detection-only.
+    this.lastStreamRawAt.set(sessionName, Date.now());
 
     // Idle detection: skip for sessions with a structured watcher (CC/Codex).
     // Those sessions get authoritative idle/running signals via hooks and JSONL events,
