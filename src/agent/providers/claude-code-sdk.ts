@@ -14,6 +14,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderUsageUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -383,6 +384,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
   // AskUserQuestion pause/answer lifecycle — generic, provider-agnostic.
   private readonly questions = new PendingQuestionRegistry<SdkPermissionResult>();
 
@@ -623,6 +625,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return () => {
       const idx = this.statusCallbacks.indexOf(cb);
       if (idx >= 0) this.statusCallbacks.splice(idx, 1);
+    };
+  }
+
+  onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
+    this.usageCallbacks.push(cb);
+    return () => {
+      const idx = this.usageCallbacks.indexOf(cb);
+      if (idx >= 0) this.usageCallbacks.splice(idx, 1);
     };
   }
 
@@ -1154,14 +1164,27 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (msg.type === 'assistant') {
       const isTopLevelMessage = !('parent_tool_use_id' in msg) || msg.parent_tool_use_id == null;
+      const assistantMessageId = typeof msg.message?.id === 'string' && msg.message.id
+        ? msg.message.id
+        : undefined;
+      if (isTopLevelMessage && !state.completed && assistantMessageId && !state.currentMessageId) {
+        state.currentMessageId = assistantMessageId;
+      }
       const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
-      if (assistantUsage && typeof assistantUsage === 'object') {
-        state.lastAssistantUsage = {
+      if (isTopLevelMessage && assistantUsage && typeof assistantUsage === 'object') {
+        const normalizedUsage: ClaudeUsageSnapshot = {
           ...(typeof assistantUsage.input_tokens === 'number' ? { input_tokens: assistantUsage.input_tokens } : {}),
           ...(typeof assistantUsage.output_tokens === 'number' ? { output_tokens: assistantUsage.output_tokens } : {}),
           ...(typeof assistantUsage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: assistantUsage.cache_read_input_tokens } : {}),
           ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
         };
+        state.lastAssistantUsage = normalizedUsage;
+        const usageMessageId = assistantMessageId ?? state.currentMessageId ?? undefined;
+        for (const cb of this.usageCallbacks) cb(sessionId, {
+          ...(usageMessageId ? { messageId: usageMessageId } : {}),
+          usage: { ...normalizedUsage },
+          ...(state.model ? { model: state.model } : {}),
+        });
       }
       // includePartialMessages can emit message_delta(end_turn) and then flush
       // the matching full assistant frame. The stream boundary already emitted

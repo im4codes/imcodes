@@ -406,6 +406,8 @@ export interface ProviderRolloutCompletionReconcileOptions {
 
 /** Provider-reported token/context usage update. */
 export interface ProviderUsageUpdate {
+  /** Provider message id used to keep a late usage frame correlated to its turn. */
+  messageId?: string;
   /** Provider-native usage fields normalized enough for the daemon relay. */
   usage?: {
     input_tokens?: number;

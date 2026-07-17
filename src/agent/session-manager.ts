@@ -2104,6 +2104,7 @@ export async function restoreTransportSessions(
         extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
         const presetOverrides = await getPresetTransportOverrides(s.ccPreset);
         if (!effectiveRequestedModel && presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
+        restoredPresetContextWindow = presetOverrides.contextWindow ?? restoredPresetContextWindow;
         systemPrompt = presetOverrides.systemPrompt;
       } else if (s.providerId === 'qwen' && s.ccPreset) {
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');

@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // ── Module mocks (must be hoisted before any imports) ───────────────────────
 
 const getSessionMock = vi.hoisted(() => vi.fn());
+const getCachedPresetContextWindowMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
@@ -30,6 +31,10 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
+}));
+
+vi.mock('../../src/daemon/cc-presets.js', () => ({
+  getCachedPresetContextWindow: getCachedPresetContextWindowMock,
 }));
 
 // ── Imports after mocks ──────────────────────────────────────────────────────
@@ -76,7 +81,7 @@ type MockProviderError = { code: string; message: string; recoverable: boolean; 
 type ErrorCb = (sessionId: string, error: MockProviderError) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
-type UsageCb = (sessionId: string, update: { usage?: Record<string, unknown>; model?: string }) => void;
+type UsageCb = (sessionId: string, update: { messageId?: string; usage?: Record<string, unknown>; model?: string }) => void;
 type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
@@ -103,7 +108,7 @@ function makeMockProvider() {
     fireError: (sid: string, err: MockProviderError) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
-    fireUsage: (sid: string, update: { usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
+    fireUsage: (sid: string, update: { messageId?: string; usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
     fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
@@ -203,6 +208,7 @@ describe('transport-relay (timeline-emitter based)', () => {
     emitMock.mockClear();
     appendMock.mockClear();
     getSessionMock.mockReset();
+    getCachedPresetContextWindowMock.mockReset();
   });
 
   afterEach(() => {
@@ -502,6 +508,46 @@ describe('transport-relay (timeline-emitter based)', () => {
       });
       expect(usageCall![3]).toMatchObject({
         eventId: 'transport:sess-1:usage:usage',
+      });
+    });
+
+    it('correlates a late provider usage frame with its completed message id', () => {
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        messageId: 'msg-late-usage',
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[3]).toMatchObject({
+        eventId: 'transport:sess-1:msg-late-usage:usage',
+      });
+    });
+
+    it('uses the current preset window instead of a stale launch-time session copy', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'MiniMax',
+        presetContextWindow: 200_000,
+        activeModel: 'MiniMax-M3',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        contextWindow: 1_000_000,
       });
     });
 

@@ -279,8 +279,13 @@ function normalizeUsageUpdatePayload(
   if (!usage && !model) return null;
   const session = getSession(sessionName);
   const effectiveModel = resolveEffectiveSessionModel(session, model);
-  const presetCtx = session?.presetContextWindow
-    ?? (session?.ccPreset ? getCachedPresetContextWindow(session.ccPreset) : undefined);
+  // A preset can be edited while an SDK session remains alive. Prefer the
+  // current preset cache over the launch-time copy stored on that session so a
+  // changed 1M window takes effect on the very next usage frame.
+  const cachedPresetCtx = session?.ccPreset
+    ? getCachedPresetContextWindow(session.ccPreset)
+    : undefined;
+  const presetCtx = cachedPresetCtx ?? session?.presetContextWindow;
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
@@ -829,7 +834,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
     if (usagePayload) {
       const tracked = inFlightMessages.get(sessionName);
-      const usageEventId = `${tracked?.eventId ?? `transport:${sessionName}:usage`}:usage`;
+      const providerMessageId = typeof update.messageId === 'string' && update.messageId
+        ? update.messageId
+        : undefined;
+      const usageEventId = providerMessageId
+        ? `transport:${sessionName}:${providerMessageId}:usage`
+        : `${tracked?.eventId ?? `transport:${sessionName}:usage`}:usage`;
       timelineEmitter.emit(sessionName, 'usage.update', {
         ...usagePayload,
         streaming: true,

@@ -77,4 +77,22 @@ describe('extractLatestUsage', () => {
       model: 'gpt-5.5',
     });
   });
+
+  it('accepts MiniMax cached-input occupancy when the preset supplies a 1M window', () => {
+    const usage = extractLatestUsage([
+      makeEvent({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        contextWindow: 1_000_000,
+        model: 'MiniMax-M3',
+      }),
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 12_000,
+      cacheTokens: 700_000,
+      contextWindow: 1_000_000,
+      model: 'MiniMax-M3',
+    });
+  });
 });
