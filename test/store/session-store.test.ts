@@ -8,6 +8,12 @@ import { vi } from 'vitest';
 // We need to test with a temp path — patch the store path
 let tempDir: string;
 
+async function importSessionStore() {
+  return vi.importActual<typeof import('../../src/store/session-store.js')>(
+    '../../src/store/session-store.js',
+  );
+}
+
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'deck-test-'));
   vi.stubEnv('HOME', tempDir);
@@ -21,13 +27,13 @@ afterEach(() => {
 
 describe('session-store', () => {
   it('starts with empty store', async () => {
-    const { listSessions } = await import('../../src/store/session-store.js');
+    const { listSessions } = await importSessionStore();
     const sessions = listSessions();
     expect(sessions).toEqual([]);
   });
 
   it('upsert and retrieve a session', async () => {
-    const { upsertSession, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_test_brain',
       project: 'test',
@@ -44,7 +50,7 @@ describe('session-store', () => {
   });
 
   it('update session state', async () => {
-    const { upsertSession, updateSessionState, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, updateSessionState, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_p2_w1',
       project: 'p2',
@@ -59,7 +65,7 @@ describe('session-store', () => {
   });
 
   it('persists error reason on error state and clears it on recovery', async () => {
-    const { upsertSession, updateSessionState, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, updateSessionState, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_error_reason_brain',
       projectName: 'p2',
@@ -83,7 +89,7 @@ describe('session-store', () => {
   });
 
   it('remove session', async () => {
-    const { upsertSession, removeSession, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, removeSession, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_del_brain',
       project: 'del',
@@ -98,7 +104,7 @@ describe('session-store', () => {
   });
 
   it('list returns all sessions', async () => {
-    const { upsertSession, listSessions } = await import('../../src/store/session-store.js');
+    const { upsertSession, listSessions } = await importSessionStore();
     upsertSession({ name: 's1', project: 'proj', role: 'brain', agentType: 'claude-code', state: 'idle', pid: 1, startedAt: 0 });
     upsertSession({ name: 's2', project: 'proj', role: 'w1', agentType: 'codex', state: 'running', pid: 2, startedAt: 0 });
     const sessions = listSessions();
@@ -139,7 +145,7 @@ describe('session-store', () => {
           },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       expect(getSession('deck_cc_brain')?.runtimeType).toBe('transport');
       expect(getSession('deck_codex_brain')?.runtimeType).toBe('transport');
@@ -159,7 +165,7 @@ describe('session-store', () => {
           },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       expect(getSession('deck_explicit_brain')?.runtimeType).toBe('process');
     });
@@ -183,7 +189,7 @@ describe('session-store', () => {
           },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       const s = getSession('deck_stuck_brain');
       expect(s?.state).toBe('stopped');
@@ -200,7 +206,7 @@ describe('session-store', () => {
           c: { name: 'c', projectName: 'c', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/c', state: 'stopped', restarts: 2, restartTimestamps: [10, 20], createdAt: 1, updatedAt: 1 },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       expect(getSession('a')?.state).toBe('idle');
       expect(getSession('b')?.state).toBe('running');
@@ -220,7 +226,7 @@ describe('session-store', () => {
         },
       });
 
-      const firstStore = await import('../../src/store/session-store.js');
+      const firstStore = await importSessionStore();
       await firstStore.loadStore();
       const first = firstStore.getSession('deck_legacy_brain');
       expect(first?.sessionInstanceId).toMatch(/^[0-9a-f-]{36}$/);
@@ -228,7 +234,7 @@ describe('session-store', () => {
       await firstStore.flushStore();
 
       vi.resetModules();
-      const reloadedStore = await import('../../src/store/session-store.js');
+      const reloadedStore = await importSessionStore();
       await reloadedStore.loadStore();
       expect(reloadedStore.getSession('deck_legacy_brain')).toMatchObject({
         sessionInstanceId: first?.sessionInstanceId,
@@ -238,7 +244,7 @@ describe('session-store', () => {
   });
 
   it('preserves logical identity on updates and changes it after true delete/recreate', async () => {
-    const { upsertSession, removeSession, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, removeSession, getSession } = await importSessionStore();
     const base = {
       name: 'deck_identity_brain', projectName: 'identity', projectDir: '/tmp/identity',
       role: 'brain' as const, agentType: 'codex-sdk', state: 'idle' as const,
@@ -256,7 +262,7 @@ describe('session-store', () => {
   });
 
   it('rotates runtimeEpoch only when runtime authority is replaced', async () => {
-    const { upsertSession, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, getSession } = await importSessionStore();
     const base = {
       name: 'deck_runtime_brain', projectName: 'runtime', projectDir: '/tmp/runtime',
       role: 'brain' as const, agentType: 'codex-sdk', runtimeType: 'transport' as const,
@@ -278,7 +284,7 @@ describe('session-store', () => {
   });
 
   it('does not persist known leaked e2e sessions to sessions.json', async () => {
-    const { upsertSession, flushStore } = await import('../../src/store/session-store.js');
+    const { upsertSession, flushStore } = await importSessionStore();
     upsertSession({
       name: 'deck_bootmainabc123_brain',
       projectName: 'bootmainabc123',
