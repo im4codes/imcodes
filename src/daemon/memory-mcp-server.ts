@@ -33,7 +33,7 @@ export function createMemoryMcpServer(caller: McpRuntimeCaller, toolDeps: Memory
   return server;
 }
 
-async function postHookSend(port: number, body: Record<string, unknown>, hookPath = '/send'): Promise<Record<string, unknown>> {
+async function postHookSend(port: number, body: Record<string, unknown>, hookPath = '/send', senderSessionName?: string): Promise<Record<string, unknown>> {
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
     const req = http.request({
@@ -44,6 +44,7 @@ async function postHookSend(port: number, body: Record<string, unknown>, hookPat
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
+        ...(senderSessionName ? { 'x-imcodes-session': senderSessionName } : {}),
       },
     }, (res) => {
       let raw = '';
@@ -81,6 +82,12 @@ async function postHookSend(port: number, body: Record<string, unknown>, hookPat
 export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryMcpToolDeps): MemoryMcpToolDeps {
   return {
     ...toolDeps,
+    peerAuditReply: toolDeps.peerAuditReply ?? (async (envelope) => {
+      const port = await resolveLiveHookPort();
+      if (!port) throw new Error('daemon peer audit ingress is unavailable');
+      if (!caller.sessionName) throw new Error('peer_audit_reply requires a scoped caller');
+      return postHookSend(port, envelope as unknown as Record<string, unknown>, '/audit-reply', caller.sessionName);
+    }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.
     // This stdio MCP server only runs on FULL nodes, so the tools are advertised

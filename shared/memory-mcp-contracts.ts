@@ -34,6 +34,13 @@ import {
   MACHINE_TARGET_MAX,
   MACHINE_TARGET_PATTERN,
 } from './machine-reference.js';
+import {
+  PEER_AUDIT_FINDINGS_BYTES,
+  PEER_AUDIT_VALIDATION_COUNT,
+  PEER_AUDIT_VALIDATION_ITEM_BYTES,
+  PEER_AUDIT_VALIDATION_KINDS,
+  PEER_AUDIT_VALIDATION_OUTCOMES,
+} from './peer-audit.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -46,6 +53,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   MEMORY_FEEDBACK: 'memory_feedback',
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
+  PEER_AUDIT_REPLY: 'peer_audit_reply',
   SEND_LIST_TARGETS: 'send_list_targets',
   SEND_MESSAGE: 'send_message',
   SEND_STOP: 'send_stop',
@@ -79,6 +87,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
@@ -343,6 +352,28 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       text: stringSchema(`Required preference text, up to ${MEMORY_MCP_CAPS.PREFERENCE_MAX_BYTES} UTF-8 bytes.`),
       idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same preference.'),
     }, ['text']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: {
+    name: MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
+    description: 'Preferred structured reply for the active lightweight peer audit. Use only when the audit brief supplies an attempt id and one-time capability. This submits directly to daemon ingress; it never sends chat text or terminal keys.',
+    inputSchema: objectSchema({
+      attemptId: stringSchema('Opaque attempt id supplied by the peer-audit brief.'),
+      replyCapability: stringSchema('One-time reply capability supplied by the peer-audit brief. Never repeat it in findings.'),
+      verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'PASS only with applicable executable validation evidence; otherwise REWORK.' },
+      findings: stringSchema(`Concrete findings, at most ${PEER_AUDIT_FINDINGS_BYTES} UTF-8 bytes.`),
+      validations: {
+        type: 'array',
+        maxItems: PEER_AUDIT_VALIDATION_COUNT,
+        description: 'Bounded non-destructive validation evidence. PASS requires at least one passed item, or all applicable checks explicitly unavailable.',
+        items: objectSchema({
+          kind: { type: 'string', enum: [...PEER_AUDIT_VALIDATION_KINDS] },
+          label: stringSchema(`Validation label, at most ${PEER_AUDIT_VALIDATION_ITEM_BYTES} UTF-8 bytes.`),
+          outcome: { type: 'string', enum: [...PEER_AUDIT_VALIDATION_OUTCOMES] },
+          summary: stringSchema(`Exact bounded outcome/unavailability reason, at most ${PEER_AUDIT_VALIDATION_ITEM_BYTES} UTF-8 bytes.`),
+        }, ['kind', 'label', 'outcome', 'summary']),
+      },
+    }, ['attemptId', 'replyCapability', 'verdict', 'findings', 'validations']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: {

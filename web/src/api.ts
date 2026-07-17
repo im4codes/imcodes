@@ -786,6 +786,8 @@ function parseApiErrorCode(body: string): string | null {
 
 export interface SubSessionData {
   id: string;
+  sessionInstanceId?: string | null;
+  runtimeEpoch?: string | null;
   serverId: string;
   type: string;
   runtimeType?: 'process' | 'transport' | null;

@@ -21,6 +21,8 @@ import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
   project: string;
   role: string;
   agentType: string;
@@ -133,6 +135,8 @@ function baseItem(s: SessionRecord): SessionListItem {
   const eligibility = computeExecutionTemplateEligibility(s);
   return {
     name: s.name,
+    sessionInstanceId: s.sessionInstanceId,
+    runtimeEpoch: s.runtimeEpoch,
     project: s.projectName,
     role: s.role,
     agentType: s.agentType,

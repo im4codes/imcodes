@@ -35,6 +35,8 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../shared/peer-audit.js';
 import {
   REMOTE_EXEC_MAX_CHUNK_BYTES,
   REMOTE_EXEC_MAX_ERROR_BYTES,
@@ -947,6 +949,55 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(daemonWs.sentStrings.some((s) => s.includes('get_sessions'))).toBe(true);
+    });
+
+    it('rejects offline peer-audit RPCs immediately and never replays them after reconnect', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({
+        type: DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START,
+        commandId: 'peer_cmd_offline_1234567890',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: PEER_AUDIT_MESSAGES.QUICK_RESULT,
+        commandId: 'peer_cmd_offline_1234567890',
+        ok: false,
+        error: PEER_AUDIT_COMMAND_ERRORS.DAEMON_UNAVAILABLE,
+      });
+
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((value) => value.includes('peer_cmd_offline_1234567890'))).toBe(false);
+    });
+
+    it('forwards live peer-audit RPCs directly without the generic replay queue', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({
+        type: DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES,
+        commandId: 'peer_cmd_live_1234567890',
+      }));
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES,
+        commandId: 'peer_cmd_live_1234567890',
+      });
+      expect(browserWs.sentStrings).toHaveLength(0);
     });
 
     it('keeps offline daemon.upgrade out of the ordinary queue and flushes it once on auth', async () => {

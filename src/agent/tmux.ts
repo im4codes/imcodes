@@ -15,6 +15,7 @@ import {
   weztermListSessions,
   weztermSendText,
   weztermSendEnter,
+  weztermSendTextAndEnterAtomic,
   weztermSendKey,
   weztermCapturePane,
   weztermRespawnPane,
@@ -398,6 +399,30 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
 
 /** @deprecated Use sendKeys — kept as alias for backward compat. */
 export const sendKeysDelayedEnter = sendKeys;
+
+/**
+ * Prepare a synchronous private input writer. Any asynchronous backend/module
+ * setup happens before the caller performs its final authorization check. The
+ * returned closure performs text+Enter without yielding the JS event loop and
+ * never writes a temporary prompt file.
+ */
+export async function preparePrivateInputWriter(session: string): Promise<(text: string) => void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return (text: string) => {
+      c.conptySendText(session, text);
+      c.conptySendEnter(session);
+    };
+  }
+  if (BACKEND === 'wezterm') {
+    return (text: string) => weztermSendTextAndEnterAtomic(session, text);
+  }
+  await ensureTmuxServer();
+  return (text: string) => {
+    execFileSync('tmux', ['send-keys', '-t', session, '-l', '--', text], { stdio: 'ignore' });
+    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'ignore' });
+  };
+}
 
 /** Send raw keys without appending Enter (e.g. for Ctrl-C). */
 export async function sendKey(session: string, key: string): Promise<void> {

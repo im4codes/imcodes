@@ -75,6 +75,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -96,6 +97,11 @@ export interface PendingTransportMessage {
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
   historyCommitted?: boolean;
+  /** @internal: private peer-audit queue ownership; excluded from public snapshots. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
 }
 
 type SdkTurnLostRecoveryAttemptStatus =
@@ -127,6 +133,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // full material for internal resend preservation only.
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
+  delete publicEntry.peerAudit;
   return publicEntry;
 }
 
@@ -150,6 +157,11 @@ export interface TransportSendMetadata {
   timelineCommitted?: boolean;
   /** @internal: set when replaying entries that already exist in runtime history. */
   historyCommitted?: boolean;
+  /** @internal: marks a persisted queued row as an ephemeral peer-audit brief. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
 }
 
 export interface TransportRuntimeDiagnosticSnapshot {
@@ -172,6 +184,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   lastProviderOutputAt: number;
   lastProviderOutputAgeMs: number | null;
   activityGeneration: ActivityGeneration;
+  completedTurn?: PeerAuditCompletedTurnEvidence;
   blockingWorkCount: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
@@ -426,6 +439,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _pendingVersion = 0;
   /** Original message entries for the currently in-flight dispatch. */
   private _activeDispatchEntries: PendingTransportMessage[] = [];
+  /** Last single-message turn that reached provider completion. Consumed by
+   * the authoritative idle projection; never inferred from timeline order. */
+  private _lastCompletedTurn: PeerAuditCompletedTurnEvidence | null = null;
   /** True after a user stop request until the active provider turn settles. */
   private _activeDispatchCancelled = false;
   /** True once the active dispatch has crossed into provider.send(). */
@@ -556,6 +572,18 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
         this._history.push(message);
+        const completedEntry = this._activeDispatchEntries.length === 1
+          ? this._activeDispatchEntries[0]
+          : undefined;
+        this._lastCompletedTurn = completedEntry && !completedEntry.peerAudit
+          ? {
+              taskCommandId: completedEntry.clientMessageId,
+              assistantText: message.content,
+              completedEventId: `transport:${this.sessionKey}:${message.id}`,
+              completedAt: this._lastActivityAt,
+              generationOrEpoch: this._activityGeneration,
+            }
+          : null;
         this._activeTurn?.resolve();
         this._activeTurn = null;
         this._activeDispatchEntries = [];
@@ -862,6 +890,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       lastProviderOutputAt: this._lastProviderOutputAt,
       lastProviderOutputAgeMs: this._lastProviderOutputAt > 0 ? Math.max(0, nowMs - this._lastProviderOutputAt) : null,
       activityGeneration: this.currentActivityGeneration(),
+      ...(this._lastCompletedTurn ? { completedTurn: { ...this._lastCompletedTurn } } : {}),
       blockingWorkCount: activitySnapshot.blockingWorkCount,
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
@@ -997,6 +1026,15 @@ export class TransportSessionRuntime implements SessionRuntime {
   rehydratePendingFromStore(): number {
     if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
     const store = getTransportQueueStore();
+    // Peer-audit capabilities and controller state are intentionally daemon-memory
+    // only. After restart no attempt can still own a queued audit brief, so scrub
+    // those rows before ordinary queue rehydration while preserving user traffic.
+    try {
+      store.scrubPeerAuditOrphans(this.sessionKey);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'rehydratePendingFromStore: peer-audit orphan scrub failed');
+      return 0;
+    }
     const snapshot = (() => {
       try {
         return store.readSnapshot(this.sessionKey, 'restart_rehydrate');
@@ -1699,6 +1737,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
+      ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
     };
 
     if (this.hasActiveTurnWork()) {
@@ -1724,6 +1763,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
             ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
             ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+            ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
           }),
         });
       } catch (err) {
@@ -2397,6 +2437,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const dispatchId = ++this._nextDispatchId;
     this._activityGeneration++;
+    this._lastCompletedTurn = null;
     this._currentActivityGenerationLocallyCancelled = false;
     this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
     this._lastActivityAt = Date.now();

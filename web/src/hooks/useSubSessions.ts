@@ -287,6 +287,8 @@ export function useSubSessions(
               );
               updated[existingIdx] = { ...updated[existingIdx],
                 ...(m.state != null && { state: m.state as SubSession['state'] }),
+                ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
+                ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
                 ...(m.cwd != null && { cwd: m.cwd }),
                 ...(m.label != null && { label: m.label }),
                 ...(m.ccPresetId !== undefined && { ccPresetId: m.ccPresetId }),
@@ -322,6 +324,8 @@ export function useSubSessions(
             const transportPendingPatch = buildTransportPendingSyncPatch({}, m, sessionNameForCreate);
             return [...prev, {
               id: m.id,
+              sessionInstanceId: m.sessionInstanceId ?? null,
+              runtimeEpoch: m.runtimeEpoch ?? null,
               serverId: '',
               type: m.sessionType || 'shell',
               sessionName: sessionNameForCreate,
@@ -378,6 +382,8 @@ export function useSubSessions(
             const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
+              ...(m.sessionInstanceId !== undefined ? { sessionInstanceId: m.sessionInstanceId } : {}),
+              ...(m.runtimeEpoch !== undefined ? { runtimeEpoch: m.runtimeEpoch } : {}),
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
               ...(m.label !== undefined ? { label: m.label } : {}),
               ...(m.ccPresetId !== undefined ? { ccPresetId: m.ccPresetId } : {}),

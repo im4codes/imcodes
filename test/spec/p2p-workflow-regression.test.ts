@@ -764,23 +764,30 @@ describe('p2p-workflow reverse-regression', () => {
     ).toBe(true);
   });
 
-  // ── 26. (Task 10.4 closure) Supervision audit launches MUST honour the
-  //      daemon advanced-run admission cap with bounded retry — no silent
-  //      bypass of `P2P_WORKFLOW_MAX_ACTIVE_RUNS`.
-  it('supervision-automation bounds daemon_busy retries on audit launches (task 10.4)', () => {
-    const file = read('src/daemon/supervision-automation.ts');
-    expect(
-      /startSupervisionRunWithBusyRetry/.test(file.text),
-      'supervision-automation must use a bounded daemon_busy retry helper',
-    ).toBe(true);
-    expect(
-      file.text.includes('loadDaemonP2pStaticPolicy'),
-      'supervision-automation must read concurrency cap from loadDaemonP2pStaticPolicy',
-    ).toBe(true);
-    expect(
-      file.text.includes('listP2pRuns'),
-      'supervision-automation must inspect listP2pRuns to compute admission',
-    ).toBe(true);
+  // ── 26. Lightweight peer supervision audits deliberately no longer launch
+  //      Advanced/P2P runs. They therefore must not consume the advanced-run
+  //      admission budget or retain the old daemon_busy poller. Contention is
+  //      owned by PeerAuditController: an automatic audit waits behind Quick,
+  //      then PeerAuditService revalidates the waiter before retrying it.
+  it('supervision automation uses peer-audit slot contention instead of P2P daemon_busy retries', () => {
+    const automation = read('src/daemon/supervision-automation.ts');
+    expect(automation.text).not.toContain('startSupervisionRunWithBusyRetry');
+    expect(automation.text).not.toContain('loadDaemonP2pStaticPolicy');
+    expect(automation.text).not.toContain('listP2pRuns');
+    expect(automation.text).not.toContain('startP2pRun');
+
+    const controller = read('src/daemon/peer-audit-controller.ts');
+    expect(controller.text).toContain("status: 'awaiting_slot'");
+    expect(controller.text).toContain("type: 'automatic_slot_available'");
+
+    const service = read('src/daemon/peer-audit-service.ts');
+    expect(service.text).toContain("effect.type === 'automatic_slot_available'");
+    expect(service.text).toContain('automatic_waiter_invalidated');
+    expect(service.text).toContain('context?.baselineValid()');
+    expect(service.text).toContain('effect.waiter.request.auditedSessionInstanceId');
+    expect(service.text).toContain('effect.waiter.request.auditedRuntimeEpoch');
+    expect(service.text).toContain('effect.waiter.configRevision');
+    expect(service.text).toContain('effect.waiter.targetRevision');
   });
 
   // ── 27. (Task 10.5 closure) `pushState` in the orchestrator MUST debounce

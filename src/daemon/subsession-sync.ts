@@ -110,6 +110,8 @@ export async function buildSubSessionSyncPayload(
   return {
     type: 'subsession.sync',
     id,
+    sessionInstanceId: r.sessionInstanceId ?? null,
+    runtimeEpoch: r.runtimeEpoch ?? null,
     state: r.state ?? null,
     sessionType: r.agentType,
     cwd: r.projectDir ?? null,

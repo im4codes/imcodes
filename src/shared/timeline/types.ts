@@ -14,6 +14,11 @@ import type {
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../../shared/file-change.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
+import type {
+  PeerAuditRuntimeDisposition,
+  PeerAuditTerminalOutcome,
+  PeerAuditTrigger,
+} from '../../../shared/peer-audit.js';
 
 export type TimelineEventType =
   | 'user.message'
@@ -35,6 +40,11 @@ export type TimelineEventType =
   | 'usage.update'
   | 'ask.question'
   | 'memory.context'
+  // Structured peer-audit terminal result. This is intentionally distinct
+  // from user/assistant chat so it cannot be mistaken for a new task or fed
+  // back into supervision/model context.
+  | 'peer_audit.result'
+  | 'peer_audit.status'
   // Emitted once per memory-compression call (NOT manual /compact, which is
   // forwarded to the SDK transport unchanged). Carries the backend+model that
   // did the compression plus token telemetry. Persisted to JSONL history for
@@ -65,6 +75,8 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   'usage.update',
   'ask.question',
   'memory.context',
+  'peer_audit.result',
+  'peer_audit.status',
   'memory.compression',
 ] as const satisfies readonly TimelineEventType[];
 
@@ -120,6 +132,34 @@ export interface TimelineEvent {
   timelineCompleteness?: TimelineEventCompleteness;
   detailRefs?: TimelineDetailRef[];
   hidden?: boolean;
+}
+
+/** Public, sanitized payload rendered for a terminal peer-audit attempt.
+ * The one-time reply capability, raw envelope, provider metadata, opaque
+ * attempt id, and full findings must never be included here. */
+export interface PeerAuditResultTimelinePayload {
+  memoryExcluded: true;
+  trigger: PeerAuditTrigger;
+  outcome: PeerAuditTerminalOutcome;
+  auditorSessionName: string;
+  auditorLabel?: string;
+  elapsedMs: number;
+  disposition?: PeerAuditRuntimeDisposition;
+  findingsPreview?: string;
+  reason?: string;
+}
+
+/** Public progress projection for one peer-audit attempt. Correlation uses
+ * the already-public terminal result event id, never the opaque attempt id. */
+export interface PeerAuditStatusTimelinePayload {
+  memoryExcluded: true;
+  resultEventId: string;
+  trigger: PeerAuditTrigger;
+  phase: import('../../../shared/peer-audit.js').PeerAuditPhase;
+  auditorSessionName: string;
+  auditorLabel?: string;
+  disposition?: PeerAuditRuntimeDisposition;
+  reason?: string;
 }
 
 export interface MemoryContextTimelineItem {

@@ -74,6 +74,7 @@ import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 import { buildAgentDelegationReplyInstruction } from '../shared/agent-delegation.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
+import { runAuditReplyCommand } from './cli/audit-reply.js';
 import { resolveLiveHookPort } from './daemon/hook-port.js';
 import {
   formatDurationSeconds,
@@ -793,7 +794,12 @@ program
 
 
 /** POST JSON to the hook server and return parsed response. */
-async function postToHookServer(port: number, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function postToHookServer(
+  port: number,
+  path: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Promise<Record<string, unknown>> {
   const http = await import('http');
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
@@ -806,6 +812,7 @@ async function postToHookServer(port: number, path: string, body: Record<string,
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(data),
+          ...headers,
         },
       },
       (res) => {
@@ -825,6 +832,25 @@ async function postToHookServer(port: number, path: string, body: Record<string,
     req.end();
   });
 }
+
+program
+  .command('audit-reply')
+  .description('Submit one structured peer-audit reply to the running daemon (no terminal fallback)')
+  .requiredOption('--attempt-id <id>', 'Opaque peer-audit attempt id')
+  .requiredOption('--capability <capability>', 'One-time peer-audit reply capability')
+  .requiredOption('--verdict <verdict>', 'PASS or REWORK')
+  .requiredOption('--findings-file <path>', 'UTF-8 findings file')
+  .requiredOption('--validations-file <path>', 'JSON array of validation summary items')
+  .action(async (opts: {
+    attemptId: string;
+    capability: string;
+    verdict: string;
+    findingsFile: string;
+    validationsFile: string;
+  }) => {
+    await runAuditReplyCommand(opts);
+    console.log('Peer audit reply accepted.');
+  });
 
 program
   .command('bind')

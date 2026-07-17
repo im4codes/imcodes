@@ -714,14 +714,6 @@
       "presetLabel": "Пресет (env-пакет)",
       "presetHelp": "Направляет supervisor через пресет-эндпоинт с собственным base URL, API-ключом и зафиксированной моделью. Пресеты настраиваются в панели Shared Context.",
       "presetNone": "(нет)",
-      "auditMode": {
-        "audit": "Аудит",
-        "review": "Ревью",
-        "audit_plan": "Аудит → план",
-        "review_plan": "Ревью → план",
-        "audit_review_plan": "Аудит → ревью → план"
-      },
-      "selectAuditMode": "Выберите режим аудита",
       "maxAuditLoops": "Макс. циклов аудита",
       "maxAutoContinueStreak": "Макс. повторяющихся auto-continue",
       "maxAutoContinueStreakHelp": "Останавливает Auto после такого числа подряд идущих continue одного типа. 0 = без лимита.",
@@ -736,7 +728,7 @@
       "summaryContinueLimits": "Лимиты continue: серия {{streak}} · жесткий {{total}}",
       "summaryCustomInstructions": "Пользовательские инструкции: {{value}}",
       "summaryCustomInstructionsSet": "заданы",
-      "summaryAudit": "Аудит: {{auditMode}} · циклов {{loops}}",
+      "summaryAudit": "Партнёр-аудитор: {{auditor}} · циклов {{loops}}",
       "summaryMeta": "Промпт {{promptVersion}}, исправление {{repairVersion}}, повторы парсинга {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Контроль доступен только для transport-сессий.",
       "unsupported": "Настройки контроля недоступны для process-сессий.",
@@ -744,10 +736,9 @@
         "backendRequired": "Выберите бэкенд контроля.",
         "modelRequired": "Выберите или введите модель контроля.",
         "modelInvalid": "Модель недопустима для {{backend}}.",
-        "auditModeRequired": "Выберите режим аудита."
+        "auditTargetRequired": "Выберите и подтвердите подходящего партнёра-аудитора."
       },
       "modeLabel": "Режим",
-      "auditModeLabel": "Режим аудита",
       "invalidStoredConfig": "Сохранённая конфигурация контроля недействительна. Автоматизация останется выключенной, пока вы её не исправите и не сохраните.",
       "quickLabel": "Авто",
       "quickTitle": "Авто режим"
@@ -2707,5 +2698,59 @@
     "rename_invalid": "Введите имя длиной от 1 до 120 символов без управляющих символов.",
     "revoke": "Отозвать",
     "revoke_confirm": "Отозвать эту машину? Ею больше нельзя будет управлять, потребуется повторная регистрация."
+  },
+  "peerAuditQuick": {
+    "iconLabel": "Пир-аудит",
+    "tooltip": "Запустить одноразовый аудит последнего завершённого хода",
+    "chooserTitle": "Выберите пир-аудитора",
+    "consentTitle": "Подтвердить передачу данных между провайдерами",
+    "consentBody": "Сводка аудита будет отправлена в {{auditor}}, который работает у другого провайдера. Продолжить?",
+    "consentConfirm": "Отправить в {{auditor}}",
+    "selectionWillPersist": "Этот аудитор также будет сохранён для будущих автоматических проверок этой сессии.",
+    "noCandidate": "Нет подходящих аудиторов в этой группе.",
+    "ineligibleCollapsed": "{{count}} не подходят",
+    "providerBadge": "Провайдер: {{provider}}",
+    "chooserReason": {
+      "missing_target": "Нет запомненного аудитора. Выберите одного.",
+      "self_target": "Запомненный аудитор — эта сессия. Выберите другую.",
+      "stale_target": "Запомненный аудитор больше не подходит. Выберите другого.",
+      "same_model_remembered": "Аудитор использует ту же модель. Выберите другую или подтвердите явно.",
+      "unknown_model_remembered": "Модель аудитора неизвестна. Выберите другого.",
+      "no_candidate": "Подходящих аудиторов сейчас нет.",
+      "model_changed_since_click": "Модель изменилась с момента открытия. Выберите аудитора.",
+      "config_repair": "Сохранённый аудитор требует починки."
+    },
+    "self_target": "Сессия не может аудировать саму себя.",
+    "not_direct_child": "Аудитор не является обычной прямой дочерней сессией.",
+    "cross_project": "Аудитор находится в другом проекте.",
+    "execution_clone": "Клоны выполнения не могут быть аудиторами.",
+    "not_reply_capable": "Аудитор не может ответить.",
+    "wrong_state": "Аудитор не в готовом состоянии.",
+    "unknown_identity": "Идентификатор аудитора ещё не подтверждён авторитетным источником.",
+    "disposition": {
+      "sent": "отправлено",
+      "queued": "в очереди",
+      "sent_unrevocable": "отправлено (нельзя отозвать)"
+    },
+    "pending": "Идёт пир-аудит…",
+    "pending_preparing": "Подготовка партнёрского аудита…",
+    "pending_sent": "Аудит отправлен партнёру…",
+    "pending_queued": "Аудит поставлен в очередь до освобождения партнёра…",
+    "pending_sent_unrevocable": "Аудит отправлен процессу-партнёру (без отзыва)…",
+    "pending_waiting_reply": "Ожидание ответа партнёрского аудита…",
+    "result_pass": "Пир-аудит пройден.",
+    "result_rework": "Пир-аудит вернул REWORK.",
+    "result_timeout": "Время пир-аудита истекло.",
+    "result_unavailable": "Аудитор недоступен.",
+    "result_cancelled": "Пир-аудит отменён.",
+    "result_error": "Пир-аудит не удался: {{message}}",
+    "acknowledge": "Закрыть",
+    "cancel_pending": "Отменить"
+  },
+  "peerAuditResult": {
+    "title": "Результат пир-аудита",
+    "attributionAuditor": "Проверил: {{auditor}}",
+    "elapsedMs": "Заняло {{seconds}} с",
+    "findingsPreview": "Замечания"
   }
 }

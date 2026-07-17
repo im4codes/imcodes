@@ -4763,7 +4763,30 @@ afterEach(() => {
     }));
   });
 
-  it('upgrades supervised mode to audit mode with default audit config', async () => {
+  it('mounts the accessible Peer Audit control immediately before Auto while mode is off', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          state: 'idle',
+          transportConfig: { supervision: { mode: 'off' } },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const peer = screen.getByTestId('peer-audit-icon');
+    const auto = screen.getByRole('button', { name: /^Auto$/ });
+    expect(peer.getAttribute('data-testid')).toBe('peer-audit-icon');
+    expect(auto.previousElementSibling).toBe(peer);
+    expect(peer.getAttribute('aria-label')).toBeTruthy();
+  });
+
+  it('opens Settings instead of inferring an auditor when enabling audit mode', async () => {
     const ws = makeWs();
     const onSettings = vi.fn();
     render(
@@ -4792,19 +4815,8 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised_audit',
-            auditMode: 'audit',
-            maxAuditLoops: 2,
-            taskRunPromptVersion: 'task_run_status_v1',
-          }),
-        }),
-      }));
-    });
-    expect(onSettings).not.toHaveBeenCalled();
+    await waitFor(() => expect(onSettings).toHaveBeenCalledTimes(1));
+    expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
   it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {
@@ -4842,6 +4854,120 @@ afterEach(() => {
       expect(onSettings).toHaveBeenCalled();
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('opens Settings when a remembered auditor now resolves to the same model', async () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              auditTargetFingerprint: {
+                sessionInstanceId: 'peer-instance',
+                normalizedModelId: 'gpt-5.6',
+                providerFamily: 'openai',
+              },
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        subSessions={[{
+          sessionName: 'deck_sub_peer',
+          type: 'codex-sdk',
+          label: 'Peer',
+          state: 'idle',
+          parentSession: 'deck_proj_brain',
+          sessionInstanceId: 'peer-instance',
+          runtimeEpoch: 'peer-runtime',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+        }]}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+    await waitFor(() => expect(onSettings).toHaveBeenCalledTimes(1));
+    expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('reuses an exact current different-model fingerprint for compact audit enablement', async () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              auditTargetFingerprint: {
+                sessionInstanceId: 'peer-instance',
+                normalizedModelId: 'claude-opus',
+                providerFamily: 'anthropic',
+              },
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        subSessions={[{
+          sessionName: 'deck_sub_peer',
+          type: 'claude-code-sdk',
+          label: 'Peer',
+          state: 'idle',
+          parentSession: 'deck_proj_brain',
+          sessionInstanceId: 'peer-instance',
+          runtimeEpoch: 'peer-runtime',
+          activeModel: 'claude-opus',
+          providerId: 'anthropic',
+        }]}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith(
+      'srv1',
+      'deck_proj_brain',
+      expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({ mode: 'supervised_audit' }),
+        }),
+      }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
   it('always shows Session Settings in the Auto dropdown when settings are available', () => {

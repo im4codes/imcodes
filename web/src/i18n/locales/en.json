@@ -680,15 +680,15 @@
       "globalDefaultsTitle": "Global defaults",
       "globalDefaultsHelp": "Used to prefill new Auto-enabled transport sessions. Saving here updates your default supervisor backend, model, and timeout.",
       "sessionConfigTitle": "This session",
-      "sessionConfigHelp": "Applies only to the current session. Backend/model/timeout can override the defaults here, while audit mode and custom instructions stay session-only.",
+      "sessionConfigHelp": "Applies only to the current session. Backend/model/timeout, peer auditor, loop limit, and custom instructions stay session-specific.",
       "intro": {
         "title": "What Auto does",
         "howToUseTitle": "How to use it",
-        "howToUseBody": "Choose Off, Supervised, or Supervised + audit. Then select a supervisor backend and model, save the settings, and leave Auto enabled for this session. Audit mode adds an audit pipeline and a rework-loop limit.",
+        "howToUseBody": "Choose Off, Supervised, or Supervised + audit. For audit, select an eligible peer session running a different model and set the rework-loop limit.",
         "purposeTitle": "What it is for",
-        "purposeBody": "Auto lets a supervisor model decide whether the current task is complete, should continue automatically, or needs a human. Audit mode adds a second pass that reviews the implementation before handing control back.",
+        "purposeBody": "Auto lets a supervisor decide whether work is complete, should continue, or needs a human. Audit adds one lightweight review by the selected peer session.",
         "howItWorksTitle": "How it works",
-        "howItWorksBody": "When the session reaches idle, IM.codes sends the latest task context to the configured supervisor, parses a structured decision, and then either stops, sends a continue prompt, or falls back to manual handling. If audit mode is enabled, the completed turn can also enter an automated audit and rework loop.",
+        "howItWorksBody": "When the session reaches idle, IM.codes asks the supervisor for a structured decision. In Supervised + audit, a bounded brief for the completed turn is sent directly to the selected peer and its structured reply drives PASS or bounded rework.",
         "expandHint": "Show details",
         "collapseHint": "Hide"
       },
@@ -714,14 +714,6 @@
       "presetLabel": "Preset (env bundle)",
       "presetHelp": "Routes the supervisor through a preset endpoint with its own base URL, API key, and pinned model. Manage presets in the Shared Context panel.",
       "presetNone": "(none)",
-      "auditMode": {
-        "audit": "Audit",
-        "review": "Review",
-        "audit_plan": "Audit → plan",
-        "review_plan": "Review → plan",
-        "audit_review_plan": "Audit → review → plan"
-      },
-      "selectAuditMode": "Select audit mode",
       "maxAuditLoops": "Max audit loops",
       "maxAutoContinueStreak": "Max repeated auto-continues",
       "maxAutoContinueStreakHelp": "Stops Auto after this many consecutive continue decisions of the same type. 0 = unlimited.",
@@ -736,7 +728,7 @@
       "summaryContinueLimits": "Continue limits: streak {{streak}} · hard {{total}}",
       "summaryCustomInstructions": "Custom instructions: {{value}}",
       "summaryCustomInstructionsSet": "set",
-      "summaryAudit": "Audit: {{auditMode}} · loops {{loops}}",
+      "summaryAudit": "Peer auditor: {{auditor}} · loops {{loops}}",
       "summaryMeta": "Prompt {{promptVersion}}, repair {{repairVersion}}, parse retries {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "Supervision is only available for transport sessions.",
       "unsupported": "Supervision settings are not available for process sessions.",
@@ -744,10 +736,9 @@
         "backendRequired": "Select a supervision backend.",
         "modelRequired": "Select or enter a supervision model.",
         "modelInvalid": "Model is not valid for {{backend}}.",
-        "auditModeRequired": "Select an audit mode."
+        "auditTargetRequired": "Select and confirm an eligible peer auditor."
       },
       "modeLabel": "Mode",
-      "auditModeLabel": "Audit mode",
       "invalidStoredConfig": "Stored supervision config is invalid. Automation is disabled until you repair and save it.",
       "quickLabel": "Auto",
       "quickTitle": "Auto mode"
@@ -2708,5 +2699,59 @@
     "rename_invalid": "Enter a name from 1 to 120 characters without control characters.",
     "revoke": "Revoke",
     "revoke_confirm": "Revoke this machine? It can no longer be controlled and must be re-enrolled."
+  },
+  "peerAuditQuick": {
+    "iconLabel": "Peer audit",
+    "tooltip": "Run a one-shot peer audit of the latest completed turn",
+    "chooserTitle": "Choose a peer auditor",
+    "consentTitle": "Confirm cross-provider data export",
+    "consentBody": "The audit summary will be sent to {{auditor}}, which runs on a different model provider. Continue?",
+    "consentConfirm": "Send to {{auditor}}",
+    "selectionWillPersist": "This auditor will also be remembered for future automatic audits of this session.",
+    "noCandidate": "No eligible auditor is available in this session group.",
+    "ineligibleCollapsed": "{{count}} ineligible",
+    "providerBadge": "Provider: {{provider}}",
+    "chooserReason": {
+      "missing_target": "No remembered auditor is set. Pick one to start.",
+      "self_target": "The remembered auditor is this session. Pick a different one.",
+      "stale_target": "The remembered auditor is no longer eligible. Pick one to continue.",
+      "same_model_remembered": "The remembered auditor uses the same model. Pick a different model or confirm explicitly.",
+      "unknown_model_remembered": "The remembered auditor's model is unknown. Pick one to continue.",
+      "no_candidate": "No eligible auditor is available right now.",
+      "model_changed_since_click": "The audited session's model changed since you opened this. Pick an auditor.",
+      "config_repair": "Stored auditor needs repair before it can be used."
+    },
+    "self_target": "This session cannot audit itself.",
+    "not_direct_child": "Auditor is not an ordinary direct child session.",
+    "cross_project": "Auditor is in a different project.",
+    "execution_clone": "Execution clones cannot audit.",
+    "not_reply_capable": "Auditor cannot reply.",
+    "wrong_state": "Auditor is not in a ready state.",
+    "unknown_identity": "Auditor identity is not authoritative yet.",
+    "disposition": {
+      "sent": "sent",
+      "queued": "queued",
+      "sent_unrevocable": "sent (cannot revoke)"
+    },
+    "pending": "Peer audit in progress…",
+    "pending_preparing": "Preparing peer audit…",
+    "pending_sent": "Audit sent to peer…",
+    "pending_queued": "Audit queued until the peer is idle…",
+    "pending_sent_unrevocable": "Audit sent to process peer (cannot revoke)…",
+    "pending_waiting_reply": "Waiting for peer audit reply…",
+    "result_pass": "Peer audit passed.",
+    "result_rework": "Peer audit returned REWORK.",
+    "result_timeout": "Peer audit timed out.",
+    "result_unavailable": "Peer auditor unavailable.",
+    "result_cancelled": "Peer audit cancelled.",
+    "result_error": "Peer audit failed: {{message}}",
+    "acknowledge": "Dismiss",
+    "cancel_pending": "Cancel"
+  },
+  "peerAuditResult": {
+    "title": "Peer audit result",
+    "attributionAuditor": "Reviewed by {{auditor}}",
+    "elapsedMs": "Took {{seconds}}s",
+    "findingsPreview": "Findings"
   }
 }

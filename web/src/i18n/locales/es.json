@@ -714,14 +714,6 @@
       "presetLabel": "Preset (paquete de entorno)",
       "presetHelp": "Enruta al supervisor a través de un endpoint preconfigurado con su propia base URL, clave API y modelo fijo. Los presets se administran desde el panel de Contexto compartido.",
       "presetNone": "(ninguno)",
-      "auditMode": {
-        "audit": "Auditoría",
-        "review": "Revisión",
-        "audit_plan": "Auditoría → plan",
-        "review_plan": "Revisión → plan",
-        "audit_review_plan": "Auditoría → revisión → plan"
-      },
-      "selectAuditMode": "Selecciona modo de auditoría",
       "maxAuditLoops": "Máx. ciclos de auditoría",
       "maxAutoContinueStreak": "Máx. auto-continuaciones repetidas",
       "maxAutoContinueStreakHelp": "Detiene Auto tras este número de decisiones continue consecutivas del mismo tipo. 0 = sin límite.",
@@ -736,7 +728,7 @@
       "summaryContinueLimits": "Límites de continue: racha {{streak}} · duro {{total}}",
       "summaryCustomInstructions": "Instrucciones personalizadas: {{value}}",
       "summaryCustomInstructionsSet": "configuradas",
-      "summaryAudit": "Auditoría: {{auditMode}} · ciclos {{loops}}",
+      "summaryAudit": "Auditor par: {{auditor}} · ciclos {{loops}}",
       "summaryMeta": "Prompt {{promptVersion}}, reparación {{repairVersion}}, reintentos de parseo {{parseRetries}}, task-run {{taskRunVersion}}",
       "disabledHint": "La supervisión solo está disponible para sesiones transport.",
       "unsupported": "La configuración de supervisión no está disponible para sesiones process.",
@@ -744,10 +736,9 @@
         "backendRequired": "Selecciona un backend de supervisión.",
         "modelRequired": "Selecciona o introduce un modelo de supervisión.",
         "modelInvalid": "El modelo no es válido para {{backend}}.",
-        "auditModeRequired": "Selecciona un modo de auditoría."
+        "auditTargetRequired": "Selecciona y confirma un auditor par elegible."
       },
       "modeLabel": "Modo",
-      "auditModeLabel": "Modo de auditoría",
       "invalidStoredConfig": "La configuración guardada de supervisión no es válida. La automatización seguirá desactivada hasta que la repares y la guardes.",
       "quickLabel": "Auto",
       "quickTitle": "Modo automático"
@@ -2708,5 +2699,59 @@
     "rename_invalid": "Introduce un nombre de 1 a 120 caracteres sin caracteres de control.",
     "revoke": "Revocar",
     "revoke_confirm": "¿Revocar esta máquina? Ya no se podrá controlar y deberá volver a registrarse."
+  },
+  "peerAuditQuick": {
+    "iconLabel": "Auditoría de pares",
+    "tooltip": "Ejecutar una auditoría puntual del último turno completado",
+    "chooserTitle": "Elige un auditor par",
+    "consentTitle": "Confirmar exportación entre proveedores",
+    "consentBody": "El resumen se enviará a {{auditor}}, que corre en otro proveedor. ¿Continuar?",
+    "consentConfirm": "Enviar a {{auditor}}",
+    "selectionWillPersist": "Este auditor también se recordará para futuras auditorías automáticas de esta sesión.",
+    "noCandidate": "No hay auditores elegibles en este grupo.",
+    "ineligibleCollapsed": "{{count}} no elegibles",
+    "providerBadge": "Proveedor: {{provider}}",
+    "chooserReason": {
+      "missing_target": "No hay auditor memorizado. Elige uno para empezar.",
+      "self_target": "El auditor memorizado es esta sesión. Elige otro.",
+      "stale_target": "El auditor memorizado ya no es elegible. Elige otro.",
+      "same_model_remembered": "El auditor usa el mismo modelo. Elige otro o confirma explícitamente.",
+      "unknown_model_remembered": "El modelo del auditor es desconocido. Elige uno.",
+      "no_candidate": "No hay auditores elegibles ahora.",
+      "model_changed_since_click": "El modelo cambió desde que abriste esto. Elige un auditor.",
+      "config_repair": "El auditor guardado necesita reparación."
+    },
+    "self_target": "Esta sesión no puede auditarse a sí misma.",
+    "not_direct_child": "El auditor no es una subsesión secundaria directa ordinaria.",
+    "cross_project": "El auditor está en otro proyecto.",
+    "execution_clone": "Los clones de ejecución no pueden auditar.",
+    "not_reply_capable": "El auditor no puede responder.",
+    "wrong_state": "El auditor no está listo.",
+    "unknown_identity": "La identidad del auditor aún no es autoritativa.",
+    "disposition": {
+      "sent": "enviado",
+      "queued": "en cola",
+      "sent_unrevocable": "enviado (no revocable)"
+    },
+    "pending": "Auditoría en curso…",
+    "pending_preparing": "Preparando la auditoría entre pares…",
+    "pending_sent": "Auditoría enviada al par…",
+    "pending_queued": "Auditoría en cola hasta que el par esté inactivo…",
+    "pending_sent_unrevocable": "Auditoría enviada al proceso par (no revocable)…",
+    "pending_waiting_reply": "Esperando la respuesta de la auditoría…",
+    "result_pass": "Auditoría aprobada.",
+    "result_rework": "Auditoría devolvió REWORK.",
+    "result_timeout": "Auditoría agotó el tiempo.",
+    "result_unavailable": "Auditor no disponible.",
+    "result_cancelled": "Auditoría cancelada.",
+    "result_error": "Auditoría falló: {{message}}",
+    "acknowledge": "Cerrar",
+    "cancel_pending": "Cancelar"
+  },
+  "peerAuditResult": {
+    "title": "Resultado de auditoría",
+    "attributionAuditor": "Revisado por {{auditor}}",
+    "elapsedMs": "Tomó {{seconds}}s",
+    "findingsPreview": "Hallazgos"
   }
 }

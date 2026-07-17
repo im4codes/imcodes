@@ -198,6 +198,39 @@ describe('SubSessionWindow metadata wiring', () => {
     activeToolCallMock = false;
   });
 
+  it('projects canonical peer-audit identity/model metadata into SessionControls', () => {
+    render(
+      <SubSessionWindow
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          sessionInstanceId: 'window-instance-1',
+          runtimeEpoch: 'window-runtime-1',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+        })}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.activeSession).toMatchObject({
+      name: 'deck_sub_sub-1',
+      sessionInstanceId: 'window-instance-1',
+      runtimeEpoch: 'window-runtime-1',
+      activeModel: 'gpt-5.6',
+      providerId: 'openai',
+    });
+  });
+
   it('exposes the accent color as a CSS variable on the window root', () => {
     const { container } = render(
       <SubSessionWindow

@@ -19,6 +19,22 @@ const mockTransportRuntime = {
   pendingMessages: [],
   pendingEntries: [],
 };
+let mockPeerAuditOutcome: 'pass' | 'rework' | 'timeout' = 'pass';
+const mockStartAutomaticPeerAudit = vi.fn(async (input: {
+  onTerminal(terminal: Record<string, unknown>): void;
+}) => {
+  queueMicrotask(() => input.onTerminal({
+    attemptId: 'peer-attempt-1',
+    revision: 2,
+    trigger: 'automatic',
+    outcome: mockPeerAuditOutcome,
+    ...(mockPeerAuditOutcome === 'rework' ? { findings: 'needs fixes' } : {}),
+    completedAt: Date.now(),
+    elapsedMs: 10,
+    disposition: 'sent',
+  }));
+  return { ok: true as const, attemptId: 'peer-attempt-1', awaitingSlot: false };
+});
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: mockStartP2pRun,
@@ -37,6 +53,14 @@ vi.mock('../../src/daemon/supervision-broker.js', () => ({
   },
 }));
 
+vi.mock('../../src/daemon/peer-audit-service.js', () => ({
+  peerAuditService: {
+    startAutomatic: mockStartAutomaticPeerAudit,
+    cancelAutomatic: vi.fn(),
+    applyAutomaticConfiguration: vi.fn(),
+  },
+}));
+
 const { supervisionAutomation } = await import('../../src/daemon/supervision-automation.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
 const { upsertSession, removeSession } = await import('../../src/store/session-store.js');
@@ -48,6 +72,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
   mockSupervisionDecide.mockResolvedValue({ decision: 'complete', reason: 'done', confidence: 0.9 });
+  mockPeerAuditOutcome = 'pass';
   supervisionAutomation.cancelSession('deck_supervision_brain');
   removeSession('deck_supervision_brain');
 });
@@ -131,14 +156,8 @@ describe('SupervisionAutomation', () => {
     await cleanupProjectDir();
   });
 
-  it('launches a P2P audit after the completion decision returns complete and clears the run on PASS', async () => {
+  it('dispatches one lightweight peer audit after completion, never launches P2P, and clears the run on PASS', async () => {
     const snapshot = await seedSession('supervised_audit');
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-1' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-1',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-1', 'implement the feature', snapshot);
@@ -146,35 +165,18 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
       taskRequest: 'implement the feature',
       assistantResponse: 'implemented the feature',
     }));
-    // modeOverride is intentionally omitted — supervision builds its own
-    // advancedRounds pipeline from auditMode, and resolveP2pRoundPlan ignores
-    // modeOverride when advancedRounds is non-empty. Asserting its absence pins
-    // the "single source of routing truth" invariant.
-    // Audit:V-2 — supervision now passes rounds through the typed
-    // `advanced: { kind: 'supervision_internal', advancedRounds }` discriminated
-    // union (escape hatch). Assertions read the rounds from `advanced.advancedRounds`.
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      initiatorSession: 'deck_supervision_brain',
-      launchOrigin: expect.objectContaining({
-        kind: 'supervision',
-      }),
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [expect.objectContaining({
-          preset: 'implementation_audit',
-          verdictPolicy: 'smart_gate',
-        })],
-      }),
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledWith(expect.objectContaining({
+      taskCommandId: 'cmd-1',
+      userText: 'implement the feature',
+      assistantText: 'implemented the feature',
     }));
-    const startArgs = mockStartP2pRun.mock.calls[0]?.[0] as { modeOverride?: unknown; advanced: { advancedRounds: unknown[] } };
-    expect(startArgs.modeOverride).toBeUndefined();
-    expect(startArgs.advanced.advancedRounds).toHaveLength(1);
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
@@ -420,12 +422,6 @@ describe('SupervisionAutomation', () => {
       mode: 'supervised_audit',
       auditMode: 'audit>plan',
     });
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-live-update' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-live-update',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-live', 'implement the feature', supervised);
@@ -434,17 +430,10 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [
-          expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
-          expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
-        ],
-      }),
-    }));
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledTimes(1);
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
   it('picks up an in-flight task at idle when Auto is enabled after the user message was already sent', async () => {
@@ -579,12 +568,7 @@ describe('SupervisionAutomation', () => {
 
   it('feeds REWORK back into the same transport session after audit', async () => {
     const snapshot = await seedSession('supervised_audit');
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-2' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-2',
-      status: 'completed',
-      resultSummary: 'needs fixes\n<!-- P2P_VERDICT: REWORK -->',
-    });
+    mockPeerAuditOutcome = 'rework';
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-2', 'implement the feature', snapshot);
@@ -592,7 +576,7 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -677,13 +661,6 @@ describe('SupervisionAutomation', () => {
 
   it('routes OpenSpec task runs through the implementation-only OpenSpec audit baseline', async () => {
     const snapshot = await seedSession('supervised_audit', true);
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-openspec' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-openspec',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
-
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent(
       'deck_supervision_brain',
@@ -709,31 +686,23 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the change');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      userText: expect.stringContaining('OpenSpec implementation audit for change: supervised-task-automation'),
-      fileContents: expect.arrayContaining([
-        expect.objectContaining({ path: 'changed-files.txt', content: expect.stringContaining('src/demo.ts') }),
-        expect.objectContaining({ path: 'validation-output.txt', content: expect.stringContaining('PASS src/demo.test.ts') }),
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledWith(expect.objectContaining({
+      changePath: expect.stringContaining('openspec/changes/supervised-task-automation'),
+      changedPaths: expect.arrayContaining([
+        'supervised-task-automation/proposal.md',
+        'supervised-task-automation/design.md',
+        'supervised-task-automation/tasks.md',
+        'changed-files.txt',
+        'validation-output.txt',
       ]),
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [expect.objectContaining({
-          promptAppend: expect.stringContaining('Do not rerun discussion or proposal phases.'),
-        })],
-      }),
     }));
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
   it('falls back to contextual audit when the task does not resolve to a specific OpenSpec change', async () => {
     const snapshot = await seedSession('supervised_audit', true);
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-contextual' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-contextual',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent(
@@ -746,53 +715,58 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      userText: expect.stringContaining('Contextual implementation audit'),
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [expect.objectContaining({
-          promptAppend: expect.stringContaining('Audit the implementation result against the original request'),
-        })],
-      }),
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledWith(expect.objectContaining({
+      userText: 'implement the feature without naming a change',
+      assistantText: 'implemented the feature',
     }));
+    expect(mockStartAutomaticPeerAudit.mock.calls[0]?.[0].changePath).toBeUndefined();
   });
 
-  it('stops after the configured rework-loop limit', async () => {
-    // maxAuditLoops=0 means "no rework dispatches permitted" — the first REWORK
-    // verdict must immediately transition to manual review without sending.
-    // (For maxAuditLoops>=1 the loop emits dispatches; see the dedicated test below.)
-    const snapshot = await seedSession('supervised_audit', false, 1);
-    // Force max to 0 by passing an invalid value that normalizes to 1 is avoided —
-    // normalize rejects <1, so use 1 and assert exactly one dispatch then stop.
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-loop' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-loop',
-      status: 'completed',
-      resultSummary: 'needs fixes\n<!-- P2P_VERDICT: REWORK -->',
-    });
+  it('dispatches zero rework briefs when maxAuditLoops is zero', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 0);
+    mockPeerAuditOutcome = 'rework';
 
     supervisionAutomation.init();
-    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-5', 'implement the feature', snapshot);
-    beginRun('cmd-5', 'implement the feature');
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-loop-zero', 'implement the feature', snapshot);
+    beginRun('cmd-loop-zero', 'implement the feature');
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    // maxAuditLoops=1 → exactly one rework brief dispatched, then run remains active
-    // waiting for the session's next turn (which is the semantically correct behavior:
-    // "up to N rework dispatches"). Prior code off-by-one'd to zero.
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('dispatches exactly one rework brief for maxAuditLoops one and stops on the next REWORK', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    mockPeerAuditOutcome = 'rework';
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-loop-one', 'implement the feature', snapshot);
+    beginRun('cmd-loop-one', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+    await sleep(25);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Audit verdict: REWORK');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       reworkDispatches: 1,
       phase: 'execution',
     });
+
+    completeTurn('implemented the requested rework');
+    await sleep(25);
+    await sleep(25);
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
-  it('expands combo audit modes into multi-round pipelines with a single smart_gate verdict', async () => {
+  it('ignores deprecated combo auditMode and still starts exactly one lightweight peer audit', async () => {
     const snapshot = await seedSession('supervised_audit');
     // Override auditMode to a combo to assert pipeline expansion
     const comboSnapshot = { ...snapshot, auditMode: 'audit>review>plan' as const };
@@ -812,12 +786,6 @@ describe('SupervisionAutomation', () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-combo' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-combo',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-combo', 'implement the feature', comboSnapshot);
@@ -825,22 +793,13 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    const args = mockStartP2pRun.mock.calls[0]?.[0] as {
-      advanced: { kind: string; advancedRounds: Array<{ preset: string; verdictPolicy: string; permissionScope: string }> };
-      modeOverride?: unknown;
-      rounds: number;
-    };
-    expect(args.modeOverride).toBeUndefined();
-    expect(args.rounds).toBe(3);
-    expect(args.advanced.kind).toBe('supervision_internal');
-    expect(args.advanced.advancedRounds.map((r) => r.preset)).toEqual(['implementation_audit', 'implementation_audit', 'custom']);
-    expect(args.advanced.advancedRounds.map((r) => r.verdictPolicy)).toEqual(['none', 'smart_gate', 'none']);
-    expect(args.advanced.advancedRounds.every((r) => r.permissionScope === 'analysis_only')).toBe(true);
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledTimes(1);
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
-  it('expands audit>plan into a two-round pipeline where audit owns the verdict', async () => {
+  it('keeps manual P2P untouched while automatic audit>plan uses the peer controller', async () => {
     const snapshot = await seedSession('supervised_audit');
     const comboSnapshot = { ...snapshot, auditMode: 'audit>plan' as const };
     upsertSession({
@@ -859,12 +818,6 @@ describe('SupervisionAutomation', () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-plan' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-plan',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-ap', 'implement the feature', comboSnapshot);
@@ -872,17 +825,9 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    const args = mockStartP2pRun.mock.calls[0]?.[0] as {
-      advanced: { kind: string; advancedRounds: Array<{ preset: string; verdictPolicy: string }> };
-      rounds: number;
-    };
-    expect(args.rounds).toBe(2);
-    expect(args.advanced.kind).toBe('supervision_internal');
-    expect(args.advanced.advancedRounds).toEqual([
-      expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
-      expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
-    ]);
+    expect(mockStartAutomaticPeerAudit).toHaveBeenCalledTimes(1);
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 });

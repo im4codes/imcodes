@@ -438,6 +438,51 @@ export class TransportQueueStore {
     return readString(row?.materialJson);
   }
 
+  /**
+   * Remove only persisted peer-audit queue rows after daemon restart. Their
+   * capability/controller authority is memory-only, so replay would be both
+   * unauthenticated and surprising. Ordinary queue rows are left byte-for-byte.
+   */
+  scrubPeerAuditOrphans(sessionNameInput: string, now = Date.now()): string[] {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const rows = this.db.prepare(`
+      SELECT client_message_id AS clientMessageId, material_json AS materialJson
+      FROM queue_private_material
+      WHERE session_name = ?
+    `).all(sessionName) as Array<{ clientMessageId: string; materialJson: string }>;
+    const orphanIds = rows.flatMap((row) => {
+      try {
+        const material = JSON.parse(row.materialJson) as { peerAudit?: unknown };
+        const marker = material.peerAudit;
+        if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return [];
+        const value = marker as Record<string, unknown>;
+        return typeof value.contractVersion === 'string' && typeof value.attemptHash === 'string'
+          ? [row.clientMessageId]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+    if (orphanIds.length === 0) return [];
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.ensureMeta(sessionName, now);
+      const removeEntry = this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?');
+      const removeMaterial = this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?');
+      for (const clientMessageId of orphanIds) {
+        removeEntry.run(sessionName, clientMessageId);
+        removeMaterial.run(sessionName, clientMessageId);
+      }
+      this.bumpVersion(sessionName, now);
+      this.db.exec('COMMIT');
+      return orphanIds;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
   markMissingPrivateMaterialFailed(sessionNameInput: string, clientMessageIdInput: string, now = Date.now()): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');

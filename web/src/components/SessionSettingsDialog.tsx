@@ -16,11 +16,9 @@ import {
   DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
   DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
   DEFAULT_SUPERVISION_TIMEOUT_MS,
-  getAutomationAuditModeOptions,
   getSupportedSupervisionBackendOptions,
   getSupervisionModelOptions,
   hasInvalidSessionSupervisionSnapshot,
-  isSupportedSupervisionAuditMode,
   isSupportedSupervisionBackend,
   mergeSupervisionCustomInstructions,
   normalizeSupervisorDefaultConfig,
@@ -30,9 +28,16 @@ import {
   SUPERVISION_REPAIR_PROMPT_VERSION,
   SUPERVISION_MODES,
   TASK_RUN_PROMPT_VERSION,
-  type SupervisionAuditMode,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
+import {
+  PEER_AUDIT_PROMPT_VERSION,
+  resolvePeerAuditNormalizedModelId,
+  resolvePeerAuditProviderFamily,
+  type PeerAuditCandidateList,
+} from '@shared/peer-audit.js';
+import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
+import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
 
 interface Props {
   serverId: string;
@@ -47,6 +52,11 @@ interface Props {
   type: string;
   parentSession?: string | null;
   transportConfig?: Record<string, unknown> | null;
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
+  activeModel?: string | null;
+  requestedModel?: string | null;
+  providerId?: string | null;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
    * to `cc.presets.list_response` and renders a preset picker for qwen
@@ -81,7 +91,13 @@ type SupervisionDraft = {
   maxParseRetries?: number;
   maxAutoContinueStreak?: number;
   maxAutoContinueTotal?: number;
-  auditMode?: SupervisionAuditMode;
+  auditTargetSessionName?: string;
+  auditTargetFingerprint?: {
+    sessionInstanceId: string;
+    normalizedModelId: string;
+    providerFamily: string;
+  };
+  peerAuditPromptVersion?: string;
   maxAuditLoops?: number;
   taskRunPromptVersion?: string;
 };
@@ -130,18 +146,8 @@ function labelForMode(t: (key: string, params?: Record<string, unknown>) => stri
   return t(`session.supervision.mode.${mode}`);
 }
 
-function labelForAuditMode(t: (key: string, params?: Record<string, unknown>) => string, mode: SupervisionAuditMode): string {
-  const key = mode.replace(/>/g, '_');
-  return t(`session.supervision.auditMode.${key}`);
-}
-
 function normalizeBackendValue(value: string): SharedContextRuntimeBackend | '' {
   return isSupportedSupervisionBackend(value) ? value : '';
-}
-
-function getAuditModeOptions(): SupervisionAuditMode[] {
-  const allowed = new Set(['audit', 'audit>plan', 'review', 'review>plan', 'audit>review>plan']);
-  return getAutomationAuditModeOptions().filter((mode): mode is SupervisionAuditMode => allowed.has(mode));
 }
 
 // localStorage key tracking whether the per-user has hidden the intro block.
@@ -510,6 +516,11 @@ export function SessionSettingsDialog({
   cwd: initCwd,
   type,
   transportConfig,
+  sessionInstanceId,
+  runtimeEpoch,
+  activeModel,
+  requestedModel,
+  providerId,
   parentSession,
   ws,
   onClose,
@@ -532,6 +543,14 @@ export function SessionSettingsDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
+  const [peerAuditTargetName, setPeerAuditTargetName] = useState<string | null>(
+    initialSupervision.auditTargetSessionName ?? null,
+  );
+  const [peerAuditCandidateList, setPeerAuditCandidateList] = useState<PeerAuditCandidateList | null>(null);
+  // A persisted fingerprint is only a claim until the daemon candidate list
+  // confirms the exact live name/instance/model/provider tuple.
+  const [peerAuditTargetConfirmed, setPeerAuditTargetConfirmed] = useState(false);
+  const peerAuditExplicitConfirmationRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -545,7 +564,58 @@ export function SessionSettingsDialog({
     setDescription(initDesc);
     setAgentType(type);
     setSupervision(initialSupervision);
+    setPeerAuditTargetName(initialSupervision.auditTargetSessionName ?? null);
+    peerAuditExplicitConfirmationRef.current = null;
+    setPeerAuditTargetConfirmed(false);
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
+
+  useEffect(() => {
+    if (!ws || !sessionInstanceId || !runtimeEpoch) {
+      setPeerAuditCandidateList(null);
+      return;
+    }
+    const adapter = createWsPeerAuditAdapter(ws);
+    let cancelled = false;
+    void adapter.listCandidates({
+      auditedSessionName: sessionName,
+      auditedSessionIdentity: { sessionInstanceId, runtimeEpoch },
+    }).then((list) => {
+      if (cancelled) return;
+      setPeerAuditCandidateList(list);
+      setPeerAuditTargetName((current) => current ?? initialSupervision.auditTargetSessionName ?? null);
+    }).catch(() => {
+      if (!cancelled) setPeerAuditCandidateList(null);
+    });
+    return () => { cancelled = true; };
+  }, [ws, sessionName, sessionInstanceId, runtimeEpoch, initialSupervision.auditTargetSessionName]);
+
+  useEffect(() => {
+    if (!peerAuditCandidateList || !peerAuditTargetName) {
+      setPeerAuditTargetConfirmed(false);
+      return;
+    }
+    const candidate = peerAuditCandidateList.candidates.find((item) => item.name === peerAuditTargetName);
+    const persisted = initialSupervision.auditTargetFingerprint;
+    const candidateFingerprint = candidate ? JSON.stringify({
+      sessionInstanceId: candidate.sessionInstanceId,
+      normalizedModelId: candidate.normalizedModelId,
+      providerFamily: candidate.providerFamily,
+    }) : null;
+    setPeerAuditTargetConfirmed(Boolean(
+      (candidate?.eligible && candidateFingerprint === peerAuditExplicitConfirmationRef.current)
+      || (candidate?.eligible
+      && persisted
+      && initialSupervision.auditTargetSessionName === candidate.name
+      && persisted.sessionInstanceId === candidate.sessionInstanceId
+      && persisted.normalizedModelId === candidate.normalizedModelId
+      && persisted.providerFamily === candidate.providerFamily)
+    ));
+  }, [
+    initialSupervision.auditTargetFingerprint,
+    initialSupervision.auditTargetSessionName,
+    peerAuditCandidateList,
+    peerAuditTargetName,
+  ]);
 
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
@@ -647,8 +717,17 @@ export function SessionSettingsDialog({
   const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
   const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
-  const supervisionAuditMode = supervision.auditMode;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
+  const selectedPeerAuditCandidate = peerAuditCandidateList?.candidates.find((candidate) => candidate.name === peerAuditTargetName);
+  const auditedPeerModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
+  const auditedPeerProvider = resolvePeerAuditProviderFamily({ providerId, agentType: type });
+  const selectedPeerIsSameModel = Boolean(selectedPeerAuditCandidate
+    && auditedPeerModel !== 'unknown'
+    && selectedPeerAuditCandidate.normalizedModelId === auditedPeerModel);
+  const selectedPeerIsCrossProvider = Boolean(selectedPeerAuditCandidate
+    && auditedPeerProvider !== 'unknown'
+    && selectedPeerAuditCandidate.providerFamily !== 'unknown'
+    && selectedPeerAuditCandidate.providerFamily !== auditedPeerProvider);
   const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
   const supervisionPresetEntry = ccPresets.find((p) => p.name === (typeof supervision.preset === 'string' ? supervision.preset.trim() : ''));
   const supervisionPresetModelOptions = getPresetModelOptions(ccPresets, supervision.preset);
@@ -720,9 +799,15 @@ export function SessionSettingsDialog({
     maxAutoContinueTotal: supervisionAutoContinueTotal,
     ...(isAuditMode
       ? {
-          auditMode: supervisionAuditMode,
           maxAuditLoops: supervisionAuditLoops,
           taskRunPromptVersion,
+          auditTargetSessionName: selectedPeerAuditCandidate?.name ?? supervision.auditTargetSessionName,
+          auditTargetFingerprint: selectedPeerAuditCandidate ? {
+            sessionInstanceId: selectedPeerAuditCandidate.sessionInstanceId,
+            normalizedModelId: selectedPeerAuditCandidate.normalizedModelId,
+            providerFamily: selectedPeerAuditCandidate.providerFamily,
+          } : supervision.auditTargetFingerprint,
+          peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
         }
       : {}),
   }), [
@@ -730,7 +815,9 @@ export function SessionSettingsDialog({
     sessionSupportsPreset,
     supervision.mode,
     supervisionAuditLoops,
-    supervisionAuditMode,
+    selectedPeerAuditCandidate,
+    supervision.auditTargetSessionName,
+    supervision.auditTargetFingerprint,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
     supervisionBackend,
@@ -799,7 +886,9 @@ export function SessionSettingsDialog({
           maxAutoContinueStreak: prev.maxAutoContinueStreak ?? supervisorDefaultsAutoContinueStreak,
           maxAutoContinueTotal: prev.maxAutoContinueTotal ?? supervisorDefaultsAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-          auditMode: prev.auditMode,
+          auditTargetSessionName: prev.auditTargetSessionName,
+          auditTargetFingerprint: prev.auditTargetFingerprint,
+          peerAuditPromptVersion: prev.peerAuditPromptVersion,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
         };
@@ -819,7 +908,9 @@ export function SessionSettingsDialog({
             ? supervisorDefaultsAutoContinueTotal
             : prev.maxAutoContinueTotal,
           maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-          auditMode: prev.auditMode,
+          auditTargetSessionName: prev.auditTargetSessionName,
+          auditTargetFingerprint: prev.auditTargetFingerprint,
+          peerAuditPromptVersion: prev.peerAuditPromptVersion,
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
         };
@@ -933,9 +1024,6 @@ export function SessionSettingsDialog({
   const supervisionModeLabel = labelForMode(t, supervision.mode);
   const handleSessionModeSelect = (e: Event): void => {
     handleModeChange((e.target as HTMLSelectElement).value as SupervisionMode);
-  };
-  const handleSessionAuditModeSelect = (e: Event): void => {
-    setSupervision((prev) => ({ ...prev, auditMode: (e.target as HTMLSelectElement).value as SupervisionAuditMode }));
   };
   const globalDefaultsValid = useMemo(() => {
     if (!isSupportedTransport) return true;
@@ -1218,22 +1306,74 @@ export function SessionSettingsDialog({
             </div>
 
             {isAuditMode && (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(0, 1fr)', gap: 12 }}>
                 <div>
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.auditModeLabel')}</div>
-                  <select
-                    class="input"
-                    value={supervisionAuditMode ?? ''}
-                    onInput={handleSessionAuditModeSelect}
-                    onChange={handleSessionAuditModeSelect}
-                    style={{ width: '100%' }}
-                    disabled={saving}
-                  >
-                    <option value="">{t('session.supervision.selectAuditMode')}</option>
-                    {getAuditModeOptions().map((mode) => (
-                      <option key={mode} value={mode}>{labelForAuditMode(t, mode)}</option>
-                    ))}
-                  </select>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
+                    {t('peerAuditQuick.chooserTitle')}
+                  </div>
+                  <div data-testid="session-supervision-peer-picker">
+                    <PeerAuditCandidatePicker
+                      list={peerAuditCandidateList}
+                      selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
+                      onSelect={(candidate) => {
+                        setPeerAuditTargetName(candidate.name);
+                        peerAuditExplicitConfirmationRef.current = null;
+                        const persisted = initialSupervision.auditTargetFingerprint;
+                        setPeerAuditTargetConfirmed(Boolean(
+                          persisted
+                          && initialSupervision.auditTargetSessionName === candidate.name
+                          && persisted.sessionInstanceId === candidate.sessionInstanceId
+                          && persisted.normalizedModelId === candidate.normalizedModelId
+                          && persisted.providerFamily === candidate.providerFamily
+                        ));
+                      }}
+                    />
+                  </div>
+                  {selectedPeerIsSameModel && (
+                    <div style={{ color: '#fbbf24', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-same-model-warning">
+                      {t('peerAuditQuick.chooserReason.same_model_remembered')}
+                    </div>
+                  )}
+                  {selectedPeerAuditCandidate?.dispositionCapability === 'sent_unrevocable' && (
+                    <div style={{ color: '#fbbf24', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-process-warning">
+                      {t('peerAuditQuick.disposition.sent_unrevocable')}
+                    </div>
+                  )}
+                  {selectedPeerAuditCandidate && !peerAuditTargetConfirmed && (
+                    <div style={{ marginTop: 8 }}>
+                      <div style={{ color: '#94a3b8', fontSize: 11, marginBottom: 6 }}>
+                        {selectedPeerAuditCandidate.label} · {selectedPeerAuditCandidate.normalizedModelId} · {selectedPeerAuditCandidate.providerFamily} · {selectedPeerAuditCandidate.liveState}
+                      </div>
+                      {selectedPeerIsCrossProvider && (
+                        <div style={{ color: '#fbbf24', fontSize: 11, marginBottom: 6 }}>
+                          {t('peerAuditQuick.consentBody', { auditor: selectedPeerAuditCandidate.label })}
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        class="btn btn-secondary"
+                        onClick={() => {
+                          peerAuditExplicitConfirmationRef.current = JSON.stringify({
+                            sessionInstanceId: selectedPeerAuditCandidate.sessionInstanceId,
+                            normalizedModelId: selectedPeerAuditCandidate.normalizedModelId,
+                            providerFamily: selectedPeerAuditCandidate.providerFamily,
+                          });
+                          setPeerAuditTargetConfirmed(true);
+                        }}
+                        data-testid="peer-audit-settings-confirm"
+                      >
+                        {t('peerAuditQuick.consentConfirm', { auditor: selectedPeerAuditCandidate.label })}
+                      </button>
+                      <div style={{ color: '#94a3b8', fontSize: 11, marginTop: 6 }}>
+                        {t('peerAuditQuick.selectionWillPersist')}
+                      </div>
+                    </div>
+                  )}
+                  {selectedPeerAuditCandidate && peerAuditTargetConfirmed && (
+                    <div style={{ color: '#34d399', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-settings-confirmed">
+                      {selectedPeerAuditCandidate.label} · {selectedPeerAuditCandidate.normalizedModelId} · {selectedPeerAuditCandidate.providerFamily}
+                    </div>
+                  )}
                 </div>
 
                 <div>
@@ -1241,11 +1381,11 @@ export function SessionSettingsDialog({
                   <input
                     class="input"
                     type="number"
-                    min={1}
+                    min={0}
                     value={String(supervisionAuditLoops)}
                     onInput={(e) => {
                       const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                      setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value > 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
+                      setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
                     }}
                     style={{ width: '100%' }}
                     disabled={saving}
@@ -1282,9 +1422,16 @@ export function SessionSettingsDialog({
               {isAuditMode && (
                 <div style={{ fontSize: 12, color: '#94a3b8' }}>
                   {t('session.supervision.summaryAudit', {
-                    auditMode: supervisionAuditMode ? labelForAuditMode(t, supervisionAuditMode) : t('session.supervision.summaryUnset'),
+                    auditor: peerAuditTargetName ?? t('session.supervision.summaryUnset'),
                     loops: supervisionAuditLoops,
                   })}
+                  {selectedPeerAuditCandidate && (
+                    <span>
+                      {' · '}{selectedPeerAuditCandidate.normalizedModelId}
+                      {' · '}{selectedPeerAuditCandidate.providerFamily}
+                      {' · '}{t(`peerAuditQuick.disposition.${selectedPeerAuditCandidate.dispositionCapability}`)}
+                    </span>
+                  )}
                 </div>
               )}
               <div style={{ fontSize: 11, color: '#64748b' }}>
@@ -1330,9 +1477,9 @@ export function SessionSettingsDialog({
         </div>
       )}
 
-      {isAuditMode && !supervisionAuditMode && (
+      {isAuditMode && !peerAuditTargetName && (
         <div style={{ color: '#fbbf24', fontSize: 12 }}>
-          {t('session.supervision.validation.auditModeRequired')}
+          {t('session.supervision.validation.auditTargetRequired')}
         </div>
       )}
     </div>
@@ -1350,11 +1497,11 @@ export function SessionSettingsDialog({
     if (supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim(), supervisionPreset.trim() || undefined)) return false;
     if (supervisionTimeout <= 0) return false;
     if (isAuditMode) {
-      if (!supervisionAuditMode || !isSupportedSupervisionAuditMode(supervisionAuditMode)) return false;
-      if (supervisionAuditLoops <= 0) return false;
+      if (!peerAuditTargetName || !selectedPeerAuditCandidate?.eligible || !peerAuditTargetConfirmed) return false;
+      if (supervisionAuditLoops < 0) return false;
     }
     return true;
-  }, [hasSupervision, isAuditMode, isSupportedTransport, supervisionAuditLoops, supervisionAuditMode, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
+  }, [hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetConfirmed, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

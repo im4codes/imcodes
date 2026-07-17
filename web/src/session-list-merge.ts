@@ -35,9 +35,12 @@ import {
  */
 export interface IncomingSessionListEntry {
   name: string;
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
   project: string;
   role: string;
   agentType: string;
+  providerId?: string;
   agentVersion?: string;
   state: string;
   error?: string | null;
@@ -138,9 +141,12 @@ export function mergeSessionListEntry(
 
   return {
     name: incoming.name,
+    sessionInstanceId: incoming.sessionInstanceId ?? existing?.sessionInstanceId,
+    runtimeEpoch: incoming.runtimeEpoch ?? existing?.runtimeEpoch,
     project: incoming.project,
     role: incoming.role as SessionInfo['role'],
     agentType: incoming.agentType,
+    providerId: incoming.providerId ?? existing?.providerId,
     agentVersion: incoming.agentVersion,
     state: incoming.state as SessionInfo['state'],
     error: incoming.state === 'error'

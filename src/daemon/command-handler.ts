@@ -9,7 +9,7 @@ import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import type { AliasSendAudit, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
+import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
@@ -199,6 +199,13 @@ import type {
 import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
 import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import {
+  PEER_AUDIT_MESSAGES,
+  decodePeerAuditCancelCommand,
+  decodePeerAuditListCandidatesCommand,
+  decodePeerAuditQuickStartCommand,
+} from '../../shared/peer-audit.js';
+import { peerAuditService } from './peer-audit-service.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -1407,6 +1414,15 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
       void handleSessionCancel(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES:
+      void handlePeerAuditListCandidates(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START:
+      void handlePeerAuditQuickStart(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.PEER_AUDIT_CANCEL:
+      handlePeerAuditCancel(cmd, serverLink);
+      break;
     case DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES:
       void handleSessionExecutionClones(cmd, serverLink);
       break;
@@ -1807,6 +1823,42 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
         logger.warn({ type: cmd.type }, 'Unknown web command type');
       }
   }
+}
+
+async function handlePeerAuditListCandidates(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const { type: _type, ...payload } = cmd;
+  const decoded = decodePeerAuditListCandidatesCommand(payload);
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const result = decoded.ok
+    ? peerAuditService.listCandidates(decoded.value)
+    : { ok: false as const, error: decoded.error };
+  try {
+    serverLink.send({ type: PEER_AUDIT_MESSAGES.CANDIDATES, commandId, ...result });
+  } catch { /* reconnect-safe: Web may retry the idempotent command */ }
+}
+
+async function handlePeerAuditQuickStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const { type: _type, ...payload } = cmd;
+  const decoded = decodePeerAuditQuickStartCommand(payload);
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const result = decoded.ok
+    ? await peerAuditService.startQuick(decoded.value)
+    : { ok: false as const, error: decoded.error };
+  try {
+    serverLink.send({ type: PEER_AUDIT_MESSAGES.QUICK_RESULT, commandId, ...result });
+  } catch { /* reconnect-safe result event remains authoritative */ }
+}
+
+function handlePeerAuditCancel(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const { type: _type, ...payload } = cmd;
+  const decoded = decodePeerAuditCancelCommand(payload);
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const result = decoded.ok
+    ? peerAuditService.cancel(decoded.value)
+    : { ok: false as const, error: decoded.error };
+  try {
+    serverLink.send({ type: PEER_AUDIT_MESSAGES.CANCEL_RESULT, commandId, ...result });
+  } catch { /* result timeline event converges after reconnect */ }
 }
 
 async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -2226,6 +2278,7 @@ function cancelTransportTurnNow(
   void (async () => {
     try {
       supervisionAutomation.cancelSession(sessionName);
+      peerAuditService.invalidateCancel(sessionName);
       await stopRuntime.cancel();
       // Mark session for fresh start so daemon restart doesn't resume the
       // stuck conversation.
@@ -2292,10 +2345,43 @@ export function stopSessionNow(sessionName: string): boolean {
 /** Agents with sandboxed file access — temp files must be in project dir. */
 const SANDBOXED_AGENTS = new Set(['gemini']);
 
-async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
+function resolveProcessSendOptions(sessionName: string, agentType: string): { cwd: string } | undefined {
   const record = getSession(sessionName);
   const cwd = SANDBOXED_AGENTS.has(agentType) ? record?.projectDir : undefined;
-  const opts = cwd ? { cwd } : undefined;
+  return cwd ? { cwd } : undefined;
+}
+
+/**
+ * Peer-audit seam: hold the per-session stdin mutex across `fn`.
+ *
+ * The peer-audit injector needs its final-boundary revalidation and its write
+ * to be one atomic critical section, so it must acquire the same mutex that
+ * serializes ordinary process sends rather than a private one.
+ */
+export async function runWithProcessSessionSendLock<T>(sessionName: string, fn: () => Promise<T>): Promise<T> {
+  const release = await getMutex(sessionName).acquire();
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Peer-audit seam: inject verbatim text into a process session with none of the
+ * ordinary send's side effects — no user.message timeline event, no history,
+ * no memory recall/injection, no advisory context, no path rewriting.
+ *
+ * Unlike sendShellAwareCommand this never interprets a leading `!` as the
+ * shell-mode escape: peer-audit briefs are injected as agent input only.
+ * Callers must already hold runWithProcessSessionSendLock.
+ */
+export async function prepareProcessSessionPrivateWriter(sessionName: string): Promise<(text: string) => void> {
+  return preparePrivateInputWriter(sessionName);
+}
+
+async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
+  const opts = resolveProcessSendOptions(sessionName, agentType);
   if (text.startsWith('!')) {
     const shellCmd = text.slice(1).trimStart();
     if (agentType === 'codex') {
@@ -4459,6 +4545,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       return;
     }
     supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
+    peerAuditService.invalidateQueuedEdit(sessionName);
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'edit_queued_message_before');
     try {
       queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text);
@@ -4511,6 +4598,7 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
+    peerAuditService.invalidateQueuedEdit(sessionName);
     try {
       queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
     } catch (err) {

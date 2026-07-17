@@ -69,6 +69,7 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: upsertSessionMock,
   getSession: getSessionMock,
   removeSession: removeSessionMock,
+  createRuntimeEpoch: vi.fn(() => 'runtime-epoch-new'),
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({

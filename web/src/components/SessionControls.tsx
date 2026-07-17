@@ -1,4 +1,13 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { PeerAuditAuditorChooser } from '../peerAudit/PeerAuditAuditorChooser.js';
+import { usePeerAuditController } from '../peerAudit/usePeerAuditController.js';
+import type {
+  PeerAuditAdapter,
+  PeerAuditRememberedTarget,
+} from '../peerAudit/types.js';
+import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
+import { createStubPeerAuditAdapter } from '../peerAudit/stubAdapter.js';
+import { resolvePeerAuditNormalizedModelId, resolvePeerAuditProviderFamily } from '@shared/peer-audit.js';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, RefObject } from 'preact';
@@ -85,7 +94,6 @@ import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
-  parseSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
   SUPERVISION_MODE,
   type SessionSupervisionSnapshot,
@@ -191,6 +199,10 @@ interface Props {
     qwenModel?: string | null;
     requestedModel?: string | null;
     activeModel?: string | null;
+    sessionInstanceId?: string | null;
+    runtimeEpoch?: string | null;
+    providerId?: string | null;
+    agentType?: string | null;
     modelDisplay?: string | null;
     executionTemplateEligible?: boolean;
     executionTemplateIneligibleReason?: string;
@@ -960,6 +972,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const machinePasteSuppressRef = useRef(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
+  const [peerAuditOpen, setPeerAuditOpen] = useState(false);
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -1464,6 +1477,100 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
   const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
+  /**
+   * Peer Audit requires daemon-authoritative identity (sessionInstanceId +
+   * runtimeEpoch) sourced from session_list / subsession.sync. Until the
+   * projection exposes those fields, Peer Audit MUST be disabled — never
+   * substitute session name as identity.
+   *
+   * Main and sub-session projections both carry these fields. The fallback
+   * lookup exists only for callers whose compact session projection has not
+   * arrived yet; absence still hides the control rather than guessing.
+   */
+  const auditedSubSession = subSessionId
+    ? subSessions?.find((session) => session.sessionName === activeSession?.name)
+    : undefined;
+  const auditedIdentitySource = auditedSubSession ?? activeSession;
+  const auditedSessionIdentity = useMemo<null | {
+    sessionInstanceId: string;
+    runtimeEpoch: string;
+  }>(() => auditedIdentitySource?.sessionInstanceId && auditedIdentitySource.runtimeEpoch
+    ? { sessionInstanceId: auditedIdentitySource.sessionInstanceId, runtimeEpoch: auditedIdentitySource.runtimeEpoch }
+    : null, [auditedIdentitySource?.sessionInstanceId, auditedIdentitySource?.runtimeEpoch]);
+  const auditedSessionName = activeSession?.name ?? null;
+  const auditedModel = useMemo(() => auditedIdentitySource ? {
+    normalizedModelId: resolvePeerAuditNormalizedModelId({
+      activeModel: auditedIdentitySource.activeModel,
+      requestedModel: auditedIdentitySource.requestedModel,
+      configuredModel: 'modelDisplay' in auditedIdentitySource ? auditedIdentitySource.modelDisplay : undefined,
+    }),
+    providerFamily: resolvePeerAuditProviderFamily({
+      providerId: auditedIdentitySource.providerId,
+      agentType: 'agentType' in auditedIdentitySource ? auditedIdentitySource.agentType : undefined,
+    }),
+  } : null, [auditedIdentitySource]);
+  const rememberedTarget: PeerAuditRememberedTarget | null = useMemo(() => {
+    const targetName = supervisionSnapshot?.auditTargetSessionName;
+    const fingerprint = supervisionSnapshot?.auditTargetFingerprint;
+    if (!targetName || !fingerprint) return null;
+    const subTarget = subSessions?.find((session) => session.sessionName === targetName);
+    // Peer auditors are ordinary direct child/sibling sub-sessions. A main
+    // session from the slim global list is never locally inferred eligible.
+    const target = subTarget;
+    if (!target?.sessionInstanceId || !target.runtimeEpoch || target.sessionInstanceId !== fingerprint.sessionInstanceId) return null;
+    const liveModel = resolvePeerAuditNormalizedModelId({
+      activeModel: target.activeModel,
+      requestedModel: target.requestedModel,
+      configuredModel: 'modelDisplay' in target ? target.modelDisplay : undefined,
+    });
+    const liveProvider = resolvePeerAuditProviderFamily({
+      providerId: target.providerId,
+      agentType: 'agentType' in target ? target.agentType : ('type' in target ? target.type : undefined),
+    });
+    if (liveModel !== fingerprint.normalizedModelId || liveProvider !== fingerprint.providerFamily) return null;
+    return {
+      sessionName: targetName,
+      sessionInstanceId: target.sessionInstanceId,
+      runtimeEpoch: target.runtimeEpoch,
+      normalizedModelId: liveModel,
+      providerFamily: liveProvider,
+      fingerprint: JSON.stringify(fingerprint),
+    };
+  }, [supervisionSnapshot, subSessions]);
+  const rememberedTargetIsLocallyUsable = Boolean(
+    rememberedTarget
+    && auditedModel
+    && rememberedTarget.sessionName !== auditedSessionName
+    && rememberedTarget.normalizedModelId !== 'unknown'
+    && auditedModel.normalizedModelId !== 'unknown'
+    && rememberedTarget.providerFamily !== 'unknown'
+    && auditedModel.providerFamily !== 'unknown'
+    && rememberedTarget.normalizedModelId !== auditedModel.normalizedModelId,
+  );
+  const peerAuditAdapter = useMemo<PeerAuditAdapter>(
+    () => ws ? createWsPeerAuditAdapter(ws) : createStubPeerAuditAdapter(),
+    [ws],
+  );
+  const peerAuditApi = usePeerAuditController({
+    adapter: peerAuditAdapter,
+    auditedSessionIdentity,
+    auditedSessionName,
+    auditedModel,
+    rememberedTarget,
+    hasUserConsentedTo: (fingerprint) => localStorage.getItem(`peerAuditConsent:${auditedSessionName}`) === fingerprint,
+    recordUserConsent: (fingerprint) => localStorage.setItem(`peerAuditConsent:${auditedSessionName}`, fingerprint),
+  });
+  // Open the chooser/result flow when the icon button is clicked.
+  useEffect(() => {
+    if (peerAuditOpen && peerAuditApi.state.kind === 'idle' && auditedSessionIdentity && auditedSessionName) {
+      peerAuditApi.start({
+        auditedSessionName,
+        auditedSessionIdentity,
+        rememberedTarget,
+        auditedModel,
+      });
+    }
+  }, [peerAuditOpen, peerAuditApi]);
   const canQuickControlSupervision = !!(
     activeSession
     && serverId
@@ -2100,19 +2207,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    const rawSupervision = currentTransportConfig && typeof currentTransportConfig === 'object' && !Array.isArray(currentTransportConfig)
-      ? (currentTransportConfig.supervision as Record<string, unknown> | undefined)
-      : undefined;
+    // Compact Auto enablement may reuse only a daemon-projected, locally
+    // current remembered peer. A name-only/stale/same-session fingerprint is
+    // repair UI, not authority to silently enable automatic auditing.
+    if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !rememberedTargetIsLocallyUsable) {
+      setAutoOpen(false);
+      onSettings?.();
+      return;
+    }
+
     let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
     if (supervisionSnapshot) {
-      const auditCandidate = nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && rawSupervision
-        ? parseSessionSupervisionSnapshot({ ...rawSupervision, mode: SUPERVISION_MODE.SUPERVISED_AUDIT })
-        : null;
-      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !auditCandidate) {
-        setAutoOpen(false);
-        onSettings?.();
-        return;
-      }
       nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
     } else {
       const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
@@ -2151,7 +2256,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     hasInvalidSupervisionConfig,
     onSettings,
     persistTransportConfig,
-    quickSupervisionMode,
+    rememberedTarget,
+    rememberedTargetIsLocallyUsable,
     serverId,
     showSendWarning,
     supervisionSnapshot,
@@ -4326,8 +4432,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           })}
         </div>}
 
+        {/* Peer Audit quick action — must remain visible while Auto is off and
+            shares the supervision-target gate so it never appears for non-target
+            sessions. Auto's mode/color dot is intentionally untouched below.
+            The icon is hidden entirely until authoritative sessionInstanceId +
+            runtimeEpoch are present (no name fallback). */}
         {canQuickControlSupervision && (
           <div class="shortcuts-model" ref={autoRef}>
+            {auditedSessionIdentity && (
+              <button
+                class="shortcut-btn shortcut-btn-peer-audit"
+                data-testid="peer-audit-icon"
+                onClick={() => setPeerAuditOpen(true)}
+                disabled={disabled || peerAuditOpen}
+                title={t('peerAuditQuick.tooltip')}
+                aria-label={t('peerAuditQuick.iconLabel')}
+                aria-haspopup="dialog"
+              >
+                <span aria-hidden="true">{t('peerAuditQuick.iconLabel').slice(0, 1)}</span>
+              </button>
+            )}
             <button
               class="shortcut-btn shortcut-btn-auto"
               onClick={() => setAutoOpen((open) => !open)}
@@ -4379,6 +4503,67 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 )}
               </div>
             )}
+          </div>
+        )}
+
+        {peerAuditOpen && auditedSessionIdentity && auditedSessionName && (
+          <div
+            class="peer-audit-overlay"
+            data-testid="peer-audit-overlay"
+            role="presentation"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) setPeerAuditOpen(false);
+            }}
+          >
+            <div
+              class="peer-audit-modal"
+              data-testid="peer-audit-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-busy={peerAuditApi.state.kind === 'starting' || peerAuditApi.state.kind === 'pending' ? 'true' : 'false'}
+            >
+              {peerAuditApi.state.kind === 'pending' && (
+                <div data-testid="peer-audit-pending" aria-live="polite">
+                  {t(`peerAuditQuick.pending_${peerAuditApi.state.phase}`, { defaultValue: t('peerAuditQuick.pending') })}
+                  <button type="button" onClick={() => peerAuditApi.cancelPending()}>
+                    {t('peerAuditQuick.cancel_pending')}
+                  </button>
+                </div>
+              )}
+              {peerAuditApi.state.kind === 'result' && (
+                <div data-testid="peer-audit-result" aria-live="polite">
+                  <h3>{t('peerAuditResult.title')}</h3>
+                  <div>{t('peerAuditResult.attributionAuditor', { auditor: peerAuditApi.state.auditorLabel })}</div>
+                  <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(peerAuditApi.state.elapsedMs / 1000) })}</div>
+                  <div>{t(`peerAuditQuick.result_${peerAuditApi.state.verdict.toLowerCase()}`)}</div>
+                  <button type="button" onClick={() => { peerAuditApi.acknowledgeResult(); setPeerAuditOpen(false); }}>
+                    {t('peerAuditQuick.acknowledge')}
+                  </button>
+                </div>
+              )}
+              {peerAuditApi.state.kind === 'error' && (
+                <div data-testid="peer-audit-error" aria-live="polite">
+                  <div>{t('peerAuditQuick.result_error', { message: peerAuditApi.state.message })}</div>
+                  <button type="button" onClick={() => { peerAuditApi.acknowledgeResult(); setPeerAuditOpen(false); }}>
+                    {t('peerAuditQuick.acknowledge')}
+                  </button>
+                </div>
+              )}
+              {(peerAuditApi.state.kind === 'idle'
+                || peerAuditApi.state.kind === 'loading'
+                || peerAuditApi.state.kind === 'chooser'
+                || peerAuditApi.state.kind === 'consent'
+                || peerAuditApi.state.kind === 'starting') && (
+                <PeerAuditAuditorChooser
+                  api={peerAuditApi}
+                  onClose={() => {
+                    if (peerAuditApi.state.kind === 'chooser') peerAuditApi.cancelChooser();
+                    if (peerAuditApi.state.kind === 'consent') peerAuditApi.cancelConsent();
+                    setPeerAuditOpen(false);
+                  }}
+                />
+              )}
+            </div>
           </div>
         )}
 

@@ -385,6 +385,27 @@ describe('TransportSessionRuntime', () => {
       expect(restarted.pendingCount).toBe(1);
     });
 
+    it('scrubs orphaned peer-audit rows before rehydrate while preserving ordinary queued work', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send('ordinary survives', 'ordinary-restart')).toBe('queued');
+      expect(runtime.send('private audit brief', 'audit-restart', undefined, undefined, {
+        peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: 'attempt_hash' },
+      })).toBe('queued');
+
+      const { restartMock, restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: 'ordinary-restart', text: 'ordinary survives' },
+      ]);
+      expect(restarted.drainPendingIfIdle('peer-audit-orphan-test')).toBe(true);
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect(restartMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        assembledMessage: expect.stringContaining('ordinary survives'),
+      }));
+      expect(JSON.stringify(restartMock.provider.send.mock.calls)).not.toContain('private audit brief');
+    });
+
     it('does NOT recover a handoff_inflight entry (may already have executed at the provider)', async () => {
       runtime.send('first');
       await waitForProviderSendCount(mock.provider, 1);
@@ -2623,7 +2644,7 @@ ${PREFERENCE_CONTEXT_END}`;
   });
 
   it('onComplete sets status to idle and appends to history', () => {
-    runtime.send('go');
+    runtime.send('go', 'authoritative-turn-1');
     mock.fireComplete('sess-1');
 
     expect(runtime.getStatus()).toBe('idle');
@@ -2631,6 +2652,12 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(h).toHaveLength(2);
     expect(h[0].role).toBe('user');
     expect(h[1].role).toBe('assistant');
+    expect(runtime.getDiagnosticSnapshot().completedTurn).toMatchObject({
+      taskCommandId: 'authoritative-turn-1',
+      assistantText: 'done',
+      completedEventId: 'transport:deck_test_brain:msg-1',
+      generationOrEpoch: 1,
+    });
   });
 
   it('onError sets status to error', () => {

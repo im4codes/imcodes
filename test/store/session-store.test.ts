@@ -208,6 +208,73 @@ describe('session-store', () => {
       expect(getSession('c')?.state).toBe('stopped');
       expect(getSession('c')?.restarts).toBe(2);
     });
+
+    it('migrates missing identities once and preserves them across daemon reload', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_legacy_brain: {
+            name: 'deck_legacy_brain', projectName: 'legacy', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/legacy',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const firstStore = await import('../../src/store/session-store.js');
+      await firstStore.loadStore();
+      const first = firstStore.getSession('deck_legacy_brain');
+      expect(first?.sessionInstanceId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(first?.runtimeEpoch).toMatch(/^[0-9a-f-]{36}$/);
+      await firstStore.flushStore();
+
+      vi.resetModules();
+      const reloadedStore = await import('../../src/store/session-store.js');
+      await reloadedStore.loadStore();
+      expect(reloadedStore.getSession('deck_legacy_brain')).toMatchObject({
+        sessionInstanceId: first?.sessionInstanceId,
+        runtimeEpoch: first?.runtimeEpoch,
+      });
+    });
+  });
+
+  it('preserves logical identity on updates and changes it after true delete/recreate', async () => {
+    const { upsertSession, removeSession, getSession } = await import('../../src/store/session-store.js');
+    const base = {
+      name: 'deck_identity_brain', projectName: 'identity', projectDir: '/tmp/identity',
+      role: 'brain' as const, agentType: 'codex-sdk', state: 'idle' as const,
+      restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    };
+    upsertSession(base);
+    const firstId = getSession(base.name)?.sessionInstanceId;
+
+    upsertSession({ ...base, activeModel: 'gpt-5', state: 'running' });
+    expect(getSession(base.name)?.sessionInstanceId).toBe(firstId);
+
+    removeSession(base.name);
+    upsertSession({ ...base, sessionInstanceId: firstId });
+    expect(getSession(base.name)?.sessionInstanceId).not.toBe(firstId);
+  });
+
+  it('rotates runtimeEpoch only when runtime authority is replaced', async () => {
+    const { upsertSession, getSession } = await import('../../src/store/session-store.js');
+    const base = {
+      name: 'deck_runtime_brain', projectName: 'runtime', projectDir: '/tmp/runtime',
+      role: 'brain' as const, agentType: 'codex-sdk', runtimeType: 'transport' as const,
+      providerSessionId: 'provider-1', state: 'idle' as const,
+      restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    };
+    upsertSession(base);
+    const firstEpoch = getSession(base.name)?.runtimeEpoch;
+
+    upsertSession({ ...getSession(base.name)!, activeModel: 'gpt-5', state: 'running' });
+    expect(getSession(base.name)?.runtimeEpoch).toBe(firstEpoch);
+
+    upsertSession({ ...getSession(base.name)!, providerSessionId: 'provider-2', state: 'idle' });
+    const replacedEpoch = getSession(base.name)?.runtimeEpoch;
+    expect(replacedEpoch).not.toBe(firstEpoch);
+
+    upsertSession({ ...getSession(base.name)!, state: 'running' });
+    expect(getSession(base.name)?.runtimeEpoch).toBe(replacedEpoch);
   });
 
   it('does not persist known leaked e2e sessions to sessions.json', async () => {

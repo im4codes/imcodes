@@ -3,6 +3,7 @@
  *
  * POST /notify  { event: "idle"|"notification"|"tool_start"|"tool_end", session, ... }
  * POST /send    { from, to, message, files?, context?, depth? }
+ * POST /audit-reply  PeerAuditReplyEnvelope (sender bound by x-imcodes-session)
  *
  * Port selection:
  *   1. Load persisted port from ~/.imcodes/hook-port (remembered across restarts)
@@ -24,6 +25,12 @@ import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
 import { dispatchHookSend } from './send-tool.js';
 import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
+import {
+  containsLegacyAuditControlMarker,
+  PEER_AUDIT_REPLY_ERRORS,
+  PEER_AUDIT_REPLY_TOTAL_BYTES,
+} from '../../shared/peer-audit.js';
+import { submitPeerAuditReply } from './peer-audit-reply-ingress.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -315,6 +322,10 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 501, body: { ok: false, error: 'context is not yet supported — send plain message only' } };
   }
 
+  if (containsLegacyAuditControlMarker(message)) {
+    return { status: 400, body: { ok: false, error: 'peer_audit_control_requires_dedicated_ingress' } };
+  }
+
   // Circuit breaker: depth limit
   if (depth >= MAX_SEND_DEPTH) {
     return { status: 429, body: { ok: false, error: 'depth limit exceeded' } };
@@ -457,7 +468,7 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
 
 // ─── Body Parser ─────────────────────────────────────────────────────────────
 
-function readBody(req: http.IncomingMessage): Promise<string> {
+function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
     let size = 0;
@@ -465,7 +476,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on('data', (chunk: Buffer) => {
       if (rejected) return;
       size += chunk.length;
-      if (size > MAX_BODY_SIZE) {
+      if (size > maxBytes) {
         rejected = true;
         reject(new Error('body too large'));
         req.resume(); // drain remaining data without storing
@@ -495,6 +506,35 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     }
 
     const url = req.url;
+
+    if (url === '/audit-reply') {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = await readBody(req, PEER_AUDIT_REPLY_TOTAL_BYTES);
+        const senderHeader = req.headers['x-imcodes-session'];
+        const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const result = await submitPeerAuditReply({ rawBody: body, senderSessionName });
+        const status = result.ok
+          ? 200
+          : result.error === PEER_AUDIT_REPLY_ERRORS.RATE_LIMITED
+            ? 429
+            : result.error === 'ingress_unavailable'
+              ? 503
+              : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'oversize' : 'malformed' }));
+      }
+      return;
+    }
 
     if (url === '/list') {
       try {

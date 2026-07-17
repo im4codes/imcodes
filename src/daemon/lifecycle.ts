@@ -15,6 +15,7 @@ import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveE
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import { peerAuditService } from './peer-audit-service.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { startHookServer, drainQueue } from './hook-server.js';
@@ -725,6 +726,8 @@ export async function startup(): Promise<DaemonContext> {
             serverLink.send({
               type: 'subsession.sync',
               id,
+              sessionInstanceId: session.sessionInstanceId ?? null,
+              runtimeEpoch: session.runtimeEpoch ?? null,
               // Including state here fixes "sidebar sub-session dot stuck
               // gray after reconnect" — see buildSubSessionSync for the
               // equivalent fix on the regular sync path.
@@ -806,6 +809,7 @@ export async function startup(): Promise<DaemonContext> {
       void drainQueue(e.sessionId);
     }
   });
+  peerAuditService.init();
 
   const backfillLiveContextFromTimeline = async (): Promise<void> => {
     const startedAt = Date.now();
@@ -1316,6 +1320,11 @@ async function autoReconnectProviders(): Promise<void> {
 /** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
 export async function shutdown(exitCode = 0): Promise<void> {
   logger.info('Daemon shutting down');
+
+  // Peer-audit attempts are intentionally not restart-resumable. Cancel
+  // deadlines/queued dispatches and close the dedicated reply ingress before
+  // timeline and queue stores are drained.
+  peerAuditService.shutdown();
 
   // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
   if ((BACKEND as string) === 'conpty') {

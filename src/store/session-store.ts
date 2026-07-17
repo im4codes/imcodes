@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
+import { randomUUID } from 'node:crypto';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
@@ -26,6 +27,19 @@ type RuntimeType = 'process' | 'transport';
 
 export interface SessionRecord extends SessionContextBootstrapState {
   name: string;
+  /**
+   * Stable identity for this logical session record. It survives daemon and
+   * runtime restarts, but is regenerated after a true remove/recreate.
+   * Optional at the type boundary so legacy snapshots and callers can be
+   * migrated by the authoritative store.
+   */
+  sessionInstanceId?: string;
+  /**
+   * Identity of the current process/provider authority. It changes when that
+   * authority is replaced, while ordinary state/model updates preserve it.
+   * Optional only for legacy/read compatibility; authoritative upserts fill it.
+   */
+  runtimeEpoch?: string;
   projectName: string;
   role: 'brain' | `w${number}`;
   agentType: string;
@@ -241,6 +255,14 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
 function reconcilePersistedSessions(): boolean {
   let mutated = false;
   for (const session of Object.values(store.sessions)) {
+    if (!isUsableSessionIdentity(session.sessionInstanceId)) {
+      session.sessionInstanceId = createSessionInstanceId();
+      mutated = true;
+    }
+    if (!isUsableSessionIdentity(session.runtimeEpoch)) {
+      session.runtimeEpoch = createRuntimeEpoch();
+      mutated = true;
+    }
     if (!session.runtimeType && typeof session.agentType === 'string') {
       session.runtimeType = getSessionRuntimeType(session.agentType);
       mutated = true;
@@ -343,6 +365,33 @@ export function getSession(name: string): SessionRecord | undefined {
   return store.sessions[name];
 }
 
+function isUsableSessionIdentity(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+export function createSessionInstanceId(): string {
+  return randomUUID();
+}
+
+export function createRuntimeEpoch(): string {
+  return randomUUID();
+}
+
+function didRuntimeAuthorityChange(existing: SessionRecord, incoming: SessionRecord): boolean {
+  if (incoming.runtimeType && existing.runtimeType && incoming.runtimeType !== existing.runtimeType) return true;
+
+  // A pane/provider route is the concrete runtime authority exposed by the
+  // current process and transport implementations. A newly discovered or
+  // changed handle therefore creates a new epoch; metadata-only writes do not.
+  if (incoming.paneId && incoming.paneId !== existing.paneId) return true;
+  if (incoming.providerSessionId && incoming.providerSessionId !== existing.providerSessionId) return true;
+
+  // tmux respawn-pane retains its pane id. The restart counter is the explicit
+  // authority-replacement signal for that path.
+  if (incoming.restarts > existing.restarts) return true;
+  return false;
+}
+
 export function upsertSession(record: SessionRecord): void {
   const existing = store.sessions[record.name];
   // Sticky execution-clone marker (P0). `upsertSession` REPLACES the whole
@@ -364,8 +413,24 @@ export function upsertSession(record: SessionRecord): void {
   const normalizedError = record.state === 'error' && typeof record.error === 'string' && record.error.trim()
     ? record.error.trim()
     : undefined;
+  // The store, not an incoming rebuild/sync payload, owns logical identity.
+  // Persisted hydration bypasses upsert and keeps its stored id; every truly
+  // absent name is therefore a new logical instance even if a stale caller
+  // accidentally carries the deleted record's old id.
+  const sessionInstanceId = existing?.sessionInstanceId ?? createSessionInstanceId();
+  const runtimeAuthorityChanged = existing ? didRuntimeAuthorityChange(existing, record) : false;
+  const runtimeEpoch = !existing
+    ? createRuntimeEpoch()
+    : isUsableSessionIdentity(record.runtimeEpoch)
+    && record.runtimeEpoch !== existing.runtimeEpoch
+    ? record.runtimeEpoch
+    : !runtimeAuthorityChanged && isUsableSessionIdentity(existing.runtimeEpoch)
+      ? existing.runtimeEpoch
+      : createRuntimeEpoch();
   store.sessions[record.name] = {
     ...record,
+    sessionInstanceId,
+    runtimeEpoch,
     ...(normalizedError ? { error: normalizedError } : { error: undefined }),
     ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
     updatedAt: Date.now(),

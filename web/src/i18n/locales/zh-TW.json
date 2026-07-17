@@ -714,14 +714,6 @@
       "presetLabel": "預設（env 套餐）",
       "presetHelp": "讓監督流量走某個預設的 endpoint（獨立的 base URL、API key 與固定模型）。預設在共享上下文面板裡管理。",
       "presetNone": "（無）",
-      "auditMode": {
-        "audit": "稽核",
-        "review": "覆核",
-        "audit_plan": "稽核→規劃",
-        "review_plan": "覆核→規劃",
-        "audit_review_plan": "稽核→覆核→規劃"
-      },
-      "selectAuditMode": "選擇稽核模式",
       "maxAuditLoops": "最大稽核循環",
       "maxAutoContinueStreak": "同類自動繼續上限",
       "maxAutoContinueStreakHelp": "同一種 continue 類型連續達到此次數後停止自動繼續。0 表示不限制。",
@@ -736,7 +728,7 @@
       "summaryContinueLimits": "繼續限制：同類 {{streak}} · 硬上限 {{total}}",
       "summaryCustomInstructions": "自訂提示詞：{{value}}",
       "summaryCustomInstructionsSet": "已設定",
-      "summaryAudit": "稽核：{{auditMode}} · 循環 {{loops}} 次",
+      "summaryAudit": "對等稽核者：{{auditor}} · 循環 {{loops}} 次",
       "summaryMeta": "提示 {{promptVersion}}，修復 {{repairVersion}}，解析重試 {{parseRetries}}，任務執行 {{taskRunVersion}}",
       "disabledHint": "只有 transport 工作階段支援監督。",
       "unsupported": "process 工作階段不支援監督設定。",
@@ -744,10 +736,9 @@
         "backendRequired": "請選擇監督後端。",
         "modelRequired": "請選擇或輸入監督模型。",
         "modelInvalid": "{{backend}} 的模型無效。",
-        "auditModeRequired": "請選擇稽核模式。"
+        "auditTargetRequired": "請選擇並確認合格的對等稽核者。"
       },
       "modeLabel": "模式",
-      "auditModeLabel": "稽核模式",
       "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。",
       "quickLabel": "自動",
       "quickTitle": "自動模式"
@@ -2708,5 +2699,59 @@
     "rename_invalid": "請輸入 1–120 個字元的名稱，且不可包含控制字元。",
     "revoke": "撤銷",
     "revoke_confirm": "撤銷這台機器?撤銷後將無法再控制,需要重新註冊。"
+  },
+  "peerAuditQuick": {
+    "iconLabel": "對等稽核",
+    "tooltip": "對最近一次完成的會話執行一次性對等稽核",
+    "chooserTitle": "選擇對等稽核者",
+    "consentTitle": "確認跨廠商資料外送",
+    "consentBody": "稽核摘要將傳送給 {{auditor}},它在另一個模型廠商上執行。是否繼續?",
+    "consentConfirm": "傳送給 {{auditor}}",
+    "selectionWillPersist": "此稽核者也會被記住，用於此工作階段後續的自動稽核。",
+    "noCandidate": "本會話群組內沒有可用的稽核者。",
+    "ineligibleCollapsed": "{{count}} 個不合格",
+    "providerBadge": "廠商:{{provider}}",
+    "chooserReason": {
+      "missing_target": "尚未記憶稽核者。請選擇一個以開始。",
+      "self_target": "記憶的稽核者是當前會話。請選擇其他會話。",
+      "stale_target": "記憶的稽核者已不再合格。請重新選擇。",
+      "same_model_remembered": "記憶的稽核者使用相同模型。請選擇不同模型或明確確認。",
+      "unknown_model_remembered": "記憶的稽核者模型未知。請選擇後繼續。",
+      "no_candidate": "目前沒有可用的稽核者。",
+      "model_changed_since_click": "被稽核會話在你開啟後模型已變化。請重新選擇。",
+      "config_repair": "儲存的稽核者需要修復後才能使用。"
+    },
+    "self_target": "本會話不能稽核自己。",
+    "not_direct_child": "稽核者不是一般的直接子會話。",
+    "cross_project": "稽核者不在同一專案內。",
+    "execution_clone": "執行複製不能作為稽核者。",
+    "not_reply_capable": "稽核者不能回覆。",
+    "wrong_state": "稽核者不在就緒狀態。",
+    "unknown_identity": "稽核者身分尚未得到權威確認。",
+    "disposition": {
+      "sent": "已傳送",
+      "queued": "已加入佇列",
+      "sent_unrevocable": "已傳送(不可撤回)"
+    },
+    "pending": "對等稽核進行中…",
+    "pending_preparing": "正在準備對等稽核…",
+    "pending_sent": "稽核已傳送給對等工作階段…",
+    "pending_queued": "稽核已排隊，等待對等工作階段閒置…",
+    "pending_sent_unrevocable": "稽核已傳送給程序工作階段（不可撤回）…",
+    "pending_waiting_reply": "正在等待對等稽核回覆…",
+    "result_pass": "對等稽核通過。",
+    "result_rework": "對等稽核返回 REWORK。",
+    "result_timeout": "對等稽核逾時。",
+    "result_unavailable": "稽核者不可用。",
+    "result_cancelled": "對等稽核已取消。",
+    "result_error": "對等稽核失敗:{{message}}",
+    "acknowledge": "關閉",
+    "cancel_pending": "取消"
+  },
+  "peerAuditResult": {
+    "title": "對等稽核結果",
+    "attributionAuditor": "審核者:{{auditor}}",
+    "elapsedMs": "耗時 {{seconds}} 秒",
+    "findingsPreview": "稽核發現"
   }
 }

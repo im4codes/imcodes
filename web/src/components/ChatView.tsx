@@ -51,6 +51,7 @@ import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -3232,6 +3233,48 @@ const ChatEvent = memo(function ChatEvent({
         </div>
       );
     }
+
+    case 'peer_audit.result': {
+      const outcome = String(event.payload.outcome ?? 'target_unavailable');
+      const outcomeKey = outcome === 'pass'
+        ? 'result_pass'
+        : outcome === 'rework'
+          ? 'result_rework'
+          : outcome === 'timeout'
+            ? 'result_timeout'
+            : outcome === 'cancelled'
+              ? 'result_cancelled'
+              : 'result_unavailable';
+      const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
+      const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
+      const findingsPreview = typeof event.payload.findingsPreview === 'string'
+        ? event.payload.findingsPreview
+        : '';
+      const disposition = isPeerAuditRuntimeDisposition(event.payload.disposition)
+        ? event.payload.disposition
+        : null;
+      return (
+        <section class="chat-event chat-system peer-audit-result-card" data-event-id={event.eventId}>
+          <strong>{t('peerAuditResult.title')}</strong>
+          <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
+          <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
+          <div>{t(`peerAuditQuick.${outcomeKey}`)}</div>
+          {disposition && (
+            <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
+          )}
+          {findingsPreview && (
+            <details>
+              <summary>{t('peerAuditResult.findingsPreview')}</summary>
+              <ChatMarkdown text={findingsPreview} />
+            </details>
+          )}
+          <ChatTime ts={event.ts} />
+        </section>
+      );
+    }
+
+    case 'peer_audit.status':
+      return null;
 
     case 'tool.call': {
       const toolName = String(event.payload.tool ?? 'tool');

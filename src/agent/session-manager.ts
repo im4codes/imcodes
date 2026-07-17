@@ -16,6 +16,9 @@ import { PROVIDER_ERROR_CODES, type SessionInfoUpdate } from './transport-provid
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
+  PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD,
+} from '../../shared/peer-audit.js';
+import {
   getSession,
   upsertSession,
   removeSession,
@@ -1525,6 +1528,9 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.clearInputs = [
         { source: 'transport-runtime', reason: 'clear', count: 0 },
       ];
+      if (activity.completedTurn) {
+        payload[PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD] = activity.completedTurn;
+      }
       const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle');
       Object.assign(payload, queuePayload);
       // Canonical authoritative-idle contract fields. The shared validator

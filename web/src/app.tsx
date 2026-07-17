@@ -1520,7 +1520,7 @@ export function App() {
   }, []);
 
   const [showSubDialog, setShowSubDialog] = useState(false);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
@@ -5040,6 +5040,11 @@ export function App() {
               onRestartProject={handleRestartProject}
               onOpenSessionSettings={(session) => setSettingsTarget({
                 sessionName: session.name,
+                sessionInstanceId: session.sessionInstanceId,
+                runtimeEpoch: session.runtimeEpoch,
+                activeModel: session.activeModel,
+                requestedModel: session.requestedModel,
+                providerId: session.providerId,
                 label: session.label || '',
                 description: session.description || '',
                 cwd: session.projectDir || '',
@@ -5139,7 +5144,7 @@ export function App() {
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onSettings={() => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
                 onShareSession={openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
@@ -5942,7 +5947,7 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
               onShareSession={openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
@@ -6067,6 +6072,11 @@ export function App() {
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
           transportConfig={settingsTarget.transportConfig}
+          sessionInstanceId={settingsTarget.sessionInstanceId}
+          runtimeEpoch={settingsTarget.runtimeEpoch}
+          activeModel={settingsTarget.activeModel}
+          requestedModel={settingsTarget.requestedModel}
+          providerId={settingsTarget.providerId}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {

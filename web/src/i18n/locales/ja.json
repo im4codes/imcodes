@@ -714,14 +714,6 @@
       "presetLabel": "プリセット (env バンドル)",
       "presetHelp": "監督トラフィックを独自の base URL・API キー・固定モデルを持つプリセットエンドポイント経由にします。プリセットは Shared Context パネルで管理します。",
       "presetNone": "(なし)",
-      "auditMode": {
-        "audit": "監査",
-        "review": "レビュー",
-        "audit_plan": "監査 → 計画",
-        "review_plan": "レビュー → 計画",
-        "audit_review_plan": "監査 → レビュー → 計画"
-      },
-      "selectAuditMode": "監査モードを選択",
       "maxAuditLoops": "監査ループ上限",
       "maxAutoContinueStreak": "同種 auto-continue 上限",
       "maxAutoContinueStreakHelp": "同じ種類の continue が連続してこの回数に達すると Auto を停止します。0 は無制限です。",
@@ -736,7 +728,7 @@
       "summaryContinueLimits": "continue 制限: 同種 {{streak}} ・ ハード {{total}}",
       "summaryCustomInstructions": "カスタム指示: {{value}}",
       "summaryCustomInstructionsSet": "設定済み",
-      "summaryAudit": "監査: {{auditMode}} · ループ {{loops}}",
+      "summaryAudit": "ピア監査者: {{auditor}} · ループ {{loops}}",
       "summaryMeta": "プロンプト {{promptVersion}}、修復 {{repairVersion}}、解析再試行 {{parseRetries}}、task-run {{taskRunVersion}}",
       "disabledHint": "監督は transport セッションでのみ利用できます。",
       "unsupported": "process セッションでは監督設定を利用できません。",
@@ -744,10 +736,9 @@
         "backendRequired": "監督バックエンドを選択してください。",
         "modelRequired": "監督モデルを選択または入力してください。",
         "modelInvalid": "{{backend}} ではこのモデルは無効です。",
-        "auditModeRequired": "監査モードを選択してください。"
+        "auditTargetRequired": "適格なピア監査者を選択して確認してください。"
       },
       "modeLabel": "モード",
-      "auditModeLabel": "監査モード",
       "invalidStoredConfig": "保存済みの監督設定が無効です。修正して保存するまで自動化は無効のままです。",
       "quickLabel": "自動",
       "quickTitle": "自動モード"
@@ -2707,5 +2698,59 @@
     "rename_invalid": "制御文字を含まない 1～120 文字の名前を入力してください。",
     "revoke": "失効",
     "revoke_confirm": "このマシンを失効しますか?失効すると制御できなくなり、再登録が必要です。"
+  },
+  "peerAuditQuick": {
+    "iconLabel": "ピア監査",
+    "tooltip": "直近の完了ターンを対象にワンショット監査を実行",
+    "chooserTitle": "ピア監査者を選択",
+    "consentTitle": "ベンダー間データ送信の確認",
+    "consentBody": "監査サマリーを {{auditor}} (別ベンダー上のモデル) に送信します。続行しますか?",
+    "consentConfirm": "{{auditor}} に送信",
+    "selectionWillPersist": "この監査担当は、このセッションの今後の自動監査にも使用されます。",
+    "noCandidate": "このセッショングループに有効な監査者はいません。",
+    "ineligibleCollapsed": "{{count}} 件対象外",
+    "providerBadge": "ベンダー:{{provider}}",
+    "chooserReason": {
+      "missing_target": "記憶された監査者がいません。選択してください。",
+      "self_target": "記憶された監査者はこのセッション自身です。別を選択してください。",
+      "stale_target": "記憶された監査者は無効です。再選択してください。",
+      "same_model_remembered": "記憶された監査者が同じモデルです。別モデル選択または明示確認を。",
+      "unknown_model_remembered": "監査者のモデルが不明です。選択してください。",
+      "no_candidate": "現在有効な監査者はいません。",
+      "model_changed_since_click": "開いた後に監査対象セッションのモデルが変更されました。再選択してください。",
+      "config_repair": "保存された監査者を修復する必要があります。"
+    },
+    "self_target": "このセッションは自身を監査できません。",
+    "not_direct_child": "監査者は通常の直接子セッションではありません。",
+    "cross_project": "監査者が別プロジェクトにいます。",
+    "execution_clone": "実行クローンは監査できません。",
+    "not_reply_capable": "監査者が返信できません。",
+    "wrong_state": "監査者が待機状態ではありません。",
+    "unknown_identity": "監査者の識別情報はまだ確定していません。",
+    "disposition": {
+      "sent": "送信済",
+      "queued": "キュー済",
+      "sent_unrevocable": "送信済(取消不可)"
+    },
+    "pending": "ピア監査を実行中…",
+    "pending_preparing": "ピア監査を準備中…",
+    "pending_sent": "監査をピアに送信しました…",
+    "pending_queued": "ピアがアイドルになるまで監査を待機中…",
+    "pending_sent_unrevocable": "監査をプロセス型ピアに送信しました（取消不可）…",
+    "pending_waiting_reply": "ピア監査の返信を待機中…",
+    "result_pass": "ピア監査はパスしました。",
+    "result_rework": "ピア監査は REWORK を返しました。",
+    "result_timeout": "ピア監査がタイムアウトしました。",
+    "result_unavailable": "監査者が利用できません。",
+    "result_cancelled": "ピア監査はキャンセルされました。",
+    "result_error": "ピア監査に失敗しました:{{message}}",
+    "acknowledge": "閉じる",
+    "cancel_pending": "キャンセル"
+  },
+  "peerAuditResult": {
+    "title": "ピア監査結果",
+    "attributionAuditor": "監査者:{{auditor}}",
+    "elapsedMs": "{{seconds}} 秒",
+    "findingsPreview": "所見"
   }
 }

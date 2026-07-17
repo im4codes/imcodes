@@ -3,9 +3,6 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
-import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns } from './p2p-orchestrator.js';
-import { loadDaemonP2pStaticPolicy } from './p2p-workflow-static-policy.js';
-import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionBroker } from './supervision-broker.js';
@@ -18,21 +15,18 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
-  parseAuditVerdictDetailsFromText,
   resolveSupervisionCustomInstructionsDetail,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
   type TaskRunTerminalState,
 } from '../../shared/supervision-config.js';
-import { parseModePipeline } from '../../shared/p2p-modes.js';
-import type { P2pAdvancedRound, P2pRoundVerdictPolicy } from '../../shared/p2p-advanced.js';
 import {
   buildSupervisionContinuePrompt,
-  buildContextualAutomationAuditPromptAppend,
-  buildOpenSpecAutomationAuditPromptAppend,
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
+import { peerAuditService } from './peer-audit-service.js';
+import type { PeerAuditTerminalRecord } from './peer-audit-controller.js';
 
 /**
  * Merge the daemon-cached global custom instructions into a session snapshot
@@ -80,10 +74,10 @@ interface ActiveTaskRunState {
   sawAssistantOutput: boolean;
   lastAssistantText?: string;
   terminalState?: TaskRunTerminalState;
-  auditRunId?: string;
+  peerAuditAttemptId?: string;
   // Number of rework briefs that have been dispatched back into the session
   // since the run started. `maxAuditLoops = N` permits up to N rework dispatches
-  // per supervised-task-audit-loop spec; see `handleCompletedAudit`.
+  // per supervised-task-audit-loop spec; see `handlePeerAuditTerminal`.
   reworkDispatches: number;
   startedAt: number;
 }
@@ -352,7 +346,6 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
       userText: [
         `OpenSpec implementation audit for change: ${changeName}`,
         `Audit verdict contract: ${SUPERVISION_CONTRACT_IDS.OPENSPEC_IMPLEMENTATION_AUDIT}`,
-        `Selected automation audit mode: ${run.snapshot.auditMode}`,
         '',
         `The completed implementation claims the task is ${run.terminalState ?? 'complete'}. Audit the implementation-only path against proposal, design, tasks, and specs.`,
         'Do not rerun discussion or proposal phases.',
@@ -363,7 +356,6 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
   const summary = [
     `Contextual implementation audit for session ${sessionName}.`,
     `Audit verdict contract: ${SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT}`,
-    `Selected automation audit mode: ${run.snapshot.auditMode}`,
     `Task request: ${run.userText}`,
     `Last assistant output: ${run.lastAssistantText ?? '(none)'}`,
     `Task terminal state: ${run.terminalState ?? 'missing'}`,
@@ -380,82 +372,6 @@ async function resolveAuditBaseline(sessionName: string, run: ActiveTaskRunState
   };
 }
 
-function buildAuditRoundPromptAppend(baseline: AuditBaseline, run: ActiveTaskRunState): string {
-  if (baseline.kind === 'openspec' && baseline.changeDir) {
-    return buildOpenSpecAutomationAuditPromptAppend(
-      run.snapshot.auditMode,
-      run.userText,
-      run.terminalState ?? 'missing',
-      baseline.changeDir,
-    );
-  } else {
-    return buildContextualAutomationAuditPromptAppend(
-      run.snapshot.auditMode,
-      run.userText,
-      run.terminalState ?? 'missing',
-    );
-  }
-}
-
-// Expand a user-selected `auditMode` (single mode or combo like `audit>review>plan`)
-// into a concrete P2P advanced-round pipeline. Each step becomes one advanced round;
-// the last non-plan step owns the authoritative `smart_gate` verdict so the existing
-// rework-loop path still fires on REWORK. Plan rounds never produce a verdict — they
-// append context for the auditor to consume.
-// See openspec/changes/supervised-task-automation/specs/session-supervision-modes/spec.md
-// and supervised-task-audit-loop/spec.md for the contract.
-function buildAutomationAuditRounds(
-  auditMode: string,
-  basePromptAppend: string,
-  opts: { timeoutMinutes: number } = { timeoutMinutes: 6 },
-): P2pAdvancedRound[] {
-  const steps = parseModePipeline(auditMode).filter(Boolean);
-  if (steps.length === 0) {
-    // Shouldn't happen — snapshot normalization rejects empty auditMode — but guard
-    // against malformed input so downstream P2P validation gets a useful shape.
-    return [{
-      id: 'implementation_audit',
-      title: 'Implementation Audit',
-      preset: 'implementation_audit',
-      executionMode: 'single_main',
-      permissionScope: 'analysis_only',
-      timeoutMinutes: opts.timeoutMinutes,
-      verdictPolicy: 'smart_gate',
-      promptAppend: basePromptAppend,
-    }];
-  }
-
-  // The authoritative verdict must come from an audit-style round. Plan rounds
-  // accumulate context without voting. Locate the last audit/review index — that's
-  // where we attach `smart_gate`. If the pipeline is only plan rounds (not valid per
-  // SUPERVISION_AUDIT_MODES, but defensively), fall back to the last round.
-  const verdictStepIndex = (() => {
-    for (let i = steps.length - 1; i >= 0; i -= 1) {
-      if (steps[i] === 'audit' || steps[i] === 'review') return i;
-    }
-    return steps.length - 1;
-  })();
-
-  return steps.map((step, idx) => {
-    const verdictPolicy: P2pRoundVerdictPolicy = idx === verdictStepIndex ? 'smart_gate' : 'none';
-    const title = step === 'plan'
-      ? `Plan Round ${idx + 1}`
-      : step === 'review'
-        ? `Implementation Review ${idx + 1}`
-        : `Implementation Audit ${idx + 1}`;
-    return {
-      id: `automation_${step}_${idx + 1}`,
-      title,
-      preset: step === 'plan' ? 'custom' : 'implementation_audit',
-      executionMode: 'single_main',
-      permissionScope: 'analysis_only',
-      timeoutMinutes: opts.timeoutMinutes,
-      verdictPolicy,
-      promptAppend: basePromptAppend,
-    };
-  });
-}
-
 function buildReworkBrief(run: ActiveTaskRunState, verdictText: string): string {
   return buildReworkBriefPrompt(run.sessionName, run.userText, run.lastAssistantText, verdictText);
 }
@@ -469,10 +385,8 @@ class SupervisionAutomation {
   private pendingTaskIntents = new Map<string, PendingTaskIntent>();
   private recentTaskCandidates = new Map<string, RecentTaskCandidate>();
   private latestAssistantTexts = new Map<string, LatestAssistantText>();
-  private pollers = new Map<string, ReturnType<typeof setInterval>>();
   private lastObservedSessionStates = new Map<string, string>();
   private initialized = false;
-  private serverLink: ServerLink | null = null;
   private eventSequence = 0;
 
   private emitWarning(sessionName: string, text: string): void {
@@ -523,20 +437,14 @@ class SupervisionAutomation {
     });
   }
 
-  setServerLink(serverLink: ServerLink | null): void {
-    this.serverLink = serverLink;
+  setServerLink(_serverLink: ServerLink | null): void {
+    // Kept as a compatibility hook for lifecycle wiring. Lightweight peer
+    // audit dispatch is daemon-local and does not use the P2P server link.
   }
 
   cancelSession(sessionName: string): void {
     const state = this.activeRuns.get(sessionName);
-    if (state?.auditRunId) {
-      cancelP2pRun(state.auditRunId, this.serverLink, {
-        source: 'supervision_cancel_session',
-        reason: 'session_supervision_cancelled',
-        requestedBySession: sessionName,
-      });
-    }
-    this.clearPoller(sessionName);
+    if (state?.peerAuditAttemptId) peerAuditService.cancelAutomatic(sessionName, 'session_supervision_cancelled');
     this.activeRuns.delete(sessionName);
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
@@ -546,6 +454,11 @@ class SupervisionAutomation {
   }
 
   applySnapshotUpdate(sessionName: string, snapshot: SessionSupervisionSnapshot | null | undefined): void {
+    peerAuditService.applyAutomaticConfiguration(
+      sessionName,
+      Boolean(snapshot && snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        && snapshot.auditTargetSessionName && snapshot.auditTargetFingerprint),
+    );
     if (!snapshot || snapshot.mode === SUPERVISION_MODE.OFF) {
       this.cancelSession(sessionName);
       return;
@@ -662,14 +575,7 @@ class SupervisionAutomation {
   ): ActiveTaskRunState | null {
     if (snapshot.mode === SUPERVISION_MODE.OFF) return null;
     const existing = this.activeRuns.get(sessionName);
-    if (existing?.auditRunId) {
-      cancelP2pRun(existing.auditRunId, this.serverLink, {
-        source: 'supervision_replace_audit',
-        reason: 'new_task_intent_replaced_existing_audit',
-        requestedBySession: sessionName,
-      });
-    }
-    this.clearPoller(sessionName);
+    if (existing?.peerAuditAttemptId) peerAuditService.cancelAutomatic(sessionName, 'new_task_intent_replaced_existing_audit');
     const next: ActiveTaskRunState = {
       generation: (existing?.generation ?? 0) + 1,
       sessionName,
@@ -858,7 +764,6 @@ class SupervisionAutomation {
     const run = this.activeRuns.get(sessionName);
     if (!run) return;
     run.terminalState = state;
-    this.clearPoller(sessionName);
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
   }
@@ -874,200 +779,91 @@ class SupervisionAutomation {
     this.emitStatus(current.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
     this.emitAutomationNote(current.sessionName, 'Auto: running the configured audit pipeline...', 'supervision-audit');
 
-    // Build the advanced-round pipeline from the stored auditMode so combo modes
-    // like `audit>plan` and `audit>review>plan` actually expand into multiple rounds.
-    // Prior to this, `modeOverride` was silently ignored whenever `advancedRounds`
-    // was non-empty (see shared/p2p-advanced.ts:349-369), collapsing every combo
-    // mode to a single `implementation_audit` round.
-    const auditRounds = buildAutomationAuditRounds(
-      current.snapshot.auditMode,
-      buildAuditRoundPromptAppend(baseline, current),
-      { timeoutMinutes: 6 },
-    );
-
-    try {
-      // Audit:V-2 / Q1 — supervision auto-audit rounds are synthesised by the
-      // daemon itself (NOT user input), so they intentionally bypass envelope
-      // validation. The `advanced: { kind: 'supervision_internal', ... }`
-      // discriminant makes the bypass explicit in source review and
-      // reverse-regression checks instead of being detected by a path heuristic.
-      //
-      // Audit:R3 hardening / task 10.4 — supervision MUST honour the daemon
-      // advanced-run admission cap. If the daemon is at
-      // `P2P_WORKFLOW_MAX_ACTIVE_RUNS`, retry with bounded backoff before
-      // giving up. Default 3 attempts × 5 s; we don't expose this as
-      // configuration in v1a because supervision audit cadence is daemon-
-      // internal and rarely contended.
-      const started = await this.startSupervisionRunWithBusyRetry({
-        sessionName: current.sessionName,
-        userText: baseline.userText,
-        fileContents: baseline.fileContents,
-        rounds: auditRounds.length,
-        advancedRounds: auditRounds,
-      });
-      current.auditRunId = started.id;
-      this.startAuditPoller(current.sessionName, current.generation, started.id);
-    } catch (error) {
-      this.clearPoller(current.sessionName);
-      this.activeRuns.delete(current.sessionName);
+    const record = getSession(current.sessionName);
+    if (!record || !current.lastAssistantText) {
+      this.emitWarning(current.sessionName, 'Automation peer audit could not establish a completed result baseline. Manual review is required.');
+      this.finishRun(current.sessionName, 'needs_input');
+      return;
+    }
+    const started = await peerAuditService.startAutomatic({
+      audited: record,
+      taskCommandId: current.commandId,
+      generationOrEpoch: current.generation,
+      userText: current.userText,
+      assistantText: current.lastAssistantText,
+      completedAt: Date.now(),
+      changePath: baseline.changeDir,
+      changedPaths: baseline.fileContents.map((entry) => entry.path),
+      isStillValid: () => {
+        const latest = this.activeRuns.get(current.sessionName);
+        return latest?.generation === current.generation && latest.phase === 'auditing';
+      },
+      onTerminal: (terminal) => {
+        void this.handlePeerAuditTerminal(current.sessionName, current.generation, terminal);
+      },
+    });
+    if (!started.ok) {
       this.clearStatus(current.sessionName);
-      throw error;
-    }
-  }
-
-  /**
-   * Audit:R3 hardening / task 10.4 — supervision auto-audit launches MUST
-   * respect the daemon advanced-run admission cap. When the daemon is at
-   * capacity (`P2P_WORKFLOW_MAX_ACTIVE_RUNS` from `loadDaemonP2pStaticPolicy`),
-   * retry with bounded backoff. Throws on retry exhaustion so the calling
-   * `try/catch` in the dispatch path triggers normal cleanup.
-   */
-  private async startSupervisionRunWithBusyRetry(args: {
-    sessionName: string;
-    userText: string;
-    fileContents: ReturnType<typeof Object.fromEntries>;
-    rounds: number;
-    advancedRounds: import('../../shared/p2p-advanced.js').P2pAdvancedRound[];
-  }): Promise<{ id: string; discussionId: string }> {
-    const SUPERVISION_BUSY_ATTEMPTS = 3;
-    const SUPERVISION_BUSY_DELAY_MS = 5_000;
-    // `loadDaemonP2pStaticPolicy` only reads `getP2pWorkflowCapabilities` /
-    // hello accessors; null serverLink degrades gracefully (fail-closed
-    // policy with no allow flags). Cast keeps the helper's narrow signature.
-    const policy = loadDaemonP2pStaticPolicy((this.serverLink ?? { getP2pWorkflowCapabilities: () => [] }) as Parameters<typeof loadDaemonP2pStaticPolicy>[0]);
-    let attempt = 0;
-    let lastError: unknown = null;
-    while (attempt < SUPERVISION_BUSY_ATTEMPTS) {
-      attempt += 1;
-      const activeAdvancedRuns = listP2pRuns().filter(
-        (run) => run.advancedP2pEnabled && !P2P_TERMINAL_RUN_STATUSES.has(run.status),
-      );
-      if (activeAdvancedRuns.length >= policy.concurrency.maxAdvancedRuns) {
-        lastError = new Error(`daemon_busy: ${activeAdvancedRuns.length}/${policy.concurrency.maxAdvancedRuns} active advanced runs`);
-        if (attempt < SUPERVISION_BUSY_ATTEMPTS) {
-          logger.warn({ sessionName: args.sessionName, attempt, of: SUPERVISION_BUSY_ATTEMPTS }, 'supervision: daemon at advanced cap, retrying');
-          await new Promise((r) => setTimeout(r, SUPERVISION_BUSY_DELAY_MS));
-          continue;
-        }
-        throw new Error(`Supervision audit launch exhausted ${SUPERVISION_BUSY_ATTEMPTS} daemon_busy retries on session ${args.sessionName}`);
-      }
-      try {
-        return await startP2pRun({
-          initiatorSession: args.sessionName,
-          targets: [],
-          userText: args.userText,
-          fileContents: args.fileContents as unknown as Array<{ path: string; content: string }>,
-          serverLink: this.serverLink,
-          rounds: args.rounds,
-          launchOrigin: {
-            kind: 'supervision',
-            supervisionRunId: `${args.sessionName}:${attempt}`,
-          },
-          advanced: {
-            kind: 'supervision_internal',
-            advancedRounds: args.advancedRounds,
-          },
-        });
-      } catch (err) {
-        lastError = err;
-        // startP2pRun throws are non-busy; surface immediately.
-        throw err;
-      }
-    }
-    // Exhausted retries without ever calling startP2pRun.
-    throw lastError ?? new Error('supervision: launch exhausted retries');
-  }
-
-  private startAuditPoller(sessionName: string, generation: number, runId: string): void {
-    this.clearPoller(sessionName);
-    const poller = setInterval(() => {
-      const state = this.activeRuns.get(sessionName);
-      if (!state || state.generation !== generation || state.auditRunId !== runId || state.phase !== 'auditing') {
-        this.clearPoller(sessionName);
-        return;
-      }
-      const run = getP2pRun(runId);
-      if (!run) return;
-      if (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled') {
-        void this.handleCompletedAudit(state, run.status === 'completed' ? (run.resultSummary ?? '') : '').catch((error) => {
-          logger.warn({ session: sessionName, err: error }, 'Supervision audit completion handling failed');
-          this.activeRuns.delete(sessionName);
-          this.clearPoller(sessionName);
-          this.clearStatus(sessionName);
-        });
-      }
-    }, 1_000);
-    this.pollers.set(sessionName, poller);
-  }
-
-  private clearPoller(sessionName: string): void {
-    const poller = this.pollers.get(sessionName);
-    if (poller) clearInterval(poller);
-    this.pollers.delete(sessionName);
-  }
-
-  private async handleCompletedAudit(state: ActiveTaskRunState, resultSummary: string): Promise<void> {
-    const current = this.activeRuns.get(state.sessionName);
-    if (!current || current.generation !== state.generation || current.phase !== 'auditing') return;
-    this.clearStatus(state.sessionName);
-    const parsedVerdict = parseAuditVerdictDetailsFromText(resultSummary);
-    const verdict = parsedVerdict.verdict;
-    if (!verdict) {
-      this.emitWarning(state.sessionName, parsedVerdict.markerCount > 1
-        ? 'Automation audit returned multiple verdict markers. Manual review is required.'
-        : 'Automation audit did not return a valid verdict marker. Manual review is required.');
-      this.activeRuns.delete(state.sessionName);
-      this.clearPoller(state.sessionName);
+      this.emitWarning(current.sessionName, `Automation peer audit could not start (${started.error}). Manual review is required.`);
+      this.finishRun(current.sessionName, 'needs_input');
       return;
     }
+    current.peerAuditAttemptId = started.attemptId;
+    if (started.awaitingSlot) {
+      this.emitAutomationNote(current.sessionName, 'Auto: waiting for the active Quick audit slot...', 'supervision-audit-waiting-slot');
+    }
+  }
 
-    if (verdict === 'PASS') {
-      this.emitAutomationNote(state.sessionName, 'Auto: audit passed.', 'supervision-audit-pass');
-      this.emitTerminalStatus(state.sessionName, 'supervision_audit_pass', SUPERVISION_AUDIT_PASS_LABEL);
-      this.activeRuns.delete(state.sessionName);
-      this.clearPoller(state.sessionName);
+  private async handlePeerAuditTerminal(
+    sessionName: string,
+    generation: number,
+    terminal: PeerAuditTerminalRecord,
+  ): Promise<void> {
+    const current = this.activeRuns.get(sessionName);
+    if (!current || current.generation !== generation || current.phase !== 'auditing') return;
+    this.clearStatus(sessionName);
+    current.peerAuditAttemptId = undefined;
+    if (terminal.outcome === 'pass') {
+      this.emitTerminalStatus(sessionName, 'supervision_audit_pass', SUPERVISION_AUDIT_PASS_LABEL);
+      this.activeRuns.delete(sessionName);
       return;
     }
-
-    // `maxAuditLoops = N` means "up to N rework dispatches". Per the audit-loop spec,
-    // we must check BEFORE incrementing so a max of N allows exactly N dispatches.
-    // (Previous code incremented first, which yielded N-1 dispatches in practice.)
-    this.clearPoller(state.sessionName);
+    if (terminal.outcome !== 'rework') {
+      this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      this.finishRun(sessionName, 'needs_input');
+      return;
+    }
     if (current.reworkDispatches >= current.snapshot.maxAuditLoops) {
-      this.emitWarning(state.sessionName, 'Automation audit reached the configured rework-loop limit. Manual review is required.');
-      this.activeRuns.delete(state.sessionName);
+      this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      this.activeRuns.delete(sessionName);
       return;
     }
     current.reworkDispatches += 1;
-
-    const transportRuntime = getTransportRuntime(state.sessionName);
+    const transportRuntime = getTransportRuntime(sessionName);
     if (!transportRuntime) {
-      this.activeRuns.delete(state.sessionName);
+      this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      this.activeRuns.delete(sessionName);
       return;
     }
-
-    const reworkBrief = buildReworkBrief(current, resultSummary);
+    const reworkBrief = buildReworkBrief(current, terminal.findings ?? 'Peer audit requested rework without additional findings.');
     current.phase = 'execution';
-    current.auditRunId = undefined;
     current.evaluating = false;
     current.sawAssistantOutput = false;
     current.terminalState = undefined;
     current.lastAssistantText = undefined;
-
     timelineEmitter.emit(
-      state.sessionName,
+      sessionName,
       'user.message',
-      { text: reworkBrief, allowDuplicate: true, automation: true, automationKind: 'supervision-rework' },
-      { source: 'daemon', confidence: 'high', eventId: `supervision-rework:${state.generation}:${current.reworkDispatches}:${randomUUID()}` },
+      { text: reworkBrief, allowDuplicate: true, automation: true, automationKind: 'peer-audit-rework' },
+      { source: 'daemon', confidence: 'high', eventId: `peer-audit-rework:${generation}:${current.reworkDispatches}:${randomUUID()}` },
     );
     try {
-      transportRuntime.send(reworkBrief, `supervision-rework-${state.generation}-${current.reworkDispatches}`);
-      this.emitAutomationNote(state.sessionName, 'Auto: audit requested rework; rework brief sent.', 'supervision-rework-status');
-      this.emitTerminalStatus(state.sessionName, 'supervision_rework_sent', SUPERVISION_REWORK_LABEL);
+      transportRuntime.send(reworkBrief, `peer-audit-rework-${generation}-${current.reworkDispatches}`);
+      this.emitTerminalStatus(sessionName, 'supervision_rework_sent', SUPERVISION_REWORK_LABEL);
     } catch (error) {
-      logger.warn({ session: state.sessionName, err: error }, 'Supervision rework dispatch failed');
-      this.emitWarning(state.sessionName, 'Automation could not send the rework brief back into the session. Manual continuation is required.');
-      this.activeRuns.delete(state.sessionName);
+      logger.warn({ session: sessionName, err: error }, 'Peer audit rework dispatch failed');
+      this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      this.activeRuns.delete(sessionName);
     }
   }
 
