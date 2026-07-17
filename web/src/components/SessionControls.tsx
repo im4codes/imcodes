@@ -2125,11 +2125,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
   }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
-  const quickAutoColor = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
-    ? '#34d399'
+  const quickAutoModeClass = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
+    ? 'shortcut-btn-auto-supervised shortcut-btn-auto-active'
     : quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT
-      ? '#f59e0b'
-      : '#94a3b8';
+      ? 'shortcut-btn-auto-audit shortcut-btn-auto-active'
+      : 'shortcut-btn-auto-off';
 
   const persistTransportConfig = useCallback(async (transportConfig: Record<string, unknown> | null) => {
     if (!serverId || !activeSession) return;
@@ -4503,16 +4503,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </svg>
             </button>
             <button
-              class="shortcut-btn shortcut-btn-auto"
+              class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}
               onClick={() => setAutoOpen((open) => !open)}
               disabled={disabled}
               title={t('session.supervision.quickTitle')}
               aria-label={t('session.supervision.quickLabel')}
+              aria-haspopup="menu"
+              aria-expanded={autoOpen}
             >
               <span
                 class="shortcut-btn-auto-dot"
                 aria-hidden="true"
-                style={{ background: quickAutoColor }}
               />
               <span class="shortcut-btn-auto-label">{t('session.supervision.quickLabel')}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>

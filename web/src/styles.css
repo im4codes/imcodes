@@ -489,12 +489,105 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-chooser-btn-hint { font-size: 11px; color: #94a3b8; }
 .chat-tool-chooser-btn-developer:hover { border-color: #60a5fa; }
 .chat-tool-chooser-footnote { font-size: 10px; color: #64748b; margin-top: 10px; }
-.shortcut-btn-auto { display: inline-flex; height: 26px; box-sizing: border-box; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
+.shortcut-btn-auto {
+  --shortcut-auto-primary: #94a3b8;
+  --shortcut-auto-secondary: #64748b;
+  --shortcut-auto-panel: rgba(15,23,42,0.96);
+  --shortcut-auto-scan: rgba(226,232,240,0.14);
+  --shortcut-auto-glow: rgba(148,163,184,0.16);
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: inline-flex;
+  height: 26px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 5px;
+  padding-left: 8px;
+  padding-right: 8px;
+  font-weight: 600;
+}
+.shortcut-btn-auto > * { position: relative; z-index: 2; }
+.shortcut-btn-auto-active {
+  border-color: transparent;
+  color: #e6fbff;
+  text-shadow: 0 0 9px var(--shortcut-auto-glow);
+  box-shadow: 0 0 12px var(--shortcut-auto-glow), inset 0 0 9px var(--shortcut-auto-glow);
+}
+.shortcut-btn-auto-active:hover:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
+  color: #fff;
+  box-shadow: 0 0 17px var(--shortcut-auto-glow), inset 0 0 12px var(--shortcut-auto-glow);
+}
+.shortcut-btn-auto-active::before {
+  content: '';
+  position: absolute;
+  z-index: 0;
+  inset: -42px;
+  pointer-events: none;
+  background: conic-gradient(
+    from 0turn,
+    transparent 0 10%,
+    var(--shortcut-auto-primary) 18%,
+    var(--shortcut-auto-secondary) 27%,
+    transparent 37% 60%,
+    var(--shortcut-auto-secondary) 69%,
+    var(--shortcut-auto-primary) 77%,
+    transparent 87% 100%
+  );
+  animation: shortcut-btn-auto-orbit 2.15s linear infinite;
+}
+.shortcut-btn-auto-active::after {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  inset: 1px;
+  border-radius: 5px;
+  pointer-events: none;
+  background:
+    linear-gradient(105deg, transparent 34%, var(--shortcut-auto-scan) 49%, transparent 64%) 130% 0 / 220% 100% no-repeat,
+    linear-gradient(180deg, rgba(255,255,255,0.055), transparent 48%),
+    var(--shortcut-auto-panel);
+  box-shadow: inset 0 0 10px var(--shortcut-auto-glow);
+  animation: shortcut-btn-auto-scan 1.7s linear infinite;
+}
+.shortcut-btn-auto-supervised {
+  --shortcut-auto-primary: #22d3ee;
+  --shortcut-auto-secondary: #34d399;
+  --shortcut-auto-panel: rgba(5,31,42,0.96);
+  --shortcut-auto-scan: rgba(165,243,252,0.28);
+  --shortcut-auto-glow: rgba(34,211,238,0.38);
+}
+.shortcut-btn-auto-audit {
+  --shortcut-auto-primary: #c084fc;
+  --shortcut-auto-secondary: #f59e0b;
+  --shortcut-auto-panel: rgba(35,15,51,0.96);
+  --shortcut-auto-scan: rgba(244,114,182,0.30);
+  --shortcut-auto-glow: rgba(192,132,252,0.42);
+}
+@keyframes shortcut-btn-auto-orbit {
+  to { transform: rotate(1turn); }
+}
+@keyframes shortcut-btn-auto-scan {
+  from { background-position: 130% 0, 0 0, 0 0; }
+  to { background-position: -125% 0, 0 0, 0 0; }
+}
 .shortcut-btn-peer-audit { height: 26px; box-sizing: border-box; color: #8ea3ba; }
 .shortcut-btn-peer-audit-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
-.shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; }
+.shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: var(--shortcut-auto-primary); box-shadow: 0 0 0 1px rgba(255,255,255,0.08); }
+.shortcut-btn-auto-active .shortcut-btn-auto-dot { box-shadow: 0 0 7px var(--shortcut-auto-primary), 0 0 13px var(--shortcut-auto-secondary); animation: shortcut-btn-auto-dot-pulse 1.05s ease-in-out infinite; }
+@keyframes shortcut-btn-auto-dot-pulse {
+  0%, 100% { opacity: 0.72; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
 .shortcut-btn-auto-label { letter-spacing: 0.01em; }
 .shortcut-btn-auto-caret { font-size: 10px; line-height: 1; opacity: 0.85; }
+@media (prefers-reduced-motion: reduce) {
+  .shortcut-btn-auto-active::before,
+  .shortcut-btn-auto-active::after,
+  .shortcut-btn-auto-active .shortcut-btn-auto-dot { animation: none; }
+}
 .p2p-mode-btn { letter-spacing: 0.01em; }
 .p2p-mode-btn-solo { background: #132033; border-color: #425a78; box-shadow: inset 0 0 0 1px rgba(219, 231, 245, 0.08); }
 .p2p-mode-btn-solo:hover:not(:disabled) { background: #1a3150; border-color: #60a5fa; color: #f8fafc; }

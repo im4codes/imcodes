@@ -4780,6 +4780,8 @@ afterEach(() => {
     const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
     expect(autoBtn.textContent).toContain('Auto');
     expect(autoBtn.textContent).not.toContain('Supervised');
+    expect(autoBtn.classList.contains('shortcut-btn-auto-off')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(false);
     fireEvent.click(autoBtn);
     expect(document.querySelector('.menu-dropdown-auto')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
@@ -4800,6 +4802,50 @@ afterEach(() => {
         mode: 'supervised',
       }),
     }));
+    expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
+  });
+
+  it('uses a distinct active visual mode for supervised audit', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised_audit',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              auditTargetFingerprint: {
+                sessionInstanceId: 'peer-instance',
+                normalizedModelId: 'claude-opus',
+                providerFamily: 'anthropic',
+              },
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
+    expect(autoBtn.classList.contains('shortcut-btn-auto-audit')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(false);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
+    expect(autoBtn.getAttribute('aria-haspopup')).toBe('menu');
+    expect(autoBtn.getAttribute('aria-expanded')).toBe('false');
   });
 
   it('mounts the accessible Peer Audit control immediately before Auto while mode is off', () => {
