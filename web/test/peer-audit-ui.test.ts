@@ -155,6 +155,11 @@ describe('Peer Audit UI slice', () => {
       'peerAuditQuick.consentConfirm',
       'peerAuditQuick.selectionWillPersist',
       'peerAuditQuick.noCandidate',
+      'peerAuditQuick.candidateLoad.waiting_authority',
+      'peerAuditQuick.candidateLoad.loading',
+      'peerAuditQuick.candidateLoad.loaded',
+      'peerAuditQuick.candidateLoad.error',
+      'peerAuditQuick.candidateLoad.retry',
       'peerAuditQuick.ineligibleCollapsed',
       'peerAuditQuick.chooserReason.missing_target',
       'peerAuditQuick.chooserReason.self_target',
@@ -203,7 +208,7 @@ describe('Peer Audit UI slice', () => {
       const top = Object.keys(en.peerAuditQuick as Record<string, unknown>);
       const EXPECTED = [
         'iconLabel', 'tooltip', 'chooserTitle', 'consentTitle', 'consentBody',
-        'consentConfirm', 'selectionWillPersist', 'noCandidate', 'ineligibleCollapsed', 'providerBadge',
+        'consentConfirm', 'selectionWillPersist', 'noCandidate', 'candidateLoad', 'ineligibleCollapsed', 'providerBadge',
         'chooserReason', 'self_target', 'not_direct_child', 'cross_project', 'execution_clone',
         'not_reply_capable', 'wrong_state', 'disposition',
         'unknown_identity',

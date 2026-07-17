@@ -2709,6 +2709,13 @@
     "consentConfirm": "Send to {{auditor}}",
     "selectionWillPersist": "This auditor will also be remembered for future automatic audits of this session.",
     "noCandidate": "No eligible auditor is available in this session group.",
+    "candidateLoad": {
+      "waiting_authority": "Waiting for the daemon to refresh authoritative session identities. Auditor options will appear automatically.",
+      "loading": "Loading auditor options…",
+      "loaded": "Auditor options loaded.",
+      "error": "Could not load auditor options.",
+      "retry": "Retry"
+    },
     "ineligibleCollapsed": "{{count}} ineligible",
     "providerBadge": "Provider: {{provider}}",
     "chooserReason": {

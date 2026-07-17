@@ -547,6 +547,10 @@ export function SessionSettingsDialog({
     initialSupervision.auditTargetSessionName ?? null,
   );
   const [peerAuditCandidateList, setPeerAuditCandidateList] = useState<PeerAuditCandidateList | null>(null);
+  const [peerAuditCandidateLoadState, setPeerAuditCandidateLoadState] = useState<'waiting_authority' | 'loading' | 'loaded' | 'error'>(
+    sessionInstanceId && runtimeEpoch ? 'loading' : 'waiting_authority',
+  );
+  const [peerAuditCandidateRefreshToken, setPeerAuditCandidateRefreshToken] = useState(0);
   // A persisted fingerprint is only a claim until the daemon candidate list
   // confirms the exact live name/instance/model/provider tuple.
   const [peerAuditTargetConfirmed, setPeerAuditTargetConfirmed] = useState(false);
@@ -570,10 +574,17 @@ export function SessionSettingsDialog({
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
 
   useEffect(() => {
-    if (!ws || !sessionInstanceId || !runtimeEpoch) {
+    if (!sessionInstanceId || !runtimeEpoch) {
       setPeerAuditCandidateList(null);
+      setPeerAuditCandidateLoadState('waiting_authority');
       return;
     }
+    if (!ws) {
+      setPeerAuditCandidateList(null);
+      setPeerAuditCandidateLoadState('error');
+      return;
+    }
+    setPeerAuditCandidateLoadState('loading');
     const adapter = createWsPeerAuditAdapter(ws);
     let cancelled = false;
     void adapter.listCandidates({
@@ -582,12 +593,16 @@ export function SessionSettingsDialog({
     }).then((list) => {
       if (cancelled) return;
       setPeerAuditCandidateList(list);
+      setPeerAuditCandidateLoadState('loaded');
       setPeerAuditTargetName((current) => current ?? initialSupervision.auditTargetSessionName ?? null);
     }).catch(() => {
-      if (!cancelled) setPeerAuditCandidateList(null);
+      if (!cancelled) {
+        setPeerAuditCandidateList(null);
+        setPeerAuditCandidateLoadState('error');
+      }
     });
     return () => { cancelled = true; };
-  }, [ws, sessionName, sessionInstanceId, runtimeEpoch, initialSupervision.auditTargetSessionName]);
+  }, [ws, sessionName, sessionInstanceId, runtimeEpoch, initialSupervision.auditTargetSessionName, peerAuditCandidateRefreshToken]);
 
   useEffect(() => {
     if (!peerAuditCandidateList || !peerAuditTargetName) {
@@ -1312,22 +1327,38 @@ export function SessionSettingsDialog({
                     {t('peerAuditQuick.chooserTitle')}
                   </div>
                   <div data-testid="session-supervision-peer-picker">
-                    <PeerAuditCandidatePicker
-                      list={peerAuditCandidateList}
-                      selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
-                      onSelect={(candidate) => {
-                        setPeerAuditTargetName(candidate.name);
-                        peerAuditExplicitConfirmationRef.current = null;
-                        const persisted = initialSupervision.auditTargetFingerprint;
-                        setPeerAuditTargetConfirmed(Boolean(
-                          persisted
-                          && initialSupervision.auditTargetSessionName === candidate.name
-                          && persisted.sessionInstanceId === candidate.sessionInstanceId
-                          && persisted.normalizedModelId === candidate.normalizedModelId
-                          && persisted.providerFamily === candidate.providerFamily
-                        ));
-                      }}
-                    />
+                    {peerAuditCandidateLoadState === 'loaded' ? (
+                      <PeerAuditCandidatePicker
+                        list={peerAuditCandidateList}
+                        selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
+                        onSelect={(candidate) => {
+                          setPeerAuditTargetName(candidate.name);
+                          peerAuditExplicitConfirmationRef.current = null;
+                          const persisted = initialSupervision.auditTargetFingerprint;
+                          setPeerAuditTargetConfirmed(Boolean(
+                            persisted
+                            && initialSupervision.auditTargetSessionName === candidate.name
+                            && persisted.sessionInstanceId === candidate.sessionInstanceId
+                            && persisted.normalizedModelId === candidate.normalizedModelId
+                            && persisted.providerFamily === candidate.providerFamily
+                          ));
+                        }}
+                      />
+                    ) : (
+                      <div class="peer-audit-chooser-empty" data-testid={`peer-audit-candidate-${peerAuditCandidateLoadState}`}>
+                        {t(`peerAuditQuick.candidateLoad.${peerAuditCandidateLoadState}`)}
+                        {peerAuditCandidateLoadState === 'error' && (
+                          <button
+                            type="button"
+                            class="btn btn-secondary"
+                            style={{ marginLeft: 8 }}
+                            onClick={() => setPeerAuditCandidateRefreshToken((value) => value + 1)}
+                          >
+                            {t('peerAuditQuick.candidateLoad.retry')}
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                   {selectedPeerIsSameModel && (
                     <div style={{ color: '#fbbf24', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-same-model-warning">

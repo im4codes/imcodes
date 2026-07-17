@@ -2708,6 +2708,13 @@
     "consentConfirm": "{{auditor}} に送信",
     "selectionWillPersist": "この監査担当は、このセッションの今後の自動監査にも使用されます。",
     "noCandidate": "このセッショングループに有効な監査者はいません。",
+    "candidateLoad": {
+      "waiting_authority": "daemon が権威あるセッション ID を更新するのを待っています。完了後、監査者の選択肢が自動的に表示されます。",
+      "loading": "監査者の選択肢を読み込み中…",
+      "loaded": "監査者の選択肢を読み込みました。",
+      "error": "監査者の選択肢を読み込めませんでした。",
+      "retry": "再試行"
+    },
     "ineligibleCollapsed": "{{count}} 件対象外",
     "providerBadge": "ベンダー:{{provider}}",
     "chooserReason": {

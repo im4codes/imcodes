@@ -2297,6 +2297,42 @@ export function App() {
     activeSession,
     Boolean(selectedShareTarget),
   );
+
+  // Session settings may stay open across a daemon rolling upgrade. Keep the
+  // authority fields live instead of freezing the identity snapshot captured
+  // when the dialog opened; otherwise peer-audit candidates remain hidden
+  // until the user closes and reopens the dialog after session_list/subsession
+  // sync starts projecting sessionInstanceId + runtimeEpoch.
+  useEffect(() => {
+    setSettingsTarget((current) => {
+      if (!current) return current;
+      const source = current.subId
+        ? subSessions.find((sub) => sub.id === current.subId || sub.sessionName === current.sessionName)
+        : sessions.find((session) => session.name === current.sessionName);
+      if (!source) return current;
+      const sessionInstanceId = source.sessionInstanceId ?? current.sessionInstanceId;
+      const runtimeEpoch = source.runtimeEpoch ?? current.runtimeEpoch;
+      const activeModel = source.activeModel ?? current.activeModel;
+      const requestedModel = source.requestedModel ?? current.requestedModel;
+      const providerId = source.providerId ?? current.providerId;
+      if (sessionInstanceId === current.sessionInstanceId
+        && runtimeEpoch === current.runtimeEpoch
+        && activeModel === current.activeModel
+        && requestedModel === current.requestedModel
+        && providerId === current.providerId) {
+        return current;
+      }
+      return {
+        ...current,
+        sessionInstanceId,
+        runtimeEpoch,
+        activeModel,
+        requestedModel,
+        providerId,
+      };
+    });
+  }, [sessions, subSessions]);
+
   const appOpenSpecAutoScopedSubSessionName = useMemo(() => {
     if (!isMobileRef.current) return null;
     const visibleById = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));

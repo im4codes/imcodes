@@ -238,6 +238,48 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
+  it('does not misreport missing daemon authority as an empty candidate list and loads options after identity refresh', async () => {
+    const ws = makePeerAuditWs() as any;
+    const commonProps = {
+      serverId: 'srv-1',
+      sessionName: 'deck_proj_brain',
+      label: 'Brain',
+      description: 'desc',
+      cwd: '/proj',
+      type: 'codex-sdk',
+      ws,
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: CODEX_MODEL_IDS[0],
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxAuditLoops: 2,
+        },
+      },
+      onClose: vi.fn(),
+      onSaved: vi.fn(),
+    };
+    const view = render(<SessionSettingsDialog {...commonProps} />);
+
+    expect(screen.getByTestId('peer-audit-candidate-waiting_authority')).toBeDefined();
+    expect(screen.queryByTestId('peer-audit-chooser-empty')).toBeNull();
+
+    view.rerender(
+      <SessionSettingsDialog
+        {...commonProps}
+        sessionInstanceId="brain-instance-1"
+        runtimeEpoch="brain-runtime-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
+    });
+    expect(screen.queryByTestId('peer-audit-candidate-waiting_authority')).toBeNull();
+  });
+
   it('shows the remembered auditor picker and persists the canonical audit target', async () => {
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'claude-code-sdk',

@@ -2708,6 +2708,13 @@
     "consentConfirm": "{{auditor}} 에게 전송",
     "selectionWillPersist": "이 감사자는 이 세션의 향후 자동 감사에도 사용되도록 기억됩니다.",
     "noCandidate": "이 세션 그룹에 적합한 감사자가 없습니다.",
+    "candidateLoad": {
+      "waiting_authority": "daemon이 권한 있는 세션 ID를 새로 고치는 중입니다. 완료되면 감사자 선택지가 자동으로 표시됩니다.",
+      "loading": "감사자 선택지 불러오는 중…",
+      "loaded": "감사자 선택지를 불러왔습니다.",
+      "error": "감사자 선택지를 불러오지 못했습니다.",
+      "retry": "다시 시도"
+    },
     "ineligibleCollapsed": "{{count}}명 부적합",
     "providerBadge": "벤더:{{provider}}",
     "chooserReason": {
