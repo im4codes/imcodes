@@ -79,6 +79,17 @@ export function isPeerAuditVerdict(v: unknown): v is PeerAuditVerdict {
   return typeof v === 'string' && (PEER_AUDIT_VERDICTS as readonly string[]).includes(v);
 }
 
+export const PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS = {
+  PASS: '<!-- IMCODES_AUTOMATIC_AUDIT: PASS -->',
+  REWORK: '<!-- IMCODES_AUTOMATIC_AUDIT: REWORK -->',
+} as const;
+
+export function parsePeerAuditOrchestratedResult(text: string): PeerAuditVerdict | null {
+  const matches = [...text.matchAll(/<!--\s*IMCODES_AUTOMATIC_AUDIT\s*:\s*(PASS|REWORK)\s*-->/g)];
+  if (matches.length !== 1) return null;
+  return matches[0]?.[1] === 'PASS' ? 'PASS' : matches[0]?.[1] === 'REWORK' ? 'REWORK' : null;
+}
+
 export const PEER_AUDIT_VALIDATION_KINDS = ['test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment'] as const;
 export type PeerAuditValidationKind = (typeof PEER_AUDIT_VALIDATION_KINDS)[number];
 export function isPeerAuditValidationKind(v: unknown): v is PeerAuditValidationKind {

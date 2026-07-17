@@ -481,9 +481,10 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-live-status-inline.idle')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-inline.waiting')).toBeNull();
-    expect(container.querySelector('.session-live-status-text')).toBeNull();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+    expect(container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.waiting .session-live-status-emoji.wait')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Checking whether the task is complete...');
   });
 
   it('shows a result indicator when idle has a supervised outcome status', () => {

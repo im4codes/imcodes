@@ -30,6 +30,7 @@ import {
   SDK_TURN_LOST_REASON,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../../shared/imcodes-send.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type {
   ActivityGeneration,
@@ -845,17 +846,47 @@ interface CodexSdkSessionState {
   nativePlanEventSeen?: boolean;
 }
 
-function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
-  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
-  if (!server) return undefined;
+/**
+ * Per-session identity for the model's SHELL tool.
+ *
+ * All codex-sdk sessions share ONE app-server process, so the daemon cannot put
+ * `IMCODES_SESSION` in the app-server's process env — every session's
+ * `imcodes send` would then impersonate a single identity. The `turn/start`
+ * `env` param we also send is silently dropped by codex 0.144.1 (only the
+ * one-off `command/exec` RPC accepts `env`; `TurnStartParams`/`ThreadStartParams`
+ * do not).
+ *
+ * `shell_environment_policy.set` DOES reach the shell tool and MERGES on top of
+ * the inherited environment (verified: PATH/HOME survive), and thread/start's
+ * `config` is applied PER-THREAD — so this gives each session's shell its own
+ * `IMCODES_SESSION` with no cross-session impersonation, making `imcodes send`
+ * auto-detect identity without the agent hand-setting it.
+ */
+function buildCodexShellEnvironmentSet(config: SessionConfig): Record<string, string> | undefined {
+  const env = config.env ?? {};
+  const sessionName = env[IMCODES_SESSION_ENV] ?? config.sessionName;
+  if (!sessionName) return undefined;
   return {
-    mcp_servers: {
-      [IMCODES_MEMORY_MCP_SERVER_NAME]: {
-        command: server.command,
-        args: server.args,
-        env: server.env,
+    [IMCODES_SESSION_ENV]: sessionName,
+    [IMCODES_SESSION_LABEL_ENV]: env[IMCODES_SESSION_LABEL_ENV] ?? config.label ?? sessionName,
+  };
+}
+
+export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
+  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+  const shellEnvSet = buildCodexShellEnvironmentSet(config);
+  if (!server && !shellEnvSet) return undefined;
+  return {
+    ...(server ? {
+      mcp_servers: {
+        [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+          command: server.command,
+          args: server.args,
+          env: server.env,
+        },
       },
-    },
+    } : {}),
+    ...(shellEnvSet ? { shell_environment_policy: { set: shellEnvSet } } : {}),
   };
 }
 

@@ -45,6 +45,8 @@ import {
   resolvePeerAuditProviderFamily,
   containsLegacyAuditControlMarker,
   peerAuditLegacyVerdictMarker,
+  parsePeerAuditOrchestratedResult,
+  PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
   PEER_AUDIT_LEGACY_VERDICT_MARKERS,
   PEER_AUDIT_CONTROL_MARKERS,
   type PeerAuditReplyEnvelope,
@@ -94,6 +96,23 @@ describe('peer-audit contract — versions, enums, limits', () => {
     expect(isPeerAuditValidationKind(1)).toBe(false);
     expect(isPeerAuditTerminalOutcome(PEER_AUDIT_TERMINAL_OUTCOMES.PASS)).toBe(true);
     expect(isPeerAuditTerminalOutcome('PASS')).toBe(false); // terminal outcomes are lowercase
+  });
+});
+
+describe('automatic audit orchestration result marker', () => {
+  it('accepts exactly one PASS or REWORK marker after the delegated reply', () => {
+    expect(parsePeerAuditOrchestratedResult(`evidence\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`)).toBe('PASS');
+    expect(parsePeerAuditOrchestratedResult(`needs fixes\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}`)).toBe('REWORK');
+    expect(parsePeerAuditOrchestratedResult('no marker')).toBeNull();
+  });
+
+  it('rejects conflicting or duplicate verdict markers', () => {
+    expect(parsePeerAuditOrchestratedResult(
+      `${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}`,
+    )).toBeNull();
+    expect(parsePeerAuditOrchestratedResult(
+      `${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+    )).toBeNull();
   });
 });
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { getActiveThinkingTs, getTailSessionState, hasActiveToolCall } from '../src/thinking-utils.js';
+import { getActiveStatusText, getActiveThinkingTs, getTailSessionState, hasActiveToolCall } from '../src/thinking-utils.js';
 
 const authoritativeIdlePayload = {
   state: 'idle',
@@ -103,6 +103,23 @@ describe('getActiveThinkingTs', () => {
       { type: 'session.state', ts: 11, payload: { state: 'idle' } },
       { type: 'agent.status', ts: 12, payload: { label: 'still thinking' } },
     ] as any)).toBe(10);
+  });
+});
+
+describe('getActiveStatusText', () => {
+  it('keeps an automatic peer-audit status visible across protocol events and automation notes', () => {
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { status: 'supervision_audit_waiting', label: 'Peer audit running' } },
+      { type: 'assistant.text', payload: { text: 'Audit started', automation: true, memoryExcluded: true } },
+      { type: 'peer_audit.status', payload: { phase: 'waiting_reply', trigger: 'automatic' } },
+    ])).toBe('Peer audit running');
+  });
+
+  it('does not carry supervision status across ordinary assistant activity', () => {
+    expect(getActiveStatusText([
+      { type: 'agent.status', payload: { status: 'supervision_audit_waiting', label: 'Peer audit running' } },
+      { type: 'assistant.text', payload: { text: 'ordinary assistant reply' } },
+    ])).toBeNull();
   });
 });
 

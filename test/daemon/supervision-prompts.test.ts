@@ -108,6 +108,29 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('do not poll session state, logs, transcripts, or the target');
   });
 
+  it('tells supervised audit to hold commit and push until peer review finishes', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const prompt = buildSupervisionDecisionPrompt({
+      snapshot,
+      taskRequest: 'Implement, audit, then commit and push',
+      assistantResponse: 'Implementation and tests are complete; changes are not committed.',
+    });
+
+    expect(prompt).toContain('Peer audit MUST finish before repository commit/push finalization.');
+    expect(prompt).toContain('the daemon will hold it until peer-audit PASS instead of sending it now');
+    expect(prompt).toContain('Never combine substantive pre-audit work and post-audit commit/push in one nextAction.');
+  });
+
   it('does NOT include IM.codes workflow background in the continue prompt', () => {
     // Regression guard. The continue prompt is sent to the TARGET session's
     // chat, not to the supervisor judge. Injecting the IM.codes capability

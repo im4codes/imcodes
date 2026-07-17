@@ -175,6 +175,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
     || mode === 'error'
     || mode === 'cancelled'
     || mode === 'result'
+    || mode === 'waiting'
     ? mode
     : 'idle';
 

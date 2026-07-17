@@ -1,5 +1,6 @@
 import {
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_MODE,
   TASK_RUN_STATUS_MARKERS,
   classifySupervisionCustomInstructions,
   resolveSupervisionCustomInstructionsDetail,
@@ -60,6 +61,17 @@ function buildCustomInstructionsSection(detail: SupervisionCustomInstructionsDet
 
 function buildImcodesWorkflowBackgroundSection(): string {
   return SUPERVISION_IMCODES_BACKGROUND_DOCS;
+}
+
+function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): string {
+  if (request.snapshot?.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) return '';
+  return [
+    'Audit-order rule for supervised_audit:',
+    '- Peer audit MUST finish before repository commit/push finalization.',
+    '- If implementation and validation are complete and the ONLY remaining action is git add/commit/push, return continue with that exact finalization-only nextAction; the daemon will hold it until peer-audit PASS instead of sending it now.',
+    '- If fixes, tests, typecheck, lint, build, validation, documentation changes, deployment, or any other substantive work remains, return continue normally so that work happens before audit.',
+    '- Never combine substantive pre-audit work and post-audit commit/push in one nextAction.',
+  ].join('\n');
 }
 
 export interface PeerAuditBriefV1Input {
@@ -217,6 +229,7 @@ export function buildSupervisionDecisionPrompt(
     '- Prefer ask_human over a vague continue. If you cannot articulate a concrete nextAction, returning ask_human is the correct move — do not stall by emitting filler continues (they are downgraded to ask_human automatically and just waste a round-trip).',
     '- A factual answer to a user question (e.g. "yes, there are 3 uncommitted files") is typically complete for that turn IF no user-set rule applies. If a user rule applies (see authoritative clause above), return continue and enforce the rule. Do not otherwise treat state reports as proposed work.',
     '- When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.',
+    buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
     request.description ? `Context: ${request.description}` : '',
@@ -240,6 +253,7 @@ export function buildSupervisionDecisionRepairPrompt(
     'When decision is continue, BOTH gap and nextAction are required; nextAction must be a concrete imperative instruction, not a filler like "keep going" / "继续完成任务". If you cannot name a concrete next action, return ask_human instead — a vague continue is always downgraded to ask_human anyway.',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue with a nextAction that names the exact command or deliverable.',
     'USER-SET SUPERVISION RULES in the block below are AUTHORITATIVE and override the generic heuristics above. If a user rule uses blanket wording ("always", "每次", "必须", "绝不") or applies conditionally to the current topic (a rule like "Always commit and push if asked!" applies whenever the conversation is about committing / pushing / uncommitted changes, even if the user just asked a status question), return `continue` with a nextAction that enforces the rule. Do not treat a factual answer as `complete` when it violates a user-set rule.',
+    buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
     'Previous invalid output:',

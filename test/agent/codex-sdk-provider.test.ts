@@ -226,7 +226,8 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   }),
 }));
 
-import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
+import { CodexSdkProvider, buildCodexMcpThreadConfig } from '../../src/agent/providers/codex-sdk.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
 import { PROVIDER_ERROR_CODES, type ProviderError, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -5677,5 +5678,44 @@ describe('CodexSdkProvider', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(errors.some((error) => error.details?.reason === 'sdk_turn_lost')).toBe(false);
+  });
+});
+
+describe('buildCodexMcpThreadConfig — per-thread shell identity', () => {
+  // All codex-sdk sessions share ONE app-server process, so identity for the
+  // model's shell tool CANNOT come from the app-server's process env (that would
+  // let every session impersonate one identity), and codex 0.144.1 ignores the
+  // `env` param on turn/start. It must ride the per-thread `config` as
+  // `shell_environment_policy.set`, which reaches the shell and merges over the
+  // inherited env — verified end-to-end against real codex.
+  it('injects IMCODES_SESSION into the shell via per-thread shell_environment_policy.set', () => {
+    const cfg = buildCodexMcpThreadConfig({
+      sessionKey: 'k',
+      sessionName: 'deck_cd_brain',
+      label: 'cd',
+      env: { [IMCODES_SESSION_ENV]: 'deck_cd_brain', [IMCODES_SESSION_LABEL_ENV]: 'cd' },
+    } as never) as Record<string, any>;
+    expect(cfg?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_brain',
+      [IMCODES_SESSION_LABEL_ENV]: 'cd',
+    });
+    // The pre-existing memory MCP config must still be present alongside it.
+    expect(cfg?.mcp_servers).toBeDefined();
+  });
+
+  it('falls back to the session name for the label and needs no explicit env', () => {
+    const cfg = buildCodexMcpThreadConfig({
+      sessionKey: 'k',
+      sessionName: 'deck_cd_w1',
+    } as never) as Record<string, any>;
+    expect(cfg?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_w1',
+      [IMCODES_SESSION_LABEL_ENV]: 'deck_cd_w1',
+    });
+  });
+
+  it('omits the shell identity when there is no session name (cannot impersonate)', () => {
+    const cfg = buildCodexMcpThreadConfig({ sessionKey: 'k' } as never) as Record<string, any> | undefined;
+    expect(cfg?.shell_environment_policy).toBeUndefined();
   });
 });

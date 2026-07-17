@@ -224,6 +224,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         : t('session.state_stop_requested');
     }
     if (liveStatusMode === 'result') return statusText || t('session.state_idle');
+    if (liveStatusMode === 'waiting') return statusText || t('session.state_idle');
     if (liveStatus.sweep) {
       if (activeToolCall) return statusText || t('session.state_running');
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
