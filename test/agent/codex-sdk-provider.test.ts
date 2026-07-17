@@ -2964,9 +2964,12 @@ describe('CodexSdkProvider', () => {
         },
       });
 
-      for (let i = 0; i < 80 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      // Rollout confirmation mixes virtual provider timers with real libuv
+      // filesystem reads. Advancing fake time alone can outrun those reads on
+      // Node 22 under full-suite load, producing a false timeout even though
+      // the provider's retry poll is correct. Use the shared bounded helper
+      // that yields both clocks, as the other rollout-authority tests do.
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
       expect(completed).toEqual(['Done after command']);
       expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
         runningTurnId: null,
