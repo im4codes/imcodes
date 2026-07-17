@@ -36,6 +36,32 @@ export type {
   PeerAuditVerdict,
 };
 
+const PEER_AUDIT_PROVIDER_TYPE_LABELS: Readonly<Record<string, string>> = {
+  anthropic: 'CC',
+  openai: 'CX',
+  cursor: 'Cu',
+  google: 'Gm',
+  alibaba: 'Qw',
+  xai: 'Gx',
+  moonshot: 'Km',
+  github: 'Cp',
+  openclaw: 'OC',
+  unknown: 'AI',
+};
+
+export function peerAuditProviderTypeLabel(providerFamily: string): string {
+  return PEER_AUDIT_PROVIDER_TYPE_LABELS[providerFamily] ?? PEER_AUDIT_PROVIDER_TYPE_LABELS.unknown;
+}
+
+/** User-visible auditor attribution. Protocol names (`deck_*`) are authority
+ * identifiers only and must never leak into chooser/result UI. */
+export function peerAuditCandidateDisplayLabel(candidate: Pick<PeerAuditCandidate, 'label' | 'providerFamily'>): string {
+  const label = candidate.label.trim();
+  return label && !label.startsWith('deck_')
+    ? label
+    : peerAuditProviderTypeLabel(candidate.providerFamily);
+}
+
 /**
  * Authoritative identity required to enable Peer Audit on a session. Every
  * field MUST come from daemon-authoritative session_list / subsession.sync —

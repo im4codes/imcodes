@@ -275,7 +275,9 @@ describe('Peer Audit UI slice', () => {
         auditedSessionInstanceId: IDENTITY.sessionInstanceId,
         candidates: [{
           name: 'deck_sub_process',
-          label: 'Process Peer',
+          // Rolling-upgrade compatibility: older daemons used the protocol id
+          // as a label fallback. The UI must still never render it.
+          label: 'deck_sub_process',
           sessionInstanceId: 'process_instance',
           runtimeEpoch: 'process_epoch',
           normalizedModelId: 'claude-opus',
@@ -293,9 +295,12 @@ describe('Peer Audit UI slice', () => {
       };
       const { getByTestId } = render(createElement(PeerAuditAuditorChooser, { api, onClose: vi.fn() }));
       const row = getByTestId('peer-audit-chooser-row');
+      expect(row.textContent).toContain('CC');
       expect(row.textContent).toContain('claude-opus');
-      expect(row.textContent).toContain('idle');
-      expect(row.textContent).toContain('peerAuditQuick.disposition.sent_unrevocable');
+      expect(row.textContent).not.toContain('idle');
+      expect(row.getAttribute('data-provider-family')).toBe('anthropic');
+      expect(row.getAttribute('data-disposition')).toBe('sent_unrevocable');
+      expect(row.textContent).not.toContain('deck_sub_process');
     });
 
     it('shows model/provider and the future automatic-target side effect in consent', () => {

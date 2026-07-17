@@ -38,6 +38,7 @@ import {
 } from '@shared/peer-audit.js';
 import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
 import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
+import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
 
 interface Props {
   serverId: string;
@@ -734,6 +735,19 @@ export function SessionSettingsDialog({
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const selectedPeerAuditCandidate = peerAuditCandidateList?.candidates.find((candidate) => candidate.name === peerAuditTargetName);
+  const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
+    ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
+    : null;
+  const selectedPeerAuditTypeLabel = selectedPeerAuditCandidate
+    ? peerAuditProviderTypeLabel(selectedPeerAuditCandidate.providerFamily)
+    : null;
+  const selectedPeerAuditVisibleIdentity = selectedPeerAuditCandidate
+    ? [
+      selectedPeerAuditTypeLabel,
+      selectedPeerAuditDisplayLabel !== selectedPeerAuditTypeLabel ? selectedPeerAuditDisplayLabel : null,
+      selectedPeerAuditCandidate.normalizedModelId,
+    ].filter(Boolean).join(' · ')
+    : null;
   const auditedPeerModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
   const auditedPeerProvider = resolvePeerAuditProviderFamily({ providerId, agentType: type });
   const selectedPeerIsSameModel = Boolean(selectedPeerAuditCandidate
@@ -1373,11 +1387,11 @@ export function SessionSettingsDialog({
                   {selectedPeerAuditCandidate && !peerAuditTargetConfirmed && (
                     <div style={{ marginTop: 8 }}>
                       <div style={{ color: '#94a3b8', fontSize: 11, marginBottom: 6 }}>
-                        {selectedPeerAuditCandidate.label} · {selectedPeerAuditCandidate.normalizedModelId} · {selectedPeerAuditCandidate.providerFamily} · {selectedPeerAuditCandidate.liveState}
+                        {selectedPeerAuditVisibleIdentity}
                       </div>
                       {selectedPeerIsCrossProvider && (
                         <div style={{ color: '#fbbf24', fontSize: 11, marginBottom: 6 }}>
-                          {t('peerAuditQuick.consentBody', { auditor: selectedPeerAuditCandidate.label })}
+                          {t('peerAuditQuick.consentBody', { auditor: selectedPeerAuditDisplayLabel })}
                         </div>
                       )}
                       <button
@@ -1393,7 +1407,7 @@ export function SessionSettingsDialog({
                         }}
                         data-testid="peer-audit-settings-confirm"
                       >
-                        {t('peerAuditQuick.consentConfirm', { auditor: selectedPeerAuditCandidate.label })}
+                        {t('peerAuditQuick.consentConfirm', { auditor: selectedPeerAuditDisplayLabel })}
                       </button>
                       <div style={{ color: '#94a3b8', fontSize: 11, marginTop: 6 }}>
                         {t('peerAuditQuick.selectionWillPersist')}
@@ -1402,7 +1416,7 @@ export function SessionSettingsDialog({
                   )}
                   {selectedPeerAuditCandidate && peerAuditTargetConfirmed && (
                     <div style={{ color: '#34d399', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-settings-confirmed">
-                      {selectedPeerAuditCandidate.label} · {selectedPeerAuditCandidate.normalizedModelId} · {selectedPeerAuditCandidate.providerFamily}
+                      {selectedPeerAuditVisibleIdentity}
                     </div>
                   )}
                 </div>
@@ -1453,7 +1467,7 @@ export function SessionSettingsDialog({
               {isAuditMode && (
                 <div style={{ fontSize: 12, color: '#94a3b8' }}>
                   {t('session.supervision.summaryAudit', {
-                    auditor: peerAuditTargetName ?? t('session.supervision.summaryUnset'),
+                    auditor: selectedPeerAuditVisibleIdentity ?? t('session.supervision.summaryUnset'),
                     loops: supervisionAuditLoops,
                   })}
                   {selectedPeerAuditCandidate && (

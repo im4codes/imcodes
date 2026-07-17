@@ -28,6 +28,8 @@ describe('SessionControls DOM placement (source-level)', () => {
 
   it('Peer Audit icon data-testid is peer-audit-icon', () => {
     expect(source).toContain('data-testid="peer-audit-icon"');
+    expect(source).toContain('class="shortcut-btn-peer-audit-icon"');
+    expect(source).not.toContain("t('peerAuditQuick.iconLabel').slice(0, 1)");
   });
 
   it('Peer Audit icon shares canQuickControlSupervision gate', () => {

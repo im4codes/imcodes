@@ -67,7 +67,7 @@ describe('peer-audit candidate authority', () => {
       return [main.name, orphan.name, [main, child, orphan]];
     }, 'not_direct_child'],
     ['cross project', (main: SessionRecord, child: SessionRecord) => {
-      const cross = session('deck_sub_cross', { parentSession: main.name, projectName: 'other' });
+      const cross = session('deck_sub_cross', { parentSession: undefined, projectName: 'other' });
       return [main.name, cross.name, [main, child, cross]];
     }, 'cross_project'],
     ['execution clone', (main: SessionRecord, child: SessionRecord) => {
@@ -143,6 +143,12 @@ describe('peer-audit candidate authority', () => {
     const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
     const sameProvider = session('deck_sub_same', { parentSession: main.name, providerId: 'openai', label: 'A' });
     const crossProvider = session('deck_sub_cross', { parentSession: main.name, providerId: 'anthropic', label: 'Z' });
+    const legacyProjectName = session('deck_sub_legacy-project', {
+      parentSession: main.name,
+      projectName: 'deck_sub_legacy-project',
+      providerId: 'anthropic',
+      label: 'Legacy',
+    });
     const nested = session('deck_sub_nested', { parentSession: audited.name });
     const clone = session('deck_sub_clone', {
       parentSession: main.name,
@@ -151,11 +157,25 @@ describe('peer-audit candidate authority', () => {
 
     const result = resolvePeerAuditCandidateList({
       auditedSessionName: audited.name,
-      allSessions: [main, audited, sameProvider, crossProvider, nested, clone],
+      allSessions: [main, audited, sameProvider, crossProvider, legacyProjectName, nested, clone],
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.list.candidates.map((item) => item.name)).toEqual([crossProvider.name, sameProvider.name]);
+    expect(result.list.candidates.map((item) => item.name)).toEqual([
+      legacyProjectName.name,
+      crossProvider.name,
+      sameProvider.name,
+    ]);
+  });
+
+  it('never exposes an internal deck id as the candidate display label', () => {
+    const main = session('deck_proj_brain');
+    const target = session('deck_sub_unlabelled', { parentSession: main.name, label: undefined, agentType: 'claude-code-sdk' });
+    const result = resolvePeerAuditCandidateList({ auditedSessionName: main.name, allSessions: [main, target] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.list.candidates[0]).toMatchObject({ name: target.name, label: 'CC' });
+    expect(result.list.candidates[0]?.label).not.toContain('deck_');
   });
 
   it('changes revision for every identity/state/model/provider/group/capability authority input', () => {

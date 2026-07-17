@@ -89,6 +89,34 @@ function dispositionFor(session: SessionRecord): PeerAuditRuntimeDisposition {
   return session.state === 'idle' ? 'sent' : 'queued';
 }
 
+function peerAuditTypeLabel(agentType: string): string {
+  switch (agentType) {
+    case 'claude-code':
+    case 'claude-code-sdk':
+      return 'CC';
+    case 'codex':
+    case 'codex-sdk':
+      return 'CX';
+    case 'cursor-headless':
+      return 'Cu';
+    case 'gemini':
+    case 'gemini-sdk':
+      return 'Gm';
+    case 'grok-sdk':
+      return 'Gx';
+    case 'qwen':
+      return 'Qw';
+    case 'kimi-sdk':
+      return 'Km';
+    case 'copilot-sdk':
+      return 'Cp';
+    case 'openclaw':
+      return 'OC';
+    default:
+      return 'AI';
+  }
+}
+
 function candidateShape(
   target: SessionRecord,
   eligible: boolean,
@@ -97,7 +125,9 @@ function candidateShape(
 ): PeerAuditCandidate {
   return {
     name: target.name,
-    label: target.label?.trim() || target.name,
+    // `name` is protocol-only (`deck_*`) and must never become user-visible.
+    // An absent user label falls back to a type badge, not the internal id.
+    label: target.label?.trim() || peerAuditTypeLabel(target.agentType),
     sessionInstanceId: target.sessionInstanceId?.trim() || UNKNOWN_DIMENSION,
     runtimeEpoch: target.runtimeEpoch?.trim() || UNKNOWN_DIMENSION,
     normalizedModelId: metadata.normalizedModelId(target),
@@ -154,9 +184,6 @@ export function resolvePeerAuditCandidate(
     return { ok: true, owningMain, audited, candidate: ineligible(target, PEER_AUDIT_CANDIDATE_REASONS.CROSS_PROJECT, metadata) };
   }
 
-  if (target.projectName !== owningMain.projectName) {
-    return { ok: true, owningMain, audited, candidate: ineligible(target, PEER_AUDIT_CANDIDATE_REASONS.CROSS_PROJECT, metadata) };
-  }
   if (target.parentSession !== owningMain.name || target.role === 'brain') {
     return { ok: true, owningMain, audited, candidate: ineligible(target, PEER_AUDIT_CANDIDATE_REASONS.NOT_DIRECT_CHILD, metadata) };
   }

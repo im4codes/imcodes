@@ -483,7 +483,8 @@ describe('SessionSettingsDialog supervision', () => {
     expect(screen.getByText('summaryTimeout:9 s')).toBeDefined();
     expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
-    expect(screen.getByText('summaryAudit:deck_sub_peer:3')).toBeDefined();
+    expect(screen.getByText('summaryAudit:summaryUnset:3')).toBeDefined();
+    expect(document.body.textContent).not.toContain('deck_sub_peer');
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
   });
 

@@ -10,32 +10,30 @@
  */
 
 import { useTranslation } from 'react-i18next';
-import { assertNeverPeerAudit } from '@shared/peer-audit.js';
 import type {
   PeerAuditCandidate,
   PeerAuditCandidateList,
   PeerAuditControllerApi,
   PeerAuditState,
 } from './types.js';
+import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from './types.js';
 
 interface PeerAuditAuditorChooserProps {
   api: PeerAuditControllerApi;
   onClose: () => void;
 }
 
-const PROVIDER_BADGE: Record<string, { label: string; color: string }> = {
-  anthropic: { label: 'A', color: '#d97706' },
-  openai: { label: 'O', color: '#10b981' },
-  google: { label: 'G', color: '#3b82f6' },
-  qwen: { label: 'Q', color: '#a855f7' },
-  openclaw: { label: 'X', color: '#64748b' },
-  unknown: { label: '?', color: '#94a3b8' },
-};
-
-const DISPOSITION_LABEL: Record<PeerAuditCandidate['dispositionCapability'], string> = {
-  sent: 'sent',
-  queued: 'queued',
-  sent_unrevocable: 'sent_unrevocable',
+const PROVIDER_BADGE_COLOR: Record<string, string> = {
+  anthropic: '#d97706',
+  openai: '#10b981',
+  cursor: '#64748b',
+  google: '#3b82f6',
+  alibaba: '#a855f7',
+  xai: '#0f172a',
+  moonshot: '#6366f1',
+  github: '#334155',
+  openclaw: '#64748b',
+  unknown: '#94a3b8',
 };
 
 function reasonKey(reason: Extract<PeerAuditState, { kind: 'chooser' }>['reason']): string {
@@ -57,20 +55,6 @@ function reasonKey(reason: Extract<PeerAuditState, { kind: 'chooser' }>['reason'
     case 'config_repair':
       return 'peerAuditQuick.chooserReason.config_repair';
   }
-}
-
-function candidateReasonKey(reason: PeerAuditCandidate['reason']): string {
-  switch (reason) {
-    case 'self': return 'peerAuditQuick.self_target';
-    case 'not_direct_child': return 'peerAuditQuick.not_direct_child';
-    case 'cross_project': return 'peerAuditQuick.cross_project';
-    case 'execution_clone': return 'peerAuditQuick.execution_clone';
-    case 'not_reply_capable': return 'peerAuditQuick.not_reply_capable';
-    case 'busy_state': return 'peerAuditQuick.wrong_state';
-    case 'unknown_identity': return 'peerAuditQuick.unknown_identity';
-    case 'eligible': return 'peerAuditQuick.chooserReason.missing_target';
-  }
-  return assertNeverPeerAudit(reason);
 }
 
 export function PeerAuditAuditorChooser({ api, onClose }: PeerAuditAuditorChooserProps) {
@@ -167,7 +151,6 @@ export function PeerAuditCandidatePicker({
 }) {
   const { t } = useTranslation();
   const eligible = list?.candidates.filter((candidate) => candidate.eligible) ?? [];
-  const ineligible = list?.candidates.filter((candidate) => !candidate.eligible) ?? [];
   return (
     <div class="peer-audit-candidate-picker" data-testid="peer-audit-candidate-picker">
       {eligible.length === 0 && (
@@ -187,20 +170,6 @@ export function PeerAuditCandidatePicker({
           ))}
         </ul>
       )}
-      {ineligible.length > 0 && (
-        <details class="peer-audit-chooser-ineligible">
-          <summary>{t('peerAuditQuick.ineligibleCollapsed', { count: ineligible.length })}</summary>
-          <ul>
-            {ineligible.map((candidate) => (
-              <li key={candidate.sessionInstanceId} data-testid="peer-audit-chooser-ineligible-row">
-                <span>{candidate.label} · {candidate.name}</span>
-                <span>{candidate.normalizedModelId} · {candidate.providerFamily} · {candidate.liveState}</span>
-                <span>{t(candidateReasonKey(candidate.reason))}</span>
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
     </div>
   );
 }
@@ -213,7 +182,9 @@ interface CandidateRowProps {
 
 function CandidateRow({ candidate, selected = false, onSelect }: CandidateRowProps) {
   const { t } = useTranslation();
-  const badge = PROVIDER_BADGE[candidate.providerFamily] ?? PROVIDER_BADGE.unknown;
+  const badgeLabel = peerAuditProviderTypeLabel(candidate.providerFamily);
+  const displayLabel = peerAuditCandidateDisplayLabel(candidate);
+  const badgeColor = PROVIDER_BADGE_COLOR[candidate.providerFamily] ?? PROVIDER_BADGE_COLOR.unknown;
   return (
     <li>
       <button
@@ -225,19 +196,20 @@ function CandidateRow({ candidate, selected = false, onSelect }: CandidateRowPro
         aria-pressed={selected}
         onClick={onSelect}
       >
-        <span
-          class="peer-audit-provider-badge"
-          aria-label={t('peerAuditQuick.providerBadge', { provider: candidate.providerFamily })}
-          style={{ background: badge.color }}
-        >
-          {badge.label}
+        <span class="peer-audit-chooser-row-main">
+          <span
+            class="peer-audit-provider-badge"
+            aria-label={t('peerAuditQuick.providerBadge', { provider: candidate.providerFamily })}
+            style={{ background: badgeColor }}
+          >
+            {badgeLabel}
+          </span>
+          {displayLabel !== badgeLabel && (
+            <span class="peer-audit-chooser-row-label">{displayLabel}</span>
+          )}
         </span>
-        <span class="peer-audit-chooser-row-label">{candidate.label}</span>
-        <span class="peer-audit-chooser-row-name">{candidate.name}</span>
-        <span class="peer-audit-chooser-row-model">{candidate.normalizedModelId}</span>
-        <span class="peer-audit-chooser-row-state">{candidate.liveState}</span>
-        <span class="peer-audit-chooser-row-disposition">
-          {t(`peerAuditQuick.disposition.${DISPOSITION_LABEL[candidate.dispositionCapability]}`)}
+        <span class="peer-audit-chooser-row-meta">
+          <span class="peer-audit-chooser-row-model">{candidate.normalizedModelId}</span>
         </span>
       </button>
     </li>

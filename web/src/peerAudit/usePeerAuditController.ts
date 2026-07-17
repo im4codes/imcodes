@@ -33,6 +33,7 @@ import type {
   PeerAuditState,
   PeerAuditAuditedSessionIdentity,
 } from './types.js';
+import { peerAuditCandidateDisplayLabel } from './types.js';
 
 interface ControllerInput {
   adapter: PeerAuditAdapter;
@@ -374,6 +375,7 @@ export function usePeerAuditController(input: ControllerInput): PeerAuditControl
     revision: string,
   ) => {
     const audited = inputRef.current.auditedModel;
+    const auditorLabel = peerAuditCandidateDisplayLabel(candidate);
     const fingerprint = JSON.stringify({
       sessionInstanceId: candidate.sessionInstanceId,
       normalizedModelId: candidate.normalizedModelId,
@@ -393,11 +395,11 @@ export function usePeerAuditController(input: ControllerInput): PeerAuditControl
         type: 'open_consent',
         providerFamily: candidate.providerFamily,
         normalizedModelId: candidate.normalizedModelId,
-        auditorLabel: candidate.label,
+        auditorLabel,
       });
       return;
     }
-    void dispatchAudit(candidate, intent, candidate.label, revision, targetConfigRevisionRef.current);
+    void dispatchAudit(candidate, intent, auditorLabel, revision, targetConfigRevisionRef.current);
   }, [dispatchAudit]);
 
   const start = useCallback(

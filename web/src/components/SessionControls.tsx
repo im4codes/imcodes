@@ -4449,7 +4449,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 aria-label={t('peerAuditQuick.iconLabel')}
                 aria-haspopup="dialog"
               >
-                <span aria-hidden="true">{t('peerAuditQuick.iconLabel').slice(0, 1)}</span>
+                <svg
+                  class="shortcut-btn-peer-audit-icon"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <circle cx="10.5" cy="10.5" r="6.5" />
+                  <path d="m15.3 15.3 4.2 4.2" />
+                  <path d="m7.7 10.6 1.8 1.8 3.8-4" />
+                </svg>
               </button>
             )}
             <button
