@@ -3156,6 +3156,51 @@ describe('CodexSdkProvider', () => {
     codexRuntimeConfigMock.reset();
   });
 
+  it('carries per-thread shell_environment_policy.set identity on the thread/start RPC (not just the builder)', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-shell-id',
+      sessionName: 'deck_cd_brain',
+      label: 'cd',
+      cwd: '/tmp/project',
+    });
+    await provider.send('route-shell-id', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    // Integration guard: the shell identity must actually reach the thread/start
+    // RPC config, so the model's shell tool gets its OWN IMCODES_SESSION in the
+    // shared app-server (no cross-session impersonation). A builder unit test
+    // alone would not catch the wiring being dropped between config and RPC.
+    expect((threadStartReq?.params?.config as Record<string, any> | undefined)?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_brain',
+      [IMCODES_SESSION_LABEL_ENV]: 'cd',
+    });
+    // The memory MCP config must still ride the same per-thread config object.
+    expect((threadStartReq?.params?.config as Record<string, any> | undefined)?.mcp_servers).toBeDefined();
+  });
+
+  it('carries per-thread shell_environment_policy.set identity on the thread/resume RPC (label falls back to name)', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-shell-id-resume',
+      sessionName: 'deck_cd_w1',
+      cwd: '/tmp/project',
+      resumeId: 'thread-shell-resume',
+    });
+    await provider.send('route-shell-id-resume', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.threadId).toBe('thread-shell-resume');
+    // Resumed threads must also acquire the identity (so already-running codex
+    // sessions get it after a resume), with the label falling back to the name.
+    expect((resumeReq?.params?.config as Record<string, any> | undefined)?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_w1',
+      [IMCODES_SESSION_LABEL_ENV]: 'deck_cd_w1',
+    });
+  });
+
   it('lists codex models across paginated model/list responses', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
