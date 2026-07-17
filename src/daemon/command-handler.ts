@@ -4593,8 +4593,13 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
     );
     if (!removed && !queuedInStore) {
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
-      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
+      // Deleting a queued message is IDEMPOTENT: if it is already gone the goal
+      // is met, so ack success. The frontend now always sends the undo — even for
+      // an entry that only ever existed optimistically (never reached the store)
+      // — so an "error: not found" here would spuriously roll the deleted bubble
+      // back into the UI. "Already absent" is a successful delete.
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
@@ -4602,7 +4607,15 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     try {
       queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
     } catch (err) {
+      // The SQLite row is the queue authority. If the drop threw, the row is
+      // STILL THERE — the delete did NOT happen — so we must NOT ack success
+      // (that would leave the message queued on the backend while the UI claims
+      // it is deleted). Ack an error so the frontend rolls the bubble back and
+      // the state stays truthful.
       logger.warn({ err, sessionName, clientMessageId }, 'transport queue sqlite drop failed for undo queued message');
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queue delete failed' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queue delete failed' });
+      return;
     }
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),

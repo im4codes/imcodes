@@ -1202,10 +1202,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
     !!activeSession && !!entry.clientMessageId
   ), [activeSession]);
-  const isLocalQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
-    !!optimisticQueuedEntries?.some((item) => item.clientMessageId === entry.clientMessageId)
-    && !incomingQueuedTransportEntries.some((item) => item.clientMessageId === entry.clientMessageId)
-  ), [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // Shared alias data — feeds compose-time resolution (A′) on send and the
@@ -3626,13 +3622,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
-    if (isLocalQueuedEntry(entry)) {
-      setOptimisticQueuedEntries((prev) => {
-        const source = prev ?? incomingQueuedTransportEntries;
-        return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-      });
-      return;
-    }
+    // Drop the local optimistic copy immediately for responsiveness.
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+    });
+    // ALWAYS ask the backend to drop it — even when the entry still looks "local"
+    // (present optimistically but not yet echoed in the authoritative snapshot).
+    // The WS enqueue for this message is ordered BEFORE this delete, so the daemon
+    // has almost always ALREADY persisted it to the SQLite queue. The old
+    // "local => remove locally and skip the backend undo" shortcut is exactly why
+    // deletes didn't reach the backend: the message reappeared on the next
+    // authoritative snapshot and stayed queued server-side. Deleting a message the
+    // backend never received is safe — the daemon treats an absent id as an
+    // idempotent success, so no rollback fires.
     let mutationCommandId: string | false = false;
     try {
       mutationCommandId = sendQueuedMessageMutation('session.undo_queued_message', {
@@ -3641,17 +3644,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch {
       return;
     }
-    if (!mutationCommandId) return;
+    if (!mutationCommandId) return; // WS unavailable: the local removal above stands.
     queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
     setOptimisticallyRemovedQueuedIds((prev) => {
       if (prev.has(entry.clientMessageId)) return prev;
       return new Set([...prev, entry.clientMessageId]);
     });
-    setOptimisticQueuedEntries((prev) => {
-      const source = prev ?? incomingQueuedTransportEntries;
-      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-    });
-  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;

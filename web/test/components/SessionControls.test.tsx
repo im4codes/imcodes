@@ -4393,6 +4393,44 @@ afterEach(() => {
     expect(screen.queryByText('queued send')).toBeNull();
   });
 
+  it('sends the backend undo when deleting a still-local optimistic queue entry', () => {
+    // Regression: an optimistic entry is queued locally the instant you send it,
+    // but the daemon has ALSO already enqueued it (the WS enqueue is ordered
+    // before any delete). Deleting it during the window before the authoritative
+    // snapshot echoes back used to remove ONLY the local copy and skip the backend
+    // undo — so the message stayed queued server-side and reappeared on the next
+    // snapshot. The delete must always reach the backend.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'delete me from the backend too';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('delete me from the backend too')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: /delete/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.undo_queued_message',
+      sessionName: 'qwen-session',
+      clientMessageId: expect.any(String),
+      commandId: expect.any(String),
+    }));
+    expect(screen.queryByText('delete me from the backend too')).toBeNull();
+  });
+
   it('keeps a deleted item hidden while a stale multi-item queue snapshot remains', () => {
     const ws = makeWs();
     const runningSession = makeSession({
