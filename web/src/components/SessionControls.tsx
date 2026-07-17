@@ -2621,15 +2621,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+  const quickDelegationTeamMembers = useMemo(() => new Set(
+    p2pSavedConfig?.sessions
+      ? getEnabledP2pMemberNames(p2pSavedConfig.sessions, { scopeSession: rootSession })
+      : [],
+  ), [p2pSavedConfig, rootSession]);
   const quickDelegationCandidates = useMemo<QuickAgentDelegationCandidate[]>(() => {
-    const activeProject = activeSession?.project?.trim();
-    if (!activeProject) return [];
-    const projectMainSessions = new Set(
-      (sessions ?? [])
-        .filter((session) => session.project === activeProject)
-        .map((session) => session.name),
-    );
-    if (rootSession) projectMainSessions.add(rootSession);
+    // Match the ordinary @agent picker: the current root session and its
+    // direct sub-sessions form one delegation group. `session.project` is not
+    // a safe UI scope here because daemon worker records can share the project
+    // name while belonging to hidden/legacy session generations.
+    if (!activeSession?.name || !rootSession) return [];
     const byName = new Map<string, QuickAgentDelegationCandidate>();
     const add = (candidate: QuickAgentDelegationCandidate) => {
       if (candidate.sessionName === activeSession?.name) return;
@@ -2637,27 +2639,29 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (!byName.has(candidate.sessionName)) byName.set(candidate.sessionName, candidate);
     };
     for (const session of sessions ?? []) {
-      if (session.project !== activeProject) continue;
+      if (session.name !== rootSession) continue;
       add({
         sessionName: session.name,
         agentType: session.agentType,
         label: session.label,
         model: resolveEffectiveSessionModel(session),
         state: session.state,
+        teamMember: quickDelegationTeamMembers.has(session.name),
       });
     }
     for (const session of subSessions ?? []) {
-      if (!session.parentSession || !projectMainSessions.has(session.parentSession)) continue;
+      if (session.parentSession !== rootSession) continue;
       add({
         sessionName: session.sessionName,
         agentType: session.type,
         label: session.label,
         model: resolveEffectiveSessionModel(session),
         state: session.state,
+        teamMember: quickDelegationTeamMembers.has(session.sessionName),
       });
     }
     return [...byName.values()];
-  }, [activeSession?.name, activeSession?.project, rootSession, sessions, subSessions]);
+  }, [activeSession?.name, quickDelegationTeamMembers, rootSession, sessions, subSessions]);
 
   // ── Dedicated execution routing preference ──────────────────────────────
   // Reads the SHARED preference (the same one Team Settings edits). Generic

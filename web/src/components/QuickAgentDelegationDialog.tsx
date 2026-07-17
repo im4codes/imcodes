@@ -13,6 +13,8 @@ export interface QuickAgentDelegationCandidate {
   label?: string | null;
   model?: string | null;
   state: string;
+  /** Enabled member of the current root session's saved Team configuration. */
+  teamMember?: boolean;
 }
 
 interface QuickAgentDelegationDialogProps {
@@ -193,6 +195,11 @@ export function QuickAgentDelegationDialog({
                     </span>
                     {displayLabel !== typeLabel && (
                       <span class="peer-audit-chooser-row-label">{displayLabel}</span>
+                    )}
+                    {candidate.teamMember && (
+                      <span class="p2p-tag quick-agent-delegation-team-tag">
+                        {t('session.p2p_tag')}
+                      </span>
                     )}
                   </span>
                   <span class="peer-audit-chooser-row-meta">

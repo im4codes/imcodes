@@ -4908,7 +4908,7 @@ afterEach(() => {
     expect(gatherSendCalls(ws)).toHaveLength(0);
   });
 
-  it('limits Quick candidates to the current project, excludes self and shell/script, and de-duplicates names', () => {
+  it('limits Quick candidates to the current session group, excluding same-project worker records and other roots', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
@@ -4922,34 +4922,103 @@ afterEach(() => {
         ]}
         subSessions={[
           { sessionName: 'deck_sub_child', type: 'codex-sdk', label: 'Child', state: 'idle', parentSession: 'deck_proj_brain' },
-          { sessionName: 'deck_sub_sibling', type: 'claude-code-sdk', label: 'Sibling child', state: 'running', parentSession: 'deck_proj_w1' },
+          { sessionName: 'deck_sub_busy', type: 'claude-code-sdk', label: 'Busy child', state: 'running', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_sibling', type: 'claude-code-sdk', label: 'Other root child', state: 'running', parentSession: 'deck_proj_w1' },
           { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'Other child', state: 'idle', parentSession: 'deck_other_brain' },
-          { sessionName: 'deck_proj_w1', type: 'codex-sdk', label: 'Duplicate peer', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_child', type: 'codex-sdk', label: 'Duplicate child', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_shell', type: 'shell', label: 'Sub shell', state: 'idle', parentSession: 'deck_proj_brain' },
         ]}
         quickData={makeQuickData() as any}
       />,
     );
     fireEvent.click(screen.getByTestId('peer-audit-icon'));
     const dialog = screen.getByTestId('quick-agent-delegation-dialog');
-    expect(within(dialog).getAllByTestId('quick-agent-delegation-candidate')).toHaveLength(3);
-    expect(dialog.textContent).toContain('Project peer');
+    expect(within(dialog).getAllByTestId('quick-agent-delegation-candidate')).toHaveLength(2);
     expect(dialog.textContent).toContain('Child');
-    expect(dialog.textContent).toContain('Sibling child');
+    expect(dialog.textContent).toContain('Busy child');
     expect(dialog.textContent).not.toContain('Self');
     expect(dialog.textContent).not.toContain('Shell');
+    expect(dialog.textContent).not.toContain('Project peer');
+    expect(dialog.textContent).not.toContain('Other root child');
     expect(dialog.textContent).not.toContain('Other project');
     expect(dialog.textContent).not.toContain('Other child');
-    expect(dialog.textContent).not.toContain('Duplicate peer');
+    expect(dialog.textContent).not.toContain('Duplicate child');
     expect(dialog.textContent).toContain('busy');
   });
 
-  it('fails closed with an empty Quick candidate list when project authority is missing', () => {
+  it('offers the owning main session and direct siblings when Quick starts from a sub-session', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
         serverId="srv1"
-        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: '' })}
+        activeSession={makeTransportSession({ name: 'deck_sub_current', project: 'proj', role: 'w1' })}
+        sessions={[
+          makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain', label: 'Project main' }),
+          makeTransportSession({ name: 'deck_proj_w1', project: 'proj', role: 'w1', label: 'Hidden worker' }),
+        ]}
+        subSessions={[
+          { sessionName: 'deck_sub_current', type: 'codex-sdk', label: 'Current', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_sibling', type: 'claude-code-sdk', label: 'Sibling', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'Other root', state: 'idle', parentSession: 'deck_other_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const dialog = screen.getByTestId('quick-agent-delegation-dialog');
+    expect(within(dialog).getAllByTestId('quick-agent-delegation-candidate')).toHaveLength(2);
+    expect(dialog.textContent).toContain('Project main');
+    expect(dialog.textContent).toContain('Sibling');
+    expect(dialog.textContent).not.toContain('Current');
+    expect(dialog.textContent).not.toContain('Hidden worker');
+    expect(dialog.textContent).not.toContain('Other root');
+  });
+
+  it('marks enabled Team members in the Quick delegation chooser', async () => {
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        return JSON.stringify({
+          sessions: {
+            deck_sub_team: { enabled: true, mode: 'audit' },
+            deck_sub_regular: { enabled: false, mode: 'review' },
+          },
+          rounds: 1,
+        });
+      }
+      return null;
+    });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[
+          { sessionName: 'deck_sub_team', type: 'claude-code-sdk', label: 'Team reviewer', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_regular', type: 'codex-sdk', label: 'Regular reviewer', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const rows = within(screen.getByTestId('quick-agent-delegation-dialog'))
+      .getAllByTestId('quick-agent-delegation-candidate');
+    expect(rows[0]!.textContent).toContain('Team reviewer');
+    expect(rows[0]!.textContent).toContain('p2p_tag');
+    expect(rows[1]!.textContent).toContain('Regular reviewer');
+    expect(rows[1]!.textContent).not.toContain('p2p_tag');
+  });
+
+  it('fails closed with an empty Quick candidate list for an orphaned sub-session', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_sub_orphan', project: 'proj' })}
         sessions={[makeTransportSession({ name: 'deck_other_brain', project: 'other', label: 'Other' })]}
+        subSessions={[{
+          sessionName: 'deck_sub_orphan', type: 'codex-sdk', label: 'Orphan', state: 'idle', parentSession: null,
+        }]}
         quickData={makeQuickData() as any}
       />,
     );

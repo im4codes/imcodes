@@ -27,6 +27,7 @@ describe('QuickAgentDelegationDialog', () => {
       label: 'Reviewer',
       model: 'gpt-5.6',
       state: 'running',
+      teamMember: true,
     },
   ];
 
@@ -45,6 +46,7 @@ describe('QuickAgentDelegationDialog', () => {
     expect(dialog.textContent).toContain('Reviewer');
     expect(dialog.textContent).toContain('claude-opus-4-7');
     expect(dialog.textContent).toContain('gpt-5.6');
+    expect(dialog.textContent).toContain('session.p2p_tag');
     expect(dialog.outerHTML).not.toContain('deck_');
   });
 

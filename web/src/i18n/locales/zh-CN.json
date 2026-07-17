@@ -2717,7 +2717,7 @@
     "consentBody": "审计摘要将发送给 {{auditor}},它在另一模型厂商上运行。是否继续?",
     "consentConfirm": "发送给 {{auditor}}",
     "selectionWillPersist": "该审计者也会被记住，用于此会话后续的自动审计。",
-    "noCandidate": "本项目内没有其他可委派的智能体。",
+    "noCandidate": "当前会话组内没有其他可委派的智能体。",
     "candidateLoad": {
       "waiting_authority": "正在等待 daemon 刷新权威会话身份；刷新完成后审计者选项会自动出现。",
       "loading": "正在加载审计者选项…",

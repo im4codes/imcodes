@@ -2717,7 +2717,7 @@
     "consentBody": "The audit summary will be sent to {{auditor}}, which runs on a different model provider. Continue?",
     "consentConfirm": "Send to {{auditor}}",
     "selectionWillPersist": "This auditor will also be remembered for future automatic audits of this session.",
-    "noCandidate": "No other agent is available in this project.",
+    "noCandidate": "No other agent is available in this session group.",
     "candidateLoad": {
       "waiting_authority": "Waiting for the daemon to refresh authoritative session identities. Auditor options will appear automatically.",
       "loading": "Loading auditor options…",

@@ -2716,7 +2716,7 @@
     "consentBody": "監査サマリーを {{auditor}} (別ベンダー上のモデル) に送信します。続行しますか?",
     "consentConfirm": "{{auditor}} に送信",
     "selectionWillPersist": "この監査担当は、このセッションの今後の自動監査にも使用されます。",
-    "noCandidate": "このプロジェクトには委任できる他のエージェントがいません。",
+    "noCandidate": "現在のセッショングループには委任できる他のエージェントがいません。",
     "candidateLoad": {
       "waiting_authority": "daemon が権威あるセッション ID を更新するのを待っています。完了後、監査者の選択肢が自動的に表示されます。",
       "loading": "監査者の選択肢を読み込み中…",
