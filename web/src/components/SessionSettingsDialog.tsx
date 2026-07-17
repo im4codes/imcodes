@@ -1295,7 +1295,23 @@ export function SessionSettingsDialog({
             </div>
 
             {isAuditMode && (
-              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(0, 1fr)', gap: 12 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ maxWidth: 200 }}>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAuditLoops')}</div>
+                  <input
+                    class="input"
+                    type="number"
+                    min={0}
+                    value={String(supervisionAuditLoops)}
+                    onInput={(e) => {
+                      const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
+                      setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
+                    }}
+                    style={{ width: '100%' }}
+                    disabled={saving}
+                  />
+                </div>
+
                 <div>
                   <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
                     {t('peerAuditQuick.chooserTitle')}
@@ -1340,22 +1356,6 @@ export function SessionSettingsDialog({
                       {selectedPeerAuditVisibleIdentity}
                     </div>
                   )}
-                </div>
-
-                <div>
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAuditLoops')}</div>
-                  <input
-                    class="input"
-                    type="number"
-                    min={0}
-                    value={String(supervisionAuditLoops)}
-                    onInput={(e) => {
-                      const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                      setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
-                    }}
-                    style={{ width: '100%' }}
-                    disabled={saving}
-                  />
                 </div>
               </div>
             )}

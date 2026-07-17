@@ -5315,7 +5315,9 @@ html.native-ios-mac .chat-dl-btn {
 
 .peer-audit-chooser-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  /* Always two columns: the list spans the full dialog width, so auto-fit would
+     spread to 3-4 narrow columns instead of the intended two. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin: 0;
   padding: 0;
