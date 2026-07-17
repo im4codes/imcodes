@@ -124,6 +124,14 @@ IM.codes puede conducir sesiones de agent compatibles turno a turno — un super
 
 ## Funciones
 
+### Alias privados
+
+Guarda fragmentos de texto reutilizables vinculados al propietario y búscalos escribiendo `;` en el composer, o inserta directamente un marcador `;;(name)`. El mensaje mantiene visible el marcador mientras IM.codes resuelve y entrega el valor fuera de banda. Los agentes también pueden crear, buscar, editar y resolver alias mediante herramientas MCP gestionadas; los listados masivos solo exponen metadatos, evitando que una sola llamada vuelque todos los valores al contexto del modelo.
+
+### Nodos controlados
+
+Registra otra máquina como nodo controlado restringido sin convertirla en un source server completo de IM.codes. Escribe `^` para autocompletar el destino o inserta `^^(name)`; los agentes autorizados podrán ejecutar comandos remotos con alcance, transferir archivos individuales o invocar herramientas Computer Use tipadas en ese nodo. El propietario habilita y puede revocar la ejecución, los nodos controlados no aparecen en las listas normales de server/session y cada máquina usa credenciales independientes. El enlace de descarga caduca, pero un instalador recién descargado puede conservarse y reutilizarse para registrar varias máquinas.
+
 ### Terminal remota
 Acceso completo al terminal de tus sesiones de agente desde cualquier navegador, sin SSH, VPN ni port forwarding. Puedes alternar entre modo terminal bruto y una vista de chat estructurada con tool calls, bloques de thinking y salida en streaming.
 

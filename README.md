@@ -122,6 +122,14 @@ IM.codes can drive supported agent sessions turn by turn — a supervisor with y
 
 ## Features
 
+### Private Aliases
+
+Save owner-scoped reusable text snippets and insert them from the composer by typing `;` or selecting a `;;(name)` marker. The message keeps the marker visible while IM.codes resolves and delivers the value out of band. Agents can create, search, edit, and resolve aliases through managed MCP tools; bulk listings expose metadata only, so one call cannot dump every stored value into model context.
+
+### Controlled Nodes
+
+Enroll another machine as a restricted controlled node without turning it into a full IM.codes source server. Type `^` to autocomplete a target or insert `^^(name)` directly, then authorized agents can run scoped remote commands, transfer individual files, or invoke typed Computer Use tools on that node. Execution remains owner-gated and revocable, controlled nodes stay out of normal server/session lists, and each enrolled machine receives independent credentials. Download links expire, but a newly downloaded installer can be kept and reused to enroll multiple machines.
+
 ### Remote Terminal
 
 Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming at 12fps with zero message limits.
