@@ -53,6 +53,18 @@ const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js')
 const { getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForRunPhase(phase: 'execution' | 'auditing' | 'finalizing', timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase !== phase) {
+    if (performance.now() >= deadline) return;
+    // `setTimeout` is deliberately faked by the deadline test below. Yield on
+    // the real check queue so async filesystem baseline discovery can finish
+    // without advancing the six-minute audit deadline.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 let projectDir: string | null = null;
 
 beforeEach(() => {
@@ -271,10 +283,7 @@ describe('SupervisionAutomation', () => {
       beginRun('cmd-timeout-audit', 'implement the feature');
       completeTurn('Implementation and tests are complete.');
 
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase === 'auditing') break;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      await waitForRunPhase('auditing');
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
         phase: 'auditing',
         deferredFinalization: expect.any(Object),

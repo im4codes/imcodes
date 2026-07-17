@@ -9,9 +9,12 @@ import { vi } from 'vitest';
 let tempDir: string;
 
 async function importSessionStore() {
-  return vi.importActual<typeof import('../../src/store/session-store.js')>(
-    '../../src/store/session-store.js',
-  );
+  // This file exercises the real persistence module. Full-suite workers also
+  // load tests that mock session-store; explicitly remove any inherited mock
+  // registration before each fresh import instead of relying on
+  // `importActual`, which can still race a reset/mock registry transition.
+  vi.doUnmock('../../src/store/session-store.js');
+  return import('../../src/store/session-store.js');
 }
 
 beforeEach(() => {
