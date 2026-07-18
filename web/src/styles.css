@@ -3690,6 +3690,11 @@ html.native-ios-mac .chat-dl-btn {
   z-index: 9999;
   padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
 }
+/* Settings can be opened from controls whose portaled menus/backdrops use the
+   maximum application stack. Keep this modal in the same top stack; the
+   component itself is portaled after the invoking controls so it receives
+   pointer/touch events instead of an older invisible backdrop. */
+.session-settings-overlay { z-index: 2147483647; }
 .dialog {
   background: #1e293b; border: 1px solid #334155; border-radius: 8px;
   width: 100%;

@@ -2,6 +2,7 @@
  * SessionSettingsDialog — edit metadata and view cwd for main or sub sessions.
  */
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
@@ -40,6 +41,7 @@ import {
   type PeerAuditCandidate,
 } from '@shared/peer-audit.js';
 import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
+import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
 import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
 import {
   SESSION_SETTINGS_FOCUS,
@@ -619,6 +621,8 @@ export function SessionSettingsDialog({
   cwd: initCwd,
   type,
   transportConfig,
+  sessionInstanceId,
+  runtimeEpoch,
   activeModel,
   requestedModel,
   peerAuditSessions = [],
@@ -636,13 +640,25 @@ export function SessionSettingsDialog({
     [transportConfig],
   );
   const initialSupervision = useMemo<SupervisionDraft>(() => {
-    const persisted = hasPersistedSupervision
+    const persisted: SupervisionDraft = hasPersistedSupervision
       ? readSupervisionSnapshotFromTransportConfig(transportConfig)
       : { mode: 'off' as const };
-    return openIntent?.supervisionMode
-      ? { ...persisted, mode: openIntent.supervisionMode }
-      : persisted;
-  }, [hasPersistedSupervision, openIntent?.supervisionMode, transportConfig]);
+    if (!openIntent?.supervisionMode) return persisted;
+    if (openIntent.supervisionMode === 'off' || (persisted.backend && persisted.model)) {
+      return { ...persisted, mode: openIntent.supervisionMode };
+    }
+    // Quick-open must be usable before the async user-pref request resolves.
+    // Seed the same canonical fallback used by the daemon so Save is never
+    // held hostage by a slow/offline preference request.
+    const immediateDefaults = normalizeSupervisorDefaultConfig(
+      isSupportedSupervisionBackend(type) ? { backend: type } : null,
+    );
+    return {
+      ...immediateDefaults,
+      ...persisted,
+      mode: openIntent.supervisionMode,
+    };
+  }, [hasPersistedSupervision, openIntent?.supervisionMode, transportConfig, type]);
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
@@ -653,6 +669,7 @@ export function SessionSettingsDialog({
   const [peerAuditTargetName, setPeerAuditTargetName] = useState<string | null>(
     initialSupervision.auditTargetSessionName ?? null,
   );
+  const [authoritativePeerAuditCandidates, setAuthoritativePeerAuditCandidates] = useState<readonly PeerAuditCandidate[]>([]);
   const peerAuditTargetRef = useRef<HTMLDivElement>(null);
   const peerAuditSessionSyncKeyRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -682,6 +699,23 @@ export function SessionSettingsDialog({
     if (peerAuditSessionSyncKeyRef.current === syncKey) return;
     if (onRequestPeerAuditSessionSync()) peerAuditSessionSyncKeyRef.current = syncKey;
   }, [isAuditMode, onRequestPeerAuditSessionSync, parentSession, sessionName]);
+
+  useEffect(() => {
+    setAuthoritativePeerAuditCandidates([]);
+    if (!isAuditMode || !ws || !sessionInstanceId || !runtimeEpoch) return;
+    let active = true;
+    const adapter = createWsPeerAuditAdapter(ws);
+    void adapter.listCandidates({
+      auditedSessionName: sessionName,
+      auditedSessionIdentity: { sessionInstanceId, runtimeEpoch },
+    }).then((list) => {
+      if (active) setAuthoritativePeerAuditCandidates(list.candidates);
+    }).catch(() => {
+      // The loaded session list remains visible. Reconnect/sub-session sync
+      // changes the callback identity and retries this authority enrichment.
+    });
+    return () => { active = false; };
+  }, [isAuditMode, onRequestPeerAuditSessionSync, runtimeEpoch, sessionInstanceId, sessionName, ws]);
 
   useEffect(() => {
     if (openIntent?.focus !== SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET || !isAuditMode) return;
@@ -741,21 +775,28 @@ export function SessionSettingsDialog({
     if (!supervisorDefaultsDirtyRef.current) {
       setSupervisorDefaults(resolvedDefaults);
     }
-    if (hasPersistedSupervision) return;
     setSupervision((prev) => {
-      if (prev.backend || prev.model) return prev;
+      const missingBackend = !prev.backend;
+      const missingModel = !prev.model?.trim();
+      if (!missingBackend && !missingModel) return prev;
+      const nextBackend = prev.backend ?? resolvedDefaults.backend;
+      const nextModel = missingModel
+        ? (nextBackend === resolvedDefaults.backend
+            ? resolvedDefaults.model
+            : resolveSupervisionModelForBackend(nextBackend, '', prev.backend))
+        : prev.model;
       const shouldSeedAutoContinueStreak = prev.maxAutoContinueStreak == null
         || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
       const shouldSeedAutoContinueTotal = prev.maxAutoContinueTotal == null
         || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
       return {
         ...prev,
-        backend: resolvedDefaults.backend,
-        model: resolvedDefaults.model,
+        backend: nextBackend,
+        model: nextModel,
         // Seed preset from defaults when the backend supports it. If the
         // backend doesn't support presets the normalizer already stripped
         // it, so copying is safe either way.
-        preset: resolvedDefaults.preset,
+        preset: prev.preset ?? (nextBackend === resolvedDefaults.backend ? resolvedDefaults.preset : undefined),
         timeoutMs: resolvedDefaults.timeoutMs,
         promptVersion: resolvedDefaults.promptVersion,
         maxAutoContinueStreak: shouldSeedAutoContinueStreak
@@ -769,7 +810,7 @@ export function SessionSettingsDialog({
         taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
       };
     });
-  }, [hasPersistedSupervision, isSupportedTransport, supervisorDefaultsPref.loaded, supervisorDefaultsPref.value]);
+  }, [isSupportedTransport, supervisorDefaultsPref.loaded, supervisorDefaultsPref.value]);
 
   const updateSupervisorDefaultsFromUser = (updater: (prev: SupervisionRuntimeDraft) => SupervisionRuntimeDraft): void => {
     supervisorDefaultsDirtyRef.current = true;
@@ -787,11 +828,19 @@ export function SessionSettingsDialog({
   const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
-  const peerAuditCandidates = useMemo(() => buildPeerAuditSettingsCandidates({
+  const loadedPeerAuditCandidates = useMemo(() => buildPeerAuditSettingsCandidates({
     auditedSessionName: sessionName,
     parentSession,
     sessions: peerAuditSessions,
   }), [parentSession, peerAuditSessions, sessionName]);
+  const peerAuditCandidates = useMemo(() => loadedPeerAuditCandidates.map((candidate) => {
+    const authoritative = authoritativePeerAuditCandidates.find((item) => (
+      item.name === candidate.name && item.eligible
+    ));
+    return authoritative
+      ? { ...authoritative, label: candidate.label || authoritative.label, authorityReady: true }
+      : candidate;
+  }), [authoritativePeerAuditCandidates, loadedPeerAuditCandidates]);
   const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
   const peerAuditTargetConfirmed = Boolean(selectedPeerAuditCandidate?.authorityReady);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
@@ -1558,12 +1607,12 @@ export function SessionSettingsDialog({
     return true;
   }, [hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetConfirmed, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
 
-  return (
-    <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+  const dialog = (
+    <div class="dialog-overlay session-settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="dialog" style={{ width: 440 }}>
         <div class="dialog-header">
           <span>{t('session.settings')}</span>
-          <button class="dialog-close" onClick={onClose}>{t('common.close')}</button>
+          <button type="button" class="dialog-close" onClick={onClose}>{t('common.close')}</button>
         </div>
 
         <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -1639,12 +1688,13 @@ export function SessionSettingsDialog({
         </div>
 
         <div class="dialog-footer">
-          <button class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
-          <button class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid}>
+          <button type="button" class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
+          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid}>
             {saving ? t('common.loading') : t('common.save')}
           </button>
         </div>
       </div>
     </div>
   );
+  return typeof document === 'undefined' ? dialog : createPortal(dialog, document.body);
 }
