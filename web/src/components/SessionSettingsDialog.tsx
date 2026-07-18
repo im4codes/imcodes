@@ -70,6 +70,8 @@ interface Props {
    * it must not start a second daemon candidate-list RPC just to populate UI.
    */
   peerAuditSessions?: readonly PeerAuditSettingsSession[];
+  /** Ask the daemon to re-project live identity/model metadata for the loaded list. */
+  onRequestPeerAuditSessionSync?: () => boolean;
   openIntent?: SessionSettingsOpenIntent;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
@@ -97,14 +99,19 @@ export interface PeerAuditSettingsSession {
   providerId?: string | null;
 }
 
+export interface PeerAuditSettingsCandidate extends PeerAuditCandidate {
+  /** False while the row is visible from HTTP-loaded data but daemon identity is still syncing. */
+  authorityReady: boolean;
+}
+
 export function buildPeerAuditSettingsCandidates(input: {
   auditedSessionName: string;
   parentSession?: string | null;
   sessions: readonly PeerAuditSettingsSession[];
-}): PeerAuditCandidate[] {
+}): PeerAuditSettingsCandidate[] {
   const owningMainSession = input.parentSession?.trim() || input.auditedSessionName;
   const seen = new Set<string>();
-  const candidates: PeerAuditCandidate[] = [];
+  const candidates: PeerAuditSettingsCandidate[] = [];
 
   for (const session of input.sessions) {
     if (session.sessionName === input.auditedSessionName
@@ -128,18 +135,25 @@ export function buildPeerAuditSettingsCandidates(input: {
       providerId: session.providerId,
       agentType: session.type,
     });
-    if (!sessionInstanceId || !runtimeEpoch
-      || normalizedModelId === PEER_AUDIT_UNKNOWN_IDENTITY
-      || providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY) {
-      continue;
-    }
+    const authorityReady = Boolean(
+      sessionInstanceId
+      && runtimeEpoch
+      && normalizedModelId !== PEER_AUDIT_UNKNOWN_IDENTITY
+      && providerFamily !== PEER_AUDIT_UNKNOWN_IDENTITY,
+    );
 
     const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.type);
     candidates.push({
       name: session.sessionName,
-      label: session.label?.trim() || peerAuditProviderTypeLabel(providerFamily),
-      sessionInstanceId,
-      runtimeEpoch,
+      label: session.label?.trim()
+        || (providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY
+          ? session.type
+          : peerAuditProviderTypeLabel(providerFamily)),
+      // These synthetic local-only values let the existing picker render and
+      // key rows while daemon identity is still syncing. `authorityReady`
+      // prevents them from ever reaching persisted supervision config.
+      sessionInstanceId: sessionInstanceId || session.sessionName,
+      runtimeEpoch: runtimeEpoch || session.sessionName,
       normalizedModelId,
       providerFamily,
       liveState: session.state ?? PEER_AUDIT_UNKNOWN_IDENTITY,
@@ -148,6 +162,7 @@ export function buildPeerAuditSettingsCandidates(input: {
         : session.state === 'idle' ? 'sent' : 'queued',
       eligible: true,
       reason: PEER_AUDIT_CANDIDATE_REASONS.ELIGIBLE,
+      authorityReady,
     });
   }
 
@@ -607,6 +622,7 @@ export function SessionSettingsDialog({
   activeModel,
   requestedModel,
   peerAuditSessions = [],
+  onRequestPeerAuditSessionSync,
   parentSession,
   openIntent,
   ws,
@@ -638,6 +654,7 @@ export function SessionSettingsDialog({
     initialSupervision.auditTargetSessionName ?? null,
   );
   const peerAuditTargetRef = useRef<HTMLDivElement>(null);
+  const peerAuditSessionSyncKeyRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -658,6 +675,13 @@ export function SessionSettingsDialog({
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
   const isAuditMode = supervision.mode === 'supervised_audit';
   const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport);
+
+  useEffect(() => {
+    if (!isAuditMode || !onRequestPeerAuditSessionSync) return;
+    const syncKey = `${sessionName}:${parentSession ?? ''}`;
+    if (peerAuditSessionSyncKeyRef.current === syncKey) return;
+    if (onRequestPeerAuditSessionSync()) peerAuditSessionSyncKeyRef.current = syncKey;
+  }, [isAuditMode, onRequestPeerAuditSessionSync, parentSession, sessionName]);
 
   useEffect(() => {
     if (openIntent?.focus !== SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET || !isAuditMode) return;
@@ -769,7 +793,7 @@ export function SessionSettingsDialog({
     sessions: peerAuditSessions,
   }), [parentSession, peerAuditSessions, sessionName]);
   const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
-  const peerAuditTargetConfirmed = Boolean(selectedPeerAuditCandidate?.eligible);
+  const peerAuditTargetConfirmed = Boolean(selectedPeerAuditCandidate?.authorityReady);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
     ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
     : null;
@@ -860,8 +884,10 @@ export function SessionSettingsDialog({
       ? {
           maxAuditLoops: supervisionAuditLoops,
           taskRunPromptVersion,
-          auditTargetSessionName: selectedPeerAuditCandidate?.name ?? supervision.auditTargetSessionName,
-          auditTargetFingerprint: selectedPeerAuditCandidate ? {
+          auditTargetSessionName: selectedPeerAuditCandidate?.authorityReady
+            ? selectedPeerAuditCandidate.name
+            : supervision.auditTargetSessionName,
+          auditTargetFingerprint: selectedPeerAuditCandidate?.authorityReady ? {
             sessionInstanceId: selectedPeerAuditCandidate.sessionInstanceId,
             normalizedModelId: selectedPeerAuditCandidate.normalizedModelId,
             providerFamily: selectedPeerAuditCandidate.providerFamily,
@@ -1504,6 +1530,11 @@ export function SessionSettingsDialog({
       {isAuditMode && !peerAuditTargetName && (
         <div style={{ color: '#fbbf24', fontSize: 12 }}>
           {t('session.supervision.validation.auditTargetRequired')}
+        </div>
+      )}
+      {isAuditMode && peerAuditTargetName && selectedPeerAuditCandidate && !peerAuditTargetConfirmed && (
+        <div style={{ color: '#fbbf24', fontSize: 12 }} data-testid="peer-audit-candidate-waiting-authority">
+          {t('peerAuditQuick.candidateLoad.waiting_authority')}
         </div>
       )}
     </div>

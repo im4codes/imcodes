@@ -90,6 +90,29 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
   };
 }
 
+export function buildSubSessionRebuildInputs(
+  subSessions: readonly SubSession[],
+): Parameters<WsClient['subSessionRebuildAll']>[0] {
+  return subSessions.map((s) => ({
+    id: s.id,
+    type: s.type,
+    runtimeType: s.runtimeType,
+    providerId: s.providerId,
+    providerSessionId: s.providerSessionId,
+    shellBin: s.shellBin,
+    cwd: s.cwd,
+    ccSessionId: s.ccSessionId,
+    geminiSessionId: s.geminiSessionId,
+    parentSession: s.parentSession,
+    label: s.label,
+    ccPresetId: s.ccPresetId,
+    requestedModel: s.requestedModel,
+    activeModel: s.activeModel,
+    effort: s.effort,
+    transportConfig: s.transportConfig,
+  }));
+}
+
 export function useSubSessions(
   serverId: string | null,
   ws: WsClient | null,
@@ -211,24 +234,7 @@ export function useSubSessions(
     if (loadedServerId !== serverId) return;
     if (loadedGenRef.current !== loadGenRef.current) return;
     rebuiltRef.current = true;
-    ws.subSessionRebuildAll(subSessions.map((s) => ({
-      id: s.id,
-      type: s.type,
-      runtimeType: s.runtimeType,
-      providerId: s.providerId,
-      providerSessionId: s.providerSessionId,
-      shellBin: s.shellBin,
-      cwd: s.cwd,
-      ccSessionId: s.ccSessionId,
-      geminiSessionId: s.geminiSessionId,
-      parentSession: s.parentSession,
-      label: s.label,
-      ccPresetId: s.ccPresetId,
-      requestedModel: s.requestedModel,
-      activeModel: s.activeModel,
-      effort: s.effort,
-      transportConfig: s.transportConfig,
-    })));
+    ws.subSessionRebuildAll(buildSubSessionRebuildInputs(subSessions));
   }, [connected, ws, subSessions, disableHttpLoad, loadedServerId, serverId]);
 
   // Reset rebuild flag when disconnected

@@ -214,8 +214,9 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('renders the App session list immediately without a peer-audit candidate RPC', () => {
+  it('renders the App session list while daemon identity is syncing without a candidate RPC', () => {
     const sent: Array<Record<string, unknown>> = [];
+    const onRequestPeerAuditSessionSync = vi.fn(() => true);
     const ws = {
       connected: false,
       send(message: Record<string, unknown>) { sent.push(message); },
@@ -230,7 +231,8 @@ describe('SessionSettingsDialog supervision', () => {
         cwd="/proj"
         type="codex-sdk"
         ws={ws}
-        peerAuditSessions={[makePeerAuditSession()]}
+        peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: null, runtimeEpoch: null })]}
+        onRequestPeerAuditSessionSync={onRequestPeerAuditSessionSync}
         transportConfig={{
           supervision: {
             mode: 'supervised_audit',
@@ -247,8 +249,43 @@ describe('SessionSettingsDialog supervision', () => {
     );
 
     expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
+    expect(screen.queryByTestId('peer-audit-chooser-empty')).toBeNull();
+    fireEvent.click(screen.getByTestId('peer-audit-chooser-row'));
+    expect(screen.getByTestId('peer-audit-candidate-waiting-authority')).toBeDefined();
+    expect(onRequestPeerAuditSessionSync).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId('peer-audit-candidate-loading')).toBeNull();
     expect(sent.some((message) => message.type === 'peer_audit.list_candidates')).toBe(false);
+  });
+
+  it('waits for runtime epoch authority before confirming a loaded candidate', () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        peerAuditSessions={[makePeerAuditSession({ runtimeEpoch: null })]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxAuditLoops: 2,
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('peer-audit-chooser-row'));
+
+    expect(screen.getByTestId('peer-audit-candidate-waiting-authority')).toBeDefined();
+    expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('only offers reply-capable sessions from the audited session group', () => {
