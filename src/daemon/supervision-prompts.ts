@@ -71,6 +71,8 @@ function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): st
     '- If implementation and validation are complete and the ONLY remaining action is git add/commit/push, return continue with that exact finalization-only nextAction; the daemon will hold it until peer-audit PASS instead of sending it now.',
     '- If fixes, tests, typecheck, lint, build, validation, documentation changes, deployment, or any other substantive work remains, return continue normally so that work happens before audit.',
     '- Never combine substantive pre-audit work and post-audit commit/push in one nextAction.',
+    '- If both the assistant response and your reason say implementation/validation are already complete, NEVER invent generic "remaining implementation or validation" work. Return only the concrete git add/commit/push finalization nextAction.',
+    '- Do not ask the target session to arrange or resend the audit in a normal continue decision. The daemon emits a separate orchestration prompt containing the exact auditor session ID and reply-enabled send command, exactly once.',
   ].join('\n');
 }
 

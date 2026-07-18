@@ -197,6 +197,11 @@ function classifyContinueBucket(decision: { nextAction?: string; gap?: string; r
 
 const REPOSITORY_FINALIZATION_ACTION_RE = /(?:\b(?:git\s+(?:add|commit|push)|commit|push|stage|staging)\b|提交|推送|暂存)/iu;
 const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|deploy|release|restart)\b|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|部署|发布|重启)/iu;
+const COMPLETED_PRE_AUDIT_WORK_RE = /(?:\b(?:implementation|fix(?:es)?|coding|changes?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,80}\b(?:complete|completed|done|finished|pass(?:ed)?)\b|(?:修复|实现|代码|改动|测试|验证|检查|类型检查|构建)[\s\S]{0,60}(?:已完成|已经完成|均已完成|全部完成|完成并通过|已通过|验证通过|测试通过))/iu;
+const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[\s\S]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|(?:仍|还|尚|待|未|缺少|失败)[\s\S]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[\s\S]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过))/iu;
+const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Finalize only the already-audited repository changes: stage the intended task files, commit them, and push the current branch. Do not request or start another audit.';
+
+type RepositoryFinalizationClassification = 'none' | 'finalization_only' | 'completion_evidenced_mixed';
 
 /**
  * `supervised_audit` must review the implementation before repository
@@ -217,6 +222,42 @@ function isRepositoryFinalizationOnly(decision: { nextAction?: string }): decisi
 
 function hasRepositoryFinalizationAction(decision: { nextAction?: string }): boolean {
   return Boolean(decision.nextAction?.trim() && REPOSITORY_FINALIZATION_ACTION_RE.test(decision.nextAction));
+}
+
+/**
+ * Supervisors occasionally violate the prompt contract by combining a
+ * commit/push instruction with generic wording such as "finish remaining
+ * validation", even though both their rationale and the completed assistant
+ * turn say that implementation and validation already passed. Treating that
+ * contradiction as substantive work sends a vague `supervision_continue_v1`
+ * instead of the dedicated audit prompt; the agent then manually delegates an
+ * audit while the daemon remains in `execution`, and the next idle repeats the
+ * same request forever.
+ *
+ * Require matching completion evidence from both the supervisor decision and
+ * the actual assistant turn, and reject either side if it names concrete
+ * pending pre-audit work. This keeps real "run tests/fix failures, then
+ * commit" decisions in the execution loop while deterministically promoting
+ * the documented completed-work contradiction into the one-shot audit phase.
+ */
+function classifyRepositoryFinalization(
+  decision: { reason: string; nextAction?: string; gap?: string },
+  assistantResponse: string | undefined,
+): RepositoryFinalizationClassification {
+  if (!hasRepositoryFinalizationAction(decision)) return 'none';
+  if (isRepositoryFinalizationOnly(decision)) return 'finalization_only';
+
+  const decisionEvidence = [decision.reason, decision.gap]
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .join(' ');
+  const assistantEvidence = assistantResponse?.trim() ?? '';
+  if (!COMPLETED_PRE_AUDIT_WORK_RE.test(decisionEvidence)
+    || !COMPLETED_PRE_AUDIT_WORK_RE.test(assistantEvidence)
+    || PENDING_PRE_AUDIT_WORK_RE.test(decisionEvidence)
+    || PENDING_PRE_AUDIT_WORK_RE.test(assistantEvidence)) {
+    return 'none';
+  }
+  return 'completion_evidenced_mixed';
 }
 
 function formatUnavailableReason(reason: SupervisionUnavailableReason | undefined): string | null {
@@ -834,14 +875,21 @@ class SupervisionAutomation {
         return;
       }
       case 'continue': {
+        const repositoryFinalization = classifyRepositoryFinalization(decision, latest.lastAssistantText);
         if (
           latest.phase === 'execution'
           && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
-          && isRepositoryFinalizationOnly(decision)
+          && repositoryFinalization !== 'none'
         ) {
           latest.deferredFinalization = {
             reason: decision.reason,
-            nextAction: decision.nextAction,
+            // A completion-evidenced mixed decision is internally
+            // contradictory. Do not replay its generic validation/audit words
+            // after PASS: doing so can ask for a second audit. The normalized
+            // action contains repository finalization only.
+            nextAction: repositoryFinalization === 'finalization_only'
+              ? decision.nextAction ?? POST_AUDIT_REPOSITORY_FINALIZATION_ACTION
+              : POST_AUDIT_REPOSITORY_FINALIZATION_ACTION,
             ...(decision.gap ? { gap: decision.gap } : {}),
           };
           latest.terminalState = 'complete';
@@ -1022,6 +1070,7 @@ class SupervisionAutomation {
     const auditTask = [
       buildQuickAgentDelegationTask('audit'),
       'This is the configured automatic supervision audit. You—not the daemon—must prepare the audit background from your real current-session context and send it to the selected delegate with reply enabled.',
+      `Automatic audit attempt ID: ${current.auditAttemptId}. The route is fixed: send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
       'Do not commit, push, deploy, or modify the implementation while waiting for the audit.',
       baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
       baseline.fileContents.length > 0

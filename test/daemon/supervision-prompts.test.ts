@@ -129,6 +129,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Peer audit MUST finish before repository commit/push finalization.');
     expect(prompt).toContain('the daemon will hold it until peer-audit PASS instead of sending it now');
     expect(prompt).toContain('Never combine substantive pre-audit work and post-audit commit/push in one nextAction.');
+    expect(prompt).toContain('NEVER invent generic "remaining implementation or validation" work');
+    expect(prompt).toContain('exact auditor session ID and reply-enabled send command, exactly once');
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {

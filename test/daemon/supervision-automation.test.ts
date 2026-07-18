@@ -236,7 +236,9 @@ describe('SupervisionAutomation', () => {
     const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(orchestrationPrompt).toContain('You are the current session orchestrator for an agent delegation.');
     expect(orchestrationPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
-    expect(orchestrationPrompt).toContain('imcodes send --reply');
+    expect(orchestrationPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(orchestrationPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
+    expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
     expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the audit background');
     expect(orchestrationPrompt).toContain('Do not commit, push, deploy');
     expect(mockStartP2pRun).not.toHaveBeenCalled();
@@ -250,6 +252,8 @@ describe('SupervisionAutomation', () => {
     // response actually returns to this session.
     completeTurn('Audit delegated; waiting for the selected agent reply.');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
 
     timelineEmitter.emit('deck_supervision_brain', 'user.message', {
       text: 'Unrelated shared participant message.',
@@ -720,6 +724,68 @@ describe('SupervisionAutomation', () => {
         nextAction: '在 peer-audit PASS 后处理未提交变更并执行 git add、commit 和 push。',
       },
     });
+  });
+
+  it('starts exactly one addressed audit when completion evidence contradicts a mixed validation and finalization action', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '该轮修复和验证已经完成且通过，但当前存在未提交改动；按用户规则必须提交并推送。',
+      confidence: 0.9,
+      gap: '工作区尚有未提交修改，且尚未执行 git add/commit/push。',
+      // This is the contradictory shape observed in production. Before the
+      // fix, the generic validation words kept the run in `execution`, so the
+      // assistant manually sent an audit without the daemon knowing and every
+      // subsequent idle injected another supervision_continue_v1 prompt.
+      nextAction: 'Complete only the remaining substantive implementation or validation work, then commit and push after peer-audit PASS.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-completed-mixed-finalization',
+      '修复解析错误',
+      snapshot,
+    );
+    beginRun('cmd-completed-mixed-finalization', '修复解析错误');
+    completeTurn('修复与验证已经完成并通过。当前未提交，等待本轮自动审计后再 commit/push。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(auditPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(auditPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(auditPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
+    expect(auditPrompt).not.toContain('[Contract: supervision_continue_v1]');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: expect.stringContaining('Do not request or start another audit'),
+      },
+    });
+
+    // Acknowledging the one dispatch and going idle must not run the
+    // supervisor again or emit a second audit/continue request.
+    completeTurn('审计已发送，等待 reply-enabled 回执。');
+    await sleep(25);
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+
+    completeDelegatedAudit('PASS', 'The completion-evidenced fix is correct.');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
+    expect(finalizationPrompt).toContain('Do not request or start another audit');
+    expect(finalizationPrompt).not.toContain('Exact delegate target session:');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+    completeTurn('已提交并推送审计通过的改动。');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send.mock.calls.filter((call) =>
+      String(call[0]).includes('Exact delegate target session:'))).toHaveLength(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
   it('never releases held commit and push when peer audit requests REWORK', async () => {
