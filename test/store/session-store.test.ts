@@ -5,15 +5,16 @@ import { join } from 'path';
 import { readFile } from 'node:fs/promises';
 import { vi } from 'vitest';
 
+// This suite exercises the real persistence module. `vi.unmock` is hoisted by
+// Vitest, so it clears any worker-inherited session-store mock BEFORE module
+// resolution starts. A runtime-only `vi.doUnmock` was too late under Node 22's
+// full-suite worker reuse and could yield another test's partial mock object.
+vi.unmock('../../src/store/session-store.js');
+
 // We need to test with a temp path — patch the store path
 let tempDir: string;
 
 async function importSessionStore() {
-  // This file exercises the real persistence module. Full-suite workers also
-  // load tests that mock session-store; explicitly remove any inherited mock
-  // registration before each fresh import instead of relying on
-  // `importActual`, which can still race a reset/mock registry transition.
-  vi.doUnmock('../../src/store/session-store.js');
   return import('../../src/store/session-store.js');
 }
 
