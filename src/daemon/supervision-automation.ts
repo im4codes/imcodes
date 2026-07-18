@@ -10,6 +10,7 @@ import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.j
 import logger from '../util/logger.js';
 import {
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_MODE,
@@ -26,6 +27,8 @@ import {
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
 import {
+  AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
+  buildAgentDelegationReplyInstruction,
   buildAgentDelegationOrchestrationPrompt,
   buildQuickAgentDelegationTask,
 } from '../../shared/agent-delegation.js';
@@ -44,6 +47,7 @@ import {
   resolvePeerAuditNormalizedModelId,
   resolvePeerAuditProviderFamily,
 } from './peer-audit-candidates.js';
+import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 
 /**
  * Merge the daemon-cached global custom instructions into a session snapshot
@@ -77,6 +81,8 @@ const SUPERVISION_NEEDS_INPUT_LABEL = 'Supervised: returned control to you.';
 const SUPERVISION_AUDIT_PASS_LABEL = 'Supervised: audit passed.';
 const SUPERVISION_REWORK_LABEL = 'Supervised: audit requested rework; brief sent.';
 const SUPERVISION_BLOCKED_LABEL = 'Supervised: stopped because the session is blocked.';
+const AUDIT_TARGET_RECOVERY_DELAY_MS = 1_500;
+const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
 
 interface ActiveTaskRunState {
   generation: number;
@@ -97,6 +103,12 @@ interface ActiveTaskRunState {
   auditStartedAt?: number;
   auditReplyObserved: boolean;
   auditDeadlineTimer?: NodeJS.Timeout;
+  auditTargetSessionInstanceId?: string;
+  auditTargetDispatchObservedAt?: number;
+  auditTargetObservedActive: boolean;
+  auditTargetRecoveryAttempts: number;
+  auditTargetRecoveryLimitNotified: boolean;
+  auditTargetRecoveryTimer?: NodeJS.Timeout;
   // When a reply-backed audit settles from the assistant-text fallback (that
   // is, before the provider emits the trailing idle for the audit turn), the
   // deferred finalization/rework prompt may already be dispatched by the time
@@ -554,6 +566,7 @@ class SupervisionAutomation {
     const state = this.activeRuns.get(sessionName);
     if (state?.phase === 'auditing' && state.auditAttemptId) {
       this.clearAuditDeadline(state);
+      this.clearAuditTargetRecovery(state);
       this.emitOrchestratedAuditResult(state, 'cancelled', 'session_supervision_cancelled');
     }
     this.activeRuns.delete(sessionName);
@@ -689,6 +702,7 @@ class SupervisionAutomation {
     const existing = this.activeRuns.get(sessionName);
     if (existing?.phase === 'auditing' && existing.auditAttemptId) {
       this.clearAuditDeadline(existing);
+      this.clearAuditTargetRecovery(existing);
       this.emitOrchestratedAuditResult(existing, 'cancelled', 'new_task_intent_replaced_existing_audit');
     }
     const next: ActiveTaskRunState = {
@@ -705,6 +719,9 @@ class SupervisionAutomation {
       sawAssistantOutput: false,
       reworkDispatches: 0,
       auditReplyObserved: false,
+      auditTargetObservedActive: false,
+      auditTargetRecoveryAttempts: 0,
+      auditTargetRecoveryLimitNotified: false,
       startedAt: Date.now(),
     };
     this.recentTaskCandidates.delete(sessionName);
@@ -716,7 +733,203 @@ class SupervisionAutomation {
     return this.activeRuns.get(sessionName);
   }
 
+  private clearAuditTargetRecoveryTimer(run: ActiveTaskRunState): void {
+    if (run.auditTargetRecoveryTimer) clearTimeout(run.auditTargetRecoveryTimer);
+    run.auditTargetRecoveryTimer = undefined;
+  }
+
+  private clearAuditTargetRecovery(run: ActiveTaskRunState): void {
+    this.clearAuditTargetRecoveryTimer(run);
+    run.auditTargetObservedActive = false;
+    run.auditTargetDispatchObservedAt = undefined;
+  }
+
+  private isCorrelatedAuditTargetDispatch(
+    run: ActiveTaskRunState,
+    payload: Record<string, unknown>,
+  ): boolean {
+    const text = trimString(payload.text);
+    if (!text || !run.auditAttemptId || payload.automation === true) return false;
+    const sharedActor = payload.sharedActor && typeof payload.sharedActor === 'object'
+      ? payload.sharedActor as Record<string, unknown>
+      : undefined;
+    const exactActor = trimString(sharedActor?.actorUserId) === run.sessionName;
+    const exactReplyRoute = text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
+      && text.includes(buildAgentDelegationReplyInstruction(run.sessionName));
+    const exactAttempt = text.includes(run.auditAttemptId);
+    // Sub-session delegation carries the authoritative shared-actor identity.
+    // Main→main delegation does not, so the attempt id embedded in the brief is
+    // the fallback authority there. Both paths must retain the exact reply
+    // route back to the audited session.
+    return exactReplyRoute && (exactActor || exactAttempt);
+  }
+
+  private auditTargetRuntimeIsWorking(sessionName: string): boolean {
+    const runtime = getTransportRuntime(sessionName);
+    if (!runtime) return false;
+    const activity = runtime.getDiagnosticSnapshot();
+    return isWorkingSessionState(activity.status)
+      || activity.sending
+      || activity.pendingCount > 0
+      || activity.activeDispatchCount > 0
+      || activity.blockingWorkCount > 0;
+  }
+
+  private handleAuditTargetTimelineEvent(event: {
+    sessionId: string;
+    type: string;
+    payload: Record<string, unknown>;
+  }): void {
+    for (const run of this.activeRuns.values()) {
+      if (
+        run.phase !== 'auditing'
+        || run.auditReplyObserved
+        || !run.auditAttemptId
+        || run.snapshot.auditTargetSessionName !== event.sessionId
+      ) continue;
+
+      if (event.type === 'user.message' && this.isCorrelatedAuditTargetDispatch(run, event.payload)) {
+        const target = getSession(event.sessionId);
+        if (!target || target.sessionInstanceId !== run.auditTargetSessionInstanceId) continue;
+        run.auditTargetDispatchObservedAt = Date.now();
+        // A correlated user.message is emitted only after a direct transport
+        // send is accepted, or when a queued send actually drains. It is thus
+        // sufficient proof that this audit attempt entered a real target turn,
+        // even if the adjacent `running` edge preceded the message.
+        run.auditTargetObservedActive = true;
+        this.clearAuditTargetRecoveryTimer(run);
+        continue;
+      }
+
+      if (event.type !== 'session.state' || run.auditTargetDispatchObservedAt === undefined) continue;
+      const state = trimString(event.payload.state);
+      if (!state) continue;
+      const target = getSession(event.sessionId);
+      if (!target || target.sessionInstanceId !== run.auditTargetSessionInstanceId) {
+        this.clearAuditTargetRecovery(run);
+        continue;
+      }
+      if (isWorkingSessionState(state) || state === 'queued') {
+        run.auditTargetObservedActive = true;
+        this.clearAuditTargetRecoveryTimer(run);
+        continue;
+      }
+      if (!run.auditTargetObservedActive) continue;
+
+      const runtime = getTransportRuntime(event.sessionId);
+      const providerError = runtime?.lastProviderError;
+      const providerErrorBelongsToAttempt = Boolean(
+        providerError && providerError.at >= run.auditTargetDispatchObservedAt,
+      );
+      const failed = state === 'error'
+        || state === 'stopped'
+        || (state === 'idle' && providerErrorBelongsToAttempt);
+      if (!failed) {
+        if (state === 'idle') run.auditTargetObservedActive = false;
+        continue;
+      }
+
+      // Consume the active edge before arming the timer. Duplicate error/idle
+      // projections for the same failed turn then cannot schedule duplicates;
+      // a genuinely resumed turn must first emit running/queued again.
+      run.auditTargetObservedActive = false;
+      this.scheduleAuditTargetRecovery(run, state);
+    }
+  }
+
+  private scheduleAuditTargetRecovery(run: ActiveTaskRunState, failedState: string): void {
+    if (run.auditTargetRecoveryTimer || run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES) {
+      if (
+        run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES
+        && !run.auditTargetRecoveryLimitNotified
+      ) {
+        run.auditTargetRecoveryLimitNotified = true;
+        this.emitWarning(run.sessionName, 'The configured audit session stopped again after the automatic recovery limit. The audit remains pending for manual intervention.');
+      }
+      return;
+    }
+    const generation = run.generation;
+    const attemptId = run.auditAttemptId;
+    const timer = setTimeout(() => {
+      const latest = this.activeRuns.get(run.sessionName);
+      if (
+        !latest
+        || latest.generation !== generation
+        || latest.phase !== 'auditing'
+        || latest.auditAttemptId !== attemptId
+        || latest.auditReplyObserved
+      ) return;
+      latest.auditTargetRecoveryTimer = undefined;
+      this.continueFailedAuditTarget(latest, failedState);
+    }, AUDIT_TARGET_RECOVERY_DELAY_MS);
+    timer.unref?.();
+    run.auditTargetRecoveryTimer = timer;
+  }
+
+  private continueFailedAuditTarget(run: ActiveTaskRunState, failedState: string): void {
+    const targetName = run.snapshot.auditTargetSessionName;
+    const target = targetName ? getSession(targetName) : undefined;
+    if (
+      !targetName
+      || !target
+      || target.sessionInstanceId !== run.auditTargetSessionInstanceId
+    ) {
+      this.emitWarning(run.sessionName, 'The configured audit session changed identity while recovery was pending. No continue prompt was sent.');
+      return;
+    }
+    if (this.auditTargetRuntimeIsWorking(targetName)) {
+      run.auditTargetObservedActive = true;
+      return;
+    }
+    const runtime = getTransportRuntime(targetName);
+    if (!runtime) {
+      this.emitWarning(run.sessionName, 'The configured audit session stopped and has no live runtime, so its audit turn could not be continued automatically.');
+      return;
+    }
+    if (run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES) return;
+
+    const recoveryNumber = run.auditTargetRecoveryAttempts + 1;
+    const recoveryPrompt = [
+      `[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_TARGET_RECOVERY}]`,
+      'Continue the in-progress automatic peer audit. The previous audit turn stopped before returning its result because of a runtime or provider failure.',
+      `Audited session ID: ${run.sessionName}`,
+      `Audit target session ID: ${targetName}`,
+      `Automatic audit attempt ID: ${run.auditAttemptId}`,
+      `Observed failed state: ${failedState}`,
+      'Resume the same audit from the evidence already available in this session. Do not start or delegate a new audit, do not change the implementation, and do not commit or push.',
+      buildAgentDelegationReplyInstruction(run.sessionName),
+    ].join('\n');
+    const clientMessageId = `${SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND}:${run.auditAttemptId}:${recoveryNumber}`;
+    run.auditTargetRecoveryAttempts = recoveryNumber;
+    try {
+      runtime.send(recoveryPrompt, clientMessageId);
+      timelineEmitter.emit(
+        targetName,
+        'user.message',
+        {
+          text: recoveryPrompt,
+          clientMessageId,
+          allowDuplicate: true,
+          automation: true,
+          automationKind: SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+          memoryExcluded: true,
+        },
+        { source: 'daemon', confidence: 'high', eventId: clientMessageId },
+      );
+      this.emitAutomationNote(
+        run.sessionName,
+        `Auto: the configured audit session stopped unexpectedly, so supervision sent continue (${recoveryNumber}/${AUDIT_TARGET_MAX_RECOVERY_CONTINUES}) for audit attempt ${run.auditAttemptId}.`,
+        SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+      );
+      this.armAuditDeadline(run);
+    } catch (error) {
+      logger.warn({ session: run.sessionName, auditorSession: targetName, err: error }, 'Automatic audit-target continue dispatch failed');
+      this.emitWarning(run.sessionName, 'The configured audit session stopped, but its automatic continue prompt could not be delivered.');
+    }
+  }
+
   private handleTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
+    this.handleAuditTargetTimelineEvent(event);
     const sequence = ++this.eventSequence;
 
     if (event.type === 'user.message') {
@@ -731,6 +944,7 @@ class SupervisionAutomation {
         && isDelegatedAuditReplyText(text),
       );
       if (delegatedReply && activeRun) {
+        this.clearAuditTargetRecovery(activeRun);
         activeRun.auditReplyObserved = true;
         activeRun.sawAssistantOutput = false;
         activeRun.lastAssistantText = undefined;
@@ -953,6 +1167,7 @@ class SupervisionAutomation {
     const run = this.activeRuns.get(sessionName);
     if (!run) return;
     this.clearAuditDeadline(run);
+    this.clearAuditTargetRecovery(run);
     run.terminalState = state;
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
@@ -969,6 +1184,12 @@ class SupervisionAutomation {
     current.auditReplyObserved = false;
     current.auditAttemptId = randomUUID();
     current.auditStartedAt = Date.now();
+    current.auditTargetSessionInstanceId = undefined;
+    current.auditTargetDispatchObservedAt = undefined;
+    current.auditTargetObservedActive = false;
+    current.auditTargetRecoveryAttempts = 0;
+    current.auditTargetRecoveryLimitNotified = false;
+    this.clearAuditTargetRecoveryTimer(current);
     current.sawAssistantOutput = false;
     current.lastAssistantText = undefined;
     this.emitStatus(current.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
@@ -1067,10 +1288,12 @@ class SupervisionAutomation {
       return;
     }
 
+    current.auditTargetSessionInstanceId = target.sessionInstanceId;
+
     const auditTask = [
       buildQuickAgentDelegationTask('audit'),
       'This is the configured automatic supervision audit. You—not the daemon—must prepare the audit background from your real current-session context and send it to the selected delegate with reply enabled.',
-      `Automatic audit attempt ID: ${current.auditAttemptId}. The route is fixed: send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
+      `Automatic audit attempt ID: ${current.auditAttemptId}. Include this exact attempt ID in the delegated audit brief. The route is fixed: send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
       'Do not commit, push, deploy, or modify the implementation while waiting for the audit.',
       baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
       baseline.fileContents.length > 0
@@ -1099,15 +1322,27 @@ class SupervisionAutomation {
       this.finishRun(current.sessionName, 'needs_input');
       return;
     }
+    this.armAuditDeadline(current);
+  }
+
+  private armAuditDeadline(run: ActiveTaskRunState): void {
+    this.clearAuditDeadline(run);
+    const generation = run.generation;
+    const attemptId = run.auditAttemptId;
     const timer = setTimeout(() => {
-      const latest = this.activeRuns.get(current.sessionName);
-      if (!latest || latest.generation !== current.generation || latest.phase !== 'auditing') return;
+      const latest = this.activeRuns.get(run.sessionName);
+      if (
+        !latest
+        || latest.generation !== generation
+        || latest.phase !== 'auditing'
+        || latest.auditAttemptId !== attemptId
+      ) return;
       this.emitOrchestratedAuditResult(latest, 'timeout', 'deadline_expired');
       this.emitTerminalStatus(latest.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
       this.finishRun(latest.sessionName, 'needs_input', { preserveStatus: true });
     }, PEER_AUDIT_DEADLINE_MS);
     timer.unref?.();
-    current.auditDeadlineTimer = timer;
+    run.auditDeadlineTimer = timer;
   }
 
   private clearAuditDeadline(run: ActiveTaskRunState): void {
@@ -1149,6 +1384,7 @@ class SupervisionAutomation {
       return;
     }
     this.clearAuditDeadline(current);
+    this.clearAuditTargetRecovery(current);
     this.clearStatus(current.sessionName);
     const findings = current.lastAssistantText;
     if (verdict === 'PASS') {

@@ -28,7 +28,10 @@ export const SUPERVISION_CONTRACT_IDS = {
   OPENSPEC_IMPLEMENTATION_AUDIT: 'openspec_implementation_audit_v1',
   CONTEXTUAL_AUDIT: 'contextual_audit_v1',
   REWORK_BRIEF: 'rework_brief_v1',
+  AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
 } as const;
+
+export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
 
 export const SUPERVISION_MODE = {
   OFF: 'off',

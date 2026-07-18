@@ -2,11 +2,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
+import {
+  normalizeSessionSupervisionSnapshot,
+  SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_MODE,
+} from '../../shared/supervision-config.js';
 import {
   PEER_AUDIT_DEADLINE_MS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
 } from '../../shared/peer-audit.js';
+import { buildAgentDelegationReplyInstruction } from '../../shared/agent-delegation.js';
 
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
@@ -23,6 +29,27 @@ const mockTransportRuntime = {
   pendingMessages: [],
   pendingEntries: [],
 };
+let mockAuditTargetStatus = 'idle';
+let mockAuditTargetSending = false;
+let mockAuditTargetLastProviderError: {
+  code: string;
+  message: string;
+  recoverable: boolean;
+  at: number;
+} | null = null;
+const mockAuditTargetRuntime = {
+  send: vi.fn(() => 'sent' as const),
+  get lastProviderError() {
+    return mockAuditTargetLastProviderError;
+  },
+  getDiagnosticSnapshot: vi.fn(() => ({
+    status: mockAuditTargetStatus,
+    sending: mockAuditTargetSending,
+    pendingCount: 0,
+    activeDispatchCount: mockAuditTargetSending ? 1 : 0,
+    blockingWorkCount: mockAuditTargetSending ? 1 : 0,
+  })),
+};
 const mockPersistSessionRecord = vi.fn();
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
@@ -33,7 +60,9 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
-  getTransportRuntime: vi.fn(() => mockTransportRuntime),
+  getTransportRuntime: vi.fn((sessionName: string) => sessionName === 'deck_sub_reviewer'
+    ? mockAuditTargetRuntime
+    : mockTransportRuntime),
   persistSessionRecord: mockPersistSessionRecord,
 }));
 
@@ -75,6 +104,11 @@ beforeEach(() => {
   mockSupervisionDecide.mockReset();
   mockSupervisionDecide.mockResolvedValue({ decision: 'complete', reason: 'done', confidence: 0.9 });
   supervisionAutomation.cancelSession('deck_supervision_brain');
+  supervisionAutomation.cancelSession('deck_sub_reviewer');
+  mockAuditTargetStatus = 'idle';
+  mockAuditTargetSending = false;
+  mockAuditTargetLastProviderError = null;
+  mockAuditTargetRuntime.send.mockReturnValue('sent');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
 });
@@ -214,6 +248,40 @@ function completeDelegatedAudit(verdict: 'PASS' | 'REWORK', findings = 'Independ
   timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
 }
 
+function beginAuditTargetTurn(attemptId: string) {
+  timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+    text: [
+      'Task: independently audit the current implementation.',
+      `Automatic audit attempt ID: ${attemptId}`,
+      buildAgentDelegationReplyInstruction('deck_supervision_brain'),
+    ].join('\n'),
+    allowDuplicate: true,
+    sharedActor: { actorUserId: 'deck_supervision_brain' },
+  });
+  mockAuditTargetStatus = 'running';
+  mockAuditTargetSending = true;
+  timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'running' });
+}
+
+async function startAuditForRecoveryTest(commandId: string) {
+  const snapshot = await seedSession('supervised_audit');
+  supervisionAutomation.init();
+  supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, 'implement the feature', snapshot);
+  beginRun(commandId, 'implement the feature');
+  completeTurn('implemented and validated the feature');
+  await waitForRunPhase('auditing');
+  const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+  if (!run?.auditAttemptId) throw new Error('automatic audit did not start');
+  return run.auditAttemptId;
+}
+
+function finishAuditRecoveryTestCleanup() {
+  if (supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase === 'auditing') {
+    completeDelegatedAudit('PASS', 'Audit recovery test cleanup.');
+  }
+  supervisionAutomation.cancelSession('deck_supervision_brain');
+}
+
 describe('SupervisionAutomation', () => {
   beforeEach(async () => {
     await cleanupProjectDir();
@@ -238,6 +306,7 @@ describe('SupervisionAutomation', () => {
     expect(orchestrationPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
     expect(orchestrationPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(orchestrationPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
+    expect(orchestrationPrompt).toContain('Include this exact attempt ID in the delegated audit brief');
     expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
     expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the audit background');
     expect(orchestrationPrompt).toContain('Do not commit, push, deploy');
@@ -278,6 +347,221 @@ describe('SupervisionAutomation', () => {
         }),
       }),
     ]));
+  });
+
+  it('continues the exact audit target after its correlated turn falls idle with a provider error', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-provider-error');
+
+      // An idle/error projection before the delegated audit task is observed
+      // belongs to older target work and must never trigger recovery.
+      mockAuditTargetLastProviderError = {
+        code: 'OVERLOADED',
+        message: 'provider overloaded',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = {
+        code: 'OVERLOADED',
+        message: 'provider overloaded',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+
+      await vi.advanceTimersByTimeAsync(1_499);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+      const recoveryPrompt = String(mockAuditTargetRuntime.send.mock.calls[0]?.[0]);
+      expect(recoveryPrompt).toContain(`[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_TARGET_RECOVERY}]`);
+      expect(recoveryPrompt).toContain(`Automatic audit attempt ID: ${attemptId}`);
+      expect(recoveryPrompt).toContain('Audited session ID: deck_supervision_brain');
+      expect(recoveryPrompt).toContain('Audit target session ID: deck_sub_reviewer');
+      expect(recoveryPrompt).toContain(buildAgentDelegationReplyInstruction('deck_supervision_brain'));
+      expect(timelineEmitter.replay('deck_sub_reviewer', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'user.message',
+          payload: expect.objectContaining({
+            automation: true,
+            automationKind: SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+          }),
+        }),
+      ]));
+
+      // Duplicate idle/error projections for the same failed turn are
+      // de-duplicated until a new active edge proves that recovery started.
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+
+      // A delivered recovery receives a fresh audit deadline instead of
+      // timing out at the original deadline while the reviewer is resuming.
+      await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS - 2_001);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('continues a correlated audit target after its active turn enters stopped state', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-stopped');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'stopped' });
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+      expect(String(mockAuditTargetRuntime.send.mock.calls[0]?.[0])).toContain('Observed failed state: stopped');
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not continue a correlated audit target after a healthy idle completion', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-healthy-idle');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a scheduled audit-target continue when the same turn becomes active again or returns its reply', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-recovers');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = {
+        code: 'TRANSIENT',
+        message: 'temporary failure',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+
+      await vi.advanceTimersByTimeAsync(500);
+      mockAuditTargetStatus = 'running';
+      mockAuditTargetSending = true;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'running' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = {
+        code: 'TRANSIENT_AGAIN',
+        message: 'temporary failure again',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+      completeDelegatedAudit('PASS', 'The audit completed before recovery backoff elapsed.');
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps audit-target recovery at two continues', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-recovery-cap');
+      beginAuditTargetTurn(attemptId);
+
+      for (let recovery = 1; recovery <= 2; recovery += 1) {
+        mockAuditTargetStatus = 'error';
+        mockAuditTargetSending = false;
+        mockAuditTargetLastProviderError = {
+          code: `TRANSIENT_${recovery}`,
+          message: `temporary failure ${recovery}`,
+          recoverable: true,
+          at: Date.now(),
+        };
+        timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(recovery);
+        mockAuditTargetStatus = 'running';
+        mockAuditTargetSending = true;
+        timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'running' });
+        await vi.advanceTimersByTimeAsync(1);
+      }
+
+      mockAuditTargetStatus = 'error';
+      mockAuditTargetSending = false;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(2);
+      expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'assistant.text',
+          payload: expect.objectContaining({
+            text: expect.stringContaining('automatic recovery limit'),
+            automationKind: 'supervision-warning',
+          }),
+        }),
+      ]));
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not continue a replacement session that reused the configured audit target name', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-identity-change');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'error';
+      mockAuditTargetSending = false;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+      recreateReviewer();
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'assistant.text',
+          payload: expect.objectContaining({
+            text: expect.stringContaining('changed identity'),
+            automationKind: 'supervision-warning',
+          }),
+        }),
+      ]));
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
   });
 
   it('settles a reply-backed PASS immediately without a later idle edge or false timeout', async () => {
