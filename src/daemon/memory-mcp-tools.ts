@@ -1465,10 +1465,48 @@ function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>)
   return wrapped;
 }
 
-function toolResult(result: ToolResult): CallToolResult {
+function computerUseTopLevelContent(result: ToolResult): CallToolResult['content'] {
+  if (result.status !== 'ok' || !('result' in result) || !result.result || typeof result.result !== 'object') {
+    return [{ type: 'text', text: JSON.stringify(result) }];
+  }
+  const computerResult = result.result as { content?: unknown };
+  if (!Array.isArray(computerResult.content)) return [{ type: 'text', text: JSON.stringify(result) }];
+  const images = computerResult.content.filter((item): item is { type: 'image'; data: string; mimeType: string } => (
+    Boolean(item)
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && (item as { type?: unknown }).type === 'image'
+    && typeof (item as { data?: unknown }).data === 'string'
+    && typeof (item as { mimeType?: unknown }).mimeType === 'string'
+  ));
+  if (images.length === 0) return [{ type: 'text', text: JSON.stringify(result) }];
+
+  // MCP clients only treat top-level ImageContent as model-visible vision
+  // input. Keep the complete typed result in structuredContent, but do not
+  // duplicate multi-megabyte base64 into the text block.
+  const textResult = {
+    ...result,
+    result: {
+      ...(result.result as Record<string, unknown>),
+      content: computerResult.content.map((item) => (
+        images.includes(item as { type: 'image'; data: string; mimeType: string })
+          ? { type: 'image', mimeType: (item as { mimeType: string }).mimeType, attached: true }
+          : item
+      )),
+    },
+  };
+  return [
+    { type: 'text', text: JSON.stringify(textResult) },
+    ...images.map((item) => ({ type: 'image' as const, data: item.data, mimeType: item.mimeType })),
+  ];
+}
+
+function toolResult(result: ToolResult, name?: MemoryMcpToolName): CallToolResult {
   return {
     structuredContent: result,
-    content: [{ type: 'text', text: JSON.stringify(result) }],
+    content: name === MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL
+      ? computerUseTopLevelContent(result)
+      : [{ type: 'text', text: JSON.stringify(result) }],
     isError: result.status === 'error',
   };
 }
@@ -1755,7 +1793,7 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
           }).catch(() => {});
         };
       }
-      return toolResult(await handlers[name](args, context));
+      return toolResult(await handlers[name](args, context), name);
     });
   }
 }

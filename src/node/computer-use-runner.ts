@@ -1131,6 +1131,7 @@ function browserLaunchArgs(
   const explicitUserAgent = optionalStringArg(args, 'userAgent');
   const launchArgs = [
     `--remote-debugging-port=${debugPort}`,
+    '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${userDataDir}`,
     '--no-first-run',
     '--no-default-browser-check',
@@ -1152,11 +1153,140 @@ function browserLaunchArgs(
   return launchArgs;
 }
 
+interface BrowserCdpCaller {
+  call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+}
+
+interface BrowserViewportScreenshot {
+  item?: ComputerUseContentItem;
+  truncated: boolean;
+}
+
+function browserImageFormat(args: Record<string, unknown>): 'jpeg' | 'png' | 'webp' {
+  const value = args.imageFormat;
+  return value === 'png' || value === 'webp' || value === 'jpeg' ? value : 'jpeg';
+}
+
+function browserImageQuality(args: Record<string, unknown>): number {
+  const value = args.imageQuality;
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(Math.max(Math.round(value), 1), 100)
+    : 60;
+}
+
+function browserImageMaxWidth(args: Record<string, unknown>): number {
+  const value = args.imageMaxWidth;
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(Math.max(Math.round(value), 320), 3840)
+    : 1280;
+}
+
+async function captureBrowserViewport(
+  client: BrowserCdpCaller,
+  args: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<BrowserViewportScreenshot> {
+  if (args.includeImage !== true) return { truncated: false };
+
+  const maxCallMs = Math.min(timeoutMs, 30_000);
+  const metrics = await client.call('Page.getLayoutMetrics', {}, maxCallMs).catch(() => null) as {
+    cssVisualViewport?: { pageX?: unknown; pageY?: unknown; clientWidth?: unknown; clientHeight?: unknown };
+  } | null;
+  const viewport = metrics?.cssVisualViewport;
+  const width = typeof viewport?.clientWidth === 'number' && viewport.clientWidth > 0 ? viewport.clientWidth : undefined;
+  const height = typeof viewport?.clientHeight === 'number' && viewport.clientHeight > 0 ? viewport.clientHeight : undefined;
+  const maxWidth = browserImageMaxWidth(args);
+  const clip = width && height
+    ? {
+        x: typeof viewport?.pageX === 'number' ? viewport.pageX : 0,
+        y: typeof viewport?.pageY === 'number' ? viewport.pageY : 0,
+        width,
+        height,
+        scale: Math.min(1, maxWidth / width),
+      }
+    : undefined;
+
+  const requestedFormat = browserImageFormat(args);
+  const attempts: Array<{ format: 'jpeg' | 'png' | 'webp'; quality?: number }> = requestedFormat === 'png'
+    ? [{ format: 'png' }, { format: 'jpeg', quality: 45 }]
+    : [
+        { format: requestedFormat, quality: browserImageQuality(args) },
+        { format: requestedFormat, quality: 40 },
+        { format: 'jpeg', quality: 25 },
+      ];
+
+  let usedFallback = false;
+  for (const attempt of attempts) {
+    const raw = await client.call('Page.captureScreenshot', {
+      format: attempt.format,
+      ...(attempt.quality !== undefined ? { quality: attempt.quality } : {}),
+      fromSurface: true,
+      captureBeyondViewport: false,
+      ...(clip ? { clip } : {}),
+    }, maxCallMs) as { data?: unknown };
+    if (typeof raw?.data !== 'string' || raw.data.length === 0) throw new Error('browser_screenshot_missing_data');
+    if (utf8Bytes(raw.data) <= COMPUTER_USE_MAX_IMAGE_BASE64_BYTES) {
+      return {
+        item: {
+          type: 'image',
+          data: raw.data,
+          mimeType: `image/${attempt.format}`,
+        },
+        truncated: usedFallback,
+      };
+    }
+    usedFallback = true;
+  }
+  return { truncated: true };
+}
+
+export async function captureBrowserViewportForTest(
+  client: BrowserCdpCaller,
+  args: Record<string, unknown>,
+  timeoutMs = 30_000,
+): Promise<BrowserViewportScreenshot> {
+  return captureBrowserViewport(client, args, timeoutMs);
+}
+
+export interface BrowserAutomationEndpoint {
+  cdpEndpoint: string;
+  cdpHost: string;
+  cdpPort: number;
+}
+
+function browserAutomationEndpoint(cdpEndpoint: string | null): BrowserAutomationEndpoint | undefined {
+  if (!cdpEndpoint) return undefined;
+  const url = new URL(cdpEndpoint);
+  const port = Number.parseInt(url.port, 10);
+  if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65_535) return undefined;
+  return {
+    cdpEndpoint: `${url.protocol}//${url.host}`,
+    cdpHost: url.hostname,
+    cdpPort: port,
+  };
+}
+
+export function browserAutomationEndpointForTest(cdpEndpoint: string | null): BrowserAutomationEndpoint | undefined {
+  return browserAutomationEndpoint(cdpEndpoint);
+}
+
+function browserSnapshotPayload(result: unknown, cdpEndpoint: string | null): Record<string, unknown> {
+  return {
+    ...(result && typeof result === 'object' && !Array.isArray(result) ? result : { page: result }),
+    automation: browserAutomationEndpoint(cdpEndpoint),
+  };
+}
+
+export function browserSnapshotPayloadForTest(result: unknown, cdpEndpoint: string | null): Record<string, unknown> {
+  return browserSnapshotPayload(result, cdpEndpoint);
+}
+
 class BrowserUseController {
   private child: ChildProcess | null = null;
   private userDataDir: string | null = null;
   private client: CdpClient | null = null;
   private starting: Promise<CdpClient> | null = null;
+  private cdpHttpEndpoint: string | null = null;
 
   async run(tool: ComputerUseToolName, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
     if (tool === 'browser_close') {
@@ -1222,12 +1352,15 @@ class BrowserUseController {
       this.child.once('exit', () => {
         this.client?.close();
         this.client = null;
+        this.cdpHttpEndpoint = null;
         this.child = null;
       });
       const base = `http://127.0.0.1:${port}`;
       const browserUserAgent = await this.waitForCdp(base, Date.now() + Math.min(timeoutMs, 30_000));
       const target = await this.newPageTarget(base, optionalStringArg(args, 'url') ?? 'about:blank');
-      return await this.connectPage(target.webSocketDebuggerUrl, args, timeoutMs, browserUserAgent);
+      const client = await this.connectPage(target.webSocketDebuggerUrl, args, timeoutMs, browserUserAgent);
+      this.cdpHttpEndpoint = base;
+      return client;
     } catch (error) {
       // NEVER leak the spawned browser tree: a failed startup previously left
       // the whole chrome process group alive, holding its port and profile dir,
@@ -1249,7 +1382,9 @@ class BrowserUseController {
       const target = await this.newPageTarget(base, optionalStringArg(args, 'url') ?? 'about:blank');
       endpoint = target.webSocketDebuggerUrl;
     }
-    return this.connectPage(endpoint, args, timeoutMs, browserUserAgent);
+    const client = await this.connectPage(endpoint, args, timeoutMs, browserUserAgent);
+    this.cdpHttpEndpoint = base;
+    return client;
   }
 
   private async connectPage(
@@ -1398,13 +1533,21 @@ class BrowserUseController {
       }));
       return { url: location.href, title: document.title, visibleText: (document.body?.innerText || '').slice(0, ${textLimit}), elements };
     })()`, timeoutMs);
-    const output = truncateJsonText(result);
-    return { content: [{ type: 'text', text: output.text }], ...(output.truncated ? { truncated: true } : {}) };
+    const output = truncateJsonText(browserSnapshotPayload(result, this.cdpHttpEndpoint));
+    const screenshot = await captureBrowserViewport(client, args, timeoutMs);
+    return {
+      content: [
+        { type: 'text', text: output.text },
+        ...(screenshot.item ? [screenshot.item] : []),
+      ],
+      ...(output.truncated || screenshot.truncated ? { truncated: true } : {}),
+    };
   }
 
   async close(): Promise<void> {
     this.client?.close();
     this.client = null;
+    this.cdpHttpEndpoint = null;
     this.child?.kill();
     this.child = null;
     const dir = this.userDataDir;
