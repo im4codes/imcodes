@@ -5270,7 +5270,7 @@ afterEach(() => {
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
-  it('opens Settings when a remembered auditor now resolves to the same model', async () => {
+  it('reuses a saved name-only auditor without local model or authority gating', async () => {
     const onSettings = vi.fn();
     render(
       <SessionControls
@@ -5280,10 +5280,6 @@ afterEach(() => {
           name: 'deck_proj_brain',
           role: 'brain',
           state: 'idle',
-          sessionInstanceId: 'brain-instance',
-          runtimeEpoch: 'brain-runtime',
-          activeModel: 'gpt-5.6',
-          providerId: 'openai',
           transportConfig: {
             supervision: {
               mode: 'supervised',
@@ -5292,26 +5288,10 @@ afterEach(() => {
               timeoutMs: 12000,
               promptVersion: 'supervision_decision_v1',
               auditTargetSessionName: 'deck_sub_peer',
-              auditTargetFingerprint: {
-                sessionInstanceId: 'peer-instance',
-                normalizedModelId: 'gpt-5.6',
-                providerFamily: 'openai',
-              },
               peerAuditPromptVersion: 'supervision_peer_audit_v1',
             },
           },
         })}
-        subSessions={[{
-          sessionName: 'deck_sub_peer',
-          type: 'codex-sdk',
-          label: 'Peer',
-          state: 'idle',
-          parentSession: 'deck_proj_brain',
-          sessionInstanceId: 'peer-instance',
-          runtimeEpoch: 'peer-runtime',
-          activeModel: 'gpt-5.6',
-          providerId: 'openai',
-        }]}
         onSettings={onSettings}
         quickData={makeQuickData() as any}
       />,
@@ -5319,11 +5299,22 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
-    await waitFor(() => expect(onSettings).toHaveBeenCalledTimes(1));
-    expect(patchSessionMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith(
+      'srv1',
+      'deck_proj_brain',
+      expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised_audit',
+            auditTargetSessionName: 'deck_sub_peer',
+          }),
+        }),
+      }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
-  it('reuses an exact current different-model fingerprint for compact audit enablement', async () => {
+  it('keeps legacy fingerprint metadata optional when compact audit is enabled', async () => {
     const onSettings = vi.fn();
     render(
       <SessionControls

@@ -122,7 +122,7 @@ import {
   serializeP2pSavedConfig,
 } from './preferences/p2p-config-pref.js';
 import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
-import { buildSubSessionRebuildInputs, useSubSessions, type SubSession } from './hooks/useSubSessions.js';
+import { useSubSessions, type SubSession } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import {
   DEFAULT_NEW_USER_GUIDE_PREF,
@@ -4542,12 +4542,6 @@ export function App() {
       modelDisplay: session.modelDisplay,
       providerId: session.providerId,
     })), [detectedModels, subSessions, subUsages]);
-  const refreshPeerAuditSettingsSessions = useCallback(() => {
-    const liveWs = wsRef.current;
-    if (!liveWs?.connected || subSessions.length === 0) return false;
-    liveWs.subSessionRebuildAll(buildSubSessionRebuildInputs(subSessions));
-    return true;
-  }, [connected, subSessions]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
     const sub = subSessionId
@@ -6160,7 +6154,6 @@ export function App() {
           requestedModel={settingsTarget.requestedModel}
           providerId={settingsTarget.providerId}
           peerAuditSessions={peerAuditSettingsSessions}
-          onRequestPeerAuditSessionSync={refreshPeerAuditSettingsSessions}
           openIntent={settingsTarget.openIntent}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}

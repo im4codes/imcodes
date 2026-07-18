@@ -196,12 +196,15 @@ describe('supervision config helpers', () => {
       expect(getSessionSupervisionSnapshotIssues(transportConfig.supervision)).toContain('legacy_audit_mode_requires_repair');
     });
 
-    it('reads a name-only target for chooser repair but new writes drop it', () => {
+    it('accepts and preserves a name-only audit target', () => {
       const transportConfig = { supervision: { ...base, auditTargetSessionName: 'deck_sub_legacy1' } };
       const snapshot = extractSessionSupervisionSnapshot(transportConfig);
       expect(snapshot?.auditTargetSessionName).toBe('deck_sub_legacy1');
-      expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(true);
-      expect(embedSessionSupervisionSnapshot(null, snapshot).supervision).not.toHaveProperty('auditTargetSessionName');
+      expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(false);
+      expect(embedSessionSupervisionSnapshot(null, snapshot).supervision).toMatchObject({
+        auditTargetSessionName: 'deck_sub_legacy1',
+        peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+      });
     });
 
     it('writes a repaired fingerprint and never emits auditMode', () => {
@@ -245,7 +248,7 @@ describe('supervision config helpers', () => {
       });
     });
 
-    it('drops an invalid fingerprint from normalized writes and reports a repair code', () => {
+    it('drops invalid optional fingerprint metadata without dropping the selected target name', () => {
       const invalid = {
         ...base,
         auditTargetSessionName: 'deck_sub_peer4',
@@ -255,8 +258,12 @@ describe('supervision config helpers', () => {
           providerFamily: 'openai',
         },
       };
-      expect(getSessionSupervisionSnapshotIssues(invalid)).toContain('invalid_audit_target_fingerprint');
-      expect(normalizeSessionSupervisionSnapshot(invalid as never)).not.toHaveProperty('auditTargetSessionName');
+      expect(getSessionSupervisionSnapshotIssues(invalid)).not.toContain('invalid_audit_target_fingerprint');
+      expect(normalizeSessionSupervisionSnapshot(invalid as never)).toMatchObject({
+        auditTargetSessionName: 'deck_sub_peer4',
+        peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+      });
+      expect(normalizeSessionSupervisionSnapshot(invalid as never)).not.toHaveProperty('auditTargetFingerprint');
     });
   });
 

@@ -748,9 +748,9 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
   });
 
-  it('fails closed instead of delegating when the configured auditor fingerprint is stale', async () => {
+  it('delegates to the current same-name session without blocking on a stale fingerprint', async () => {
     const snapshot = await seedSession('supervised_audit');
-    recreateReviewer();
+    const replacement = recreateReviewer();
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stale-auditor', 'implement the feature', snapshot);
@@ -758,20 +758,37 @@ describe('SupervisionAutomation', () => {
     completeTurn('implemented the feature');
     await sleep(50);
 
-    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
-    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automationKind: 'supervision-warning',
-          text: expect.stringContaining('configured auditor'),
-        }),
-      }),
-    ]));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditTargetSessionInstanceId: replacement.sessionInstanceId,
+      snapshot: { auditTargetSessionName: replacement.name },
+    });
   });
 
-  it('uses the authoritative repaired auditor fingerprint when an in-flight snapshot is stale', async () => {
+  it('starts automatic audit from a name-only target saved by settings', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 2, {
+      auditTargetFingerprint: undefined,
+    });
+    expect(snapshot.auditTargetSessionName).toBe('deck_sub_reviewer');
+    expect(snapshot.auditTargetFingerprint).toBeUndefined();
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-name-only-auditor', 'implement the feature', snapshot);
+    beginRun('cmd-name-only-auditor', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(50);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: { auditTargetSessionName: 'deck_sub_reviewer' },
+    });
+  });
+
+  it('uses the latest persisted target name when an in-flight snapshot is stale', async () => {
     const staleSnapshot = await seedSession('supervised_audit');
     const replacement = recreateReviewer('Repaired reviewer');
     const repairedSnapshot = normalizeSessionSupervisionSnapshot({
@@ -808,14 +825,12 @@ describe('SupervisionAutomation', () => {
       phase: 'auditing',
       snapshot: {
         auditTargetSessionName: replacement.name,
-        auditTargetFingerprint: {
-          sessionInstanceId: replacement.sessionInstanceId,
-        },
       },
+      auditTargetSessionInstanceId: replacement.sessionInstanceId,
     });
   });
 
-  it('repairs a configured alias fingerprint when the same auditor gains authoritative live model metadata', async () => {
+  it('does not require or rewrite model fingerprint metadata before delegating', async () => {
     const initial = await seedSession('supervised_audit');
     const reviewer = getSession('deck_sub_reviewer');
     const audited = getSession('deck_supervision_brain');
@@ -858,7 +873,7 @@ describe('SupervisionAutomation', () => {
       snapshot: {
         auditTargetFingerprint: {
           sessionInstanceId: reviewer.sessionInstanceId,
-          normalizedModelId: 'claude-opus-4-8',
+          normalizedModelId: 'opus[1m]',
           providerFamily: 'anthropic',
         },
       },
@@ -866,17 +881,14 @@ describe('SupervisionAutomation', () => {
     expect(getSession('deck_supervision_brain')?.transportConfig?.supervision).toMatchObject({
       auditTargetFingerprint: {
         sessionInstanceId: reviewer.sessionInstanceId,
-        normalizedModelId: 'claude-opus-4-8',
+        normalizedModelId: 'opus[1m]',
         providerFamily: 'anthropic',
       },
     });
-    expect(mockPersistSessionRecord).toHaveBeenCalledWith(
-      expect.objectContaining({ name: 'deck_supervision_brain' }),
-      'deck_supervision_brain',
-    );
+    expect(mockPersistSessionRecord).not.toHaveBeenCalled();
   });
 
-  it('does not auto-repair a genuine auditor model change', async () => {
+  it('does not block delegation when the selected session changes model', async () => {
     const snapshot = await seedSession('supervised_audit');
     const reviewer = getSession('deck_sub_reviewer');
     if (!reviewer) throw new Error('seeded reviewer is unavailable');
@@ -899,15 +911,12 @@ describe('SupervisionAutomation', () => {
     completeTurn('implemented the feature');
     await sleep(25);
 
-    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(mockPersistSessionRecord).not.toHaveBeenCalled();
-    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
-    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'peer_audit.result',
-        payload: expect.objectContaining({ outcome: 'invalid_configuration' }),
-      }),
-    ]));
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: { auditTargetSessionName: reviewer.name },
+    });
   });
 
   it('holds commit and push until PASS and allows multi-turn finalization without a second audit', async () => {

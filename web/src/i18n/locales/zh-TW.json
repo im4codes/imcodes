@@ -2719,13 +2719,6 @@
     "consentConfirm": "傳送給 {{auditor}}",
     "selectionWillPersist": "此稽核者也會被記住，用於此工作階段後續的自動稽核。",
     "noCandidate": "目前會話群組內沒有其他可委派的智慧體。",
-    "candidateLoad": {
-      "waiting_authority": "正在等待 daemon 重新整理權威工作階段身分；完成後稽核者選項會自動出現。",
-      "loading": "正在載入稽核者選項…",
-      "loaded": "稽核者選項已載入。",
-      "error": "無法載入稽核者選項。",
-      "retry": "重試"
-    },
     "ineligibleCollapsed": "{{count}} 個不合格",
     "providerBadge": "廠商:{{provider}}",
     "chooserReason": {

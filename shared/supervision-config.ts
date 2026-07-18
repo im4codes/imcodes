@@ -304,21 +304,16 @@ export function getSessionSupervisionSnapshotIssues(
   const rawTargetName = record.auditTargetSessionName;
   const targetName = trimString(rawTargetName);
   const hasTargetName = rawTargetName != null;
-  const hasFingerprint = record.auditTargetFingerprint != null;
   const validTargetName = !!targetName && targetName === rawTargetName && isValidImcodesSessionName(targetName);
-  const validFingerprint = isCanonicalPeerAuditTargetFingerprint(record.auditTargetFingerprint);
 
   if (hasTargetName && !validTargetName) issues.push('invalid_audit_target_name');
-  if (hasFingerprint && !validFingerprint) issues.push('invalid_audit_target_fingerprint');
-  if (hasTargetName && validTargetName && !hasFingerprint) issues.push('missing_audit_target_fingerprint');
-  if (!hasTargetName && hasFingerprint) issues.push('missing_audit_target');
   if (
     record.peerAuditPromptVersion != null
     && record.peerAuditPromptVersion !== PEER_AUDIT_PROMPT_VERSION
   ) {
     issues.push('invalid_peer_audit_prompt_version');
   }
-  if (record.peerAuditPromptVersion != null && (!validTargetName || !validFingerprint)) {
+  if (record.peerAuditPromptVersion != null && !validTargetName) {
     if (!issues.includes('invalid_peer_audit_prompt_version')) issues.push('invalid_peer_audit_prompt_version');
   }
 
@@ -396,12 +391,6 @@ export function getSessionSupervisionSnapshotIssues(
       else issues.push('legacy_audit_mode_requires_repair');
     }
     if (!hasTargetName) issues.push('missing_audit_target');
-    else if (validTargetName && !hasFingerprint && !issues.includes('missing_audit_target_fingerprint')) {
-      issues.push('missing_audit_target_fingerprint');
-    }
-    if (validTargetName && validFingerprint && record.peerAuditPromptVersion !== PEER_AUDIT_PROMPT_VERSION) {
-      issues.push('invalid_peer_audit_prompt_version');
-    }
     if (
       record.maxAuditLoops != null
       && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 0)
@@ -441,8 +430,7 @@ export function normalizeSessionSupervisionSnapshot(
     ? merged.auditTargetFingerprint
     : undefined;
   const hasCanonicalAuditTarget = !!auditTargetSessionName
-    && isValidImcodesSessionName(auditTargetSessionName)
-    && !!auditTargetFingerprint;
+    && isValidImcodesSessionName(auditTargetSessionName);
   return {
     ...supervisorDefaults,
     mode,
@@ -456,7 +444,7 @@ export function normalizeSessionSupervisionSnapshot(
     maxAutoContinueTotal,
     ...(hasCanonicalAuditTarget ? {
       auditTargetSessionName,
-      auditTargetFingerprint,
+      ...(auditTargetFingerprint ? { auditTargetFingerprint } : {}),
       peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
     } : {}),
     maxAuditLoops,
@@ -478,9 +466,9 @@ export function parseSessionSupervisionSnapshot(value: unknown): SessionSupervis
   if (issues.some((issue) => !repairOnly.has(issue))) return null;
   const record = value as Partial<SessionSupervisionSnapshot>;
   const normalized = normalizeSessionSupervisionSnapshot(record);
-  // Legacy read compatibility is deliberately separate from the new-write
-  // normalizer: a name-only target/auditMode can be shown for repair, but an
-  // embed/save immediately drops them until a confirmed fingerprint exists.
+  // Legacy auditMode remains read-only compatibility. A valid name-only
+  // target is now canonical: automatic audit resolves the live session when
+  // it starts rather than blocking settings on persisted runtime metadata.
   const legacyTargetName = trimString(record.auditTargetSessionName);
   return {
     ...normalized,
@@ -534,8 +522,6 @@ export function getPeerAuditSnapshotRepairIssues(
     'invalid_audit_mode',
     'missing_audit_target',
     'invalid_audit_target_name',
-    'missing_audit_target_fingerprint',
-    'invalid_audit_target_fingerprint',
     'invalid_peer_audit_prompt_version',
   ]);
   return getSessionSupervisionSnapshotIssues(value).filter((issue) => peerIssues.has(issue));

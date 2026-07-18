@@ -2719,13 +2719,6 @@
     "consentConfirm": "Enviar a {{auditor}}",
     "selectionWillPersist": "Este auditor también se recordará para futuras auditorías automáticas de esta sesión.",
     "noCandidate": "No hay otro agente disponible en este grupo de sesiones.",
-    "candidateLoad": {
-      "waiting_authority": "Esperando a que el daemon actualice las identidades de sesión autorizadas. Las opciones aparecerán automáticamente.",
-      "loading": "Cargando opciones de auditor…",
-      "loaded": "Opciones de auditor cargadas.",
-      "error": "No se pudieron cargar las opciones de auditor.",
-      "retry": "Reintentar"
-    },
     "ineligibleCollapsed": "{{count}} no elegibles",
     "providerBadge": "Proveedor: {{provider}}",
     "chooserReason": {

@@ -1,6 +1,4 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
-import type { PeerAuditRememberedTarget } from '../peerAudit/types.js';
-import { resolvePeerAuditNormalizedModelId, resolvePeerAuditProviderFamily } from '@shared/peer-audit.js';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, RefObject } from 'preact';
@@ -1472,59 +1470,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
   const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
-  const auditedSubSession = subSessionId
-    ? subSessions?.find((session) => session.sessionName === activeSession?.name)
-    : undefined;
-  const auditedIdentitySource = auditedSubSession ?? activeSession;
   const auditedSessionName = activeSession?.name ?? null;
-  const auditedModel = useMemo(() => auditedIdentitySource ? {
-    normalizedModelId: resolvePeerAuditNormalizedModelId({
-      activeModel: auditedIdentitySource.activeModel,
-      requestedModel: auditedIdentitySource.requestedModel,
-      configuredModel: 'modelDisplay' in auditedIdentitySource ? auditedIdentitySource.modelDisplay : undefined,
-    }),
-    providerFamily: resolvePeerAuditProviderFamily({
-      providerId: auditedIdentitySource.providerId,
-      agentType: 'agentType' in auditedIdentitySource ? auditedIdentitySource.agentType : undefined,
-    }),
-  } : null, [auditedIdentitySource]);
-  const rememberedTarget: PeerAuditRememberedTarget | null = useMemo(() => {
-    const targetName = supervisionSnapshot?.auditTargetSessionName;
-    const fingerprint = supervisionSnapshot?.auditTargetFingerprint;
-    if (!targetName || !fingerprint) return null;
-    const subTarget = subSessions?.find((session) => session.sessionName === targetName);
-    // Peer auditors are ordinary direct child/sibling sub-sessions. A main
-    // session from the slim global list is never locally inferred eligible.
-    const target = subTarget;
-    if (!target?.sessionInstanceId || !target.runtimeEpoch || target.sessionInstanceId !== fingerprint.sessionInstanceId) return null;
-    const liveModel = resolvePeerAuditNormalizedModelId({
-      activeModel: target.activeModel,
-      requestedModel: target.requestedModel,
-      configuredModel: 'modelDisplay' in target ? target.modelDisplay : undefined,
-    });
-    const liveProvider = resolvePeerAuditProviderFamily({
-      providerId: target.providerId,
-      agentType: 'agentType' in target ? target.agentType : ('type' in target ? target.type : undefined),
-    });
-    if (liveModel !== fingerprint.normalizedModelId || liveProvider !== fingerprint.providerFamily) return null;
-    return {
-      sessionName: targetName,
-      sessionInstanceId: target.sessionInstanceId,
-      runtimeEpoch: target.runtimeEpoch,
-      normalizedModelId: liveModel,
-      providerFamily: liveProvider,
-      fingerprint: JSON.stringify(fingerprint),
-    };
-  }, [supervisionSnapshot, subSessions]);
-  const rememberedTargetIsLocallyUsable = Boolean(
-    rememberedTarget
-    && auditedModel
-    && rememberedTarget.sessionName !== auditedSessionName
-    && rememberedTarget.normalizedModelId !== 'unknown'
-    && auditedModel.normalizedModelId !== 'unknown'
-    && rememberedTarget.providerFamily !== 'unknown'
-    && auditedModel.providerFamily !== 'unknown'
-    && rememberedTarget.normalizedModelId !== auditedModel.normalizedModelId,
+  const hasSavedAuditTarget = Boolean(
+    supervisionSnapshot?.auditTargetSessionName
+    && supervisionSnapshot.auditTargetSessionName !== auditedSessionName,
   );
   const canQuickControlSupervision = !!(
     activeSession
@@ -2171,10 +2120,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    // Compact Auto enablement may reuse only a daemon-projected, locally
-    // current remembered peer. A name-only/stale/same-session fingerprint is
-    // repair UI, not authority to silently enable automatic auditing.
-    if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !rememberedTargetIsLocallyUsable) {
+    // Settings persist the user's exact auditor choice. Live availability and
+    // delivery remain daemon/ordinary-delegation concerns at audit time.
+    if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasSavedAuditTarget) {
       openSettingsForMode();
       return;
     }
@@ -2217,8 +2165,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     hasInvalidSupervisionConfig,
     onSettings,
     persistTransportConfig,
-    rememberedTarget,
-    rememberedTargetIsLocallyUsable,
+    hasSavedAuditTarget,
     serverId,
     showSendWarning,
     supervisionSnapshot,

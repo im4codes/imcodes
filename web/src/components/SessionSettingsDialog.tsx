@@ -41,7 +41,6 @@ import {
   type PeerAuditCandidate,
 } from '@shared/peer-audit.js';
 import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
-import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
 import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
 import {
   SESSION_SETTINGS_FOCUS,
@@ -72,8 +71,6 @@ interface Props {
    * it must not start a second daemon candidate-list RPC just to populate UI.
    */
   peerAuditSessions?: readonly PeerAuditSettingsSession[];
-  /** Ask the daemon to re-project live identity/model metadata for the loaded list. */
-  onRequestPeerAuditSessionSync?: () => boolean;
   openIntent?: SessionSettingsOpenIntent;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
@@ -101,10 +98,7 @@ export interface PeerAuditSettingsSession {
   providerId?: string | null;
 }
 
-export interface PeerAuditSettingsCandidate extends PeerAuditCandidate {
-  /** False while the row is visible from HTTP-loaded data but daemon identity is still syncing. */
-  authorityReady: boolean;
-}
+export type PeerAuditSettingsCandidate = PeerAuditCandidate;
 
 export function buildPeerAuditSettingsCandidates(input: {
   auditedSessionName: string;
@@ -137,13 +131,6 @@ export function buildPeerAuditSettingsCandidates(input: {
       providerId: session.providerId,
       agentType: session.type,
     });
-    const authorityReady = Boolean(
-      sessionInstanceId
-      && runtimeEpoch
-      && normalizedModelId !== PEER_AUDIT_UNKNOWN_IDENTITY
-      && providerFamily !== PEER_AUDIT_UNKNOWN_IDENTITY,
-    );
-
     const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.type);
     candidates.push({
       name: session.sessionName,
@@ -151,9 +138,9 @@ export function buildPeerAuditSettingsCandidates(input: {
         || (providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY
           ? session.type
           : peerAuditProviderTypeLabel(providerFamily)),
-      // These synthetic local-only values let the existing picker render and
-      // key rows while daemon identity is still syncing. `authorityReady`
-      // prevents them from ever reaching persisted supervision config.
+      // Candidate identity is presentation-only in settings. Automatic audit
+      // persists the selected session name and resolves the live target when
+      // the audit starts, exactly like ordinary reply-enabled delegation.
       sessionInstanceId: sessionInstanceId || session.sessionName,
       runtimeEpoch: runtimeEpoch || session.sessionName,
       normalizedModelId,
@@ -164,7 +151,6 @@ export function buildPeerAuditSettingsCandidates(input: {
         : session.state === 'idle' ? 'sent' : 'queued',
       eligible: true,
       reason: PEER_AUDIT_CANDIDATE_REASONS.ELIGIBLE,
-      authorityReady,
     });
   }
 
@@ -621,12 +607,9 @@ export function SessionSettingsDialog({
   cwd: initCwd,
   type,
   transportConfig,
-  sessionInstanceId,
-  runtimeEpoch,
   activeModel,
   requestedModel,
   peerAuditSessions = [],
-  onRequestPeerAuditSessionSync,
   parentSession,
   openIntent,
   ws,
@@ -669,9 +652,7 @@ export function SessionSettingsDialog({
   const [peerAuditTargetName, setPeerAuditTargetName] = useState<string | null>(
     initialSupervision.auditTargetSessionName ?? null,
   );
-  const [authoritativePeerAuditCandidates, setAuthoritativePeerAuditCandidates] = useState<readonly PeerAuditCandidate[]>([]);
   const peerAuditTargetRef = useRef<HTMLDivElement>(null);
-  const peerAuditSessionSyncKeyRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -692,30 +673,6 @@ export function SessionSettingsDialog({
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
   const isAuditMode = supervision.mode === 'supervised_audit';
   const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport);
-
-  useEffect(() => {
-    if (!isAuditMode || !onRequestPeerAuditSessionSync) return;
-    const syncKey = `${sessionName}:${parentSession ?? ''}`;
-    if (peerAuditSessionSyncKeyRef.current === syncKey) return;
-    if (onRequestPeerAuditSessionSync()) peerAuditSessionSyncKeyRef.current = syncKey;
-  }, [isAuditMode, onRequestPeerAuditSessionSync, parentSession, sessionName]);
-
-  useEffect(() => {
-    setAuthoritativePeerAuditCandidates([]);
-    if (!isAuditMode || !ws || !sessionInstanceId || !runtimeEpoch) return;
-    let active = true;
-    const adapter = createWsPeerAuditAdapter(ws);
-    void adapter.listCandidates({
-      auditedSessionName: sessionName,
-      auditedSessionIdentity: { sessionInstanceId, runtimeEpoch },
-    }).then((list) => {
-      if (active) setAuthoritativePeerAuditCandidates(list.candidates);
-    }).catch(() => {
-      // The loaded session list remains visible. Reconnect/sub-session sync
-      // changes the callback identity and retries this authority enrichment.
-    });
-    return () => { active = false; };
-  }, [isAuditMode, onRequestPeerAuditSessionSync, runtimeEpoch, sessionInstanceId, sessionName, ws]);
 
   useEffect(() => {
     if (openIntent?.focus !== SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET || !isAuditMode) return;
@@ -833,16 +790,8 @@ export function SessionSettingsDialog({
     parentSession,
     sessions: peerAuditSessions,
   }), [parentSession, peerAuditSessions, sessionName]);
-  const peerAuditCandidates = useMemo(() => loadedPeerAuditCandidates.map((candidate) => {
-    const authoritative = authoritativePeerAuditCandidates.find((item) => (
-      item.name === candidate.name && item.eligible
-    ));
-    return authoritative
-      ? { ...authoritative, label: candidate.label || authoritative.label, authorityReady: true }
-      : candidate;
-  }), [authoritativePeerAuditCandidates, loadedPeerAuditCandidates]);
+  const peerAuditCandidates = loadedPeerAuditCandidates;
   const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
-  const peerAuditTargetConfirmed = Boolean(selectedPeerAuditCandidate?.authorityReady);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
     ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
     : null;
@@ -933,14 +882,7 @@ export function SessionSettingsDialog({
       ? {
           maxAuditLoops: supervisionAuditLoops,
           taskRunPromptVersion,
-          auditTargetSessionName: selectedPeerAuditCandidate?.authorityReady
-            ? selectedPeerAuditCandidate.name
-            : supervision.auditTargetSessionName,
-          auditTargetFingerprint: selectedPeerAuditCandidate?.authorityReady ? {
-            sessionInstanceId: selectedPeerAuditCandidate.sessionInstanceId,
-            normalizedModelId: selectedPeerAuditCandidate.normalizedModelId,
-            providerFamily: selectedPeerAuditCandidate.providerFamily,
-          } : supervision.auditTargetFingerprint,
+          auditTargetSessionName: selectedPeerAuditCandidate?.name ?? peerAuditTargetName ?? undefined,
           peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
         }
       : {}),
@@ -950,8 +892,7 @@ export function SessionSettingsDialog({
     supervision.mode,
     supervisionAuditLoops,
     selectedPeerAuditCandidate,
-    supervision.auditTargetSessionName,
-    supervision.auditTargetFingerprint,
+    peerAuditTargetName,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
     supervisionBackend,
@@ -1581,11 +1522,6 @@ export function SessionSettingsDialog({
           {t('session.supervision.validation.auditTargetRequired')}
         </div>
       )}
-      {isAuditMode && peerAuditTargetName && selectedPeerAuditCandidate && !peerAuditTargetConfirmed && (
-        <div style={{ color: '#fbbf24', fontSize: 12 }} data-testid="peer-audit-candidate-waiting-authority">
-          {t('peerAuditQuick.candidateLoad.waiting_authority')}
-        </div>
-      )}
     </div>
   ) : (
     <div style={{ color: '#fca5a5', fontSize: 12 }}>
@@ -1601,11 +1537,11 @@ export function SessionSettingsDialog({
     if (supervisionBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisionBackend, supervisionModel.trim(), supervisionPreset.trim() || undefined)) return false;
     if (supervisionTimeout <= 0) return false;
     if (isAuditMode) {
-      if (!peerAuditTargetName || !selectedPeerAuditCandidate?.eligible || !peerAuditTargetConfirmed) return false;
+      if (!peerAuditTargetName || !selectedPeerAuditCandidate?.eligible) return false;
       if (supervisionAuditLoops < 0) return false;
     }
     return true;
-  }, [hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetConfirmed, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
+  }, [hasSupervision, isAuditMode, isSupportedTransport, peerAuditTargetName, selectedPeerAuditCandidate, supervisionAuditLoops, supervisionBackend, supervisionModel, supervisionPreset, supervisionTimeout]);
 
   const dialog = (
     <div class="dialog-overlay session-settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

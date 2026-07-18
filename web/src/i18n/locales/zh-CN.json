@@ -2719,13 +2719,6 @@
     "consentConfirm": "发送给 {{auditor}}",
     "selectionWillPersist": "该审计者也会被记住，用于此会话后续的自动审计。",
     "noCandidate": "当前会话组内没有其他可委派的智能体。",
-    "candidateLoad": {
-      "waiting_authority": "正在等待 daemon 刷新权威会话身份；刷新完成后审计者选项会自动出现。",
-      "loading": "正在加载审计者选项…",
-      "loaded": "审计者选项已加载。",
-      "error": "无法加载审计者选项。",
-      "retry": "重试"
-    },
     "ineligibleCollapsed": "{{count}} 个不合格",
     "providerBadge": "厂商:{{provider}}",
     "chooserReason": {
