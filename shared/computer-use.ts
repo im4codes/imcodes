@@ -265,8 +265,8 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
         'Target controlled machines accept either their stable ref_name or the complete ^^(ref_name) marker. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
-        'When the user asks to use a browser, OCU, or Open Computer Use on the daemon host, call computer_use_call with machine=local and browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
-        'Browser-specific control is available through built-in CDP-backed browser_* tools and should be preferred over coordinate GUI control for web pages.',
+        'When the user asks to use a browser on the daemon host, call computer_use_call with machine=local and the built-in CDP-backed browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
+        'Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path; browser_* is IM.codes\' separate CDP implementation and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
@@ -293,7 +293,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'browser':
       return [
         'Browser control uses Chrome DevTools Protocol (CDP), the mature browser automation protocol used by Chrome/Edge tooling, and is more deterministic for web pages than screen coordinates.',
-        'For the current daemon host use computer_use_call with machine=local. This is the built-in OCU path; do not replace it with shell-launched Playwright when the user asks for OCU/browser control.',
+        'For the current daemon host use computer_use_call with machine=local. browser_* is IM.codes\' built-in CDP path, separate from the integrated Open Computer Use desktop-app path; do not replace it with shell-launched Playwright.',
         'Use browser_open first with url. Optional arguments: channel=chrome|msedge|chromium, executablePath, headless=true|false, noSandbox=false, cdpEndpoint to attach to an existing browser target websocket.',
         'Then use browser_navigate, browser_snapshot, browser_click, browser_fill, browser_press, browser_evaluate, browser_close.',
         'Every browser snapshot includes automation.cdpEndpoint, cdpHost, and cdpPort. A local Python/Node script may attach to that loopback CDP endpoint (for example Playwright connect_over_cdp) to run complex logic against the same browser instance instead of launching another browser.',

@@ -132,6 +132,12 @@ Guarda fragmentos de texto reutilizables vinculados al propietario y búscalos e
 
 Registra otra máquina como nodo controlado restringido sin convertirla en un source server completo de IM.codes. Escribe `^` para autocompletar el destino o inserta `^^(name)`; los agentes autorizados podrán ejecutar comandos remotos con alcance, transferir archivos individuales o invocar herramientas Computer Use tipadas en ese nodo. El propietario habilita y puede revocar la ejecución, los nodos controlados no aparecen en las listas normales de server/session y cada máquina usa credenciales independientes. El enlace de descarga caduca, pero un instalador recién descargado puede conservarse y reutilizarse para registrar varias máquinas.
 
+### Computer Use y automatización del navegador
+
+Los agentes SDK compatibles pueden controlar aplicaciones de escritorio mediante herramientas Computer Use tipadas. La ruta multiplataforma para aplicaciones de escritorio integra [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use), de Leo ([iFurySt](https://github.com/iFurySt)), publicado con licencia MIT; se acredita expresamente a ese proyecto por esta capacidad integrada.
+
+La automatización del navegador es una función independiente implementada por IM.codes directamente sobre Chrome DevTools Protocol (CDP). Permite abrir, inspeccionar, navegar, hacer clic, rellenar y evaluar páginas; devuelve texto estructurado por defecto y una captura opcional solo cuando se solicita. El navegador gestionado también expone un endpoint CDP limitado al loopback para que scripts locales de Python o Node reutilicen la misma instancia activa.
+
 ### Terminal remota
 Acceso completo al terminal de tus sesiones de agente desde cualquier navegador, sin SSH, VPN ni port forwarding. Puedes alternar entre modo terminal bruto y una vista de chat estructurada con tool calls, bloques de thinking y salida en streaming.
 

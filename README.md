@@ -130,6 +130,12 @@ Save owner-scoped reusable text snippets and insert them from the composer by ty
 
 Enroll another machine as a restricted controlled node without turning it into a full IM.codes source server. Type `^` to autocomplete a target or insert `^^(name)` directly, then authorized agents can run scoped remote commands, transfer individual files, or invoke typed Computer Use tools on that node. Execution remains owner-gated and revocable, controlled nodes stay out of normal server/session lists, and each enrolled machine receives independent credentials. Download links expire, but a newly downloaded installer can be kept and reused to enroll multiple machines.
 
+### Computer Use & Browser Automation
+
+Supported SDK agents can control desktop apps through typed Computer Use tools. The cross-platform desktop-app path integrates [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) by Leo ([iFurySt](https://github.com/iFurySt)), licensed under [MIT](https://github.com/iFurySt/open-codex-computer-use/blob/main/LICENSE); credit goes to that project for this integrated capability.
+
+Browser automation is a separate IM.codes feature built directly on Chrome DevTools Protocol (CDP): agents can open, inspect, navigate, click, fill, and evaluate pages, returning structured text by default and an optional screenshot only when requested. The managed browser exposes a loopback-only CDP endpoint so local Python or Node scripts can attach to the same live instance for complex work without launching another browser.
+
 ### Remote Terminal
 
 Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming at 12fps with zero message limits.
