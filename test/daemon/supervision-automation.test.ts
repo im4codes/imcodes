@@ -23,6 +23,7 @@ const mockTransportRuntime = {
   pendingMessages: [],
   pendingEntries: [],
 };
+const mockPersistSessionRecord = vi.fn();
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: mockStartP2pRun,
@@ -33,6 +34,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: vi.fn(() => mockTransportRuntime),
+  persistSessionRecord: mockPersistSessionRecord,
 }));
 
 vi.mock('../../src/daemon/supervision-broker.js', () => ({
@@ -523,6 +525,101 @@ describe('SupervisionAutomation', () => {
         },
       },
     });
+  });
+
+  it('repairs a configured alias fingerprint when the same auditor gains authoritative live model metadata', async () => {
+    const initial = await seedSession('supervised_audit');
+    const reviewer = getSession('deck_sub_reviewer');
+    const audited = getSession('deck_supervision_brain');
+    if (!reviewer?.sessionInstanceId || !audited) throw new Error('seeded sessions are unavailable');
+    const aliasSnapshot = normalizeSessionSupervisionSnapshot({
+      ...initial,
+      auditTargetFingerprint: {
+        sessionInstanceId: reviewer.sessionInstanceId,
+        normalizedModelId: 'opus[1m]',
+        providerFamily: 'anthropic',
+      },
+    });
+    upsertSession({
+      ...reviewer,
+      requestedModel: 'opus',
+      modelDisplay: 'claude-opus-4-8',
+      activeModel: 'claude-opus-4-8',
+      updatedAt: Date.now(),
+    });
+    upsertSession({
+      ...audited,
+      transportConfig: { ...audited.transportConfig, supervision: aliasSnapshot },
+      updatedAt: Date.now(),
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-authoritative-model-repair',
+      'implement the feature',
+      aliasSnapshot,
+    );
+    beginRun('cmd-authoritative-model-repair', 'implement the feature');
+    completeTurn('implemented the feature');
+    await waitForRunPhase('auditing');
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: {
+        auditTargetFingerprint: {
+          sessionInstanceId: reviewer.sessionInstanceId,
+          normalizedModelId: 'claude-opus-4-8',
+          providerFamily: 'anthropic',
+        },
+      },
+    });
+    expect(getSession('deck_supervision_brain')?.transportConfig?.supervision).toMatchObject({
+      auditTargetFingerprint: {
+        sessionInstanceId: reviewer.sessionInstanceId,
+        normalizedModelId: 'claude-opus-4-8',
+        providerFamily: 'anthropic',
+      },
+    });
+    expect(mockPersistSessionRecord).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_supervision_brain' }),
+      'deck_supervision_brain',
+    );
+  });
+
+  it('does not auto-repair a genuine auditor model change', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const reviewer = getSession('deck_sub_reviewer');
+    if (!reviewer) throw new Error('seeded reviewer is unavailable');
+    upsertSession({
+      ...reviewer,
+      requestedModel: 'opus',
+      modelDisplay: 'claude-opus-4-8',
+      activeModel: 'claude-opus-4-8',
+      updatedAt: Date.now(),
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-genuine-model-change',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-genuine-model-change', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(mockPersistSessionRecord).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'peer_audit.result',
+        payload: expect.objectContaining({ outcome: 'invalid_configuration' }),
+      }),
+    ]));
   });
 
   it('holds commit and push until PASS and allows multi-turn finalization without a second audit', async () => {

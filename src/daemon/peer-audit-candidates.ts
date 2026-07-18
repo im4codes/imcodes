@@ -66,6 +66,20 @@ export function resolvePeerAuditNormalizedModelId(session: SessionRecord): strin
   }, { knownModelIds });
 }
 
+/** Resolve only the explicit requested/configured identity, deliberately
+ * excluding live active-model metadata. This lets callers distinguish a
+ * harmless metadata enrichment (for example `opus` -> a live
+ * `claude-opus-4-8`) from an actual user-selected model change. */
+export function resolvePeerAuditConfiguredModelId(session: SessionRecord): string {
+  const configuredModel = session.modelDisplay ?? session.qwenModel;
+  const knownModelIds = [session.requestedModel, configuredModel]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  return resolveSharedPeerAuditNormalizedModelId({
+    requestedModel: session.requestedModel,
+    configuredModel,
+  }, { knownModelIds });
+}
+
 export function resolvePeerAuditProviderFamily(session: SessionRecord): string {
   return resolveSharedPeerAuditProviderFamily({ providerId: session.providerId, agentType: session.agentType });
 }

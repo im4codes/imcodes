@@ -1,8 +1,8 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { getSession } from '../store/session-store.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
+import { getSession, upsertSession } from '../store/session-store.js';
+import { getTransportRuntime, persistSessionRecord } from '../agent/session-manager.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { supervisionBroker } from './supervision-broker.js';
@@ -15,6 +15,7 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   extractSessionSupervisionSnapshot,
+  patchPeerAuditTargetInTransportConfig,
   resolveSupervisionCustomInstructionsDetail,
   type SessionSupervisionSnapshot,
   type SupervisionUnavailableReason,
@@ -31,6 +32,7 @@ import {
 import {
   PEER_AUDIT_DEADLINE_MS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
+  PEER_AUDIT_UNKNOWN_IDENTITY,
   parsePeerAuditOrchestratedResult,
   type PeerAuditTerminalOutcome,
 } from '../../shared/peer-audit.js';
@@ -38,6 +40,7 @@ import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/f
 import { peerAuditService } from './peer-audit-service.js';
 import { emitPeerAuditResult } from './peer-audit-result.js';
 import {
+  resolvePeerAuditConfiguredModelId,
   resolvePeerAuditNormalizedModelId,
   resolvePeerAuditProviderFamily,
 } from './peer-audit-candidates.js';
@@ -933,21 +936,72 @@ class SupervisionAutomation {
       ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
       : null;
     const latestSnapshot = current.hasLiveSnapshotUpdate ? current.snapshot : authoritativeSnapshot;
-    const automaticSnapshot = latestSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+    let automaticSnapshot = latestSnapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
       ? latestSnapshot
       : null;
     if (automaticSnapshot) current.snapshot = automaticSnapshot;
 
     const targetName = automaticSnapshot?.auditTargetSessionName;
     const target = targetName ? getSession(targetName) : undefined;
-    const configuredFingerprint = automaticSnapshot?.auditTargetFingerprint;
+    let configuredFingerprint = automaticSnapshot?.auditTargetFingerprint;
+    const liveTargetModel = target ? resolvePeerAuditNormalizedModelId(target) : PEER_AUDIT_UNKNOWN_IDENTITY;
+    const liveTargetProvider = target ? resolvePeerAuditProviderFamily(target) : PEER_AUDIT_UNKNOWN_IDENTITY;
+    const configuredTargetModel = target ? resolvePeerAuditConfiguredModelId(target) : PEER_AUDIT_UNKNOWN_IDENTITY;
+
+    // Older candidate snapshots could be saved before authoritative live model
+    // metadata arrived. A concrete example is a Claude requested alias `opus`
+    // being stored as `opus[1m]`, while the same logical session later reports
+    // the authoritative active model `claude-opus-4-8`. That is metadata
+    // enrichment, not a target replacement or user-driven model switch. Repair
+    // only when the logical instance and provider are unchanged AND the stored
+    // model still exactly matches the target's configured/requested identity.
+    // A genuinely changed model (whose configured identity no longer matches)
+    // remains fail-closed and requires user confirmation.
+    const canRepairAuthoritativeModel = Boolean(
+      record
+      && target
+      && targetName
+      && automaticSnapshot
+      && configuredFingerprint
+      && configuredFingerprint.sessionInstanceId === target.sessionInstanceId
+      && configuredFingerprint.providerFamily === liveTargetProvider
+      && configuredFingerprint.normalizedModelId === configuredTargetModel
+      && liveTargetModel !== PEER_AUDIT_UNKNOWN_IDENTITY
+      && liveTargetModel !== configuredFingerprint.normalizedModelId,
+    );
+    if (canRepairAuthoritativeModel && record && target && targetName && automaticSnapshot && configuredFingerprint) {
+      const repairedFingerprint = {
+        sessionInstanceId: configuredFingerprint.sessionInstanceId,
+        normalizedModelId: liveTargetModel,
+        providerFamily: liveTargetProvider,
+      };
+      const repairedRecord = {
+        ...record,
+        transportConfig: patchPeerAuditTargetInTransportConfig(record.transportConfig, {
+          auditTargetSessionName: targetName,
+          auditTargetFingerprint: repairedFingerprint,
+        }),
+        updatedAt: Date.now(),
+      };
+      upsertSession(repairedRecord);
+      persistSessionRecord(repairedRecord, repairedRecord.name);
+      automaticSnapshot = { ...automaticSnapshot, auditTargetFingerprint: repairedFingerprint };
+      configuredFingerprint = repairedFingerprint;
+      current.snapshot = automaticSnapshot;
+      logger.info({
+        session: current.sessionName,
+        auditorSession: targetName,
+        configuredModel: configuredTargetModel,
+        liveModel: liveTargetModel,
+      }, 'Repaired peer-audit target fingerprint from authoritative live model metadata');
+    }
     const transportRuntime = getTransportRuntime(current.sessionName);
     const targetStillMatches = Boolean(
       target
       && configuredFingerprint
       && target.sessionInstanceId === configuredFingerprint.sessionInstanceId
-      && resolvePeerAuditNormalizedModelId(target) === configuredFingerprint.normalizedModelId
-      && resolvePeerAuditProviderFamily(target) === configuredFingerprint.providerFamily,
+      && liveTargetModel === configuredFingerprint.normalizedModelId
+      && liveTargetProvider === configuredFingerprint.providerFamily,
     );
     if (!record || !targetName || !target || !targetStillMatches || !transportRuntime) {
       logger.warn({
