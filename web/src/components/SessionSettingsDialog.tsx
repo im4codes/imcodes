@@ -6,7 +6,8 @@ import { useTranslation } from 'react-i18next';
 import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import type { WsClient } from '../ws-client.js';
-import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, type SessionAgentType } from '@shared/agent-types.js';
+import { SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
+import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { doesSharedContextBackendSupportPresets, isKnownSharedContextModelForBackend } from '@shared/shared-context-runtime-config.js';
 import {
@@ -31,11 +32,13 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import {
+  PEER_AUDIT_CANDIDATE_REASONS,
   PEER_AUDIT_PROMPT_VERSION,
+  PEER_AUDIT_UNKNOWN_IDENTITY,
   resolvePeerAuditNormalizedModelId,
-  type PeerAuditCandidateList,
+  resolvePeerAuditProviderFamily,
+  type PeerAuditCandidate,
 } from '@shared/peer-audit.js';
-import { createWsPeerAuditAdapter } from '../peerAudit/wsAdapter.js';
 import { PeerAuditCandidatePicker } from '../peerAudit/PeerAuditAuditorChooser.js';
 import { peerAuditCandidateDisplayLabel, peerAuditProviderTypeLabel } from '../peerAudit/types.js';
 import {
@@ -61,6 +64,12 @@ interface Props {
   activeModel?: string | null;
   requestedModel?: string | null;
   providerId?: string | null;
+  /**
+   * Ordinary sub-sessions already loaded by the App's HTTP session APIs and
+   * enriched by live session sync. Settings must render this list directly;
+   * it must not start a second daemon candidate-list RPC just to populate UI.
+   */
+  peerAuditSessions?: readonly PeerAuditSettingsSession[];
   openIntent?: SessionSettingsOpenIntent;
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
@@ -71,6 +80,80 @@ interface Props {
   ws?: WsClient | null;
   onClose: () => void;
   onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null }) => void;
+}
+
+export interface PeerAuditSettingsSession {
+  sessionName: string;
+  parentSession?: string | null;
+  type: string;
+  runtimeType?: 'process' | 'transport' | null;
+  label?: string | null;
+  state?: string | null;
+  sessionInstanceId?: string | null;
+  runtimeEpoch?: string | null;
+  activeModel?: string | null;
+  requestedModel?: string | null;
+  modelDisplay?: string | null;
+  providerId?: string | null;
+}
+
+export function buildPeerAuditSettingsCandidates(input: {
+  auditedSessionName: string;
+  parentSession?: string | null;
+  sessions: readonly PeerAuditSettingsSession[];
+}): PeerAuditCandidate[] {
+  const owningMainSession = input.parentSession?.trim() || input.auditedSessionName;
+  const seen = new Set<string>();
+  const candidates: PeerAuditCandidate[] = [];
+
+  for (const session of input.sessions) {
+    if (session.sessionName === input.auditedSessionName
+      || session.parentSession !== owningMainSession
+      || seen.has(session.sessionName)
+      || !isDelegationReplyCapableAgentType(session.type)) {
+      continue;
+    }
+    seen.add(session.sessionName);
+
+    const sessionInstanceId = session.sessionInstanceId?.trim();
+    const runtimeEpoch = session.runtimeEpoch?.trim();
+    const knownModelIds = [session.activeModel, session.requestedModel, session.modelDisplay]
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+    const normalizedModelId = resolvePeerAuditNormalizedModelId({
+      activeModel: session.activeModel,
+      requestedModel: session.requestedModel,
+      configuredModel: session.modelDisplay,
+    }, { knownModelIds });
+    const providerFamily = resolvePeerAuditProviderFamily({
+      providerId: session.providerId,
+      agentType: session.type,
+    });
+    if (!sessionInstanceId || !runtimeEpoch
+      || normalizedModelId === PEER_AUDIT_UNKNOWN_IDENTITY
+      || providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY) {
+      continue;
+    }
+
+    const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.type);
+    candidates.push({
+      name: session.sessionName,
+      label: session.label?.trim() || peerAuditProviderTypeLabel(providerFamily),
+      sessionInstanceId,
+      runtimeEpoch,
+      normalizedModelId,
+      providerFamily,
+      liveState: session.state ?? PEER_AUDIT_UNKNOWN_IDENTITY,
+      dispositionCapability: runtimeType === 'process'
+        ? 'sent_unrevocable'
+        : session.state === 'idle' ? 'sent' : 'queued',
+      eligible: true,
+      reason: PEER_AUDIT_CANDIDATE_REASONS.ELIGIBLE,
+    });
+  }
+
+  return candidates.sort((left, right) => left.label.localeCompare(right.label)
+    || left.normalizedModelId.localeCompare(right.normalizedModelId)
+    || left.name.localeCompare(right.name));
 }
 
 type SupervisionDraft = {
@@ -521,10 +604,9 @@ export function SessionSettingsDialog({
   cwd: initCwd,
   type,
   transportConfig,
-  sessionInstanceId,
-  runtimeEpoch,
   activeModel,
   requestedModel,
+  peerAuditSessions = [],
   parentSession,
   openIntent,
   ws,
@@ -555,11 +637,6 @@ export function SessionSettingsDialog({
   const [peerAuditTargetName, setPeerAuditTargetName] = useState<string | null>(
     initialSupervision.auditTargetSessionName ?? null,
   );
-  const [peerAuditCandidateList, setPeerAuditCandidateList] = useState<PeerAuditCandidateList | null>(null);
-  const [peerAuditCandidateLoadState, setPeerAuditCandidateLoadState] = useState<'waiting_authority' | 'loading' | 'loaded' | 'error'>(
-    sessionInstanceId && runtimeEpoch ? 'loading' : 'waiting_authority',
-  );
-  const [peerAuditCandidateRefreshToken, setPeerAuditCandidateRefreshToken] = useState(0);
   const peerAuditTargetRef = useRef<HTMLDivElement>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -576,37 +653,6 @@ export function SessionSettingsDialog({
     setSupervision(initialSupervision);
     setPeerAuditTargetName(initialSupervision.auditTargetSessionName ?? null);
   }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
-
-  useEffect(() => {
-    if (!sessionInstanceId || !runtimeEpoch) {
-      setPeerAuditCandidateList(null);
-      setPeerAuditCandidateLoadState('waiting_authority');
-      return;
-    }
-    if (!ws) {
-      setPeerAuditCandidateList(null);
-      setPeerAuditCandidateLoadState('error');
-      return;
-    }
-    setPeerAuditCandidateLoadState('loading');
-    const adapter = createWsPeerAuditAdapter(ws);
-    let cancelled = false;
-    void adapter.listCandidates({
-      auditedSessionName: sessionName,
-      auditedSessionIdentity: { sessionInstanceId, runtimeEpoch },
-    }).then((list) => {
-      if (cancelled) return;
-      setPeerAuditCandidateList(list);
-      setPeerAuditCandidateLoadState('loaded');
-      setPeerAuditTargetName((current) => current ?? initialSupervision.auditTargetSessionName ?? null);
-    }).catch(() => {
-      if (!cancelled) {
-        setPeerAuditCandidateList(null);
-        setPeerAuditCandidateLoadState('error');
-      }
-    });
-    return () => { cancelled = true; };
-  }, [ws, sessionName, sessionInstanceId, runtimeEpoch, initialSupervision.auditTargetSessionName, peerAuditCandidateRefreshToken]);
 
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
@@ -717,7 +763,12 @@ export function SessionSettingsDialog({
   const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
   const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
   const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
-  const selectedPeerAuditCandidate = peerAuditCandidateList?.candidates.find((candidate) => candidate.name === peerAuditTargetName);
+  const peerAuditCandidates = useMemo(() => buildPeerAuditSettingsCandidates({
+    auditedSessionName: sessionName,
+    parentSession,
+    sessions: peerAuditSessions,
+  }), [parentSession, peerAuditSessions, sessionName]);
+  const selectedPeerAuditCandidate = peerAuditCandidates.find((candidate) => candidate.name === peerAuditTargetName);
   const peerAuditTargetConfirmed = Boolean(selectedPeerAuditCandidate?.eligible);
   const selectedPeerAuditDisplayLabel = selectedPeerAuditCandidate
     ? peerAuditCandidateDisplayLabel(selectedPeerAuditCandidate)
@@ -1340,29 +1391,13 @@ export function SessionSettingsDialog({
                     {t('peerAuditQuick.chooserTitle')}
                   </div>
                   <div data-testid="session-supervision-peer-picker">
-                    {peerAuditCandidateLoadState === 'loaded' ? (
-                      <PeerAuditCandidatePicker
-                        list={peerAuditCandidateList}
-                        selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
-                        onSelect={(candidate) => {
-                          setPeerAuditTargetName(candidate.name);
-                        }}
-                      />
-                    ) : (
-                      <div class="peer-audit-chooser-empty" data-testid={`peer-audit-candidate-${peerAuditCandidateLoadState}`}>
-                        {t(`peerAuditQuick.candidateLoad.${peerAuditCandidateLoadState}`)}
-                        {peerAuditCandidateLoadState === 'error' && (
-                          <button
-                            type="button"
-                            class="btn btn-secondary"
-                            style={{ marginLeft: 8 }}
-                            onClick={() => setPeerAuditCandidateRefreshToken((value) => value + 1)}
-                          >
-                            {t('peerAuditQuick.candidateLoad.retry')}
-                          </button>
-                        )}
-                      </div>
-                    )}
+                    <PeerAuditCandidatePicker
+                      candidates={peerAuditCandidates}
+                      selectedSessionInstanceId={selectedPeerAuditCandidate?.sessionInstanceId}
+                      onSelect={(candidate) => {
+                        setPeerAuditTargetName(candidate.name);
+                      }}
+                    />
                   </div>
                   {selectedPeerIsSameModel && (
                     <div style={{ color: '#fbbf24', fontSize: 11, marginTop: 6 }} data-testid="peer-audit-same-model-warning">

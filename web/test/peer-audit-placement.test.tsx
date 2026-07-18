@@ -19,8 +19,8 @@ const source = readFileSync(SRC, 'utf8');
 
 describe('SessionControls Quick static migration guards', () => {
   it('renders shortcut-btn-peer-audit immediately before shortcut-btn-auto', () => {
-    const peerIdx = source.indexOf('shortcut-btn-peer-audit');
-    const autoIdx = source.indexOf('shortcut-btn-auto');
+    const peerIdx = source.indexOf('class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"');
+    const autoIdx = source.indexOf('class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}');
     expect(peerIdx).toBeGreaterThan(-1);
     expect(autoIdx).toBeGreaterThan(-1);
     expect(peerIdx).toBeLessThan(autoIdx);
@@ -34,9 +34,9 @@ describe('SessionControls Quick static migration guards', () => {
 
   it('Peer Audit icon shares canQuickControlSupervision gate', () => {
     // The Peer Audit icon button is wrapped in the same canQuickControlSupervision check.
-    const peerGateIdx = source.indexOf('canQuickControlSupervision &&');
-    const peerBtnIdx = source.indexOf('shortcut-btn-peer-audit');
-    const autoBtnIdx = source.indexOf('shortcut-btn-auto');
+    const peerBtnIdx = source.indexOf('class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"');
+    const autoBtnIdx = source.indexOf('class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}');
+    const peerGateIdx = source.lastIndexOf('{canQuickControlSupervision && (', peerBtnIdx);
     // Both buttons must appear AFTER a canQuickControlSupervision && check.
     expect(peerGateIdx).toBeLessThan(peerBtnIdx);
     expect(peerGateIdx).toBeLessThan(autoBtnIdx);
@@ -60,10 +60,13 @@ describe('SessionControls Quick static migration guards', () => {
   });
 
   it('does not mutate supervision Auto color/dot', () => {
-    // Find the auto-color/dot block — it must remain unchanged (no Peer Audit hooks touched it).
-    // We assert that quickAutoColor is still computed from quickSupervisionMode, not from peer audit state.
-    expect(source).toContain('quickAutoColor');
-    expect(source).toContain('quickSupervisionMode === SUPERVISION_MODE.SUPERVISED');
+    // Auto visual state remains derived only from supervision mode, not from
+    // Quick delegation state. The active animation classes replaced the old
+    // inline quickAutoColor variable.
+    expect(source).toContain('const quickAutoModeClass = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED');
+    expect(source).toContain("? 'shortcut-btn-auto-supervised shortcut-btn-auto-active'");
+    expect(source).toContain("? 'shortcut-btn-auto-audit shortcut-btn-auto-active'");
+    expect(source).toContain(": 'shortcut-btn-auto-off'");
   });
 
 });

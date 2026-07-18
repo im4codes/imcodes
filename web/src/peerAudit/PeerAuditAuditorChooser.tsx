@@ -142,15 +142,17 @@ function ChooserPanel({ api, list, reason, onClose }: ChooserPanelProps) {
 
 export function PeerAuditCandidatePicker({
   list,
+  candidates,
   selectedSessionInstanceId,
   onSelect,
 }: {
-  list: PeerAuditCandidateList | null;
+  list?: PeerAuditCandidateList | null;
+  candidates?: readonly PeerAuditCandidate[];
   selectedSessionInstanceId?: string;
   onSelect: (candidate: PeerAuditCandidate) => void;
 }) {
   const { t } = useTranslation();
-  const eligible = list?.candidates.filter((candidate) => candidate.eligible) ?? [];
+  const eligible = (candidates ?? list?.candidates ?? []).filter((candidate) => candidate.eligible);
   return (
     <div class="peer-audit-candidate-picker" data-testid="peer-audit-candidate-picker">
       {eligible.length === 0 && (

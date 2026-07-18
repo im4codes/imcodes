@@ -55,44 +55,20 @@ function changeSelect(select: HTMLElement, value: string): void {
   fireEvent.change(element);
 }
 
-function makePeerAuditWs(candidateOverrides: Record<string, unknown> = {}) {
-  const listeners = new Set<(message: any) => void>();
+function makePeerAuditSession(overrides: Record<string, unknown> = {}) {
   return {
-    send(message: any) {
-      if (message.type !== 'peer_audit.list_candidates') return;
-      queueMicrotask(() => {
-        for (const listener of listeners) {
-          listener({
-            type: 'peer_audit.candidates',
-            commandId: message.commandId,
-            ok: true,
-            list: {
-              revision: 'settings-revision-1',
-              targetConfigRevision: 'settings-target-revision-1',
-              auditedSessionName: 'deck_proj_brain',
-              auditedSessionInstanceId: 'brain-instance-1',
-              candidates: [{
-                name: 'deck_sub_peer',
-                label: 'Peer',
-                sessionInstanceId: 'peer-instance-1',
-                runtimeEpoch: 'peer-runtime-1',
-                normalizedModelId: 'gpt-5.6',
-                providerFamily: 'openai',
-                liveState: 'idle',
-                dispositionCapability: 'sent',
-                eligible: true,
-                reason: 'eligible',
-                ...candidateOverrides,
-              }],
-            },
-          });
-        }
-      });
-    },
-    onMessage(listener: (message: any) => void) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
+    sessionName: 'deck_sub_peer',
+    parentSession: 'deck_proj_brain',
+    type: 'codex-sdk',
+    runtimeType: 'transport' as const,
+    label: 'Peer',
+    state: 'idle',
+    sessionInstanceId: 'peer-instance-1',
+    runtimeEpoch: 'peer-runtime-1',
+    activeModel: 'gpt-5.6',
+    requestedModel: 'gpt-5.6',
+    providerId: 'openai',
+    ...overrides,
   };
 }
 
@@ -238,46 +214,77 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('does not misreport missing daemon authority as an empty candidate list and loads options after identity refresh', async () => {
-    const ws = makePeerAuditWs() as any;
-    const commonProps = {
-      serverId: 'srv-1',
-      sessionName: 'deck_proj_brain',
-      label: 'Brain',
-      description: 'desc',
-      cwd: '/proj',
-      type: 'codex-sdk',
-      ws,
-      transportConfig: {
-        supervision: {
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: CODEX_MODEL_IDS[0],
-          timeoutMs: 12_000,
-          promptVersion: 'supervision_decision_v1',
-          maxAuditLoops: 2,
-        },
-      },
-      onClose: vi.fn(),
-      onSaved: vi.fn(),
-    };
-    const view = render(<SessionSettingsDialog {...commonProps} />);
-
-    expect(screen.getByTestId('peer-audit-candidate-waiting_authority')).toBeDefined();
-    expect(screen.queryByTestId('peer-audit-chooser-empty')).toBeNull();
-
-    view.rerender(
+  it('renders the App session list immediately without a peer-audit candidate RPC', () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const ws = {
+      connected: false,
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage: () => () => undefined,
+    } as any;
+    render(
       <SessionSettingsDialog
-        {...commonProps}
-        sessionInstanceId="brain-instance-1"
-        runtimeEpoch="brain-runtime-1"
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        ws={ws}
+        peerAuditSessions={[makePeerAuditSession()]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxAuditLoops: 2,
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
       />,
     );
 
-    await waitFor(() => {
-      expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
-    });
-    expect(screen.queryByTestId('peer-audit-candidate-waiting_authority')).toBeNull();
+    expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
+    expect(screen.queryByTestId('peer-audit-candidate-loading')).toBeNull();
+    expect(sent.some((message) => message.type === 'peer_audit.list_candidates')).toBe(false);
+  });
+
+  it('only offers reply-capable sessions from the audited session group', () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        peerAuditSessions={[
+          makePeerAuditSession(),
+          makePeerAuditSession({ sessionName: 'deck_sub_other', parentSession: 'deck_other_brain', label: 'Other project' }),
+          makePeerAuditSession({ sessionName: 'deck_sub_shell', type: 'shell', label: 'Shell' }),
+          makePeerAuditSession({ sessionName: 'deck_proj_brain', label: 'Self' }),
+        ]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxAuditLoops: 2,
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByTestId('peer-audit-chooser-row')).toHaveLength(1);
+    expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
+    expect(document.body.textContent).not.toContain('Other project');
+    expect(document.body.textContent).not.toContain('Shell');
   });
 
   it('shows the remembered auditor picker and persists the canonical audit target', async () => {
@@ -295,7 +302,7 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="claude-code-sdk"
-        ws={makePeerAuditWs() as any}
+        peerAuditSessions={[makePeerAuditSession()]}
         sessionInstanceId="brain-instance-1"
         runtimeEpoch="brain-runtime-1"
         transportConfig={{
@@ -356,7 +363,7 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="claude-code-sdk"
-        ws={makePeerAuditWs() as any}
+        peerAuditSessions={[makePeerAuditSession()]}
         sessionInstanceId="brain-instance-1"
         runtimeEpoch="brain-runtime-1"
         transportConfig={{
@@ -396,7 +403,7 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="claude-code-sdk"
-        ws={makePeerAuditWs({ normalizedModelId: 'gpt-5.7' }) as any}
+        peerAuditSessions={[makePeerAuditSession({ activeModel: 'gpt-5.7' })]}
         sessionInstanceId="brain-instance-1"
         runtimeEpoch="brain-runtime-1"
         transportConfig={{

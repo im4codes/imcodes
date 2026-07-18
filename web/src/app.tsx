@@ -53,7 +53,7 @@ import {
 } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js';
-import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
+import { SessionSettingsDialog, type PeerAuditSettingsSession } from './components/SessionSettingsDialog.js';
 import type { SessionSettingsOpenIntent } from './session-settings-open-intent.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
@@ -100,6 +100,7 @@ import {
 } from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
   isSubSessionName,
@@ -4521,6 +4522,26 @@ export function App() {
       subUsages.get(session.sessionName)?.model,
     ),
   })), [detectedModels, subSessions, subUsages]);
+  const peerAuditSettingsSessions = useMemo<PeerAuditSettingsSession[]>(() => subSessions
+    .filter((session) => session.executionCloneKind !== EXECUTION_CLONE_KIND && typeof session.parentRunId !== 'string')
+    .map((session) => ({
+      sessionName: session.sessionName,
+      parentSession: session.parentSession,
+      type: session.type,
+      runtimeType: session.runtimeType,
+      label: session.label,
+      state: session.state,
+      sessionInstanceId: session.sessionInstanceId,
+      runtimeEpoch: session.runtimeEpoch,
+      activeModel: resolveQuickAgentDelegationModel(
+        session,
+        detectedModels.get(session.sessionName),
+        subUsages.get(session.sessionName)?.model,
+      ),
+      requestedModel: session.requestedModel,
+      modelDisplay: session.modelDisplay,
+      providerId: session.providerId,
+    })), [detectedModels, subSessions, subUsages]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
     const sub = subSessionId
@@ -6132,6 +6153,7 @@ export function App() {
           activeModel={settingsTarget.activeModel}
           requestedModel={settingsTarget.requestedModel}
           providerId={settingsTarget.providerId}
+          peerAuditSessions={peerAuditSettingsSessions}
           openIntent={settingsTarget.openIntent}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
