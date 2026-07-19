@@ -7,12 +7,14 @@ import {
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_MODE,
+  SUPERVISION_UNAVAILABLE_REASONS,
 } from '../../shared/supervision-config.js';
 import {
   PEER_AUDIT_DEADLINE_MS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
 } from '../../shared/peer-audit.js';
 import { buildAgentDelegationReplyInstruction } from '../../shared/agent-delegation.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
@@ -1499,6 +1501,36 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
     expect(mockStartP2pRun).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('reports the supervisor provider failure category and exhausted attempt count', async () => {
+    const snapshot = await seedSession('supervised');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'ask_human',
+      reason: 'upstream provider failed token=supersecret',
+      confidence: 0,
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: {
+        code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        attempts: 3,
+      },
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-provider-error', 'implement the feature', snapshot);
+    beginRun('cmd-provider-error', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    const warning = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'assistant.text'
+      && event.payload.automationKind === 'supervision-warning',
+    ).at(-1);
+    expect(warning?.payload.text).toBe(
+      '⚠️ Automation could not obtain a decision from supervisor model codex-sdk/gpt-5.3-codex-spark after 3 attempts: upstream provider failed token=[redacted]. Manual continuation is required.',
+    );
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 

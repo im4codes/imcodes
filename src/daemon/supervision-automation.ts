@@ -3,9 +3,13 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
+import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { supervisionBroker } from './supervision-broker.js';
+import {
+  supervisionBroker,
+  type SupervisionProviderFailure,
+} from './supervision-broker.js';
 import { getCachedGlobalCustomInstructions } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
@@ -41,6 +45,7 @@ import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/f
 import { peerAuditService } from './peer-audit-service.js';
 import { emitPeerAuditResult } from './peer-audit-result.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
 /**
  * Merge the daemon-cached global custom instructions into a session snapshot
@@ -265,7 +270,12 @@ function classifyRepositoryFinalization(
   return 'completion_evidenced_mixed';
 }
 
-function formatUnavailableReason(reason: SupervisionUnavailableReason | undefined): string | null {
+function formatUnavailableReason(
+  reason: SupervisionUnavailableReason | undefined,
+  providerFailure?: SupervisionProviderFailure,
+  providerMessage?: string,
+  providerSelection?: { backend?: string; model?: string },
+): string | null {
   switch (reason) {
     case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED:
       return 'Automation could not reach the configured supervisor provider. Manual continuation is required.';
@@ -277,8 +287,27 @@ function formatUnavailableReason(reason: SupervisionUnavailableReason | undefine
       return 'Automation timed out waiting for a supervisor decision. Manual continuation is required.';
     case SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT:
       return 'Automation could not parse a valid supervisor decision. Manual continuation is required.';
-    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR:
-      return 'Automation failed because the supervisor provider returned an error. Manual continuation is required.';
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR: {
+      const attemptText = providerFailure && providerFailure.attempts > 1
+        ? ` after ${providerFailure.attempts} attempts`
+        : '';
+      const selectionText = providerSelection?.backend && providerSelection.model
+        ? ` ${providerSelection.backend}/${providerSelection.model}`
+        : '';
+      switch (providerFailure?.code) {
+        case PROVIDER_ERROR_CODES.AUTH_FAILED:
+          return `Automation could not authenticate supervisor model${selectionText}. Check the provider credentials in Auto settings.`;
+        case PROVIDER_ERROR_CODES.CONFIG_ERROR:
+        case PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND:
+          return `Automation could not start supervisor model${selectionText}. Repair the Auto settings before continuing.`;
+        case PROVIDER_ERROR_CODES.RATE_LIMITED:
+          return `Automation could not obtain a decision from supervisor model${selectionText}${attemptText} because the provider is rate-limited. Manual continuation is required.`;
+        default: {
+          const safeDetail = sanitizeMcpErrorMessage(providerMessage, 'provider error');
+          return `Automation could not obtain a decision from supervisor model${selectionText}${attemptText}: ${safeDetail}. Manual continuation is required.`;
+        }
+      }
+    }
     default:
       return null;
   }
@@ -1144,7 +1173,12 @@ class SupervisionAutomation {
       }
       case 'ask_human':
       default: {
-        const unavailableText = formatUnavailableReason(decision.unavailableReason);
+        const unavailableText = formatUnavailableReason(
+          decision.unavailableReason,
+          decision.providerFailure,
+          decision.reason,
+          { backend: run.snapshot.backend, model: run.snapshot.model },
+        );
         this.emitTerminalStatus(run.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
         this.emitWarning(run.sessionName, unavailableText ?? `Automation returned control to the human: ${decision.reason}`);
         this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });

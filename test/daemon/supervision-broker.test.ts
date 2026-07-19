@@ -6,6 +6,7 @@ import {
 } from '../../shared/supervision-config.js';
 import { SupervisionBroker, parseSupervisionDecision } from '../../src/daemon/supervision-broker.js';
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 
 // Mock the preset resolver so broker tests don't touch ~/.imcodes/cc-presets.json.
@@ -56,7 +57,7 @@ class FakeProvider implements TransportProvider {
     this.outputs = outputs;
   }
 
-  send = vi.fn(async (sessionId: string): Promise<void> => {
+  protected emitNext(sessionId: string): void {
     const next = this.outputs.shift();
     if (next === undefined) {
       queueMicrotask(() => {
@@ -78,6 +79,10 @@ class FakeProvider implements TransportProvider {
       };
       for (const cb of this.completeHandlers) cb(sessionId, message);
     });
+  }
+
+  send = vi.fn(async (sessionId: string): Promise<void> => {
+    this.emitNext(sessionId);
   });
 }
 
@@ -795,6 +800,7 @@ describe('SupervisionBroker', () => {
     const provider = new FakeProvider([]);
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
+      waitForRetry: async () => {},
     });
     const snapshot = normalizeSessionSupervisionSnapshot({
       mode: SUPERVISION_MODE.SUPERVISED,
@@ -817,7 +823,196 @@ describe('SupervisionBroker', () => {
     expect(result).toMatchObject({
       decision: 'ask_human',
       unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: {
+        code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        attempts: 3,
+      },
     });
+    expect(provider.createSession).toHaveBeenCalledTimes(3);
+    expect(provider.endSession).toHaveBeenCalledTimes(3);
+  });
+
+  it('recovers a transient supervisor provider failure in a fresh ephemeral session', async () => {
+    class RecoveringProvider extends FakeProvider {
+      private attempts = 0;
+
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        this.attempts += 1;
+        if (this.attempts === 1) {
+          queueMicrotask(() => {
+            for (const cb of this.errorHandlers) {
+              cb(sessionId, {
+                code: PROVIDER_ERROR_CODES.RATE_LIMITED,
+                message: 'temporary rate limit',
+                recoverable: true,
+              });
+            }
+          });
+          return;
+        }
+        this.emitNext(sessionId);
+      });
+    }
+
+    const provider = new RecoveringProvider([
+      '{"decision":"complete","reason":"recovered","confidence":0.9}',
+    ]);
+    const waitForRetry = vi.fn(async () => {});
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      waitForRetry,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await expect(broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Implementation complete',
+    })).resolves.toMatchObject({ decision: 'complete', reason: 'recovered' });
+    expect(waitForRetry).toHaveBeenCalledWith(250);
+    expect(provider.createSession).toHaveBeenCalledTimes(2);
+    expect(provider.createSession.mock.calls[0]?.[0].sessionKey)
+      .not.toBe(provider.createSession.mock.calls[1]?.[0].sessionKey);
+    expect(provider.endSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry permanent supervisor authentication failures', async () => {
+    class AuthFailureProvider extends FakeProvider {
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        queueMicrotask(() => {
+          for (const cb of this.errorHandlers) {
+            cb(sessionId, {
+              code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+              message: 'authentication failed',
+              recoverable: false,
+            });
+          }
+        });
+      });
+    }
+
+    const provider = new AuthFailureProvider([]);
+    const waitForRetry = vi.fn(async () => {});
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      waitForRetry,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await expect(broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Implementation complete',
+    })).resolves.toMatchObject({
+      decision: 'ask_human',
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: {
+        code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+        attempts: 1,
+      },
+    });
+    expect(waitForRetry).not.toHaveBeenCalled();
+    expect(provider.createSession).toHaveBeenCalledTimes(1);
+    expect(provider.endSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps provider retries inside the original supervision timeout budget', async () => {
+    let now = 10_000;
+    const provider = new FakeProvider([]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      now: () => now,
+      waitForRetry: async (delayMs) => { now += delayMs; },
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6',
+      timeoutMs: 300,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await expect(broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Implementation complete',
+    })).resolves.toMatchObject({
+      decision: 'ask_human',
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: { attempts: 2 },
+    });
+    expect(provider.createSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('cleans attempt listeners when provider.send throws before emitting an event', async () => {
+    class ThrowThenRecoverProvider extends FakeProvider {
+      private attempts = 0;
+
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        this.attempts += 1;
+        if (this.attempts === 1) {
+          throw Object.assign(new Error('temporary send failure'), {
+            code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+            recoverable: true,
+          });
+        }
+        this.emitNext(sessionId);
+      });
+
+      listenerCounts(): { complete: number; error: number } {
+        return { complete: this.completeHandlers.size, error: this.errorHandlers.size };
+      }
+    }
+
+    const provider = new ThrowThenRecoverProvider([
+      '{"decision":"complete","reason":"recovered","confidence":0.9}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      waitForRetry: async () => {},
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await expect(broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Implementation complete',
+    })).resolves.toMatchObject({ decision: 'complete' });
+    expect(provider.listenerCounts()).toEqual({ complete: 0, error: 0 });
   });
 
   describe('custom instructions merge (end-to-end through broker)', () => {
