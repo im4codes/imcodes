@@ -15,6 +15,12 @@ vi.unmock('../../src/store/session-store.js');
 let tempDir: string;
 
 async function importSessionStore() {
+  // Coverage runs reuse workers across files that install partial mocks of
+  // session-store. The hoisted unmock above protects initial collection, while
+  // this runtime unmock protects every import after vi.resetModules(). Both are
+  // required: a later worker-local mock registration must not turn a reload
+  // into another test's partial module shape.
+  vi.doUnmock('../../src/store/session-store.js');
   return import('../../src/store/session-store.js');
 }
 
@@ -30,6 +36,17 @@ afterEach(() => {
 });
 
 describe('session-store', () => {
+  it('reloads the real store after a worker-local partial mock registration', async () => {
+    vi.doMock('../../src/store/session-store.js', () => ({
+      listSessions: vi.fn(() => []),
+    }));
+    vi.resetModules();
+
+    const sessionStore = await importSessionStore();
+    expect(sessionStore.loadStore).toBeTypeOf('function');
+    expect(sessionStore.flushStore).toBeTypeOf('function');
+  });
+
   it('starts with empty store', async () => {
     const { listSessions } = await importSessionStore();
     const sessions = listSessions();
