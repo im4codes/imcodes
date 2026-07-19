@@ -489,6 +489,75 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('keeps MiniMax message_start cache usage when reconciling the live context total', async () => {
+    sdkMock.setNextContextUsage({ totalTokens: 452_797 });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-live-cache', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'msg-live-cache',
+            usage: {
+              input_tokens: 4_930,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 447_867,
+              output_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-live-cache',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-live-cache',
+      cwd: '/tmp/project',
+      resumeId: 'session-live-cache',
+      agentId: 'MiniMax-M3',
+    });
+
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-live-cache', 'hello');
+    await flush();
+
+    expect(usageUpdates.at(-1)).toEqual({
+      messageId: 'msg-live-cache',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 4_930,
+        cache_read_input_tokens: 447_867,
+        output_tokens: 0,
+      },
+    });
+  });
+
   it('falls back to completing from result when the SDK iterator never closes', async () => {
     vi.useFakeTimers();
     sdkMock.setWaitForClose(true);

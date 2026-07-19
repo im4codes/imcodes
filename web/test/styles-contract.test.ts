@@ -130,8 +130,8 @@ describe('styles.css regression contracts', () => {
     const fillRule = css.match(/\.session-ctx-input,\s*[\s\S]*?\.subsession-card-ctx-fill\s*\{[^}]*\}/);
     expect(fillRule).not.toBeNull();
     expect(fillRule![0]).toMatch(/repeating-linear-gradient\(135deg/);
-    expect(fillRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
-    expect(fillRule![0]).toMatch(/left\s+0\.32s/);
+    expect(fillRule![0]).toMatch(/transition:\s*width\s+0\.58s/);
+    expect(fillRule![0]).toMatch(/left\s+0\.58s/);
     expect(fillRule![0]).not.toMatch(/animation\s*:/);
 
     const cacheRule = css.match(/\.session-ctx-cache,\s*[\s\S]*?\.subcard-ctx-cache\s*\{[^}]*\}/);
@@ -139,11 +139,12 @@ describe('styles.css regression contracts', () => {
     expect(cacheRule![0]).toMatch(/#c084fc/);
     expect(cacheRule![0]).toMatch(/#a855f7/);
     expect(cacheRule![0]).toMatch(/rgba\(168,\s*85,\s*247,\s*0\.56\)/);
-    expect(cacheRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
+    expect(cacheRule![0]).toMatch(/transition:\s*width\s+0\.58s/);
 
     expect(css).toMatch(/\.session-usage-footer \.session-ctx-bar\.is-burning/);
     expect(css).toMatch(/\.session-ctx-burn\s*\{[\s\S]*?overflow:\s*hidden/);
     expect(css).toMatch(/\.session-ctx-burn::after\s*\{[\s\S]*?animation:\s*ctx-burn-sparks\s+0\.78s/);
+    expect(css).toMatch(/\.session-ctx-burn-edge\s*\{[\s\S]*?animation:\s*ctx-burn-edge\s+1\.2s/);
   });
 
   it('transport stop shortcut stays left while meta header controls stay right', () => {

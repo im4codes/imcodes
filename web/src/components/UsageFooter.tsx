@@ -157,9 +157,13 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       { preferExplicit: isAuthoritativeUsageContextWindowSource(usage.contextWindowSource) },
     );
     const total = usage.inputTokens + usage.cacheTokens;
-    const totalPct = Math.min(100, total / ctx * 100);
-    const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
-    const newPct = totalPct - cachePct;
+    // Keep style percentages stable across rerenders. Raw floating-point
+    // subtraction can produce values such as 0.506299999999996%, which makes
+    // tiny live ctx changes harder to inspect and needlessly dirties the DOM.
+    const roundPct = (value: number) => Math.round(value * 10_000) / 10_000;
+    const totalPct = roundPct(Math.min(100, total / ctx * 100));
+    const cachePct = roundPct(Math.min(totalPct, usage.cacheTokens / ctx * 100));
+    const newPct = roundPct(Math.max(0, totalPct - cachePct));
     const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
     const tip = [
       displayModel ?? '',
@@ -195,7 +199,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (!previousSignature || previousSignature === signature) return;
 
     setCtxBurning(true);
-    const timeoutId = window.setTimeout(() => setCtxBurning(false), 780);
+    const timeoutId = window.setTimeout(() => setCtxBurning(false), 1_200);
     return () => window.clearTimeout(timeoutId);
   }, [cachePct, ctx, hasContextInfo, newPct, total]);
 
@@ -262,7 +266,22 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-          {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
+          {ctxBurning && (
+            <>
+              <span
+                key={`burn:${total}:${ctx}`}
+                class="session-ctx-burn"
+                style={{ width: `${totalPct}%` }}
+                aria-hidden="true"
+              />
+              <span
+                key={`edge:${total}:${ctx}`}
+                class="session-ctx-burn-edge"
+                style={{ left: `${totalPct}%` }}
+                aria-hidden="true"
+              />
+            </>
+          )}
         </div>
       )}
       {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt || isCodexSession) && (

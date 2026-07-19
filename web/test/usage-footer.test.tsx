@@ -204,8 +204,39 @@ describe('UsageFooter', () => {
       expect(container.querySelector('.session-ctx-bar')?.className).toContain('is-burning');
     });
     const burn = container.querySelector('.session-ctx-burn') as HTMLElement | null;
+    const edge = container.querySelector('.session-ctx-burn-edge') as HTMLElement | null;
     expect(burn).toBeTruthy();
     expect(burn?.style.width).toBe('0.8%');
+    expect(edge).toBeTruthy();
+    expect(edge?.style.left).toBe('0.8%');
+  });
+
+  it('moves the MiniMax ctx endpoint and cache segment from live stream usage', async () => {
+    const usage = (inputTokens: number, cacheTokens: number) => ({
+      inputTokens,
+      cacheTokens,
+      contextWindow: 1_000_000,
+      contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PRESET,
+      model: 'MiniMax-M3',
+    });
+    const { container, rerender } = render(
+      <UsageFooter usage={usage(437_967, 0)} sessionName="deck_sub_minimax" />,
+    );
+
+    const input = () => container.querySelector('.session-ctx-input') as HTMLElement | null;
+    const cache = () => container.querySelector('.session-ctx-cache') as HTMLElement | null;
+    expect(input()?.style.width).toBe('43.7967%');
+    expect(cache()?.style.width).toBe('0%');
+
+    // Real MiniMax stream fixture: 5,063 uncached + 452,608 cache-read tokens.
+    rerender(<UsageFooter usage={usage(5_063, 452_608)} sessionName="deck_sub_minimax" />);
+
+    await waitFor(() => {
+      expect(cache()?.style.width).toBe('45.2608%');
+      expect(input()?.style.width).toBe('0.5063%');
+      expect(input()?.style.left).toBe('45.2608%');
+      expect((container.querySelector('.session-ctx-burn-edge') as HTMLElement | null)?.style.left).toBe('45.7671%');
+    });
   });
 
   it('keeps the robot status visible for idle or unknown agent states', () => {

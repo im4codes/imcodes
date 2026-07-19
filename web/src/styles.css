@@ -3528,7 +3528,7 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow:
     inset 0 1px 0 rgba(255,255,255,0.22),
     0 0 14px rgba(34,211,238,0.45);
-  transition: width 0.32s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.32s cubic-bezier(0.22, 0.72, 0.22, 1);
+  transition: width 0.58s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.58s cubic-bezier(0.22, 0.72, 0.22, 1);
   z-index: 2;
 }
 .subcard-ctx-input,
@@ -3551,7 +3551,7 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow:
     inset 0 1px 0 rgba(255,255,255,0.24),
     0 0 14px rgba(168,85,247,0.56);
-  transition: width 0.32s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.32s cubic-bezier(0.22, 0.72, 0.22, 1);
+  transition: width 0.58s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.58s cubic-bezier(0.22, 0.72, 0.22, 1);
   z-index: 1;
 }
 .session-usage-footer .session-ctx-bar.is-burning {
@@ -3603,6 +3603,22 @@ html.native-ios-mac .chat-dl-btn {
   filter: drop-shadow(0 0 5px rgba(251,146,60,0.62)) drop-shadow(0 0 8px rgba(34,211,238,0.34));
   animation: ctx-burn-sparks 0.78s ease-out both;
 }
+.session-ctx-burn-edge {
+  position: absolute;
+  top: 50%;
+  width: 5px;
+  height: 16px;
+  z-index: 7;
+  pointer-events: none;
+  border-radius: 999px;
+  background: #fef3c7;
+  box-shadow:
+    0 0 5px rgba(255,255,255,0.96),
+    0 0 11px rgba(251,191,36,0.92),
+    0 0 17px rgba(34,211,238,0.72);
+  transform: translate(-50%, -50%);
+  animation: ctx-burn-edge 1.2s ease-out both;
+}
 @keyframes ctx-energy-scan {
   0% { opacity: 0; transform: translateX(-18%); }
   18% { opacity: 0.95; }
@@ -3615,9 +3631,16 @@ html.native-ios-mac .chat-dl-btn {
   46% { opacity: 0.86; }
   100% { opacity: 0; transform: translateY(-5px) scaleX(1.02); }
 }
+@keyframes ctx-burn-edge {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.55); }
+  18% { opacity: 1; transform: translate(-50%, -50%) scale(1.28); }
+  58% { opacity: 0.88; transform: translate(-50%, -50%) scale(0.92); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(0.72); }
+}
 @media (prefers-reduced-motion: reduce) {
   .session-ctx-burn::before,
-  .session-ctx-burn::after {
+  .session-ctx-burn::after,
+  .session-ctx-burn-edge {
     animation: none;
     opacity: 0;
   }

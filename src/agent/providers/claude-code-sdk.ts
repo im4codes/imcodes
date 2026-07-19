@@ -1103,6 +1103,18 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // correct text when the message completes — visible flicker/bleed.
         state.currentText = '';
         state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        // Anthropic-compatible streaming responses publish the authoritative
+        // prompt-cache split on message_start. MiniMax follows that contract,
+        // while its trailing Claude Agent SDK result frame can contain an
+        // all-zero usage object. Capture the raw stream usage before asking the
+        // SDK control channel for the total-context fallback; otherwise the UI
+        // can track total ctx growth but permanently lose cache_read tokens.
+        this.recordClaudeUsage(
+          sessionId,
+          state,
+          event.message?.usage,
+          state.currentMessageId ?? undefined,
+        );
         this.refreshClaudeContextUsage(sessionId, state, turnGeneration);
         return;
       }
@@ -1438,8 +1450,20 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (state.turnGeneration !== turnGeneration || state.contextUsageRequestSerial !== requestSerial) return;
       const totalTokens = contextUsage?.totalTokens;
       if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) return;
+      const roundedTotal = Math.round(totalTokens);
+      // getContextUsage() reports only the aggregate context occupancy. Preserve
+      // the cache composition already received from message_start and reconcile
+      // the uncached input remainder so input + cache_creation + cache_read is
+      // still exactly the live total. Never fabricate cache data when the
+      // stream did not provide it.
+      const previousCacheRead = Math.max(0, Math.round(state.lastAssistantUsage?.cache_read_input_tokens ?? 0));
+      const cacheRead = Math.min(previousCacheRead, roundedTotal);
+      const previousCacheCreation = Math.max(0, Math.round(state.lastAssistantUsage?.cache_creation_input_tokens ?? 0));
+      const cacheCreation = Math.min(previousCacheCreation, roundedTotal - cacheRead);
       this.recordClaudeUsage(sessionId, state, {
-        input_tokens: Math.round(totalTokens),
+        input_tokens: roundedTotal - cacheRead - cacheCreation,
+        ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead } : {}),
+        ...(cacheCreation > 0 ? { cache_creation_input_tokens: cacheCreation } : {}),
         output_tokens: state.lastAssistantUsage?.output_tokens ?? 0,
       }, messageId ?? undefined);
     }).catch((err) => {
