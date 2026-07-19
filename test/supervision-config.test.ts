@@ -11,6 +11,7 @@ import {
   SUPERVISION_DEFAULT_PROMPT_VERSION,
   SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   DEFAULT_SUPERVISION_TIMEOUT_MS,
+  SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   TASK_RUN_STATUS_MARKERS,
@@ -30,8 +31,9 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
-  it('uses 12 seconds as the default supervision timeout (design.md §5)', () => {
-    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(12_000);
+  it('uses 30 seconds as both the default and minimum supervision timeout', () => {
+    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(30_000);
+    expect(SUPERVISION_MIN_TIMEOUT_MS).toBe(30_000);
   });
 
   it('normalizes supervisor defaults with backend inference and defaults', () => {
@@ -57,8 +59,23 @@ describe('supervision config helpers', () => {
 
     expect(config.backend).toBe('qwen');
     expect(config.model).toBe('qwen3-coder-plus');
-    expect(config.timeoutMs).toBe(15_000);
+    expect(config.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
     expect(config.promptVersion).toBe('custom_prompt_v1');
+  });
+
+  it('upgrades legacy positive timeouts to the 30-second minimum without invalidating the snapshot', () => {
+    const transportConfig = {
+      supervision: {
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      },
+    };
+
+    expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(false);
+    expect(extractSessionSupervisionSnapshot(transportConfig)?.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
   });
 
   it('normalizes a peer-audit snapshot and omits the deprecated audit pipeline', () => {
@@ -84,7 +101,7 @@ describe('supervision config helpers', () => {
     expect(snapshot.mode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
     expect(snapshot.backend).toBe('claude-code-sdk');
     expect(snapshot.model).toBe(DEFAULT_PRIMARY_CONTEXT_MODEL);
-    expect(snapshot.timeoutMs).toBe(8_000);
+    expect(snapshot.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
     expect(snapshot.promptVersion).toBe(SUPERVISION_CONTRACT_IDS.DECISION_REPAIR);
     expect(snapshot.customInstructions).toBe('Prefer tests before complete.');
     expect(snapshot.maxParseRetries).toBe(2);
@@ -130,7 +147,7 @@ describe('supervision config helpers', () => {
       mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
       backend: 'codex-sdk',
       model: CODEX_MODEL_IDS[0],
-      timeoutMs: 12_000,
+      timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
       promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
       maxParseRetries: 1,
       maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
@@ -143,7 +160,7 @@ describe('supervision config helpers', () => {
       mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
       backend: 'codex-sdk',
       model: CODEX_MODEL_IDS[0],
-      timeoutMs: 12_000,
+      timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
       promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
     } })).toBe(true);
   });

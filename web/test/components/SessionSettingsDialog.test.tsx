@@ -533,7 +533,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
 
     changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    expect(screen.getAllByDisplayValue('18').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByDisplayValue('30').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('4').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('9').length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
@@ -545,7 +545,7 @@ describe('SessionSettingsDialog supervision', () => {
             mode: 'supervised',
             backend: 'codex-sdk',
             model: CODEX_MODEL_IDS[0],
-            timeoutMs: 18_000,
+            timeoutMs: 30_000,
           }),
         }),
       }));
@@ -590,7 +590,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
     expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
-    expect(screen.getByText('summaryTimeout:9 s')).toBeDefined();
+    expect(screen.getByText('summaryTimeout:30 s')).toBeDefined();
     expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
     expect(screen.getByText('summaryAudit:summaryUnset:3')).toBeDefined();
@@ -1109,7 +1109,10 @@ describe('SessionSettingsDialog supervision', () => {
 
     changeSelect(screen.getAllByRole('combobox')[1]!, 'claude-code-sdk');
     changeSelect(screen.getAllByRole('combobox')[2]!, CLAUDE_CODE_MODEL_IDS[0]);
-    fireEvent.input(screen.getByDisplayValue('12'), { target: { value: '30' } });
+    const timeoutInput = screen.getByDisplayValue('30');
+    expect(timeoutInput.getAttribute('min')).toBe('30');
+    fireEvent.input(timeoutInput, { target: { value: '5' } });
+    expect(screen.getByDisplayValue('30')).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {

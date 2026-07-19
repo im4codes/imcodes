@@ -717,7 +717,7 @@ describe('SupervisionBroker', () => {
       mode: SUPERVISION_MODE.SUPERVISED,
       backend: 'codex-sdk',
       model: 'gpt-5.3-codex-spark',
-      timeoutMs: 10,
+      timeoutMs: 30_000,
       promptVersion: 'supervision_decision_v1',
       maxParseRetries: 1,
       auditMode: 'audit',
@@ -732,13 +732,44 @@ describe('SupervisionBroker', () => {
       cwd: '/tmp/project',
       description: 'test session',
     });
-    await vi.advanceTimersByTimeAsync(25);
+    await vi.advanceTimersByTimeAsync(30_025);
     const result = await promise;
 
     expect(result.decision).toBe('ask_human');
     expect(result.reason).toMatch(/timeout/i);
     expect(result.unavailableReason).toBe(SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT);
     expect(provider.cancel).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it('defensively enforces the 30-second minimum for an unnormalized snapshot', async () => {
+    vi.useFakeTimers();
+    class DelayedProvider extends FakeProvider {
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        setTimeout(() => this.emitNext(sessionId), 20);
+      });
+    }
+    const provider = new DelayedProvider([
+      '{"decision":"complete","reason":"within minimum budget","confidence":0.8}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = {
+      ...normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: 'gpt-5.6',
+      }),
+      timeoutMs: 10,
+    };
+
+    const promise = broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Implementation complete',
+    });
+    await vi.advanceTimersByTimeAsync(20);
+
+    await expect(promise).resolves.toMatchObject({ decision: 'complete' });
     vi.useRealTimers();
   });
 
@@ -761,7 +792,7 @@ describe('SupervisionBroker', () => {
           for (const cb of this.completeHandlers) {
             cb(sessionId, message);
           }
-        }, 20);
+        }, 29_996);
       });
     }
 
@@ -776,7 +807,7 @@ describe('SupervisionBroker', () => {
       mode: SUPERVISION_MODE.SUPERVISED,
       backend: 'codex-sdk',
       model: 'gpt-5.3-codex-spark',
-      timeoutMs: 25,
+      timeoutMs: 30_000,
       promptVersion: 'supervision_decision_v1',
       maxParseRetries: 1,
       auditMode: 'audit',
@@ -786,7 +817,7 @@ describe('SupervisionBroker', () => {
 
     const first = broker.decide({ snapshot, taskRequest: 'first', assistantResponse: 'first reply' });
     const second = broker.decide({ snapshot, taskRequest: 'second', assistantResponse: 'second reply' });
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(40_000);
 
     await expect(first).resolves.toMatchObject({ decision: 'complete' });
     await expect(second).resolves.toMatchObject({
@@ -942,13 +973,13 @@ describe('SupervisionBroker', () => {
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
       now: () => now,
-      waitForRetry: async (delayMs) => { now += delayMs; },
+      waitForRetry: async () => { now += 29_750; },
     });
     const snapshot = normalizeSessionSupervisionSnapshot({
       mode: SUPERVISION_MODE.SUPERVISED,
       backend: 'codex-sdk',
       model: 'gpt-5.6',
-      timeoutMs: 300,
+      timeoutMs: 30_000,
       promptVersion: 'supervision_decision_v1',
       maxParseRetries: 1,
       auditMode: 'audit',

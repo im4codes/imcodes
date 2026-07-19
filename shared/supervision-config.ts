@@ -58,9 +58,12 @@ const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
 // no longer promoted as default Team/P2P combo presets.
 export const SUPERVISION_AUDIT_MODES = SUPERVISION_AUDIT_MODE_ALLOWLIST;
 
-// Default supervisor timeout aligns with design.md §5 (12_000 ms). Queue wait time
-// counts against the same budget, so this must stay conservative.
-export const SUPERVISION_DEFAULT_TIMEOUT_MS = 12_000;
+// Supervisor decisions include queueing, provider startup, bounded provider
+// retries, and structured-output repair in one shared budget. Keep both the
+// default and the normalized minimum at 30 seconds so a transient startup does
+// not consume nearly the whole decision window.
+export const SUPERVISION_MIN_TIMEOUT_MS = 30_000;
+export const SUPERVISION_DEFAULT_TIMEOUT_MS = SUPERVISION_MIN_TIMEOUT_MS;
 export const SUPERVISION_DEFAULT_MAX_PARSE_RETRIES = 1;
 export const SUPERVISION_DEFAULT_AUDIT_MODE: SupervisionAuditMode = 'audit';
 export const SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS = 2;
@@ -276,7 +279,11 @@ export function normalizeSupervisorDefaultConfig(
   return {
     backend: normalizedBackend,
     model,
-    timeoutMs: normalizePositiveInteger(merged.timeoutMs, SUPERVISION_DEFAULT_TIMEOUT_MS, 1),
+    timeoutMs: normalizePositiveInteger(
+      merged.timeoutMs,
+      SUPERVISION_DEFAULT_TIMEOUT_MS,
+      SUPERVISION_MIN_TIMEOUT_MS,
+    ),
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
     maxAutoContinueStreak: normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK),
     maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
@@ -347,6 +354,8 @@ export function getSessionSupervisionSnapshotIssues(
     issues.push('invalid_model');
   }
 
+  // Keep legacy positive values readable; normalization upgrades them to the
+  // current minimum before any supervisor decision runs.
   if (typeof record.timeoutMs !== 'number' || !Number.isFinite(record.timeoutMs) || record.timeoutMs <= 0) {
     issues.push('invalid_timeout');
   }

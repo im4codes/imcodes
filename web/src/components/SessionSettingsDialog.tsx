@@ -29,6 +29,7 @@ import {
   SUPERVISION_PROMPT_VERSION,
   SUPERVISION_REPAIR_PROMPT_VERSION,
   SUPERVISION_MODES,
+  SUPERVISION_MIN_TIMEOUT_MS,
   TASK_RUN_PROMPT_VERSION,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
@@ -211,14 +212,14 @@ type CcPresetSummary = {
 };
 
 function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
-  const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
-    ? timeoutMs
+  const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)
+    ? Math.max(timeoutMs, SUPERVISION_MIN_TIMEOUT_MS)
     : DEFAULT_SUPERVISION_TIMEOUT_MS;
-  return Math.max(1, Math.round(safeMs / 1000));
+  return Math.round(safeMs / 1000);
 }
 
 function timeoutUiSecondsToMs(seconds: number): number {
-  return Math.max(1, Math.round(seconds)) * 1000;
+  return Math.max(SUPERVISION_MIN_TIMEOUT_MS, Math.round(seconds) * 1000);
 }
 
 function labelForBackend(t: (key: string, params?: Record<string, unknown>) => string, backend: SharedContextRuntimeBackend): string {
@@ -583,12 +584,16 @@ function SupervisionRuntimeFields({
         <input
           class="input"
           type="number"
-          min={1}
+          min={SUPERVISION_MIN_TIMEOUT_MS / 1000}
           step={1}
           value={String(timeoutSeconds)}
           onInput={(e) => {
             const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-            onTimeoutChange(Number.isFinite(value) && value > 0 ? value : timeoutSeconds);
+            onTimeoutChange(
+              Number.isFinite(value)
+                ? Math.max(value, SUPERVISION_MIN_TIMEOUT_MS / 1000)
+                : timeoutSeconds,
+            );
           }}
           style={{ width: '100%' }}
           disabled={saving}
@@ -1105,7 +1110,7 @@ export function SessionSettingsDialog({
     if (!supervisorDefaultsBackend) return false;
     if (!supervisorDefaultsModel.trim()) return false;
     if (supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim(), supervisorDefaultsPreset.trim() || undefined)) return false;
-    if (supervisorDefaultsTimeout <= 0) return false;
+    if (supervisorDefaultsTimeout < SUPERVISION_MIN_TIMEOUT_MS) return false;
     return true;
   }, [isSupportedTransport, supervisorDefaultsBackend, supervisorDefaultsModel, supervisorDefaultsPreset, supervisorDefaultsTimeout]);
 

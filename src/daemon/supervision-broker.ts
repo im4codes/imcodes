@@ -9,6 +9,7 @@ import type { SharedContextRuntimeBackend } from '../../shared/context-types.js'
 import {
   parseTaskRunTerminalStateFromText,
   SUPERVISION_DEFAULT_TIMEOUT_MS,
+  SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   type SessionSupervisionSnapshot,
@@ -374,7 +375,10 @@ export class SupervisionBroker {
     }
 
     const startedAt = this.now();
-    const timeoutMs = snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS;
+    const timeoutMs = Math.max(
+      snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS,
+      SUPERVISION_MIN_TIMEOUT_MS,
+    );
     const key = `${snapshot.backend}:${snapshot.model}:${snapshot.preset ?? ''}`;
     const previous = this.queueChains.get(key) ?? Promise.resolve();
     let release!: () => void;

@@ -50,7 +50,7 @@ describe('supervision API helpers', () => {
     await expect(fetchSupervisorDefaults()).resolves.toEqual({
       backend: 'codex-sdk',
       model: CODEX_MODEL_IDS[0],
-      timeoutMs: 20_000,
+      timeoutMs: 30_000,
       promptVersion: 'custom_prompt_v1',
       maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
       maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
@@ -73,7 +73,7 @@ describe('supervision API helpers', () => {
     })).resolves.toEqual({
       backend: 'qwen',
       model: 'qwen3-coder-plus',
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
       promptVersion: 'supervision_decision_v1',
       maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
       maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
@@ -87,7 +87,7 @@ describe('supervision API helpers', () => {
           value: {
             backend: 'qwen',
             model: 'qwen3-coder-plus',
-            timeoutMs: 15_000,
+            timeoutMs: 30_000,
             promptVersion: 'supervision_decision_v1',
             maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
             maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
