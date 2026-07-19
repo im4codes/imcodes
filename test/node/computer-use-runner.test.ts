@@ -9,6 +9,7 @@ import {
   captureBrowserViewportForTest,
   isFastWindowsCoordinatePointerActionForTest,
   normalizeBrowserUserAgent,
+  normalizeComputerUseErrorForTest,
   normalizeOpenComputerUseParsedResult,
   openComputerUseCallArgs,
   openComputerUseCandidateBinariesForTest,
@@ -148,6 +149,27 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(browserExecutableCandidatesForTest({}, 'linux')).toEqual(expect.arrayContaining(['google-chrome', 'chromium', 'microsoft-edge']));
     expect(browserExecutableCandidatesForTest({ channel: 'chromium' }, 'linux')).toEqual(expect.arrayContaining(['chromium-browser', 'chromium']));
     expect(browserExecutableCandidatesForTest({ channel: 'chromium' }, 'linux')).not.toContain('google-chrome');
+  });
+
+  it('turns a missing browser executable into an actionable install prompt without mentioning OCU', () => {
+    const result = normalizeComputerUseErrorForTest('browser_open', 'browser_executable_not_found', 'linux');
+    expect(result).toEqual({
+      error: 'No supported browser is installed on this machine. Install Google Chrome, Chromium, or Microsoft Edge, then retry the browser request.',
+      truncated: false,
+    });
+    expect(result.error).not.toMatch(/OCU|Open Computer Use|AT-SPI/i);
+  });
+
+  it('hides Linux AT-SPI tracebacks behind a desktop-specific prerequisite message', () => {
+    const result = normalizeComputerUseErrorForTest(
+      'list_apps',
+      'Linux runtime failed:\nTraceback...\nValueError: Namespace Atspi not available',
+      'linux',
+    );
+    expect(result.error).toContain('Desktop app control is unavailable');
+    expect(result.error).toContain('Browser automation is separate');
+    expect(result.error).toContain('install Google Chrome, Chromium, or Microsoft Edge');
+    expect(result.error).not.toContain('Traceback');
   });
 
   it('uses Linux-safe headless browser launch defaults without forcing headless on desktop platforms', () => {

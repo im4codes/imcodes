@@ -793,8 +793,35 @@ export async function normalizeOpenComputerUseParsedResult(
   return { content, truncated, isError };
 }
 
-function normalizeError(message: string): { error: string; truncated: boolean } {
+function actionableComputerUseError(
+  tool: string,
+  message: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   const text = message.trim() || 'computer use tool failed';
+  if (isBrowserUseTool(tool) && text.includes('browser_executable_not_found')) {
+    return 'No supported browser is installed on this machine. Install Google Chrome, Chromium, or Microsoft Edge, then retry the browser request.';
+  }
+  if (platform === 'linux' && /Namespace Atspi not available|No module named ['"]pyatspi['"]/.test(text)) {
+    return 'Desktop app control is unavailable because this Linux host is missing AT-SPI accessibility support or a graphical desktop session. Browser automation is separate: install Google Chrome, Chromium, or Microsoft Edge and use a browser_* tool.';
+  }
+  return text;
+}
+
+export function normalizeComputerUseErrorForTest(
+  tool: string,
+  message: string,
+  platform: NodeJS.Platform = process.platform,
+): { error: string; truncated: boolean } {
+  return normalizeError(message, tool, platform);
+}
+
+function normalizeError(
+  message: string,
+  tool = '',
+  platform: NodeJS.Platform = process.platform,
+): { error: string; truncated: boolean } {
+  const text = actionableComputerUseError(tool, message, platform);
   const cut = truncateUtf8(text, COMPUTER_USE_MAX_ERROR_BYTES);
   return { error: cut.value || 'computer use tool failed', truncated: cut.truncated };
 }
@@ -1570,7 +1597,7 @@ async function runBrowserUseTool(request: ComputerUseRequest, timeoutMs: number,
       ...(result.truncated ? { truncated: true } : {}),
     };
   } catch (error) {
-    const normalized = normalizeError(error instanceof Error ? error.message : String(error));
+    const normalized = normalizeError(error instanceof Error ? error.message : String(error), request.tool);
     return {
       correlationId: request.correlationId,
       ok: false,
@@ -1689,7 +1716,7 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
       const durationMs = Date.now() - started;
       try { parsed = JSON.parse(proc.stdout); } catch {
         if (proc.error) {
-          const normalized = normalizeError(proc.stderr || proc.error);
+          const normalized = normalizeError(proc.stderr || proc.error, request.tool);
           return {
             correlationId: request.correlationId,
             ok: false,
@@ -1701,7 +1728,7 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
             ...(normalized.truncated ? { truncated: true } : {}),
           };
         }
-        const normalized = normalizeError(proc.stderr || proc.stdout || 'computer use tool returned non-json output');
+        const normalized = normalizeError(proc.stderr || proc.stdout || 'computer use tool returned non-json output', request.tool);
         return {
           correlationId: request.correlationId,
           ok: false,
@@ -1718,12 +1745,15 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
     const normalizedResult = await normalizeOpenComputerUseParsedResult(request.tool, argsObject, parsed);
     if (normalizedResult.isError) {
       const text = normalizedResult.content.find((item) => item.type === 'text')?.text ?? 'computer use tool failed';
-      const normalized = normalizeError(text);
+      const normalized = normalizeError(text, request.tool);
+      const content = normalizedResult.content.some((item) => item.type === 'text')
+        ? normalizedResult.content.map((item) => item.type === 'text' ? { ...item, text: normalized.error } : item)
+        : [{ type: 'text' as const, text: normalized.error }, ...normalizedResult.content];
       return {
         correlationId: request.correlationId,
         ok: false,
         tool: request.tool,
-        content: normalizedResult.content,
+        content,
         durationMs,
         error: normalized.error,
         ...(normalizedResult.truncated || normalized.truncated ? { truncated: true } : {}),
@@ -1738,7 +1768,7 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
       ...(normalizedResult.truncated ? { truncated: true } : {}),
     };
   } catch (error) {
-    const normalized = normalizeError(error instanceof Error ? error.message : String(error));
+    const normalized = normalizeError(error instanceof Error ? error.message : String(error), request.tool);
     return {
       correlationId: request.correlationId,
       ok: false,
