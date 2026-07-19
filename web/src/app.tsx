@@ -71,7 +71,7 @@ import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
-import { isPlausibleUsagePayload } from './usage-data.js';
+import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
@@ -3186,8 +3186,8 @@ export function App() {
             }
           }
           // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
-          if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
-            const payload = event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+          if (event.sessionId.startsWith('deck_sub_')) {
+            const payload = event.payload as { inputTokens?: number; cacheTokens?: number; contextWindow?: number; contextWindowSource?: UsageContextWindowSource; model?: string };
             const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === event.sessionId);
             const detectedModel = detectedModelsRef.current.get(event.sessionId);
             const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, payload.model);
@@ -3201,8 +3201,10 @@ export function App() {
               ? { ...payload, model: effectiveModel }
               : payload;
             setSubUsages((prev) => {
+              const merged = mergeUsageUpdate(prev.get(event.sessionId), displayPayload as Record<string, unknown>);
+              if (!merged) return prev;
               const next = new Map(prev);
-              next.set(event.sessionId, displayPayload);
+              next.set(event.sessionId, merged);
               return next;
             });
           }

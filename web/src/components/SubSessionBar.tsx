@@ -25,7 +25,7 @@ import { SharedStateIndicator } from './SharedStateIndicator.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES, type UsageContextWindowSource } from '@shared/usage-context-window.js';
+import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
 import {
   createSubSessionEntryGestureController,
@@ -222,7 +222,7 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
       usage.contextWindow,
       effectiveModel,
       1_000_000,
-      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+      { preferExplicit: isAuthoritativeUsageContextWindowSource(usage.contextWindowSource) },
     );
     ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
   }

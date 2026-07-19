@@ -607,6 +607,23 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
   });
 
+  it('uses a preset-sourced 1M window before model-family inference', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PRESET,
+          model: 'claude-haiku-4-5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 1M (10%)');
+  });
+
   it('honors Codex provider effective GPT-5.5 context window', () => {
     const { container } = render(
       <UsageFooter

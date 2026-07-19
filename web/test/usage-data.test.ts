@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractLatestUsage } from '../src/usage-data.js';
+import { extractLatestUsage, mergeUsageUpdate } from '../src/usage-data.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
 function makeEvent(payload: Record<string, unknown>): TimelineEvent {
@@ -92,6 +92,54 @@ describe('extractLatestUsage', () => {
       inputTokens: 12_000,
       cacheTokens: 700_000,
       contextWindow: 1_000_000,
+      model: 'MiniMax-M3',
+    });
+  });
+
+  it('applies a newer preset window to an older token snapshot', () => {
+    const usage = extractLatestUsage([
+      makeEvent({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        contextWindow: 200_000,
+        model: 'MiniMax-M3',
+      }),
+      makeEvent({
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+        model: 'MiniMax-M3',
+      }),
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 12_000,
+      cacheTokens: 700_000,
+      contextWindow: 1_000_000,
+      contextWindowSource: 'preset',
+      model: 'MiniMax-M3',
+    });
+  });
+
+  it('merges a live metadata-only preset update without losing current tokens', () => {
+    const usage = mergeUsageUpdate(
+      {
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        contextWindow: 200_000,
+        model: 'MiniMax-M3',
+      },
+      {
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+        model: 'MiniMax-M3',
+      },
+    );
+
+    expect(usage).toMatchObject({
+      inputTokens: 12_000,
+      cacheTokens: 700_000,
+      contextWindow: 1_000_000,
+      contextWindowSource: 'preset',
       model: 'MiniMax-M3',
     });
   });

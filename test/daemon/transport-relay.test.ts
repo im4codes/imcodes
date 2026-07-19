@@ -548,7 +548,72 @@ describe('transport-relay (timeline-emitter based)', () => {
         inputTokens: 12_000,
         cacheTokens: 700_000,
         contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
       });
+    });
+
+    it('keeps the configured preset window authoritative over model-family inference', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'LongContext',
+        presetContextWindow: 200_000,
+        activeModel: 'claude-haiku-4-5',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'claude-haiku-4-5',
+        usage: { input_tokens: 100_000, cache_read_input_tokens: 0 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 100_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+    });
+
+    it('reconciles a metadata-only preset completion with trailing result usage on one event id', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'MiniMax',
+        presetContextWindow: 200_000,
+        activeModel: 'MiniMax-M3',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireDelta, fireComplete, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-result-usage', delta: 'Done' }));
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-result-usage',
+        content: 'Done',
+        metadata: { model: 'MiniMax-M3' },
+      }));
+      fireUsage('sess-1', {
+        messageId: 'msg-result-usage',
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 14_000, cache_read_input_tokens: 710_000 },
+      });
+
+      const usageCalls = emitMock.mock.calls.filter(c => c[1] === 'usage.update');
+      expect(usageCalls).toHaveLength(2);
+      expect(usageCalls[0]?.[2]).toMatchObject({
+        model: 'MiniMax-M3',
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+      expect(usageCalls[1]?.[2]).toMatchObject({
+        inputTokens: 14_000,
+        cacheTokens: 710_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+      expect(usageCalls[0]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
+      expect(usageCalls[1]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
     });
 
     it('honors Codex SDK provider effective window for GPT-5.5', () => {

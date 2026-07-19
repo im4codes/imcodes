@@ -10,7 +10,7 @@ import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../co
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
@@ -154,7 +154,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       usage.contextWindow,
       displayModel,
       1_000_000,
-      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+      { preferExplicit: isAuthoritativeUsageContextWindowSource(usage.contextWindowSource) },
     );
     const total = usage.inputTokens + usage.cacheTokens;
     const totalPct = Math.min(100, total / ctx * 100);

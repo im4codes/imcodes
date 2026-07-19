@@ -1,5 +1,9 @@
 import type { CodexStatusSnapshot } from '@shared/codex-status.js';
-import { isUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
+import {
+  isAuthoritativeUsageContextWindowSource,
+  isUsageContextWindowSource,
+  type UsageContextWindowSource,
+} from '@shared/usage-context-window.js';
 import type { TimelineEvent } from './ws-client.js';
 import { resolveContextWindow } from './model-context.js';
 
@@ -32,7 +36,7 @@ export function isPlausibleUsagePayload(payload: Record<string, unknown>): boole
     payload.contextWindow,
     typeof payload.model === 'string' ? payload.model : undefined,
     1_000_000,
-    { preferExplicit: payload.contextWindowSource === 'provider' },
+    { preferExplicit: isAuthoritativeUsageContextWindowSource(payload.contextWindowSource) },
   );
   const total = inputTokens + cacheTokens;
   // Provider context meters describe current prompt/window occupancy, not
@@ -43,8 +47,58 @@ export function isPlausibleUsagePayload(payload: Record<string, unknown>): boole
   return total <= contextWindow * MAX_CONTEXT_USAGE_OVERRUN_RATIO;
 }
 
+export function mergeUsageUpdate(
+  previous: UsageData | undefined,
+  payload: Record<string, unknown>,
+): UsageData | null {
+  const next: UsageData = previous
+    ? { ...previous }
+    : { inputTokens: 0, cacheTokens: 0, contextWindow: 0 };
+  let changed = false;
+
+  const hasTokenSnapshot = typeof payload.inputTokens === 'number';
+  const payloadIsPlausible = hasTokenSnapshot && isPlausibleUsagePayload(payload);
+  if (
+    typeof payload.contextWindow === 'number'
+    && Number.isFinite(payload.contextWindow)
+    && payload.contextWindow > 0
+    && (!hasTokenSnapshot || payloadIsPlausible)
+  ) {
+    next.contextWindow = payload.contextWindow;
+    next.contextWindowSource = isUsageContextWindowSource(payload.contextWindowSource)
+      ? payload.contextWindowSource
+      : undefined;
+    changed = true;
+  }
+  if (typeof payload.model === 'string' && payload.model) {
+    next.model = payload.model;
+    changed = true;
+  }
+  if (isCodexStatusSnapshot(payload.codexStatus)) {
+    next.codexStatus = payload.codexStatus;
+    changed = true;
+  }
+
+  const candidate = {
+    ...payload,
+    ...(next.contextWindow > 0 ? {
+      contextWindow: next.contextWindow,
+      ...(next.contextWindowSource ? { contextWindowSource: next.contextWindowSource } : {}),
+    } : {}),
+    ...(next.model ? { model: next.model } : {}),
+  };
+  if (isPlausibleUsagePayload(candidate)) {
+    next.inputTokens = payload.inputTokens as number;
+    next.cacheTokens = typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0;
+    changed = true;
+  }
+
+  return changed ? next : (previous ?? null);
+}
+
 export function extractLatestUsage(events: TimelineEvent[]): UsageData | null {
   let tokensFound = false;
+  let contextFound = false;
   let modelFound = false;
   let codexFound = false;
   const usage: UsageData = { inputTokens: 0, cacheTokens: 0, contextWindow: 0 };
@@ -54,25 +108,56 @@ export function extractLatestUsage(events: TimelineEvent[]): UsageData | null {
     if (event.type !== 'usage.update') continue;
     const payload = event.payload as Record<string, unknown>;
 
-    if (!tokensFound && isPlausibleUsagePayload(payload)) {
-      usage.inputTokens = payload.inputTokens as number;
-      usage.cacheTokens = typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0;
-      usage.contextWindow = typeof payload.contextWindow === 'number' ? payload.contextWindow : 0;
+    const hasTokenSnapshot = typeof payload.inputTokens === 'number';
+    const contextMetadataIsUsable = !hasTokenSnapshot || isPlausibleUsagePayload(payload);
+    if (
+      !contextFound
+      && contextMetadataIsUsable
+      && typeof payload.contextWindow === 'number'
+      && Number.isFinite(payload.contextWindow)
+      && payload.contextWindow > 0
+    ) {
+      usage.contextWindow = payload.contextWindow;
       if (isUsageContextWindowSource(payload.contextWindowSource)) {
         usage.contextWindowSource = payload.contextWindowSource;
       }
-      tokensFound = true;
+      contextFound = true;
     }
     if (!modelFound && typeof payload.model === 'string') {
       usage.model = payload.model;
       modelFound = true;
     }
+
+    // Claude-compatible SDKs can publish the authoritative preset/model window
+    // in a metadata-only completion and publish token occupancy in an earlier
+    // frame. Validate the older token snapshot against the newest metadata,
+    // rather than letting a stale launch-time 200k window hide a current 1M
+    // preset update.
+    const effectivePayload = {
+      ...payload,
+      ...(contextFound ? {
+        contextWindow: usage.contextWindow,
+        ...(usage.contextWindowSource ? { contextWindowSource: usage.contextWindowSource } : {}),
+      } : {}),
+      ...(modelFound && usage.model ? { model: usage.model } : {}),
+    };
+    if (!tokensFound && isPlausibleUsagePayload(effectivePayload)) {
+      usage.inputTokens = payload.inputTokens as number;
+      usage.cacheTokens = typeof payload.cacheTokens === 'number' ? payload.cacheTokens : 0;
+      if (!contextFound) {
+        usage.contextWindow = typeof payload.contextWindow === 'number' ? payload.contextWindow : 0;
+        if (isUsageContextWindowSource(payload.contextWindowSource)) {
+          usage.contextWindowSource = payload.contextWindowSource;
+        }
+      }
+      tokensFound = true;
+    }
     if (!codexFound && isCodexStatusSnapshot(payload.codexStatus)) {
       usage.codexStatus = payload.codexStatus;
       codexFound = true;
     }
-    if (tokensFound && modelFound && codexFound) break;
+    if (tokensFound && contextFound && modelFound && codexFound) break;
   }
 
-  return tokensFound || modelFound || codexFound ? usage : null;
+  return tokensFound || contextFound || modelFound || codexFound ? usage : null;
 }

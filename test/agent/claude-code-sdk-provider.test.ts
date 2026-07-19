@@ -360,6 +360,70 @@ describe('ClaudeCodeSdkProvider', () => {
     }]);
   });
 
+  it('reports result-only usage that trails a terminal stream delta', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-result-usage', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-result-usage' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-result-usage',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: {
+          input_tokens: 14_000,
+          cache_read_input_tokens: 710_000,
+          output_tokens: 90,
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-result-usage',
+      cwd: '/tmp/project',
+      resumeId: 'session-result-usage',
+      agentId: 'MiniMax-M3',
+    });
+
+    const completed: AgentMessage[] = [];
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-result-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(usageUpdates).toEqual([{
+      messageId: 'msg-result-usage',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 14_000,
+        cache_read_input_tokens: 710_000,
+        output_tokens: 90,
+      },
+    }]);
+  });
+
   it('falls back to completing from result when the SDK iterator never closes', async () => {
     vi.useFakeTimers();
     sdkMock.setWaitForClose(true);

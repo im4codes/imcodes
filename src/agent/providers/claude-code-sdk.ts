@@ -141,6 +141,7 @@ interface ClaudeSdkSessionState {
   started: boolean;
   resumeId: string;
   currentMessageId: string | null;
+  lastCompletedMessageId?: string;
   currentText: string;
   currentQuery: ReturnType<typeof query> | null;
   currentChild: ChildProcess | null;
@@ -252,6 +253,18 @@ interface ClaudeUsageSnapshot {
   output_tokens?: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+}
+
+function normalizeClaudeUsageSnapshot(value: unknown): ClaudeUsageSnapshot | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const usage = value as ClaudeUsageSnapshot;
+  const normalized: ClaudeUsageSnapshot = {
+    ...(typeof usage.input_tokens === 'number' ? { input_tokens: usage.input_tokens } : {}),
+    ...(typeof usage.output_tokens === 'number' ? { output_tokens: usage.output_tokens } : {}),
+    ...(typeof usage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}),
+    ...(typeof usage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: usage.cache_creation_input_tokens } : {}),
+  };
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
 interface ClaudeTaskUsageSnapshot {
@@ -670,6 +683,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.completed = false;
         state.currentMessageId = null;
         state.currentText = '';
+        this.resetClaudeTurnUsage(state);
         state.pendingComplete = undefined;
         state.pendingError = undefined;
         this.clearTaskNotificationWake(state);
@@ -712,10 +726,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   ): Promise<void> {
     state.currentText = '';
     state.currentMessageId = null;
+    this.resetClaudeTurnUsage(state);
     state.completed = false;
     state.cancelled = false;
     state.finalMetadata = undefined;
-    state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
     state.currentPayload = payload;
@@ -1171,20 +1185,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.currentMessageId = assistantMessageId;
       }
       const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
-      if (isTopLevelMessage && assistantUsage && typeof assistantUsage === 'object') {
-        const normalizedUsage: ClaudeUsageSnapshot = {
-          ...(typeof assistantUsage.input_tokens === 'number' ? { input_tokens: assistantUsage.input_tokens } : {}),
-          ...(typeof assistantUsage.output_tokens === 'number' ? { output_tokens: assistantUsage.output_tokens } : {}),
-          ...(typeof assistantUsage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: assistantUsage.cache_read_input_tokens } : {}),
-          ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
-        };
-        state.lastAssistantUsage = normalizedUsage;
-        const usageMessageId = assistantMessageId ?? state.currentMessageId ?? undefined;
-        for (const cb of this.usageCallbacks) cb(sessionId, {
-          ...(usageMessageId ? { messageId: usageMessageId } : {}),
-          usage: { ...normalizedUsage },
-          ...(state.model ? { model: state.model } : {}),
-        });
+      if (isTopLevelMessage) {
+        this.recordClaudeUsage(
+          sessionId,
+          state,
+          assistantUsage,
+          assistantMessageId ?? state.currentMessageId ?? undefined,
+        );
       }
       // includePartialMessages can emit message_delta(end_turn) and then flush
       // the matching full assistant frame. The stream boundary already emitted
@@ -1297,6 +1304,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // another completion. Failures for an active follow-up still flow through
       // below because send() resets completed=false before pushing its input.
       if (state.completed) {
+        // Some Claude-compatible endpoints emit a terminal message_delta and
+        // then put the only current-context usage snapshot on the trailing
+        // result frame (no full assistant frame). The terminal delta already
+        // completed the visible turn, but its usage is still authoritative for
+        // that same generation. Capture it before dropping the duplicate
+        // completion. A newly-started follow-up has completed=false, so a stale
+        // predecessor result cannot overwrite the new turn's usage.
+        if (!msg.is_error && !state.lastAssistantUsage) {
+          this.recordClaudeUsage(sessionId, state, msg.usage, state.lastCompletedMessageId);
+        }
         state.started = true;
         return;
       }
@@ -1357,6 +1374,27 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.armResultCompletionFallback(sessionId, state);
       return;
     }
+  }
+
+  private recordClaudeUsage(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    usage: unknown,
+    messageId?: string,
+  ): void {
+    const normalizedUsage = normalizeClaudeUsageSnapshot(usage);
+    if (!normalizedUsage) return;
+    state.lastAssistantUsage = normalizedUsage;
+    for (const cb of this.usageCallbacks) cb(sessionId, {
+      ...(messageId ? { messageId } : {}),
+      usage: { ...normalizedUsage },
+      ...(state.model ? { model: state.model } : {}),
+    });
+  }
+
+  private resetClaudeTurnUsage(state: ClaudeSdkSessionState): void {
+    state.lastAssistantUsage = undefined;
+    state.lastCompletedMessageId = undefined;
   }
 
   private armResultCompletionFallback(sessionId: string, state: ClaudeSdkSessionState): void {
@@ -1435,6 +1473,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         completionBoundary: 'assistant-terminal',
       },
     };
+    state.lastCompletedMessageId = completed.id;
     state.currentMessageId = null;
     state.currentText = '';
     if (!hasActiveSubagents) {
@@ -1570,6 +1609,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.completed = false;
     state.currentMessageId = null;
     state.currentText = '';
+    this.resetClaudeTurnUsage(state);
     state.pendingComplete = undefined;
     state.pendingError = undefined;
   }

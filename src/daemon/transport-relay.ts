@@ -308,11 +308,13 @@ function normalizeUsageUpdatePayload(
     explicitContextWindow ?? presetCtx,
     effectiveModel,
     1_000_000,
-    { preferExplicit: explicitContextWindow !== undefined },
+    { preferExplicit: explicitContextWindow !== undefined || presetCtx !== undefined },
   );
   const contextWindowSource = explicitContextWindow !== undefined && contextWindow === explicitContextWindow
     ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
-    : undefined;
+    : presetCtx !== undefined && contextWindow === presetCtx
+      ? USAGE_CONTEXT_WINDOW_SOURCES.PRESET
+      : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
