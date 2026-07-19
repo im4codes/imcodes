@@ -118,7 +118,7 @@ export interface SessionRecord extends SessionContextBootstrapState {
   description?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
   ccPreset?: string;
-  /** Context window override carried by a provider preset (e.g. MiniMax 200K). */
+  /** Context window override carried by a provider preset (for example MiniMax-M3 1M). */
   presetContextWindow?: number;
   /** Shell/script launch binary (e.g. "/bin/bash", "fish"). CONFIG, not identity —
    *  inherited by execution clones and synced to the server `sub_sessions.shell_bin`

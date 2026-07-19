@@ -38,6 +38,27 @@ export interface CcPreset {
   modelDiscoveryError?: string;
 }
 
+export const DEFAULT_CC_PRESET_CONTEXT_WINDOW = 1_000_000;
+const LEGACY_MINIMAX_M3_CONTEXT_WINDOW = 200_000;
+
+/**
+ * MiniMax-M3 presets created before the 1M default shipped were persisted with
+ * the old generic 200K value. Upgrade only that exact legacy/model pairing so
+ * other providers and deliberate custom limits remain untouched.
+ */
+export function normalizeCcPresetContextWindow(
+  contextWindow: number | undefined,
+  model: string | undefined,
+): number | undefined {
+  if (
+    contextWindow === LEGACY_MINIMAX_M3_CONTEXT_WINDOW
+    && /^minimax-m3(?:$|[-_.])/i.test(model?.trim() ?? '')
+  ) {
+    return DEFAULT_CC_PRESET_CONTEXT_WINDOW;
+  }
+  return contextWindow;
+}
+
 export function normalizeCcPresetName(name: string): string {
   return name.trim().toLowerCase();
 }

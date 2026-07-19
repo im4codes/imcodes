@@ -149,6 +149,7 @@ interface ClaudeSdkSessionState {
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
   lastAssistantUsage?: ClaudeUsageSnapshot;
+  contextUsageRequestSerial: number;
   /** Cached per-type Claude rate-limit snapshots (five_hour / seven_day*). Each
    *  `rate_limit_event` carries ONE window; accumulate across the session so the
    *  weekly window — which only surfaces near a limit — is retained once seen. */
@@ -488,6 +489,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
       lastAssistantUsage: existing?.lastAssistantUsage,
+      contextUsageRequestSerial: existing?.contextUsageRequestSerial ?? 0,
       rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
       currentPayload: undefined,
@@ -1009,6 +1011,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       state.model = msg.model;
       state.started = true;
       this.emitSessionInfo(sessionId, { resumeId: msg.session_id, model: msg.model });
+      this.refreshClaudeContextUsage(sessionId, state, turnGeneration);
       return;
     }
 
@@ -1100,6 +1103,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // correct text when the message completes — visible flicker/bleed.
         state.currentText = '';
         state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        this.refreshClaudeContextUsage(sessionId, state, turnGeneration);
         return;
       }
       if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {
@@ -1384,17 +1388,72 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   ): void {
     const normalizedUsage = normalizeClaudeUsageSnapshot(usage);
     if (!normalizedUsage) return;
-    state.lastAssistantUsage = normalizedUsage;
+    const previous = state.lastAssistantUsage;
+    const normalizedContextTokens = (normalizedUsage.input_tokens ?? 0)
+      + (normalizedUsage.cache_read_input_tokens ?? 0)
+      + (normalizedUsage.cache_creation_input_tokens ?? 0);
+    const previousContextTokens = (previous?.input_tokens ?? 0)
+      + (previous?.cache_read_input_tokens ?? 0)
+      + (previous?.cache_creation_input_tokens ?? 0);
+    // Some Anthropic-compatible endpoints return an all-zero result usage
+    // object even though the SDK's getContextUsage() control request reports a
+    // real live context. Never let that lossy terminal frame erase the richer
+    // snapshot captured for this same turn.
+    const effectiveUsage = normalizedContextTokens === 0 && previousContextTokens > 0
+      ? {
+          ...normalizedUsage,
+          ...(previous?.input_tokens !== undefined ? { input_tokens: previous.input_tokens } : {}),
+          ...(previous?.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: previous.cache_read_input_tokens } : {}),
+          ...(previous?.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: previous.cache_creation_input_tokens } : {}),
+        }
+      : normalizedUsage;
+    state.lastAssistantUsage = effectiveUsage;
     for (const cb of this.usageCallbacks) cb(sessionId, {
       ...(messageId ? { messageId } : {}),
-      usage: { ...normalizedUsage },
+      usage: { ...effectiveUsage },
       ...(state.model ? { model: state.model } : {}),
+    });
+  }
+
+  /**
+   * Claude-compatible gateways can omit or zero the usage object carried by
+   * assistant/result frames. The SDK control channel has an independent live
+   * context meter; use it as a bounded, turn-owned fallback. Its maxTokens is
+   * deliberately not forwarded because preset contextWindow is the configured
+   * authority for third-party models such as MiniMax-M3.
+   */
+  private refreshClaudeContextUsage(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    turnGeneration: number,
+  ): void {
+    const queryWithContextUsage = state.currentQuery as (ReturnType<typeof query> & {
+      getContextUsage?: () => Promise<{ totalTokens?: number }>;
+    }) | null;
+    if (typeof queryWithContextUsage?.getContextUsage !== 'function') return;
+    const requestSerial = ++state.contextUsageRequestSerial;
+    const messageId = state.currentMessageId ?? state.lastCompletedMessageId;
+    void queryWithContextUsage.getContextUsage().then((contextUsage) => {
+      if (this.sessions.get(sessionId) !== state) return;
+      if (state.turnGeneration !== turnGeneration || state.contextUsageRequestSerial !== requestSerial) return;
+      const totalTokens = contextUsage?.totalTokens;
+      if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) return;
+      this.recordClaudeUsage(sessionId, state, {
+        input_tokens: Math.round(totalTokens),
+        output_tokens: state.lastAssistantUsage?.output_tokens ?? 0,
+      }, messageId ?? undefined);
+    }).catch((err) => {
+      logger.debug({ provider: this.id, sessionId, err }, 'Claude SDK live context usage unavailable');
     });
   }
 
   private resetClaudeTurnUsage(state: ClaudeSdkSessionState): void {
     state.lastAssistantUsage = undefined;
     state.lastCompletedMessageId = undefined;
+    // Invalidate any getContextUsage() response still in flight for the prior
+    // foreground turn, including retained-query follow-ups where the SDK query
+    // generation itself does not change.
+    state.contextUsageRequestSerial += 1;
   }
 
   private armResultCompletionFallback(sessionId: string, state: ClaudeSdkSessionState): void {

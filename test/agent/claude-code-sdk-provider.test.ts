@@ -30,7 +30,8 @@ const sdkMock = vi.hoisted(() => {
   let nextMessageBatches: any[][] | null = null;
   let waitForClose = false;
   let interruptNeverResolves = false;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
+  let nextContextUsage: { totalTokens?: number } | null = null;
+  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; contextUsageCalls: number; resolveClose?: () => void }> = [];
   // The provider drives the SDK in streaming-input mode, so `prompt` is an
   // AsyncIterable<SDKUserMessage>, not a string — that is what lets a message
   // reach a query still running subagents. This mock stands in for the SDK, so it
@@ -43,7 +44,7 @@ const sdkMock = vi.hoisted(() => {
     return typeof content === 'string' ? content : '';
   };
   const query = vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
-    const run = { prompt: readPromptText(prompt), options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
+    const run = { prompt: readPromptText(prompt), options, closed: false, interrupted: false, stoppedTasks: [] as string[], contextUsageCalls: 0, resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
     const messages = nextMessageBatches?.shift() ?? nextMessages;
     async function* gen() {
@@ -54,7 +55,7 @@ const sdkMock = vi.hoisted(() => {
         });
       }
     }
-    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
+    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void>; getContextUsage(): Promise<{ totalTokens?: number }> };
     iterator.close = () => {
       run.closed = true;
       run.resolveClose?.();
@@ -68,6 +69,10 @@ const sdkMock = vi.hoisted(() => {
     iterator.stopTask = async (taskId: string) => {
       run.stoppedTasks.push(taskId);
     };
+    iterator.getContextUsage = async () => {
+      run.contextUsageCalls += 1;
+      return nextContextUsage ?? {};
+    };
     return iterator;
   });
   return {
@@ -78,6 +83,7 @@ const sdkMock = vi.hoisted(() => {
     setNextMessageBatches(batches: any[][]) { nextMessageBatches = batches.map((batch) => [...batch]); },
     setWaitForClose(value: boolean) { waitForClose = value; },
     setInterruptNeverResolves(value: boolean) { interruptNeverResolves = value; },
+    setNextContextUsage(value: { totalTokens?: number } | null) { nextContextUsage = value; },
   };
 });
 
@@ -113,6 +119,7 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setNextMessages([]);
     sdkMock.setWaitForClose(false);
     sdkMock.setInterruptNeverResolves(false);
+    sdkMock.setNextContextUsage(null);
     childProcessMock.spawn.mockClear();
   });
 
@@ -422,6 +429,64 @@ describe('ClaudeCodeSdkProvider', () => {
         output_tokens: 90,
       },
     }]);
+  });
+
+  it('uses the SDK live context meter when a compatible endpoint reports zero usage', async () => {
+    sdkMock.setNextContextUsage({ totalTokens: 734_321 });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-live-context', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-live-context' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-live-context',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-live-context',
+      cwd: '/tmp/project',
+      resumeId: 'session-live-context',
+      agentId: 'MiniMax-M3',
+    });
+
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-live-context', 'hello');
+    await flush();
+
+    expect(sdkMock.runs.at(-1)?.contextUsageCalls).toBeGreaterThanOrEqual(1);
+    expect(usageUpdates.at(-1)).toEqual({
+      messageId: 'msg-live-context',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 734_321,
+        output_tokens: 0,
+      },
+    });
   });
 
   it('falls back to completing from result when the SDK iterator never closes', async () => {
