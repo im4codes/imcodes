@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { vi } from 'vitest';
 
 // This suite exercises the real persistence module. `vi.unmock` is hoisted by
@@ -13,6 +15,43 @@ vi.unmock('../../src/store/session-store.js');
 
 // We need to test with a temp path — patch the store path
 let tempDir: string;
+const execFileAsync = promisify(execFile);
+
+async function loadStoreInFreshProcess(sessionName: string): Promise<{
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
+}> {
+  const resultMarker = '__IMCODES_SESSION_STORE_RESULT__';
+  const moduleUrl = new URL('../../src/store/session-store.ts', import.meta.url).href;
+  const script = `
+    const store = await import(process.env.IMCODES_TEST_SESSION_STORE_MODULE_URL);
+    await store.loadStore();
+    await store.flushStore();
+    console.log(${JSON.stringify(resultMarker)} + JSON.stringify(store.getSession(${JSON.stringify(sessionName)})));
+  `;
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--import',
+    'tsx',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: tempDir,
+      IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
+    },
+  });
+  const resultLine = stdout.split(/\r?\n/).find((line) => line.startsWith(resultMarker));
+  if (!resultLine) {
+    throw new Error(`fresh session-store process did not emit its result: ${stdout}`);
+  }
+  return JSON.parse(resultLine.slice(resultMarker.length)) as {
+    sessionInstanceId?: string;
+    runtimeEpoch?: string;
+  };
+}
 
 async function importSessionStore() {
   // Coverage runs reuse workers across files that install partial mocks of
@@ -247,17 +286,14 @@ describe('session-store', () => {
         },
       });
 
-      const firstStore = await importSessionStore();
-      await firstStore.loadStore();
-      const first = firstStore.getSession('deck_legacy_brain');
+      // A daemon reload is a process boundary. Exercise it with two actual
+      // Node processes so this persistence assertion cannot inherit Vitest's
+      // worker-level session-store mocks or module cache.
+      const first = await loadStoreInFreshProcess('deck_legacy_brain');
       expect(first?.sessionInstanceId).toMatch(/^[0-9a-f-]{36}$/);
       expect(first?.runtimeEpoch).toMatch(/^[0-9a-f-]{36}$/);
-      await firstStore.flushStore();
-
-      vi.resetModules();
-      const reloadedStore = await importSessionStore();
-      await reloadedStore.loadStore();
-      expect(reloadedStore.getSession('deck_legacy_brain')).toMatchObject({
+      const reloaded = await loadStoreInFreshProcess('deck_legacy_brain');
+      expect(reloaded).toMatchObject({
         sessionInstanceId: first?.sessionInstanceId,
         runtimeEpoch: first?.runtimeEpoch,
       });
