@@ -87,14 +87,15 @@ const execFileAsync = promisify(execFile);
 // validation, git init/commit/push, and file I/O. It runs inside the full
 // `test:unit` daemon suite, so on a loaded/contended CI runner an awaited
 // websocket/transport send can legitimately arrive several seconds late — which
-// flaked the previous tight 1000/2500ms send-observation deadlines (macOS +
-// Node 24 while Node 22 + Windows passed the same commit). Use one generous
-// deadline for every send wait and raise the per-test timeout to match. The
-// sends are in-process mocks, so a correct send is still observed within a poll
-// cycle on a fast machine; the ceiling only prevents spurious "send was not
-// observed" throws under contention.
-const SEND_WAIT_MS = 15_000;
-vi.setConfig({ testTimeout: 90_000, hookTimeout: 60_000 });
+// Full Node 24 CI runs more than 500 daemon test files on the same worker. A
+// saturated event loop can consume most of a 15s wall-clock polling deadline
+// without giving this file enough polling turns, even though the in-process
+// transport send is recorded correctly (the same failing case completes in
+// ~1.5s alone and the complete file passes). Keep the wait bounded, but leave
+// enough headroom for full-suite contention; a genuinely absent send still
+// fails explicitly at the deadline.
+const SEND_WAIT_MS = 30_000;
+vi.setConfig({ testTimeout: 120_000, hookTimeout: 60_000 });
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
