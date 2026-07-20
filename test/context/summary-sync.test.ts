@@ -76,6 +76,14 @@ describe('recent summary synchronization', () => {
     expect(fingerprintRecentSummary(fullSummary)).toBe(fingerprintRecentSummary(remotePreview));
   });
 
+  it('treats summaries with the same server-visible 240-character prefix as one delivery identity', () => {
+    const sharedPreview = 'x'.repeat(240);
+
+    expect(fingerprintRecentSummary(`${sharedPreview} first private tail`)).toBe(
+      fingerprintRecentSummary(`${sharedPreview} second private tail`),
+    );
+  });
+
   it('reserves once across concurrent sends, commits only on success, and rolls back failures', () => {
     const a = fingerprintRecentSummary('summary A');
     const b = fingerprintRecentSummary('summary B');

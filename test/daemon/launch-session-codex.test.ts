@@ -3,8 +3,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
 const mocks = vi.hoisted(() => ({
+  store: new Map<string, any>(),
   ensureSessionFile: vi.fn().mockResolvedValue('/proj/rollout-seeded.jsonl'),
   upsertSession: vi.fn(),
+  getSession: vi.fn(),
   newSession: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -19,7 +21,7 @@ vi.mock('node:crypto', async (importOriginal) => {
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: vi.fn(() => []),
   upsertSession: mocks.upsertSession,
-  getSession: vi.fn(() => null),
+  getSession: mocks.getSession,
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -74,13 +76,27 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   }),
 }));
 
-import { launchSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
+import { launchSession, restartSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
+import {
+  getSummarySyncFingerprints,
+  recordSyncedSummaryFingerprints,
+  resetAllSummarySyncHistories,
+} from '../../src/context/summary-sync-history.js';
+import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('launchSession — Codex ID handling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.store.clear();
+    mocks.getSession.mockImplementation((name: string) => mocks.store.get(name));
+    mocks.upsertSession.mockImplementation((record: any) => {
+      mocks.store.set(record.name, record);
+      return record;
+    });
+    mocks.ensureSessionFile.mockResolvedValue('/proj/rollout-seeded.jsonl');
+    resetAllSummarySyncHistories();
     setSessionEventCallback(() => {});
   });
 
@@ -111,5 +127,49 @@ describe('launchSession — Codex ID handling', () => {
       secondary: { usedPercent: 50, windowDurationMins: 10080, resetsAt: 1_700_100_000 },
     });
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_codex_brain', 'idle');
+  });
+
+  it('persists startup summary fingerprints created before the first SessionRecord', async () => {
+    const fingerprint = fingerprintRecentSummary('startup summary delivered in the Codex rollout');
+    mocks.ensureSessionFile.mockImplementationOnce(async (_id: string, _dir: string, sessionName: string) => {
+      recordSyncedSummaryFingerprints(sessionName, [fingerprint]);
+      return '/proj/rollout-seeded.jsonl';
+    });
+
+    await launchSession({
+      name: 'deck_codex_brain',
+      projectName: 'test',
+      role: 'brain',
+      agentType: 'codex',
+      projectDir: '/proj',
+    });
+
+    expect(mocks.store.get('deck_codex_brain')?.summarySyncFingerprints).toEqual([fingerprint]);
+    resetAllSummarySyncHistories();
+    expect(getSummarySyncFingerprints('deck_codex_brain')).toEqual([fingerprint]);
+  });
+
+  it('preserves the summary ledger when a missing process pane is restarted non-fresh', async () => {
+    const fingerprint = fingerprintRecentSummary('already delivered before crash');
+    const record = {
+      name: 'deck_codex_brain',
+      projectName: 'test',
+      role: 'brain',
+      agentType: 'codex',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      codexSessionId: 'existing-codex-thread',
+      summarySyncFingerprints: [fingerprint],
+    } as any;
+    mocks.store.set(record.name, record);
+
+    await expect(restartSession(record)).resolves.toBe(true);
+
+    expect(mocks.store.get(record.name)?.summarySyncFingerprints).toEqual([fingerprint]);
+    expect(getSummarySyncFingerprints(record.name)).toEqual([fingerprint]);
   });
 });

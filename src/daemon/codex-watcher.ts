@@ -9,7 +9,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
-import { buildSessionBootstrapContext, buildCodexMemoryEntry, readProcessedMemoryItems } from './memory-inject.js';
+import { buildSessionBootstrapContextWithItems, buildCodexMemoryEntry } from './memory-inject.js';
 import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
 import { recordSyncedSummaryFingerprints } from '../context/summary-sync-history.js';
 import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
@@ -475,16 +475,17 @@ export async function ensureSessionFile(uuid: string, cwd: string, sessionName?:
 
   // Inject project memory so the agent starts with project context loaded.
   // Also required: `codex resume` needs at least one entry beyond session_meta.
-  const memory = legacyInjectionDisabled()
-    ? 'Shared context bootstrap deferred to runtime assembly.'
-    : await buildSessionBootstrapContext(cwd, basename(cwd));
+  const bootstrap = legacyInjectionDisabled()
+    ? { text: 'Shared context bootstrap deferred to runtime assembly.', items: [] }
+    : await buildSessionBootstrapContextWithItems(cwd, basename(cwd));
+  const memory = bootstrap.text;
   const lines = [meta, buildCodexMemoryEntry(memory, isoNow)];
 
   await writeFile(filePath, lines.join('\n') + '\n', 'utf8');
   logger.info({ uuid, filePath, hasMemory: !!memory }, 'codex-watcher: created bootstrapped session file');
 
   if (sessionName && !legacyInjectionDisabled()) {
-    const items = await readProcessedMemoryItems(basename(cwd));
+    const items = bootstrap.items;
     recordSyncedSummaryFingerprints(sessionName, recentSummaryFingerprintsFromItems(items));
     const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
     if (payload) {

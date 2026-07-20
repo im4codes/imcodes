@@ -4,7 +4,7 @@ import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, sendProcessSessionMessageForAutomation } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
@@ -26,7 +26,6 @@ import net from 'node:net';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
-import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
@@ -132,6 +131,17 @@ export interface DaemonContext {
   removeBinding(platform: string, channelId: string, botId: string): Promise<boolean>;
   /** Send a session event (started/stopped/error) to the CF Worker for relay to browsers. */
   sendSessionEvent(event: 'started' | 'stopped' | 'error', session: string, state: string): void;
+}
+
+/** Route an external chat message through the same process-session delivery
+ * boundary as Web/CLI sends so summary sync, serialization, and error handling
+ * cannot drift from ordinary user-visible delivery. */
+export async function sendExternalMessageToProcessSession(
+  sessionName: string,
+  text: string,
+  sender = sendProcessSessionMessageForAutomation,
+): Promise<void> {
+  await sender(sessionName, text);
 }
 
 let ctx: DaemonContext | null = null;
@@ -1038,11 +1048,7 @@ export async function startup(): Promise<DaemonContext> {
           logger.warn({ err: e, platform, channelId }, 'sendOutbound failed');
         }
       },
-      sendToSession: async (sessionName, text) => {
-        const record = (await import('../store/session-store.js')).getSession(sessionName);
-        const cwd = record?.agentType === 'gemini' ? record?.projectDir : undefined;
-        await sendKeys(sessionName, text, cwd ? { cwd } : undefined);
-      },
+      sendToSession: sendExternalMessageToProcessSession,
       persistBinding,
       removeBinding,
     });

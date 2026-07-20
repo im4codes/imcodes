@@ -9,13 +9,15 @@ const execMock = vi.hoisted(() => vi.fn((cmd: string, cb?: (err: Error | null, r
 }));
 const readProjectMemoryMock = vi.hoisted(() => vi.fn().mockResolvedValue('# Project context'));
 const appendAgentSendDocsMock = vi.hoisted(() => vi.fn((memory: string | null) => `${memory ?? ''}\n\nAGENT_SEND_DOCS`.trim()));
-const buildSessionBootstrapContextMock = vi.hoisted(() => vi.fn().mockResolvedValue('# Project context\n\nAGENT_SEND_DOCS'));
+const buildSessionBootstrapContextWithItemsMock = vi.hoisted(() => vi.fn().mockResolvedValue({
+  text: '# Project context\n\nAGENT_SEND_DOCS',
+  items: [],
+}));
 const buildCodexMemoryEntryMock = vi.hoisted(() => vi.fn((memory: string, timestamp: string) => JSON.stringify({
   timestamp,
   type: 'response_item',
   payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: memory }] },
 })));
-const readProcessedMemoryItemsMock = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 const timelineEmitMock = vi.hoisted(() => vi.fn());
 
 vi.mock('fs/promises', () => ({
@@ -38,9 +40,8 @@ vi.mock('node:child_process', () => ({
 vi.mock('../../src/daemon/memory-inject.js', () => ({
   readProjectMemory: readProjectMemoryMock,
   appendAgentSendDocs: appendAgentSendDocsMock,
-  buildSessionBootstrapContext: buildSessionBootstrapContextMock,
+  buildSessionBootstrapContextWithItems: buildSessionBootstrapContextWithItemsMock,
   buildCodexMemoryEntry: buildCodexMemoryEntryMock,
-  readProcessedMemoryItems: readProcessedMemoryItemsMock,
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
@@ -55,14 +56,17 @@ describe('ensureSessionFile', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     readdirMock.mockRejectedValue(new Error('missing'));
-    readProcessedMemoryItemsMock.mockResolvedValue([]);
+    buildSessionBootstrapContextWithItemsMock.mockResolvedValue({
+      text: '# Project context\n\nAGENT_SEND_DOCS',
+      items: [],
+    });
     delete process.env.IMCODES_SHARED_CONTEXT_LEGACY_INJECTION_DISABLED;
   });
 
-  it('uses buildSessionBootstrapContext before legacy injection is disabled', async () => {
+  it('uses one bootstrap snapshot before legacy injection is disabled', async () => {
     await ensureSessionFile('uuid-1', '/proj');
 
-    expect(buildSessionBootstrapContextMock).toHaveBeenCalledWith('/proj', 'proj');
+    expect(buildSessionBootstrapContextWithItemsMock).toHaveBeenCalledWith('/proj', 'proj');
     expect(buildCodexMemoryEntryMock).toHaveBeenCalledWith(expect.any(String), expect.any(String));
   });
 
@@ -71,7 +75,7 @@ describe('ensureSessionFile', () => {
 
     await ensureSessionFile('uuid-2', '/proj');
 
-    expect(buildSessionBootstrapContextMock).not.toHaveBeenCalled();
+    expect(buildSessionBootstrapContextWithItemsMock).not.toHaveBeenCalled();
     expect(buildCodexMemoryEntryMock).toHaveBeenCalledWith(
       'Shared context bootstrap deferred to runtime assembly.',
       expect.any(String),
@@ -79,18 +83,22 @@ describe('ensureSessionFile', () => {
   });
 
   it('emits a startup memory.context timeline event when processed memory exists', async () => {
-    readProcessedMemoryItemsMock.mockResolvedValue([
+    buildSessionBootstrapContextWithItemsMock.mockResolvedValue({
+      text: '# Project context\n\n[Related past work]\n<related-past-work advisory="true">\n- [proj] Fix websocket reconnect loop\n</related-past-work>\n\nAGENT_SEND_DOCS',
+      items: [
       {
         id: 'mem-1',
         type: 'processed',
         projectId: 'proj',
         scope: 'personal',
+        projectionClass: 'recent_summary',
         summary: 'Fix websocket reconnect loop',
         createdAt: 1,
         hitCount: 3,
         relevanceScore: 0.77,
       },
-    ]);
+      ],
+    });
 
     await ensureSessionFile('uuid-3', '/proj', 'deck_proj_brain');
 

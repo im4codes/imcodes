@@ -73,7 +73,7 @@ import { buildTransportQueueSnapshotPayload } from '../daemon/transport-queue-pr
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
-import { clearSummarySyncHistory } from '../context/summary-sync-history.js';
+import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 
@@ -2727,7 +2727,11 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   const exists = await sessionExists(name);
-  if (!exists) clearSummarySyncHistory(name);
+  const storedBeforeLaunch = getSession(name);
+  // A missing tmux pane can be a non-fresh crash restart of the same logical
+  // conversation. Only explicit fresh launches or genuinely new records reset
+  // the conversation-lifetime summary ledger.
+  if (fresh || (!exists && !storedBeforeLaunch)) clearSummarySyncHistory(name);
 
   let ccSessionId = opts.ccSessionId;
   if (agentType === 'claude-code' && !fresh) {
@@ -2806,6 +2810,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   if (!skipStore) {
     const existing = getSession(name);
+    const summarySyncFingerprints = getSummarySyncFingerprints(name);
     const record: SessionRecord = {
       name,
       projectName,
@@ -2828,6 +2833,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.description ? { description: opts.description } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
+      ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
     };
     upsertSession(record);

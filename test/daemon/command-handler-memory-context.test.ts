@@ -290,7 +290,7 @@ vi.mock('../../src/repo/detector.js', () => ({
     .filter((remote): remote is { name: string; url: string; host: string; owner: string; repo: string } => Boolean(remote))),
 }));
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { handleWebCommand, sendProcessSessionMessageForAutomation } from '../../src/daemon/command-handler.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
@@ -1459,6 +1459,52 @@ describe('handleWebCommand memory context timeline', () => {
     expect(delivered).toHaveLength(2);
     expect(delivered.filter((text) => text.includes(summary))).toHaveLength(1);
     expect(delivered.find((text) => text.includes(summary))).toContain('# Recent project memory (reference only)');
+  });
+
+  it('keeps P2P metadata while the common automation boundary synchronizes summaries', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    const summary = 'Summary synchronized into a process P2P prompt';
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-p2p-process',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+      },
+    }]);
+
+    await sendProcessSessionMessageForAutomation('deck_process_brain', '[P2P Discussion Task] inspect changes', {
+      userMessageMetadata: {
+        memoryExcluded: true,
+        p2pRunId: 'p2p-run-1',
+        p2pDiscussionId: 'discussion-1',
+        p2pPhase: 'round',
+      },
+    });
+
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      expect.stringContaining(summary),
+      undefined,
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_process_brain',
+      'user.message',
+      expect.objectContaining({
+        text: '[P2P Discussion Task] inspect changes',
+        memoryExcluded: true,
+        p2pRunId: 'p2p-run-1',
+        p2pDiscussionId: 'discussion-1',
+        p2pPhase: 'round',
+      }),
+    );
   });
 
   it('REGRESSION GUARD: process recall queries must use canonical repo identity instead of projectName and this test must not be deleted', async () => {

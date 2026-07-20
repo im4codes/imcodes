@@ -4407,6 +4407,15 @@ async function sendProcessSessionMessage(
     serverLink?: Pick<ServerLink, 'send'>;
     /** RV-C non-displayed audit anchor for an alias-bearing send (no plaintext). */
     aliasAudit?: AliasSendAudit;
+    /** Trusted daemon-owned metadata for automation surfaces such as P2P.
+     * Values are projected only to the local user.message event. */
+    userMessageMetadata?: Readonly<{
+      allowDuplicate?: boolean;
+      memoryExcluded?: boolean;
+      p2pRunId?: string;
+      p2pDiscussionId?: string;
+      p2pPhase?: string;
+    }>;
   },
 ): Promise<void> {
   // ── Step 1: Confirm receipt to the user IMMEDIATELY ─────────────────────────
@@ -4420,6 +4429,7 @@ async function sendProcessSessionMessage(
   // RV-C: attach the alias audit anchor to the human-facing user.message. It
   // carries only referenced names + a hash of resolved values, never plaintext.
   if (options?.aliasAudit) payload.aliasAudit = options.aliasAudit;
+  if (options?.userMessageMetadata) Object.assign(payload, options.userMessageMetadata);
   const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
   if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
@@ -4500,8 +4510,23 @@ async function sendProcessSessionMessage(
   }
 }
 
-export async function sendProcessSessionMessageForAutomation(sessionName: string, text: string): Promise<void> {
-  await sendProcessSessionMessage(sessionName, text, [], { originalText: text });
+export async function sendProcessSessionMessageForAutomation(
+  sessionName: string,
+  text: string,
+  options?: {
+    userMessageMetadata?: Readonly<{
+      allowDuplicate?: boolean;
+      memoryExcluded?: boolean;
+      p2pRunId?: string;
+      p2pDiscussionId?: string;
+      p2pPhase?: string;
+    }>;
+  },
+): Promise<void> {
+  await sendProcessSessionMessage(sessionName, text, [], {
+    originalText: text,
+    ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
+  });
 }
 
 async function resolveProcessRecallQueryContext(

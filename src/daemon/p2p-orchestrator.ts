@@ -10,7 +10,6 @@ import { appendFile, readdir, stat, writeFile, readFile, unlink, copyFile, open 
 import { join, basename, dirname } from 'node:path';
 import { ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
-import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
@@ -1001,7 +1000,16 @@ async function dispatchP2pPromptToSession(args: {
   if (record?.runtimeType === 'transport') {
     throw new Error(`missing_transport_runtime:${args.session}`);
   }
-  await sendKeysDelayedEnter(args.session, args.prompt);
+  const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  await sendProcessSessionMessageForAutomation(args.session, args.prompt, {
+    userMessageMetadata: {
+      ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
+      memoryExcluded: true,
+      p2pRunId: args.run.id,
+      p2pDiscussionId: args.run.discussionId,
+      p2pPhase: args.run.activePhase,
+    },
+  });
   return { mode: 'tmux' };
 }
 

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 
 const {
   sendKeysDelayedEnterMock,
+  processSessionSendMock,
   capturePaneMock,
   sendKeyMock,
   getSessionMock,
@@ -17,6 +18,7 @@ const {
   serverLinkMock,
 } = vi.hoisted(() => ({
   sendKeysDelayedEnterMock: vi.fn().mockResolvedValue(undefined),
+  processSessionSendMock: vi.fn().mockResolvedValue(undefined),
   capturePaneMock: vi.fn().mockResolvedValue(['$']),
   sendKeyMock: vi.fn().mockResolvedValue(undefined),
   getSessionMock: vi.fn(),
@@ -32,6 +34,10 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sendKeys: sendKeysDelayedEnterMock,
   capturePane: capturePaneMock,
   sendKey: sendKeyMock,
+}));
+
+vi.mock('../../src/daemon/command-handler.js', () => ({
+  sendProcessSessionMessageForAutomation: processSessionSendMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -272,6 +278,9 @@ beforeEach(async () => {
       return;
     }
   });
+  processSessionSendMock.mockImplementation(async (session: string, prompt: string) => {
+    await sendKeysDelayedEnterMock(session, prompt);
+  });
 });
 
 afterEach(async () => {
@@ -354,6 +363,17 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['completed']);
     expect(done.hopStates).toHaveLength(1);
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
+    expect(processSessionSendMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({
+        userMessageMetadata: expect.objectContaining({
+          memoryExcluded: true,
+          p2pRunId: done.id,
+          p2pDiscussionId: done.discussionId,
+        }),
+      }),
+    );
   });
 
   it('restores transport initiator runtime instead of falling back to tmux dispatch', async () => {

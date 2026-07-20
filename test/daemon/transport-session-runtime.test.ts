@@ -2443,6 +2443,45 @@ ${PREFERENCE_CONTEXT_END}`;
     }));
   });
 
+  it('does not collect or publish new summaries for a private peer-audit dispatch', async () => {
+    const summary = makeSummarySyncCandidate('summary-private-audit', 'Must not ride the private audit brief');
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_private_audit');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_summary_private_audit' });
+    collectRecentSummarySyncCandidatesMock.mockClear();
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('private audit brief', 'peer-audit-private-turn', undefined, undefined, {
+      peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: 'attempt_hash' },
+    });
+    await waitForProviderSendCount(localMock.provider, 1);
+
+    expect(collectRecentSummarySyncCandidatesMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock.mock.calls.some((call) => (
+      call[1] === 'memory.context'
+      && JSON.stringify(call[2]).includes('Must not ride the private audit brief')
+    ))).toBe(false);
+
+    localMock.fireComplete('sess-1');
+    r.send('Review the newly materialized project summary', 'normal-after-private-audit');
+    await waitForProviderSendCount(localMock.provider, 2);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Must not ride the private audit brief'),
+      }),
+    }));
+  });
+
   it('does not duplicate summaries already carried by first-turn startup memory', async () => {
     const summary = makeSummarySyncCandidate('summary-startup', 'Startup already carries this summary');
     collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
