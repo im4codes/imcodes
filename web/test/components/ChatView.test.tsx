@@ -309,6 +309,42 @@ describe('ChatView', () => {
     expect(screen.queryByText('chat.user_message_expand')).toBeNull();
   });
 
+  it('renders legacy inter-agent send newline escapes as real timeline line breaks only for send_message ids', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'transport-user:send_message_legacy',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: {
+              text: String.raw`Task: inspect\n\nContext:\n- one`,
+              commandId: 'send_message_legacy',
+              clientMessageId: 'send_message_legacy',
+              allowDuplicate: true,
+            },
+          },
+          {
+            eventId: 'ordinary-user-message',
+            type: 'user.message',
+            ts: 1_700_000_000_001,
+            payload: { text: String.raw`source example: "a\nb"` },
+          },
+        ] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_legacy_inter_agent_newline"
+      />,
+    );
+
+    const messages = [...container.querySelectorAll('.chat-user-message-fold-content')]
+      .map((element) => element.textContent);
+    expect(messages).toEqual([
+      'Task: inspect\n\nContext:\n- one',
+      String.raw`source example: "a\nb"`,
+    ]);
+  });
+
   it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
     // Regression test for "本地历史还是没有瞬间加载" / 暂无消息 flash:
     // SubSessionWindow forces `loading={false}` so its ChatView doesn't
