@@ -29,6 +29,7 @@ Notes:
   \`deck_<project>_wN\` names: unlisted legacy workers are hidden compatibility
   sessions and are not user-visible conversation targets.
 - Messages are delivered via the daemon's hook server. If the target is busy, the message is queued.
+- In CLI message arguments, literal \\n and \\r\\n escapes become real line breaks. Use \`--literal\` when those characters must stay verbatim (for example in source-code text).
 - A \`--reply\` send already arranges for the target's response to be delivered back to this session as a normal incoming message. The send command returns after dispatch; do not poll session state, logs, transcripts, or the target while waiting for that reply.
 - The \`--files\` flag attaches file references; format depends on the target agent type.
 - Your session identity is auto-detected from $${IMCODES_SESSION_ENV}. SDK/transport sessions also expose

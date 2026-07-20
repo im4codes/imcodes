@@ -5,6 +5,7 @@
  * - Backward compatibility with existing positional args
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { decodeImcodesSendNewlineEscapes } from '../../shared/imcodes-send.js';
 
 // ── detectSenderSession tests ─────────────────────────────────────────────────
 
@@ -99,6 +100,7 @@ describe('appendAgentSendDocs', () => {
     expect(result).toContain('--files');
     expect(result).toContain('--list');
     expect(result).toContain('--all');
+    expect(result).toContain('--literal');
   });
 
   it('returns send docs when memory is null', () => {
@@ -122,6 +124,16 @@ describe('appendAgentSendDocs', () => {
 // ── CLI argument parsing tests ──────────────────────────────────────────────
 
 describe('CLI send argument parsing', () => {
+  it('decodes literal newline escapes used by generated multi-line delegation commands', () => {
+    expect(decodeImcodesSendNewlineEscapes(String.raw`Task: inspect\n\nContext:\r\n- one`))
+      .toBe('Task: inspect\n\nContext:\n- one');
+  });
+
+  it('preserves doubled backslashes and unrelated escape sequences', () => {
+    expect(decodeImcodesSendNewlineEscapes(String.raw`show \\n and keep \t plus \q`))
+      .toBe(String.raw`show \n and keep \t plus \q`);
+  });
+
   it('parses --files into comma-separated array', () => {
     const raw = 'file1.ts,file2.ts,src/index.ts';
     const files = raw.split(',').map((f) => f.trim()).filter(Boolean);

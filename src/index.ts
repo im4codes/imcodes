@@ -71,7 +71,7 @@ import { cpus, freemem, homedir, loadavg, totalmem } from 'os';
 import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
+import { decodeImcodesSendNewlineEscapes, IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 import { buildAgentDelegationReplyInstruction } from '../shared/agent-delegation.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
 import { runAuditReplyCommand } from './cli/audit-reply.js';
@@ -640,7 +640,8 @@ program
   .option('--list', 'List available sibling sessions')
   .option('--reply', 'Route the target response back automatically; no polling needed')
   .option('--no-reply', 'Disable automatic reply instruction (default)')
-  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean }) => {
+  .option('--literal', 'Keep message backslash-newline escapes literal')
+  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean; literal?: boolean }) => {
     const { detectSenderSession } = await import('./util/detect-session.js');
 
     // ── --list mode: show available siblings ───────────────────────────────
@@ -709,6 +710,8 @@ program
       resolvedTarget = target;
       message = messageParts?.join(' ') ?? '';
     }
+
+    if (!opts.literal) message = decodeImcodesSendNewlineEscapes(message);
 
     if (!message) {
       console.error('Error: message is required.');
