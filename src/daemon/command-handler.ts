@@ -138,6 +138,17 @@ import {
   recordRecentInjection,
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
+import {
+  commitSummarySyncReservation,
+  clearSummarySyncHistory,
+  reserveUnsyncedSummaryFingerprints,
+  rollbackSummarySyncReservation,
+  type SummarySyncReservation,
+} from '../context/summary-sync-history.js';
+import {
+  collectRecentSummarySyncCandidates,
+  fingerprintRecentSummary,
+} from '../context/summary-sync.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -948,7 +959,7 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
-import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
@@ -3895,6 +3906,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         // Reset per-session memory injection history — fresh conversation
         // should be allowed to re-inject previously-shown memories again.
         clearRecentInjectionHistory(sessionName);
+        clearSummarySyncHistory(sessionName);
         await handleGetSessions(serverLink);
         await syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -4298,6 +4310,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Reset per-session memory injection history — fresh conversation
       // should be allowed to re-inject previously-shown memories again.
       clearRecentInjectionHistory(sessionName);
+      clearSummarySyncHistory(sessionName);
       await handleGetSessions(serverLink);
       await syncSubSessionIfNeeded(sessionName, serverLink);
       timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -4430,15 +4443,21 @@ async function sendProcessSessionMessage(
   }
 
   let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+  let memoryRecallCancelled = false;
   try {
     const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
     memoryContext = await withDeadline(
-      prependLocalMemory(sendText, sessionName, { deadlineAt }),
+      prependLocalMemory(sendText, sessionName, {
+        deadlineAt,
+        isCancelled: () => memoryRecallCancelled,
+      }),
       PROCESS_MEMORY_RECALL_DEADLINE_MS,
       'memory_recall_timeout',
     );
     sendText = memoryContext.text;
   } catch (recallErr) {
+    memoryRecallCancelled = true;
+    rollbackSummarySyncReservation(memoryContext.summaryReservation);
     logger.warn({ sessionName, timeoutMs: PROCESS_MEMORY_RECALL_DEADLINE_MS, err: recallErr }, 'memory recall skipped — sending without memory injection');
   }
 
@@ -4450,6 +4469,7 @@ async function sendProcessSessionMessage(
   try {
     await sendShellAwareCommand(sessionName, sendText, agentType);
   } catch (sendErr) {
+    rollbackSummarySyncReservation(memoryContext.summaryReservation);
     const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
     logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
     try {
@@ -4460,6 +4480,8 @@ async function sendProcessSessionMessage(
     release();
     deliveryTurn.releaseTurn();
   }
+
+  commitSummarySyncReservation(memoryContext.summaryReservation);
 
   // ── Step 4: Post-delivery — emit memory.context + record hits ──────────────
   if (memoryContext.timelinePayload && userEvent) {
@@ -12258,42 +12280,30 @@ async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: Serv
 async function prependLocalMemory(
   prompt: string,
   sessionName: string,
-  options?: { deadlineAt?: number },
+  options?: { deadlineAt?: number; isCancelled?: () => boolean },
 ): Promise<{
   text: string;
   timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
   hitIds?: string[];
+  summaryReservation?: SummarySyncReservation;
 }> {
   const query = prompt.slice(0, 200);
+  let summaryReservation: SummarySyncReservation | undefined;
   if (prompt.trim().startsWith('/')) {
     return {
       text: prompt,
       timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_control_message'),
     };
   }
-  if (prompt.length < 10) {
-    return {
-      text: prompt,
-      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt'),
-    };
-  }
+  let semanticSkipReason: 'skipped_short_prompt' | 'skipped_template_prompt' | 'skipped_control_message' | undefined;
+  if (prompt.length < 10) semanticSkipReason = 'skipped_short_prompt';
   // Template-prompt skip: OpenSpec / slash-command / skill-template prompts
   // are not natural-language questions; a recall over them returns noise.
   // See shared/template-prompt-patterns.ts.
-  if (isTemplatePrompt(prompt)) {
-    return {
-      text: prompt,
-      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt'),
-    };
-  }
+  if (!semanticSkipReason && isTemplatePrompt(prompt)) semanticSkipReason = 'skipped_template_prompt';
   // Imperative-command skip: short terse task-control verbs ("commit&push",
   // "redeploy", "continue") are ops directives, not semantic queries.
-  if (isImperativeCommand(prompt)) {
-    return {
-      text: prompt,
-      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_control_message'),
-    };
-  }
+  if (!semanticSkipReason && isImperativeCommand(prompt)) semanticSkipReason = 'skipped_control_message';
   try {
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
@@ -12309,13 +12319,30 @@ async function prependLocalMemory(
     // (bounded L3 RPC), off the daemon main thread — same as the transport path
     // (Req "Bounded front-of-turn L3 recall"). In-process fallback only when the
     // worker is not warm / unavailable, so recall never blocks the turn.
-    const searchResult = await searchLocalMemorySemanticFrontOfTurn(recallQuery);
-    if (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt) {
+    const [searchResult, summaryCandidates] = await Promise.all([
+      semanticSkipReason
+        ? Promise.resolve({ items: [] })
+        : searchLocalMemorySemanticFrontOfTurn(recallQuery),
+      collectRecentSummarySyncCandidates(recallContext.namespace),
+    ]);
+    if (options?.isCancelled?.()
+      || (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt)) {
       return {
         text: prompt,
         timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),
       };
     }
+    summaryReservation = reserveUnsyncedSummaryFingerprints(
+      sessionName,
+      summaryCandidates.map((candidate) => candidate.fingerprint),
+    );
+    const reservedSummaryFingerprints = new Set(summaryReservation?.fingerprints ?? []);
+    const summaryItems = summaryCandidates
+      .filter((candidate) => reservedSummaryFingerprints.has(candidate.fingerprint))
+      .map((candidate) => candidate.item);
+    const summaryContentFingerprints = new Set(
+      summaryItems.map((item) => fingerprintRecentSummary(item.summary)),
+    );
     // 1) Template-origin legacy summaries never surface through recall.
     const notTemplate = searchResult.items.filter(
       (item) => !isTemplateOriginSummary(item.summary),
@@ -12324,7 +12351,10 @@ async function prependLocalMemory(
     //    of THIS session. Cleared on `session.clear`.
     const ids = notTemplate.map((item) => item.id);
     const keepIds = new Set(filterRecentlyInjected(sessionName, ids));
-    const deduped = notTemplate.filter((item) => keepIds.has(item.id));
+    const deduped = notTemplate.filter((item) => (
+      keepIds.has(item.id)
+      && !summaryContentFingerprints.has(fingerprintRecentSummary(item.summary))
+    ));
     const dedupedCount = Math.max(0, notTemplate.length - deduped.length);
     // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
     //    See shared/memory-scoring.ts.
@@ -12333,10 +12363,12 @@ async function prependLocalMemory(
       minFloor: getContextModelConfig().memoryRecallMinScore,
     });
     const finalItems = finalScored.map((s) => s.item);
-    if (finalItems.length === 0) {
+    if (finalItems.length === 0 && summaryItems.length === 0) {
       return {
         text: prompt,
-        timelinePayload: deduped.length === 0 && notTemplate.length > 0
+        timelinePayload: semanticSkipReason
+          ? buildMemoryContextStatusPayload(query, semanticSkipReason)
+          : deduped.length === 0 && notTemplate.length > 0
           ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
               matchedCount: notTemplate.length,
               dedupedCount,
@@ -12346,24 +12378,35 @@ async function prependLocalMemory(
             }),
       };
     }
-    const hitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
-    const injectedText = buildRelatedPastWorkText(finalItems);
-    const timelinePayload = buildMemoryContextTimelinePayload(query, finalItems);
+    if (options?.isCancelled?.()) {
+      rollbackSummarySyncReservation(summaryReservation);
+      return { text: prompt };
+    }
+    const semanticHitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
+    const hitIds = [...summaryItems.map((item) => item.id), ...semanticHitIds];
+    const sections: string[] = [];
+    if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(summaryItems));
+    if (finalItems.length > 0) sections.push(buildRelatedPastWorkText(finalItems));
+    const injectedText = sections.join('\n\n');
+    const timelineItems = [...summaryItems, ...finalItems];
+    const timelinePayload = buildMemoryContextTimelinePayload(query, timelineItems);
     // 4) Record the injection into the per-session ring buffer so these
     //    same items do not re-inject on the next 10 turns.
-    recordRecentInjection(sessionName, hitIds);
+    recordRecentInjection(sessionName, semanticHitIds);
     return {
       text: `${injectedText}\n\n${prompt}`,
       timelinePayload: timelinePayload
         ? {
             query: timelinePayload.query,
-            injectedText: timelinePayload.injectedText,
+            injectedText,
             items: timelinePayload.items,
           }
         : undefined,
       hitIds: hitIds.length > 0 ? hitIds : undefined,
+      summaryReservation,
     };
   } catch {
+    rollbackSummarySyncReservation(summaryReservation);
     return {
       text: prompt,
       timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),

@@ -32,6 +32,7 @@ const {
   deleteMemoryMock,
   listSessionsMock,
   recallClientControl,
+  collectRecentSummarySyncCandidatesMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -61,6 +62,7 @@ const {
   // existing expectations). One test flips it true to exercise the owner-mode
   // bounded-empty path (no in-process recall).
   recallClientControl: { isProductionOwner: false },
+  collectRecentSummarySyncCandidatesMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -259,6 +261,11 @@ vi.mock('../../src/context/memory-recall-client.js', () => ({
   searchLocalMemoryAuthorizedForManagement: vi.fn(async (query) => searchLocalMemorySemanticMock(query)),
 }));
 
+vi.mock('../../src/context/summary-sync.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/context/summary-sync.js')>()),
+  collectRecentSummarySyncCandidates: collectRecentSummarySyncCandidatesMock,
+}));
+
 vi.mock('../../src/repo/detector.js', () => ({
   detectRepo: detectRepoMock,
   parseRemoteUrl: vi.fn((url: string) => {
@@ -286,6 +293,8 @@ vi.mock('../../src/repo/detector.js', () => ({
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { resetAllRecentInjectionHistories } from '../../src/context/recent-injection-history.js';
+import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
+import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-feature-config-store.js';
 import { MEMORY_WS } from '../../shared/memory-ws.js';
 import { MEMORY_MANAGEMENT_CONTEXT_FIELD } from '../../shared/memory-management-context.js';
@@ -335,6 +344,8 @@ describe('handleWebCommand memory context timeline', () => {
     process.env.IMCODES_MEM_FEATURE_OBSERVATION_STORE = 'true';
     resetMemoryFeatureConfigStoreForTests();
     resetAllRecentInjectionHistories();
+    resetAllSummarySyncHistories();
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([]);
     setContextModelRuntimeConfig(null);
     getProcessedProjectionStatsMock.mockReturnValue({
       totalRecords: 0,
@@ -1404,6 +1415,52 @@ describe('handleWebCommand memory context timeline', () => {
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
   });
 
+  it('synchronizes a new recent summary once across subsequent process sends', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    const summary = 'New project summary created after this process session started';
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-new',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+        updatedAt: 2,
+      },
+    }]);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'First concurrent normal request',
+      commandId: 'cmd-summary-one',
+    }, serverLink as any);
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Second concurrent normal request',
+      commandId: 'cmd-summary-two',
+    }, serverLink as any);
+
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const delivered = sendKeysDelayedEnterMock.mock.calls.map((call) => String(call[1]));
+    expect(delivered).toHaveLength(2);
+    expect(delivered.filter((text) => text.includes(summary))).toHaveLength(1);
+    expect(delivered.find((text) => text.includes(summary))).toContain('# Recent project memory (reference only)');
+  });
+
   it('REGRESSION GUARD: process recall queries must use canonical repo identity instead of projectName and this test must not be deleted', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',
@@ -1502,6 +1559,49 @@ describe('handleWebCommand memory context timeline', () => {
       'memory.context',
       expect.anything(),
     );
+  });
+
+  it('retries an unsynchronized summary after a process delivery failure', async () => {
+    const summary = 'Process delivery must not tombstone this summary on failure';
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-process-retry',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+      },
+    }]);
+    sendKeysDelayedEnterMock.mockRejectedValueOnce(new Error('tmux failed'));
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'First process delivery attempt',
+      commandId: 'cmd-summary-failed',
+    }, serverLink as any);
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_process_brain',
+      text: 'Second process delivery attempt',
+      commandId: 'cmd-summary-retry',
+    }, serverLink as any);
+    for (let i = 0; i < 20 && sendKeysDelayedEnterMock.mock.calls.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(String(sendKeysDelayedEnterMock.mock.calls[1]?.[1])).toContain(summary);
   });
 
   it('emits a no-matches status when no related process memory is found', async () => {

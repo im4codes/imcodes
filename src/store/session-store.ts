@@ -146,6 +146,12 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  1 turn = 1 inner array (regardless of how many IDs it carries).
    *  Wiped on `/clear` / fresh-restart alongside the runtime state. */
   recentInjectionHistory?: string[][];
+  /** Content fingerprints of project recent-summary entries already delivered
+   *  to this conversation. Unlike recentInjectionHistory this is an exact
+   *  conversation-lifetime ledger: it prevents startup/subsequent summary
+   *  synchronization from repeating after daemon restart. Cleared only for a
+   *  genuinely fresh conversation (`/clear` / fresh restart). */
+  summarySyncFingerprints?: string[];
   /** Execution-clone metadata. Present ONLY for ephemeral execution-clone
    *  sub-sessions (`kind: 'execution_clone'`). First-class field — NEVER stored
    *  inside `transportConfig` (the transport-identity scrubber would strip

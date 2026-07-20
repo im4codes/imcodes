@@ -10,6 +10,8 @@ import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
 import { buildSessionBootstrapContext, buildCodexMemoryEntry, readProcessedMemoryItems } from './memory-inject.js';
+import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
+import { recordSyncedSummaryFingerprints } from '../context/summary-sync-history.js';
 import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
 import logger from '../util/logger.js';
 import { buildMemoryContextTimelinePayload } from './memory-context-timeline.js';
@@ -483,6 +485,7 @@ export async function ensureSessionFile(uuid: string, cwd: string, sessionName?:
 
   if (sessionName && !legacyInjectionDisabled()) {
     const items = await readProcessedMemoryItems(basename(cwd));
+    recordSyncedSummaryFingerprints(sessionName, recentSummaryFingerprintsFromItems(items));
     const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
     if (payload) {
       timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });

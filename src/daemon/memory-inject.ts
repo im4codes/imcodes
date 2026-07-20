@@ -19,6 +19,8 @@ import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format
 import logger from '../util/logger.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
+import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
+import { recordSyncedSummaryFingerprints } from '../context/summary-sync-history.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 
@@ -67,7 +69,7 @@ async function findGeminiSessionFile(sessionId: string): Promise<string | null> 
  * never appears as a sent message in the UI but is part of the history.
  * Retries for up to 3s to handle Gemini's async file write timing.
  */
-export async function injectGeminiMemory(sessionId: string, cwd: string, projectName?: string): Promise<void> {
+export async function injectGeminiMemory(sessionId: string, cwd: string, projectName?: string): Promise<boolean> {
   const memory = await buildSessionBootstrapContext(cwd, projectName ?? '');
   // memory is always non-null now since appendAgentSendDocs guarantees content
 
@@ -79,7 +81,7 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
   }
   if (!filePath) {
     logger.warn({ sessionId }, 'memory-inject: Gemini session file not found, skipping injection');
-    return;
+    return false;
   }
 
   let session: any;
@@ -87,10 +89,10 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
     session = JSON.parse(await readFile(filePath, 'utf8'));
   } catch {
     logger.warn({ filePath }, 'memory-inject: failed to parse Gemini session file');
-    return;
+    return false;
   }
 
-  if (!Array.isArray(session.messages)) return;
+  if (!Array.isArray(session.messages)) return false;
 
   const first = session.messages[0];
   if (first?.type === 'user' && first?.content?.[0]?.text === 'hi') {
@@ -108,6 +110,7 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
   session.lastUpdated = new Date().toISOString();
   await writeFile(filePath, JSON.stringify(session, null, 2), 'utf8');
   logger.info({ sessionId, filePath }, 'memory-inject: injected project memory into Gemini session');
+  return true;
 }
 
 export async function injectGeminiMemoryWithTimeline(
@@ -116,8 +119,10 @@ export async function injectGeminiMemoryWithTimeline(
   cwd: string,
   projectName?: string,
 ): Promise<void> {
-  await injectGeminiMemory(sessionId, cwd, projectName);
+  const injected = await injectGeminiMemory(sessionId, cwd, projectName);
+  if (!injected) return;
   const items = await readProcessedMemoryItems(projectName ?? '');
+  recordSyncedSummaryFingerprints(sessionName, recentSummaryFingerprintsFromItems(items));
   const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
   if (!payload) return;
   timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });

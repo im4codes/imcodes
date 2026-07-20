@@ -1036,6 +1036,7 @@ describe('sdk transport session restore', () => {
       codexSessionId: 'codex-thread-stale-running',
       startupMemoryInjected: true,
       recentInjectionHistory: [['memory-old']],
+      summarySyncFingerprints: ['summary-old'],
       requestedModel: 'gpt-5.5',
       activeModel: 'gpt-5.5',
     });
@@ -1050,6 +1051,7 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBeUndefined();
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBeUndefined();
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toBeUndefined();
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.summarySyncFingerprints).toBeUndefined();
     expect(persistedRecords.at(-1)).toMatchObject({
       name: 'deck_sub_sdk_stale_running',
       state: 'idle',

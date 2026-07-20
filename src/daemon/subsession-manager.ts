@@ -552,6 +552,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         ...(stored?.recentInjectionHistory && stored.recentInjectionHistory.length > 0
           ? { recentInjectionHistory: stored.recentInjectionHistory }
           : {}),
+        ...(stored?.summarySyncFingerprints && stored.summarySyncFingerprints.length > 0
+          ? { summarySyncFingerprints: stored.summarySyncFingerprints }
+          : {}),
       });
     }
   }

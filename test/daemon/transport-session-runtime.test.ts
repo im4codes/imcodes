@@ -27,10 +27,13 @@ import {
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
+import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
+const collectRecentSummarySyncCandidatesMock = vi.hoisted(() => vi.fn());
 
 const sharedActorFixture: SharedActorEnvelope = {
   actorUserId: 'user-shared',
@@ -63,6 +66,14 @@ vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemory: searchLocalMemoryMock,
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
 }));
+
+vi.mock('../../src/context/summary-sync.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../src/context/summary-sync.js')>();
+  return {
+    ...original,
+    collectRecentSummarySyncCandidates: collectRecentSummarySyncCandidatesMock,
+  };
+});
 
 // ── Mock provider factory ──────────────────────────────────────────────────────
 
@@ -147,6 +158,22 @@ function makeSearchResult(items: MemorySearchResultItem[]): MemorySearchResult {
   };
 }
 
+function makeSummarySyncCandidate(id: string, summary: string) {
+  return {
+    fingerprint: fingerprintRecentSummary(summary),
+    item: {
+      id,
+      type: 'processed' as const,
+      projectId: 'repo-1',
+      scope: 'personal',
+      summary,
+      projectionClass: 'recent_summary' as const,
+      updatedAt: Date.now(),
+      sourceKind: 'local_processed' as const,
+    },
+  };
+}
+
 function sdkTurnLostError(options: {
   sessionKey?: string;
   sessionName?: string | null;
@@ -226,6 +253,9 @@ describe('TransportSessionRuntime', () => {
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
+    collectRecentSummarySyncCandidatesMock.mockReset();
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([]);
+    resetAllSummarySyncHistories();
     setContextModelRuntimeConfig(null);
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
@@ -2359,6 +2389,125 @@ ${PREFERENCE_CONTEXT_END}`;
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
+  });
+
+  it('injects each newly materialized recent summary once across subsequent transport turns', async () => {
+    const summary = makeSummarySyncCandidate('summary-new', 'Added the latest unsynchronized project summary');
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_once_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_summary_once_brain' });
+
+    r.send('Review the latest work now', 'summary-turn-1');
+    await waitForProviderSendCount(localMock.provider, 1);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Added the latest unsynchronized project summary'),
+      }),
+      messagePreamble: expect.stringContaining('# Recent project memory (reference only)'),
+    }));
+
+    localMock.fireComplete('sess-1');
+    r.send('Continue with another normal request', 'summary-turn-2');
+    await waitForProviderSendCount(localMock.provider, 2);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+  });
+
+  it('synchronizes new summaries even when the user message is too short for semantic recall', async () => {
+    const summary = makeSummarySyncCandidate('summary-short', 'Summary sync is independent of semantic query length');
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_short_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_summary_short_brain' });
+
+    r.send('ok', 'summary-short-turn');
+    await waitForProviderSendCount(localMock.provider, 1);
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Summary sync is independent of semantic query length'),
+      }),
+    }));
+  });
+
+  it('does not duplicate summaries already carried by first-turn startup memory', async () => {
+    const summary = makeSummarySyncCandidate('summary-startup', 'Startup already carries this summary');
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([]));
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'message-preamble' as const,
+      items: [summary.item],
+      injectedText: '# Recent project memory (reference only)\nStartup already carries this summary',
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_startup_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_summary_startup_brain' });
+
+    r.send('Review startup context without duplication', 'summary-startup-turn');
+    await waitForProviderSendCount(localMock.provider, 1);
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      startupMemory: expect.objectContaining({ items: [summary.item] }),
+    }));
+    expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+  });
+
+  it('rolls back summary delivery ownership when provider send fails', async () => {
+    const summary = makeSummarySyncCandidate('summary-retry', 'Retry this summary after a failed provider send');
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([]));
+    const failedMock = makeMockProvider();
+    (failedMock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('send failed'));
+    const failed = new TransportSessionRuntime(failedMock.provider, 'deck_summary_retry_brain');
+    failed.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await failed.initialize({ ...defaultConfig, sessionKey: 'deck_summary_retry_brain' });
+    failed.send('First delivery fails after reservation', 'summary-failed-turn');
+    await waitForProviderSendCount(failedMock.provider, 1);
+    await flushDispatch();
+
+    const retryMock = makeMockProvider();
+    const retry = new TransportSessionRuntime(retryMock.provider, 'deck_summary_retry_brain');
+    retry.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await retry.initialize({ ...defaultConfig, sessionKey: 'deck_summary_retry_brain' });
+    retry.send('Retry delivery after the failed send', 'summary-retry-turn');
+    await waitForProviderSendCount(retryMock.provider, 1);
+    expect(retryMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Retry this summary after a failed provider send'),
+      }),
+    }));
   });
 
   it('still injects per-message local recall when authority resolves to processed_remote for shared scope', async () => {
