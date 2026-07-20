@@ -1957,6 +1957,168 @@ describe('CodexSdkProvider', () => {
     expect(tools).toHaveLength(3);
   });
 
+  it('shows collaboration-v2 spawn_agent outputs that identify the child only by task_name', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-task-name-spawn-agent', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-task-name-spawn-agent', 'spawn the disk audit helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-task-name-spawn',
+          arguments: JSON.stringify({
+            task_name: 'disk_deep_audit',
+            message: 'Audit disk usage in the background',
+          }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-task-name-spawn',
+          output: JSON.stringify({ task_name: '/root/disk_deep_audit' }),
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-task-name-spawn-agent',
+      'runtime:/root/disk_deep_audit',
+    );
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+      input: {
+        action: 'codex-runtime-subagent',
+        description: 'Audit disk usage in the background',
+      },
+    });
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      agentPath: '/root/disk_deep_audit',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+    });
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('merges a task_name-only spawn with its child thread rollout instead of duplicating the UI row', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-task-name-child-rollout-'));
+    const provider = createCodexProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({ sessionKey: 'route-task-name-child-rollout', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-task-name-child-rollout', 'spawn the disk audit helper');
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call',
+            name: 'spawn_agent',
+            call_id: 'call-task-name-rollout',
+            arguments: JSON.stringify({
+              task_name: 'disk_deep_audit',
+              message: 'Audit disk usage in the background',
+            }),
+          },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call_output',
+            call_id: 'call-task-name-rollout',
+            output: JSON.stringify({ task_name: '/root/disk_deep_audit' }),
+          },
+        },
+      });
+      await waitForCondition(() => tools.length === 1);
+
+      await writeCodexRolloutFile(codexHome, '019f7f0e-74ef-7873-88a9-845487b05cb7', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f7f0e-74ef-7873-88a9-845487b05cb7',
+            cwd: '/tmp/project',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'thread-1',
+                  agent_path: '/root/disk_deep_audit',
+                  agent_nickname: 'Rawls',
+                },
+              },
+            },
+            agent_nickname: 'Rawls',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            last_agent_message: 'Disk audit complete.',
+          },
+        },
+      ]);
+
+      await waitForCondition(() => tools.some((tool) => tool.status === 'complete'), 10_000);
+      const expectedKey = makeCodexSubagentCanonicalKey(
+        'route-task-name-child-rollout',
+        'runtime:/root/disk_deep_audit',
+      );
+      expect(new Set(tools.map((tool) => tool.id))).toEqual(new Set([expectedKey]));
+      const completed = tools.find((tool) => tool.status === 'complete')!;
+      expect(completed).toMatchObject({
+        id: expectedKey,
+        output: 'Disk audit complete.',
+      });
+      const detail = expectCodexSubagentDetail(completed, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(detail.meta).toMatchObject({
+        agentPath: '/root/disk_deep_audit',
+        agentName: 'Rawls',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        terminal: true,
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('emits backgrounded SDK sub-agent snapshots from Codex child rollout metadata', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-'));
     const provider = createCodexProvider();
@@ -1978,6 +2140,7 @@ describe('CodexSdkProvider', () => {
               subagent: {
                 thread_spawn: {
                   parent_thread_id: 'thread-1',
+                  agent_path: '/root/rollout_only',
                   agent_nickname: 'Rawls',
                   agent_role: 'default',
                 },
@@ -2007,7 +2170,7 @@ describe('CodexSdkProvider', () => {
 
       const expectedKey = makeCodexSubagentCanonicalKey(
         'route-child-rollout-subagent',
-        'runtime:019f-child-rollout-only',
+        'runtime:/root/rollout_only',
       );
       expect(tools[0]).toMatchObject({
         id: expectedKey,
@@ -2018,7 +2181,7 @@ describe('CodexSdkProvider', () => {
       const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
       expect(runningDetail.meta).toMatchObject({
         canonicalKey: expectedKey,
-        agentPath: '019f-child-rollout-only',
+        agentPath: '/root/rollout_only',
         agentName: 'Rawls',
         model: 'gpt-5.5',
         rawStatus: 'running',

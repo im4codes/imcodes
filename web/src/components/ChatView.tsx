@@ -1740,8 +1740,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => window.clearInterval(timer);
   }, [hasAgentsStatusRows, preview]);
   const canShowAgentsControl = !preview;
-  const hasRunningSdkAgents = sdkAgentsStatus.runningCount > 0;
-  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasRunningSdkAgents;
+  // Keep the panel mounted for every retained sub-agent row, not only while at
+  // least one child is currently running. Otherwise a just-finished child (or
+  // a provider diagnostic) makes the entire list disappear even though the
+  // aggregator still has authoritative status to show.
+  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items

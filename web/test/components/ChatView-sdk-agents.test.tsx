@@ -162,7 +162,7 @@ describe('ChatView SDK agents panel', () => {
       .toBeLessThan(Array.from(actions?.children ?? []).indexOf(agentsButton as Element));
   });
 
-  it('remembers desired-open state, only mounts while agents are running, and manual close suppresses auto-show', () => {
+  it('remembers desired-open state, keeps all retained agent statuses visible, and honors manual close', () => {
     const runningEvent = makeSdkEvent('agent-running', makeMeta({ childStatusSummary: 'Checking files' }));
     const terminalEvent = makeSdkEvent('agent-complete', makeMeta({
       normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
@@ -199,15 +199,18 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByText('Checking files')).toBeTruthy();
 
     rerender(<ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />);
-    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
-    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Finished child work')).toBeTruthy();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
-    // Still toggled open (agents finished) → button stays active; badge shows 0.
+    // Finished agents remain visible while retained; the badge still reports
+    // only active children.
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(true);
 
     rerender(<ChatView events={[diagnosticEvent]} loading={false} sessionId="deck_agents" />);
-    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
-    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Diagnostics')).toBeTruthy();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);

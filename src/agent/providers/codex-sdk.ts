@@ -219,6 +219,8 @@ interface CodexTrackedSubagentThread {
   sessionId: string;
   callId: string;
   agentId: string;
+  /** Stable orchestration path (for example `/root/disk_deep_audit`). */
+  agentPath?: string;
   agentName?: string;
   prompt?: string;
   model?: string;
@@ -230,6 +232,7 @@ interface CodexTrackedSubagentThread {
 
 interface CodexChildSubagentRolloutSnapshot {
   agentId: string;
+  agentPath?: string;
   parentThreadId: string;
   rolloutPath: string;
   cwd?: string;
@@ -268,6 +271,7 @@ function codexRolloutPayload(record: Record<string, any>): Record<string, any> {
 function readCodexChildSubagentSpawn(payload: Record<string, any>): {
   parentThreadId: string;
   agentId?: string;
+  agentPath?: string;
   agentName?: string;
 } | null {
   const source = isRecord(payload.source) ? payload.source : undefined;
@@ -283,13 +287,20 @@ function readCodexChildSubagentSpawn(payload: Record<string, any>): {
     ?? meaningfulString(spawn?.threadId)
     ?? meaningfulString(spawn?.agent_path)
     ?? meaningfulString(spawn?.agentPath);
+  const agentPath = meaningfulString(spawn?.agent_path)
+    ?? meaningfulString(spawn?.agentPath);
   const agentName = meaningfulString(payload.agent_nickname)
     ?? meaningfulString(spawn?.agent_nickname)
     ?? meaningfulString(spawn?.agentNickname)
     ?? meaningfulString(payload.agent_role)
     ?? meaningfulString(spawn?.agent_role)
     ?? meaningfulString(spawn?.agentRole);
-  return { parentThreadId, ...(agentId ? { agentId } : {}), ...(agentName ? { agentName } : {}) };
+  return {
+    parentThreadId,
+    ...(agentId ? { agentId } : {}),
+    ...(agentPath ? { agentPath } : {}),
+    ...(agentName ? { agentName } : {}),
+  };
 }
 
 function readCodexRolloutUserMessage(payload: Record<string, any>): string | undefined {
@@ -386,6 +397,7 @@ async function readCodexChildSubagentRolloutSnapshot(
   if (!agentId) return null;
   return {
     agentId,
+    ...(spawn.agentPath ? { agentPath: spawn.agentPath } : {}),
     parentThreadId: spawn.parentThreadId,
     rolloutPath,
     ...(cwd ? { cwd } : {}),
@@ -1759,11 +1771,34 @@ function readRawSpawnAgentId(record: Record<string, any>): string | undefined {
     ?? meaningfulString(record.id);
 }
 
+function readRawSpawnAgentPath(
+  call: CodexRawSpawnAgentCall,
+  output: Record<string, any>,
+): string | undefined {
+  // Codex collaboration v2 returns only `task_name: "/root/<name>"`; older
+  // builds returned a UUID in `agent_id`. Keep the orchestration path as the
+  // stable UI identity and use the UUID separately for runtime correlation.
+  const outputPath = meaningfulString(output.task_name)
+    ?? meaningfulString(output.taskName)
+    ?? meaningfulString(output.agent_path)
+    ?? meaningfulString(output.agentPath);
+  if (outputPath) return outputPath;
+  // An input task name is only a requested path. Treat it as accepted when an
+  // older successful response supplied a runtime id; otherwise a failed spawn
+  // would be misreported as a running child.
+  if (!readRawSpawnAgentId(output)) return undefined;
+  return meaningfulString(call.args.task_name)
+    ?? meaningfulString(call.args.taskName)
+    ?? meaningfulString(call.args.agent_path)
+    ?? meaningfulString(call.args.agentPath);
+}
+
 function buildRawSpawnAgentRuntimePayload(
   call: CodexRawSpawnAgentCall,
   output: Record<string, any>,
 ): Record<string, any> {
   const agentId = readRawSpawnAgentId(output);
+  const agentPath = readRawSpawnAgentPath(call, output);
   const agentName = meaningfulString(output.nickname)
     ?? meaningfulString(output.name)
     ?? meaningfulString(call.args.nickname)
@@ -1778,6 +1813,7 @@ function buildRawSpawnAgentRuntimePayload(
     ?? meaningfulString(call.args.agent_id);
   return {
     ...(agentId ? { agent_id: agentId } : {}),
+    ...(agentPath ? { agent_path: agentPath } : {}),
     status: 'running',
     ...(agentName ? { nickname: agentName } : {}),
     ...(prompt ? { prompt } : {}),
@@ -3536,12 +3572,23 @@ export class CodexSdkProvider implements TransportProvider {
     for (const snapshot of sessionSnapshots) rememberSnapshot(snapshot);
     for (const snapshot of snapshots) {
       if (state.childSubagentRolloutCompletedIds.has(snapshot.agentId)) continue;
-      const existing = this.trackedSubagentThreads.get(snapshot.agentId);
+      const existingById = this.trackedSubagentThreads.get(snapshot.agentId);
+      const existingByPath = snapshot.agentPath
+        ? [...this.trackedSubagentThreads.values()].find((candidate) => (
+            candidate.sessionId === sessionId && candidate.agentPath === snapshot.agentPath
+          ))
+        : undefined;
+      const existing = existingById ?? existingByPath;
       const tracked: CodexTrackedSubagentThread = existing ?? {
         sessionId,
         callId: `rollout:${snapshot.agentId}`,
         agentId: snapshot.agentId,
       };
+      if (existing && existing.agentId !== snapshot.agentId) {
+        this.trackedSubagentThreads.delete(existing.agentId);
+      }
+      tracked.agentId = snapshot.agentId;
+      tracked.agentPath = snapshot.agentPath ?? tracked.agentPath;
       tracked.agentName = snapshot.agentName ?? tracked.agentName;
       tracked.prompt = snapshot.prompt ?? tracked.prompt;
       tracked.model = snapshot.model ?? tracked.model;
@@ -3674,11 +3721,14 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     const agentId = readRawSpawnAgentId(outputRecord);
-    if (agentId) {
-      this.trackedSubagentThreads.set(agentId, {
+    const agentPath = readRawSpawnAgentPath(call, outputRecord);
+    const trackingId = agentId ?? agentPath;
+    if (trackingId) {
+      this.trackedSubagentThreads.set(trackingId, {
         sessionId: call.sessionId,
         callId,
-        agentId,
+        agentId: trackingId,
+        ...(agentPath ? { agentPath } : {}),
         startedAtMs: call.startedAtMs,
         agentName: meaningfulString(outputRecord.nickname)
           ?? meaningfulString(outputRecord.name)
@@ -3712,6 +3762,7 @@ export class CodexSdkProvider implements TransportProvider {
   private emitTrackedSubagentSnapshot(tracked: CodexTrackedSubagentThread, status: unknown): ToolCallEvent | null {
     const tool = runtimeSubagentToolFromPayload(tracked.sessionId, {
       agent_id: tracked.agentId,
+      ...(tracked.agentPath ? { agent_path: tracked.agentPath } : {}),
       status,
       ...(tracked.agentName ? { nickname: tracked.agentName } : {}),
       ...(tracked.prompt ? { prompt: tracked.prompt } : {}),
