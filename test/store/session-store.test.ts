@@ -54,13 +54,15 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
 }
 
 async function importSessionStore() {
-  // Coverage runs reuse workers across files that install partial mocks of
-  // session-store. The hoisted unmock above protects initial collection, while
-  // this runtime unmock protects every import after vi.resetModules(). Both are
-  // required: a later worker-local mock registration must not turn a reload
-  // into another test's partial module shape.
-  vi.doUnmock('../../src/store/session-store.js');
-  return import('../../src/store/session-store.js');
+  // Full-suite workers can inherit partial session-store mocks from other test
+  // files. `doUnmock` followed by a dynamic import is still order-sensitive in
+  // Node 22 worker reuse: a concurrently registered mock can win before module
+  // resolution and return only that mock's partial exports. `importActual`
+  // bypasses the mock registry for this import by contract, while resetModules
+  // below still gives each test a fresh real store instance.
+  return vi.importActual<typeof import('../../src/store/session-store.js')>(
+    '../../src/store/session-store.js',
+  );
 }
 
 beforeEach(() => {
