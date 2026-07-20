@@ -15,6 +15,7 @@ import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 import { dispatchJobNow } from '../cron/job-dispatch.js';
 import { WsBridge } from '../ws/bridge.js';
 import { RESOURCE_TOPICS } from '../../../shared/resource-events.js';
+import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 
 type CronRouteEnv = { Bindings: Env; Variables: { userId: string; role: string; cronDaemonLocal?: boolean } };
 
@@ -91,6 +92,14 @@ function getPodStickyServerId(c: { req: { param: (name: string) => string | unde
 function withPodStickyServerId(body: unknown, serverId: string | null): unknown {
   if (!serverId || !body || typeof body !== 'object' || Array.isArray(body)) return body;
   return { ...(body as Record<string, unknown>), serverId };
+}
+
+function withClientTimezone(body: unknown, timezone: string | undefined): unknown {
+  const normalizedTimezone = timezone?.trim();
+  if (!normalizedTimezone || !body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const record = body as Record<string, unknown>;
+  if (record.timezone !== undefined) return body;
+  return { ...record, timezone: normalizedTimezone };
 }
 
 function isWrongPodStickyServer(jobServerId: string, routeServerId: string | null): boolean {
@@ -193,7 +202,11 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const body = await c.req.json().catch(() => null);
-  const parsed = cronJobCreateSchema.safeParse(withPodStickyServerId(body, routeServerId));
+  const requestBody = withClientTimezone(
+    withPodStickyServerId(body, routeServerId),
+    c.req.header(CLIENT_TIMEZONE_HEADER),
+  );
+  const parsed = cronJobCreateSchema.safeParse(requestBody);
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
   const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, timezone, expiresAt } = parsed.data;
@@ -229,7 +242,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   const body = await c.req.json().catch(() => null);
-  const parsed = cronJobUpdateSchema.safeParse(body);
+  const parsed = cronJobUpdateSchema.safeParse(withClientTimezone(body, c.req.header(CLIENT_TIMEZONE_HEADER)));
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
   const job = await c.env.DB.queryOne<DbCronJob>(

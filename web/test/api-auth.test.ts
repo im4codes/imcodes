@@ -388,11 +388,13 @@ describe('auth nonce exchange API', () => {
 
     const browserHeaders = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
     expect(browserHeaders.get('X-CSRF-Token')).toBe('csrf token');
+    expect(browserHeaders.get('x-client-timezone')).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
     expect(browserHeaders.has('Authorization')).toBe(false);
     expect((fetchMock.mock.calls[0][1] as RequestInit).credentials).toBe('include');
 
     const nativeHeaders = new Headers((fetchMock.mock.calls[1][1] as RequestInit).headers);
     expect(nativeHeaders.get('Authorization')).toBe('Bearer native-key-1');
+    expect(nativeHeaders.get('x-client-timezone')).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
     expect(nativeHeaders.has('X-CSRF-Token')).toBe(false);
     expect((fetchMock.mock.calls[1][1] as RequestInit).credentials).toBe('omit');
 

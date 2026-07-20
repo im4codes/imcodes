@@ -18,6 +18,7 @@
  * 5. /api/auth/token-exchange MUST be exempt from CSRF (native app has no CSRF token pre-login)
  * 6. /api/auth/password/login MUST be exempt from CSRF
  * 7. /api/auth/password/register MUST be exempt from CSRF
+ * 8. CORS MUST allow the device timezone header used by browser/native cron writes
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createDatabase, type Database } from '../src/db/client.js';
@@ -93,6 +94,7 @@ describe('iOS CORS compatibility', () => {
     expect(allowHeaders).toContain('x-platform');
     expect(allowHeaders).toContain('x-app-version');
     expect(allowHeaders).toContain('x-bundle-version');
+    expect(allowHeaders).toContain('x-client-timezone');
   });
 
   it('⚠️ MUST allow capacitor://localhost origin', async () => {

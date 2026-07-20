@@ -712,6 +712,26 @@ describe('Cron API routes', () => {
   // ── Timezone support ──────────────────────────────────────────────────
 
   describe('POST /api/cron (timezone)', () => {
+    it('defaults new browser and app jobs to the client device timezone header', async () => {
+      const res = await app.request('/api/cron', {
+        ...jsonReq('POST', '', {
+          name: 'device-tz-create',
+          cronExpr: '0 9 * * *',
+          serverId: 'srv-1',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: 'hello' },
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-client-timezone': 'Asia/Tokyo',
+        },
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('Asia/Tokyo');
+    });
+
     it('accepts timezone and stores it', async () => {
       const res = await app.request('/api/cron', jsonReq('POST', '', {
         name: 'tz-test',
@@ -753,7 +773,7 @@ describe('Cron API routes', () => {
       expect(body1.nextRunAt).not.toBe(body2.nextRunAt);
     });
 
-    it('works without timezone (defaults to server time)', async () => {
+    it('keeps legacy and daemon callers without client timezone backward compatible', async () => {
       const res = await app.request('/api/cron', jsonReq('POST', '', {
         name: 'no-tz',
         cronExpr: '0 9 * * *',
@@ -765,6 +785,41 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, unknown>;
       expect(body.timezone).toBeNull();
+    });
+
+    it('defaults updates to the current client device timezone and recalculates the schedule', async () => {
+      mockDb.cronJobs.set('job-device-tz-update', {
+        id: 'job-device-tz-update',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'device update',
+        cron_expr: '0 9 * * *',
+        project_name: 'proj',
+        target_role: 'brain',
+        target_session_name: null,
+        action: JSON.stringify({ type: 'command', command: 'hello' }),
+        timezone: 'UTC',
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: 1,
+        expires_at: null,
+        created_at: 1,
+        updated_at: 1,
+      });
+      const executeSpy = vi.spyOn(mockDb.db, 'execute');
+
+      const res = await app.request('/api/cron/job-device-tz-update', {
+        ...jsonReq('PUT', '', { name: 'updated on device' }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-client-timezone': 'America/Los_Angeles',
+        },
+      });
+
+      expect(res.status).toBe(200);
+      const updateCall = executeSpy.mock.calls.find(([sql]) => String(sql).includes('UPDATE cron_jobs SET'));
+      expect(updateCall?.[0]).toContain('timezone =');
+      expect(updateCall?.[0]).toContain('next_run_at =');
+      expect(updateCall?.[1]).toContain('America/Los_Angeles');
     });
   });
 });

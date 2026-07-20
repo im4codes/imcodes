@@ -264,6 +264,7 @@ describe('CronManager', () => {
     expect(payload).toMatchObject({
       name: 'Direct check',
       cronExpr: '0 11 * * *',
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       targetRole: 'brain',
       targetSessionName: 'deck_sub_52123h2r',
       action: {
@@ -456,6 +457,8 @@ describe('CronManager', () => {
       method: 'PUT',
       body: expect.stringContaining('"topic":"Updated topic"'),
     }));
+    const updateCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron/edit-job');
+    expect(JSON.parse(String(updateCall?.[1]?.body)).timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
   });
 
   it('opens job history, execution details, p2p discussions, and session navigation links', async () => {
