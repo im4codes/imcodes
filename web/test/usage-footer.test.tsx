@@ -16,7 +16,6 @@ vi.mock('react-i18next', () => ({
       const translations: Record<string, string> = {
         'session.state_idle': 'Agent idle — waiting for input',
         'session.state_running': 'Agent working...',
-        'session.state_running_detail': 'Agent working: {{detail}}',
         'session.state_error': 'Session error',
         'session.state_error_detail': 'Error: {{error}}',
         'session.state_stop_requested': 'Stop requested',
@@ -144,18 +143,21 @@ describe('UsageFooter', () => {
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
   });
 
-  it('shows transport activity detail when running is blocked by a specific reason', () => {
+  it('hides internal transport activity reasons from the user-facing working status', () => {
     const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
         sessionName="deck_test_brain"
         sessionState="running"
-        transportActivityDetail="provider_compaction"
+        transportActivityDetail="runtime_dispatch, act, provider_compaction"
       />,
     );
 
     const liveStatus = container.querySelector('.session-live-status-inline.running');
-    expect(liveStatus?.textContent).toContain('Agent working: provider_compaction');
+    expect(liveStatus?.textContent).toContain('Agent working...');
+    expect(liveStatus?.textContent).not.toContain('runtime_dispatch');
+    expect(liveStatus?.textContent).not.toContain('act');
+    expect(liveStatus?.textContent).not.toContain('provider_compaction');
   });
 
   it('shows the concrete session error reason from the session summary', () => {
