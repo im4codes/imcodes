@@ -81,7 +81,7 @@ type MockProviderError = { code: string; message: string; recoverable: boolean; 
 type ErrorCb = (sessionId: string, error: MockProviderError) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
-type UsageCb = (sessionId: string, update: { messageId?: string; usage?: Record<string, unknown>; model?: string }) => void;
+type UsageCb = (sessionId: string, update: { messageId?: string; finalized?: boolean; usage?: Record<string, unknown>; model?: string }) => void;
 type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
@@ -108,7 +108,7 @@ function makeMockProvider() {
     fireError: (sid: string, err: MockProviderError) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
-    fireUsage: (sid: string, update: { messageId?: string; usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
+    fireUsage: (sid: string, update: { messageId?: string; finalized?: boolean; usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
     fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
@@ -511,17 +511,23 @@ describe('transport-relay (timeline-emitter based)', () => {
       });
     });
 
-    it('correlates a late provider usage frame with its completed message id', () => {
+    it('persists a finalized late provider usage frame on its completed message id', () => {
       const { provider, fireUsage } = makeMockProvider();
       wireProviderToRelay(provider);
 
       fireUsage('sess-1', {
         messageId: 'msg-late-usage',
+        finalized: true,
         model: 'MiniMax-M3',
         usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
       });
 
       const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        streaming: false,
+      });
       expect(usageCall?.[3]).toMatchObject({
         eventId: 'transport:sess-1:msg-late-usage:usage',
       });
@@ -595,6 +601,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       }));
       fireUsage('sess-1', {
         messageId: 'msg-result-usage',
+        finalized: true,
         model: 'MiniMax-M3',
         usage: { input_tokens: 14_000, cache_read_input_tokens: 710_000 },
       });
@@ -611,6 +618,7 @@ describe('transport-relay (timeline-emitter based)', () => {
         cacheTokens: 710_000,
         contextWindow: 1_000_000,
         contextWindowSource: 'preset',
+        streaming: false,
       });
       expect(usageCalls[0]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
       expect(usageCalls[1]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });

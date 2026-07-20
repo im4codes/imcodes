@@ -1209,6 +1209,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           state,
           assistantUsage,
           assistantMessageId ?? state.currentMessageId ?? undefined,
+          state.completed,
         );
       }
       // includePartialMessages can emit message_delta(end_turn) and then flush
@@ -1330,7 +1331,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // completion. A newly-started follow-up has completed=false, so a stale
         // predecessor result cannot overwrite the new turn's usage.
         if (!msg.is_error && !state.lastAssistantUsage) {
-          this.recordClaudeUsage(sessionId, state, msg.usage, state.lastCompletedMessageId);
+          this.recordClaudeUsage(sessionId, state, msg.usage, state.lastCompletedMessageId, true);
         }
         state.started = true;
         return;
@@ -1399,6 +1400,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state: ClaudeSdkSessionState,
     usage: unknown,
     messageId?: string,
+    finalized = false,
   ): void {
     const normalizedUsage = normalizeClaudeUsageSnapshot(usage);
     if (!normalizedUsage) return;
@@ -1424,6 +1426,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.lastAssistantUsage = effectiveUsage;
     for (const cb of this.usageCallbacks) cb(sessionId, {
       ...(messageId ? { messageId } : {}),
+      ...(finalized ? { finalized: true } : {}),
       usage: { ...effectiveUsage },
       ...(state.model ? { model: state.model } : {}),
     });

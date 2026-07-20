@@ -836,6 +836,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
     if (usagePayload) {
       const tracked = inFlightMessages.get(sessionName);
+      const finalized = update.finalized === true;
       const providerMessageId = typeof update.messageId === 'string' && update.messageId
         ? update.messageId
         : undefined;
@@ -844,7 +845,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         : `${tracked?.eventId ?? `transport:${sessionName}:usage`}:usage`;
       timelineEmitter.emit(sessionName, 'usage.update', {
         ...usagePayload,
-        streaming: true,
+        // A full Claude assistant/result frame can arrive after the terminal
+        // stream boundary. Its cache split is newer and more authoritative
+        // than the aggregate getContextUsage() snapshot already persisted by
+        // onComplete, so emit it as a terminal replacement with the same id.
+        // Ordinary live-meter updates remain streaming-only and disk-free.
+        streaming: !finalized,
       }, { source: 'daemon', confidence: 'high', eventId: usageEventId });
     }
   });

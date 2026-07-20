@@ -408,6 +408,12 @@ export interface ProviderRolloutCompletionReconcileOptions {
 export interface ProviderUsageUpdate {
   /** Provider message id used to keep a late usage frame correlated to its turn. */
   messageId?: string;
+  /**
+   * The provider has supplied a stable usage snapshot for an already-completed
+   * message. Relays must persist this correction instead of treating it as a
+   * transient live meter update.
+   */
+  finalized?: boolean;
   /** Provider-native usage fields normalized enough for the daemon relay. */
   usage?: {
     input_tokens?: number;

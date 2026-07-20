@@ -358,6 +358,7 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(completed).toHaveLength(1);
     expect(usageUpdates).toEqual([{
       messageId: 'msg-late-usage',
+      finalized: true,
       model: 'MiniMax-M3',
       usage: {
         input_tokens: 12_000,
@@ -422,6 +423,7 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(completed).toHaveLength(1);
     expect(usageUpdates).toEqual([{
       messageId: 'msg-result-usage',
+      finalized: true,
       model: 'MiniMax-M3',
       usage: {
         input_tokens: 14_000,
