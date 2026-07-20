@@ -1551,6 +1551,69 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(tool?.detail?.raw).toBeUndefined();
   });
 
+  it('does not expose local_bash task lifecycle events as subagents or wake the retained parent', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-local-bash-task', model: 'MiniMax-M3' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-local-bash-task',
+        uuid: 'uuid-local-bash-start',
+        task_id: 'bp1xwk3v9',
+        tool_use_id: 'call-local-bash',
+        description: 'Search for income user rec references',
+        task_type: 'local_bash',
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-local-bash-task',
+        parent_tool_use_id: null,
+        message: { id: 'message-local-bash-parent', content: [{ type: 'text', text: 'Waiting for Explore agents' }], stop_reason: 'end_turn' },
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-local-bash-task',
+        uuid: 'uuid-local-bash-complete',
+        task_id: 'bp1xwk3v9',
+        status: 'completed',
+        summary: 'Search for income user rec references',
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-local-bash-task',
+      sessionName: 'deck_project_claude_local_bash',
+      cwd: '/tmp/project',
+      resumeId: 'session-local-bash-task',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, message) => completed.push(message));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-local-bash-task', 'hello');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sdkMock.runs[0]?.closed).toBe(true);
+    expect(completed.map((message) => message.content)).toEqual(['Waiting for Explore agents']);
+    expect(sdkSubagentTools(tools)).toEqual([]);
+    expect(provider.getActiveWorkSnapshot('route-local-bash-task')).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(provider.getSessionDiagnostics('route-local-bash-task')).toMatchObject({
+      completed: true,
+      retainedSubagentMode: false,
+    });
+  });
+
   it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {
     const previousStaleMs = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
     process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = '1000';

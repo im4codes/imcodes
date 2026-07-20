@@ -298,6 +298,8 @@ interface ClaudeTaskState {
   parentWakeHandled?: boolean;
 }
 
+const CLAUDE_LOCAL_BASH_TASK_TYPE = 'local_bash';
+
 type ClaudeToolBlock = {
   type: 'tool_use' | 'server_tool_use' | 'mcp_tool_use';
   id?: string;
@@ -1621,6 +1623,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const task = existing ?? this.createClaudeTaskState(sessionId, state, taskId);
     if (!existing) state.subagentTasks.set(taskId, task);
     task.lastUpdatedAt = Date.now();
+    task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
 
     const toolUseId = this.pickString(msg.tool_use_id);
     if (toolUseId) task.toolUseId = toolUseId;
@@ -1628,7 +1631,6 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (msg.subtype === 'task_started') {
       task.description = this.pickShortString(msg.description) ?? task.description;
       task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
-      task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
       task.workflowName = this.pickShortString(msg.workflow_name) ?? task.workflowName;
       this.applyClaudeTaskStatus(task, 'running');
     } else if (msg.subtype === 'task_progress') {
@@ -1652,6 +1654,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
       this.applyClaudeTaskStatus(task, this.pickString(msg.status));
     }
+
+    // Claude SDK also reports every background Bash command as a task with
+    // task_type=local_bash. Those commands already have ordinary Bash tool
+    // events and are implementation details of the real local_agent task.
+    // Treating them as subagents creates one parent wake per command, causing
+    // compatible models to receive dozens of unrelated short task IDs. Keep
+    // the lifecycle state only to recognize later updates, but do not expose it
+    // as a subagent or wake the retained parent query.
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) return;
 
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
@@ -2008,6 +2019,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const staleMs = getSubagentStaleWithoutTerminalMs();
     let expired = 0;
     for (const task of state.subagentTasks.values()) {
+      if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) continue;
       if (!task.active || task.terminal) continue;
       if (now - task.lastUpdatedAt < staleMs) continue;
       task.rawStatus = 'stale';
@@ -2033,7 +2045,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
-    return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
+    return Array.from(state.subagentTasks.values()).filter((task) => (
+      task.taskType !== CLAUDE_LOCAL_BASH_TASK_TYPE
+      && task.active
+      && !task.terminal
+    ));
   }
 
   /**
