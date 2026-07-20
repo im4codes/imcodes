@@ -6,6 +6,7 @@
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { CLIENT_TIMEZONE_HEADER } from '@shared/http-header-names.js';
+import { normalizeClientTimezone } from '@shared/client-timezone.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type {
@@ -301,7 +302,7 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
   }
   if (!headers.has(CLIENT_TIMEZONE_HEADER)) {
     try {
-      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone?.trim();
+      const timezone = normalizeClientTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
       if (timezone) headers.set(CLIENT_TIMEZONE_HEADER, timezone);
     } catch { /* restricted or incomplete Intl runtime — cron writes still carry their explicit body value */ }
   }

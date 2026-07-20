@@ -95,6 +95,7 @@ describe('iOS CORS compatibility', () => {
     expect(allowHeaders).toContain('x-app-version');
     expect(allowHeaders).toContain('x-bundle-version');
     expect(allowHeaders).toContain('x-client-timezone');
+    expect(allowHeaders).toContain('x-device-timezone');
   });
 
   it('⚠️ MUST allow capacitor://localhost origin', async () => {

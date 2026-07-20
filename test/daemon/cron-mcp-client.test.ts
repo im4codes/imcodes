@@ -8,6 +8,7 @@ import {
   cronMcpUpdateSelf,
 } from '../../src/daemon/cron-mcp-client.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 
 const endpoint = {
   serverId: 'srv-bound',
@@ -50,7 +51,7 @@ describe('cron MCP client', () => {
       serverId: 'srv-forged',
       token: 'tok-forged',
       actorId: 'actor-forged',
-    }), { ...boundIdentity, fetchImpl });
+    }), { ...boundIdentity, fetchImpl, deviceTimezone: 'America/Denver' });
 
     expect(result.status).toBe('ok');
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -58,12 +59,14 @@ describe('cron MCP client', () => {
     expect(url).toBe('https://worker.test/api/server/srv-bound/cron');
     expect(url).not.toContain('/api/cron');
     expect(init.headers).toMatchObject({ 'X-Server-Id': 'srv-bound' });
+    expect(init.headers).toMatchObject({ [DEVICE_TIMEZONE_HEADER]: 'America/Denver' });
     expect(init.headers).not.toHaveProperty('Authorization');
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(body.serverId).toBe('srv-bound');
     expect(body.userId).toBeUndefined();
     expect(body.token).toBeUndefined();
     expect(body.actorId).toBeUndefined();
+    expect(body.timezone).toBeUndefined();
   });
 
   it('attaches runtime-derived source provenance to structured send actions', async () => {

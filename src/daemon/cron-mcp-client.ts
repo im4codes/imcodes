@@ -3,6 +3,8 @@ import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance } from '../../shared/memory-mcp-provenance.js';
 import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags.js';
 import { validateMcpCronAction } from './cron-action-validator.js';
+import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
+import { normalizeClientTimezone } from '../../shared/client-timezone.js';
 
 const CRON_EXPIRES_AT_MAX_MS = 90 * 24 * 60 * 60 * 1000;
 const CRON_LIST_LIMIT_MAX = 100;
@@ -20,6 +22,7 @@ export interface CronMcpClientOptions {
   nowMs?: () => number;
   runtimeServerId?: string | null;
   timeoutMs?: number;
+  deviceTimezone?: string | null;
 }
 
 export interface CronCreateInput extends MemoryMcpSourceProvenance {
@@ -180,12 +183,18 @@ async function requestCron(
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const deviceTimezone = normalizeClientTimezone(
+    options.deviceTimezone !== undefined
+      ? options.deviceTimezone
+      : Intl.DateTimeFormat().resolvedOptions().timeZone,
+  );
   try {
     const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix), {
       ...init,
       headers: {
         'X-Server-Id': runtimeServerId,
         'Content-Type': 'application/json',
+        ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
         ...init.headers,
       },
       signal: controller.signal,

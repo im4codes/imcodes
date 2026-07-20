@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { CRON_STATUS } from '../../shared/cron-types.js';
+import { CLIENT_TIMEZONE_PREF_KEY } from '../../shared/client-timezone.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -51,6 +52,7 @@ interface MockRow {
 function makeMockDb() {
   const cronJobs = new Map<string, MockRow>();
   const cronExecutions: MockRow[] = [];
+  const userPrefs = new Map<string, string>();
 
   function normalize(sql: string): string {
     return sql.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -64,6 +66,11 @@ function makeMockDb() {
         const job = cronJobs.get(params[0] as string);
         if (job && job.user_id === params[1]) return job as T;
         return null;
+      }
+
+      if (s.includes('from user_preferences where user_id')) {
+        const value = userPrefs.get(`${String(params[0])}:${String(params[1])}`);
+        return (value === undefined ? null : { value }) as T | null;
       }
 
       return null;
@@ -131,6 +138,10 @@ function makeMockDb() {
         // no-op
       }
 
+      if (s.includes('insert into user_preferences')) {
+        userPrefs.set(`${String(params[0])}:${String(params[1])}`, String(params[2]));
+      }
+
       return { changes: 1 };
     },
 
@@ -138,7 +149,7 @@ function makeMockDb() {
     close: async () => {},
   } as unknown as Database;
 
-  return { db, cronJobs, cronExecutions };
+  return { db, cronJobs, cronExecutions, userPrefs };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -730,6 +741,48 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, unknown>;
       expect(body.timezone).toBe('Asia/Tokyo');
+      expect(mockDb.userPrefs.get(`user-1:${CLIENT_TIMEZONE_PREF_KEY}`)).toBe(JSON.stringify('Asia/Tokyo'));
+    });
+
+    it('uses the last browser or app timezone for an agent MCP create before daemon device fallback', async () => {
+      mockDb.userPrefs.set(`user-1:${CLIENT_TIMEZONE_PREF_KEY}`, JSON.stringify('Europe/Berlin'));
+      const res = await app.request('/api/cron', {
+        ...jsonReq('POST', '', {
+          name: 'agent-create',
+          cronExpr: '0 9 * * *',
+          serverId: 'srv-1',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: 'hello' },
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-timezone': 'America/Los_Angeles',
+        },
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('Europe/Berlin');
+    });
+
+    it('falls back to the daemon device timezone when no browser or app timezone is known', async () => {
+      const res = await app.request('/api/cron', {
+        ...jsonReq('POST', '', {
+          name: 'agent-device-fallback',
+          cronExpr: '0 9 * * *',
+          serverId: 'srv-1',
+          projectName: 'proj',
+          targetRole: 'brain',
+          action: { type: 'command', command: 'hello' },
+        }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-device-timezone': 'America/Los_Angeles',
+        },
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('America/Los_Angeles');
     });
 
     it('accepts timezone and stores it', async () => {
