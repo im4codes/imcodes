@@ -54,7 +54,7 @@ import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
-import { decodeImcodesSendNewlineEscapes } from '@shared/imcodes-send.js';
+import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -3093,7 +3093,7 @@ const AssistantBlock = memo(function AssistantBlock({
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
+      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
       <ChatTime ts={ts} />
     </div>
   );
@@ -3201,15 +3201,7 @@ const ChatEvent = memo(function ChatEvent({
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
-      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
-      const clientMessageId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId : undefined;
-      const isInterAgentSend = [commandId, clientMessageId, event.eventId]
-        .some((value) => typeof value === 'string' && value.includes('send_message_'));
-      const retryText = isInterAgentSend ? decodeImcodesSendNewlineEscapes(rawUserText) : rawUserText;
-      // Compatibility for messages persisted before CLI send decoded newline
-      // escapes at ingress. Restrict this to inter-agent send ids so ordinary
-      // user/source-code messages containing a literal `\n` stay verbatim.
-      let userText = retryText;
+      let userText = parseTimelineDisplayText(rawUserText);
       const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges
       if (attachments && attachments.length > 0) {
@@ -3220,6 +3212,7 @@ const ChatEvent = memo(function ChatEvent({
       const isPending = !!event.payload.pending;
       const isFailed = !!event.payload.failed;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
+      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
       return (
@@ -3263,7 +3256,7 @@ const ChatEvent = memo(function ChatEvent({
                 <button
                   type="button"
                   class="chat-user-retry-btn"
-                  onClick={() => onResendFailed(commandId, retryText)}
+                  onClick={() => onResendFailed(commandId, rawUserText)}
                 >
                   {t('chat.retrySend', 'Retry')}
                 </button>

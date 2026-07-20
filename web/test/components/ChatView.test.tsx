@@ -309,40 +309,69 @@ describe('ChatView', () => {
     expect(screen.queryByText('chat.user_message_expand')).toBeNull();
   });
 
-  it('renders legacy inter-agent send newline escapes as real timeline line breaks only for send_message ids', () => {
+  it('parses escaped newlines for timeline display while preserving code examples', () => {
+    const rawText = 'Task: inspect\\n\\nContext:\\n- one\\nsource: `"a\\nb"`';
     const { container } = render(
       <ChatView
-        events={[
-          {
-            eventId: 'transport-user:send_message_legacy',
-            type: 'user.message',
-            ts: 1_700_000_000_000,
-            payload: {
-              text: String.raw`Task: inspect\n\nContext:\n- one`,
-              commandId: 'send_message_legacy',
-              clientMessageId: 'send_message_legacy',
-              allowDuplicate: true,
-            },
-          },
-          {
-            eventId: 'ordinary-user-message',
-            type: 'user.message',
-            ts: 1_700_000_000_001,
-            payload: { text: String.raw`source example: "a\nb"` },
-          },
-        ] as any}
+        events={[{
+          eventId: 'ordinary-user-message',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: rawText },
+        }] as any}
         loading={false}
         hasOlderHistory={false}
-        sessionId="deck_legacy_inter_agent_newline"
+        sessionId="deck_timeline_display_newline"
       />,
     );
 
-    const messages = [...container.querySelectorAll('.chat-user-message-fold-content')]
-      .map((element) => element.textContent);
-    expect(messages).toEqual([
-      'Task: inspect\n\nContext:\n- one',
-      String.raw`source example: "a\nb"`,
-    ]);
+    expect(container.querySelector('.chat-user-message-fold-content')?.textContent)
+      .toBe('Task: inspect\n\nContext:\n- one\nsource: `"a\\nb"`');
+  });
+
+  it('keeps the original timeline payload when retrying a failed message', () => {
+    const onResendFailed = vi.fn();
+    const rawText = String.raw`Task: inspect\nContext: retry`;
+    render(
+      <ChatView
+        events={[{
+          eventId: 'failed-user-message',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: {
+            text: rawText,
+            commandId: 'failed-command',
+            failed: true,
+          },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_timeline_retry_raw"
+        onResendFailed={onResendFailed}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.retrySend' }));
+
+    expect(onResendFailed).toHaveBeenCalledWith('failed-command', rawText);
+  });
+
+  it('parses escaped newlines before rendering assistant timeline markdown', () => {
+    render(
+      <ChatView
+        events={[{
+          eventId: 'assistant-display-newline',
+          type: 'assistant.text',
+          ts: 1_700_000_000_000,
+          payload: { text: 'First\\nSecond with `code\\nvalue`' },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_assistant_display_newline"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy).toHaveBeenCalledWith('First\nSecond with `code\\nvalue`');
   });
 
   it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
