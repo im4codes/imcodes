@@ -36,6 +36,9 @@ vi.mock('react-i18next', () => ({
         'chat.sdk_agents_provider_claude': 'Claude SDK',
         'chat.sdk_agents_provider_codex': 'Codex SDK',
         'chat.sdk_agents_provider_unknown': 'SDK agent',
+        'chat.sdk_agents_task_bash': 'Bash / Shell',
+        'chat.sdk_agents_task_agent': 'Agent',
+        'chat.sdk_agents_task_background': 'Background task',
         'chat.sdk_agents_status_running': 'Running',
         'chat.sdk_agents_status_complete': 'Complete',
         'chat.sdk_agents_status_unknown': 'Unknown',
@@ -137,6 +140,32 @@ describe('ChatView SDK agents panel', () => {
     localStorage.clear();
     showToolCallsPref.value = false;
     vi.useRealTimers();
+  });
+
+  it('shows Bash and true Agent work together while labeling their backend task kinds', () => {
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
+    const bashEvent = makeSdkEvent('bash-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:bash-1',
+      taskId: 'bash-1',
+      taskType: 'local_bash',
+      childStatusSummary: 'Indexing files',
+    }));
+    const agentEvent = makeSdkEvent('agent-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:agent-1',
+      taskId: 'agent-1',
+      taskType: 'local_agent',
+      childStatusSummary: 'Reviewing changes',
+    }));
+
+    const { container } = render(
+      <ChatView events={[bashEvent, agentEvent]} loading={false} sessionId="deck_agents" />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 2 running' })).toBeTruthy();
+    expect(screen.getByText('Indexing files')).toBeTruthy();
+    expect(screen.getByText('Reviewing changes')).toBeTruthy();
+    expect(Array.from(container.querySelectorAll('.chat-sdk-agent-task-kind')).map((node) => node.textContent))
+      .toEqual(['Bash / Shell', 'Agent']);
   });
 
   it('renders the Agents toggle immediately before refresh and shows the running badge', () => {

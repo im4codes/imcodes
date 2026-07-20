@@ -2983,6 +2983,7 @@ html.native-ios-mac .chat-dl-btn {
 .chat-sdk-agent-row.status-unknown { border-left-color: #f59e0b; }
 .chat-sdk-agent-row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .chat-sdk-agent-provider { min-width: 0; color: #dbeafe; font-size: 12px; font-weight: 700; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agent-task-kind { flex: 0 0 auto; border: 1px solid rgba(96, 165, 250, 0.28); border-radius: 999px; padding: 1px 6px; color: #bfdbfe; background: rgba(30, 64, 175, 0.18); font-size: 9px; font-weight: 800; line-height: 1.3; white-space: nowrap; }
 .chat-sdk-agent-status { flex: 0 0 auto; color: #94a3b8; font-size: 10px; font-weight: 800; line-height: 1.2; text-transform: uppercase; }
 .chat-sdk-agent-summary { color: #cbd5e1; font-size: 12px; line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }
 .chat-sdk-agent-detail { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: start; color: #94a3b8; font-size: 10px; line-height: 1.25; min-width: 0; }

@@ -41,6 +41,7 @@ export interface SdkSubagentStatusRow {
   agentName?: string;
   model?: string;
   taskId?: string;
+  taskType?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
   receiverCount?: number;
@@ -223,6 +224,7 @@ function makeRow(event: TimelineEvent, detail: SdkSubagentDetail, order: number)
     agentName: meta.agentName,
     model: meta.model,
     taskId: meta.taskId,
+    taskType: meta.taskType,
     receiverThreadId: meta.receiverThreadId,
     receiverIndex: meta.receiverIndex,
     receiverCount: meta.receiverCount,

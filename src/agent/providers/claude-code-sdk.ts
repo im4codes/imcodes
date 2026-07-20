@@ -165,7 +165,7 @@ interface ClaudeSdkSessionState {
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
   resultCompletionGeneration?: number;
   taskNotificationWakeTimer: ReturnType<typeof setTimeout> | null;
-  pendingTaskNotificationWakes: Map<string, SdkSubagentNormalizedStatus>;
+  pendingTaskNotificationWakes: Map<string, ClaudeTaskWake>;
   /** Once a foreground turn settles while subagents remain active, the SDK
    * query is retained only to carry later user input and task notifications.
    * In this mode top-level terminal assistant messages, rather than trailing
@@ -299,6 +299,12 @@ interface ClaudeTaskState {
 }
 
 const CLAUDE_LOCAL_BASH_TASK_TYPE = 'local_bash';
+const CLAUDE_LOCAL_AGENT_TASK_TYPE = 'local_agent';
+
+interface ClaudeTaskWake {
+  status: SdkSubagentNormalizedStatus;
+  kind: 'bash' | 'agent' | 'task';
+}
 
 type ClaudeToolBlock = {
   type: 'tool_use' | 'server_tool_use' | 'mcp_tool_use';
@@ -1658,15 +1664,6 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.applyClaudeTaskStatus(task, this.pickString(msg.status));
     }
 
-    // Claude SDK also reports every background Bash command as a task with
-    // task_type=local_bash. Those commands already have ordinary Bash tool
-    // events and are implementation details of the real local_agent task.
-    // Treating them as subagents creates one parent wake per command, causing
-    // compatible models to receive dozens of unrelated short task IDs. Keep
-    // the lifecycle state only to recognize later updates, but do not expose it
-    // as a subagent or wake the retained parent query.
-    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) return;
-
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
       if (state.currentQuery && state.completed && state.retainedSubagentMode) {
@@ -1677,7 +1674,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // privacy-safe notification into the retained input channel so every
         // terminal can still wake the parent without reopening "working"
         // forever. parentWakeHandled makes duplicate terminal snapshots inert.
-        state.pendingTaskNotificationWakes.set(taskId, task.normalizedStatus);
+        state.pendingTaskNotificationWakes.set(taskId, {
+          status: task.normalizedStatus,
+          kind: this.claudeTaskKind(task),
+        });
         this.scheduleTaskNotificationWakeFallback(sessionId, state);
       }
     }
@@ -1724,7 +1724,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.pendingTaskNotificationWakes.clear();
         return;
       }
-      const statuses = [...state.pendingTaskNotificationWakes.entries()].map(([taskId, status]) => ({ taskId, status }));
+      const statuses = [...state.pendingTaskNotificationWakes.entries()].map(([taskId, wake]) => ({
+        taskId,
+        status: wake.status,
+        kind: wake.kind,
+      }));
       const inputQueue = state.inputQueue;
       if (!inputQueue) {
         state.pendingTaskNotificationWakes.clear();
@@ -1735,7 +1739,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       inputQueue.push([
         '# IM.codes background task completion',
         'This is a trusted IM.codes runtime notification, not a user-authored instruction.',
-        `Background task terminal states: ${JSON.stringify(statuses)}`,
+        `Background task terminal states (kind=bash means Bash/shell, kind=agent means a true subagent): ${JSON.stringify(statuses)}`,
         'Resume now. Inspect the provider-native task result/history, then report the relevant outcome or failure.',
       ].join('\n'));
       logger.info({
@@ -2022,7 +2026,6 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const staleMs = getSubagentStaleWithoutTerminalMs();
     let expired = 0;
     for (const task of state.subagentTasks.values()) {
-      if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) continue;
       if (!task.active || task.terminal) continue;
       if (now - task.lastUpdatedAt < staleMs) continue;
       task.rawStatus = 'stale';
@@ -2048,11 +2051,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   private activeClaudeSubagentTasks(state: ClaudeSdkSessionState): ClaudeTaskState[] {
-    return Array.from(state.subagentTasks.values()).filter((task) => (
-      task.taskType !== CLAUDE_LOCAL_BASH_TASK_TYPE
-      && task.active
-      && !task.terminal
-    ));
+    return Array.from(state.subagentTasks.values()).filter((task) => task.active && !task.terminal);
   }
 
   /**
@@ -2273,18 +2272,19 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state: ClaudeSdkSessionState,
     task: ClaudeTaskState,
   ): void {
-    const summary = sanitizeSdkSubagentText(task.summary) ?? 'Claude task';
+    const isBashTask = task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE;
+    const summary = sanitizeSdkSubagentText(task.summary) ?? (isBashTask ? 'Claude Bash task' : 'Claude task');
     const meta = this.buildClaudeSubagentMeta(state, task);
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
       summary,
-      ...(task.description ? { input: { action: 'claude-task', description: task.description } } : {}),
+      ...(task.description ? { input: { action: isBashTask ? 'claude-bash-task' : 'claude-task', description: task.description } } : {}),
       ...(task.terminal ? { output: task.error ?? task.summary } : {}),
       meta,
     }, { allowRaw: false });
     const tool: ToolCallEvent = {
       id: task.canonicalKey,
-      name: 'Agent',
+      name: isBashTask ? 'Bash' : 'Agent',
       status: task.normalizedStatus === SDK_SUBAGENT_STATUS.ERROR
         || task.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED
         || task.normalizedStatus === SDK_SUBAGENT_STATUS.UNKNOWN
@@ -2298,6 +2298,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       detail,
     };
     this.emitSubagentToolCall(sessionId, state, tool);
+  }
+
+  private claudeTaskKind(task: ClaudeTaskState): ClaudeTaskWake['kind'] {
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) return 'bash';
+    if (task.taskType === CLAUDE_LOCAL_AGENT_TASK_TYPE || task.taskType === 'agent') return 'agent';
+    return 'task';
   }
 
   private emitClaudeSubagentDiagnostic(

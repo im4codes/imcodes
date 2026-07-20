@@ -31,7 +31,7 @@ const sdkMock = vi.hoisted(() => {
   let waitForClose = false;
   let interruptNeverResolves = false;
   let nextContextUsage: { totalTokens?: number } | null = null;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; contextUsageCalls: number; resolveClose?: () => void }> = [];
+  const runs: Array<{ prompt: string; promptSource: unknown; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; contextUsageCalls: number; resolveClose?: () => void }> = [];
   // The provider drives the SDK in streaming-input mode, so `prompt` is an
   // AsyncIterable<SDKUserMessage>, not a string — that is what lets a message
   // reach a query still running subagents. This mock stands in for the SDK, so it
@@ -44,7 +44,7 @@ const sdkMock = vi.hoisted(() => {
     return typeof content === 'string' ? content : '';
   };
   const query = vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
-    const run = { prompt: readPromptText(prompt), options, closed: false, interrupted: false, stoppedTasks: [] as string[], contextUsageCalls: 0, resolveClose: undefined as (() => void) | undefined };
+    const run = { prompt: readPromptText(prompt), promptSource: prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], contextUsageCalls: 0, resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
     const messages = nextMessageBatches?.shift() ?? nextMessages;
     async function* gen() {
@@ -1553,7 +1553,7 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(tool?.detail?.raw).toBeUndefined();
   });
 
-  it('does not expose local_bash task lifecycle events as subagents or wake the retained parent', async () => {
+  it('surfaces local_bash in the agent process panel and wakes the parent with an explicit Bash kind', async () => {
     vi.useFakeTimers();
     sdkMock.setWaitForClose(true);
     sdkMock.setNextMessages([
@@ -1600,20 +1600,45 @@ describe('ClaudeCodeSdkProvider', () => {
 
     await provider.send('route-local-bash-task', 'hello');
     await vi.advanceTimersByTimeAsync(0);
-    expect(sdkMock.runs[0]?.closed).toBe(true);
+    expect(sdkMock.runs[0]?.closed).toBe(false);
     expect(completed.map((message) => message.content)).toEqual(['Waiting for Explore agents']);
-    expect(sdkSubagentTools(tools)).toEqual([]);
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      name: 'Bash',
+      status: 'complete',
+      input: {
+        action: 'claude-bash-task',
+        description: 'Search for income user rec references',
+      },
+      detail: {
+        meta: {
+          taskId: 'bp1xwk3v9',
+          taskType: 'local_bash',
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
     expect(provider.getActiveWorkSnapshot('route-local-bash-task')).toMatchObject({
-      activeWorkCount: 0,
+      activeWorkCount: 1,
       activeToolCount: 0,
-      busyReasons: [],
+      busyReasons: ['background_monitor'],
     });
 
     await vi.advanceTimersByTimeAsync(1_500);
+    const queuedInputs = (sdkMock.runs[0]?.promptSource as {
+      buffer?: Array<{ message?: { content?: unknown } }>;
+    })?.buffer?.map((entry) => entry.message?.content);
+    expect(queuedInputs).toEqual(expect.arrayContaining([
+      expect.stringContaining('kind=bash means Bash/shell'),
+      expect.stringContaining('"kind":"bash"'),
+    ]));
     expect(provider.getSessionDiagnostics('route-local-bash-task')).toMatchObject({
-      completed: true,
-      retainedSubagentMode: false,
+      completed: false,
+      retainedSubagentMode: true,
+      currentQueryActive: true,
     });
+    await provider.endSession('route-local-bash-task');
   });
 
   it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {

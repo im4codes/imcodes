@@ -102,6 +102,8 @@ export interface SdkSubagentDetailMeta {
   agentName?: string;
   model?: string;
   taskId?: string;
+  /** Provider-native task category, such as Claude's local_bash/local_agent. */
+  taskType?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
   receiverCount?: number;

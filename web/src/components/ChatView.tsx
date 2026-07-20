@@ -19,6 +19,7 @@ import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_STATUS,
 } from '@shared/sdk-subagent-status.js';
@@ -1035,6 +1036,22 @@ function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow
   }
 }
 
+function sdkAgentsTaskKindLabel(t: ChatTranslate, row: SdkSubagentStatusRow): string {
+  if (row.taskType === 'local_bash') return t('chat.sdk_agents_task_bash');
+  if (row.taskType === 'local_agent' || row.taskType === 'agent') return t('chat.sdk_agents_task_agent');
+  switch (row.providerKind) {
+    case SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT:
+      return t('chat.sdk_agents_task_agent');
+    default:
+      return t('chat.sdk_agents_task_background');
+  }
+}
+
 function sdkAgentsStatusLabel(t: ChatTranslate, status: SdkSubagentStatusRow['normalizedStatus'] | SdkSubagentDiagnostic['normalizedStatus']): string {
   switch (status) {
     case SDK_SUBAGENT_STATUS.PENDING:
@@ -1240,6 +1257,7 @@ function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) 
     <div class={`chat-sdk-agent-row ${row.active ? 'active' : 'terminal'} status-${statusClass}`}>
       <div class="chat-sdk-agent-row-top">
         <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, row)}</span>
+        <span class="chat-sdk-agent-task-kind">{sdkAgentsTaskKindLabel(t, row)}</span>
         <span class="chat-sdk-agent-status">{statusLabel}</span>
       </div>
       <div class="chat-sdk-agent-summary">{summary}</div>
