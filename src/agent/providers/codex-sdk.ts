@@ -65,15 +65,18 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-serve
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_ACTIONS,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   buildSdkSubagentSafeDetail,
   isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
   readSdkSubagentStartedAtMs,
+  sanitizeSdkSubagentText,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
@@ -1659,6 +1662,100 @@ function customToolTerminalFromOutput(item: Record<string, any>): {
   return failed
     ? { status: 'error', terminalStatus: 'errored', terminalReason: 'provider_error', output }
     : { status: 'complete', terminalStatus: 'succeeded', terminalReason: 'provider_result', output };
+}
+
+function codexCustomToolScript(tool: ToolCallEvent | undefined): string | undefined {
+  const input = isRecord(tool?.input) ? tool.input : undefined;
+  return meaningfulString(input?.command) ?? meaningfulString(input?.script);
+}
+
+function readCodexExecCommandDescription(script: string): string | undefined {
+  const match = script.match(/\bcmd\s*:\s*("(?:\\.|[^"\\])*")/s);
+  if (!match?.[1]) return undefined;
+  try {
+    return sanitizeSdkSubagentText(JSON.parse(match[1]), 180);
+  } catch {
+    return undefined;
+  }
+}
+
+function readCodexBackgroundExecSessionId(value: unknown, depth = 0): string | undefined {
+  if (depth > 5 || value == null) return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined;
+    try {
+      return readCodexBackgroundExecSessionId(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return undefined;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const sessionId = readCodexBackgroundExecSessionId(entry, depth + 1);
+      if (sessionId) return sessionId;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+
+  const sessionId = finiteNumber(value.session_id) ?? meaningfulString(value.session_id);
+  const chunkId = meaningfulString(value.chunk_id);
+  if (sessionId !== undefined && chunkId) return String(sessionId);
+
+  for (const key of ['text', 'output', 'content', 'result']) {
+    const nestedSessionId = readCodexBackgroundExecSessionId(value[key], depth + 1);
+    if (nestedSessionId) return nestedSessionId;
+  }
+  return undefined;
+}
+
+function codexBackgroundShellToolFromCustomToolOutput(
+  sessionId: string,
+  prior: ToolCallEvent | undefined,
+  outputItem: Record<string, any>,
+): ToolCallEvent | null {
+  const script = codexCustomToolScript(prior);
+  if (!script || !/\btools\.exec_command\s*\(/.test(script)) return null;
+  const runtimeSessionId = readCodexBackgroundExecSessionId(
+    outputItem.output ?? outputItem.result ?? outputItem.content,
+  );
+  if (!runtimeSessionId) return null;
+
+  const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `shell:${runtimeSessionId}`);
+  const description = readCodexExecCommandDescription(script) ?? 'Bash';
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: description,
+    input: {
+      action: SDK_SUBAGENT_ACTIONS.CODEX_BACKGROUND_SHELL,
+      description,
+    },
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+      canonicalKey,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      rawStatus: 'running',
+      active: true,
+      terminal: false,
+      parentSessionId: sessionId,
+      parentItemId: meaningfulString(prior?.id),
+      taskId: runtimeSessionId,
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      startedAtMs: Date.now(),
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: canonicalKey,
+    name: 'Bash',
+    status: 'running',
+    ...(detail.input ? { input: detail.input } : {}),
+    detail,
+  };
 }
 
 function rawChecklistText(item: Record<string, unknown>): string | undefined {
@@ -3659,6 +3756,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.recordStrongActivity(sessionId, state, turnId);
       const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
       const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+      const backgroundShellTool = codexBackgroundShellToolFromCustomToolOutput(sessionId, prior, item);
       this.emitTrackedProviderToolCall(sessionId, state, {
         id: callId,
         name: prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
@@ -3684,6 +3782,9 @@ export class CodexSdkProvider implements TransportProvider {
           raw: item,
         },
       });
+      if (backgroundShellTool && !state.openProviderToolCalls.has(backgroundShellTool.id)) {
+        this.emitTrackedProviderToolCall(sessionId, state, backgroundShellTool);
+      }
       return true;
     }
 

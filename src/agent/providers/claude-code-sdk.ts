@@ -47,6 +47,7 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   buildSdkSubagentSafeDetail,
   makeClaudeSubagentCanonicalKey,
   readSdkSubagentStartedAtMs,
@@ -298,8 +299,8 @@ interface ClaudeTaskState {
   parentWakeHandled?: boolean;
 }
 
-const CLAUDE_LOCAL_BASH_TASK_TYPE = 'local_bash';
-const CLAUDE_LOCAL_AGENT_TASK_TYPE = 'local_agent';
+const CLAUDE_LOCAL_BASH_TASK_TYPE = SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH;
+const CLAUDE_LOCAL_AGENT_TASK_TYPE = SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT;
 
 interface ClaudeTaskWake {
   status: SdkSubagentNormalizedStatus;
@@ -2302,7 +2303,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   private claudeTaskKind(task: ClaudeTaskState): ClaudeTaskWake['kind'] {
     if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) return 'bash';
-    if (task.taskType === CLAUDE_LOCAL_AGENT_TASK_TYPE || task.taskType === 'agent') return 'agent';
+    if (task.taskType === CLAUDE_LOCAL_AGENT_TASK_TYPE || task.taskType === SDK_SUBAGENT_TASK_TYPES.AGENT) return 'agent';
     return 'task';
   }
 

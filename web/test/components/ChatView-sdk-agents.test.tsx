@@ -11,6 +11,7 @@ import {
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   type SdkSubagentDetailMeta,
 } from '../../../shared/sdk-subagent-status.js';
 import { ChatView } from '../../src/components/ChatView.js';
@@ -147,25 +148,34 @@ describe('ChatView SDK agents panel', () => {
     const bashEvent = makeSdkEvent('bash-running', makeMeta({
       canonicalKey: 'claude:deck_agents:bash-1',
       taskId: 'bash-1',
-      taskType: 'local_bash',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
       childStatusSummary: 'Indexing files',
     }));
     const agentEvent = makeSdkEvent('agent-running', makeMeta({
       canonicalKey: 'claude:deck_agents:agent-1',
       taskId: 'agent-1',
-      taskType: 'local_agent',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT,
       childStatusSummary: 'Reviewing changes',
+    }));
+    const codexBashEvent = makeSdkEvent('codex-bash-running', makeMeta({
+      canonicalKey: 'codex:deck_agents:shell:81234',
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+      taskId: '81234',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      childStatusSummary: 'Running tests',
     }));
 
     const { container } = render(
-      <ChatView events={[bashEvent, agentEvent]} loading={false} sessionId="deck_agents" />,
+      <ChatView events={[bashEvent, agentEvent, codexBashEvent]} loading={false} sessionId="deck_agents" />,
     );
 
-    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 2 running' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 3 running' })).toBeTruthy();
     expect(screen.getByText('Indexing files')).toBeTruthy();
     expect(screen.getByText('Reviewing changes')).toBeTruthy();
+    expect(screen.getByText('Running tests')).toBeTruthy();
     expect(Array.from(container.querySelectorAll('.chat-sdk-agent-task-kind')).map((node) => node.textContent))
-      .toEqual(['Bash / Shell', 'Agent']);
+      .toEqual(['Bash / Shell', 'Agent', 'Bash / Shell']);
   });
 
   it('renders the Agents toggle immediately before refresh and shows the running badge', () => {

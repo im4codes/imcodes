@@ -247,6 +247,7 @@ import {
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   isSdkSubagentDetail,
   makeCodexSubagentCanonicalKey,
   type SdkSubagentDetail,
@@ -1365,6 +1366,119 @@ describe('CodexSdkProvider', () => {
       terminalStatus: 'succeeded',
       terminalReason: 'provider_result',
       terminalSynthetic: false,
+    });
+  });
+
+  it('promotes only backgrounded Codex exec sessions into the Agents panel lifecycle', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-background-shell', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-background-shell', 'run one short and one long command');
+    const child = childProcessMock.children[0];
+
+    const emitExecLifecycle = (callId: string, input: string, output: unknown) => {
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { type: 'custom_tool_call', call_id: callId, name: 'exec', input },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { type: 'custom_tool_call_output', call_id: callId, output },
+        },
+      });
+    };
+
+    emitExecLifecycle(
+      'call-short',
+      'const r = await tools.exec_command({cmd:"pwd"}); text(r.output);',
+      [{ type: 'input_text', text: 'Script completed' }, { type: 'input_text', text: '/tmp/project' }],
+    );
+    await flush();
+    expect(tools.filter((tool) => isSdkSubagentDetail(tool.detail))).toHaveLength(0);
+
+    emitExecLifecycle(
+      'call-long',
+      'const r = await tools.exec_command({cmd:"sleep 30", yield_time_ms:1000}); text(JSON.stringify(r));',
+      [
+        { type: 'input_text', text: 'Script completed' },
+        {
+          type: 'input_text',
+          text: JSON.stringify({
+            chunk_id: 'chunk-long',
+            session_id: 81234,
+            wall_time_seconds: 1.01,
+            output: '',
+          }),
+        },
+      ],
+    );
+    await waitForCondition(() => tools.some((tool) => isSdkSubagentDetail(tool.detail)));
+
+    const runningShell = tools.find((tool) => (
+      isSdkSubagentDetail(tool.detail)
+      && (tool.detail as SdkSubagentDetail).meta.normalizedStatus === SDK_SUBAGENT_STATUS.RUNNING
+    ));
+    expect(runningShell).toMatchObject({
+      id: makeCodexSubagentCanonicalKey('route-background-shell', 'shell:81234'),
+      name: 'Bash',
+      status: 'running',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'sleep 30',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          taskId: '81234',
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          active: true,
+          terminal: false,
+        },
+      },
+    });
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        turn: {
+          id: 'turn-1',
+          status: 'completed',
+          items: [{ id: 'msg-1', type: 'agentMessage', text: 'Long command handled' }],
+        },
+      },
+    });
+    await waitForCondition(() => tools.some((tool) => (
+      isSdkSubagentDetail(tool.detail)
+      && (tool.detail as SdkSubagentDetail).meta.normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+    )));
+
+    const terminalShell = tools.find((tool) => (
+      isSdkSubagentDetail(tool.detail)
+      && (tool.detail as SdkSubagentDetail).meta.normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+    ));
+    expect(terminalShell).toMatchObject({
+      id: runningShell?.id,
+      status: 'complete',
+      detail: {
+        meta: {
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          active: false,
+          terminal: true,
+        },
+      },
     });
   });
 

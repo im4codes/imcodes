@@ -22,6 +22,7 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
@@ -1037,8 +1038,10 @@ function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow
 }
 
 function sdkAgentsTaskKindLabel(t: ChatTranslate, row: SdkSubagentStatusRow): string {
-  if (row.taskType === 'local_bash') return t('chat.sdk_agents_task_bash');
-  if (row.taskType === 'local_agent' || row.taskType === 'agent') return t('chat.sdk_agents_task_agent');
+  if (row.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH) return t('chat.sdk_agents_task_bash');
+  if (row.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT || row.taskType === SDK_SUBAGENT_TASK_TYPES.AGENT) {
+    return t('chat.sdk_agents_task_agent');
+  }
   switch (row.providerKind) {
     case SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT:
     case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT:
