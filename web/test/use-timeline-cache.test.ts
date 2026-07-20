@@ -17,6 +17,7 @@ vi.mock('../src/api.js', () => ({
 }));
 import {
   __clearPersistedTimelineSnapshotsForTests,
+  __getTimelineCacheForTests,
   __getTimelineCacheKeysForTests,
   __getSharedTimelineBaseForTests,
   __resetTimelineCacheForTests,
@@ -82,6 +83,29 @@ describe('useTimeline global cache bounds', () => {
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
+  });
+
+  it('does not collapse paged history back to the initial window on a realtime event', () => {
+    const sessionName = `deck_paged_realtime_${Date.now()}`;
+    const history = makeEvents(sessionName, 600);
+    __setTimelineCacheForTests(sessionName, history);
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-live`,
+      sessionId: sessionName,
+      ts: 601,
+      epoch: 1,
+      seq: 601,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'new live turn' },
+    });
+
+    const retained = __getTimelineCacheForTests(sessionName);
+    expect(retained).toHaveLength(601);
+    expect(retained?.[0]?.eventId).toBe(`${sessionName}-0`);
+    expect(retained?.at(-1)?.eventId).toBe(`${sessionName}-live`);
   });
 
   it('pushes cache updates to already-mounted hooks for the same session', async () => {
