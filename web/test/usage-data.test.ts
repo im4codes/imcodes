@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { extractLatestUsage, mergeUsageUpdate } from '../src/usage-data.js';
 import type { TimelineEvent } from '../src/ws-client.js';
+import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
 
 function makeEvent(payload: Record<string, unknown>): TimelineEvent {
   return {
@@ -141,6 +142,40 @@ describe('extractLatestUsage', () => {
       contextWindow: 1_000_000,
       contextWindowSource: 'preset',
       model: 'MiniMax-M3',
+    });
+  });
+
+  it('renders tokens after same-event OpenCode terminal metadata replaces the live frame', () => {
+    const eventId = 'transport:deck_sub_0m081z0m:msg-opencode:usage';
+    const tokenEvent = {
+      ...makeEvent({
+        inputTokens: 22,
+        cacheTokens: 36_608,
+        outputTokens: 10,
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+        streaming: false,
+      }),
+      eventId,
+      seq: 8,
+    };
+    const metadataEvent = {
+      ...makeEvent({
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 1_000_000,
+      }),
+      eventId,
+      seq: 14,
+    };
+
+    const usage = extractLatestUsage(mergeTimelineEvents([tokenEvent], [metadataEvent]));
+
+    expect(usage).toMatchObject({
+      inputTokens: 22,
+      cacheTokens: 36_608,
+      contextWindow: 1_000_000,
+      model: 'opencode/deepseek-v4-flash-free',
     });
   });
 });

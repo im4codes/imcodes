@@ -80,6 +80,45 @@ describe('preferTimelineEvent', () => {
 
     expect(preferTimelineEvent(full, preview)).toBe(full);
   });
+
+  it('keeps an earlier usage snapshot when terminal metadata updates the same event id', () => {
+    const tokens = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 8,
+      payload: {
+        inputTokens: 22,
+        cacheTokens: 36_608,
+        outputTokens: 10,
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+        streaming: false,
+      },
+    });
+    const terminalMetadata = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 14,
+      payload: {
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 1_000_000,
+      },
+    });
+
+    const merged = preferTimelineEvent(tokens, terminalMetadata);
+
+    expect(merged.seq).toBe(14);
+    expect(merged.payload).toMatchObject({
+      inputTokens: 22,
+      cacheTokens: 36_608,
+      outputTokens: 10,
+      model: 'opencode/deepseek-v4-flash-free',
+      contextWindow: 1_000_000,
+    });
+    expect(merged.payload).not.toHaveProperty('contextWindowSource');
+    expect(preferTimelineEvent(terminalMetadata, tokens).payload).toEqual(merged.payload);
+  });
 });
 
 describe('mergeTimelineEvents', () => {

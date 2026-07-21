@@ -52,18 +52,43 @@ function compareNumbers(a: number | undefined, b: number | undefined): number {
   return left > right ? 1 : -1;
 }
 
+const USAGE_SNAPSHOT_PAYLOAD_KEYS = [
+  'inputTokens',
+  'cacheTokens',
+  'outputTokens',
+  'costUsd',
+  'codexStatus',
+] as const;
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 /**
- * Resolve same-eventId conflicts deterministically.
+ * A stable usage event can be updated twice by a transport provider: once with
+ * the token snapshot and later with model/context metadata from the terminal
+ * completion. Timeline storage is keyed by eventId, so treating the latter as
+ * a full replacement would erase the token snapshot and make the UI show 0.
  *
- * Preference order:
- * 1. full events over preview events
- * 2. terminal/non-streaming over streaming
- * 3. newer epoch
- * 4. newer seq
- * 5. newer ts
- * 6. incoming as tie-breaker
+ * Only carry forward occupancy/cost fields. Context/model provenance belongs
+ * to the preferred (newer/more complete) event; merging the whole payload
+ * could incorrectly attach an older provider source to a newer inferred window.
  */
-export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+function supplementUsageSnapshot(
+  preferred: TimelineEvent,
+  alternate: TimelineEvent,
+): TimelineEvent {
+  if (preferred.type !== 'usage.update' || alternate.type !== 'usage.update') return preferred;
+  let payload: TimelineEvent['payload'] | undefined;
+  for (const key of USAGE_SNAPSHOT_PAYLOAD_KEYS) {
+    if (hasOwn(preferred.payload, key) || !hasOwn(alternate.payload, key)) continue;
+    payload ??= { ...preferred.payload };
+    payload[key] = alternate.payload[key];
+  }
+  return payload ? { ...preferred, payload } : preferred;
+}
+
+function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
   const completenessCmp = compareCompleteness(existing, incoming);
   if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
 
@@ -83,6 +108,23 @@ export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineE
   if (tsCmp !== 0) return tsCmp > 0 ? incoming : existing;
 
   return incoming;
+}
+
+/**
+ * Resolve same-eventId conflicts deterministically.
+ *
+ * Preference order:
+ * 1. full events over preview events
+ * 2. terminal/non-streaming over streaming
+ * 3. newer epoch
+ * 4. newer seq
+ * 5. newer ts
+ * 6. incoming as tie-breaker
+ */
+export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const preferred = choosePreferredTimelineEvent(existing, incoming);
+  const alternate = preferred === existing ? incoming : existing;
+  return supplementUsageSnapshot(preferred, alternate);
 }
 
 export function mergeTimelineEvents(

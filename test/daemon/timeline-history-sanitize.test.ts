@@ -287,6 +287,50 @@ describe('timeline history transport sanitization', () => {
     });
   });
 
+  it('preserves token occupancy when newer metadata shares the usage event id', () => {
+    const eventId = 'transport:deck_hist:msg-opencode:usage';
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId,
+        type: 'usage.update',
+        ts: 10,
+        seq: 8,
+        payload: {
+          inputTokens: 22,
+          cacheTokens: 36_608,
+          outputTokens: 10,
+          model: 'opencode/deepseek-v4-flash-free',
+          contextWindow: 200_000,
+          contextWindowSource: 'provider',
+          streaming: false,
+        },
+      }),
+      event({
+        eventId,
+        type: 'usage.update',
+        ts: 10,
+        seq: 14,
+        payload: {
+          model: 'opencode/deepseek-v4-flash-free',
+          contextWindow: 1_000_000,
+        },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]).toMatchObject({
+      seq: 14,
+      payload: {
+        inputTokens: 22,
+        cacheTokens: 36_608,
+        outputTokens: 10,
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 1_000_000,
+      },
+    });
+    expect(result.events[0]?.payload).not.toHaveProperty('contextWindowSource');
+  });
+
   it('bounds diagnostic SDK raw payloads before history transport', () => {
     const wideRaw: Record<string, string | string[]> = {
       messages: ['secret child prompt'],
