@@ -42,6 +42,7 @@ const TYPE_ICON: Record<string, string> = {
   'codex-sdk': '📦',
   'copilot-sdk': '🧭',
   'cursor-headless': '➤',
+  'opencode-sdk': '🔆',
   'opencode': '🔆',
   'openclaw': '☁️',
   'qwen': '千',

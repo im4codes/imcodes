@@ -129,6 +129,7 @@ describe('agent delegation shared contract', () => {
       'codex',
       'copilot-sdk',
       'cursor-headless',
+      'opencode-sdk',
       'opencode',
       'gemini-sdk',
       'grok-sdk',

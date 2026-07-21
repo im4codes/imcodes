@@ -43,6 +43,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'codex',
   'copilot-sdk',
   'cursor-headless',
+  'opencode-sdk',
   'opencode',
   'gemini-sdk',
   'grok-sdk',

@@ -8,6 +8,7 @@ describe('shared agent type helpers', () => {
     expect(isTransportSessionAgentType('qoder-sdk')).toBe(true);
     expect(isTransportSessionAgentType('kimi-sdk')).toBe(true);
     expect(isTransportSessionAgentType('grok-sdk')).toBe(true);
+    expect(isTransportSessionAgentType('opencode-sdk')).toBe(true);
     expect(isTransportSessionAgentType('qwen')).toBe(true);
     expect(isTransportSessionAgentType('openclaw')).toBe(true);
     expect(isTransportSessionAgentType('claude-code')).toBe(false);
@@ -19,6 +20,8 @@ describe('shared agent type helpers', () => {
     expect(getSessionRuntimeType('qoder-sdk')).toBe('transport');
     expect(getSessionRuntimeType('kimi-sdk')).toBe('transport');
     expect(getSessionRuntimeType('grok-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('opencode-sdk')).toBe('transport');
+    expect(getSessionRuntimeType('opencode')).toBe('process');
     expect(getSessionRuntimeType('claude-code')).toBe('process');
     expect(getSessionRuntimeType('shell')).toBe('process');
   });

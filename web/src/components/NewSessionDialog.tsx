@@ -77,6 +77,7 @@ type AgentType =
   | "qoder-sdk"
   | "copilot-sdk"
   | "cursor-headless"
+  | "opencode-sdk"
   | "opencode"
   | "gemini"
   | "gemini-sdk"
@@ -462,6 +463,7 @@ export function NewSessionDialog({
           || agentType === "codex-sdk"
           || agentType === "copilot-sdk"
           || agentType === "cursor-headless"
+          || agentType === "opencode-sdk"
           || agentType === "gemini-sdk"
           || agentType === "grok-sdk"
           || agentType === "kimi-sdk"
@@ -489,7 +491,7 @@ export function NewSessionDialog({
   const agentFlavor =
     agentType === "claude-code" || agentType === "codex"
       ? "cli"
-      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk"
+      : agentType === "claude-code-sdk" || agentType === "codex-sdk" || agentType === "qoder-sdk" || agentType === "opencode-sdk" || agentType === "grok-sdk" || agentType === "kimi-sdk"
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
@@ -516,6 +518,7 @@ export function NewSessionDialog({
     || agentType === "codex-sdk"
     || agentType === "copilot-sdk"
     || agentType === "cursor-headless"
+    || agentType === "opencode-sdk"
     || agentType === "gemini-sdk"
     || agentType === "grok-sdk"
     || agentType === "kimi-sdk"

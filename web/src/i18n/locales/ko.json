@@ -630,6 +630,7 @@
       "codex_cli": "Codex CLI",
       "copilot_sdk": "Copilot",
       "cursor_headless": "Cursor",
+      "opencode_sdk": "OpenCode SDK",
       "gemini_sdk": "Gemini SDK",
       "grok_sdk": "Grok Build",
       "kimi_sdk": "Kimi Code"
@@ -2339,6 +2340,7 @@
       "mcpProviderCodexSdk": "Codex SDK",
       "mcpProviderQoderSdk": "Qoder SDK",
       "mcpProviderCursorHeadless": "Cursor headless",
+      "mcpProviderOpenCodeSdk": "OpenCode SDK",
       "mcpProviderQwen": "Qwen",
       "mcpProviderUnknown": "{{provider}}",
       "mcpDisabledFlag": "비활성화 플래그: {{flag}}",

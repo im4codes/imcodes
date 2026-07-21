@@ -295,6 +295,8 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   'copilot-sdk': 'github',
   cursor: 'cursor',
   'cursor-headless': 'cursor',
+  'opencode-sdk': 'opencode',
+  opencode: 'opencode',
   qoder: 'qoder',
   'qoder-sdk': 'qoder',
   openclaw: 'openclaw',

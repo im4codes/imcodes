@@ -192,7 +192,7 @@ describe('startSubSession — forced fresh (transport families)', () => {
 
   // openclaw included; qwen/cursor-headless/copilot-sdk/gemini-sdk/grok-sdk are the
   // families the OLD code never passed `fresh` to.
-  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'gemini-sdk', 'grok-sdk', 'openclaw'] as const;
+  const TRANSPORT_FAMILIES = ['qwen', 'cursor-headless', 'copilot-sdk', 'opencode-sdk', 'gemini-sdk', 'grok-sdk', 'openclaw'] as const;
 
   for (const type of TRANSPORT_FAMILIES) {
     it(`${type}: fresh:true reaches launch, NO old identity / bind reaches launchTransportSession`, async () => {

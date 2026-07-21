@@ -35,6 +35,7 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'codex':       ['/compact', '/help', '/model', '/approval', '/clear'],
   'codex-sdk':   ['/compact', '/clear', '/model', '/thinking'],
   'cursor-headless': ['/compact', '/clear', '/model'],
+  'opencode-sdk': ['/clear', '/model'],
   'opencode':    ['/compact', '/clear', '/model', '/help'],
   'qwen':        ['/compact', '/stop', '/clear', '/model', '/thinking'],
   'grok-sdk':    ['/compact', '/clear', '/model'],

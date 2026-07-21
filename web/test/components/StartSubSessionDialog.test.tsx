@@ -34,7 +34,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows claude-code-sdk, codex-sdk, and qoder-sdk options', () => {
+  it('shows Claude, Codex, Qoder, OpenCode, and Grok SDK options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -50,6 +50,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /opencode_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
   });
 
@@ -216,6 +217,29 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('qoder-sdk', undefined, '/tmp', undefined, undefined);
+  });
+
+  it('passes a provider-qualified model for OpenCode SDK sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /opencode_sdk/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'anthropic/claude-sonnet-4-5' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('opencode-sdk', undefined, '/tmp', undefined, {
+      requestedModel: 'anthropic/claude-sonnet-4-5',
+    });
   });
 
   it('clicking the backdrop does not call onClose', () => {

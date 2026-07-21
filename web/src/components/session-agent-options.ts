@@ -59,6 +59,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: 'opencode-sdk',
+    icon: '🔆',
+    fallbackLabel: 'OpenCode SDK',
+    labelKey: 'session.agentType.opencode_sdk',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'gemini-sdk',
     icon: '♊',
     fallbackLabel: 'Gemini SDK',

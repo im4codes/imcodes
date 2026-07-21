@@ -113,6 +113,9 @@ function peerAuditTypeLabel(agentType: string): string {
       return 'CX';
     case 'cursor-headless':
       return 'Cu';
+    case 'opencode-sdk':
+    case 'opencode':
+      return 'Op';
     case 'gemini':
     case 'gemini-sdk':
       return 'Gm';

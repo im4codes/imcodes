@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -154,6 +154,27 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-2'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
+  const MockOpenCodeSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'opencode-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: true,
+      approval: true,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: true,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('route-opencode'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
   const MockKimiSdkProvider = vi.fn().mockImplementation(() => ({
     id: 'kimi-sdk',
     connectionMode: 'local-sdk',
@@ -196,7 +217,7 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('route-grok'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider };
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockGrokSdkProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -225,6 +246,10 @@ vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
 
 vi.mock('../../src/agent/providers/copilot-sdk.js', () => ({
   CopilotSdkProvider: MockCopilotSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/opencode-sdk.js', () => ({
+  OpenCodeSdkProvider: MockOpenCodeSdkProvider,
 }));
 
 vi.mock('../../src/agent/providers/kimi-sdk.js', () => ({
@@ -321,6 +346,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('copilot-sdk');
   });
 
+  it('returns opencode-sdk after connectProvider()', async () => {
+    await connectProvider('opencode-sdk', CONFIG);
+    const provider = getProvider('opencode-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('opencode-sdk');
+  });
+
   it('returns kimi-sdk after connectProvider()', async () => {
     await connectProvider('kimi-sdk', CONFIG);
     const provider = getProvider('kimi-sdk');
@@ -381,6 +413,12 @@ describe('connectProvider', () => {
   it('instantiates CopilotSdkProvider and calls connect()', async () => {
     await connectProvider('copilot-sdk', CONFIG);
     expect(MockCopilotSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates OpenCodeSdkProvider and calls connect()', async () => {
+    await connectProvider('opencode-sdk', CONFIG);
+    expect(MockOpenCodeSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 
