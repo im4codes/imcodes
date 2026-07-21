@@ -70,6 +70,10 @@ vi.mock('react-i18next', () => {
     'chat.new_folder': 'New folder',
     'chat.new_folder_name': 'Folder name',
     'chat.create': 'Create',
+    'file_browser.refresh_changes': 'Refresh changes',
+    'file_browser.refreshing_changes': 'Refreshing changes…',
+    'file_browser.refresh_changes_success': 'Changes refreshed',
+    'file_browser.refresh_changes_failed': 'Refresh failed',
   };
   const t = (key: string, opts?: Record<string, unknown>) => {
     if (key === 'file_browser.insert') return `Insert ${opts?.count ?? 0}`;
@@ -1065,6 +1069,52 @@ describe('FileBrowser', () => {
       });
     });
     expect(document.querySelector('.fb-changes-section')).not.toBeNull();
+  });
+
+  it('shows loading, success, and failure feedback on the Changes refresh button', async () => {
+    vi.useFakeTimers();
+    const { ws, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+        changesRootPath="/home/user" defaultTab="changes" onConfirm={vi.fn()} />,
+    );
+
+    const refresh = screen.getByTitle('Refreshing changes…') as HTMLButtonElement;
+    expect(refresh.disabled).toBe(true);
+    expect(refresh.classList.contains('is-refreshing')).toBe(true);
+    expect(refresh.textContent).toBe('↻');
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [],
+      });
+    });
+    expect(screen.getByTitle('Changes refreshed').classList.contains('is-success')).toBe(true);
+    expect(screen.getByTitle('Changes refreshed').textContent).toBe('✓');
+
+    await act(async () => { vi.advanceTimersByTime(1_500); });
+    const idleRefresh = screen.getByTitle('Refresh changes') as HTMLButtonElement;
+    expect(idleRefresh.disabled).toBe(false);
+
+    await act(async () => { fireEvent.click(idleRefresh); });
+    expect(screen.getByTitle('Refreshing changes…').classList.contains('is-refreshing')).toBe(true);
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'error',
+        error: 'git failed',
+      });
+    });
+    expect(screen.getByTitle('Refresh failed').classList.contains('is-error')).toBe(true);
+    expect(screen.getByTitle('Refresh failed').textContent).toBe('!');
   });
 
   it('keeps the Changes list usable when stats are unavailable', async () => {

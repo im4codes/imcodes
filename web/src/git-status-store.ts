@@ -21,6 +21,8 @@ import type { WsClient, ServerMessage } from './ws-client.js';
 
 export type ChangeFile = { path: string; code: string; additions?: number; deletions?: number };
 export type SharedChangesListener = (files: ChangeFile[]) => void;
+export type SharedChangesRequestStatus = 'idle' | 'refreshing' | 'success' | 'error';
+export type SharedChangesStatusListener = (status: SharedChangesRequestStatus) => void;
 
 interface SharedChangesEntry {
   repoPath: string;
@@ -35,6 +37,8 @@ interface SharedChangesEntry {
   inFlightStartedAt: number;
   queued: boolean;
   listeners: Set<SharedChangesListener>;
+  status: SharedChangesRequestStatus;
+  statusListeners: Set<SharedChangesStatusListener>;
   ws: WsClient | null;
 }
 
@@ -82,6 +86,8 @@ function getEntry(key: string): SharedChangesEntry {
       inFlightStartedAt: 0,
       queued: false,
       listeners: new Set(),
+      status: 'idle',
+      statusListeners: new Set(),
       ws: null,
     };
     sharedChangesByKey.set(key, entry);
@@ -112,10 +118,34 @@ export function subscribeSharedChanges(key: string, listener: SharedChangesListe
     const current = sharedChangesByKey.get(key);
     if (!current) return;
     current.listeners.delete(listener);
-    if (current.listeners.size === 0 && !current.inFlightRequestId) {
+    if (current.listeners.size === 0 && current.statusListeners.size === 0 && !current.inFlightRequestId) {
       sharedChangesByKey.delete(key);
     }
   };
+}
+
+/** Subscribe to real request settlement so controls can show useful feedback.
+ * A newly mounted listener only receives an existing in-flight state; settled
+ * success/error states belong to the interaction that observed them and must
+ * not flash again when another FileBrowser opens later. */
+export function subscribeSharedChangesStatus(key: string, listener: SharedChangesStatusListener): () => void {
+  const entry = getEntry(key);
+  entry.statusListeners.add(listener);
+  if (entry.status === 'refreshing') listener(entry.status);
+  return () => {
+    const current = sharedChangesByKey.get(key);
+    if (!current) return;
+    current.statusListeners.delete(listener);
+    if (current.listeners.size === 0 && current.statusListeners.size === 0 && !current.inFlightRequestId) {
+      sharedChangesByKey.delete(key);
+    }
+  };
+}
+
+function publishStatus(key: string, status: SharedChangesRequestStatus): void {
+  const entry = getEntry(key);
+  entry.status = status;
+  for (const listener of entry.statusListeners) listener(status);
 }
 
 function publish(key: string, files: ChangeFile[]): void {
@@ -155,14 +185,16 @@ export function requestSharedChanges(ws: WsClient, repoPath: string, force = fal
   try {
     requestId = ws.fsGitStatus(repoPath, { includeStats: true });
   } catch (error) {
-    if (!isWebSocketNotConnectedError(error)) throw error;
     entry.queued = false;
+    publishStatus(key, 'error');
+    if (!isWebSocketNotConnectedError(error)) throw error;
     return;
   }
   entry.inFlightRequestId = requestId;
   entry.inFlightStartedAt = Date.now();
   entry.queued = false;
   sharedChangesRequestKey.set(requestId, key);
+  publishStatus(key, 'refreshing');
 }
 
 export function forceRefreshSharedChangesForCheckout(
@@ -193,7 +225,12 @@ export function settleSharedChangesRequest(requestId: string, files: ChangeFile[
     entry.inFlightRequestId = null;
     entry.inFlightStartedAt = 0;
   }
-  if (files) publish(key, files);
+  if (files) {
+    publish(key, files);
+    publishStatus(key, 'success');
+  } else {
+    publishStatus(key, 'error');
+  }
   if (entry.queued && entry.ws && !entry.inFlightRequestId) {
     entry.queued = false;
     requestSharedChanges(entry.ws, entry.repoPath, true);
