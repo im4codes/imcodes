@@ -202,6 +202,10 @@ describe('OpenCodeSdkProvider', () => {
         ],
       }),
     }));
+    expect(harness.client.event.subscribe).toHaveBeenCalledWith(expect.objectContaining({
+      query: { directory: '/tmp/project' },
+      signal: expect.any(AbortSignal),
+    }));
 
     harness.queue.push({
       type: 'message.part.updated',
@@ -210,6 +214,10 @@ describe('OpenCodeSdkProvider', () => {
     harness.queue.push({
       type: 'message.part.updated',
       properties: { part: { id: 'tool-1', callID: 'call-1', sessionID: 'oc-session-1', messageID: 'msg-1', type: 'tool', tool: 'bash', state: { status: 'running', input: { command: 'pwd' } } } },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: { part: { id: 'tool-1', callID: 'call-1', sessionID: 'oc-session-1', messageID: 'msg-1', type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'pwd' }, output: '/tmp/project' } } },
     });
     harness.queue.push({
       type: 'permission.updated',
@@ -223,7 +231,10 @@ describe('OpenCodeSdkProvider', () => {
     await vi.waitFor(() => expect(completions).toHaveLength(1));
 
     expect(deltas.at(-1)).toMatchObject({ sessionId: 'route-1', messageId: 'msg-1', delta: 'Hello' });
-    expect(tools).toEqual([expect.objectContaining({ sessionId: 'route-1', id: 'call-1', name: 'bash', status: 'running' })]);
+    expect(tools).toEqual([
+      expect.objectContaining({ sessionId: 'route-1', id: 'call-1', name: 'bash', status: 'running' }),
+      expect.objectContaining({ sessionId: 'route-1', id: 'call-1', name: 'bash', status: 'complete', output: '/tmp/project' }),
+    ]);
     expect(approvals).toEqual([expect.objectContaining({ sessionId: 'route-1', id: 'perm-1', tool: 'bash' })]);
     expect(usage).toEqual([expect.objectContaining({
       sessionId: 'route-1', messageId: 'msg-1', finalized: true,

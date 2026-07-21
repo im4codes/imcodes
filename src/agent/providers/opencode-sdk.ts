@@ -253,7 +253,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     if (existing) await this.endSession(routeId);
 
     const cwd = safeString(config.cwd) ?? process.cwd();
-    const sessionRuntime = await this.startSessionRuntime(config);
+    const sessionRuntime = await this.startSessionRuntime(config, cwd);
     let info: Record<string, any>;
     if (config.skipCreate && safeString(config.resumeId)) {
       try {
@@ -535,7 +535,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     }
   }
 
-  private async startSessionRuntime(config: SessionConfig): Promise<{
+  private async startSessionRuntime(config: SessionConfig, cwd: string): Promise<{
     client: OpenCodeClientLike;
     server: OpenCodeServerLike;
     abort: AbortController;
@@ -563,7 +563,10 @@ export class OpenCodeSdkProvider implements TransportProvider {
       if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
         throw providerError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'OpenCode SDK session server did not bind to loopback', false);
       }
-      const subscription = await started.client.event.subscribe({ signal: abort.signal });
+      const subscription = await started.client.event.subscribe({
+        query: { directory: cwd },
+        signal: abort.signal,
+      });
       return { client: started.client, server: started.server, abort, stream: subscription.stream };
     } catch (error) {
       abort.abort();
