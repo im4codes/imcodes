@@ -1563,7 +1563,7 @@ afterEach(() => {
     });
   });
 
-  it('lists saved custom Team combos in the Auto Deliver launcher and blocks them with a compatibility reason before launch', async () => {
+  it('lists saved custom Team combos and launches Auto Deliver with the selected flow', async () => {
     const onLaunch = vi.fn();
     render(
       <OpenSpecAutoDeliverLauncher
@@ -1585,11 +1585,20 @@ afterEach(() => {
     expect(within(comboSelect).queryByRole('option', { name: 'audit>plan (Custom)' })).toBeNull();
     fireEvent.change(comboSelect, { target: { value: 'audit>plan' } });
 
-    expect(screen.getByTestId('openspec-auto-combo-warning').textContent).toBe('Custom Team combos are not supported for Auto Deliver yet');
-    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByTestId('openspec-auto-combo-warning')).toBeNull();
+    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(false);
 
     fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
-    expect(onLaunch).not.toHaveBeenCalled();
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', {
+      selectedTeamComboId: 'audit>plan',
+      autoCommitPush: false,
+      materializedLimits: {
+        specAuditRepairRounds: 1,
+        implementationAuditRepairRounds: 2,
+        maxImplementationPrompts: 12,
+        maxElapsedMinutes: 480,
+      },
+    });
   });
 
   it('shows local Auto Deliver launch validation when no change is selected', () => {

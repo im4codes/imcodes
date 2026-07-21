@@ -1406,6 +1406,7 @@
         "launch_timeout": "自動交付啟動逾時，請重試。",
         "stop_timeout": "自動交付停止逾時，請重試。",
         "custom_combo_unsupported": "自動交付暫不支援自訂團隊組合流程。",
+        "combo_unsupported": "此團隊組合流程無效或不受支援。",
         "strict_result_failed": "稽核沒有回傳有效的嚴格結果。",
         "continue_timeout": "自動交付繼續逾時，請重試。"
       },

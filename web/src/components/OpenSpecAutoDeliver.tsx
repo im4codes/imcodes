@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { isValidP2pComboPipeline } from '@shared/p2p-modes.js';
 import { PREF_KEY_OPENSPEC_AUTO_DELIVER_AUTO_COMMIT_PUSH } from '../constants/prefs.js';
 import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import {
@@ -470,13 +471,13 @@ export function OpenSpecAutoDeliverLauncher({
     || !Number.isInteger(implementationRounds)
     || implementationRounds < OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMin
     || implementationRounds > OPENSPEC_AUTO_DELIVER_ROUND_BOUNDS.implementationMax;
-  const incompatibleCombo = selectedTeamComboId !== OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO;
+  const incompatibleCombo = !isValidP2pComboPipeline(selectedTeamComboId);
   const validationError = !changeName
     ? 'openspec.auto.error.missing_change'
     : invalidRounds
       ? 'openspec.auto.error.invalid_rounds'
       : incompatibleCombo
-        ? 'openspec.auto.error.custom_combo_unsupported'
+        ? 'openspec.auto.error.combo_unsupported'
       : error;
   const handleTeamComboChange = (event: Event) => {
     setSelectedTeamComboId((event.target as HTMLSelectElement).value);
@@ -580,11 +581,6 @@ export function OpenSpecAutoDeliverLauncher({
               </select>
             </label>
           </div>
-          {incompatibleCombo && (
-            <div class="openspec-auto-warning-subtle" data-testid="openspec-auto-combo-warning">
-              {t('openspec.auto.error.custom_combo_unsupported')}
-            </div>
-          )}
           <label class="openspec-auto-checkbox">
             <input
               type="checkbox"

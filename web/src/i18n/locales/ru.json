@@ -1405,6 +1405,7 @@
         "launch_timeout": "Истекло время запуска автодоставки. Повторите попытку.",
         "stop_timeout": "Истекло время остановки автодоставки. Повторите попытку.",
         "custom_combo_unsupported": "Автодоставка пока не поддерживает пользовательские комбо Team.",
+        "combo_unsupported": "Это комбо Team недопустимо или не поддерживается.",
         "strict_result_failed": "The audit did not return a valid strict result.",
         "continue_timeout": "Продолжение Auto Deliver истекло по времени. Попробуйте снова."
       },

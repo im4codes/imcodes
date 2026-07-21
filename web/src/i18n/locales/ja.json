@@ -1405,6 +1405,7 @@
         "launch_timeout": "自動デリバリーの起動がタイムアウトしました。もう一度試してください。",
         "stop_timeout": "自動デリバリーの停止がタイムアウトしました。もう一度試してください。",
         "custom_combo_unsupported": "自動デリバリーはまだカスタム Team コンボに対応していません。",
+        "combo_unsupported": "この Team コンボは無効か、対応していません。",
         "strict_result_failed": "The audit did not return a valid strict result.",
         "continue_timeout": "Auto Deliver の続行がタイムアウトしました。もう一度試してください。"
       },

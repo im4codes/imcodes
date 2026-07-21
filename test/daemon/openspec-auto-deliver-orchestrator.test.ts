@@ -547,6 +547,34 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }));
   });
 
+  it('launches the selected valid custom Team combo through the audit stage', async () => {
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-custom-combo',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'standard',
+      selectedTeamComboId: 'audit>plan',
+    }, serverLinkMock as never);
+
+    const ack = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK);
+    expect(ack.projection.selectedTeamComboId).toBe('audit>plan');
+    expect(startP2pRunMock).toHaveBeenCalledWith(expect.objectContaining({
+      modeOverride: 'audit>plan',
+      rounds: 1,
+      targets: [
+        { session: 'deck_sub_peer', mode: 'audit>plan' },
+        { session: 'deck_sub_worker', mode: 'audit>plan' },
+      ],
+      launchOrigin: expect.objectContaining({
+        autoDeliver: expect.objectContaining({
+          selectedTeamComboId: 'audit>plan',
+          activeOpenSpecPromptId: 'proposal_audit',
+        }),
+      }),
+    }));
+  });
+
   it('passes the selected UI locale through Auto Deliver Team/P2P audit launches', async () => {
     await handleOpenSpecAutoDeliverCommand({
       type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,

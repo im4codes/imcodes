@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from 'preact/hooks';
-import { COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
+import { COMBO_PRESETS, COMBO_SEPARATOR, isValidP2pComboPipeline } from '@shared/p2p-modes.js';
 import { PREF_KEY_P2P_CUSTOM_COMBOS } from '../constants/prefs.js';
 import { parseJsonValue, usePref } from '../hooks/usePref.js';
 
@@ -42,7 +42,7 @@ export function normalizeCustomCombos(raw: unknown): string[] {
   for (const entry of raw) {
     if (typeof entry !== 'string') continue;
     const key = entry.trim();
-    if (!key || seen.has(key) || presetKeys.has(key)) continue;
+    if (!key || seen.has(key) || presetKeys.has(key) || !isValidP2pComboPipeline(key)) continue;
     seen.add(key);
     combos.push(key);
     if (combos.length >= MAX_CUSTOM_COMBOS) break;

@@ -72,6 +72,7 @@ const OPENSPEC_AUTO_DELIVER_KEYS = [
   'openspec.auto.error.launch_timeout',
   'openspec.auto.error.stop_timeout',
   'openspec.auto.error.custom_combo_unsupported',
+  'openspec.auto.error.combo_unsupported',
   'openspec.auto.error.strict_result_failed',
   'openspec.auto.preset.fast',
   'openspec.auto.preset.standard',

@@ -1406,6 +1406,7 @@
         "launch_timeout": "自动交付启动超时，请重试。",
         "stop_timeout": "自动交付停止超时，请重试。",
         "custom_combo_unsupported": "自动交付暂不支持自定义团队组合流程。",
+        "combo_unsupported": "该团队组合流程无效或不受支持。",
         "strict_result_failed": "审计没有返回有效的严格结果。",
         "continue_timeout": "自动交付继续超时，请重试。"
       },

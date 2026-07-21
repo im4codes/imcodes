@@ -1406,6 +1406,7 @@
         "launch_timeout": "La entrega automática agotó el tiempo de inicio. Inténtalo de nuevo.",
         "stop_timeout": "La detención de la entrega automática agotó el tiempo. Inténtalo de nuevo.",
         "custom_combo_unsupported": "La entrega automática todavía no admite combos personalizados de Team.",
+        "combo_unsupported": "Este combo de Team no es válido o no es compatible.",
         "strict_result_failed": "The audit did not return a valid strict result.",
         "continue_timeout": "La continuación de Auto Deliver agotó el tiempo. Inténtalo de nuevo."
       },
