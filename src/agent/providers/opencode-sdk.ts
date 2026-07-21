@@ -87,6 +87,8 @@ interface OpenCodeSessionState {
   textParts: Map<string, string>;
   toolSignatures: Map<string, string>;
   lastUsageSignature: string | null;
+  lastUsage: ProviderUsageUpdate['usage'];
+  lastUsageMessageId: string | null;
   client: OpenCodeClientLike;
   server: OpenCodeServerLike;
   abort: AbortController;
@@ -106,6 +108,13 @@ function safeString(value: unknown): string | undefined {
 
 function positiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function isTerminalAssistantMessage(info: Record<string, any> | undefined): boolean {
+  if (!info || info.role !== 'assistant') return false;
+  return Boolean(info.error)
+    || safeString(info.finish) !== undefined
+    || positiveNumber(info.time?.completed) !== undefined;
 }
 
 function sessionIdFromEvent(event: Record<string, any>): string | undefined {
@@ -297,6 +306,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
       textParts: new Map(),
       toolSignatures: new Map(),
       lastUsageSignature: null,
+      lastUsage: undefined,
+      lastUsageMessageId: null,
       client: sessionRuntime.client,
       server: sessionRuntime.server,
       abort: sessionRuntime.abort,
@@ -412,6 +423,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.textParts.clear();
     state.toolSignatures.clear();
     state.lastUsageSignature = null;
+    state.lastUsage = undefined;
+    state.lastUsageMessageId = null;
     this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
 
     const parts: Array<Record<string, unknown>> = [
@@ -438,8 +451,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
     }
     void promptRequest.then((result) => {
       if (!this.isCurrent(state, generation) || state.cancelled) return;
-      this.processPromptResult(state, result.data);
-      this.completeOnce(state, 'prompt.result');
+      const terminal = this.processPromptResult(state, result.data);
+      if (terminal) this.completeOnce(state, 'prompt.result');
     }).catch((error) => {
       if (!this.isCurrent(state, generation) || state.cancelled) return;
       this.failOnce(state, this.normalizeError(error, 'prompt'));
@@ -602,7 +615,9 @@ export class OpenCodeSdkProvider implements TransportProvider {
         this.processPart(state, event.properties?.part, event.properties?.delta);
         return;
       case 'message.updated':
-        this.processMessage(state, event.properties?.info);
+        if (this.processMessage(state, event.properties?.info)) {
+          this.completeOnce(state, 'message.updated');
+        }
         return;
       case 'permission.updated':
         this.processPermission(state, event.properties);
@@ -626,15 +641,16 @@ export class OpenCodeSdkProvider implements TransportProvider {
     }
   }
 
-  private processPromptResult(state: OpenCodeSessionState, result: Record<string, any>): void {
-    this.processMessage(state, result?.info);
+  private processPromptResult(state: OpenCodeSessionState, result: Record<string, any>): boolean {
+    const terminal = this.processMessage(state, result?.info);
     if (Array.isArray(result?.parts)) {
       for (const part of result.parts) this.processPart(state, part);
     }
+    return terminal;
   }
 
-  private processMessage(state: OpenCodeSessionState, info: Record<string, any> | undefined): void {
-    if (!info || info.role !== 'assistant') return;
+  private processMessage(state: OpenCodeSessionState, info: Record<string, any> | undefined): boolean {
+    if (!info || info.role !== 'assistant') return false;
     state.currentMessageId = safeString(info.id) ?? state.currentMessageId;
     if (safeString(info.modelID) && safeString(info.providerID)) {
       const model = `${info.providerID}/${info.modelID}`;
@@ -647,6 +663,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     if (info.error) {
       this.failOnce(state, this.normalizeError(info.error, 'message'));
     }
+    return isTerminalAssistantMessage(info);
   }
 
   private processPart(state: OpenCodeSessionState, part: Record<string, any> | undefined, delta?: string): void {
@@ -746,19 +763,48 @@ export class OpenCodeSdkProvider implements TransportProvider {
   private emitUsage(state: OpenCodeSessionState, messageId: unknown, tokens: any, cost: unknown, finalized: boolean): void {
     if (!tokens || typeof tokens !== 'object') return;
     const modelContextWindow = state.model ? this.modelContextWindows.get(state.model) : undefined;
+    const inputTokens = positiveNumber(tokens.input) ?? 0;
+    const outputTokens = positiveNumber(tokens.output) ?? 0;
+    const cacheReadTokens = positiveNumber(tokens.cache?.read) ?? 0;
+    const cacheWriteTokens = positiveNumber(tokens.cache?.write) ?? 0;
+    const normalizedMessageId = safeString(messageId);
+
+    // OpenCode emits an initial assistant message with an all-zero token
+    // placeholder before the authoritative step-finish/final message. Expose
+    // the provider context limit without publishing that placeholder as a
+    // finalized zero-token snapshot, which would otherwise win the completion
+    // race and leave the persisted timeline at 0 usage.
+    if (inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens === 0) {
+      if (state.lastUsage || modelContextWindow === undefined) return;
+      const metadataOnlyUsage = { model_context_window: modelContextWindow };
+      const metadataOnlySignature = JSON.stringify(metadataOnlyUsage);
+      if (metadataOnlySignature === state.lastUsageSignature) return;
+      state.lastUsageSignature = metadataOnlySignature;
+      const update: ProviderUsageUpdate = {
+        ...(normalizedMessageId ? { messageId: normalizedMessageId } : {}),
+        finalized: false,
+        usage: metadataOnlyUsage,
+        ...(state.model ? { model: state.model } : {}),
+      };
+      for (const callback of this.usageCallbacks) callback(state.routeId, update);
+      return;
+    }
+
     const usage = {
-      input_tokens: positiveNumber(tokens.input) ?? 0,
-      output_tokens: positiveNumber(tokens.output) ?? 0,
-      cache_read_input_tokens: positiveNumber(tokens.cache?.read) ?? 0,
-      cache_creation_input_tokens: positiveNumber(tokens.cache?.write) ?? 0,
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cache_read_input_tokens: cacheReadTokens,
+      cache_creation_input_tokens: cacheWriteTokens,
       ...(modelContextWindow !== undefined ? { model_context_window: modelContextWindow } : {}),
       ...(positiveNumber(cost) !== undefined ? { cost_usd: cost } : {}),
     };
+    state.lastUsage = usage;
+    state.lastUsageMessageId = normalizedMessageId ?? state.lastUsageMessageId;
     const signature = JSON.stringify(usage);
     if (signature === state.lastUsageSignature) return;
     state.lastUsageSignature = signature;
     const update: ProviderUsageUpdate = {
-      ...(safeString(messageId) ? { messageId: String(messageId) } : {}),
+      ...(normalizedMessageId ? { messageId: normalizedMessageId } : {}),
       finalized,
       usage,
       ...(state.model ? { model: state.model } : {}),
@@ -773,7 +819,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     this.emitStatus(state.routeId, { status: null, label: null });
     const content = [...state.textParts.values()].join('');
     const message: AgentMessage = {
-      id: state.currentMessageId ?? `${state.providerSessionId}:${state.generation}`,
+      id: state.currentMessageId ?? state.lastUsageMessageId ?? `${state.providerSessionId}:${state.generation}`,
       sessionId: state.routeId,
       kind: 'text',
       role: 'assistant',
@@ -785,6 +831,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
         providerSessionId: state.providerSessionId,
         source,
         ...(state.model ? { model: state.model } : {}),
+        ...(state.lastUsage ? { usage: state.lastUsage } : {}),
       },
     };
     for (const callback of this.completeCallbacks) callback(state.routeId, message);

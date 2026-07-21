@@ -264,6 +264,102 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('ignores the initial zero-token placeholder and completes with authoritative usage', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      harness.startOptions.push(options as unknown as Record<string, unknown>);
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const usage: any[] = [];
+    const completions: any[] = [];
+    provider.onUsage((sessionId, update) => usage.push({ sessionId, ...update }));
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-placeholder',
+      cwd: '/tmp/project',
+      agentId: 'anthropic/claude-sonnet-4-5',
+    });
+    await provider.send(routeId, 'hello');
+
+    harness.prompt.resolve({
+      data: {
+        info: {
+          id: 'msg-placeholder',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'anthropic',
+          modelID: 'claude-sonnet-4-5',
+          tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        },
+        parts: [],
+      },
+    });
+    await vi.waitFor(() => expect(usage).toHaveLength(1));
+
+    expect(completions).toHaveLength(0);
+    expect(usage[0]).toMatchObject({
+      sessionId: 'route-placeholder',
+      messageId: 'msg-placeholder',
+      finalized: false,
+      usage: { model_context_window: 1_000_000 },
+    });
+    expect(usage[0].usage).not.toHaveProperty('input_tokens');
+    expect(usage[0].usage).not.toHaveProperty('cache_read_input_tokens');
+
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-placeholder',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'anthropic',
+          modelID: 'claude-sonnet-4-5',
+          finish: 'stop',
+          time: { completed: 123 },
+          cost: 0.01,
+          tokens: { input: 90, output: 123, cache: { read: 88_192, write: 0 } },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+
+    expect(usage.at(-1)).toMatchObject({
+      sessionId: 'route-placeholder',
+      messageId: 'msg-placeholder',
+      finalized: true,
+      usage: {
+        input_tokens: 90,
+        output_tokens: 123,
+        cache_read_input_tokens: 88_192,
+        cache_creation_input_tokens: 0,
+        model_context_window: 1_000_000,
+      },
+    });
+    expect(completions[0]).toMatchObject({
+      sessionId: 'route-placeholder',
+      id: 'msg-placeholder',
+      status: 'complete',
+      metadata: {
+        usage: {
+          input_tokens: 90,
+          output_tokens: 123,
+          cache_read_input_tokens: 88_192,
+          model_context_window: 1_000_000,
+        },
+      },
+    });
+
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await Promise.resolve();
+    expect(completions).toHaveLength(1);
+    await provider.disconnect();
+  });
+
   it('restores provider sessions, discovers connected models and cancels active work', async () => {
     const harness = createHarness();
     harness.sessions.set('resume-1', { id: 'resume-1', title: 'Restored', time: { updated: 12 } });
