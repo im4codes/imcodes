@@ -2532,12 +2532,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
       }).authority;
-      const startupMemory = isSlashControl ? null : (this._startupMemory ?? (
+      // Private peer-audit turns must carry only the audit brief. In
+      // particular, do not consume first-turn startup memory or run semantic
+      // recall: both can contain recent summaries and both emit public
+      // memory.context evidence after provider acceptance.
+      const suppressMemoryContext = isSlashControl || isPrivatePeerAuditDispatch;
+      const startupMemory = suppressMemoryContext ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
           ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
       ));
-      const memoryRecallResult = isSlashControl
+      const memoryRecallResult = isPrivatePeerAuditDispatch
+        ? { artifact: null }
+        : isSlashControl
         ? {
             artifact: null,
             statusPayload: buildMemoryContextStatusPayload(message.trim().slice(0, 200), 'skipped_control_message', 'message', {
@@ -2552,7 +2559,6 @@ export class TransportSessionRuntime implements SessionRuntime {
             new Set(recentSummaryFingerprintsFromItems(
               startupMemory?.items ?? [],
             )),
-            isPrivatePeerAuditDispatch,
           );
       summarySyncReservation = memoryRecallResult.summaryReservation;
       const memoryRecall = memoryRecallResult.artifact;
@@ -3050,7 +3056,6 @@ export class TransportSessionRuntime implements SessionRuntime {
     message: string,
     authoritySource: ContextAuthorityDecision['authoritySource'],
     excludedSummaryFingerprints: ReadonlySet<string> = new Set(),
-    suppressSummarySync = false,
   ): Promise<{
     artifact: TransportMemoryRecallArtifact | null;
     statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
@@ -3064,7 +3069,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       message,
       authoritySource,
       excludedSummaryFingerprints,
-      { isCancelled: () => cancelled, suppressSummarySync },
+      { isCancelled: () => cancelled },
     );
     try {
       const outcome = await withTimeoutOutcome(recallPromise, timeoutMs);
@@ -3103,7 +3108,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     message: string,
     authoritySource: ContextAuthorityDecision['authoritySource'],
     excludedSummaryFingerprints: ReadonlySet<string> = new Set(),
-    options?: { isCancelled?: () => boolean; suppressSummarySync?: boolean },
+    options?: { isCancelled?: () => boolean },
   ): Promise<{
     artifact: TransportMemoryRecallArtifact | null;
     statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
@@ -3148,9 +3153,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         semanticSkipReason
           ? Promise.resolve({ items: [] })
           : searchLocalMemorySemanticFrontOfTurn(recallQuery),
-        options?.suppressSummarySync
-          ? Promise.resolve([])
-          : collectRecentSummarySyncCandidates(this._contextNamespace),
+        collectRecentSummarySyncCandidates(this._contextNamespace),
       ]);
       if (options?.isCancelled?.()) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall result ignored after timeout');

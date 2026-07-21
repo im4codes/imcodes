@@ -2482,6 +2482,99 @@ ${PREFERENCE_CONTEXT_END}`;
     }));
   });
 
+  it('does not consume first-turn startup summaries during a private peer-audit dispatch', async () => {
+    const summary = makeSummarySyncCandidate('summary-private-startup', 'Startup summary must wait for an ordinary turn');
+    const startupMemory = {
+      reason: 'startup' as const,
+      runtimeFamily: 'transport' as const,
+      authoritySource: 'processed_local' as const,
+      sourceKind: 'local_processed' as const,
+      injectionSurface: 'message-preamble' as const,
+      injectedText: `# Recent project memory\n\n- ${summary.item.summary}`,
+      items: [summary.item],
+    };
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_private_startup');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      startupMemory,
+    }));
+    const onStartupMemoryInjected = vi.fn();
+    r.onStartupMemoryInjected = onStartupMemoryInjected;
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_summary_private_startup' });
+    timelineEmitterEmitMock.mockClear();
+
+    r.send('private audit brief', 'peer-audit-private-startup', undefined, undefined, {
+      peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: 'attempt_hash' },
+    });
+    await waitForProviderSendCount(localMock.provider, 1);
+
+    const privatePayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(privatePayload).not.toHaveProperty('startupMemory');
+    expect(privatePayload).not.toHaveProperty('memoryRecall');
+    expect(onStartupMemoryInjected).not.toHaveBeenCalled();
+    expect(timelineEmitterEmitMock.mock.calls.some((call) => call[1] === 'memory.context')).toBe(false);
+
+    localMock.fireComplete('sess-1');
+    r.send('ordinary turn after private audit', 'ordinary-after-private-startup');
+    await waitForProviderSendCount(localMock.provider, 2);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      startupMemory: expect.objectContaining({
+        injectedText: expect.stringContaining('Startup summary must wait for an ordinary turn'),
+      }),
+    }));
+    expect(onStartupMemoryInjected).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run semantic recent-summary recall during a private peer-audit dispatch', async () => {
+    const semanticSummary = makeSearchItem({
+      id: 'semantic-private-summary',
+      projectId: 'repo-1',
+      projectionClass: 'recent_summary',
+      summary: 'Semantic recent summary must remain private-turn isolated',
+      relevanceScore: 0.95,
+    });
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([semanticSummary]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_private_semantic');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize({
+      ...defaultConfig,
+      sessionKey: 'deck_summary_private_semantic',
+      startupMemoryAlreadyInjected: true,
+    });
+    timelineEmitterEmitMock.mockClear();
+    searchLocalMemorySemanticMock.mockClear();
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([semanticSummary]));
+
+    r.send('private audit brief', 'peer-audit-private-semantic', undefined, undefined, {
+      peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: 'attempt_hash' },
+    });
+    await waitForProviderSendCount(localMock.provider, 1);
+
+    expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+    expect(timelineEmitterEmitMock.mock.calls.some((call) => call[1] === 'memory.context')).toBe(false);
+
+    localMock.fireComplete('sess-1');
+    r.send('ordinary semantic recall turn', 'ordinary-after-private-semantic');
+    await waitForProviderSendCount(localMock.provider, 2);
+    expect(searchLocalMemorySemanticMock).toHaveBeenCalledTimes(1);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Semantic recent summary must remain private-turn isolated'),
+      }),
+    }));
+  });
+
   it('does not duplicate summaries already carried by first-turn startup memory', async () => {
     const summary = makeSummarySyncCandidate('summary-startup', 'Startup already carries this summary');
     collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);

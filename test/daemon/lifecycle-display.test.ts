@@ -16,7 +16,7 @@ const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js')
 const {
   getLastAssistantText,
   resolvePushDisplayContext,
-  sendExternalMessageToProcessSession,
+  sendExternalMessageToSession,
   shouldRunGenericSilentActiveTurnRecovery,
 } = await import('../../src/daemon/lifecycle.js');
 
@@ -108,10 +108,10 @@ describe('daemon lifecycle push display helpers', () => {
     expect(shouldRunGenericSilentActiveTurnRecovery({ agentType: 'claude-code-sdk' }, true)).toBe(false);
   });
 
-  it('routes external chat messages through the common process send boundary', async () => {
+  it('routes external chat messages through the runtime-neutral send boundary', async () => {
     const sender = vi.fn().mockResolvedValue(undefined);
 
-    await sendExternalMessageToProcessSession('deck_alpha_brain', 'message from chat bridge', sender);
+    await sendExternalMessageToSession('deck_alpha_brain', 'message from chat bridge', sender);
 
     expect(sender).toHaveBeenCalledWith('deck_alpha_brain', 'message from chat bridge');
   });

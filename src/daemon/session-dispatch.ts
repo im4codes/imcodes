@@ -22,7 +22,7 @@ import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
-import type { SessionRecord } from '../store/session-store.js';
+import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
@@ -167,6 +167,26 @@ export async function dispatchSessionMessage(
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
   await sendProcessSessionMessageForAutomation(target.name, message);
+}
+
+/** Resolve a named session and deliver through the runtime-neutral boundary.
+ * The selected runtime owns the single user.timeline projection: transport
+ * dispatch emits its structured event, while the process sender emits before
+ * entering its serialized terminal delivery path. */
+export async function dispatchSessionMessageByName(
+  sessionName: string,
+  message: string,
+  deps: {
+    getSession?: (name: string) => SessionRecord | undefined;
+    dispatchMessage?: typeof dispatchSessionMessage;
+  } = {},
+): Promise<SessionDispatchMessageResult> {
+  const target = (deps.getSession ?? getStoredSession)(sessionName);
+  if (!target) throw new Error(`session not found: ${sessionName}`);
+  return (deps.dispatchMessage ?? dispatchSessionMessage)(target, message, {
+    dispatchId: createSendDispatchId(),
+    messageId: createSendMessageId(),
+  });
 }
 
 export type PeerAuditDispatchResult =

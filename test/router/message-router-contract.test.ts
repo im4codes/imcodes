@@ -107,7 +107,9 @@ describe('message router contracts', () => {
 
     await router.routeMessage(inbound('/send please review'), ctx);
     expect(ctx.sendToSession).toHaveBeenCalledWith('deck_alpha_brain', 'please review');
-    expect(timelineEmitMock).toHaveBeenCalledWith('deck_alpha_brain', 'user.message', { text: 'please review' });
+    // The runtime-aware delivery boundary owns the single user.message event.
+    // The router must not duplicate it after a slow process/queued send.
+    expect(timelineEmitMock).not.toHaveBeenCalled();
 
     await router.routeMessage(inbound('plain text'), ctx);
     expect(ctx.sendToSession).toHaveBeenCalledWith('deck_alpha_brain', 'plain text');

@@ -6,7 +6,6 @@ import { parseCommand, fromPlatformCommand } from './command-parser.js';
 import type { ParseResult } from './command-parser.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import logger from '../util/logger.js';
-import { timelineEmitter } from '../daemon/timeline-emitter.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -312,7 +311,6 @@ async function forwardTextToBrain(
 ): Promise<void> {
   try {
     await ctx.sendToSession(brainSessionName, text);
-    timelineEmitter.emit(brainSessionName, 'user.message', { text });
   } catch (err) {
     logger.error({ brainSessionName, err }, 'Failed to forward text to brain session');
   }

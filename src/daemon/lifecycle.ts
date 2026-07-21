@@ -4,7 +4,8 @@ import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
-import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, sendProcessSessionMessageForAutomation } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
+import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
@@ -133,13 +134,13 @@ export interface DaemonContext {
   sendSessionEvent(event: 'started' | 'stopped' | 'error', session: string, state: string): void;
 }
 
-/** Route an external chat message through the same process-session delivery
- * boundary as Web/CLI sends so summary sync, serialization, and error handling
- * cannot drift from ordinary user-visible delivery. */
-export async function sendExternalMessageToProcessSession(
+/** Route an external chat message through the same runtime-neutral delivery
+ * boundary as Web/CLI sends so summary sync, serialization, and timeline
+ * ownership cannot drift from ordinary user-visible delivery. */
+export async function sendExternalMessageToSession(
   sessionName: string,
   text: string,
-  sender = sendProcessSessionMessageForAutomation,
+  sender = dispatchSessionMessageByName,
 ): Promise<void> {
   await sender(sessionName, text);
 }
@@ -1048,7 +1049,7 @@ export async function startup(): Promise<DaemonContext> {
           logger.warn({ err: e, platform, channelId }, 'sendOutbound failed');
         }
       },
-      sendToSession: sendExternalMessageToProcessSession,
+      sendToSession: sendExternalMessageToSession,
       persistBinding,
       removeBinding,
     });

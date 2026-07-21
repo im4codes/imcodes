@@ -28,7 +28,12 @@ vi.mock('../../src/daemon/transport-queue-projection.js', () => ({
   buildTransportQueueSnapshotPayload: vi.fn(() => ({ queueEpoch: 'queue_epoch_1' })),
 }));
 
-const { cancelQueuedPeerAuditMessage, dispatchPeerAuditMessage, dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
+const {
+  cancelQueuedPeerAuditMessage,
+  dispatchPeerAuditMessage,
+  dispatchSessionMessage,
+  dispatchSessionMessageByName,
+} = await import('../../src/daemon/session-dispatch.js');
 
 function target(patch: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -142,5 +147,25 @@ describe('peer-audit dedicated dispatch', () => {
     })).resolves.toBe('sent');
     expect(sendMock).toHaveBeenCalledWith('ordinary delegation', 'send_message_12345678');
     expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('routes named external sends through transport and process runtimes', async () => {
+    sendMock.mockReturnValue('sent');
+    getSessionMock.mockReturnValueOnce(target());
+
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'transport external message'))
+      .resolves.toBe('sent');
+    expect(sendMock).toHaveBeenCalledWith(
+      'transport external message',
+      expect.stringMatching(/^send_message_/),
+    );
+    expect(processSendMock).not.toHaveBeenCalled();
+
+    sendMock.mockClear();
+    getSessionMock.mockReturnValueOnce(target({ agentType: 'codex', runtimeType: 'process' }));
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'process external message'))
+      .resolves.toBeUndefined();
+    expect(processSendMock).toHaveBeenCalledWith('deck_sub_audit123', 'process external message');
+    expect(sendMock).not.toHaveBeenCalled();
   });
 });
