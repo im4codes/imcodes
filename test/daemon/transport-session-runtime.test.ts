@@ -2642,6 +2642,53 @@ ${PREFERENCE_CONTEXT_END}`;
     }));
   });
 
+  it('retries summaries when an accepted turn later ends with a provider error', async () => {
+    const summary = makeSummarySyncCandidate(
+      'summary-terminal-retry',
+      'Retry this summary after the accepted turn ends at model capacity',
+    );
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([]));
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_summary_terminal_retry');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_summary_terminal_retry' });
+
+    r.send('ok', 'summary-terminal-failed-turn');
+    await waitForProviderSendCount(localMock.provider, 1);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Retry this summary after the accepted turn ends at model capacity'),
+      }),
+    }));
+
+    localMock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity. Please try a different model.',
+      recoverable: false,
+    });
+    await flushDispatch();
+
+    r.send('ok', 'summary-terminal-retry-turn');
+    await waitForProviderSendCount(localMock.provider, 2);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      memoryRecall: expect.objectContaining({
+        injectedText: expect.stringContaining('Retry this summary after the accepted turn ends at model capacity'),
+      }),
+    }));
+
+    localMock.fireComplete('sess-1');
+    r.send('ok', 'summary-after-success-turn');
+    await waitForProviderSendCount(localMock.provider, 3);
+    expect(localMock.provider.send).toHaveBeenNthCalledWith(3, 'sess-1', expect.not.objectContaining({
+      memoryRecall: expect.anything(),
+    }));
+  });
+
   it('still injects per-message local recall when authority resolves to processed_remote for shared scope', async () => {
     const memoryItem = makeSearchItem({
       projectId: 'repo-1',

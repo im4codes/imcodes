@@ -461,6 +461,15 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** True once the active dispatch has crossed into provider.send(). */
   private _activeDispatchProviderStarted = false;
   private _activeDispatchId: number | null = null;
+  /** Summary delivery ownership for the active provider turn. A provider
+   * accepting send() is not proof that the model consumed the context: the
+   * turn can still terminate with capacity/auth/provider errors. Commit only
+   * on authoritative completion; failed/cancelled settlements roll back so a
+   * later user retry receives the same new summaries. */
+  private _activeSummarySyncReservation: {
+    dispatchId: number;
+    reservation: SummarySyncReservation;
+  } | null = null;
   private _activeDispatchStaleRecoveryStarted = false;
   private _stalePendingCancelFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private _ignoreProviderSnapshotForNextLocalStopDrain = false;
@@ -559,6 +568,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
         }
         if (this._activeDispatchCancelled) {
+          this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this.clearStalePendingCancelFallbackTimer();
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
@@ -598,6 +608,7 @@ export class TransportSessionRuntime implements SessionRuntime {
               generationOrEpoch: this._activityGeneration,
             }
           : null;
+        this.commitActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
         this._activeTurn?.resolve();
         this._activeTurn = null;
         this._activeDispatchEntries = [];
@@ -711,6 +722,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime provider error',
         );
+        this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -1266,6 +1278,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
 
     this._sending = false;
+    this.commitActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -1989,6 +2002,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._activeTurn) {
       this._activeTurn.reject({ code: 'CANCELLED', message: 'Session killed', recoverable: false });
     }
+    this.rollbackActiveSummarySyncReservation();
     this._sending = false;
     this._activeTurn = null;
     this._activeDispatchEntries = [];
@@ -2034,6 +2048,39 @@ export class TransportSessionRuntime implements SessionRuntime {
   getHistory(): AgentMessage[] { return [...this._history]; }
 
   // ── Internal ────────────────────────────────────────────────────────────────
+
+  private bindActiveSummarySyncReservation(
+    dispatchId: number,
+    reservation: SummarySyncReservation | undefined,
+  ): void {
+    if (!reservation) return;
+    if (this._activeSummarySyncReservation) {
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          previousDispatchId: this._activeSummarySyncReservation.dispatchId,
+          dispatchId,
+        },
+        'transport runtime replaced an unsettled summary-sync reservation',
+      );
+      rollbackSummarySyncReservation(this._activeSummarySyncReservation.reservation);
+    }
+    this._activeSummarySyncReservation = { dispatchId, reservation };
+  }
+
+  private commitActiveSummarySyncReservation(expectedDispatchId?: number): void {
+    const active = this._activeSummarySyncReservation;
+    if (!active || (expectedDispatchId !== undefined && active.dispatchId !== expectedDispatchId)) return;
+    this._activeSummarySyncReservation = null;
+    commitSummarySyncReservation(active.reservation);
+  }
+
+  private rollbackActiveSummarySyncReservation(expectedDispatchId?: number): void {
+    const active = this._activeSummarySyncReservation;
+    if (!active || (expectedDispatchId !== undefined && active.dispatchId !== expectedDispatchId)) return;
+    this._activeSummarySyncReservation = null;
+    rollbackSummarySyncReservation(active.reservation);
+  }
 
   private setStatus(status: AgentStatus): void {
     if (status === 'idle' && this.drainPendingIfNoActiveTurn('setStatus')) return;
@@ -2211,6 +2258,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime sdk turn lost recovery failed',
     );
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.reject(failure);
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -2241,6 +2289,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
     this.closeOpenTools('errored', 'provider_error');
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -2321,6 +2370,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
     );
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -2583,6 +2633,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Generated Image Reporting is now appended in Codex SDK's own
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
+      this.bindActiveSummarySyncReservation(dispatchId, summarySyncReservation);
+      summarySyncReservation = undefined;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
         activityGeneration: this.currentActivityGeneration(),
@@ -2624,11 +2676,8 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         },
       });
-      // Crossing the provider-send boundary means the context was delivered,
-      // even if a local cancellation raced immediately afterwards.
-      commitSummarySyncReservation(summarySyncReservation);
-      summarySyncReservation = undefined;
       if (this.isDispatchLocallyCancelled(dispatchId)) {
+        this.rollbackActiveSummarySyncReservation(dispatchId);
         await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
           logger.warn({ err, providerSessionId: this._providerSessionId }, 'runtime dispatch noticed late cancel after provider send accepted');
         });
@@ -2678,6 +2727,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       .catch((err) => {
         rollbackSummarySyncReservation(summarySyncReservation);
         summarySyncReservation = undefined;
+        this.rollbackActiveSummarySyncReservation(dispatchId);
         // Only handle if the provider didn't already fire onError callback.
         // Shared-context dispatch denial is surfaced here as a send failure
         // because the outer runtime contract is still send-oriented.
@@ -2921,6 +2971,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     this.markCurrentActivityGenerationLocallyCancelled();
     if (!this._activeTurn && !this._sending) {
+      this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
       this._activeDispatchEntries = [];
@@ -2935,6 +2986,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return;
     }
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.reject(makeCancelledProviderError());
     this._activeTurn = null;
     this._activeDispatchEntries = [];
