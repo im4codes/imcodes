@@ -35,6 +35,7 @@ const sessionControlsSpy = vi.fn((props: any) => (
     data-model={props.activeSession?.modelDisplay ?? ''}
     data-effort={props.activeSession?.effort ?? ''}
     data-quota={props.activeSession?.quotaLabel ?? ''}
+    data-state={props.activeSession?.state ?? ''}
     data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}
   />
 ));
@@ -674,6 +675,55 @@ describe('SubSessionWindow metadata wiring', () => {
     await waitFor(() => {
       const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
       expect(footer?.dataset.state).toBe('idle');
+    });
+  });
+
+  it('clears the sub-session controls sweep when authoritative timeline idle beats stale running metadata', async () => {
+    timelineEventsMock = [
+      { type: 'session.state', ts: 10, payload: { state: 'running' } },
+      { type: 'assistant.text', ts: 20, payload: { text: 'done', streaming: false } },
+      {
+        type: 'session.state',
+        ts: 21,
+        payload: {
+          state: 'idle',
+          authoritative: true,
+          blockingWorkCount: 0,
+          activeWorkCount: 0,
+          activeToolCount: 0,
+          busyReasons: [],
+        },
+      },
+    ];
+
+    const sub = makeSubSession({
+      type: 'opencode-sdk',
+      runtimeType: 'transport' as any,
+      state: 'running',
+    } as any);
+
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = container.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      const controls = container.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      expect(footer?.dataset.state).toBe('idle');
+      expect(controls?.dataset.state).toBe('idle');
     });
   });
 

@@ -452,6 +452,15 @@ export function SubSessionWindow({
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
+  // Keep the controls' working sweep on the same reconciled live state as the
+  // footer. Transport sub-session metadata can lag the authoritative timeline
+  // idle edge; passing the stale outer `sub.state` made the footer show idle
+  // while SessionControls continued rendering its running scan indefinitely.
+  const controlsSessionInfo: SessionInfo = isTransport
+    && liveSessionState
+    && liveSessionState !== sessionInfo.state
+    ? { ...sessionInfo, state: liveSessionState as SessionInfo['state'] }
+    : sessionInfo;
 
   useEffect(() => {
     if (!shouldPersistGeometry(isDesktopMaximized)) return;
@@ -1024,7 +1033,7 @@ export function SubSessionWindow({
       <SessionControls
         ws={ws}
         connected={connected}
-        activeSession={sessionInfo}
+        activeSession={controlsSessionInfo}
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}
