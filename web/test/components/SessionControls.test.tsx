@@ -7221,6 +7221,54 @@ afterEach(() => {
     });
   });
 
+  it('force-loads OpenCode SDK models and sends /model from the active session picker', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'opencode-sdk-session',
+          agentType: 'opencode-sdk',
+          runtimeType: 'transport',
+          activeModel: 'opencode/pickle',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === 'opencode-sdk'
+        && call[0]?.force === true
+    ))?.[0];
+    expect(request).toMatchObject({
+      type: 'transport.list_models',
+      agentType: 'opencode-sdk',
+      force: true,
+    });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'opencode-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'opencode/pickle', name: 'OpenCode · Pickle' },
+        { id: 'anthropic/claude-sonnet-4-5', name: 'Anthropic · Claude Sonnet 4.5' },
+      ],
+      defaultModel: 'opencode/pickle',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^opencode\/pickle$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /anthropic\/claude-sonnet-4-5/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'opencode-sdk-session',
+      text: '/model anthropic/claude-sonnet-4-5',
+    });
+  });
+
   it('shows dynamically discovered kimi-sdk models and sends /model', async () => {
     const ws = makeWs();
     render(

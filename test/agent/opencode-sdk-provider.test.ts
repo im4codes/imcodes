@@ -80,7 +80,12 @@ function createHarness() {
           id: 'anthropic',
           name: 'Anthropic',
           models: {
-            'claude-sonnet-4-5': { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5', reasoning: true },
+            'claude-sonnet-4-5': {
+              id: 'claude-sonnet-4-5',
+              name: 'Claude Sonnet 4.5',
+              reasoning: true,
+              limit: { context: 1_000_000, output: 128_000 },
+            },
           },
         }],
       })),
@@ -222,7 +227,13 @@ describe('OpenCodeSdkProvider', () => {
     expect(approvals).toEqual([expect.objectContaining({ sessionId: 'route-1', id: 'perm-1', tool: 'bash' })]);
     expect(usage).toEqual([expect.objectContaining({
       sessionId: 'route-1', messageId: 'msg-1', finalized: true,
-      usage: expect.objectContaining({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 3, cache_creation_input_tokens: 2 }),
+      usage: expect.objectContaining({
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 3,
+        cache_creation_input_tokens: 2,
+        model_context_window: 1_000_000,
+      }),
     })]);
     expect(completions[0]).toMatchObject({ sessionId: 'route-1', id: 'msg-1', content: 'Hello', status: 'complete' });
 

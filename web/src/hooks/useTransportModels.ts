@@ -110,9 +110,11 @@ export function useTransportModels(
       });
     });
 
-    // Grok has no safe hardcoded model roster and its connect-time ACP probe
-    // is also the authoritative binary/authentication prerequisite check.
-    if (wsConnected) fetchModels(agentType === 'grok-sdk');
+    // Grok and OpenCode have no safe hardcoded model roster. Their live
+    // provider catalogs are the authoritative binary/authentication check, so
+    // the first picker load must actively connect instead of asking for the
+    // passive fallback (which is intentionally empty for these providers).
+    if (wsConnected) fetchModels(agentType === 'grok-sdk' || agentType === 'opencode-sdk');
     return unsub;
   }, [ws, wsConnected, agentType, fetchModels]);
 

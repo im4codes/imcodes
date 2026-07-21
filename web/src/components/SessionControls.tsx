@@ -1489,7 +1489,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isGrokSdk || isKimiSdk;
+  const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1537,6 +1538,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isGeminiSdk,
     isGrokSdk,
     isKimiSdk,
+    isOpenCodeSdk,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);

@@ -803,6 +803,11 @@ describe('NewSessionDialog', () => {
     const request = ws.send.mock.calls.find((call) => (
       call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'opencode-sdk'
     ))?.[0];
+    expect(request).toMatchObject({
+      type: 'transport.list_models',
+      agentType: 'opencode-sdk',
+      force: true,
+    });
     act(() => ws.emit({
       type: 'transport.models_response',
       agentType: 'opencode-sdk',

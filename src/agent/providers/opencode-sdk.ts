@@ -169,6 +169,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
   private sessions = new Map<string, OpenCodeSessionState>();
   private providerToRoute = new Map<string, string>();
   private modelCache: { at: number; value: ProviderModelList } | null = null;
+  private modelContextWindows = new Map<string, number>();
   private approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS;
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -222,6 +223,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     this.server = null;
     this.client = null;
     this.modelCache = null;
+    this.modelContextWindows.clear();
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
@@ -235,6 +237,12 @@ export class OpenCodeSdkProvider implements TransportProvider {
 
   async createSession(config: SessionConfig): Promise<string> {
     this.assertConnected();
+    // Usage events contain token counts but not the model limit. Prime the
+    // provider catalog before the session starts so the first usage frame can
+    // carry OpenCode's authoritative context window instead of a guessed UI
+    // fallback. listModels() is locally cached and fails closed to an empty
+    // catalog without preventing session creation.
+    if (!this.modelCache) await this.listModels(false);
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(routeId);
     if (existing && !config.fresh) {
@@ -346,13 +354,19 @@ export class OpenCodeSdkProvider implements TransportProvider {
       const result = await client.provider.list({ throwOnError: true });
       const connected = new Set(Array.isArray(result.data?.connected) ? result.data.connected : []);
       const providers = Array.isArray(result.data?.all) ? result.data.all : [];
+      const nextContextWindows = new Map<string, number>();
       const models = providers
         .filter((provider) => connected.has(provider.id))
-        .flatMap((provider) => Object.values(provider.models ?? {}).map((model: any) => ({
-          id: `${provider.id}/${model.id}`,
-          name: `${provider.name} · ${model.name ?? model.id}`,
-          ...(model.reasoning ? { supportsReasoningEffort: true } : {}),
-        })))
+        .flatMap((provider) => Object.values(provider.models ?? {}).map((model: any) => {
+          const id = `${provider.id}/${model.id}`;
+          const contextWindow = positiveNumber(model.limit?.context);
+          if (contextWindow !== undefined && contextWindow > 0) nextContextWindows.set(id, contextWindow);
+          return {
+            id,
+            name: `${provider.name} · ${model.name ?? model.id}`,
+            ...(model.reasoning ? { supportsReasoningEffort: true } : {}),
+          };
+        }))
         .sort((a, b) => a.name.localeCompare(b.name));
       const firstProvider = providers.find((provider) => connected.has(provider.id));
       const defaultModelId = firstProvider ? result.data?.default?.[firstProvider.id] : undefined;
@@ -362,6 +376,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
         ...(firstProvider && defaultModelId ? { defaultModel: `${firstProvider.id}/${defaultModelId}` } : {}),
         ...(connected.size === 0 ? { error: 'OpenCode has no connected model provider' } : {}),
       };
+      this.modelContextWindows = nextContextWindows;
       this.modelCache = { at: Date.now(), value };
       return value;
     } catch (error) {
@@ -727,11 +742,13 @@ export class OpenCodeSdkProvider implements TransportProvider {
 
   private emitUsage(state: OpenCodeSessionState, messageId: unknown, tokens: any, cost: unknown, finalized: boolean): void {
     if (!tokens || typeof tokens !== 'object') return;
+    const modelContextWindow = state.model ? this.modelContextWindows.get(state.model) : undefined;
     const usage = {
       input_tokens: positiveNumber(tokens.input) ?? 0,
       output_tokens: positiveNumber(tokens.output) ?? 0,
       cache_read_input_tokens: positiveNumber(tokens.cache?.read) ?? 0,
       cache_creation_input_tokens: positiveNumber(tokens.cache?.write) ?? 0,
+      ...(modelContextWindow !== undefined ? { model_context_window: modelContextWindow } : {}),
       ...(positiveNumber(cost) !== undefined ? { cost_usd: cost } : {}),
     };
     const signature = JSON.stringify(usage);
