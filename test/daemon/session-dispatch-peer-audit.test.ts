@@ -6,12 +6,17 @@ const removeMock = vi.fn();
 const processSendMock = vi.fn();
 const injectPrivateMock = vi.fn();
 const getSessionMock = vi.fn();
+const getTransportRuntimeMock = vi.fn();
+const ensureTransportRuntimeForPendingResendMock = vi.fn();
+const enqueueResendMock = vi.fn();
 
 vi.mock('../../src/agent/session-manager.js', () => ({
-  getTransportRuntime: vi.fn(() => ({
-    send: sendMock,
-    removePendingMessage: removeMock,
-  })),
+  getTransportRuntime: (...args: unknown[]) => getTransportRuntimeMock(...args),
+  ensureTransportRuntimeForPendingResend: (...args: unknown[]) => ensureTransportRuntimeForPendingResendMock(...args),
+}));
+
+vi.mock('../../src/daemon/transport-resend-queue.js', () => ({
+  enqueueResend: (...args: unknown[]) => enqueueResendMock(...args),
 }));
 
 vi.mock('../../src/daemon/command-handler.js', () => ({
@@ -63,6 +68,16 @@ describe('peer-audit dedicated dispatch', () => {
     processSendMock.mockReset();
     injectPrivateMock.mockReset();
     getSessionMock.mockReset();
+    getTransportRuntimeMock.mockReset();
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider_session_1',
+      send: sendMock,
+      removePendingMessage: removeMock,
+    });
+    ensureTransportRuntimeForPendingResendMock.mockReset();
+    ensureTransportRuntimeForPendingResendMock.mockResolvedValue(undefined);
+    enqueueResendMock.mockReset();
+    enqueueResendMock.mockReturnValue({ accepted: true, droppedOldest: false, pendingVersion: 1 });
   });
 
   it.each(['sent', 'queued'] as const)('returns the exact transport %s disposition and private queue metadata', async (disposition) => {
@@ -167,5 +182,25 @@ describe('peer-audit dedicated dispatch', () => {
       .resolves.toBeUndefined();
     expect(processSendMock).toHaveBeenCalledWith('deck_sub_audit123', 'process external message');
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('durably queues a named transport send while its runtime is still restoring', async () => {
+    getSessionMock.mockReturnValueOnce(target());
+    getTransportRuntimeMock.mockReturnValueOnce(undefined);
+
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'startup-window external message'))
+      .resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'startup-window external message',
+      commandId: expect.stringMatching(/^send_message_/),
+      clientMessageId: expect.stringMatching(/^send_message_/),
+      queuedAt: expect.any(Number),
+    }));
+    const queuedEntry = enqueueResendMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(queuedEntry.commandId).toBe(queuedEntry.clientMessageId);
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123');
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
   });
 });

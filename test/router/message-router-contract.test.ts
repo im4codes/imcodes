@@ -136,4 +136,21 @@ describe('message router contracts', () => {
     await router.routeMessage(inbound('/help', { isCommand: true, command: 'help', args: [] }), ctx);
     expect(ctx.sendOutbound.mock.calls.at(-1)?.[3]).toContain('Available commands');
   });
+
+  it('reports external delivery failure instead of claiming a dropped message was sent', async () => {
+    const router = await import('../../src/router/message-router.js');
+    const ctx = context();
+    router.bindChannel('slack', 'C1', 'bot-1', 'alpha', 'user-1');
+    ctx.sendToSession.mockRejectedValueOnce(new Error('transport queue unavailable'));
+
+    await router.routeMessage(inbound('message during unavailable startup'), ctx);
+
+    expect(ctx.sendOutbound).toHaveBeenCalledWith(
+      'C1',
+      'slack',
+      'bot-1',
+      'Failed to deliver message to brain. Please try again.',
+    );
+    expect(timelineEmitMock).not.toHaveBeenCalled();
+  });
 });

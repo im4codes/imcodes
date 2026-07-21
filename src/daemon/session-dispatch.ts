@@ -23,9 +23,10 @@ import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
+import { ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { enqueueResend } from './transport-resend-queue.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import type { TimelineEvent } from './timeline-event.js';
@@ -149,7 +150,25 @@ export async function dispatchSessionMessage(
 ): Promise<SessionDispatchMessageResult> {
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     const runtime = getTransportRuntime(target.name);
-    if (!runtime) throw new Error(`no transport runtime for session ${target.name}`);
+    if (!runtime?.providerSessionId) {
+      const queued = enqueueResend(target.name, {
+        text: message,
+        commandId: options.messageId,
+        clientMessageId: options.messageId,
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        queuedAt: Date.now(),
+      });
+      if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...buildTransportQueueSnapshotPayload(target.name, 'session_dispatch_missing_runtime'),
+      }, { source: 'daemon', confidence: 'high' });
+      // Do not await provider startup on the inbound webhook path. The durable
+      // resend entry is now authoritative; launch/restore drains it and owns
+      // the eventual single user.message projection.
+      void ensureTransportRuntimeForPendingResend(target.name);
+      return 'queued';
+    }
     const result = options.sharedActor
       ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
       : runtime.send(message, options.messageId);

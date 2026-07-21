@@ -486,7 +486,11 @@ describe('Hook server /send endpoint', () => {
       });
       listSessionsMock.mockReturnValue([brain, transport]);
 
-      const mockRuntime = { send: vi.fn().mockReturnValue('sent'), getStatus: vi.fn().mockReturnValue('idle') };
+      const mockRuntime = {
+        providerSessionId: 'transport-provider-session',
+        send: vi.fn().mockReturnValue('sent'),
+        getStatus: vi.fn().mockReturnValue('idle'),
+      };
       getTransportRuntimeMock.mockReturnValue(mockRuntime);
 
       const res = await postSend(port, { from: 'deck_proj_brain', to: 'deck_proj_w1', message: 'hello transport' });
@@ -523,6 +527,7 @@ describe('Hook server /send endpoint', () => {
       listSessionsMock.mockReturnValue([brain, transport]);
 
       const mockRuntime = {
+        providerSessionId: 'transport-provider-session',
         send: vi.fn((text: string, clientMessageId: string) => {
           getTransportQueueStore().enqueue({
             sessionName: 'deck_proj_w1',

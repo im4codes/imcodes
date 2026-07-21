@@ -853,6 +853,14 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns).toHaveLength(2);
     expect(mocks.claudeRuns[0].prompt).toBe('offline-msg-1');
     expect(mocks.claudeRuns[1].prompt).toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+    for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
+      const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
+        call[0] === 'deck_sdk_drain_brain'
+        && call[1] === 'user.message'
+        && (call[2] as { text?: unknown } | undefined)?.text === text
+      ));
+      expect(matchingUserEvents, `${text} should have exactly one timeline owner after restore drain`).toHaveLength(1);
+    }
   });
 
   it('launchTransportSession awaits drainResend — fresh launch with pre-populated queue dispatches in order', async () => {
