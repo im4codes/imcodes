@@ -500,10 +500,14 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     scope?: SearchRequestScope;
     projectId?: string;
     limit?: number;
+    excludeSourceSessionName?: string;
   }>(c);
   const query = body?.query?.trim() ?? '';
   const requestedScope = isSearchRequestScope(body?.scope) ? body.scope : 'all_authorized';
   const limit = Math.max(1, Math.min(50, typeof body?.limit === 'number' ? body.limit : 20));
+  const excludeSourceSessionName = typeof body?.excludeSourceSessionName === 'string'
+    ? body.excludeSourceSessionName.trim().slice(0, 512) || null
+    : null;
   const userPrivateSyncEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.userPrivateSync, featureFlags);
   const scopes = expandSearchRequestScope(requestedScope, { includeOwnerPrivate: userPrivateSyncEnabled });
   if (scopes.length === 0) return c.json(sameShapeSearchEnvelope());
@@ -573,6 +577,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
        WHERE COALESCE(p.status, 'active') = 'active'
          AND ($1::text IS NULL OR p.project_id = $1)
          AND ($2::text = '' OR p.summary ILIKE $3)
+         AND ($8::text IS NULL OR COALESCE(p.content_json->>'sessionName', '') <> $8)
          AND (
            (p.scope = 'personal' AND p.user_id = $4 AND p.scope = ANY($5::text[]))
 	           OR (
@@ -586,7 +591,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
          )
        ORDER BY (p.updated_at + CASE WHEN $7::boolean THEN LEAST(COALESCE(cc.cite_count, 0), 100) ELSE 0 END) DESC
        LIMIT $6`,
-      [body?.projectId?.trim() || null, query, `%${query}%`, userId, sharedScopes, limit, citeCountEnabled],
+      [body?.projectId?.trim() || null, query, `%${query}%`, userId, sharedScopes, limit, citeCountEnabled, excludeSourceSessionName],
     );
     for (const row of rows.filter((entry) => !isMemoryNoiseSummary(entry.summary))) {
       results.push({
@@ -608,6 +613,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
   });
 
   return c.json({
+    ...(excludeSourceSessionName ? { sourceSessionExclusionApplied: true } : {}),
     results: results.slice(0, limit).map((result) => ({
       id: result.id,
       scope: result.scope,

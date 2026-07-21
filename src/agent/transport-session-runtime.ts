@@ -3205,7 +3205,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         semanticSkipReason
           ? Promise.resolve({ items: [] })
           : searchLocalMemorySemanticFrontOfTurn(recallQuery),
-        collectRecentSummarySyncCandidates(this._contextNamespace),
+        collectRecentSummarySyncCandidates(this._contextNamespace, {
+          currentSessionName: this.sessionKey,
+        }),
       ]);
       if (options?.isCancelled?.()) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall result ignored after timeout');

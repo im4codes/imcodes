@@ -89,6 +89,8 @@ export interface MemorySearchResultItem {
   userId?: string;
   eventType?: string;
   projectionClass?: ProcessedContextClass;
+  /** Session whose timeline produced this projection, when provenance is known. */
+  sourceSessionName?: string;
   summary: string;
   content?: string;
   createdAt: number;
@@ -617,6 +619,9 @@ function projectionToItem(projection: ProcessedContextProjection): MemorySearchR
     workspaceId: projection.namespace.workspaceId,
     userId: projection.namespace.userId,
     projectionClass: projection.class,
+    ...(typeof contentRecord?.sessionName === 'string' && contentRecord.sessionName.trim()
+      ? { sourceSessionName: contentRecord.sessionName.trim() }
+      : {}),
     summary: projection.summary,
     content: contentRecord ? JSON.stringify(contentRecord) : undefined,
     createdAt: projection.createdAt,

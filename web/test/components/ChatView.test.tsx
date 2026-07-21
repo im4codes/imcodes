@@ -1433,6 +1433,49 @@ describe('ChatView', () => {
     });
   });
 
+  it('labels supplemental summaries in the existing expandable related-history card', async () => {
+    const { container, getByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-summary-sync',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Continue the sibling work' },
+          },
+          {
+            eventId: 'evt-summary-sync',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              relatedToEventId: 'evt-user-summary-sync',
+              reason: 'message',
+              items: [
+                {
+                  id: 'summary-from-sibling',
+                  projectId: 'codedeck',
+                  summary: 'Sibling session completed the transport retry fix',
+                  projectionClass: 'recent_summary',
+                },
+              ],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelectorAll('.chat-memory-context')).toHaveLength(1);
+    expect(container.textContent).not.toContain('Sibling session completed the transport retry fix');
+    fireEvent.click(getByText('chat.memory_context_supplemental_title'));
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('chat.memory_context_section_recent');
+      expect(container.textContent).toContain('Sibling session completed the transport retry fix');
+    });
+  });
+
   it('renders status-only memory context hints collapsed by default — only the one-line reason is visible', async () => {
     const { container, getByText } = render(
       <ChatView

@@ -23,6 +23,8 @@ export interface SummarySyncCandidate {
 
 export interface CollectRecentSummarySyncOptions {
   limit?: number;
+  /** Current conversation; its own summaries are not supplemental context. */
+  currentSessionName?: string;
   selectLocal?: (
     namespace: ContextNamespace,
     limit: number,
@@ -30,6 +32,7 @@ export interface CollectRecentSummarySyncOptions {
   fetchRemote?: (
     namespace: ContextNamespace,
     limit: number,
+    excludeSourceSessionName?: string,
   ) => Promise<MemorySearchResultItem[]>;
 }
 
@@ -76,10 +79,11 @@ async function selectLocalRecent(
 async function fetchRemoteRecent(
   namespace: ContextNamespace,
   limit: number,
+  excludeSourceSessionName?: string,
 ): Promise<MemorySearchResultItem[]> {
   const credentials = getSharedContextRuntimeCredentials();
   if (!credentials) return [];
-  return fetchBackendStartupMemoryItems(credentials, namespace, limit);
+  return fetchBackendStartupMemoryItems(credentials, namespace, limit, { excludeSourceSessionName });
 }
 
 /**
@@ -97,19 +101,22 @@ export async function collectRecentSummarySyncCandidates(
   if (limit === 0) return [];
   const selectLocal = options.selectLocal ?? selectLocalRecent;
   const fetchRemote = options.fetchRemote ?? fetchRemoteRecent;
+  const currentSessionName = options.currentSessionName?.trim();
   const [local, remote] = await Promise.all([
     selectLocal(namespace, limit).catch(() => []),
     // The server endpoint returns one mixed durable/recent page (max 50), so
     // request the full page before filtering to recent summaries. Otherwise a
     // durable-heavy project could hide a newly-created recent summary.
-    fetchRemote(namespace, Math.max(limit, 50)).catch(() => []),
+    fetchRemote(namespace, Math.max(limit, 50), currentSessionName).catch(() => []),
   ]);
   const rows = [
     ...remote
       .filter((item) => item.type === 'processed' && item.projectionClass === 'recent_summary')
+      .filter((item) => !currentSessionName || item.sourceSessionName !== currentSessionName)
       .map((item) => ({ item, sourceKind: 'remote_processed' as const })),
     ...local
       .filter((item) => item.type === 'processed' && item.projectionClass === 'recent_summary')
+      .filter((item) => !currentSessionName || item.sourceSessionName !== currentSessionName)
       .map((item) => ({ item, sourceKind: 'local_processed' as const })),
   ].sort((a, b) => (
     (b.item.updatedAt ?? b.item.createdAt ?? 0)

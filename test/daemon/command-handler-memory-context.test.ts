@@ -1457,6 +1457,10 @@ describe('handleWebCommand memory context timeline', () => {
 
     const delivered = sendKeysDelayedEnterMock.mock.calls.map((call) => String(call[1]));
     expect(delivered).toHaveLength(2);
+    expect(collectRecentSummarySyncCandidatesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: 'personal' }),
+      { currentSessionName: 'deck_process_brain' },
+    );
     expect(delivered.filter((text) => text.includes(summary))).toHaveLength(1);
     expect(delivered.find((text) => text.includes(summary))).toContain('# Recent project memory (reference only)');
   });

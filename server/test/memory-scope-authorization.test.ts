@@ -122,6 +122,7 @@ function makeMockDb() {
         return [...projections.values()]
           .filter((projection) => projection.scope !== 'personal' || projection.user_id === userId)
           .filter((projection) => projection.scope === 'personal' || projection.enterprise_id === 'ent-1')
+          .filter((projection) => !params[7] || projection.content_json.sessionName !== params[7])
           .map((projection) => ({
             id: projection.id,
             scope: projection.scope,
@@ -217,6 +218,52 @@ describe('memory scope authorization and same-shape citation lookup', () => {
     expect(searchSql).toContain("p.scope <> 'personal'");
     expect(searchSql).not.toContain("p.scope in ('project_shared', 'workspace_shared', 'org_shared')");
     expect(searchSql).toContain('order by (p.updated_at + case when $7::boolean then least(coalesce(cc.cite_count, 0), 100) else 0 end) desc');
+  });
+
+  it('excludes projections produced by the requested current session', async () => {
+    const { db, queryLog, projections } = makeMockDb();
+    projections.set('own-summary', {
+      id: 'own-summary',
+      scope: 'org_shared',
+      enterprise_id: 'ent-1',
+      user_id: null,
+      project_id: 'github.com/acme/repo',
+      summary: 'Current conversation summary',
+      origin: 'chat_compacted',
+      content_json: { sessionName: 'deck_proj_brain' },
+    });
+    projections.set('sibling-summary', {
+      id: 'sibling-summary',
+      scope: 'org_shared',
+      enterprise_id: 'ent-1',
+      user_id: null,
+      project_id: 'github.com/acme/repo',
+      summary: 'Sibling conversation summary',
+      origin: 'chat_compacted',
+      content_json: { sessionName: 'deck_sub_worker' },
+    });
+    const { app, env } = await buildApp(db);
+
+    const res = await app.request('/api/shared-context/memory/search', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-user': 'user-member' },
+      body: JSON.stringify({
+        query: '',
+        scope: 'all_authorized',
+        projectId: 'github.com/acme/repo',
+        excludeSourceSessionName: 'deck_proj_brain',
+        limit: 20,
+      }),
+    }, env);
+
+    expect(res.status).toBe(200);
+    const json = await res.json() as { sourceSessionExclusionApplied?: boolean; results: Array<{ id: string }> };
+    expect(json.sourceSessionExclusionApplied).toBe(true);
+    expect(json.results.map((item) => item.id)).toContain('sibling-summary');
+    expect(json.results.map((item) => item.id)).not.toContain('own-summary');
+    const search = queryLog.find((entry) => normalize(entry.sql).includes('shared_context_projection_cite_counts'));
+    expect(normalize(search?.sql ?? '')).toContain("content_json->>'sessionname'");
+    expect(search?.params[7]).toBe('deck_proj_brain');
   });
 
   it('does not query owner-private memories from generic search when user-private sync is disabled', async () => {

@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   collectRecentSummarySyncCandidates,
   fingerprintRecentSummary,
 } from '../../src/context/summary-sync.js';
+import { fetchBackendStartupMemoryItems } from '../../src/context/backend-startup-memory.js';
 import {
   clearSummarySyncHistory,
   commitSummarySyncReservation,
@@ -22,6 +23,7 @@ function item(
   summary: string,
   updatedAt: number,
   projectionClass: 'recent_summary' | 'durable_memory_candidate' = 'recent_summary',
+  sourceSessionName?: string,
 ) {
   return {
     type: 'processed' as const,
@@ -29,6 +31,7 @@ function item(
     projectId: NAMESPACE.projectId!,
     scope: NAMESPACE.scope,
     projectionClass,
+    ...(sourceSessionName ? { sourceSessionName } : {}),
     summary,
     createdAt: updatedAt,
     updatedAt,
@@ -74,6 +77,52 @@ describe('recent summary synchronization', () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0]?.item.id).toBe('shared-projection');
     expect(fingerprintRecentSummary(fullSummary)).toBe(fingerprintRecentSummary(remotePreview));
+  });
+
+  it('excludes the current conversation while keeping sibling summaries', async () => {
+    const fetchRemote = vi.fn(async () => [
+      item('remote-self', 'own remote summary', 40, 'recent_summary', SESSION),
+      item('remote-sibling', 'remote sibling summary', 30, 'recent_summary', 'deck_sub_remote'),
+    ]);
+    const candidates = await collectRecentSummarySyncCandidates(NAMESPACE, {
+      currentSessionName: SESSION,
+      selectLocal: async () => [
+        item('local-self', 'own local summary', 50, 'recent_summary', SESSION),
+        item('local-sibling', 'local sibling summary', 20, 'recent_summary', 'deck_sub_local'),
+      ],
+      fetchRemote,
+    });
+
+    expect(fetchRemote).toHaveBeenCalledWith(NAMESPACE, 50, SESSION);
+    expect(candidates.map((candidate) => candidate.item.id)).toEqual([
+      'remote-sibling',
+      'local-sibling',
+    ]);
+  });
+
+  it('fails closed when a remote server does not confirm source-session exclusion', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      results: [{
+        id: 'possibly-self',
+        scope: 'personal',
+        class: 'recent_summary',
+        preview: 'Could belong to the current conversation',
+        projectId: NAMESPACE.projectId,
+        updatedAt: 20,
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+
+    const rows = await fetchBackendStartupMemoryItems(
+      { workerUrl: 'https://worker.example', serverId: 'srv-1', token: 'test-token' },
+      NAMESPACE,
+      30,
+      { fetchImpl: fetchImpl as unknown as typeof fetch, excludeSourceSessionName: SESSION },
+    );
+
+    expect(rows).toEqual([]);
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toEqual(expect.objectContaining({
+      excludeSourceSessionName: SESSION,
+    }));
   });
 
   it('treats summaries with the same server-visible 240-character prefix as one delivery identity', () => {

@@ -382,6 +382,7 @@
     "pinned_last_sent_label": "最近发送",
     "pinned_last_sent_aria": "跳转到你最近发送的消息",
     "memory_context_title": "相关历史",
+    "memory_context_supplemental_title": "相关历史 · 补充摘要",
     "memory_context_startup_title": "历史上下文 · 已注入",
     "memory_context_summary": "召回 {{count}} 条",
     "memory_context_query": "查询：{{query}}",

@@ -12348,7 +12348,9 @@ async function prependLocalMemory(
       semanticSkipReason
         ? Promise.resolve({ items: [] })
         : searchLocalMemorySemanticFrontOfTurn(recallQuery),
-      collectRecentSummarySyncCandidates(recallContext.namespace),
+      collectRecentSummarySyncCandidates(recallContext.namespace, {
+        currentSessionName: sessionName,
+      }),
     ]);
     if (options?.isCancelled?.()
       || (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt)) {

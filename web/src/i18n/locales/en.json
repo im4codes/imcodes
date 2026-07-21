@@ -382,6 +382,7 @@
     "pinned_last_sent_label": "Last sent",
     "pinned_last_sent_aria": "Jump to your last sent message",
     "memory_context_title": "Related history",
+    "memory_context_supplemental_title": "Related history · Supplemental summaries",
     "memory_context_startup_title": "Historical context · injected",
     "memory_context_summary": "{{count}} recalled",
     "memory_context_query": "Query: {{query}}",

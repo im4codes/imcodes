@@ -3661,6 +3661,8 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const statusSummary = getMemoryContextStatusSummary(t, payload, contextItemCount);
   const statusDetail = getMemoryContextStatusDetail(t, payload);
   const isStatusOnly = contextItemCount === 0 && !!payload.status;
+  const hasSupplementalSummaries = reason === 'message'
+    && items.some((item) => item.projectionClass === 'recent_summary');
   // The startup-memory dump and the per-message recall both render as
   // memory-context cards, but they're conceptually different things:
   //   - startup: a one-shot "pre-loaded project history" preamble
@@ -3670,7 +3672,9 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   // fresh recall (see the daemon-restart dedup fix that pairs with this).
   const titleKey = reason === 'startup'
     ? 'chat.memory_context_startup_title'
-    : 'chat.memory_context_title';
+    : hasSupplementalSummaries
+      ? 'chat.memory_context_supplemental_title'
+      : 'chat.memory_context_title';
 
   if (isStatusOnly) {
     // Skipped/empty recall cards were showing title + summary + query + detail

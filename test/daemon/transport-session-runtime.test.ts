@@ -2406,6 +2406,10 @@ ${PREFERENCE_CONTEXT_END}`;
 
     r.send('Review the latest work now', 'summary-turn-1');
     await waitForProviderSendCount(localMock.provider, 1);
+    expect(collectRecentSummarySyncCandidatesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId: 'repo-1' }),
+      { currentSessionName: 'deck_summary_once_brain' },
+    );
     expect(localMock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
       memoryRecall: expect.objectContaining({
         injectedText: expect.stringContaining('Added the latest unsynchronized project summary'),
