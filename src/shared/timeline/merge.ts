@@ -3,6 +3,10 @@ import {
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   type TimelineDetailFieldPath,
 } from '../../../shared/timeline-protocol.js';
+import {
+  usageContextWindowSourceRank,
+  type UsageContextWindowSource,
+} from '../../../shared/usage-context-window.js';
 
 export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
 export type { TimelineDetailFieldPath };
@@ -64,15 +68,24 @@ function hasOwn(value: object, key: PropertyKey): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function canShareUsageContext(preferred: TimelineEvent, alternate: TimelineEvent): boolean {
+  const preferredModel = preferred.payload.model;
+  const alternateModel = alternate.payload.model;
+  return typeof preferredModel !== 'string'
+    || typeof alternateModel !== 'string'
+    || preferredModel === alternateModel;
+}
+
 /**
  * A stable usage event can be updated twice by a transport provider: once with
  * the token snapshot and later with model/context metadata from the terminal
  * completion. Timeline storage is keyed by eventId, so treating the latter as
  * a full replacement would erase the token snapshot and make the UI show 0.
  *
- * Only carry forward occupancy/cost fields. Context/model provenance belongs
- * to the preferred (newer/more complete) event; merging the whole payload
- * could incorrectly attach an older provider source to a newer inferred window.
+ * Carry forward occupancy/cost fields, plus a stronger authoritative context
+ * window for the same model. A terminal metadata frame may contain only a
+ * model-name inference; it must not replace a provider/preset window already
+ * reported for that exact usage event.
  */
 function supplementUsageSnapshot(
   preferred: TimelineEvent,
@@ -84,6 +97,19 @@ function supplementUsageSnapshot(
     if (hasOwn(preferred.payload, key) || !hasOwn(alternate.payload, key)) continue;
     payload ??= { ...preferred.payload };
     payload[key] = alternate.payload[key];
+  }
+  const preferredContextRank = usageContextWindowSourceRank(preferred.payload.contextWindowSource);
+  const alternateContextRank = usageContextWindowSourceRank(alternate.payload.contextWindowSource);
+  if (
+    alternateContextRank > preferredContextRank
+    && typeof alternate.payload.contextWindow === 'number'
+    && Number.isFinite(alternate.payload.contextWindow)
+    && alternate.payload.contextWindow > 0
+    && canShareUsageContext(preferred, alternate)
+  ) {
+    payload ??= { ...preferred.payload };
+    payload.contextWindow = alternate.payload.contextWindow;
+    payload.contextWindowSource = alternate.payload.contextWindowSource as UsageContextWindowSource;
   }
   return payload ? { ...preferred, payload } : preferred;
 }

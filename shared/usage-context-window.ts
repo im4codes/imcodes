@@ -18,3 +18,11 @@ export function isAuthoritativeUsageContextWindowSource(value: unknown): value i
   return value === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
     || value === USAGE_CONTEXT_WINDOW_SOURCES.PRESET;
 }
+
+/** Provider metadata outranks a configured preset, and both outrank a
+ * model-name inference that has no explicit source. */
+export function usageContextWindowSourceRank(value: unknown): number {
+  if (value === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER) return 2;
+  if (value === USAGE_CONTEXT_WINDOW_SOURCES.PRESET) return 1;
+  return 0;
+}

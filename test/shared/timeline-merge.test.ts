@@ -81,7 +81,7 @@ describe('preferTimelineEvent', () => {
     expect(preferTimelineEvent(full, preview)).toBe(full);
   });
 
-  it('keeps an earlier usage snapshot when terminal metadata updates the same event id', () => {
+  it('keeps provider-authoritative usage context when inferred terminal metadata updates the same event id', () => {
     const tokens = makeEvent({
       eventId: 'transport:s:msg-1:usage',
       type: 'usage.update',
@@ -114,10 +114,34 @@ describe('preferTimelineEvent', () => {
       cacheTokens: 36_608,
       outputTokens: 10,
       model: 'opencode/deepseek-v4-flash-free',
-      contextWindow: 1_000_000,
+      contextWindow: 200_000,
+      contextWindowSource: 'provider',
     });
-    expect(merged.payload).not.toHaveProperty('contextWindowSource');
     expect(preferTimelineEvent(terminalMetadata, tokens).payload).toEqual(merged.payload);
+  });
+
+  it('does not carry authoritative context across different models sharing a malformed event id', () => {
+    const providerUsage = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 8,
+      payload: {
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+      },
+    });
+    const newerModel = makeEvent({
+      eventId: 'transport:s:msg-1:usage',
+      type: 'usage.update',
+      seq: 14,
+      payload: {
+        model: 'opencode/deepseek-v4-pro',
+        contextWindow: 1_000_000,
+      },
+    });
+
+    expect(preferTimelineEvent(providerUsage, newerModel).payload).toEqual(newerModel.payload);
   });
 });
 

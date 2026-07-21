@@ -145,7 +145,7 @@ describe('extractLatestUsage', () => {
     });
   });
 
-  it('renders tokens after same-event OpenCode terminal metadata replaces the live frame', () => {
+  it('renders provider context after same-event OpenCode inferred metadata updates the live frame', () => {
     const eventId = 'transport:deck_sub_0m081z0m:msg-opencode:usage';
     const tokenEvent = {
       ...makeEvent({
@@ -174,8 +174,44 @@ describe('extractLatestUsage', () => {
     expect(usage).toMatchObject({
       inputTokens: 22,
       cacheTokens: 36_608,
-      contextWindow: 1_000_000,
+      contextWindow: 200_000,
+      contextWindowSource: 'provider',
       model: 'opencode/deepseek-v4-flash-free',
+    });
+  });
+});
+
+describe('mergeUsageUpdate context authority', () => {
+  it('does not let inferred terminal metadata replace a provider context window for the same model', () => {
+    const previous = {
+      inputTokens: 101,
+      cacheTokens: 16_000,
+      contextWindow: 200_000,
+      contextWindowSource: 'provider' as const,
+      model: 'opencode/deepseek-v4-flash-free',
+    };
+
+    expect(mergeUsageUpdate(previous, {
+      model: 'opencode/deepseek-v4-flash-free',
+      contextWindow: 1_000_000,
+    })).toEqual(previous);
+  });
+
+  it('accepts a new inferred context when the active model changes', () => {
+    expect(mergeUsageUpdate({
+      inputTokens: 101,
+      cacheTokens: 16_000,
+      contextWindow: 200_000,
+      contextWindowSource: 'provider',
+      model: 'opencode/deepseek-v4-flash-free',
+    }, {
+      model: 'opencode/deepseek-v4-pro',
+      contextWindow: 1_000_000,
+    })).toMatchObject({
+      inputTokens: 101,
+      cacheTokens: 16_000,
+      contextWindow: 1_000_000,
+      model: 'opencode/deepseek-v4-pro',
     });
   });
 });

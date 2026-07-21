@@ -287,7 +287,7 @@ describe('timeline history transport sanitization', () => {
     });
   });
 
-  it('preserves token occupancy when newer metadata shares the usage event id', () => {
+  it('preserves token occupancy and provider context when newer inferred metadata shares the usage event id', () => {
     const eventId = 'transport:deck_hist:msg-opencode:usage';
     const result = sanitizeTimelineHistoryEventsForTransport([
       event({
@@ -325,10 +325,10 @@ describe('timeline history transport sanitization', () => {
         cacheTokens: 36_608,
         outputTokens: 10,
         model: 'opencode/deepseek-v4-flash-free',
-        contextWindow: 1_000_000,
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
       },
     });
-    expect(result.events[0]?.payload).not.toHaveProperty('contextWindowSource');
   });
 
   it('bounds diagnostic SDK raw payloads before history transport', () => {

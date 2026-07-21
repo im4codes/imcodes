@@ -2,6 +2,7 @@ import type { CodexStatusSnapshot } from '@shared/codex-status.js';
 import {
   isAuthoritativeUsageContextWindowSource,
   isUsageContextWindowSource,
+  usageContextWindowSourceRank,
   type UsageContextWindowSource,
 } from '@shared/usage-context-window.js';
 import type { TimelineEvent } from './ws-client.js';
@@ -58,16 +59,23 @@ export function mergeUsageUpdate(
 
   const hasTokenSnapshot = typeof payload.inputTokens === 'number';
   const payloadIsPlausible = hasTokenSnapshot && isPlausibleUsagePayload(payload);
+  const incomingContextSource = isUsageContextWindowSource(payload.contextWindowSource)
+    ? payload.contextWindowSource
+    : undefined;
+  const modelChanged = typeof previous?.model === 'string'
+    && typeof payload.model === 'string'
+    && previous.model !== payload.model;
+  const contextSourceIsCurrent = modelChanged
+    || usageContextWindowSourceRank(incomingContextSource) >= usageContextWindowSourceRank(next.contextWindowSource);
   if (
     typeof payload.contextWindow === 'number'
     && Number.isFinite(payload.contextWindow)
     && payload.contextWindow > 0
     && (!hasTokenSnapshot || payloadIsPlausible)
+    && contextSourceIsCurrent
   ) {
     next.contextWindow = payload.contextWindow;
-    next.contextWindowSource = isUsageContextWindowSource(payload.contextWindowSource)
-      ? payload.contextWindowSource
-      : undefined;
+    next.contextWindowSource = incomingContextSource;
     changed = true;
   }
   if (typeof payload.model === 'string' && payload.model) {
