@@ -60,6 +60,50 @@ describe('memory MCP tool schema firewall', () => {
     resetMemoryShortRefsForTests();
   });
 
+  it('submits peer audit replies only through the strict structured dependency', async () => {
+    const peerAuditReply = vi.fn(async () => ({ ok: true }));
+    const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
+    const valid = {
+      attemptId: 'attempt_12345678',
+      replyCapability: 'A'.repeat(32),
+      verdict: 'PASS',
+      findings: 'Focused tests passed.',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
+    };
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](valid)).resolves.toEqual({ status: 'ok', accepted: true });
+    expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
+      version: 'peer_audit_reply_v1',
+      attemptId: valid.attemptId,
+      replyCapability: valid.replyCapability,
+    }));
+
+    const forged = await handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({ ...valid, injectedTarget: 'other-session' });
+    expect(forged).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(peerAuditReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers peer-audit PASS evidence policy until the sender-bound ingress', async () => {
+    const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'invalid_capability' }));
+    const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
+    const structureOnlyPass = {
+      attemptId: 'attempt_12345678',
+      replyCapability: 'A'.repeat(32),
+      verdict: 'PASS',
+      findings: 'No executable evidence was supplied.',
+      validations: [],
+    };
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](structureOnlyPass)).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+    });
+    expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
+      version: 'peer_audit_reply_v1',
+      verdict: 'PASS',
+      validations: [],
+    }));
+  });
+
   it('strips forged memory authority fields before search and write helpers', async () => {
     const searchMemory = vi.fn(async () => ({
       items: [],

@@ -17,12 +17,12 @@ export interface TransportModelState {
 }
 
 /** Agent types that support dynamic model discovery via `transport.list_models`. */
-export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk';
+export type TransportAgentTypeWithModels = 'claude-code-sdk' | 'copilot-sdk' | 'cursor-headless' | 'codex-sdk' | 'opencode-sdk' | 'gemini-sdk' | 'grok-sdk' | 'kimi-sdk';
 
 export function supportsDynamicTransportModels(
   agentType: string | undefined | null,
 ): agentType is TransportAgentTypeWithModels {
-  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk';
+  return agentType === 'claude-code-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'grok-sdk' || agentType === 'kimi-sdk';
 }
 
 /** Fetch and cache the list of available models for a transport agent type.
@@ -110,9 +110,11 @@ export function useTransportModels(
       });
     });
 
-    // Grok has no safe hardcoded model roster and its connect-time ACP probe
-    // is also the authoritative binary/authentication prerequisite check.
-    if (wsConnected) fetchModels(agentType === 'grok-sdk');
+    // Grok and OpenCode have no safe hardcoded model roster. Their live
+    // provider catalogs are the authoritative binary/authentication check, so
+    // the first picker load must actively connect instead of asking for the
+    // passive fallback (which is intentionally empty for these providers).
+    if (wsConnected) fetchModels(agentType === 'grok-sdk' || agentType === 'opencode-sdk');
     return unsub;
   }, [ws, wsConnected, agentType, fetchModels]);
 

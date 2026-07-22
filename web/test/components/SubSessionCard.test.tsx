@@ -107,6 +107,36 @@ describe('SubSessionCard', () => {
     localStorage.clear();
   });
 
+  it('projects canonical peer-audit identity/model metadata into compact SessionControls', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          sessionInstanceId: 'card-instance-1',
+          runtimeEpoch: 'card-runtime-1',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+        })}
+        ws={null}
+        connected={true}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+        isOpen={false}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.activeSession).toMatchObject({
+      name: 'deck_sub_sub-card-1',
+      sessionInstanceId: 'card-instance-1',
+      runtimeEpoch: 'card-runtime-1',
+      activeModel: 'gpt-5.6',
+      providerId: 'openai',
+    });
+  });
+
   it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(

@@ -11,6 +11,8 @@ import {
   buildSdkSubagentTimelinePayload,
   parseSdkSubagentDetail,
 } from '../../shared/sdk-subagent-status.js';
+import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
+import { preferTimelineEvent } from '../shared/timeline/merge.js';
 
 export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
 export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -359,10 +361,6 @@ function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): num
   return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
 }
 
-function isNewerTimelineEvent(candidate: TimelineEvent, current: TimelineEvent): boolean {
-  return compareTimelineEventsForReplay(candidate, current) >= 0;
-}
-
 function detailStringAtPath(event: TimelineEvent, fieldPath: string): string | undefined {
   const parts = fieldPath.split('.');
   let current: unknown = event as unknown;
@@ -480,8 +478,9 @@ export function sanitizeTimelineHistoryEventsForTransport(
   const maxResponseBytes = Math.max(64 * 1024, Math.trunc(options.maxResponseBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES));
   const dedupedByEventId = new Map<string, TimelineEvent>();
   for (const event of events) {
+    if (isClaudeSyntheticSeedAssistantTextEvent(event as unknown as Record<string, unknown>)) continue;
     const current = dedupedByEventId.get(event.eventId);
-    if (!current || isNewerTimelineEvent(event, current)) dedupedByEventId.set(event.eventId, event);
+    dedupedByEventId.set(event.eventId, current ? preferTimelineEvent(current, event) : event);
   }
   const inputEvents = Array.from(dedupedByEventId.values()).sort(compareTimelineEventsForReplay);
   const selectedEntries: Array<ReturnType<typeof sanitizeTimelineHistoryEventForTransport> & { originalEvent: TimelineEvent }> = [];

@@ -24,6 +24,33 @@ afterEach(() => {
 });
 
 describe('TransportQueueStore', () => {
+  it('scrubs only orphaned peer-audit rows and preserves ordinary queued work', () => {
+    store.enqueue({
+      sessionName: 'deck',
+      clientMessageId: 'audit-queued',
+      text: 'private audit brief',
+      privateMaterialJson: JSON.stringify({
+        text: 'private audit brief',
+        peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: 'attempt-hash' },
+      }),
+      now: 100,
+    });
+    store.enqueue({
+      sessionName: 'deck',
+      clientMessageId: 'ordinary-queued',
+      text: 'ordinary user task',
+      privateMaterialJson: JSON.stringify({ text: 'ordinary user task' }),
+      now: 101,
+    });
+
+    expect(store.scrubPeerAuditOrphans('deck', 200)).toEqual(['audit-queued']);
+    expect(store.readSnapshot('deck').pendingMessageEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['ordinary-queued']);
+    expect(store.readPrivateDispatchMaterial('deck', 'audit-queued')).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial('deck', 'ordinary-queued')).toContain('ordinary user task');
+    expect(store.scrubPeerAuditOrphans('deck', 201)).toEqual([]);
+  });
+
   it('persists live entries in SQLite snapshots with transaction-generated versions', () => {
     const first = store.enqueue({
       sessionName: 'deck',

@@ -32,6 +32,7 @@ import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -100,7 +101,7 @@ export interface SessionPaneProps {
   // ── Action callbacks ────────────────────────────────────────────────────────
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
-  onSettings?: () => void;
+  onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   sessionPinned?: boolean;
   stopBlockedByPinned?: boolean;

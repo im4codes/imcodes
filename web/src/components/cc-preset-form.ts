@@ -1,4 +1,8 @@
-import { getCcPresetEffectiveModel } from '@shared/cc-presets.js';
+import {
+  DEFAULT_CC_PRESET_CONTEXT_WINDOW as DEFAULT_CC_PRESET_CONTEXT_WINDOW_VALUE,
+  getCcPresetEffectiveModel,
+  normalizeCcPresetContextWindow,
+} from '@shared/cc-presets.js';
 import type { CcPreset, CcPresetModelInfo } from '@shared/cc-presets.js';
 
 export type CcPresetEntry = CcPreset;
@@ -16,7 +20,7 @@ export interface CcPresetDraft {
 
 export const DEFAULT_CC_PRESET_BASE_URL = 'https://api.minimax.io/anthropic';
 export const DEFAULT_CC_PRESET_MODEL = 'MiniMax-M2.7';
-export const DEFAULT_CC_PRESET_CONTEXT_WINDOW = '1000000';
+export const DEFAULT_CC_PRESET_CONTEXT_WINDOW = String(DEFAULT_CC_PRESET_CONTEXT_WINDOW_VALUE);
 export const DEFAULT_CC_PRESET_INIT_MSG =
   'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
 
@@ -53,12 +57,14 @@ export function createDefaultCcPresetDraft(): CcPresetDraft {
 }
 
 export function createCcPresetDraftFromPreset(preset: CcPresetEntry): CcPresetDraft {
+  const effectiveModel = getCcPresetEffectiveModel(preset) ?? DEFAULT_CC_PRESET_MODEL;
+  const effectiveContextWindow = normalizeCcPresetContextWindow(preset.contextWindow, effectiveModel);
   return {
     name: preset.name,
     baseUrl: preset.env.ANTHROPIC_BASE_URL ?? DEFAULT_CC_PRESET_BASE_URL,
     token: preset.env.ANTHROPIC_API_KEY ?? preset.env.ANTHROPIC_AUTH_TOKEN ?? '',
-    model: getCcPresetEffectiveModel(preset) ?? DEFAULT_CC_PRESET_MODEL,
-    contextWindow: preset.contextWindow ? String(preset.contextWindow) : DEFAULT_CC_PRESET_CONTEXT_WINDOW,
+    model: effectiveModel,
+    contextWindow: effectiveContextWindow ? String(effectiveContextWindow) : DEFAULT_CC_PRESET_CONTEXT_WINDOW,
     customEnv: Object.entries(preset.env)
       .filter(([key]) => !INLINE_ENV_KEYS.has(key))
       .map(([key, value]) => ({ key, value })),

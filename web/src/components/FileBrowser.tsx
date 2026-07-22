@@ -29,9 +29,11 @@ import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
   getSharedChangesKey,
   subscribeSharedChanges,
+  subscribeSharedChangesStatus,
   requestSharedChanges,
   __resetSharedChangesForTests,
   type ChangeFile,
+  type SharedChangesRequestStatus,
 } from '../git-status-store.js';
 import { filePreviewStatesEqual } from '../file-preview-state.js';
 import { FILE_BROWSER_SNAPSHOT_KEY_PREFIX } from '../local-storage-quota.js';
@@ -559,6 +561,8 @@ export function FileBrowser({
     try { localStorage.setItem('rcc_fb_tab', v); } catch { /* ignore */ }
   };
   const [changesFiles, setChangesFiles] = useState<ChangeFile[]>([]);
+  const [changesRefreshStatus, setChangesRefreshStatus] = useState<SharedChangesRequestStatus>('idle');
+  const changesRefreshFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadedRef = useRef(new Set<string>());
   const pendingRef = useRef(new Map<string, string>()); // requestId → nodeId
@@ -1311,7 +1315,7 @@ export function FileBrowser({
   useEffect(() => {
     if (!changesRootPath) return;
     const cacheKey = getSharedChangesKey(ws, changesRootPath);
-    return subscribeSharedChanges(cacheKey, (files) => {
+    const unsubscribeFiles = subscribeSharedChanges(cacheKey, (files) => {
       if (!mountedRef.current) return;
       setChangesFiles(files);
       setModifiedFiles((prev) => {
@@ -1323,6 +1327,34 @@ export function FileBrowser({
         return next;
       });
     });
+    const unsubscribeStatus = subscribeSharedChangesStatus(cacheKey, (status) => {
+      if (!mountedRef.current) return;
+      if (changesRefreshFeedbackTimerRef.current) {
+        clearTimeout(changesRefreshFeedbackTimerRef.current);
+        changesRefreshFeedbackTimerRef.current = null;
+      }
+      setChangesRefreshStatus(status);
+      if (status === 'success' || status === 'error') {
+        changesRefreshFeedbackTimerRef.current = setTimeout(() => {
+          if (mountedRef.current) setChangesRefreshStatus('idle');
+          changesRefreshFeedbackTimerRef.current = null;
+        }, status === 'success' ? 1_500 : 3_000);
+      } else if (status === 'refreshing') {
+        changesRefreshFeedbackTimerRef.current = setTimeout(() => {
+          if (mountedRef.current) setChangesRefreshStatus('error');
+          changesRefreshFeedbackTimerRef.current = null;
+        }, 15_000);
+      }
+    });
+    return () => {
+      unsubscribeFiles();
+      unsubscribeStatus();
+      if (changesRefreshFeedbackTimerRef.current) {
+        clearTimeout(changesRefreshFeedbackTimerRef.current);
+        changesRefreshFeedbackTimerRef.current = null;
+      }
+      setChangesRefreshStatus('idle');
+    };
   }, [changesRootPath, ws]);
 
   useEffect(() => {
@@ -1941,18 +1973,43 @@ export function FileBrowser({
     return groups;
   }, [changesFiles]);
 
-  const changesSection = changesFiles.length > 0 ? (
+  const changesRefreshLabel = changesRefreshStatus === 'refreshing'
+    ? t('file_browser.refreshing_changes')
+    : changesRefreshStatus === 'success'
+      ? t('file_browser.refresh_changes_success')
+      : changesRefreshStatus === 'error'
+        ? t('file_browser.refresh_changes_failed')
+        : t('file_browser.refresh_changes');
+  const changesRefreshIcon = changesRefreshStatus === 'success'
+    ? '✓'
+    : changesRefreshStatus === 'error'
+      ? '!'
+      : '↻';
+  const changesSection = (
     <div class="fb-changes-section">
       <div class="fb-changes-header">
         <span class="fb-changes-title">{t('file_browser.changes_title', { count: changesFiles.length })}</span>
         {changesRootPath && (
-          <button class="fb-changes-refresh" onClick={() => {
-            requestSharedChanges(ws, changesRootPath!, true);
-          }} title="Refresh">↻</button>
+          <button
+            class={`fb-changes-refresh is-${changesRefreshStatus}`}
+            disabled={changesRefreshStatus === 'refreshing'}
+            onClick={() => {
+              try {
+                requestSharedChanges(ws, changesRootPath!, true);
+              } catch {
+                setChangesRefreshStatus('error');
+              }
+            }}
+            title={changesRefreshLabel}
+            aria-label={changesRefreshLabel}
+            aria-live="polite"
+            aria-atomic="true"
+          ><span class="fb-changes-refresh-icon" aria-hidden="true">{changesRefreshIcon}</span></button>
         )}
       </div>
-      <div class="fb-changes-list">
-        {Object.entries(groupedChanges).map(([label, files]) => (
+      {changesFiles.length > 0 ? (
+        <div class="fb-changes-list">
+          {Object.entries(groupedChanges).map(([label, files]) => (
           <div key={label} class="fb-changes-group">
             <div class="fb-changes-group-label">{label} ({files.length})</div>
             {files.map((f) => {
@@ -1979,10 +2036,13 @@ export function FileBrowser({
               );
             })}
           </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : (
+        <div class="fb-preview-msg fb-changes-empty">{t('file_browser.no_changes')}</div>
+      )}
     </div>
-  ) : null;
+  );
 
   // Build breadcrumb segments from currentLabel (handles Unix / and Windows \ paths)
   const breadcrumbSegments = useMemo(() => {

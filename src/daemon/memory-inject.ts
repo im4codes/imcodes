@@ -19,6 +19,8 @@ import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format
 import logger from '../util/logger.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
+import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
+import { recordSyncedSummaryFingerprints } from '../context/summary-sync-history.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 
@@ -67,8 +69,13 @@ async function findGeminiSessionFile(sessionId: string): Promise<string | null> 
  * never appears as a sent message in the UI but is part of the history.
  * Retries for up to 3s to handle Gemini's async file write timing.
  */
-export async function injectGeminiMemory(sessionId: string, cwd: string, projectName?: string): Promise<void> {
-  const memory = await buildSessionBootstrapContext(cwd, projectName ?? '');
+export async function injectGeminiMemory(
+  sessionId: string,
+  cwd: string,
+  projectName?: string,
+): Promise<MemorySearchResultItem[] | null> {
+  const bootstrap = await buildSessionBootstrapContextWithItems(cwd, projectName ?? '');
+  const memory = bootstrap.text;
   // memory is always non-null now since appendAgentSendDocs guarantees content
 
   // Retry: Gemini writes the session file slightly after emitting 'init'
@@ -79,7 +86,7 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
   }
   if (!filePath) {
     logger.warn({ sessionId }, 'memory-inject: Gemini session file not found, skipping injection');
-    return;
+    return null;
   }
 
   let session: any;
@@ -87,10 +94,10 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
     session = JSON.parse(await readFile(filePath, 'utf8'));
   } catch {
     logger.warn({ filePath }, 'memory-inject: failed to parse Gemini session file');
-    return;
+    return null;
   }
 
-  if (!Array.isArray(session.messages)) return;
+  if (!Array.isArray(session.messages)) return null;
 
   const first = session.messages[0];
   if (first?.type === 'user' && first?.content?.[0]?.text === 'hi') {
@@ -108,6 +115,7 @@ export async function injectGeminiMemory(sessionId: string, cwd: string, project
   session.lastUpdated = new Date().toISOString();
   await writeFile(filePath, JSON.stringify(session, null, 2), 'utf8');
   logger.info({ sessionId, filePath }, 'memory-inject: injected project memory into Gemini session');
+  return bootstrap.items;
 }
 
 export async function injectGeminiMemoryWithTimeline(
@@ -116,8 +124,9 @@ export async function injectGeminiMemoryWithTimeline(
   cwd: string,
   projectName?: string,
 ): Promise<void> {
-  await injectGeminiMemory(sessionId, cwd, projectName);
-  const items = await readProcessedMemoryItems(projectName ?? '');
+  const items = await injectGeminiMemory(sessionId, cwd, projectName);
+  if (!items) return;
+  recordSyncedSummaryFingerprints(sessionName, recentSummaryFingerprintsFromItems(items));
   const payload = buildMemoryContextTimelinePayload(undefined, items, 'startup');
   if (!payload) return;
   timelineEmitter.emit(sessionName, 'memory.context', payload, { source: 'daemon', confidence: 'high' });
@@ -149,13 +158,24 @@ export async function readProcessedMemoryItems(projectName: string): Promise<Mem
  * Build full session bootstrap context: project files + processed memory + send docs.
  */
 export async function buildSessionBootstrapContext(cwd: string, projectName: string): Promise<string> {
+  return (await buildSessionBootstrapContextWithItems(cwd, projectName)).text;
+}
+
+/** Build bootstrap text and return the exact processed-memory snapshot used in
+ * that text. Startup callers must persist fingerprints from this same snapshot
+ * rather than reading the store a second time and creating ghost tombstones. */
+export async function buildSessionBootstrapContextWithItems(
+  cwd: string,
+  projectName: string,
+): Promise<{ text: string; items: MemorySearchResultItem[] }> {
   const projectContext = await readProjectMemory(cwd);
-  const processedMemory = await readProcessedMemory(projectName);
+  const items = await readProcessedMemoryItems(projectName);
+  const processedMemory = items.length > 0 ? buildStartupProjectMemoryText(items) : null;
   const parts: string[] = [];
   if (projectContext) parts.push(projectContext);
   if (processedMemory) parts.push(processedMemory);
   parts.push(AGENT_SEND_DOCS);
-  return parts.join('\n\n');
+  return { text: parts.join('\n\n'), items };
 }
 
 /**

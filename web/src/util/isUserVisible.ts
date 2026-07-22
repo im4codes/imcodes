@@ -21,6 +21,7 @@ const VISIBLE_TYPES = new Set([
   // assistant.thinking is streaming partial — merged into indicator, not a separate message row
   'ask.question',
   'file.change',
+  'peer_audit.result',
 ]);
 
 export function isUserVisible(event: { type: string; payload?: Record<string, unknown> & { streaming?: boolean } }): boolean {

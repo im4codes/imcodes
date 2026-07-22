@@ -1,17 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.js';
+import { PEER_AUDIT_PROMPT_VERSION } from '../shared/peer-audit.js';
 import {
-  AUDIT_VERDICT_MARKERS,
   DEFAULT_SUPERVISION_BACKEND,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_AUDIT_MODES,
   SUPERVISION_CONTRACT_IDS,
-  SUPERVISION_DEFAULT_AUDIT_MODE,
   SUPERVISION_DEFAULT_PROMPT_VERSION,
   SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   DEFAULT_SUPERVISION_TIMEOUT_MS,
+  SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   TASK_RUN_STATUS_MARKERS,
@@ -25,14 +25,15 @@ import {
   mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
   normalizeSupervisorDefaultConfig,
-  parseAuditVerdictFromText,
   parseTaskRunTerminalStateFromText,
+  patchPeerAuditTargetInTransportConfig,
   resolveEffectiveCustomInstructions,
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
-  it('uses 12 seconds as the default supervision timeout (design.md §5)', () => {
-    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(12_000);
+  it('uses 30 seconds as both the default and minimum supervision timeout', () => {
+    expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(30_000);
+    expect(SUPERVISION_MIN_TIMEOUT_MS).toBe(30_000);
   });
 
   it('normalizes supervisor defaults with backend inference and defaults', () => {
@@ -58,11 +59,26 @@ describe('supervision config helpers', () => {
 
     expect(config.backend).toBe('qwen');
     expect(config.model).toBe('qwen3-coder-plus');
-    expect(config.timeoutMs).toBe(15_000);
+    expect(config.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
     expect(config.promptVersion).toBe('custom_prompt_v1');
   });
 
-  it('normalizes a heavy-mode session snapshot with audit defaults', () => {
+  it('upgrades legacy positive timeouts to the 30-second minimum without invalidating the snapshot', () => {
+    const transportConfig = {
+      supervision: {
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model: CODEX_MODEL_IDS[0],
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      },
+    };
+
+    expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(false);
+    expect(extractSessionSupervisionSnapshot(transportConfig)?.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
+  });
+
+  it('normalizes a peer-audit snapshot and omits the deprecated audit pipeline', () => {
     const snapshot = normalizeSessionSupervisionSnapshot({
       mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
       backend: 'claude-code-sdk',
@@ -72,6 +88,12 @@ describe('supervision config helpers', () => {
       customInstructions: '  Prefer tests before complete.  ',
       maxParseRetries: 2,
       auditMode: 'audit>plan',
+      auditTargetSessionName: 'deck_sub_auditor1',
+      auditTargetFingerprint: {
+        sessionInstanceId: 'logical_instance_1',
+        normalizedModelId: 'claude-sonnet-4-6',
+        providerFamily: 'anthropic',
+      },
       maxAuditLoops: 3,
       taskRunPromptVersion: SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS,
     });
@@ -79,13 +101,20 @@ describe('supervision config helpers', () => {
     expect(snapshot.mode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
     expect(snapshot.backend).toBe('claude-code-sdk');
     expect(snapshot.model).toBe(DEFAULT_PRIMARY_CONTEXT_MODEL);
-    expect(snapshot.timeoutMs).toBe(8_000);
+    expect(snapshot.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
     expect(snapshot.promptVersion).toBe(SUPERVISION_CONTRACT_IDS.DECISION_REPAIR);
     expect(snapshot.customInstructions).toBe('Prefer tests before complete.');
     expect(snapshot.maxParseRetries).toBe(2);
     expect(snapshot.maxAutoContinueStreak).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK);
     expect(snapshot.maxAutoContinueTotal).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL);
-    expect(snapshot.auditMode).toBe('audit>plan');
+    expect(snapshot.auditMode).toBeUndefined();
+    expect(snapshot.auditTargetSessionName).toBe('deck_sub_auditor1');
+    expect(snapshot.auditTargetFingerprint).toEqual({
+      sessionInstanceId: 'logical_instance_1',
+      normalizedModelId: 'claude-sonnet-4-6',
+      providerFamily: 'anthropic',
+    });
+    expect(snapshot.peerAuditPromptVersion).toBe(PEER_AUDIT_PROMPT_VERSION);
     expect(snapshot.maxAuditLoops).toBe(3);
     expect(snapshot.taskRunPromptVersion).toBe(SUPERVISION_CONTRACT_IDS.TASK_RUN_STATUS);
   });
@@ -118,15 +147,22 @@ describe('supervision config helpers', () => {
       mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
       backend: 'codex-sdk',
       model: CODEX_MODEL_IDS[0],
-      timeoutMs: 12_000,
+      timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
       promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
       maxParseRetries: 1,
       maxAutoContinueStreak: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
       maxAutoContinueTotal: DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
-      auditMode: SUPERVISION_DEFAULT_AUDIT_MODE,
       maxAuditLoops: 2,
       taskRunPromptVersion: SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
     });
+    expect(snapshot?.auditMode).toBeUndefined();
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: {
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
+      promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+    } })).toBe(true);
   });
 
   it('flags invalid persisted supervision snapshots instead of silently activating normalized automation', () => {
@@ -155,6 +191,99 @@ describe('supervision config helpers', () => {
     expect(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]).toBeDefined();
   });
 
+  describe('peer-audit snapshot migration', () => {
+    const base = {
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk' as const,
+      model: CODEX_MODEL_IDS[0],
+      timeoutMs: 12_000,
+      promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      maxParseRetries: 1,
+      maxAuditLoops: 0,
+      taskRunPromptVersion: SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
+    };
+
+    it('reads an audit-mode-only legacy snapshot but keeps it repair-required', () => {
+      const transportConfig = { supervision: { ...base, auditMode: 'audit>review>plan' } };
+      const snapshot = extractSessionSupervisionSnapshot(transportConfig);
+      expect(snapshot?.auditMode).toBe('audit>review>plan');
+      expect(snapshot?.maxAuditLoops).toBe(0);
+      expect(snapshot?.auditTargetFingerprint).toBeUndefined();
+      expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(true);
+      expect(getSessionSupervisionSnapshotIssues(transportConfig.supervision)).toContain('legacy_audit_mode_requires_repair');
+    });
+
+    it('accepts and preserves a name-only audit target', () => {
+      const transportConfig = { supervision: { ...base, auditTargetSessionName: 'deck_sub_legacy1' } };
+      const snapshot = extractSessionSupervisionSnapshot(transportConfig);
+      expect(snapshot?.auditTargetSessionName).toBe('deck_sub_legacy1');
+      expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(false);
+      expect(embedSessionSupervisionSnapshot(null, snapshot).supervision).toMatchObject({
+        auditTargetSessionName: 'deck_sub_legacy1',
+        peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+      });
+    });
+
+    it('writes a repaired fingerprint and never emits auditMode', () => {
+      const normalized = normalizeSessionSupervisionSnapshot({
+        ...base,
+        auditMode: 'audit',
+        auditTargetSessionName: 'deck_sub_peer2',
+        auditTargetFingerprint: {
+          sessionInstanceId: 'logical_peer_2',
+          normalizedModelId: 'gpt-5.6',
+          providerFamily: 'openai',
+        },
+      });
+      expect(normalized).toMatchObject({
+        maxAuditLoops: 0,
+        auditTargetSessionName: 'deck_sub_peer2',
+        auditTargetFingerprint: {
+          sessionInstanceId: 'logical_peer_2',
+          normalizedModelId: 'gpt-5.6',
+          providerFamily: 'openai',
+        },
+        peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+      });
+      expect(normalized).not.toHaveProperty('auditMode');
+    });
+
+    it('preserves a confirmed Quick target while mode is off', () => {
+      const persisted = embedSessionSupervisionSnapshot(null, {
+        mode: SUPERVISION_MODE.OFF,
+        auditTargetSessionName: 'deck_sub_peer3',
+        auditTargetFingerprint: {
+          sessionInstanceId: 'logical_peer_3',
+          normalizedModelId: 'claude-opus-4-6',
+          providerFamily: 'anthropic',
+        },
+      });
+      expect(extractSessionSupervisionSnapshot(persisted)).toMatchObject({
+        mode: SUPERVISION_MODE.OFF,
+        auditTargetSessionName: 'deck_sub_peer3',
+        peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+      });
+    });
+
+    it('drops invalid optional fingerprint metadata without dropping the selected target name', () => {
+      const invalid = {
+        ...base,
+        auditTargetSessionName: 'deck_sub_peer4',
+        auditTargetFingerprint: {
+          sessionInstanceId: 'not valid!',
+          normalizedModelId: 'gpt-5.6',
+          providerFamily: 'openai',
+        },
+      };
+      expect(getSessionSupervisionSnapshotIssues(invalid)).not.toContain('invalid_audit_target_fingerprint');
+      expect(normalizeSessionSupervisionSnapshot(invalid as never)).toMatchObject({
+        auditTargetSessionName: 'deck_sub_peer4',
+        peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+      });
+      expect(normalizeSessionSupervisionSnapshot(invalid as never)).not.toHaveProperty('auditTargetFingerprint');
+    });
+  });
+
   it('exposes the supervision audit-mode allowlist independently from default Team combos', () => {
     expect(getSupportedSupervisionAuditModes()).toEqual(SUPERVISION_AUDIT_MODES);
     expect(isSupportedSupervisionAuditMode('audit')).toBe(true);
@@ -162,11 +291,9 @@ describe('supervision config helpers', () => {
     expect(isSupportedSupervisionAuditMode('brainstorm>discuss>plan')).toBe(false);
   });
 
-  it('accepts exactly one task-run or verdict marker and rejects duplicates', () => {
+  it('accepts exactly one task-run marker and rejects duplicates', () => {
     expect(parseTaskRunTerminalStateFromText(`hello\n${TASK_RUN_STATUS_MARKERS.COMPLETE}`)).toBe('complete');
     expect(parseTaskRunTerminalStateFromText(`${TASK_RUN_STATUS_MARKERS.NEEDS_INPUT}\n${TASK_RUN_STATUS_MARKERS.BLOCKED}`)).toBeNull();
-    expect(parseAuditVerdictFromText(`before\n${AUDIT_VERDICT_MARKERS.PASS}`)).toBe('PASS');
-    expect(parseAuditVerdictFromText(`${AUDIT_VERDICT_MARKERS.PASS}\n${AUDIT_VERDICT_MARKERS.REWORK}`)).toBeNull();
   });
 
   describe('mergeTransportConfigPreservingSupervision', () => {
@@ -219,6 +346,38 @@ describe('supervision config helpers', () => {
       const incoming = { someOtherKey: 'value' };
       expect(mergeTransportConfigPreservingSupervision(incoming, null)).toEqual(incoming);
       expect(mergeTransportConfigPreservingSupervision(incoming, {})).toEqual(incoming);
+    });
+  });
+
+  it('patches only peer-audit target fields over the latest supervision config', () => {
+    const latest = embedSessionSupervisionSnapshot({ unrelated: { keep: true } }, {
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      customInstructions: 'keep concurrent instructions',
+      maxAuditLoops: 7,
+      maxAutoContinueStreak: 4,
+    });
+
+    const patched = patchPeerAuditTargetInTransportConfig(latest, {
+      auditTargetSessionName: 'deck_sub_peer_target',
+      auditTargetFingerprint: {
+        sessionInstanceId: 'logical_peer_instance',
+        normalizedModelId: 'claude-sonnet-4-6',
+        providerFamily: 'anthropic',
+      },
+    });
+
+    expect(patched.unrelated).toEqual({ keep: true });
+    expect(extractSessionSupervisionSnapshot(patched)).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      customInstructions: 'keep concurrent instructions',
+      maxAuditLoops: 7,
+      maxAutoContinueStreak: 4,
+      auditTargetSessionName: 'deck_sub_peer_target',
+      peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
     });
   });
 

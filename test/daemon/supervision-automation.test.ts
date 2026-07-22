@@ -2,7 +2,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
+import {
+  normalizeSessionSupervisionSnapshot,
+  SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_MODE,
+  SUPERVISION_UNAVAILABLE_REASONS,
+} from '../../shared/supervision-config.js';
+import {
+  PEER_AUDIT_DEADLINE_MS,
+  PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
+} from '../../shared/peer-audit.js';
+import { buildAgentDelegationReplyInstruction } from '../../shared/agent-delegation.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
@@ -19,6 +31,28 @@ const mockTransportRuntime = {
   pendingMessages: [],
   pendingEntries: [],
 };
+let mockAuditTargetStatus = 'idle';
+let mockAuditTargetSending = false;
+let mockAuditTargetLastProviderError: {
+  code: string;
+  message: string;
+  recoverable: boolean;
+  at: number;
+} | null = null;
+const mockAuditTargetRuntime = {
+  send: vi.fn(() => 'sent' as const),
+  get lastProviderError() {
+    return mockAuditTargetLastProviderError;
+  },
+  getDiagnosticSnapshot: vi.fn(() => ({
+    status: mockAuditTargetStatus,
+    sending: mockAuditTargetSending,
+    pendingCount: 0,
+    activeDispatchCount: mockAuditTargetSending ? 1 : 0,
+    blockingWorkCount: mockAuditTargetSending ? 1 : 0,
+  })),
+};
+const mockPersistSessionRecord = vi.fn();
 
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: mockStartP2pRun,
@@ -28,7 +62,10 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
-  getTransportRuntime: vi.fn(() => mockTransportRuntime),
+  getTransportRuntime: vi.fn((sessionName: string) => sessionName === 'deck_sub_reviewer'
+    ? mockAuditTargetRuntime
+    : mockTransportRuntime),
+  persistSessionRecord: mockPersistSessionRecord,
 }));
 
 vi.mock('../../src/daemon/supervision-broker.js', () => ({
@@ -37,19 +74,45 @@ vi.mock('../../src/daemon/supervision-broker.js', () => ({
   },
 }));
 
+vi.mock('../../src/daemon/peer-audit-service.js', () => ({
+  peerAuditService: {
+    cancelAutomatic: vi.fn(),
+    applyAutomaticConfiguration: vi.fn(),
+  },
+}));
+
 const { supervisionAutomation } = await import('../../src/daemon/supervision-automation.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
-const { upsertSession, removeSession } = await import('../../src/store/session-store.js');
+const { getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitForRunPhase(phase: 'execution' | 'auditing' | 'finalizing', timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase !== phase) {
+    if (performance.now() >= deadline) return;
+    // `setTimeout` is deliberately faked by the deadline test below. Yield on
+    // the real check queue so async filesystem baseline discovery can finish
+    // without advancing the six-minute audit deadline.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 let projectDir: string | null = null;
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useRealTimers();
+  mockSupervisionDecide.mockReset();
   mockSupervisionDecide.mockResolvedValue({ decision: 'complete', reason: 'done', confidence: 0.9 });
   supervisionAutomation.cancelSession('deck_supervision_brain');
+  supervisionAutomation.cancelSession('deck_sub_reviewer');
+  mockAuditTargetStatus = 'idle';
+  mockAuditTargetSending = false;
+  mockAuditTargetLastProviderError = null;
+  mockAuditTargetRuntime.send.mockReturnValue('sent');
   removeSession('deck_supervision_brain');
+  removeSession('deck_sub_reviewer');
 });
 
 async function seedProjectDir(withOpenSpecChange = false) {
@@ -76,6 +139,26 @@ async function seedSession(
   maxAuditLoops = 2,
   overrides: Record<string, unknown> = {},
 ) {
+  const seededProjectDir = await seedProjectDir(withOpenSpecChange);
+  upsertSession({
+    name: 'deck_sub_reviewer',
+    label: 'Reviewer',
+    projectName: 'supervision',
+    role: 'w1',
+    agentType: 'claude-code-sdk',
+    runtimeType: 'transport',
+    providerId: 'claude-code-sdk',
+    providerSessionId: 'provider-session-reviewer',
+    activeModel: 'claude-sonnet-4-6',
+    projectDir: seededProjectDir,
+    state: 'idle',
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  const reviewerSessionInstanceId = getSession('deck_sub_reviewer')?.sessionInstanceId;
+  if (!reviewerSessionInstanceId) throw new Error('reviewer session identity was not created');
   const snapshot = normalizeSessionSupervisionSnapshot({
     mode: mode === 'supervised' ? SUPERVISION_MODE.SUPERVISED : SUPERVISION_MODE.SUPERVISED_AUDIT,
     backend: 'codex-sdk',
@@ -84,11 +167,16 @@ async function seedSession(
     promptVersion: 'supervision_decision_v1',
     maxParseRetries: 1,
     auditMode: 'audit',
+    auditTargetSessionName: 'deck_sub_reviewer',
+    auditTargetFingerprint: {
+      sessionInstanceId: reviewerSessionInstanceId,
+      normalizedModelId: 'claude-sonnet-4-6',
+      providerFamily: 'anthropic',
+    },
     maxAuditLoops,
     taskRunPromptVersion: 'task_run_status_v1',
     ...overrides,
   });
-  const seededProjectDir = await seedProjectDir(withOpenSpecChange);
   upsertSession({
     name: 'deck_supervision_brain',
     projectName: 'supervision',
@@ -106,6 +194,30 @@ async function seedSession(
     updatedAt: Date.now(),
   });
   return snapshot;
+}
+
+function recreateReviewer(label = 'Replacement reviewer') {
+  removeSession('deck_sub_reviewer');
+  upsertSession({
+    name: 'deck_sub_reviewer',
+    label,
+    projectName: 'supervision',
+    role: 'w1',
+    agentType: 'claude-code-sdk',
+    runtimeType: 'transport',
+    providerId: 'claude-code-sdk',
+    providerSessionId: 'provider-session-replacement',
+    activeModel: 'claude-sonnet-4-6',
+    projectDir: projectDir!,
+    state: 'idle',
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  const reviewer = getSession('deck_sub_reviewer');
+  if (!reviewer?.sessionInstanceId) throw new Error('replacement reviewer identity was not created');
+  return reviewer;
 }
 
 function completeTurn(text = 'done') {
@@ -126,19 +238,59 @@ function beginRun(commandId: string, text: string) {
   });
 }
 
+function completeDelegatedAudit(verdict: 'PASS' | 'REWORK', findings = 'Independent audit evidence.') {
+  timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+    text: `Task: independent audit\nResult: ${findings}`,
+    allowDuplicate: true,
+  });
+  timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+    text: `${findings}\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS[verdict]}`,
+    streaming: false,
+  });
+  timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+}
+
+function beginAuditTargetTurn(attemptId: string) {
+  timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+    text: [
+      'Task: independently audit the current implementation.',
+      `Automatic audit attempt ID: ${attemptId}`,
+      buildAgentDelegationReplyInstruction('deck_supervision_brain'),
+    ].join('\n'),
+    allowDuplicate: true,
+    sharedActor: { actorUserId: 'deck_supervision_brain' },
+  });
+  mockAuditTargetStatus = 'running';
+  mockAuditTargetSending = true;
+  timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'running' });
+}
+
+async function startAuditForRecoveryTest(commandId: string) {
+  const snapshot = await seedSession('supervised_audit');
+  supervisionAutomation.init();
+  supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, 'implement the feature', snapshot);
+  beginRun(commandId, 'implement the feature');
+  completeTurn('implemented and validated the feature');
+  await waitForRunPhase('auditing');
+  const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+  if (!run?.auditAttemptId) throw new Error('automatic audit did not start');
+  return run.auditAttemptId;
+}
+
+function finishAuditRecoveryTestCleanup() {
+  if (supervisionAutomation.getActiveRun('deck_supervision_brain')?.phase === 'auditing') {
+    completeDelegatedAudit('PASS', 'Audit recovery test cleanup.');
+  }
+  supervisionAutomation.cancelSession('deck_supervision_brain');
+}
+
 describe('SupervisionAutomation', () => {
   beforeEach(async () => {
     await cleanupProjectDir();
   });
 
-  it('launches a P2P audit after the completion decision returns complete and clears the run on PASS', async () => {
+  it('asks the current session to prepare and delegate the audit, then clears only after the reply-backed PASS', async () => {
     const snapshot = await seedSession('supervised_audit');
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-1' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-1',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-1', 'implement the feature', snapshot);
@@ -146,36 +298,879 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
-
     expect(mockSupervisionDecide).toHaveBeenCalledWith(expect.objectContaining({
       taskRequest: 'implement the feature',
       assistantResponse: 'implemented the feature',
     }));
-    // modeOverride is intentionally omitted — supervision builds its own
-    // advancedRounds pipeline from auditMode, and resolveP2pRoundPlan ignores
-    // modeOverride when advancedRounds is non-empty. Asserting its absence pins
-    // the "single source of routing truth" invariant.
-    // Audit:V-2 — supervision now passes rounds through the typed
-    // `advanced: { kind: 'supervision_internal', advancedRounds }` discriminated
-    // union (escape hatch). Assertions read the rounds from `advanced.advancedRounds`.
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      initiatorSession: 'deck_supervision_brain',
-      launchOrigin: expect.objectContaining({
-        kind: 'supervision',
-      }),
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [expect.objectContaining({
-          preset: 'implementation_audit',
-          verdictPolicy: 'smart_gate',
-        })],
-      }),
-    }));
-    const startArgs = mockStartP2pRun.mock.calls[0]?.[0] as { modeOverride?: unknown; advanced: { advancedRounds: unknown[] } };
-    expect(startArgs.modeOverride).toBeUndefined();
-    expect(startArgs.advanced.advancedRounds).toHaveLength(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(orchestrationPrompt).toContain('You are the current session orchestrator for an agent delegation.');
+    expect(orchestrationPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(orchestrationPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(orchestrationPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
+    expect(orchestrationPrompt).toContain('Include this exact attempt ID in the delegated audit brief');
+    expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
+    expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the audit background');
+    expect(orchestrationPrompt).toContain('Do not commit, push, deploy');
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditReplyObserved: false,
+    });
+
+    // The current session acknowledging the orchestration request is not an
+    // audit result. It must remain pending until a reply-enabled delegation
+    // response actually returns to this session.
+    completeTurn('Audit delegated; waiting for the selected agent reply.');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'Unrelated shared participant message.',
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'someone-else', actorDisplayName: 'Someone else' },
+    });
+    completeTurn(`Premature marker must not pass.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditReplyObserved: false,
+    });
+
+    completeDelegatedAudit('PASS');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'peer_audit.result',
+        payload: expect.objectContaining({
+          trigger: 'automatic',
+          outcome: 'pass',
+          auditorSessionName: 'deck_sub_reviewer',
+        }),
+      }),
+    ]));
+  });
+
+  it('continues the exact audit target after its correlated turn falls idle with a provider error', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-provider-error');
+
+      // An idle/error projection before the delegated audit task is observed
+      // belongs to older target work and must never trigger recovery.
+      mockAuditTargetLastProviderError = {
+        code: 'OVERLOADED',
+        message: 'provider overloaded',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = {
+        code: 'OVERLOADED',
+        message: 'provider overloaded',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+
+      await vi.advanceTimersByTimeAsync(1_499);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+      const recoveryPrompt = String(mockAuditTargetRuntime.send.mock.calls[0]?.[0]);
+      expect(recoveryPrompt).toContain(`[Contract: ${SUPERVISION_CONTRACT_IDS.AUDIT_TARGET_RECOVERY}]`);
+      expect(recoveryPrompt).toContain(`Automatic audit attempt ID: ${attemptId}`);
+      expect(recoveryPrompt).toContain('Audited session ID: deck_supervision_brain');
+      expect(recoveryPrompt).toContain('Audit target session ID: deck_sub_reviewer');
+      expect(recoveryPrompt).toContain(buildAgentDelegationReplyInstruction('deck_supervision_brain'));
+      expect(timelineEmitter.replay('deck_sub_reviewer', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'user.message',
+          payload: expect.objectContaining({
+            automation: true,
+            automationKind: SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+          }),
+        }),
+      ]));
+
+      // Duplicate idle/error projections for the same failed turn are
+      // de-duplicated until a new active edge proves that recovery started.
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+
+      // A delivered recovery receives a fresh audit deadline instead of
+      // timing out at the original deadline while the reviewer is resuming.
+      await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS - 2_001);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('continues a correlated audit target after its active turn enters stopped state', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-stopped');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'stopped' });
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+      expect(String(mockAuditTargetRuntime.send.mock.calls[0]?.[0])).toContain('Observed failed state: stopped');
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not continue a correlated audit target after a healthy idle completion', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-healthy-idle');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a scheduled audit-target continue when the same turn becomes active again or returns its reply', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-recovers');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = {
+        code: 'TRANSIENT',
+        message: 'temporary failure',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+
+      await vi.advanceTimersByTimeAsync(500);
+      mockAuditTargetStatus = 'running';
+      mockAuditTargetSending = true;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'running' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = {
+        code: 'TRANSIENT_AGAIN',
+        message: 'temporary failure again',
+        recoverable: true,
+        at: Date.now(),
+      };
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+      completeDelegatedAudit('PASS', 'The audit completed before recovery backoff elapsed.');
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps audit-target recovery at two continues', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-recovery-cap');
+      beginAuditTargetTurn(attemptId);
+
+      for (let recovery = 1; recovery <= 2; recovery += 1) {
+        mockAuditTargetStatus = 'error';
+        mockAuditTargetSending = false;
+        mockAuditTargetLastProviderError = {
+          code: `TRANSIENT_${recovery}`,
+          message: `temporary failure ${recovery}`,
+          recoverable: true,
+          at: Date.now(),
+        };
+        timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(recovery);
+        mockAuditTargetStatus = 'running';
+        mockAuditTargetSending = true;
+        timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'running' });
+        await vi.advanceTimersByTimeAsync(1);
+      }
+
+      mockAuditTargetStatus = 'error';
+      mockAuditTargetSending = false;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(2);
+      expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'assistant.text',
+          payload: expect.objectContaining({
+            text: expect.stringContaining('automatic recovery limit'),
+            automationKind: 'supervision-warning',
+          }),
+        }),
+      ]));
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not continue a replacement session that reused the configured audit target name', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-identity-change');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'error';
+      mockAuditTargetSending = false;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'error' });
+      recreateReviewer();
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+      expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'assistant.text',
+          payload: expect.objectContaining({
+            text: expect.stringContaining('changed identity'),
+            automationKind: 'supervision-warning',
+          }),
+        }),
+      ]));
+    } finally {
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles a reply-backed PASS immediately without a later idle edge or false timeout', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-pass-without-idle',
+        'implement the feature',
+        snapshot,
+      );
+      beginRun('cmd-pass-without-idle', 'implement the feature');
+      completeTurn('implemented the feature');
+      await waitForRunPhase('auditing');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.auditAttemptId).toBeTruthy();
+      const priorResultCount = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+        event.type === 'peer_audit.result').length;
+
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: 'Task: independent audit\nResult: PASS with evidence.',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: `PASS with evidence.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+        streaming: false,
+      });
+      await Promise.resolve();
+
+      // Intentionally do not emit session.state=idle. The final assistant
+      // boundary must settle the audit and disarm the six-minute deadline.
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS);
+
+      const results = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+        event.type === 'peer_audit.result').slice(priorResultCount);
+      expect(results.filter((event) => event.payload.outcome === 'pass')).toHaveLength(1);
+      expect(results.filter((event) => event.payload.outcome === 'timeout')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores the audit turn idle when it arrives after fallback settlement starts finalization', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'implementation is complete but repository finalization remains',
+        confidence: 0.9,
+        nextAction: 'Commit and push the audited changes.',
+      })
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'post-audit finalization completed',
+        confidence: 0.95,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-delayed-audit-idle',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-delayed-audit-idle', 'implement the feature');
+    completeTurn('Implementation is complete; commit and push remain.');
+    await waitForRunPhase('auditing');
+    const priorPassCount = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'peer_audit.result' && event.payload.outcome === 'pass').length;
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: 'Task: independent audit\nResult: PASS with evidence.',
+      allowDuplicate: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `PASS with evidence.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+      streaming: false,
+    });
+    await Promise.resolve();
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+    // This is the trailing idle for the audit turn, delivered after the
+    // assistant-text fallback has already dispatched finalization. It must
+    // not evaluate the PASS text as finalization output or terminate the run.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+    completeTurn('Committed and pushed the audited changes.');
+    await sleep(25);
+
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await Promise.resolve();
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    const results = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'peer_audit.result');
+    expect(results.filter((event) => event.payload.outcome === 'pass')).toHaveLength(priorPassCount + 1);
+  });
+
+  it('cancels an in-flight orchestrated audit exactly once when supervision is stopped', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-cancel-audit', 'implement the feature', snapshot);
+    beginRun('cmd-cancel-audit', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(50);
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    const cancelled = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'peer_audit.result' && event.payload.outcome === 'cancelled');
+    expect(cancelled).toHaveLength(1);
+  });
+
+  it('times out an orchestrated audit at the deadline without releasing held finalization', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: 'repository finalization remains',
+      confidence: 0.9,
+      nextAction: 'Commit the completed changes and push to origin/dev.',
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-timeout-audit', 'implement the feature', snapshot);
+      beginRun('cmd-timeout-audit', 'implement the feature');
+      completeTurn('Implementation and tests are complete.');
+
+      await waitForRunPhase('auditing');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'auditing',
+        deferredFinalization: expect.any(Object),
+      });
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(PEER_AUDIT_DEADLINE_MS);
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'peer_audit.result',
+          payload: expect.objectContaining({ outcome: 'timeout', reason: 'deadline_expired' }),
+        }),
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels the stale audit generation when a new task intent replaces it', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-old-audit', 'implement the old feature', snapshot);
+    beginRun('cmd-old-audit', 'implement the old feature');
+    completeTurn('implemented the old feature');
+    await sleep(50);
+
+    const oldGeneration = supervisionAutomation.getActiveRun('deck_supervision_brain')?.generation;
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-new-task', 'implement the new feature', snapshot);
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      commandId: 'cmd-new-task',
+      phase: 'execution',
+      generation: (oldGeneration ?? 0) + 1,
+    });
+    const cancelled = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'peer_audit.result'
+      && event.payload.outcome === 'cancelled'
+      && event.payload.reason === 'new_task_intent_replaced_existing_audit');
+    expect(cancelled).toHaveLength(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('delegates to the current same-name session without blocking on a stale fingerprint', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const replacement = recreateReviewer();
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stale-auditor', 'implement the feature', snapshot);
+    beginRun('cmd-stale-auditor', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(50);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditTargetSessionInstanceId: replacement.sessionInstanceId,
+      snapshot: { auditTargetSessionName: replacement.name },
+    });
+  });
+
+  it('starts automatic audit from a name-only target saved by settings', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 2, {
+      auditTargetFingerprint: undefined,
+    });
+    expect(snapshot.auditTargetSessionName).toBe('deck_sub_reviewer');
+    expect(snapshot.auditTargetFingerprint).toBeUndefined();
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-name-only-auditor', 'implement the feature', snapshot);
+    beginRun('cmd-name-only-auditor', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(50);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: { auditTargetSessionName: 'deck_sub_reviewer' },
+    });
+  });
+
+  it('uses the latest persisted target name when an in-flight snapshot is stale', async () => {
+    const staleSnapshot = await seedSession('supervised_audit');
+    const replacement = recreateReviewer('Repaired reviewer');
+    const repairedSnapshot = normalizeSessionSupervisionSnapshot({
+      ...staleSnapshot,
+      auditTargetSessionName: replacement.name,
+      auditTargetFingerprint: {
+        sessionInstanceId: replacement.sessionInstanceId,
+        normalizedModelId: 'claude-sonnet-4-6',
+        providerFamily: 'anthropic',
+      },
+    });
+    const audited = getSession('deck_supervision_brain');
+    if (!audited) throw new Error('audited session was not created');
+    upsertSession({
+      ...audited,
+      transportConfig: { ...audited.transportConfig, supervision: repairedSnapshot },
+      updatedAt: Date.now(),
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-repaired-auditor',
+      'implement the feature',
+      staleSnapshot,
+    );
+    beginRun('cmd-repaired-auditor', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(50);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: {
+        auditTargetSessionName: replacement.name,
+      },
+      auditTargetSessionInstanceId: replacement.sessionInstanceId,
+    });
+  });
+
+  it('does not require or rewrite model fingerprint metadata before delegating', async () => {
+    const initial = await seedSession('supervised_audit');
+    const reviewer = getSession('deck_sub_reviewer');
+    const audited = getSession('deck_supervision_brain');
+    if (!reviewer?.sessionInstanceId || !audited) throw new Error('seeded sessions are unavailable');
+    const aliasSnapshot = normalizeSessionSupervisionSnapshot({
+      ...initial,
+      auditTargetFingerprint: {
+        sessionInstanceId: reviewer.sessionInstanceId,
+        normalizedModelId: 'opus[1m]',
+        providerFamily: 'anthropic',
+      },
+    });
+    upsertSession({
+      ...reviewer,
+      requestedModel: 'opus',
+      modelDisplay: 'claude-opus-4-8',
+      activeModel: 'claude-opus-4-8',
+      updatedAt: Date.now(),
+    });
+    upsertSession({
+      ...audited,
+      transportConfig: { ...audited.transportConfig, supervision: aliasSnapshot },
+      updatedAt: Date.now(),
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-authoritative-model-repair',
+      'implement the feature',
+      aliasSnapshot,
+    );
+    beginRun('cmd-authoritative-model-repair', 'implement the feature');
+    completeTurn('implemented the feature');
+    await waitForRunPhase('auditing');
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: {
+        auditTargetFingerprint: {
+          sessionInstanceId: reviewer.sessionInstanceId,
+          normalizedModelId: 'opus[1m]',
+          providerFamily: 'anthropic',
+        },
+      },
+    });
+    expect(getSession('deck_supervision_brain')?.transportConfig?.supervision).toMatchObject({
+      auditTargetFingerprint: {
+        sessionInstanceId: reviewer.sessionInstanceId,
+        normalizedModelId: 'opus[1m]',
+        providerFamily: 'anthropic',
+      },
+    });
+    expect(mockPersistSessionRecord).not.toHaveBeenCalled();
+  });
+
+  it('does not block delegation when the selected session changes model', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    const reviewer = getSession('deck_sub_reviewer');
+    if (!reviewer) throw new Error('seeded reviewer is unavailable');
+    upsertSession({
+      ...reviewer,
+      requestedModel: 'opus',
+      modelDisplay: 'claude-opus-4-8',
+      activeModel: 'claude-opus-4-8',
+      updatedAt: Date.now(),
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-genuine-model-change',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-genuine-model-change', 'implement the feature');
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(mockPersistSessionRecord).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      snapshot: { auditTargetSessionName: reviewer.name },
+    });
+  });
+
+  it('holds commit and push until PASS and allows multi-turn finalization without a second audit', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'implementation and validation are complete, but repository finalization remains',
+        confidence: 0.9,
+        gap: 'the completed changes are not committed or pushed',
+        nextAction: 'Run git add -A, commit the completed changes, and push to origin/dev.',
+      })
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'the commit is complete but the audited branch still needs to be pushed',
+        confidence: 0.9,
+        nextAction: 'Push the remaining audited commit to origin/dev.',
+      })
+      .mockResolvedValueOnce({ decision: 'complete', reason: 'post-audit finalization completed', confidence: 0.95 });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-before-commit', 'implement the feature', snapshot);
+    beginRun('cmd-audit-before-commit', 'implement the feature');
+    completeTurn('Implementation and tests are complete. Changes are not committed yet.');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).not.toContain('Run git add -A');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: 'Run git add -A, commit the completed changes, and push to origin/dev.',
+      },
+    });
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'agent.status',
+        payload: expect.objectContaining({
+          status: 'supervision_audit_waiting',
+          label: expect.stringContaining('commit/push paused'),
+        }),
+      }),
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automationKind: 'supervision-audit',
+          text: expect.stringContaining('Commit/push is paused until PASS'),
+        }),
+      }),
+    ]));
+
+    completeDelegatedAudit('PASS');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Run git add -A, commit the completed changes, and push to origin/dev.');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+    completeTurn('Committed the audited changes; push is still pending.');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain('Push the remaining audited commit to origin/dev.');
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).not.toContain('Do not stage, commit, or push');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+    completeTurn('Pushed the audited changes.');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('starts peer audit when commit-only finalization is qualified by audit-pass wording', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '实现和验证均已完成，只剩仓库收尾',
+      confidence: 0.9,
+      gap: '存在未提交的代码变更',
+      nextAction: '在 peer-audit PASS 后处理未提交变更并执行 git add、commit 和 push。',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-qualified-commit', 'implement the feature', snapshot);
+    beginRun('cmd-audit-qualified-commit', 'implement the feature');
+    completeTurn('实现与测试均已完成，当前改动尚未提交。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(auditPrompt).toContain('imcodes send --reply');
+    expect(auditPrompt).not.toContain('Complete only the remaining substantive implementation or validation work');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: '在 peer-audit PASS 后处理未提交变更并执行 git add、commit 和 push。',
+      },
+    });
+  });
+
+  it('starts exactly one addressed audit when completion evidence contradicts a mixed validation and finalization action', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '该轮修复和验证已经完成且通过，但当前存在未提交改动；按用户规则必须提交并推送。',
+      confidence: 0.9,
+      gap: '工作区尚有未提交修改，且尚未执行 git add/commit/push。',
+      // This is the contradictory shape observed in production. Before the
+      // fix, the generic validation words kept the run in `execution`, so the
+      // assistant manually sent an audit without the daemon knowing and every
+      // subsequent idle injected another supervision_continue_v1 prompt.
+      nextAction: 'Complete only the remaining substantive implementation or validation work, then commit and push after peer-audit PASS.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-completed-mixed-finalization',
+      '修复解析错误',
+      snapshot,
+    );
+    beginRun('cmd-completed-mixed-finalization', '修复解析错误');
+    completeTurn('修复与验证已经完成并通过。当前未提交，等待本轮自动审计后再 commit/push。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(auditPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(auditPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(auditPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
+    expect(auditPrompt).not.toContain('[Contract: supervision_continue_v1]');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      deferredFinalization: {
+        nextAction: expect.stringContaining('Do not request or start another audit'),
+      },
+    });
+
+    // Acknowledging the one dispatch and going idle must not run the
+    // supervisor again or emit a second audit/continue request.
+    completeTurn('审计已发送，等待 reply-enabled 回执。');
+    await sleep(25);
+    expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+
+    completeDelegatedAudit('PASS', 'The completion-evidenced fix is correct.');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
+    expect(finalizationPrompt).toContain('Do not request or start another audit');
+    expect(finalizationPrompt).not.toContain('Exact delegate target session:');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
+
+    completeTurn('已提交并推送审计通过的改动。');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(mockTransportRuntime.send.mock.calls.filter((call) =>
+      String(call[0]).includes('Exact delegate target session:'))).toHaveLength(1);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('never releases held commit and push when peer audit requests REWORK', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: 'only repository finalization remains',
+      confidence: 0.9,
+      gap: 'changes are uncommitted',
+      nextAction: 'Commit the completed changes and push to origin/dev.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-rework-before-commit', 'implement the feature', snapshot);
+    beginRun('cmd-rework-before-commit', 'implement the feature');
+    completeTurn('Implementation and tests are complete.');
+    await sleep(25);
+    completeDelegatedAudit('REWORK', 'needs fixes');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).not.toContain('Commit the completed changes and push to origin/dev.');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'execution',
+      reworkDispatches: 1,
+    });
+  });
+
+  it('keeps ordinary supervised commit and push continuation immediate', async () => {
+    const snapshot = await seedSession('supervised');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: 'repository finalization remains',
+      confidence: 0.9,
+      nextAction: 'Commit the completed changes and push to origin/dev.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-ordinary-commit', 'implement the feature', snapshot);
+    beginRun('cmd-ordinary-commit', 'implement the feature');
+    completeTurn('Implementation and tests are complete.');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Commit the completed changes and push to origin/dev.');
+  });
+
+  it('does not defer substantive validation work merely because commit is also mentioned', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: 'validation still remains before repository finalization',
+      confidence: 0.8,
+      nextAction: 'Run the focused tests, fix failures, then commit and push.',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-tests-before-audit', 'implement the feature', snapshot);
+    beginRun('cmd-tests-before-audit', 'implement the feature');
+    completeTurn('Implementation is present but validation is still pending.');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(continuePrompt).toContain('Complete only the remaining substantive implementation or validation work');
+    expect(continuePrompt).toContain('Do not stage, commit, or push');
+    expect(continuePrompt).not.toContain('Run the focused tests, fix failures, then commit and push.');
+  });
+
+  it('keeps Chinese substantive work in the pre-audit loop when commit is also mentioned', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'continue',
+      reason: '提交前仍有失败的验证项',
+      confidence: 0.8,
+      nextAction: '先运行测试并修复失败，再执行 git commit 和 push。',
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-chinese-tests-before-audit', 'implement the feature', snapshot);
+    beginRun('cmd-chinese-tests-before-audit', 'implement the feature');
+    completeTurn('实现存在，但验证仍未完成。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    const continuePrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(continuePrompt).toContain('Complete only the remaining substantive implementation or validation work');
+    expect(continuePrompt).not.toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
   });
 
   it('auto-continues a supervised run when the completion decision returns continue', async () => {
@@ -420,12 +1415,6 @@ describe('SupervisionAutomation', () => {
       mode: 'supervised_audit',
       auditMode: 'audit>plan',
     });
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-live-update' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-live-update',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-live', 'implement the feature', supervised);
@@ -434,17 +1423,12 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [
-          expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
-          expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
-        ],
-      }),
-    }));
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
   it('picks up an in-flight task at idle when Auto is enabled after the user message was already sent', async () => {
@@ -520,6 +1504,36 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
+  it('reports the supervisor provider failure category and exhausted attempt count', async () => {
+    const snapshot = await seedSession('supervised');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'ask_human',
+      reason: 'upstream provider failed token=supersecret',
+      confidence: 0,
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: {
+        code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        attempts: 3,
+      },
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-provider-error', 'implement the feature', snapshot);
+    beginRun('cmd-provider-error', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+
+    const warning = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
+      event.type === 'assistant.text'
+      && event.payload.automationKind === 'supervision-warning',
+    ).at(-1);
+    expect(warning?.payload.text).toBe(
+      '⚠️ Automation could not obtain a decision from supervisor model codex-sdk/gpt-5.3-codex-spark after 3 attempts: upstream provider failed token=[redacted]. Manual continuation is required.',
+    );
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
   it('fails closed when a supervised run reaches idle without a completed assistant response', async () => {
     const snapshot = await seedSession('supervised');
 
@@ -579,12 +1593,6 @@ describe('SupervisionAutomation', () => {
 
   it('feeds REWORK back into the same transport session after audit', async () => {
     const snapshot = await seedSession('supervised_audit');
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-2' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-2',
-      status: 'completed',
-      resultSummary: 'needs fixes\n<!-- P2P_VERDICT: REWORK -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-2', 'implement the feature', snapshot);
@@ -592,11 +1600,12 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    completeDelegatedAudit('REWORK', 'needs fixes');
+    await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
-    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Audit verdict: REWORK');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
   });
 
@@ -677,13 +1686,6 @@ describe('SupervisionAutomation', () => {
 
   it('routes OpenSpec task runs through the implementation-only OpenSpec audit baseline', async () => {
     const snapshot = await seedSession('supervised_audit', true);
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-openspec' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-openspec',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
-
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent(
       'deck_supervision_brain',
@@ -709,31 +1711,19 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the change');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      userText: expect.stringContaining('OpenSpec implementation audit for change: supervised-task-automation'),
-      fileContents: expect.arrayContaining([
-        expect.objectContaining({ path: 'changed-files.txt', content: expect.stringContaining('src/demo.ts') }),
-        expect.objectContaining({ path: 'validation-output.txt', content: expect.stringContaining('PASS src/demo.test.ts') }),
-      ]),
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [expect.objectContaining({
-          promptAppend: expect.stringContaining('Do not rerun discussion or proposal phases.'),
-        })],
-      }),
-    }));
+    const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(orchestrationPrompt).toContain('Relevant OpenSpec change:');
+    expect(orchestrationPrompt).toContain('openspec/changes/supervised-task-automation');
+    expect(orchestrationPrompt).toContain('supervised-task-automation/proposal.md');
+    expect(orchestrationPrompt).toContain('changed-files.txt');
+    expect(orchestrationPrompt).toContain('validation-output.txt');
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
   it('falls back to contextual audit when the task does not resolve to a specific OpenSpec change', async () => {
     const snapshot = await seedSession('supervised_audit', true);
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-contextual' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-contextual',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent(
@@ -746,53 +1736,59 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    expect(mockStartP2pRun).toHaveBeenCalledWith(expect.objectContaining({
-      userText: expect.stringContaining('Contextual implementation audit'),
-      advanced: expect.objectContaining({
-        kind: 'supervision_internal',
-        advancedRounds: [expect.objectContaining({
-          promptAppend: expect.stringContaining('Audit the implementation result against the original request'),
-        })],
-      }),
-    }));
+    const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
+    expect(orchestrationPrompt).toContain('independently audit this session\'s most recent work');
+    expect(orchestrationPrompt).not.toContain('Relevant OpenSpec change:');
   });
 
-  it('stops after the configured rework-loop limit', async () => {
-    // maxAuditLoops=0 means "no rework dispatches permitted" — the first REWORK
-    // verdict must immediately transition to manual review without sending.
-    // (For maxAuditLoops>=1 the loop emits dispatches; see the dedicated test below.)
-    const snapshot = await seedSession('supervised_audit', false, 1);
-    // Force max to 0 by passing an invalid value that normalizes to 1 is avoided —
-    // normalize rejects <1, so use 1 and assert exactly one dispatch then stop.
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-run-loop' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-run-loop',
-      status: 'completed',
-      resultSummary: 'needs fixes\n<!-- P2P_VERDICT: REWORK -->',
-    });
+  it('dispatches zero rework briefs when maxAuditLoops is zero', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 0);
 
     supervisionAutomation.init();
-    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-5', 'implement the feature', snapshot);
-    beginRun('cmd-5', 'implement the feature');
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-loop-zero', 'implement the feature', snapshot);
+    beginRun('cmd-loop-zero', 'implement the feature');
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    completeDelegatedAudit('REWORK', 'needs fixes');
+    await sleep(25);
 
-    // maxAuditLoops=1 → exactly one rework brief dispatched, then run remains active
-    // waiting for the session's next turn (which is the semantically correct behavior:
-    // "up to N rework dispatches"). Prior code off-by-one'd to zero.
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('Audit verdict: REWORK');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
+  it('dispatches exactly one rework brief for maxAuditLoops one and stops on the next REWORK', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-loop-one', 'implement the feature', snapshot);
+    beginRun('cmd-loop-one', 'implement the feature');
+
+    completeTurn('implemented the feature');
+    await sleep(25);
+    completeDelegatedAudit('REWORK', 'first audit needs fixes');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       reworkDispatches: 1,
       phase: 'execution',
     });
+
+    completeTurn('implemented the requested rework');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain('imcodes send --reply');
+    completeDelegatedAudit('REWORK', 'second audit still needs fixes');
+    await sleep(25);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
-  it('expands combo audit modes into multi-round pipelines with a single smart_gate verdict', async () => {
+  it('ignores deprecated combo auditMode and still starts exactly one lightweight peer audit', async () => {
     const snapshot = await seedSession('supervised_audit');
     // Override auditMode to a combo to assert pipeline expansion
     const comboSnapshot = { ...snapshot, auditMode: 'audit>review>plan' as const };
@@ -812,12 +1808,6 @@ describe('SupervisionAutomation', () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-combo' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-combo',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-combo', 'implement the feature', comboSnapshot);
@@ -825,22 +1815,14 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    const args = mockStartP2pRun.mock.calls[0]?.[0] as {
-      advanced: { kind: string; advancedRounds: Array<{ preset: string; verdictPolicy: string; permissionScope: string }> };
-      modeOverride?: unknown;
-      rounds: number;
-    };
-    expect(args.modeOverride).toBeUndefined();
-    expect(args.rounds).toBe(3);
-    expect(args.advanced.kind).toBe('supervision_internal');
-    expect(args.advanced.advancedRounds.map((r) => r.preset)).toEqual(['implementation_audit', 'implementation_audit', 'custom']);
-    expect(args.advanced.advancedRounds.map((r) => r.verdictPolicy)).toEqual(['none', 'smart_gate', 'none']);
-    expect(args.advanced.advancedRounds.every((r) => r.permissionScope === 'analysis_only')).toBe(true);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 
-  it('expands audit>plan into a two-round pipeline where audit owns the verdict', async () => {
+  it('keeps manual P2P untouched while deprecated automatic audit>plan uses ordinary reply delegation', async () => {
     const snapshot = await seedSession('supervised_audit');
     const comboSnapshot = { ...snapshot, auditMode: 'audit>plan' as const };
     upsertSession({
@@ -859,12 +1841,6 @@ describe('SupervisionAutomation', () => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
-    mockStartP2pRun.mockResolvedValue({ id: 'audit-plan' });
-    mockGetP2pRun.mockReturnValue({
-      id: 'audit-plan',
-      status: 'completed',
-      resultSummary: 'all good\n<!-- P2P_VERDICT: PASS -->',
-    });
 
     supervisionAutomation.init();
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-ap', 'implement the feature', comboSnapshot);
@@ -872,17 +1848,10 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
-    await sleep(1_100);
+    await sleep(25);
 
-    const args = mockStartP2pRun.mock.calls[0]?.[0] as {
-      advanced: { kind: string; advancedRounds: Array<{ preset: string; verdictPolicy: string }> };
-      rounds: number;
-    };
-    expect(args.rounds).toBe(2);
-    expect(args.advanced.kind).toBe('supervision_internal');
-    expect(args.advanced.advancedRounds).toEqual([
-      expect.objectContaining({ preset: 'implementation_audit', verdictPolicy: 'smart_gate' }),
-      expect.objectContaining({ preset: 'custom', verdictPolicy: 'none' }),
-    ]);
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
+    expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
 });

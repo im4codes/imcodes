@@ -23,7 +23,7 @@ import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import { isTransportRuntime, resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { extractLatestUsage } from '../usage-data.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
@@ -42,6 +42,7 @@ const TYPE_ICON: Record<string, string> = {
   'codex-sdk': '📦',
   'copilot-sdk': '🧭',
   'cursor-headless': '➤',
+  'opencode-sdk': '🔆',
   'opencode': '🔆',
   'openclaw': '☁️',
   'qwen': '千',
@@ -106,6 +107,9 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     label: sub.label ?? null,
     projectDir: sub.cwd ?? undefined,
     runtimeType: resolveSubSessionRuntimeType(sub),
+    sessionInstanceId: sub.sessionInstanceId ?? undefined,
+    runtimeEpoch: sub.runtimeEpoch ?? undefined,
+    providerId: sub.providerId ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
@@ -404,7 +408,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
             lastUsage.contextWindow,
             effectiveModel,
             1_000_000,
-            { preferExplicit: lastUsage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+            { preferExplicit: isAuthoritativeUsageContextWindowSource(lastUsage.contextWindowSource) },
           );
           const total = lastUsage.inputTokens + lastUsage.cacheTokens;
           const totalPct = Math.min(100, total / ctx * 100);

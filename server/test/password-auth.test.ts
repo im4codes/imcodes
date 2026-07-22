@@ -7,6 +7,8 @@ import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { hashPassword } from '../src/security/crypto.js';
+import { CLIENT_TIMEZONE_PREF_KEY } from '../../shared/client-timezone.js';
+import { CLIENT_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
@@ -28,6 +30,7 @@ function makeMemDb(): Database {
   const servers = new Map<string, { id: string; user_id: string; name: string }>();
   const auditLog: unknown[] = [];
   const lockouts = new Map<string, { identity: string; failed_attempts: number; locked_until: number | null; last_attempt_at: number }>();
+  const userPrefs = new Map<string, string>();
 
   function normalize(sql: string): string {
     return sql.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -70,6 +73,10 @@ function makeMemDb(): Database {
         if (key === 'registration_enabled') return { value: 'true' } as T;
         if (key === 'require_approval') return { value: 'false' } as T;
         return null;
+      }
+      if (s.includes('from user_preferences where user_id')) {
+        const value = userPrefs.get(`${String(params[0])}:${String(params[1])}`);
+        return (value === undefined ? null : { value }) as T | null;
       }
       return null;
     },
@@ -163,6 +170,9 @@ function makeMemDb(): Database {
       if (s.includes('insert into audit_log')) {
         auditLog.push(params);
       }
+      if (s.includes('insert into user_preferences')) {
+        userPrefs.set(`${String(params[0])}:${String(params[1])}`, String(params[2]));
+      }
       if (s.includes('insert into auth_lockout') || s.includes('update auth_lockout')) {
         // simplified lockout handling
       }
@@ -230,6 +240,29 @@ describe('Password authentication', () => {
     expect(body.ok).toBe(true);
     expect(body.passwordMustChange).toBe(true);
     expect(body.accessToken).toBeTruthy();
+  });
+
+  it('remembers the authenticated browser or app timezone for later agent cron creation', async () => {
+    const loginRes = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'imcodes' }),
+    });
+    const { accessToken } = await loginRes.json() as { accessToken: string };
+
+    const meRes = await app.request('/api/auth/user/me', {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        [CLIENT_TIMEZONE_HEADER]: 'Asia/Shanghai',
+      },
+    });
+    expect(meRes.status).toBe(200);
+
+    const prefRes = await app.request(`/api/preferences/${CLIENT_TIMEZONE_PREF_KEY}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    expect(prefRes.status).toBe(200);
+    await expect(prefRes.json()).resolves.toEqual({ value: 'Asia/Shanghai' });
   });
 
   it('rejects incorrect password', async () => {

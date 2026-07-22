@@ -33,6 +33,7 @@ describe('memory-search', () => {
     expect(result.items.length).toBeGreaterThan(0);
     expect(result.items[0].type).toBe('processed');
     expect(result.items[0].summary).toContain('download');
+    expect(result.items[0].sourceSessionName).toBe('deck_repo_brain');
     expect(result.stats.totalRecords).toBeGreaterThan(0);
   });
 

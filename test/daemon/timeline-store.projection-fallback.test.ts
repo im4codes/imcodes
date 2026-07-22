@@ -9,6 +9,7 @@ const projectionMocks = vi.hoisted(() => ({
   queryCompletedTextTail: vi.fn(),
   getLatest: vi.fn(),
   recordAppendedEvent: vi.fn(),
+  rebuildSession: vi.fn(async () => true),
   pruneSessionToAuthoritative: vi.fn(),
   deleteSession: vi.fn(),
 }));

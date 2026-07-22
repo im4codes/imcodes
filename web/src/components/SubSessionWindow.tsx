@@ -48,6 +48,7 @@ import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
 import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -75,7 +76,7 @@ interface Props {
   desktopLayoutCapable?: boolean;
   onRestart: () => void;
   onRename: () => void;
-  onSettings?: () => void;
+  onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
@@ -429,6 +430,7 @@ export function SubSessionWindow({
               ? 'error'
               : 'idle',
     projectDir: sub.cwd ?? undefined,
+    ccPreset: sub.ccPresetId ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
     qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
@@ -442,11 +444,23 @@ export function SubSessionWindow({
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: effectiveRuntimeType,
+    sessionInstanceId: sub.sessionInstanceId ?? undefined,
+    runtimeEpoch: sub.runtimeEpoch ?? undefined,
+    providerId: sub.providerId ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
   };
+  // Keep the controls' working sweep on the same reconciled live state as the
+  // footer. Transport sub-session metadata can lag the authoritative timeline
+  // idle edge; passing the stale outer `sub.state` made the footer show idle
+  // while SessionControls continued rendering its running scan indefinitely.
+  const controlsSessionInfo: SessionInfo = isTransport
+    && liveSessionState
+    && liveSessionState !== sessionInfo.state
+    ? { ...sessionInfo, state: liveSessionState as SessionInfo['state'] }
+    : sessionInfo;
 
   useEffect(() => {
     if (!shouldPersistGeometry(isDesktopMaximized)) return;
@@ -1019,7 +1033,7 @@ export function SubSessionWindow({
       <SessionControls
         ws={ws}
         connected={connected}
-        activeSession={sessionInfo}
+        activeSession={controlsSessionInfo}
         inputRef={inputRef}
         quickData={quickData}
         hideShortcuts={false}

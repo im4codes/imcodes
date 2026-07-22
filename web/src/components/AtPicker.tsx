@@ -199,6 +199,12 @@ export function AtPicker({
   const containerRef = useRef<HTMLDivElement>(null);
 
   const delegateAgents = useMemo<PickerAgent[]>(() => {
+    // The current session is SHOWN but disabled (greyed) — you can't delegate to
+    // yourself, and a disabled row is clearer than silently dropping it. Detect
+    // self by NAME, not just the isSelf-tagged copy: the same session can arrive
+    // from more than one source (main list + sub-session list) and dedup may keep
+    // the untagged copy, so a by-name set greys EVERY copy reliably.
+    const selfNames = new Set(sessions.filter((s) => s.isSelf).map((s) => s.name));
     const seen = new Map<string, SessionEntry>();
     for (const s of sessions) {
       if (s.agentType === 'shell' || s.agentType === 'script') continue;
@@ -212,19 +218,19 @@ export function AtPicker({
     }
     return [...seen.values()]
       .map((s) => {
-        const shortName = s.label || s.name.split('_').pop() || s.name;
-        const isSelf = !!s.isSelf;
+        const disabled = selfNames.has(s.name) || !!s.isSelf;
         return {
           session: s.name,
-          shortName,
+          shortName: s.label || s.name.split('_').pop() || s.name,
           agentType: s.agentType,
           busy: s.state !== 'idle',
-          isSelf,
-          disabled: isSelf,
+          isSelf: disabled,
+          disabled,
         };
       })
       .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()))
-      .sort((a, b) => Number(!!a.disabled) - Number(!!b.disabled));
+      // Selectable agents first; the disabled self row sinks to the bottom.
+      .sort((a, b) => Number(a.disabled) - Number(b.disabled));
   }, [sessions, query, rootSession]);
 
   // Debounced file search — only when in files category

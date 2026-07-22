@@ -48,6 +48,7 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: upsertSessionMock,
   getSession: getSessionMock,
   removeSession: removeSessionMock,
+  createRuntimeEpoch: vi.fn(() => 'runtime-epoch-new'),
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
@@ -204,6 +205,7 @@ describe('normalizeShellBinForHost()', () => {
 describe('startSubSession — ccSessionId stored in session-store', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    getSessionMock.mockReturnValue(null);
     sessionExistsMock.mockResolvedValue(false);
     newSessionMock.mockResolvedValue(undefined);
     getDriverMock.mockReturnValue({
@@ -274,6 +276,23 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     // Should be a valid UUID string, not undefined or null
     expect(typeof call.ccSessionId).toBe('string');
     expect(call.ccSessionId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('preserves logical identity and replaces runtime epoch when a process authority is created', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_identity',
+      sessionInstanceId: 'logical-instance',
+      runtimeEpoch: 'runtime-epoch-old',
+      createdAt: 42,
+    });
+
+    await startSubSession({ id: 'identity', type: 'claude-code', cwd: '/proj' });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionInstanceId: 'logical-instance',
+      runtimeEpoch: 'runtime-epoch-new',
+      createdAt: 42,
+    }));
   });
 });
 
@@ -708,5 +727,25 @@ describe('rebuildSubSessions — geminiSessionId preserved', () => {
     expect(call.geminiSessionId).toBe('must-not-lose');
     // Also verify other fields aren't clobbered
     expect(call.agentType).toBe('gemini');
+  });
+
+  it('preserves both logical identity and runtime authority while reattaching an existing process', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_identity-rebuild',
+      agentType: 'codex',
+      state: 'idle',
+      sessionInstanceId: 'logical-stable',
+      runtimeEpoch: 'runtime-stable',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 100,
+    });
+
+    await rebuildSubSessions([{ id: 'identity-rebuild', type: 'codex', cwd: '/proj' }]);
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionInstanceId: 'logical-stable',
+      runtimeEpoch: 'runtime-stable',
+    }));
   });
 });

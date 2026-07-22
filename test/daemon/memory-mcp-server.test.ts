@@ -190,9 +190,9 @@ describe('memory MCP stdio server', () => {
       // Provider tokenizers differ, so enforce the stable serialized payload
       // size here. This keeps the fixed tools/list prompt near 5k tokens while
       // allowing a small margin for intentional schema additions.
-      // Two explicit-path machine file-transfer tools add their safety and
-      // destination contracts to the fixed surface.
-      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(25_000);
+      // Explicit-path machine file-transfer tools plus the strict structured
+      // peer-audit reply envelope add safety contracts to the fixed surface.
+      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(27_000);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {
@@ -341,6 +341,67 @@ describe('memory MCP stdio server', () => {
         message: 'hello late peer',
         depth: 0,
       });
+    } finally {
+      await client.close();
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('submits peer_audit_reply to dedicated ingress with the runtime-bound sender header', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-audit-reply-'));
+    await writeSessionStore(home);
+    const received: Array<{ body: Record<string, unknown>; sender?: string }> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== '/audit-reply') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        received.push({
+          body: JSON.parse(raw) as Record<string, unknown>,
+          sender: typeof req.headers['x-imcodes-session'] === 'string' ? req.headers['x-imcodes-session'] : undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+    const address = hookServer.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+    await writeFile(join(home, '.imcodes', 'hook-port'), String(address.port), 'utf8');
+    const client = new Client({ name: 'memory-mcp-audit-reply-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: mcpEnv(home),
+      stderr: 'pipe',
+    });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({
+        name: 'peer_audit_reply',
+        arguments: {
+          attemptId: 'attempt_12345678',
+          replyCapability: 'A'.repeat(32),
+          verdict: 'PASS',
+          findings: 'Focused checks passed.',
+          validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
+        },
+      });
+      expect(result.structuredContent).toEqual({ status: 'ok', accepted: true });
+      expect(received).toEqual([{
+        sender: 'deck_sub_worker',
+        body: expect.objectContaining({
+          version: 'peer_audit_reply_v1',
+          attemptId: 'attempt_12345678',
+          replyCapability: 'A'.repeat(32),
+        }),
+      }]);
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

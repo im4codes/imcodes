@@ -33,6 +33,7 @@ describe('memory MCP shared contracts', () => {
       'memory_feedback',
       'save_observation',
       'save_preference',
+      'peer_audit_reply',
       'send_list_targets',
       'send_message',
       'send_stop',

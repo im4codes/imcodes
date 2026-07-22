@@ -11,7 +11,7 @@
  * from persisted SessionRecord.paneId values.
  */
 
-import { execFile as execFileCb } from 'child_process';
+import { execFile as execFileCb, execFileSync } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -209,6 +209,22 @@ export async function weztermSendEnter(name: string): Promise<void> {
     child.stdin!.end();
     child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
     child.on('error', reject);
+  });
+}
+
+/** Prepare no state; synchronously write a private control-plane message and
+ * Enter so no JS event can invalidate authorization between the final guard
+ * and the unrevocable pane write. */
+export function weztermSendTextAndEnterAtomic(name: string, text: string): void {
+  const paneId = requirePaneId(name);
+  execFileSync('wezterm', ['cli', 'send-text', '--pane-id', paneId, '--no-paste', '--', text], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  });
+  execFileSync('wezterm', ['cli', 'send-text', '--pane-id', paneId, '--no-paste'], {
+    input: '\r',
+    stdio: ['pipe', 'ignore', 'pipe'],
+    windowsHide: true,
   });
 }
 

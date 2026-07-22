@@ -23,9 +23,20 @@ export const SDK_SUBAGENT_PROVIDER_KINDS = {
   CLAUDE_RUNTIME_AGENT: 'claudeRuntimeAgent',
   CODEX_COLLAB_AGENT: 'codexCollabAgent',
   CODEX_RUNTIME_AGENT: 'codexRuntimeAgent',
+  CODEX_RUNTIME_SHELL: 'codexRuntimeShell',
   QWEN_RUNTIME_AGENT: 'qwenRuntimeAgent',
   GEMINI_RUNTIME_AGENT: 'geminiRuntimeAgent',
   GROK_RUNTIME_AGENT: 'grokRuntimeAgent',
+} as const;
+
+export const SDK_SUBAGENT_TASK_TYPES = {
+  LOCAL_BASH: 'local_bash',
+  LOCAL_AGENT: 'local_agent',
+  AGENT: 'agent',
+} as const;
+
+export const SDK_SUBAGENT_ACTIONS = {
+  CODEX_BACKGROUND_SHELL: 'codex-background-shell',
 } as const;
 
 export const SDK_SUBAGENT_STATUS = {
@@ -102,6 +113,8 @@ export interface SdkSubagentDetailMeta {
   agentName?: string;
   model?: string;
   taskId?: string;
+  /** Provider-native task category, such as Claude's local_bash/local_agent. */
+  taskType?: string;
   receiverThreadId?: string;
   receiverIndex?: number;
   receiverCount?: number;

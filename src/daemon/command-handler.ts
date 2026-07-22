@@ -9,7 +9,7 @@ import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import type { AliasSendAudit, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
+import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
@@ -138,6 +138,17 @@ import {
   recordRecentInjection,
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
+import {
+  commitSummarySyncReservation,
+  clearSummarySyncHistory,
+  reserveUnsyncedSummaryFingerprints,
+  rollbackSummarySyncReservation,
+  type SummarySyncReservation,
+} from '../context/summary-sync-history.js';
+import {
+  collectRecentSummarySyncCandidates,
+  fingerprintRecentSummary,
+} from '../context/summary-sync.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -199,6 +210,13 @@ import type {
 import { bindP2pCompiledWorkflow } from './p2p-workflow-bind.js';
 import { readP2pDiscussionWithOffset } from './p2p-workflow-discussion-offsets.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import {
+  PEER_AUDIT_MESSAGES,
+  decodePeerAuditCancelCommand,
+  decodePeerAuditListCandidatesCommand,
+  decodePeerAuditQuickStartCommand,
+} from '../../shared/peer-audit.js';
+import { peerAuditService } from './peer-audit-service.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -745,11 +763,12 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' {
+function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
     || agentType === 'cursor-headless'
+    || agentType === 'opencode-sdk'
     || agentType === 'openclaw'
     || agentType === 'qwen'
     || agentType === 'kimi-sdk'
@@ -773,7 +792,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk',
+    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk',
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -941,7 +960,7 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
-import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
@@ -1407,6 +1426,15 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SESSION_CANCEL:
       void handleSessionCancel(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES:
+      void handlePeerAuditListCandidates(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START:
+      void handlePeerAuditQuickStart(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.PEER_AUDIT_CANCEL:
+      handlePeerAuditCancel(cmd, serverLink);
+      break;
     case DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES:
       void handleSessionExecutionClones(cmd, serverLink);
       break;
@@ -1809,6 +1837,42 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
   }
 }
 
+async function handlePeerAuditListCandidates(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const { type: _type, ...payload } = cmd;
+  const decoded = decodePeerAuditListCandidatesCommand(payload);
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const result = decoded.ok
+    ? peerAuditService.listCandidates(decoded.value)
+    : { ok: false as const, error: decoded.error };
+  try {
+    serverLink.send({ type: PEER_AUDIT_MESSAGES.CANDIDATES, commandId, ...result });
+  } catch { /* reconnect-safe: Web may retry the idempotent command */ }
+}
+
+async function handlePeerAuditQuickStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const { type: _type, ...payload } = cmd;
+  const decoded = decodePeerAuditQuickStartCommand(payload);
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const result = decoded.ok
+    ? await peerAuditService.startQuick(decoded.value)
+    : { ok: false as const, error: decoded.error };
+  try {
+    serverLink.send({ type: PEER_AUDIT_MESSAGES.QUICK_RESULT, commandId, ...result });
+  } catch { /* reconnect-safe result event remains authoritative */ }
+}
+
+function handlePeerAuditCancel(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const { type: _type, ...payload } = cmd;
+  const decoded = decodePeerAuditCancelCommand(payload);
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const result = decoded.ok
+    ? peerAuditService.cancel(decoded.value)
+    : { ok: false as const, error: decoded.error };
+  try {
+    serverLink.send({ type: PEER_AUDIT_MESSAGES.CANCEL_RESULT, commandId, ...result });
+  } catch { /* result timeline event converges after reconnect */ }
+}
+
 async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const scopeSession = typeof cmd.scopeSession === 'string' ? cmd.scopeSession.trim() : '';
@@ -1941,7 +2005,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       removeSession(`deck_${project}_brain`);
     }
@@ -1951,7 +2015,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk',
       extraEnv,
       ccPreset: ccPresetName,
       effort,
@@ -1998,7 +2062,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         label,
         effort,
       });
-    } else if (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
       // ACP SDK providers share the codex-sdk shape: fresh launch, optional
       // requested model, no ccPreset. The provider emits a durable resume id
       // after the first real ACP session is created.
@@ -2007,7 +2071,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk',
+        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk',
         projectDir: dir,
         fresh: true,
         ...(requestedModel ? { requestedModel } : {}),
@@ -2226,6 +2290,7 @@ function cancelTransportTurnNow(
   void (async () => {
     try {
       supervisionAutomation.cancelSession(sessionName);
+      peerAuditService.invalidateCancel(sessionName);
       await stopRuntime.cancel();
       // Mark session for fresh start so daemon restart doesn't resume the
       // stuck conversation.
@@ -2292,10 +2357,43 @@ export function stopSessionNow(sessionName: string): boolean {
 /** Agents with sandboxed file access — temp files must be in project dir. */
 const SANDBOXED_AGENTS = new Set(['gemini']);
 
-async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
+function resolveProcessSendOptions(sessionName: string, agentType: string): { cwd: string } | undefined {
   const record = getSession(sessionName);
   const cwd = SANDBOXED_AGENTS.has(agentType) ? record?.projectDir : undefined;
-  const opts = cwd ? { cwd } : undefined;
+  return cwd ? { cwd } : undefined;
+}
+
+/**
+ * Peer-audit seam: hold the per-session stdin mutex across `fn`.
+ *
+ * The peer-audit injector needs its final-boundary revalidation and its write
+ * to be one atomic critical section, so it must acquire the same mutex that
+ * serializes ordinary process sends rather than a private one.
+ */
+export async function runWithProcessSessionSendLock<T>(sessionName: string, fn: () => Promise<T>): Promise<T> {
+  const release = await getMutex(sessionName).acquire();
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Peer-audit seam: inject verbatim text into a process session with none of the
+ * ordinary send's side effects — no user.message timeline event, no history,
+ * no memory recall/injection, no advisory context, no path rewriting.
+ *
+ * Unlike sendShellAwareCommand this never interprets a leading `!` as the
+ * shell-mode escape: peer-audit briefs are injected as agent input only.
+ * Callers must already hold runWithProcessSessionSendLock.
+ */
+export async function prepareProcessSessionPrivateWriter(sessionName: string): Promise<(text: string) => void> {
+  return preparePrivateInputWriter(sessionName);
+}
+
+async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
+  const opts = resolveProcessSendOptions(sessionName, agentType);
   if (text.startsWith('!')) {
     const shellCmd = text.slice(1).trimStart();
     if (agentType === 'codex') {
@@ -3809,6 +3907,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         // Reset per-session memory injection history — fresh conversation
         // should be allowed to re-inject previously-shown memories again.
         clearRecentInjectionHistory(sessionName);
+        clearSummarySyncHistory(sessionName);
         await handleGetSessions(serverLink);
         await syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -3907,7 +4006,19 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (record?.agentType === 'claude-code-sdk' && modelMatch) {
         const requestedModel = modelMatch[1];
-        const selectedModel = normalizeClaudeCodeModelId(requestedModel);
+        let presetContextWindow = record.presetContextWindow;
+        let selectedModel: string | undefined;
+        if (record.ccPreset) {
+          const { getPreset, getPresetAvailableModelIds, getPresetTransportOverrides } = await import('./cc-presets.js');
+          const preset = await getPreset(record.ccPreset);
+          const presetModels = preset ? getPresetAvailableModelIds(preset) : [];
+          selectedModel = presetModels.find((model) => model === requestedModel);
+          if (!presetContextWindow) {
+            presetContextWindow = (await getPresetTransportOverrides(record.ccPreset)).contextWindow;
+          }
+        } else {
+          selectedModel = normalizeClaudeCodeModelId(requestedModel);
+        }
         if (!selectedModel) {
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
@@ -3930,7 +4041,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: selectedModel, contextWindow: resolveContextWindow(undefined, selectedModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'usage.update', {
+          model: selectedModel,
+          contextWindow: resolveContextWindow(presetContextWindow, selectedModel),
+        }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', {
           text: `Switched model to ${selectedModel}`,
           streaming: false,
@@ -4009,7 +4123,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
       }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk') && modelMatch) {
+      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk') && modelMatch) {
         const nextModel = modelMatch[1];
         transportRuntime.setAgentId(nextModel);
         const nextRecord = {
@@ -4197,6 +4311,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Reset per-session memory injection history — fresh conversation
       // should be allowed to re-inject previously-shown memories again.
       clearRecentInjectionHistory(sessionName);
+      clearSummarySyncHistory(sessionName);
       await handleGetSessions(serverLink);
       await syncSubSessionIfNeeded(sessionName, serverLink);
       timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -4293,6 +4408,15 @@ async function sendProcessSessionMessage(
     serverLink?: Pick<ServerLink, 'send'>;
     /** RV-C non-displayed audit anchor for an alias-bearing send (no plaintext). */
     aliasAudit?: AliasSendAudit;
+    /** Trusted daemon-owned metadata for automation surfaces such as P2P.
+     * Values are projected only to the local user.message event. */
+    userMessageMetadata?: Readonly<{
+      allowDuplicate?: boolean;
+      memoryExcluded?: boolean;
+      p2pRunId?: string;
+      p2pDiscussionId?: string;
+      p2pPhase?: string;
+    }>;
   },
 ): Promise<void> {
   // ── Step 1: Confirm receipt to the user IMMEDIATELY ─────────────────────────
@@ -4306,6 +4430,7 @@ async function sendProcessSessionMessage(
   // RV-C: attach the alias audit anchor to the human-facing user.message. It
   // carries only referenced names + a hash of resolved values, never plaintext.
   if (options?.aliasAudit) payload.aliasAudit = options.aliasAudit;
+  if (options?.userMessageMetadata) Object.assign(payload, options.userMessageMetadata);
   const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
   if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
@@ -4329,15 +4454,21 @@ async function sendProcessSessionMessage(
   }
 
   let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
+  let memoryRecallCancelled = false;
   try {
     const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
     memoryContext = await withDeadline(
-      prependLocalMemory(sendText, sessionName, { deadlineAt }),
+      prependLocalMemory(sendText, sessionName, {
+        deadlineAt,
+        isCancelled: () => memoryRecallCancelled,
+      }),
       PROCESS_MEMORY_RECALL_DEADLINE_MS,
       'memory_recall_timeout',
     );
     sendText = memoryContext.text;
   } catch (recallErr) {
+    memoryRecallCancelled = true;
+    rollbackSummarySyncReservation(memoryContext.summaryReservation);
     logger.warn({ sessionName, timeoutMs: PROCESS_MEMORY_RECALL_DEADLINE_MS, err: recallErr }, 'memory recall skipped — sending without memory injection');
   }
 
@@ -4349,6 +4480,7 @@ async function sendProcessSessionMessage(
   try {
     await sendShellAwareCommand(sessionName, sendText, agentType);
   } catch (sendErr) {
+    rollbackSummarySyncReservation(memoryContext.summaryReservation);
     const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
     logger.error({ sessionName, err: sendErr }, 'sendShellAwareCommand failed after ack');
     try {
@@ -4359,6 +4491,8 @@ async function sendProcessSessionMessage(
     release();
     deliveryTurn.releaseTurn();
   }
+
+  commitSummarySyncReservation(memoryContext.summaryReservation);
 
   // ── Step 4: Post-delivery — emit memory.context + record hits ──────────────
   if (memoryContext.timelinePayload && userEvent) {
@@ -4377,8 +4511,23 @@ async function sendProcessSessionMessage(
   }
 }
 
-export async function sendProcessSessionMessageForAutomation(sessionName: string, text: string): Promise<void> {
-  await sendProcessSessionMessage(sessionName, text, [], { originalText: text });
+export async function sendProcessSessionMessageForAutomation(
+  sessionName: string,
+  text: string,
+  options?: {
+    userMessageMetadata?: Readonly<{
+      allowDuplicate?: boolean;
+      memoryExcluded?: boolean;
+      p2pRunId?: string;
+      p2pDiscussionId?: string;
+      p2pPhase?: string;
+    }>;
+  },
+): Promise<void> {
+  await sendProcessSessionMessage(sessionName, text, [], {
+    originalText: text,
+    ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
+  });
 }
 
 async function resolveProcessRecallQueryContext(
@@ -4444,6 +4593,7 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
       return;
     }
     supervisionAutomation.updateQueuedTaskIntent(sessionName, clientMessageId, text);
+    peerAuditService.invalidateQueuedEdit(sessionName);
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'edit_queued_message_before');
     try {
       queueSnapshot = getTransportQueueStore().edit(sessionName, clientMessageId, text);
@@ -4491,15 +4641,29 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
       (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
     );
     if (!removed && !queuedInStore) {
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
-      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });
+      // Deleting a queued message is IDEMPOTENT: if it is already gone the goal
+      // is met, so ack success. The frontend now always sends the undo — even for
+      // an entry that only ever existed optimistically (never reached the store)
+      // — so an "error: not found" here would spuriously roll the deleted bubble
+      // back into the UI. "Already absent" is a successful delete.
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
       return;
     }
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
+    peerAuditService.invalidateQueuedEdit(sessionName);
     try {
       queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
     } catch (err) {
+      // The SQLite row is the queue authority. If the drop threw, the row is
+      // STILL THERE — the delete did NOT happen — so we must NOT ack success
+      // (that would leave the message queued on the backend while the UI claims
+      // it is deleted). Ack an error so the frontend rolls the bubble back and
+      // the state stays truthful.
       logger.warn({ err, sessionName, clientMessageId }, 'transport queue sqlite drop failed for undo queued message');
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queue delete failed' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queue delete failed' });
+      return;
     }
     timelineEmitter.emit(sessionName, 'session.state', {
       state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
@@ -5683,7 +5847,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -9909,7 +10073,7 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
@@ -12142,42 +12306,30 @@ async function handleMemoryDelete(cmd: Record<string, unknown>, serverLink: Serv
 async function prependLocalMemory(
   prompt: string,
   sessionName: string,
-  options?: { deadlineAt?: number },
+  options?: { deadlineAt?: number; isCancelled?: () => boolean },
 ): Promise<{
   text: string;
   timelinePayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
   hitIds?: string[];
+  summaryReservation?: SummarySyncReservation;
 }> {
   const query = prompt.slice(0, 200);
+  let summaryReservation: SummarySyncReservation | undefined;
   if (prompt.trim().startsWith('/')) {
     return {
       text: prompt,
       timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_control_message'),
     };
   }
-  if (prompt.length < 10) {
-    return {
-      text: prompt,
-      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt'),
-    };
-  }
+  let semanticSkipReason: 'skipped_short_prompt' | 'skipped_template_prompt' | 'skipped_control_message' | undefined;
+  if (prompt.length < 10) semanticSkipReason = 'skipped_short_prompt';
   // Template-prompt skip: OpenSpec / slash-command / skill-template prompts
   // are not natural-language questions; a recall over them returns noise.
   // See shared/template-prompt-patterns.ts.
-  if (isTemplatePrompt(prompt)) {
-    return {
-      text: prompt,
-      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt'),
-    };
-  }
+  if (!semanticSkipReason && isTemplatePrompt(prompt)) semanticSkipReason = 'skipped_template_prompt';
   // Imperative-command skip: short terse task-control verbs ("commit&push",
   // "redeploy", "continue") are ops directives, not semantic queries.
-  if (isImperativeCommand(prompt)) {
-    return {
-      text: prompt,
-      timelinePayload: buildMemoryContextStatusPayload(query, 'skipped_control_message'),
-    };
-  }
+  if (!semanticSkipReason && isImperativeCommand(prompt)) semanticSkipReason = 'skipped_control_message';
   try {
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
@@ -12193,13 +12345,32 @@ async function prependLocalMemory(
     // (bounded L3 RPC), off the daemon main thread — same as the transport path
     // (Req "Bounded front-of-turn L3 recall"). In-process fallback only when the
     // worker is not warm / unavailable, so recall never blocks the turn.
-    const searchResult = await searchLocalMemorySemanticFrontOfTurn(recallQuery);
-    if (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt) {
+    const [searchResult, summaryCandidates] = await Promise.all([
+      semanticSkipReason
+        ? Promise.resolve({ items: [] })
+        : searchLocalMemorySemanticFrontOfTurn(recallQuery),
+      collectRecentSummarySyncCandidates(recallContext.namespace, {
+        currentSessionName: sessionName,
+      }),
+    ]);
+    if (options?.isCancelled?.()
+      || (typeof options?.deadlineAt === 'number' && Date.now() > options.deadlineAt)) {
       return {
         text: prompt,
         timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),
       };
     }
+    summaryReservation = reserveUnsyncedSummaryFingerprints(
+      sessionName,
+      summaryCandidates.map((candidate) => candidate.fingerprint),
+    );
+    const reservedSummaryFingerprints = new Set(summaryReservation?.fingerprints ?? []);
+    const summaryItems = summaryCandidates
+      .filter((candidate) => reservedSummaryFingerprints.has(candidate.fingerprint))
+      .map((candidate) => candidate.item);
+    const summaryContentFingerprints = new Set(
+      summaryItems.map((item) => fingerprintRecentSummary(item.summary)),
+    );
     // 1) Template-origin legacy summaries never surface through recall.
     const notTemplate = searchResult.items.filter(
       (item) => !isTemplateOriginSummary(item.summary),
@@ -12208,7 +12379,10 @@ async function prependLocalMemory(
     //    of THIS session. Cleared on `session.clear`.
     const ids = notTemplate.map((item) => item.id);
     const keepIds = new Set(filterRecentlyInjected(sessionName, ids));
-    const deduped = notTemplate.filter((item) => keepIds.has(item.id));
+    const deduped = notTemplate.filter((item) => (
+      keepIds.has(item.id)
+      && !summaryContentFingerprints.has(fingerprintRecentSummary(item.summary))
+    ));
     const dedupedCount = Math.max(0, notTemplate.length - deduped.length);
     // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
     //    See shared/memory-scoring.ts.
@@ -12217,10 +12391,12 @@ async function prependLocalMemory(
       minFloor: getContextModelConfig().memoryRecallMinScore,
     });
     const finalItems = finalScored.map((s) => s.item);
-    if (finalItems.length === 0) {
+    if (finalItems.length === 0 && summaryItems.length === 0) {
       return {
         text: prompt,
-        timelinePayload: deduped.length === 0 && notTemplate.length > 0
+        timelinePayload: semanticSkipReason
+          ? buildMemoryContextStatusPayload(query, semanticSkipReason)
+          : deduped.length === 0 && notTemplate.length > 0
           ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
               matchedCount: notTemplate.length,
               dedupedCount,
@@ -12230,24 +12406,35 @@ async function prependLocalMemory(
             }),
       };
     }
-    const hitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
-    const injectedText = buildRelatedPastWorkText(finalItems);
-    const timelinePayload = buildMemoryContextTimelinePayload(query, finalItems);
+    if (options?.isCancelled?.()) {
+      rollbackSummarySyncReservation(summaryReservation);
+      return { text: prompt };
+    }
+    const semanticHitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
+    const hitIds = [...summaryItems.map((item) => item.id), ...semanticHitIds];
+    const sections: string[] = [];
+    if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(summaryItems));
+    if (finalItems.length > 0) sections.push(buildRelatedPastWorkText(finalItems));
+    const injectedText = sections.join('\n\n');
+    const timelineItems = [...summaryItems, ...finalItems];
+    const timelinePayload = buildMemoryContextTimelinePayload(query, timelineItems);
     // 4) Record the injection into the per-session ring buffer so these
     //    same items do not re-inject on the next 10 turns.
-    recordRecentInjection(sessionName, hitIds);
+    recordRecentInjection(sessionName, semanticHitIds);
     return {
       text: `${injectedText}\n\n${prompt}`,
       timelinePayload: timelinePayload
         ? {
             query: timelinePayload.query,
-            injectedText: timelinePayload.injectedText,
+            injectedText,
             items: timelinePayload.items,
           }
         : undefined,
       hitIds: hitIds.length > 0 ? hitIds : undefined,
+      summaryReservation,
     };
   } catch {
+    rollbackSummarySyncReservation(summaryReservation);
     return {
       text: prompt,
       timelinePayload: buildMemoryContextStatusPayload(query, 'failed'),

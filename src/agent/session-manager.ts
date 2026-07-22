@@ -16,6 +16,9 @@ import { PROVIDER_ERROR_CODES, type SessionInfoUpdate } from './transport-provid
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
+  PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD,
+} from '../../shared/peer-audit.js';
+import {
   getSession,
   upsertSession,
   removeSession,
@@ -70,6 +73,7 @@ import { buildTransportQueueSnapshotPayload } from '../daemon/transport-queue-pr
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
+import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 
@@ -1525,6 +1529,9 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       payload.clearInputs = [
         { source: 'transport-runtime', reason: 'clear', count: 0 },
       ];
+      if (activity.completedTurn) {
+        payload[PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD] = activity.completedTurn;
+      }
       const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle');
       Object.assign(payload, queuePayload);
       // Canonical authoritative-idle contract fields. The shared validator
@@ -2098,6 +2105,7 @@ export async function restoreTransportSessions(
         extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
         const presetOverrides = await getPresetTransportOverrides(s.ccPreset);
         if (!effectiveRequestedModel && presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
+        restoredPresetContextWindow = presetOverrides.contextWindow ?? restoredPresetContextWindow;
         systemPrompt = presetOverrides.systemPrompt;
       } else if (s.providerId === 'qwen' && s.ccPreset) {
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
@@ -2170,8 +2178,14 @@ export async function restoreTransportSessions(
         state: 'idle',
         updatedAt: Date.now(),
         ...(freshAfterInterruptedCodexRestore
-          ? { codexSessionId: undefined, startupMemoryInjected: undefined, recentInjectionHistory: undefined }
+          ? {
+              codexSessionId: undefined,
+              startupMemoryInjected: undefined,
+              recentInjectionHistory: undefined,
+              summarySyncFingerprints: undefined,
+            }
           : {}),
+        ...(freshOnRestore ? { summarySyncFingerprints: undefined } : {}),
         ...(freshQoderRestore
           ? { providerResumeId: undefined }
           : {}),
@@ -2332,6 +2346,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
+  if (opts.fresh || !existing) clearSummarySyncHistory(name);
   const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
   const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
     && existing?.agentType === 'claude-code'
@@ -2399,6 +2414,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // and previously-injected memories get re-injected into the same conversation.
   const preservedRecentInjectionHistory: string[][] | undefined =
     !opts.fresh ? existing?.recentInjectionHistory : undefined;
+  const preservedSummarySyncFingerprints: string[] | undefined =
+    !opts.fresh ? existing?.summarySyncFingerprints : undefined;
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   let presetContextWindow: number | undefined = !opts.fresh ? existing?.presetContextWindow : undefined;
@@ -2609,6 +2626,9 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(preservedRecentInjectionHistory && preservedRecentInjectionHistory.length > 0
           ? { recentInjectionHistory: preservedRecentInjectionHistory }
           : {}),
+        ...(preservedSummarySyncFingerprints && preservedSummarySyncFingerprints.length > 0
+          ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
+          : {}),
       };
       upsertSession(record);
       emitSessionPersist(record, name);
@@ -2707,6 +2727,11 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   const exists = await sessionExists(name);
+  const storedBeforeLaunch = getSession(name);
+  // A missing tmux pane can be a non-fresh crash restart of the same logical
+  // conversation. Only explicit fresh launches or genuinely new records reset
+  // the conversation-lifetime summary ledger.
+  if (fresh || (!exists && !storedBeforeLaunch)) clearSummarySyncHistory(name);
 
   let ccSessionId = opts.ccSessionId;
   if (agentType === 'claude-code' && !fresh) {
@@ -2785,6 +2810,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   if (!skipStore) {
     const existing = getSession(name);
+    const summarySyncFingerprints = getSummarySyncFingerprints(name);
     const record: SessionRecord = {
       name,
       projectName,
@@ -2807,6 +2833,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.description ? { description: opts.description } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
+      ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
     };
     upsertSession(record);

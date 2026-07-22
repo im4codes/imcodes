@@ -10,7 +10,7 @@ import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../co
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
 import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES } from '@shared/usage-context-window.js';
+import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
@@ -154,12 +154,16 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       usage.contextWindow,
       displayModel,
       1_000_000,
-      { preferExplicit: usage.contextWindowSource === USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER },
+      { preferExplicit: isAuthoritativeUsageContextWindowSource(usage.contextWindowSource) },
     );
     const total = usage.inputTokens + usage.cacheTokens;
-    const totalPct = Math.min(100, total / ctx * 100);
-    const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
-    const newPct = totalPct - cachePct;
+    // Keep style percentages stable across rerenders. Raw floating-point
+    // subtraction can produce values such as 0.506299999999996%, which makes
+    // tiny live ctx changes harder to inspect and needlessly dirties the DOM.
+    const roundPct = (value: number) => Math.round(value * 10_000) / 10_000;
+    const totalPct = roundPct(Math.min(100, total / ctx * 100));
+    const cachePct = roundPct(Math.min(totalPct, usage.cacheTokens / ctx * 100));
+    const newPct = roundPct(Math.max(0, totalPct - cachePct));
     const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
     const tip = [
       displayModel ?? '',
@@ -195,7 +199,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (!previousSignature || previousSignature === signature) return;
 
     setCtxBurning(true);
-    const timeoutId = window.setTimeout(() => setCtxBurning(false), 780);
+    const timeoutId = window.setTimeout(() => setCtxBurning(false), 1_200);
     return () => window.clearTimeout(timeoutId);
   }, [cachePct, ctx, hasContextInfo, newPct, total]);
 
@@ -224,19 +228,19 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         : t('session.state_stop_requested');
     }
     if (liveStatusMode === 'result') return statusText || t('session.state_idle');
+    if (liveStatusMode === 'waiting') return statusText || t('session.state_idle');
     if (liveStatus.sweep) {
       if (activeToolCall) return statusText || t('session.state_running');
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
-      if (liveStatus.activityDetail) {
-        return t('session.state_running_detail', {
-          detail: liveStatus.activityDetail,
-          defaultValue: 'Agent working: {{detail}}',
-        });
-      }
+      // Transport activity details are daemon-internal liveness signals such as
+      // `runtime_dispatch`, `act`, or `provider_compaction`. They are useful for
+      // deciding whether the session is busy, but not meaningful user-facing
+      // status copy. Keep the generic working state while retaining concrete
+      // error details in the error branch above.
       return t('session.state_running');
     }
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'stopping' || liveStatusMode === 'cancelled' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK
@@ -261,7 +265,22 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         <div class={`session-ctx-bar${ctxBurning ? ' is-burning' : ''}`}>
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-          {ctxBurning && <span class="session-ctx-burn" style={{ width: `${totalPct}%` }} aria-hidden="true" />}
+          {ctxBurning && (
+            <>
+              <span
+                key={`burn:${total}:${ctx}`}
+                class="session-ctx-burn"
+                style={{ width: `${totalPct}%` }}
+                aria-hidden="true"
+              />
+              <span
+                key={`edge:${total}:${ctx}`}
+                class="session-ctx-burn-edge"
+                style={{ left: `${totalPct}%` }}
+                aria-hidden="true"
+              />
+            </>
+          )}
         </div>
       )}
       {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt || isCodexSession) && (

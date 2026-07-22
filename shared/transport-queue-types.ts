@@ -60,6 +60,11 @@ export interface QueuePrivateDispatchMaterial {
   providerRouting?: Record<string, unknown>;
   timelineCommitted?: boolean;
   historyCommitted?: boolean;
+  /** Private peer-audit ownership marker. Never expose through queue projections. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
 }
 
 export interface QueueDispatchMaterial {

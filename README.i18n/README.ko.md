@@ -123,6 +123,20 @@ IM.codes는 직접 작성한 supervisor 지시문으로 지원되는 agent sessi
 
 ## 주요 기능
 
+### 비공개 별칭
+
+사용자 소유의 재사용 가능한 텍스트 조각을 저장하고 composer에서 `;`를 입력해 검색하거나 `;;(name)` 마커를 직접 삽입할 수 있습니다. 메시지에는 마커가 그대로 보이고 IM.codes가 값을 대역 외로 해석해 agent에 전달합니다. Agent도 managed MCP tools로 별칭을 생성·검색·편집·해석할 수 있습니다. 일괄 목록은 메타데이터만 공개하므로 한 번의 호출로 모든 값이 모델 컨텍스트에 들어가지 않습니다.
+
+### 제어 노드
+
+다른 머신을 완전한 IM.codes source server로 만들지 않고 제한된 controlled node로 등록할 수 있습니다. `^`로 대상을 자동 완성하거나 `^^(name)`을 직접 삽입하면, 권한을 받은 agent가 해당 노드에서 범위가 지정된 원격 명령, 단일 파일 전송, 타입이 지정된 Computer Use tool을 실행할 수 있습니다. 실행 권한은 소유자가 활성화하거나 철회할 수 있고, controlled node는 일반 server/session 목록에 섞이지 않으며 머신마다 독립 자격 증명을 사용합니다. 다운로드 링크는 만료되지만 새로 받은 설치 패키지는 보관해 여러 머신 등록에 재사용할 수 있습니다.
+
+### Computer Use 및 브라우저 자동화
+
+지원되는 SDK agent는 타입이 지정된 Computer Use tool로 데스크톱 앱을 제어할 수 있습니다. 크로스플랫폼 데스크톱 앱 제어에는 Leo([iFurySt](https://github.com/iFurySt))가 개발하고 MIT 라이선스로 배포한 [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use)를 통합했으며, 이 통합 기능에 대해 해당 프로젝트에 명확히 크레딧을 표합니다.
+
+브라우저 자동화는 별도로 IM.codes가 구현한 Chrome DevTools Protocol(CDP) 기반 기능입니다. 페이지 열기, 검사, 이동, 클릭, 입력 및 스크립트 평가를 지원하고 기본적으로 구조화된 텍스트를 반환하며 요청할 때만 스크린샷을 첨부합니다. 관리 브라우저는 로컬 루프백 전용 CDP endpoint도 노출하므로 로컬 Python 또는 Node script가 같은 실행 중인 browser instance를 재사용할 수 있습니다.
+
 ### 원격 터미널
 SSH, VPN, 포트 포워딩 없이 브라우저에서 agent session의 터미널에 접근할 수 있습니다.
 

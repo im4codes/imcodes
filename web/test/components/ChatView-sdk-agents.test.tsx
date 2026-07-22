@@ -11,6 +11,7 @@ import {
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   type SdkSubagentDetailMeta,
 } from '../../../shared/sdk-subagent-status.js';
 import { ChatView } from '../../src/components/ChatView.js';
@@ -36,6 +37,9 @@ vi.mock('react-i18next', () => ({
         'chat.sdk_agents_provider_claude': 'Claude SDK',
         'chat.sdk_agents_provider_codex': 'Codex SDK',
         'chat.sdk_agents_provider_unknown': 'SDK agent',
+        'chat.sdk_agents_task_bash': 'Bash / Shell',
+        'chat.sdk_agents_task_agent': 'Agent',
+        'chat.sdk_agents_task_background': 'Background task',
         'chat.sdk_agents_status_running': 'Running',
         'chat.sdk_agents_status_complete': 'Complete',
         'chat.sdk_agents_status_unknown': 'Unknown',
@@ -139,6 +143,41 @@ describe('ChatView SDK agents panel', () => {
     vi.useRealTimers();
   });
 
+  it('shows Bash and true Agent work together while labeling their backend task kinds', () => {
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
+    const bashEvent = makeSdkEvent('bash-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:bash-1',
+      taskId: 'bash-1',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      childStatusSummary: 'Indexing files',
+    }));
+    const agentEvent = makeSdkEvent('agent-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:agent-1',
+      taskId: 'agent-1',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT,
+      childStatusSummary: 'Reviewing changes',
+    }));
+    const codexBashEvent = makeSdkEvent('codex-bash-running', makeMeta({
+      canonicalKey: 'codex:deck_agents:shell:81234',
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+      taskId: '81234',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      childStatusSummary: 'Running tests',
+    }));
+
+    const { container } = render(
+      <ChatView events={[bashEvent, agentEvent, codexBashEvent]} loading={false} sessionId="deck_agents" />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 3 running' })).toBeTruthy();
+    expect(screen.getByText('Indexing files')).toBeTruthy();
+    expect(screen.getByText('Reviewing changes')).toBeTruthy();
+    expect(screen.getByText('Running tests')).toBeTruthy();
+    expect(Array.from(container.querySelectorAll('.chat-sdk-agent-task-kind')).map((node) => node.textContent))
+      .toEqual(['Bash / Shell', 'Agent', 'Bash / Shell']);
+  });
+
   it('renders the Agents toggle immediately before refresh and shows the running badge', () => {
     const onForceSync = vi.fn();
     const { container } = render(
@@ -162,7 +201,7 @@ describe('ChatView SDK agents panel', () => {
       .toBeLessThan(Array.from(actions?.children ?? []).indexOf(agentsButton as Element));
   });
 
-  it('remembers desired-open state, only mounts while agents are running, and manual close suppresses auto-show', () => {
+  it('remembers desired-open state, keeps all retained agent statuses visible, and honors manual close', () => {
     const runningEvent = makeSdkEvent('agent-running', makeMeta({ childStatusSummary: 'Checking files' }));
     const terminalEvent = makeSdkEvent('agent-complete', makeMeta({
       normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
@@ -199,15 +238,18 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByText('Checking files')).toBeTruthy();
 
     rerender(<ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />);
-    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
-    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Finished child work')).toBeTruthy();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
-    // Still toggled open (agents finished) → button stays active; badge shows 0.
+    // Finished agents remain visible while retained; the badge still reports
+    // only active children.
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(true);
 
     rerender(<ChatView events={[diagnosticEvent]} loading={false} sessionId="deck_agents" />);
-    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
-    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Diagnostics')).toBeTruthy();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
 
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);

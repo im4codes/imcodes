@@ -18,6 +18,7 @@ import {
   MIXED_DELEGATION_P2P_FIELDS,
   buildAgentDelegationOrchestrationPrompt,
   buildAgentDelegationReplyInstruction,
+  buildQuickAgentDelegationTask,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
   hasAgentDelegationTargetField,
@@ -128,6 +129,7 @@ describe('agent delegation shared contract', () => {
       'codex',
       'copilot-sdk',
       'cursor-headless',
+      'opencode-sdk',
       'opencode',
       'gemini-sdk',
       'grok-sdk',
@@ -204,6 +206,19 @@ describe('agent delegation shared contract', () => {
     expect(prompt).toContain('multiple @ delegates');
     expect(prompt).toContain('separate per-delegate briefs');
     expect(prompt).toContain('each delegate result separately');
+  });
+
+  it('builds quick presets as ordinary delegation tasks and keeps custom text exact', () => {
+    const audit = buildQuickAgentDelegationTask('audit');
+    expect(audit).toContain('current session context');
+    expect(audit).toContain('non-destructive tests');
+    expect(audit).toContain('PASS or REWORK');
+    expect(audit).not.toContain('replyCapability');
+    expect(audit).not.toContain('baseline');
+
+    expect(buildQuickAgentDelegationTask('discussion')).toContain('challenge the approach');
+    expect(buildQuickAgentDelegationTask('brainstorm')).toContain('practical alternatives');
+    expect(buildQuickAgentDelegationTask('custom', '  inspect the cache race  ')).toBe('inspect the cache race');
   });
 
   it('detects and strips historical reply/delegation/imcodes-send/P2P control instructions from context', () => {

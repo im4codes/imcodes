@@ -27,6 +27,7 @@ const { timelineOn, timelineEmit } = vi.hoisted(() => ({
   timelineOn: vi.fn(),
   timelineEmit: vi.fn(),
 }));
+const cronProcessSendMock = vi.fn().mockResolvedValue(undefined);
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
     on: timelineOn,
@@ -45,7 +46,7 @@ vi.mock('../../src/util/logger.js', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 
-import { executeCronJob } from '../../src/daemon/cron-executor.js';
+import { __setCronProcessCommandSenderForTests, executeCronJob } from '../../src/daemon/cron-executor.js';
 import { getSession } from '../../src/store/session-store.js';
 import { sessionName, getTransportRuntime } from '../../src/agent/session-manager.js';
 import { detectStatusAsync } from '../../src/agent/detect.js';
@@ -95,26 +96,22 @@ describe('executeCronJob', () => {
       (project: string, role: string) => `deck_${project}_${role}`,
     );
     timelineOn.mockReturnValue(() => {});
+    __setCronProcessCommandSenderForTests(cronProcessSendMock);
   });
 
   // 1. Command to idle process session
-  it('sends command to idle process session via sendKeys with cwd', async () => {
+  it('routes an idle process cron command through the common process send boundary', async () => {
     const session = makeSession();
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(session);
     (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
 
     await executeCronJob(makeMsg(), mockServerLink);
 
-    expect(sendKeys).toHaveBeenCalledWith(
+    expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
-      { cwd: '/home/user/myapp' },
     );
-    expect(timelineEmit).toHaveBeenCalledWith(
-      'deck_myapp_brain',
-      'user.message',
-      { text: 'review the codebase', allowDuplicate: true },
-    );
+    expect(sendKeys).not.toHaveBeenCalled();
   });
 
   it('injects only the self-management id and lifecycle rule into agent wake-up prompts', async () => {
@@ -130,12 +127,8 @@ describe('executeCronJob', () => {
       action: { type: 'command', command: 'Inspect the current progress.', selfManaged: true },
     }), mockServerLink);
 
-    const prompt = (sendKeys as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    const prompt = cronProcessSendMock.mock.calls[0][1] as string;
     expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1">\nUse cron_update_self to change this task. When complete, call cron_cancel_self with this id; otherwise keep it scheduled.\n</imcodes-cron-control>');
-    expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
-      text: prompt,
-      allowDuplicate: true,
-    });
   });
 
   it.each(['shell', 'script'] as const)('does not inject MCP controls into %s commands', async (agentType) => {
@@ -147,15 +140,10 @@ describe('executeCronJob', () => {
       action: { type: 'command', command: 'printf ready', selfManaged: true },
     }), mockServerLink);
 
-    expect(sendKeys).toHaveBeenCalledWith(
+    expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'printf ready',
-      { cwd: '/home/user/myapp' },
     );
-    expect(timelineEmit).toHaveBeenCalledWith('deck_myapp_brain', 'user.message', {
-      text: 'printf ready',
-      allowDuplicate: true,
-    });
   });
 
   // 2. Command to streaming session — skips (busy)
@@ -213,10 +201,9 @@ describe('executeCronJob', () => {
       expect.objectContaining({ err: expect.any(Error) }),
       expect.stringContaining('status detection failed'),
     );
-    expect(sendKeys).toHaveBeenCalledWith(
+    expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
-      { cwd: '/home/user/myapp' },
     );
   });
 
@@ -227,10 +214,9 @@ describe('executeCronJob', () => {
 
     await executeCronJob(makeMsg(), mockServerLink);
 
-    expect(sendKeys).toHaveBeenCalledWith(
+    expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
-      { cwd: '/home/user/myapp' },
     );
   });
 
@@ -415,7 +401,7 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg({ targetRole: 'w1' }), mockServerLink);
 
     expect(sessionName).toHaveBeenCalledWith('myapp', 'w1');
-    expect(sendKeys).toHaveBeenCalled();
+    expect(cronProcessSendMock).toHaveBeenCalled();
   });
 
   it('P2P defaults to 1 round when rounds is not specified', async () => {
@@ -484,10 +470,9 @@ describe('executeCronJob', () => {
     // Should use targetSessionName directly, not construct via sessionName()
     expect(sessionName).not.toHaveBeenCalled();
     expect(getSession).toHaveBeenCalledWith('deck_sub_abc123');
-    expect(sendKeys).toHaveBeenCalledWith(
+    expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_sub_abc123',
       'review the codebase',
-      { cwd: '/home/user/myapp' },
     );
   });
 
@@ -507,7 +492,7 @@ describe('executeCronJob', () => {
       expect.objectContaining({ targetRole: 'not_a_valid_role' }),
       expect.stringContaining('invalid target role'),
     );
-    expect(sendKeys).toHaveBeenCalled();
+    expect(cronProcessSendMock).toHaveBeenCalled();
   });
 
   it('resolves sub-session P2P participants from participantEntries', async () => {

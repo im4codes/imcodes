@@ -12,6 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // ── Module mocks (must be hoisted before any imports) ───────────────────────
 
 const getSessionMock = vi.hoisted(() => vi.fn());
+const getCachedPresetContextWindowMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
@@ -30,6 +31,10 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
+}));
+
+vi.mock('../../src/daemon/cc-presets.js', () => ({
+  getCachedPresetContextWindow: getCachedPresetContextWindowMock,
 }));
 
 // ── Imports after mocks ──────────────────────────────────────────────────────
@@ -76,7 +81,7 @@ type MockProviderError = { code: string; message: string; recoverable: boolean; 
 type ErrorCb = (sessionId: string, error: MockProviderError) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
-type UsageCb = (sessionId: string, update: { usage?: Record<string, unknown>; model?: string }) => void;
+type UsageCb = (sessionId: string, update: { messageId?: string; finalized?: boolean; usage?: Record<string, unknown>; model?: string }) => void;
 type ApprovalCb = (sessionId: string, request: { id: string; description: string; tool?: string }) => void;
 
 function makeMockProvider() {
@@ -103,7 +108,7 @@ function makeMockProvider() {
     fireError: (sid: string, err: MockProviderError) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
     fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
-    fireUsage: (sid: string, update: { usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
+    fireUsage: (sid: string, update: { messageId?: string; finalized?: boolean; usage?: Record<string, unknown>; model?: string }) => usageCb?.(sid, update),
     fireApproval: (sid: string, request: { id: string; description: string; tool?: string }) => approvalCb?.(sid, request),
   };
 }
@@ -203,6 +208,7 @@ describe('transport-relay (timeline-emitter based)', () => {
     emitMock.mockClear();
     appendMock.mockClear();
     getSessionMock.mockReset();
+    getCachedPresetContextWindowMock.mockReset();
   });
 
   afterEach(() => {
@@ -503,6 +509,119 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(usageCall![3]).toMatchObject({
         eventId: 'transport:sess-1:usage:usage',
       });
+    });
+
+    it('persists a finalized late provider usage frame on its completed message id', () => {
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        messageId: 'msg-late-usage',
+        finalized: true,
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        streaming: false,
+      });
+      expect(usageCall?.[3]).toMatchObject({
+        eventId: 'transport:sess-1:msg-late-usage:usage',
+      });
+    });
+
+    it('uses the current preset window instead of a stale launch-time session copy', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'MiniMax',
+        presetContextWindow: 200_000,
+        activeModel: 'MiniMax-M3',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 12_000, cache_read_input_tokens: 700_000 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 12_000,
+        cacheTokens: 700_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+    });
+
+    it('keeps the configured preset window authoritative over model-family inference', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'LongContext',
+        presetContextWindow: 200_000,
+        activeModel: 'claude-haiku-4-5',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireUsage('sess-1', {
+        model: 'claude-haiku-4-5',
+        usage: { input_tokens: 100_000, cache_read_input_tokens: 0 },
+      });
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall?.[2]).toMatchObject({
+        inputTokens: 100_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+    });
+
+    it('reconciles a metadata-only preset completion with trailing result usage on one event id', () => {
+      getSessionMock.mockReturnValue({
+        name: 'sess-1',
+        ccPreset: 'MiniMax',
+        presetContextWindow: 200_000,
+        activeModel: 'MiniMax-M3',
+      });
+      getCachedPresetContextWindowMock.mockReturnValue(1_000_000);
+      const { provider, fireDelta, fireComplete, fireUsage } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-result-usage', delta: 'Done' }));
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-result-usage',
+        content: 'Done',
+        metadata: { model: 'MiniMax-M3' },
+      }));
+      fireUsage('sess-1', {
+        messageId: 'msg-result-usage',
+        finalized: true,
+        model: 'MiniMax-M3',
+        usage: { input_tokens: 14_000, cache_read_input_tokens: 710_000 },
+      });
+
+      const usageCalls = emitMock.mock.calls.filter(c => c[1] === 'usage.update');
+      expect(usageCalls).toHaveLength(2);
+      expect(usageCalls[0]?.[2]).toMatchObject({
+        model: 'MiniMax-M3',
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+      });
+      expect(usageCalls[1]?.[2]).toMatchObject({
+        inputTokens: 14_000,
+        cacheTokens: 710_000,
+        contextWindow: 1_000_000,
+        contextWindowSource: 'preset',
+        streaming: false,
+      });
+      expect(usageCalls[0]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
+      expect(usageCalls[1]?.[3]).toMatchObject({ eventId: 'transport:sess-1:msg-result-usage:usage' });
     });
 
     it('honors Codex SDK provider effective window for GPT-5.5', () => {

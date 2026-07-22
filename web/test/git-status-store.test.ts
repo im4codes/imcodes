@@ -11,6 +11,7 @@ import {
   forceRefreshSharedChangesForCheckout,
   settleSharedChangesRequest,
   subscribeSharedChanges,
+  subscribeSharedChangesStatus,
   getSharedChangesKey,
   __resetSharedChangesForTests,
   SHARED_CHANGES_INFLIGHT_TIMEOUT_MS,
@@ -138,6 +139,43 @@ describe('git-status-store — refresh resilience', () => {
     // 5s TTL and fire again (user explicitly asking for fresh data).
     requestSharedChanges(ws, repo, true);
     expect(ws.fsGitStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports refreshing, success, and error states from real request settlement', () => {
+    const { ws, emit } = makeFakeWs();
+    const repo = '/repo/status';
+    const listener = vi.fn();
+    subscribeSharedChangesStatus(getSharedChangesKey(ws, repo), listener);
+
+    requestSharedChanges(ws, repo, true);
+    expect(listener).toHaveBeenLastCalledWith('refreshing');
+
+    emit(filesResponse('req-1', []));
+    expect(listener).toHaveBeenLastCalledWith('success');
+
+    requestSharedChanges(ws, repo, true);
+    expect(listener).toHaveBeenLastCalledWith('refreshing');
+    emit({ type: 'fs.git_status_response', requestId: 'req-2', status: 'error', error: 'git failed' } as unknown as ServerMessage);
+    expect(listener).toHaveBeenLastCalledWith('error');
+    expect(listener.mock.calls.map(([status]) => status)).toEqual([
+      'refreshing',
+      'success',
+      'refreshing',
+      'error',
+    ]);
+  });
+
+  it('reports a disconnected manual refresh as an error', () => {
+    const { ws } = makeFakeWs();
+    const repo = '/repo/status-disconnected';
+    const listener = vi.fn();
+    subscribeSharedChangesStatus(getSharedChangesKey(ws, repo), listener);
+    vi.mocked(ws.fsGitStatus).mockImplementationOnce(() => {
+      throw new Error('WebSocket not connected');
+    });
+
+    requestSharedChanges(ws, repo, true);
+    expect(listener).toHaveBeenCalledWith('error');
   });
 
   it('checkout force refresh bypasses TTL once per generation and drops stale in-flight responses', () => {

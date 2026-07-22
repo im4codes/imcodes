@@ -3,9 +3,9 @@
  * (testcontainers via integration-global). Covers the integrated repair:
  *   - separate controlled_node_enrollments_v2 table (audit E1)
  *   - v2 redeem with {version:2, installId, nodeTokenHash, os, arch} body
- *   - atomic claim with idempotent replay (same identity → same server)
- *   - mismatch (installId or nodeTokenHash) → 409
- *   - both-null-or-both-present CHECK
+ *   - permanent multi-use package identity with per-machine install rows
+ *   - idempotent replay (same install identity → same server)
+ *   - mismatch (same installId with another hash, or reused hash) → 409
  *   - ticket mint only from a build-pipeline sidecar whose digest matches
  *   - bearer download with same encrypted_code reused across retries
  *   - Range check before incrementing consume_count
@@ -158,9 +158,10 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       ticket_hash: string; code_hash: string; encrypted_code: string;
       artifact_sha256: string; used_at: string | null; install_id: string | null;
       node_token_hash: string | null; consumed_count: number;
+      reusable: boolean; expires_at: string | null;
     }>(
       `SELECT ticket_hash, code_hash, encrypted_code, artifact_sha256, used_at,
-              install_id, node_token_hash, consumed_count
+              install_id, node_token_hash, consumed_count, reusable, expires_at
          FROM controlled_node_enrollments_v2 LIMIT 1`,
     );
     expect(row?.ticket_hash).toBe(sha256(body.ticket));
@@ -173,6 +174,8 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     expect(row?.install_id).toBeNull();
     expect(row?.node_token_hash).toBeNull();
     expect(row?.consumed_count).toBe(0);
+    expect(row?.reusable).toBe(true);
+    expect(row?.expires_at).toBeNull();
   });
 
   it('rejects requests missing version:2 or arch (400)', async () => {
@@ -753,7 +756,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     expect(await r.json()).toEqual({ error: 'redeem_failed' });
   });
 
-  it('atomically binds identity on first claim; no install/identity required at mint', async () => {
+  it('atomically binds a per-machine identity while the reusable installer remains unexpired', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -794,13 +797,17 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     expect(body.token).toBeUndefined(); // audit: no raw token returned
     expect(body.nodeRole).toBe('controlled');
 
-    // Identity is now atomically bound.
-    const bound = await db.queryOne<{ install_id: string; node_token_hash: string; used_at: string; redeemed_server_id: string }>(
-      'SELECT install_id, node_token_hash, used_at, redeemed_server_id FROM controlled_node_enrollments_v2 LIMIT 1',
+    const installer = await db.queryOne<{ reusable: boolean; expires_at: string | null; used_at: string | null }>(
+      'SELECT reusable, expires_at, used_at FROM controlled_node_enrollments_v2 LIMIT 1',
+    );
+    expect(installer).toEqual({ reusable: true, expires_at: null, used_at: null });
+
+    // Machine identity is atomically bound in its own install row.
+    const bound = await db.queryOne<{ install_id: string; node_token_hash: string; redeemed_server_id: string }>(
+      'SELECT install_id, node_token_hash, redeemed_server_id FROM controlled_node_enrollment_installs LIMIT 1',
     );
     expect(bound?.install_id).toBe(installId);
     expect(bound?.node_token_hash).toBe(sha256(nodeToken));
-    expect(bound?.used_at).not.toBeNull();
     expect(bound?.redeemed_server_id).toBe(body.serverId);
   });
 
@@ -844,6 +851,40 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     expect(count?.n).toBe('1');
   });
 
+  it('serializes concurrent redemption of the same installer/install identity', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
+    const payload = {
+      version: 2 as const,
+      enrollToken: decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode,
+      installId: `concurrent-${hex(4)}`,
+      nodeTokenHash: sha256(hex(16)),
+      hostname: 'concurrent-host',
+      os: 'linux',
+      arch: 'x64',
+    };
+    const responses = await Promise.all(Array.from({ length: 8 }, () => app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+    })));
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+    const serverIds = new Set(await Promise.all(responses.map(async (response) => (
+      (await response.json() as { serverId: string }).serverId
+    ))));
+    expect(serverIds.size).toBe(1);
+    const count = await db.queryOne<{ n: string }>(
+      'SELECT COUNT(*)::text AS n FROM controlled_node_enrollment_installs',
+    );
+    expect(count?.n).toBe('1');
+  });
+
   it('mismatch (same installId, different nodeTokenHash) returns generic 409 redeem failure', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -873,7 +914,46 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     expect(await r2.json()).toEqual({ error: 'redeem_failed' });
   });
 
-  it('mismatch (different installId) returns the same generic 409 redeem failure', async () => {
+  it('different installIds with different token hashes create independent nodes from one package', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
+    const firstNodeTokenHash = sha256(hex(16));
+    const r1 = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-A', nodeTokenHash: firstNodeTokenHash, hostname: 'h-a', os: 'linux', arch: 'x64' }),
+    });
+    expect(r1.status).toBe(200);
+    const first = await r1.json() as { serverId: string };
+    const secondNodeTokenHash = sha256(hex(16));
+    const r2 = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-B', nodeTokenHash: secondNodeTokenHash, hostname: 'h-b', os: 'linux', arch: 'x64' }),
+    });
+    expect(r2.status).toBe(200);
+    const second = await r2.json() as { serverId: string };
+    expect(second.serverId).not.toBe(first.serverId);
+
+    const installs = await db.query<{ install_id: string; node_token_hash: string; redeemed_server_id: string }>(
+      `SELECT install_id, node_token_hash, redeemed_server_id
+         FROM controlled_node_enrollment_installs
+        ORDER BY install_id`,
+    );
+    expect(installs).toEqual([
+      { install_id: 'inst-A', node_token_hash: firstNodeTokenHash, redeemed_server_id: first.serverId },
+      { install_id: 'inst-B', node_token_hash: secondNodeTokenHash, redeemed_server_id: second.serverId },
+    ]);
+  });
+
+  it('rejects reusing one node token hash for another install under the same package', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
@@ -886,17 +966,129 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
     const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
     const nodeTokenHash = sha256(hex(16));
-    const r1 = await app.request('/api/enroll/v2/redeem', {
+    const first = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-A', nodeTokenHash, hostname: 'h', os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-A', nodeTokenHash, hostname: 'h-a', os: 'linux', arch: 'x64' }),
     });
-    expect(r1.status).toBe(200);
-    const r2 = await app.request('/api/enroll/v2/redeem', {
+    expect(first.status).toBe(200);
+    const second = await app.request('/api/enroll/v2/redeem', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-B', nodeTokenHash, hostname: 'h', os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-B', nodeTokenHash, hostname: 'h-b', os: 'linux', arch: 'x64' }),
     });
-    expect(r2.status).toBe(409);
-    expect(await r2.json()).toEqual({ error: 'redeem_failed' });
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({ error: 'redeem_failed' });
+  });
+
+  it('keeps a downloaded reusable package valid after its short-lived download ticket expires', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const row = await db.queryOne<{ encrypted_code: string; reusable: boolean; expires_at: string | null }>(
+      'SELECT encrypted_code, reusable, expires_at FROM controlled_node_enrollments_v2 LIMIT 1',
+    );
+    expect(row?.reusable).toBe(true);
+    expect(row?.expires_at).toBeNull();
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
+    await db.execute(
+      'UPDATE controlled_node_enrollments_v2 SET ticket_expires_at = $1, consumed_at = $1',
+      [Date.now() - 30 * 24 * 60 * 60 * 1000],
+    );
+
+    const redeem = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: enrollCode,
+        installId: 'late-install',
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'late-host',
+        os: 'linux',
+        arch: 'x64',
+      }),
+    });
+    expect(redeem.status).toBe(200);
+  });
+
+  it('rejects future installs after installer revocation without deleting an already enrolled node', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const row = await db.queryOne<{ id: string; encrypted_code: string }>(
+      'SELECT id, encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1',
+    );
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
+    const first = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-A', nodeTokenHash: sha256(hex(16)), hostname: 'h-a', os: 'linux', arch: 'x64' }),
+    });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json() as { serverId: string };
+    await db.execute('UPDATE controlled_node_enrollments_v2 SET revoked_at = $2 WHERE id = $1', [row!.id, Date.now()]);
+
+    const second = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'inst-B', nodeTokenHash: sha256(hex(16)), hostname: 'h-b', os: 'linux', arch: 'x64' }),
+    });
+    expect(second.status).toBe(401);
+    const existing = await db.queryOne<{ id: string; revoked_at: string | null }>(
+      'SELECT id, revoked_at FROM servers WHERE id = $1',
+      [firstBody.serverId],
+    );
+    expect(existing).toEqual({ id: firstBody.serverId, revoked_at: null });
+  });
+
+  it('preserves legacy single-use and expiry semantics', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
+    await db.execute(
+      'UPDATE controlled_node_enrollments_v2 SET reusable = FALSE, expires_at = $1',
+      [Date.now() + 60_000],
+    );
+    const first = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'legacy-A', nodeTokenHash: sha256(hex(16)), hostname: 'legacy-a', os: 'linux', arch: 'x64' }),
+    });
+    expect(first.status).toBe(200);
+    const second = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'legacy-B', nodeTokenHash: sha256(hex(16)), hostname: 'legacy-b', os: 'linux', arch: 'x64' }),
+    });
+    expect(second.status).toBe(409);
+
+    await db.execute(
+      `UPDATE controlled_node_enrollments_v2
+          SET used_at = NULL, redeemed_server_id = NULL, install_id = NULL,
+              node_token_hash = NULL, expires_at = $1
+        WHERE code_hash = $2`,
+      [Date.now() - 1, sha256(enrollCode)],
+    );
+    await db.execute('DELETE FROM controlled_node_enrollment_installs');
+    const expired = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId: 'legacy-C', nodeTokenHash: sha256(hex(16)), hostname: 'legacy-c', os: 'linux', arch: 'x64' }),
+    });
+    expect(expired.status).toBe(401);
   });
 
   it('os/arch mismatch on a valid ticket returns the same generic 409 conflict', async () => {
@@ -1109,6 +1301,48 @@ describe('GET /api/enroll/v2/availability + retention', () => {
       [userId, Date.now()],
     );
     expect(live?.n).toBe('1');
+  });
+
+  it('retention keeps an active reusable installer after old ticket consumption and repeated redemption', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const row = await db.queryOne<{ id: string; encrypted_code: string }>(
+      'SELECT id, encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1',
+    );
+    const enrollCode = decryptBotConfig(row!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
+    for (const installId of ['keep-A', 'keep-B']) {
+      const response = await app.request('/api/enroll/v2/redeem', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ version: 2, enrollToken: enrollCode, installId, nodeTokenHash: sha256(hex(16)), hostname: installId, os: 'linux', arch: 'x64' }),
+      });
+      expect(response.status).toBe(200);
+    }
+    await db.execute(
+      `UPDATE controlled_node_enrollments_v2
+          SET consumed_at = $2, ticket_expires_at = $2
+        WHERE id = $1`,
+      [row!.id, Date.now() - 8 * 24 * 60 * 60 * 1000],
+    );
+
+    await runEnrollmentRetention(db);
+    const kept = await db.queryOne<{ reusable: boolean; installs: string }>(
+      `SELECT enrollment.reusable,
+              COUNT(install.id)::text AS installs
+         FROM controlled_node_enrollments_v2 AS enrollment
+         LEFT JOIN controlled_node_enrollment_installs AS install
+           ON install.enrollment_id = enrollment.id
+        WHERE enrollment.id = $1
+        GROUP BY enrollment.reusable`,
+      [row!.id],
+    );
+    expect(kept).toEqual({ reusable: true, installs: '2' });
   });
 
   it('retention releases an expired reservation without changing committed consumption', async () => {

@@ -54,8 +54,10 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
  */
 /**
  * Extract active agent status label (e.g. "Reading file...") from the tail of events.
- * Returns the label of the last agent.status event if it's at the very end of the
- * event stream (only other agent.status events may follow it).
+ * Returns the label of the active agent.status event. Audit protocol events and
+ * memory-excluded automation notes are transparent: they describe the same
+ * active supervision operation and must not make its persistent footer status
+ * disappear. Ordinary user/assistant activity still terminates the lookup.
  */
 export function getActiveStatusText(events: Array<{ type: string; payload?: Record<string, unknown> }>): string | null {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -64,6 +66,8 @@ export function getActiveStatusText(events: Array<{ type: string; payload?: Reco
       if (e.payload?.label) return String(e.payload.label);
       return null;
     }
+    if (e.type === 'peer_audit.status') continue;
+    if (e.type === 'assistant.text' && e.payload?.automation === true && e.payload?.memoryExcluded === true) continue;
     if (e.type !== 'agent.status') break;
   }
   return null;

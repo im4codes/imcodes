@@ -379,6 +379,15 @@ export function isComboMode(mode: string): boolean {
   return mode.includes(COMBO_SEPARATOR);
 }
 
+/** A user-selectable combo must contain at least two real P2P phases. The
+ * `config` meta-mode is intentionally excluded because it delegates mode
+ * choice per participant and therefore cannot define a deterministic flow. */
+export function isValidP2pComboPipeline(mode: string): boolean {
+  const pipeline = parseModePipeline(mode);
+  return pipeline.length > 1
+    && pipeline.every((entry) => entry !== P2P_CONFIG_MODE && getP2pMode(entry) !== undefined);
+}
+
 /** Get the mode config for a specific round in a pipeline. Falls back to last element if round exceeds pipeline length. */
 export function getModeForRound(mode: string, round: number): P2pMode | undefined {
   const pipeline = parseModePipeline(mode);

@@ -12,6 +12,13 @@ import {
 } from './shared-context-runtime-config.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
+import {
+  PEER_AUDIT_PROMPT_VERSION,
+  isPeerAuditOpaqueId,
+  peerAuditByteLength,
+  type PeerAuditTargetFingerprint,
+} from './peer-audit.js';
+import { isValidImcodesSessionName } from './session-scope.js';
 
 export const SUPERVISION_CONTRACT_IDS = {
   DECISION: 'supervision_decision_v1',
@@ -21,7 +28,10 @@ export const SUPERVISION_CONTRACT_IDS = {
   OPENSPEC_IMPLEMENTATION_AUDIT: 'openspec_implementation_audit_v1',
   CONTEXTUAL_AUDIT: 'contextual_audit_v1',
   REWORK_BRIEF: 'rework_brief_v1',
+  AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
 } as const;
+
+export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
 
 export const SUPERVISION_MODE = {
   OFF: 'off',
@@ -48,9 +58,12 @@ const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
 // no longer promoted as default Team/P2P combo presets.
 export const SUPERVISION_AUDIT_MODES = SUPERVISION_AUDIT_MODE_ALLOWLIST;
 
-// Default supervisor timeout aligns with design.md §5 (12_000 ms). Queue wait time
-// counts against the same budget, so this must stay conservative.
-export const SUPERVISION_DEFAULT_TIMEOUT_MS = 12_000;
+// Supervisor decisions include queueing, provider startup, bounded provider
+// retries, and structured-output repair in one shared budget. Keep both the
+// default and the normalized minimum at 30 seconds so a transient startup does
+// not consume nearly the whole decision window.
+export const SUPERVISION_MIN_TIMEOUT_MS = 30_000;
+export const SUPERVISION_DEFAULT_TIMEOUT_MS = SUPERVISION_MIN_TIMEOUT_MS;
 export const SUPERVISION_DEFAULT_MAX_PARSE_RETRIES = 1;
 export const SUPERVISION_DEFAULT_AUDIT_MODE: SupervisionAuditMode = 'audit';
 export const SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS = 2;
@@ -83,17 +96,10 @@ export const TASK_RUN_STATUS_MARKERS = {
   BLOCKED: '<!-- IMCODES_TASK_RUN: BLOCKED -->',
 } as const;
 
-export const AUDIT_VERDICT_MARKERS = {
-  PASS: '<!-- P2P_VERDICT: PASS -->',
-  REWORK: '<!-- P2P_VERDICT: REWORK -->',
-} as const;
-
 export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
 export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
-export type AuditVerdictMarker = keyof typeof AUDIT_VERDICT_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';
-export type AuditVerdict = 'PASS' | 'REWORK';
 export type SessionSupervisionSnapshotIssue =
   | 'invalid_shape'
   | 'invalid_mode'
@@ -113,14 +119,15 @@ export type SessionSupervisionSnapshotIssue =
   | 'missing_audit_mode'
   | 'invalid_audit_mode'
   | 'invalid_max_audit_loops'
-  | 'invalid_task_run_prompt_version';
+  | 'invalid_task_run_prompt_version'
+  | 'legacy_audit_mode_requires_repair'
+  | 'missing_audit_target'
+  | 'invalid_audit_target_name'
+  | 'missing_audit_target_fingerprint'
+  | 'invalid_audit_target_fingerprint'
+  | 'invalid_peer_audit_prompt_version';
 export interface ParsedTaskRunTerminalState {
   state: TaskRunTerminalState | null;
-  markerCount: number;
-}
-
-export interface ParsedAuditVerdict {
-  verdict: AuditVerdict | null;
   markerCount: number;
 }
 
@@ -172,7 +179,14 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   maxParseRetries: number;
   maxAutoContinueStreak: number;
   maxAutoContinueTotal: number;
-  auditMode: SupervisionAuditMode;
+  /** @deprecated Read-only compatibility field. New normalized writes omit it. */
+  auditMode?: SupervisionAuditMode;
+  /** Exact remembered auditor session name, scoped to this audited session. */
+  auditTargetSessionName?: string;
+  /** Confirmation fingerprint. Name-only legacy targets are never fast-path eligible. */
+  auditTargetFingerprint?: PeerAuditTargetFingerprint;
+  /** Present only with a canonical target + fingerprint. */
+  peerAuditPromptVersion?: typeof PEER_AUDIT_PROMPT_VERSION;
   maxAuditLoops: number;
   taskRunPromptVersion: string;
 }
@@ -185,6 +199,23 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function trimString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function isCanonicalPeerAuditDimension(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value !== value.trim()) return false;
+  if (peerAuditByteLength(value) > 256) return false;
+  return !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+export function isCanonicalPeerAuditTargetFingerprint(value: unknown): value is PeerAuditTargetFingerprint {
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 3 || !keys.every((key) => ['sessionInstanceId', 'normalizedModelId', 'providerFamily'].includes(key))) {
+    return false;
+  }
+  return isPeerAuditOpaqueId(value.sessionInstanceId)
+    && isCanonicalPeerAuditDimension(value.normalizedModelId)
+    && isCanonicalPeerAuditDimension(value.providerFamily);
 }
 
 function normalizePositiveInteger(value: unknown, fallback: number, minimum = 1): number {
@@ -248,7 +279,11 @@ export function normalizeSupervisorDefaultConfig(
   return {
     backend: normalizedBackend,
     model,
-    timeoutMs: normalizePositiveInteger(merged.timeoutMs, SUPERVISION_DEFAULT_TIMEOUT_MS, 1),
+    timeoutMs: normalizePositiveInteger(
+      merged.timeoutMs,
+      SUPERVISION_DEFAULT_TIMEOUT_MS,
+      SUPERVISION_MIN_TIMEOUT_MS,
+    ),
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
     maxAutoContinueStreak: normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK),
     maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
@@ -271,9 +306,29 @@ export function getSessionSupervisionSnapshotIssues(
   if (mode !== SUPERVISION_MODE.OFF && mode !== SUPERVISION_MODE.SUPERVISED && mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) {
     return ['invalid_mode'];
   }
-  if (mode === SUPERVISION_MODE.OFF) return [];
 
   const issues: SessionSupervisionSnapshotIssue[] = [];
+  const rawTargetName = record.auditTargetSessionName;
+  const targetName = trimString(rawTargetName);
+  const hasTargetName = rawTargetName != null;
+  const validTargetName = !!targetName && targetName === rawTargetName && isValidImcodesSessionName(targetName);
+
+  if (hasTargetName && !validTargetName) issues.push('invalid_audit_target_name');
+  if (
+    record.peerAuditPromptVersion != null
+    && record.peerAuditPromptVersion !== PEER_AUDIT_PROMPT_VERSION
+  ) {
+    issues.push('invalid_peer_audit_prompt_version');
+  }
+  if (record.peerAuditPromptVersion != null && !validTargetName) {
+    if (!issues.includes('invalid_peer_audit_prompt_version')) issues.push('invalid_peer_audit_prompt_version');
+  }
+
+  // `off` remains a valid persisted state because Quick audit may remember a
+  // peer while automatic supervision is disabled. Only target-shape issues are
+  // relevant in that mode; supervisor broker fields are intentionally ignored.
+  if (mode === SUPERVISION_MODE.OFF) return issues;
+
   const backend = trimString(record.backend);
   if (!backend) issues.push('missing_backend');
   else if (!isSupportedSupervisionBackend(backend)) issues.push('invalid_backend');
@@ -299,6 +354,8 @@ export function getSessionSupervisionSnapshotIssues(
     issues.push('invalid_model');
   }
 
+  // Keep legacy positive values readable; normalization upgrades them to the
+  // current minimum before any supervisor decision runs.
   if (typeof record.timeoutMs !== 'number' || !Number.isFinite(record.timeoutMs) || record.timeoutMs <= 0) {
     issues.push('invalid_timeout');
   }
@@ -338,12 +395,14 @@ export function getSessionSupervisionSnapshotIssues(
   }
 
   if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-    if (record.auditMode != null && record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) {
-      issues.push('invalid_audit_mode');
+    if (record.auditMode != null) {
+      if (record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
+      else issues.push('legacy_audit_mode_requires_repair');
     }
+    if (!hasTargetName) issues.push('missing_audit_target');
     if (
       record.maxAuditLoops != null
-      && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 1)
+      && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 0)
     ) {
       issues.push('invalid_max_audit_loops');
     }
@@ -352,7 +411,7 @@ export function getSessionSupervisionSnapshotIssues(
     }
   }
 
-  return issues;
+  return [...new Set(issues)];
 }
 
 export function normalizeSessionSupervisionSnapshot(
@@ -374,8 +433,13 @@ export function normalizeSessionSupervisionSnapshot(
   const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
   const maxAutoContinueStreak = normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK);
   const maxAutoContinueTotal = normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL);
-  const auditMode = isSupportedSupervisionAuditMode(merged.auditMode) ? merged.auditMode : SUPERVISION_DEFAULT_AUDIT_MODE;
-  const maxAuditLoops = normalizePositiveInteger(merged.maxAuditLoops, SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS, 1);
+  const maxAuditLoops = normalizeNonNegativeInteger(merged.maxAuditLoops, SUPERVISION_DEFAULT_MAX_AUDIT_LOOPS);
+  const auditTargetSessionName = trimString(merged.auditTargetSessionName);
+  const auditTargetFingerprint = isCanonicalPeerAuditTargetFingerprint(merged.auditTargetFingerprint)
+    ? merged.auditTargetFingerprint
+    : undefined;
+  const hasCanonicalAuditTarget = !!auditTargetSessionName
+    && isValidImcodesSessionName(auditTargetSessionName);
   return {
     ...supervisorDefaults,
     mode,
@@ -387,15 +451,41 @@ export function normalizeSessionSupervisionSnapshot(
     maxParseRetries,
     maxAutoContinueStreak,
     maxAutoContinueTotal,
-    auditMode,
+    ...(hasCanonicalAuditTarget ? {
+      auditTargetSessionName,
+      ...(auditTargetFingerprint ? { auditTargetFingerprint } : {}),
+      peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+    } : {}),
     maxAuditLoops,
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   };
 }
 
 export function parseSessionSupervisionSnapshot(value: unknown): SessionSupervisionSnapshot | null {
-  if (getSessionSupervisionSnapshotIssues(value).length > 0) return null;
-  return normalizeSessionSupervisionSnapshot(value as Partial<SessionSupervisionSnapshot>);
+  const issues = getSessionSupervisionSnapshotIssues(value);
+  const repairOnly = new Set<SessionSupervisionSnapshotIssue>([
+    'legacy_audit_mode_requires_repair',
+    'invalid_audit_mode',
+    'missing_audit_target',
+    'invalid_audit_target_name',
+    'missing_audit_target_fingerprint',
+    'invalid_audit_target_fingerprint',
+    'invalid_peer_audit_prompt_version',
+  ]);
+  if (issues.some((issue) => !repairOnly.has(issue))) return null;
+  const record = value as Partial<SessionSupervisionSnapshot>;
+  const normalized = normalizeSessionSupervisionSnapshot(record);
+  // Legacy auditMode remains read-only compatibility. A valid name-only
+  // target is now canonical: automatic audit resolves the live session when
+  // it starts rather than blocking settings on persisted runtime metadata.
+  const legacyTargetName = trimString(record.auditTargetSessionName);
+  return {
+    ...normalized,
+    ...(legacyTargetName && isValidImcodesSessionName(legacyTargetName) && !normalized.auditTargetSessionName
+      ? { auditTargetSessionName: legacyTargetName }
+      : {}),
+    ...(isSupportedSupervisionAuditMode(record.auditMode) ? { auditMode: record.auditMode } : {}),
+  };
 }
 
 export function extractSessionSupervisionSnapshot(
@@ -428,7 +518,22 @@ export function hasInvalidSessionSupervisionSnapshot(
 ): boolean {
   if (!transportConfig || typeof transportConfig !== 'object' || Array.isArray(transportConfig)) return false;
   if (!(SUPERVISION_TRANSPORT_CONFIG_KEY in transportConfig)) return false;
-  return parseSessionSupervisionSnapshot(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]) == null;
+  return getSessionSupervisionSnapshotIssues(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]).length > 0;
+}
+
+/** Stable repair issues used by daemon/Web to keep legacy data readable while
+ * refusing automatic or remembered-fast-path dispatch. */
+export function getPeerAuditSnapshotRepairIssues(
+  value: unknown,
+): SessionSupervisionSnapshotIssue[] {
+  const peerIssues = new Set<SessionSupervisionSnapshotIssue>([
+    'legacy_audit_mode_requires_repair',
+    'invalid_audit_mode',
+    'missing_audit_target',
+    'invalid_audit_target_name',
+    'invalid_peer_audit_prompt_version',
+  ]);
+  return getSessionSupervisionSnapshotIssues(value).filter((issue) => peerIssues.has(issue));
 }
 
 export function buildTransportConfigWithSupervision(
@@ -436,13 +541,36 @@ export function buildTransportConfigWithSupervision(
   snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
 ): Record<string, unknown> | null {
   const normalized = normalizeSessionSupervisionSnapshot(snapshot);
-  if (normalized.mode === SUPERVISION_MODE.OFF) {
+  if (normalized.mode === SUPERVISION_MODE.OFF && !normalized.auditTargetSessionName) {
     if (!transportConfig) return null;
     const next = { ...transportConfig };
     delete next[SUPERVISION_TRANSPORT_CONFIG_KEY];
     return Object.keys(next).length > 0 ? next : null;
   }
   return embedSessionSupervisionSnapshot(transportConfig, normalized);
+}
+
+/**
+ * Apply the peer-audit target as a field-level patch over the latest persisted
+ * supervision snapshot. Callers must pass the current transport config read at
+ * the CAS boundary; stale UI/command snapshots are deliberately not accepted
+ * here. All non-target supervision fields and unrelated transport keys survive
+ * byte-for-byte through the merge.
+ */
+export function patchPeerAuditTargetInTransportConfig(
+  transportConfig: Record<string, unknown> | null | undefined,
+  target: {
+    auditTargetSessionName: string;
+    auditTargetFingerprint: PeerAuditTargetFingerprint;
+  },
+): Record<string, unknown> {
+  const latest = readSupervisionSnapshotFromTransportConfig(transportConfig);
+  return embedSessionSupervisionSnapshot(transportConfig, {
+    ...latest,
+    auditTargetSessionName: target.auditTargetSessionName,
+    auditTargetFingerprint: target.auditTargetFingerprint,
+    peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+  });
 }
 
 /**
@@ -547,24 +675,6 @@ export function parseTaskRunTerminalStateDetailsFromText(text: string): ParsedTa
 
 export function parseTaskRunTerminalStateFromText(text: string): TaskRunTerminalState | null {
   return parseTaskRunTerminalStateDetailsFromText(text).state;
-}
-
-export function parseAuditVerdictDetailsFromText(text: string): ParsedAuditVerdict {
-  const matches = [...text.matchAll(/<!--\s*P2P_VERDICT:\s*(PASS|REWORK)\s*-->/g)];
-  if (matches.length !== 1) return { verdict: null, markerCount: matches.length };
-  const verdict = matches[0]?.[1];
-  switch (verdict) {
-    case 'PASS':
-      return { verdict: 'PASS', markerCount: 1 };
-    case 'REWORK':
-      return { verdict: 'REWORK', markerCount: 1 };
-    default:
-      return { verdict: null, markerCount: matches.length };
-  }
-}
-
-export function parseAuditVerdictFromText(text: string): AuditVerdict | null {
-  return parseAuditVerdictDetailsFromText(text).verdict;
 }
 
 export function getSupportedSupervisionAuditModes(): readonly SupervisionAuditMode[] {

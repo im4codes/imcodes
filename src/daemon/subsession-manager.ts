@@ -8,7 +8,7 @@ import type { AgentType } from '../agent/detect.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { upsertSession, getSession, removeSession, type SessionRecord } from '../store/session-store.js';
+import { createRuntimeEpoch, upsertSession, getSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -93,6 +93,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const sessionName = subSessionName(sub.id);
   const agentType = sub.type as AgentType;
   const projectName = parentProjectName(sub, sessionName);
+  const storedBeforeLaunch = getSession(sessionName);
 
   // Provider-family-independent forced-fresh flag. When a record explicitly
   // requests `fresh:true` (e.g. an execution clone), the launch path MUST start
@@ -290,6 +291,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   upsertSession({
     name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
+    sessionInstanceId: storedBeforeLaunch?.sessionInstanceId,
+    // Reaching this write means a previously absent process authority was
+    // created above. Preserve the logical identity but install a new epoch.
+    runtimeEpoch: createRuntimeEpoch(),
     projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
     ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
@@ -303,7 +308,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     // not identity.
     ...((agentType === 'shell' || agentType === 'script') && sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.effort ? { effort: sub.effort } : {}),
-    restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
+    restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
   });
 
   // Start Watchers
@@ -507,6 +512,8 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
       upsertSession({
         name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
+        sessionInstanceId: stored?.sessionInstanceId,
+        runtimeEpoch: stored?.runtimeEpoch,
         projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
         // shell/script launch binary survives a daemon-restart rebuild (config, not identity).
         ...((sub.type === 'shell' || sub.type === 'script') && (sub.shellBin ?? stored?.shellBin) ? { shellBin: sub.shellBin ?? stored?.shellBin ?? undefined } : {}),
@@ -544,6 +551,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         ...(stored?.startupMemoryInjected ? { startupMemoryInjected: true } : {}),
         ...(stored?.recentInjectionHistory && stored.recentInjectionHistory.length > 0
           ? { recentInjectionHistory: stored.recentInjectionHistory }
+          : {}),
+        ...(stored?.summarySyncFingerprints && stored.summarySyncFingerprints.length > 0
+          ? { summarySyncFingerprints: stored.summarySyncFingerprints }
           : {}),
       });
     }

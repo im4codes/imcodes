@@ -1,11 +1,15 @@
 import { resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   browserExecutableCandidatesForTest,
+  browserAutomationEndpointForTest,
   browserLaunchArgsForTest,
+  browserSnapshotPayloadForTest,
+  captureBrowserViewportForTest,
   isFastWindowsCoordinatePointerActionForTest,
   normalizeBrowserUserAgent,
+  normalizeComputerUseErrorForTest,
   normalizeOpenComputerUseParsedResult,
   openComputerUseCallArgs,
   openComputerUseCandidateBinariesForTest,
@@ -147,6 +151,27 @@ describe('computer use runner open-computer-use CLI', () => {
     expect(browserExecutableCandidatesForTest({ channel: 'chromium' }, 'linux')).not.toContain('google-chrome');
   });
 
+  it('turns a missing browser executable into an actionable install prompt without mentioning OCU', () => {
+    const result = normalizeComputerUseErrorForTest('browser_open', 'browser_executable_not_found', 'linux');
+    expect(result).toEqual({
+      error: 'No supported browser is installed on this machine. Install Google Chrome, Chromium, or Microsoft Edge, then retry the browser request.',
+      truncated: false,
+    });
+    expect(result.error).not.toMatch(/OCU|Open Computer Use|AT-SPI/i);
+  });
+
+  it('hides Linux AT-SPI tracebacks behind a desktop-specific prerequisite message', () => {
+    const result = normalizeComputerUseErrorForTest(
+      'list_apps',
+      'Linux runtime failed:\nTraceback...\nValueError: Namespace Atspi not available',
+      'linux',
+    );
+    expect(result.error).toContain('Desktop app control is unavailable');
+    expect(result.error).toContain('Browser automation is separate');
+    expect(result.error).toContain('install Google Chrome, Chromium, or Microsoft Edge');
+    expect(result.error).not.toContain('Traceback');
+  });
+
   it('uses Linux-safe headless browser launch defaults without forcing headless on desktop platforms', () => {
     expect(browserLaunchArgsForTest('/tmp/profile', {}, 'linux', {})).toEqual(expect.arrayContaining([
       '--headless=new',
@@ -166,7 +191,57 @@ describe('computer use runner open-computer-use CLI', () => {
     // removes that dependency, so the arg must never be 0 again.
     const args = browserLaunchArgsForTest('/tmp/profile', {}, 'linux', {}, 45123);
     expect(args).toContain('--remote-debugging-port=45123');
+    expect(args).toContain('--remote-debugging-address=127.0.0.1');
     expect(args).not.toContain('--remote-debugging-port=0');
+  });
+
+  it('publishes a loopback CDP endpoint that external scripts can reuse', () => {
+    expect(browserAutomationEndpointForTest('http://127.0.0.1:45123')).toEqual({
+      cdpEndpoint: 'http://127.0.0.1:45123',
+      cdpHost: '127.0.0.1',
+      cdpPort: 45123,
+    });
+    expect(browserAutomationEndpointForTest(null)).toBeUndefined();
+    expect(browserAutomationEndpointForTest('http://127.0.0.1')).toBeUndefined();
+    expect(browserSnapshotPayloadForTest(
+      { url: 'https://example.com', title: 'Example' },
+      'http://127.0.0.1:45123',
+    )).toEqual({
+      url: 'https://example.com',
+      title: 'Example',
+      automation: {
+        cdpEndpoint: 'http://127.0.0.1:45123',
+        cdpHost: '127.0.0.1',
+        cdpPort: 45123,
+      },
+    });
+  });
+
+  it('captures a bounded model-visible browser viewport image when requested', async () => {
+    const call = vi.fn(async (method: string) => {
+      if (method === 'Page.getLayoutMetrics') {
+        return { cssVisualViewport: { pageX: 2, pageY: 3, clientWidth: 1600, clientHeight: 900 } };
+      }
+      if (method === 'Page.captureScreenshot') return { data: 'aW1hZ2U=' };
+      throw new Error(`unexpected method: ${method}`);
+    });
+
+    await expect(captureBrowserViewportForTest({ call }, { includeImage: true }, 5_000)).resolves.toEqual({
+      item: { type: 'image', data: 'aW1hZ2U=', mimeType: 'image/jpeg' },
+      truncated: false,
+    });
+    expect(call).toHaveBeenNthCalledWith(2, 'Page.captureScreenshot', expect.objectContaining({
+      format: 'jpeg',
+      quality: 60,
+      captureBeyondViewport: false,
+      clip: { x: 2, y: 3, width: 1600, height: 900, scale: 0.8 },
+    }), 5_000);
+  });
+
+  it('keeps browser screenshots disabled by default', async () => {
+    const call = vi.fn();
+    await expect(captureBrowserViewportForTest({ call }, {})).resolves.toEqual({ truncated: false });
+    expect(call).not.toHaveBeenCalled();
   });
 
   it('drops the navigator.webdriver automation tell on every platform', () => {

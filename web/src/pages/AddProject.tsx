@@ -25,7 +25,7 @@ export function AddProject({ apiKey, serverId, onAdded, onCancel }: AddProjectPr
   const [validationError, setValidationError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk', 'cursor-headless', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk', 'kimi-sdk', 'qwen'];
+  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk', 'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk', 'kimi-sdk', 'qwen'];
 
   async function validateTracker() {
     if (trackerType === 'none') return true;

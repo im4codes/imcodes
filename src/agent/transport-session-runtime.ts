@@ -66,6 +66,20 @@ import {
   recordRecentInjection,
   clearRecentInjectionHistory,
 } from '../context/recent-injection-history.js';
+import {
+  commitSummarySyncReservation,
+  reserveUnsyncedSummaryFingerprints,
+  rollbackSummarySyncReservation,
+  recordSyncedSummaryFingerprints,
+  type SummarySyncReservation,
+} from '../context/summary-sync-history.js';
+import {
+  collectRecentSummarySyncCandidates,
+  fingerprintRecentSummary,
+  recentSummaryFingerprintsFromItems,
+  resolveSummarySyncSourceKind,
+} from '../context/summary-sync.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
@@ -75,6 +89,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -96,6 +111,11 @@ export interface PendingTransportMessage {
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
   historyCommitted?: boolean;
+  /** @internal: private peer-audit queue ownership; excluded from public snapshots. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
 }
 
 type SdkTurnLostRecoveryAttemptStatus =
@@ -127,6 +147,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // full material for internal resend preservation only.
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
+  delete publicEntry.peerAudit;
   return publicEntry;
 }
 
@@ -150,6 +171,11 @@ export interface TransportSendMetadata {
   timelineCommitted?: boolean;
   /** @internal: set when replaying entries that already exist in runtime history. */
   historyCommitted?: boolean;
+  /** @internal: marks a persisted queued row as an ephemeral peer-audit brief. */
+  peerAudit?: {
+    contractVersion: string;
+    attemptHash: string;
+  };
 }
 
 export interface TransportRuntimeDiagnosticSnapshot {
@@ -172,6 +198,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   lastProviderOutputAt: number;
   lastProviderOutputAgeMs: number | null;
   activityGeneration: ActivityGeneration;
+  completedTurn?: PeerAuditCompletedTurnEvidence;
   blockingWorkCount: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
@@ -426,11 +453,23 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _pendingVersion = 0;
   /** Original message entries for the currently in-flight dispatch. */
   private _activeDispatchEntries: PendingTransportMessage[] = [];
+  /** Last single-message turn that reached provider completion. Consumed by
+   * the authoritative idle projection; never inferred from timeline order. */
+  private _lastCompletedTurn: PeerAuditCompletedTurnEvidence | null = null;
   /** True after a user stop request until the active provider turn settles. */
   private _activeDispatchCancelled = false;
   /** True once the active dispatch has crossed into provider.send(). */
   private _activeDispatchProviderStarted = false;
   private _activeDispatchId: number | null = null;
+  /** Summary delivery ownership for the active provider turn. A provider
+   * accepting send() is not proof that the model consumed the context: the
+   * turn can still terminate with capacity/auth/provider errors. Commit only
+   * on authoritative completion; failed/cancelled settlements roll back so a
+   * later user retry receives the same new summaries. */
+  private _activeSummarySyncReservation: {
+    dispatchId: number;
+    reservation: SummarySyncReservation;
+  } | null = null;
   private _activeDispatchStaleRecoveryStarted = false;
   private _stalePendingCancelFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private _ignoreProviderSnapshotForNextLocalStopDrain = false;
@@ -529,6 +568,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
         }
         if (this._activeDispatchCancelled) {
+          this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this.clearStalePendingCancelFallbackTimer();
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
@@ -556,6 +596,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
         this._history.push(message);
+        const completedEntry = this._activeDispatchEntries.length === 1
+          ? this._activeDispatchEntries[0]
+          : undefined;
+        this._lastCompletedTurn = completedEntry && !completedEntry.peerAudit
+          ? {
+              taskCommandId: completedEntry.clientMessageId,
+              assistantText: message.content,
+              completedEventId: `transport:${this.sessionKey}:${message.id}`,
+              completedAt: this._lastActivityAt,
+              generationOrEpoch: this._activityGeneration,
+            }
+          : null;
+        this.commitActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
         this._activeTurn?.resolve();
         this._activeTurn = null;
         this._activeDispatchEntries = [];
@@ -669,6 +722,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime provider error',
         );
+        this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -862,6 +916,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       lastProviderOutputAt: this._lastProviderOutputAt,
       lastProviderOutputAgeMs: this._lastProviderOutputAt > 0 ? Math.max(0, nowMs - this._lastProviderOutputAt) : null,
       activityGeneration: this.currentActivityGeneration(),
+      ...(this._lastCompletedTurn ? { completedTurn: { ...this._lastCompletedTurn } } : {}),
       blockingWorkCount: activitySnapshot.blockingWorkCount,
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
@@ -997,6 +1052,15 @@ export class TransportSessionRuntime implements SessionRuntime {
   rehydratePendingFromStore(): number {
     if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
     const store = getTransportQueueStore();
+    // Peer-audit capabilities and controller state are intentionally daemon-memory
+    // only. After restart no attempt can still own a queued audit brief, so scrub
+    // those rows before ordinary queue rehydration while preserving user traffic.
+    try {
+      store.scrubPeerAuditOrphans(this.sessionKey);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'rehydratePendingFromStore: peer-audit orphan scrub failed');
+      return 0;
+    }
     const snapshot = (() => {
       try {
         return store.readSnapshot(this.sessionKey, 'restart_rehydrate');
@@ -1214,6 +1278,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
 
     this._sending = false;
+    this.commitActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -1699,6 +1764,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
+      ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
     };
 
     if (this.hasActiveTurnWork()) {
@@ -1724,6 +1790,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
             ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
             ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+            ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
           }),
         });
       } catch (err) {
@@ -1935,6 +2002,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._activeTurn) {
       this._activeTurn.reject({ code: 'CANCELLED', message: 'Session killed', recoverable: false });
     }
+    this.rollbackActiveSummarySyncReservation();
     this._sending = false;
     this._activeTurn = null;
     this._activeDispatchEntries = [];
@@ -1980,6 +2048,39 @@ export class TransportSessionRuntime implements SessionRuntime {
   getHistory(): AgentMessage[] { return [...this._history]; }
 
   // ── Internal ────────────────────────────────────────────────────────────────
+
+  private bindActiveSummarySyncReservation(
+    dispatchId: number,
+    reservation: SummarySyncReservation | undefined,
+  ): void {
+    if (!reservation) return;
+    if (this._activeSummarySyncReservation) {
+      logger.warn(
+        {
+          sessionKey: this.sessionKey,
+          previousDispatchId: this._activeSummarySyncReservation.dispatchId,
+          dispatchId,
+        },
+        'transport runtime replaced an unsettled summary-sync reservation',
+      );
+      rollbackSummarySyncReservation(this._activeSummarySyncReservation.reservation);
+    }
+    this._activeSummarySyncReservation = { dispatchId, reservation };
+  }
+
+  private commitActiveSummarySyncReservation(expectedDispatchId?: number): void {
+    const active = this._activeSummarySyncReservation;
+    if (!active || (expectedDispatchId !== undefined && active.dispatchId !== expectedDispatchId)) return;
+    this._activeSummarySyncReservation = null;
+    commitSummarySyncReservation(active.reservation);
+  }
+
+  private rollbackActiveSummarySyncReservation(expectedDispatchId?: number): void {
+    const active = this._activeSummarySyncReservation;
+    if (!active || (expectedDispatchId !== undefined && active.dispatchId !== expectedDispatchId)) return;
+    this._activeSummarySyncReservation = null;
+    rollbackSummarySyncReservation(active.reservation);
+  }
 
   private setStatus(status: AgentStatus): void {
     if (status === 'idle' && this.drainPendingIfNoActiveTurn('setStatus')) return;
@@ -2157,6 +2258,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime sdk turn lost recovery failed',
     );
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.reject(failure);
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -2187,6 +2289,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
     this.closeOpenTools('errored', 'provider_error');
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -2267,6 +2370,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
     );
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
@@ -2397,6 +2501,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const dispatchId = ++this._nextDispatchId;
     this._activityGeneration++;
+    this._lastCompletedTurn = null;
     this._currentActivityGenerationLocallyCancelled = false;
     this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
     this._lastActivityAt = Date.now();
@@ -2413,6 +2518,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       text: message,
       ...(attachments?.length ? { attachments } : {}),
     }]).map((entry) => ({ ...entry }));
+    const isPrivatePeerAuditDispatch = this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => !!entry.peerAudit);
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     // Alias expansion (A′): the provider (and runtime history) receive the
@@ -2432,6 +2539,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
+    let summarySyncReservation: SummarySyncReservation | undefined;
 
     const historyEntries = this._activeDispatchEntries.filter((entry) => !entry.historyCommitted);
     if (historyEntries.length > 0) {
@@ -2474,12 +2582,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         retryExhausted: this._contextRetryExhausted,
         sharedPolicyOverride: this._contextSharedPolicyOverride,
       }).authority;
-      const startupMemory = isSlashControl ? null : (this._startupMemory ?? (
+      // Private peer-audit turns must carry only the audit brief. In
+      // particular, do not consume first-turn startup memory or run semantic
+      // recall: both can contain recent summaries and both emit public
+      // memory.context evidence after provider acceptance.
+      const suppressMemoryContext = isSlashControl || isPrivatePeerAuditDispatch;
+      const startupMemory = suppressMemoryContext ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
           ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
       ));
-      const memoryRecallResult = isSlashControl
+      const memoryRecallResult = isPrivatePeerAuditDispatch
+        ? { artifact: null }
+        : isSlashControl
         ? {
             artifact: null,
             statusPayload: buildMemoryContextStatusPayload(message.trim().slice(0, 200), 'skipped_control_message', 'message', {
@@ -2488,10 +2603,19 @@ export class TransportSessionRuntime implements SessionRuntime {
               sourceKind: 'local_processed',
             }),
           }
-        : await this.buildTransportMessageRecallResultWithinBudget(message, authority.authoritySource);
+        : await this.buildTransportMessageRecallResultWithinBudget(
+            message,
+            authority.authoritySource,
+            new Set(recentSummaryFingerprintsFromItems(
+              startupMemory?.items ?? [],
+            )),
+          );
+      summarySyncReservation = memoryRecallResult.summaryReservation;
       const memoryRecall = memoryRecallResult.artifact;
       const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
       if (this.isDispatchLocallyCancelled(dispatchId)) {
+        rollbackSummarySyncReservation(summarySyncReservation);
+        summarySyncReservation = undefined;
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
@@ -2509,6 +2633,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Generated Image Reporting is now appended in Codex SDK's own
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
+      this.bindActiveSummarySyncReservation(dispatchId, summarySyncReservation);
+      summarySyncReservation = undefined;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
         activityGeneration: this.currentActivityGeneration(),
@@ -2551,6 +2677,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         },
       });
       if (this.isDispatchLocallyCancelled(dispatchId)) {
+        this.rollbackActiveSummarySyncReservation(dispatchId);
         await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
           logger.warn({ err, providerSessionId: this._providerSessionId }, 'runtime dispatch noticed late cancel after provider send accepted');
         });
@@ -2575,6 +2702,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._preferenceContextInjectionAttempt = null;
       if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
         this._startupMemoryInjected = true;
+        recordSyncedSummaryFingerprints(
+          this.sessionKey,
+          recentSummaryFingerprintsFromItems(dispatchResult.payload.startupMemory.items),
+        );
         // Emit the "Historical context · injected" timeline card at the
         // same commit boundary as the persisted flag. Doing this here
         // (instead of eagerly in `initialize`) guarantees restart-before-
@@ -2594,6 +2725,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
     })()
       .catch((err) => {
+        rollbackSummarySyncReservation(summarySyncReservation);
+        summarySyncReservation = undefined;
+        this.rollbackActiveSummarySyncReservation(dispatchId);
         // Only handle if the provider didn't already fire onError callback.
         // Shared-context dispatch denial is surfaced here as a send failure
         // because the outer runtime contract is still send-oriented.
@@ -2837,6 +2971,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     this.markCurrentActivityGenerationLocallyCancelled();
     if (!this._activeTurn && !this._sending) {
+      this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
       this._activeDispatchEntries = [];
@@ -2851,6 +2986,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return;
     }
     this._sending = false;
+    this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.reject(makeCancelledProviderError());
     this._activeTurn = null;
     this._activeDispatchEntries = [];
@@ -2971,17 +3107,22 @@ export class TransportSessionRuntime implements SessionRuntime {
   private async buildTransportMessageRecallResultWithinBudget(
     message: string,
     authoritySource: ContextAuthorityDecision['authoritySource'],
+    excludedSummaryFingerprints: ReadonlySet<string> = new Set(),
   ): Promise<{
     artifact: TransportMemoryRecallArtifact | null;
     statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
+    summaryReservation?: SummarySyncReservation;
   }> {
     const timeoutMs = getTransportContextBudgetMs();
     let cancelled = false;
     const trimmed = message.trim();
     const query = trimmed.slice(0, 200);
-    const recallPromise = this.buildTransportMessageRecallResult(message, authoritySource, {
-      isCancelled: () => cancelled,
-    });
+    const recallPromise = this.buildTransportMessageRecallResult(
+      message,
+      authoritySource,
+      excludedSummaryFingerprints,
+      { isCancelled: () => cancelled },
+    );
     try {
       const outcome = await withTimeoutOutcome(recallPromise, timeoutMs);
       if (!outcome.timedOut) return outcome.value;
@@ -3018,10 +3159,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   private async buildTransportMessageRecallResult(
     message: string,
     authoritySource: ContextAuthorityDecision['authoritySource'],
+    excludedSummaryFingerprints: ReadonlySet<string> = new Set(),
     options?: { isCancelled?: () => boolean },
   ): Promise<{
     artifact: TransportMemoryRecallArtifact | null;
     statusPayload?: Omit<MemoryContextTimelinePayload, 'relatedToEventId'>;
+    summaryReservation?: SummarySyncReservation;
   }> {
     const trimmed = message.trim();
     const query = trimmed.slice(0, 200);
@@ -3040,42 +3183,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         }),
       };
     }
-    if (trimmed.length < 10) {
-      logger.debug({ sessionKey: this.sessionKey, length: trimmed.length }, 'transport message recall skipped: short message');
-      return {
-        artifact: null,
-        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_short_prompt', 'message', {
-          runtimeFamily: 'transport',
-          authoritySource,
-          sourceKind: 'local_processed',
-        }),
-      };
-    }
-    if (isTemplatePrompt(trimmed)) {
-      logger.debug({ sessionKey: this.sessionKey }, 'transport message recall skipped: template prompt');
-      return {
-        artifact: null,
-        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_template_prompt', 'message', {
-          runtimeFamily: 'transport',
-          authoritySource,
-          sourceKind: 'local_processed',
-        }),
-      };
-    }
-    if (isImperativeCommand(trimmed)) {
-      logger.debug({ sessionKey: this.sessionKey, text: trimmed }, 'transport message recall skipped: imperative command');
-      return {
-        artifact: null,
-        // Reuse the 'skipped_control_message' reason — imperative commands are
-        // a form of control input (task-level verb, not a semantic query) and
-        // we don't need to surface a separate status banner for them.
-        statusPayload: buildMemoryContextStatusPayload(query, 'skipped_control_message', 'message', {
-          runtimeFamily: 'transport',
-          authoritySource,
-          sourceKind: 'local_processed',
-        }),
-      };
-    }
+    let semanticSkipReason: 'skipped_short_prompt' | 'skipped_template_prompt' | 'skipped_control_message' | undefined;
+    if (trimmed.length < 10) semanticSkipReason = 'skipped_short_prompt';
+    else if (isTemplatePrompt(trimmed)) semanticSkipReason = 'skipped_template_prompt';
+    else if (isImperativeCommand(trimmed)) semanticSkipReason = 'skipped_control_message';
+    let summaryReservation: SummarySyncReservation | undefined;
     try {
       // Broaden candidate pool — the cap rule trims to 3 (up to 5 if all
       // results are strong). See shared/memory-scoring.ts.
@@ -3089,11 +3201,31 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Front-of-turn recall runs in the context-store worker (bounded L3 RPC),
       // off the daemon main thread. Falls back to the in-process path when the
       // worker is not warm / unavailable so recall never blocks the turn.
-      const result = await searchLocalMemorySemanticFrontOfTurn(recallQuery);
+      const [result, summaryCandidates] = await Promise.all([
+        semanticSkipReason
+          ? Promise.resolve({ items: [] })
+          : searchLocalMemorySemanticFrontOfTurn(recallQuery),
+        collectRecentSummarySyncCandidates(this._contextNamespace, {
+          currentSessionName: this.sessionKey,
+        }),
+      ]);
       if (options?.isCancelled?.()) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall result ignored after timeout');
         return { artifact: null };
       }
+      summaryReservation = reserveUnsyncedSummaryFingerprints(
+        this.sessionKey,
+        summaryCandidates
+          .filter((candidate) => !excludedSummaryFingerprints.has(candidate.fingerprint))
+          .map((candidate) => candidate.fingerprint),
+      );
+      const reservedSummaryFingerprints = new Set(summaryReservation?.fingerprints ?? []);
+      const summaryItems = summaryCandidates
+        .filter((candidate) => reservedSummaryFingerprints.has(candidate.fingerprint))
+        .map((candidate) => candidate.item);
+      const summaryContentFingerprints = new Set(
+        summaryItems.map((item) => fingerprintRecentSummary(item.summary)),
+      );
       // 1) Template-origin legacy summaries never surface through recall.
       // Guard the worker/degrade path: a degraded/unavailable context-store
       // worker can yield a nullish result — recall must never throw and abort the
@@ -3105,7 +3237,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       //    10 turns. Cleared on session.clear.
       const procIds = processed.map((item) => item.id);
       const keepIds = new Set(filterRecentlyInjected(this.sessionKey, procIds));
-      const deduped = processed.filter((item) => keepIds.has(item.id));
+      const deduped = processed.filter((item) => (
+        keepIds.has(item.id)
+        && !summaryContentFingerprints.has(fingerprintRecentSummary(item.summary))
+      ));
       const dedupedCount = Math.max(0, processed.length - deduped.length);
       // 3) Cap rule: floor 0.5, top 3, extend to 5 iff all >= 0.6.
       const scored = deduped.map((item) => ({ item, score: item.relevanceScore ?? 0 }));
@@ -3113,11 +3248,17 @@ export class TransportSessionRuntime implements SessionRuntime {
         minFloor: getContextModelConfig().memoryRecallMinScore,
       });
       const items = finalScored.map((s) => toTransportMemoryRecallItem(s.item));
-      if (items.length === 0) {
+      if (items.length === 0 && summaryItems.length === 0) {
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall skipped: no processed matches');
         return {
           artifact: null,
-          statusPayload: deduped.length === 0 && processed.length > 0
+          statusPayload: semanticSkipReason
+            ? buildMemoryContextStatusPayload(query, semanticSkipReason, 'message', {
+                runtimeFamily: 'transport',
+                authoritySource,
+                sourceKind: 'local_processed',
+              })
+            : deduped.length === 0 && processed.length > 0
             ? buildMemoryContextStatusPayload(query, 'deduped_recently', 'message', {
                 runtimeFamily: 'transport',
                 authoritySource,
@@ -3134,6 +3275,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         };
       }
       if (options?.isCancelled?.()) {
+        rollbackSummarySyncReservation(summaryReservation);
         logger.debug({ sessionKey: this.sessionKey, query }, 'transport message recall injection ignored after timeout');
         return { artifact: null };
       }
@@ -3143,26 +3285,38 @@ export class TransportSessionRuntime implements SessionRuntime {
       const injectionSurface = supportClass === 'full-normalized-context-injection'
         ? 'normalized-payload'
         : 'degraded-message-side';
-      const payload = buildMemoryContextTimelinePayload(query, items, 'message', {
+      const combinedItems = [...summaryItems, ...items];
+      const sections: string[] = [];
+      if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(summaryItems));
+      if (items.length > 0) sections.push(buildRelatedPastWorkText(items));
+      const injectedText = sections.join('\n\n');
+      const sourceKind = resolveSummarySyncSourceKind(combinedItems);
+      const payload = buildMemoryContextTimelinePayload(query, combinedItems, 'message', {
         runtimeFamily: 'transport',
         injectionSurface,
         authoritySource,
-        sourceKind: 'local_processed',
+        sourceKind,
+        injectedText,
       });
-      if (!payload?.injectedText) return { artifact: null };
+      if (!payload?.injectedText) {
+        rollbackSummarySyncReservation(summaryReservation);
+        return { artifact: null };
+      }
       return {
         artifact: {
           reason: 'message',
           runtimeFamily: 'transport',
           authoritySource,
-          sourceKind: 'local_processed',
+          sourceKind,
           injectionSurface,
           query,
-          items,
-          injectedText: payload.injectedText,
+          items: combinedItems,
+          injectedText,
         },
+        summaryReservation,
       };
     } catch (err) {
+      rollbackSummarySyncReservation(summaryReservation);
       logger.warn({ err, sessionKey: this.sessionKey }, 'transport message recall failed; continuing without recall');
       return {
         artifact: null,

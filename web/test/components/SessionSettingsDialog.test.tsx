@@ -18,7 +18,7 @@ vi.mock('react-i18next', () => ({
       const leaf = parts[parts.length - 1];
       if (params?.value && typeof params.value === 'string') return `${leaf}:${params.value}`;
       if (params?.backend && params?.model) return `${leaf}:${params.backend}:${params.model}`;
-      if (params?.auditMode && params?.loops != null) return `${leaf}:${params.auditMode}:${params.loops}`;
+      if (params?.auditor && params?.loops != null) return `${leaf}:${params.auditor}:${params.loops}`;
       if (params?.streak != null && params?.total != null) return `${leaf}:${params.streak}:${params.total}`;
       if (params?.promptVersion) return `${leaf}:${params.promptVersion}`;
       return leaf;
@@ -53,6 +53,23 @@ function changeSelect(select: HTMLElement, value: string): void {
   element.value = value;
   fireEvent.input(element);
   fireEvent.change(element);
+}
+
+function makePeerAuditSession(overrides: Record<string, unknown> = {}) {
+  return {
+    sessionName: 'deck_sub_peer',
+    parentSession: 'deck_proj_brain',
+    type: 'codex-sdk',
+    runtimeType: 'transport' as const,
+    label: 'Peer',
+    state: 'idle',
+    sessionInstanceId: 'peer-instance-1',
+    runtimeEpoch: 'peer-runtime-1',
+    activeModel: 'gpt-5.6',
+    requestedModel: 'gpt-5.6',
+    providerId: 'openai',
+    ...overrides,
+  };
 }
 
 describe('SessionSettingsDialog supervision', () => {
@@ -197,7 +214,156 @@ describe('SessionSettingsDialog supervision', () => {
     });
   });
 
-  it('shows audit mode selection and persists the audit config', async () => {
+  it('saves a selected session name immediately without identity refresh or a candidate RPC', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const ws = {
+      connected: true,
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage: () => () => undefined,
+    } as any;
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        sessionInstanceId="brain-instance-1"
+        runtimeEpoch="brain-runtime-1"
+        ws={ws}
+        peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: null, runtimeEpoch: null })]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxAuditLoops: 2,
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
+    expect(screen.queryByTestId('peer-audit-chooser-empty')).toBeNull();
+    fireEvent.click(screen.getByTestId('peer-audit-chooser-row'));
+    expect(screen.queryByTestId('peer-audit-candidate-waiting-authority')).toBeNull();
+    expect(screen.queryByTestId('peer-audit-candidate-loading')).toBeNull();
+    expect(sent.some((message) => message.type === 'peer_audit.list_candidates')).toBe(false);
+    expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            auditTargetSessionName: 'deck_sub_peer',
+          }),
+        }),
+      }));
+    });
+    const saved = patchSessionMock.mock.calls.at(-1)?.[2] as { transportConfig?: { supervision?: Record<string, unknown> } };
+    expect(saved.transportConfig?.supervision).not.toHaveProperty('auditTargetFingerprint');
+  });
+
+  it('seeds a quick-open audit draft immediately instead of leaving Save disabled', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+      maxAutoContinueStreak: 3,
+      maxAutoContinueTotal: 0,
+    });
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        peerAuditSessions={[makePeerAuditSession({ sessionInstanceId: null, runtimeEpoch: null })]}
+        transportConfig={null}
+        openIntent={{ supervisionMode: 'supervised_audit', focus: 'peer-audit-target' }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('peer-audit-chooser-row'));
+
+    await waitFor(() => {
+      expect(screen.queryByText('backendRequired')).toBeNull();
+      expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
+      expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it('portals above control overlays and always keeps Close and Cancel actionable', () => {
+    const onClose = vi.fn();
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={onClose}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const overlay = document.querySelector('.session-settings-overlay');
+    expect(overlay?.parentElement).toBe(document.body);
+    fireEvent.click(screen.getByRole('button', { name: /^close$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+    expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it('only offers reply-capable sessions from the audited session group', () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        peerAuditSessions={[
+          makePeerAuditSession(),
+          makePeerAuditSession({ sessionName: 'deck_sub_other', parentSession: 'deck_other_brain', label: 'Other project' }),
+          makePeerAuditSession({ sessionName: 'deck_sub_shell', type: 'shell', label: 'Shell' }),
+          makePeerAuditSession({ sessionName: 'deck_proj_brain', label: 'Self' }),
+        ]}
+        transportConfig={{
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: CODEX_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxAuditLoops: 2,
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByTestId('peer-audit-chooser-row')).toHaveLength(1);
+    expect(screen.getByTestId('peer-audit-chooser-row').textContent).toContain('Peer');
+    expect(document.body.textContent).not.toContain('Other project');
+    expect(document.body.textContent).not.toContain('Shell');
+  });
+
+  it('shows the remembered auditor picker and persists only the selected session name', async () => {
     fetchSupervisorDefaultsMock.mockResolvedValue({
       backend: 'claude-code-sdk',
       model: CLAUDE_CODE_MODEL_IDS[0],
@@ -212,19 +378,38 @@ describe('SessionSettingsDialog supervision', () => {
         description="desc"
         cwd="/proj"
         type="claude-code-sdk"
-        transportConfig={null}
+        peerAuditSessions={[makePeerAuditSession()]}
+        sessionInstanceId="brain-instance-1"
+        runtimeEpoch="brain-runtime-1"
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'claude-code-sdk',
+            model: CLAUDE_CODE_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            auditTargetSessionName: 'deck_sub_peer',
+            auditTargetFingerprint: {
+              sessionInstanceId: 'peer-instance-1',
+              normalizedModelId: 'gpt-5.6',
+              providerFamily: 'openai',
+            },
+            peerAuditPromptVersion: 'supervision_peer_audit_v1',
+          },
+        }}
         onClose={vi.fn()}
         onSaved={vi.fn()}
       />,
     );
 
     changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised_audit');
-    expect(screen.getByText('auditModeLabel')).toBeDefined();
+    await waitFor(() => {
+      expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('Peer');
+    });
     expect(screen.getByText('maxAuditLoops')).toBeDefined();
 
     changeSelect(screen.getAllByRole('combobox')[4]!, 'claude-code-sdk');
     changeSelect(screen.getAllByRole('combobox')[5]!, CLAUDE_CODE_MODEL_IDS[0]);
-    changeSelect(screen.getAllByRole('combobox')[6]!, 'audit>plan');
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {
@@ -232,11 +417,91 @@ describe('SessionSettingsDialog supervision', () => {
         transportConfig: expect.objectContaining({
           supervision: expect.objectContaining({
             mode: 'supervised_audit',
-            auditMode: 'audit>plan',
+            auditTargetSessionName: 'deck_sub_peer',
+            peerAuditPromptVersion: 'supervision_peer_audit_v1',
           }),
         }),
       }));
     });
+    const saved = patchSessionMock.mock.calls.at(-1)?.[2] as { transportConfig?: { supervision?: Record<string, unknown> } };
+    expect(saved.transportConfig?.supervision).not.toHaveProperty('auditTargetFingerprint');
+  });
+
+  it('opens directly in audit mode and focuses the auditor picker when requested from Auto', async () => {
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="claude-code-sdk"
+        peerAuditSessions={[makePeerAuditSession()]}
+        sessionInstanceId="brain-instance-1"
+        runtimeEpoch="brain-runtime-1"
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'claude-code-sdk',
+            model: CLAUDE_CODE_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+          },
+        }}
+        openIntent={{ supervisionMode: 'supervised_audit', focus: 'peer-audit-target' }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const modeSelect = screen.getAllByRole('combobox')[3] as HTMLSelectElement;
+    expect(modeSelect.value).toBe('supervised_audit');
+    const targetSection = screen.getByTestId('session-supervision-peer-target-section');
+    await waitFor(() => expect(document.activeElement).toBe(targetSection));
+    await waitFor(() => expect(screen.getByTestId('peer-audit-chooser-row')).toBeDefined());
+  });
+
+  it('shows current candidate metadata without requiring fingerprint confirmation', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'claude-code-sdk',
+      model: CLAUDE_CODE_MODEL_IDS[0],
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+    });
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="claude-code-sdk"
+        peerAuditSessions={[makePeerAuditSession({ activeModel: 'gpt-5.7' })]}
+        sessionInstanceId="brain-instance-1"
+        runtimeEpoch="brain-runtime-1"
+        transportConfig={{
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'claude-code-sdk',
+            model: CLAUDE_CODE_MODEL_IDS[0],
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            auditTargetSessionName: 'deck_sub_peer',
+            auditTargetFingerprint: {
+              sessionInstanceId: 'peer-instance-1',
+              normalizedModelId: 'gpt-5.6',
+              providerFamily: 'openai',
+            },
+            peerAuditPromptVersion: 'supervision_peer_audit_v1',
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('peer-audit-settings-selected').textContent).toContain('gpt-5.7'));
+    expect(screen.queryByTestId('peer-audit-settings-confirm')).toBeNull();
   });
 
   it('prefills from saved supervisor defaults when available', async () => {
@@ -268,7 +533,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
 
     changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    expect(screen.getAllByDisplayValue('18').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByDisplayValue('30').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('4').length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByDisplayValue('9').length).toBeGreaterThanOrEqual(2);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
@@ -280,7 +545,7 @@ describe('SessionSettingsDialog supervision', () => {
             mode: 'supervised',
             backend: 'codex-sdk',
             model: CODEX_MODEL_IDS[0],
-            timeoutMs: 18_000,
+            timeoutMs: 30_000,
           }),
         }),
       }));
@@ -307,7 +572,13 @@ describe('SessionSettingsDialog supervision', () => {
             maxParseRetries: 1,
             maxAutoContinueStreak: 2,
             maxAutoContinueTotal: 8,
-            auditMode: 'review>plan',
+            auditTargetSessionName: 'deck_sub_peer',
+            auditTargetFingerprint: {
+              sessionInstanceId: 'peer-instance-1',
+              normalizedModelId: 'claude-opus-4-7',
+              providerFamily: 'anthropic',
+            },
+            peerAuditPromptVersion: 'supervision_peer_audit_v1',
             maxAuditLoops: 3,
             taskRunPromptVersion: 'task_run_status_v1',
           },
@@ -319,10 +590,11 @@ describe('SessionSettingsDialog supervision', () => {
 
     expect(screen.getByText('summaryMode:supervised_audit')).toBeDefined();
     expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
-    expect(screen.getByText('summaryTimeout:9 s')).toBeDefined();
+    expect(screen.getByText('summaryTimeout:30 s')).toBeDefined();
     expect(screen.getByText('summaryContinueLimits:2:8')).toBeDefined();
     expect(screen.getByText('summaryCustomInstructions:summaryCustomInstructionsSet')).toBeDefined();
-    expect(screen.getByText('summaryAudit:review_plan:3')).toBeDefined();
+    expect(screen.getByText('summaryAudit:summaryUnset:3')).toBeDefined();
+    expect(document.body.textContent).not.toContain('deck_sub_peer');
     expect(screen.getByText('summaryMeta:supervision_decision_v1')).toBeDefined();
   });
 
@@ -837,7 +1109,10 @@ describe('SessionSettingsDialog supervision', () => {
 
     changeSelect(screen.getAllByRole('combobox')[1]!, 'claude-code-sdk');
     changeSelect(screen.getAllByRole('combobox')[2]!, CLAUDE_CODE_MODEL_IDS[0]);
-    fireEvent.input(screen.getByDisplayValue('12'), { target: { value: '30' } });
+    const timeoutInput = screen.getByDisplayValue('30');
+    expect(timeoutInput.getAttribute('min')).toBe('30');
+    fireEvent.input(timeoutInput, { target: { value: '5' } });
+    expect(screen.getByDisplayValue('30')).toBeDefined();
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
 
     await waitFor(() => {

@@ -167,6 +167,43 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     await client.close();
   });
 
+  it('forwards Computer Use images as top-level MCP image content visible to the model', async () => {
+    const client = await connect({
+      ...okDeps,
+      computerUseCall: vi.fn(async () => ({
+        outcome: 'completed' as const,
+        result: {
+          correlationId: 'computer-use-image-1',
+          ok: true,
+          tool: 'browser_snapshot' as const,
+          content: [
+            { type: 'text' as const, text: '{"title":"Example"}' },
+            { type: 'image' as const, data: 'aW1hZ2U=', mimeType: 'image/jpeg' },
+          ],
+          durationMs: 12,
+        },
+      })),
+    });
+    const response = await client.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+      arguments: { machine: 'local', tool: 'browser_snapshot' },
+    });
+
+    expect(response.isError).toBeFalsy();
+    expect(response.content).toEqual(expect.arrayContaining([
+      { type: 'image', data: 'aW1hZ2U=', mimeType: 'image/jpeg' },
+    ]));
+    expect(response.content[0]).toMatchObject({ type: 'text' });
+    expect((response.content[0] as { text: string }).text).toContain('"attached":true');
+    expect((response.content[0] as { text: string }).text).not.toContain('aW1hZ2U=');
+    expect(response.structuredContent).toMatchObject({
+      status: 'ok',
+      outcome: 'completed',
+      result: { content: expect.arrayContaining([{ type: 'image', data: 'aW1hZ2U=', mimeType: 'image/jpeg' }]) },
+    });
+    await client.close();
+  });
+
   it('tools/call sends and fetches explicit files with SDK-validated metadata', async () => {
     const client = await connect(okDeps);
     const sent = await client.callTool({

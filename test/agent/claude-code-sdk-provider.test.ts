@@ -27,9 +27,11 @@ vi.mock('node:child_process', () => ({
 
 const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
+  let nextMessageBatches: any[][] | null = null;
   let waitForClose = false;
   let interruptNeverResolves = false;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; resolveClose?: () => void }> = [];
+  let nextContextUsage: { totalTokens?: number } | null = null;
+  const runs: Array<{ prompt: string; promptSource: unknown; options: Record<string, unknown>; closed: boolean; interrupted: boolean; stoppedTasks: string[]; contextUsageCalls: number; resolveClose?: () => void }> = [];
   // The provider drives the SDK in streaming-input mode, so `prompt` is an
   // AsyncIterable<SDKUserMessage>, not a string — that is what lets a message
   // reach a query still running subagents. This mock stands in for the SDK, so it
@@ -42,17 +44,18 @@ const sdkMock = vi.hoisted(() => {
     return typeof content === 'string' ? content : '';
   };
   const query = vi.fn(({ prompt, options }: { prompt: unknown; options: Record<string, unknown> }) => {
-    const run = { prompt: readPromptText(prompt), options, closed: false, interrupted: false, stoppedTasks: [] as string[], resolveClose: undefined as (() => void) | undefined };
+    const run = { prompt: readPromptText(prompt), promptSource: prompt, options, closed: false, interrupted: false, stoppedTasks: [] as string[], contextUsageCalls: 0, resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
+    const messages = nextMessageBatches?.shift() ?? nextMessages;
     async function* gen() {
-      for (const message of nextMessages) yield message;
+      for (const message of messages) yield message;
       if (waitForClose && !run.closed) {
         await new Promise<void>((resolve) => {
           run.resolveClose = resolve;
         });
       }
     }
-    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void> };
+    const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void>; stopTask(taskId: string): Promise<void>; getContextUsage(): Promise<{ totalTokens?: number }> };
     iterator.close = () => {
       run.closed = true;
       run.resolveClose?.();
@@ -66,15 +69,21 @@ const sdkMock = vi.hoisted(() => {
     iterator.stopTask = async (taskId: string) => {
       run.stoppedTasks.push(taskId);
     };
+    iterator.getContextUsage = async () => {
+      run.contextUsageCalls += 1;
+      return nextContextUsage ?? {};
+    };
     return iterator;
   });
   return {
     query,
     runs,
     readPromptText,
-    setNextMessages(messages: any[]) { nextMessages = messages; },
+    setNextMessages(messages: any[]) { nextMessages = messages; nextMessageBatches = null; },
+    setNextMessageBatches(batches: any[][]) { nextMessageBatches = batches.map((batch) => [...batch]); },
     setWaitForClose(value: boolean) { waitForClose = value; },
     setInterruptNeverResolves(value: boolean) { interruptNeverResolves = value; },
+    setNextContextUsage(value: { totalTokens?: number } | null) { nextContextUsage = value; },
   };
 });
 
@@ -110,6 +119,7 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setNextMessages([]);
     sdkMock.setWaitForClose(false);
     sdkMock.setInterruptNeverResolves(false);
+    sdkMock.setNextContextUsage(null);
     childProcessMock.spawn.mockClear();
   });
 
@@ -287,6 +297,265 @@ describe('ClaudeCodeSdkProvider', () => {
         cache_creation_input_tokens: 400,
         cache_read_input_tokens: 300,
         output_tokens: 50,
+      },
+    });
+  });
+
+  it('reports usage that arrives in the full assistant frame after a terminal stream delta', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'stream_event',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-late-usage' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-late-usage',
+        parent_tool_use_id: null,
+        message: {
+          id: 'msg-late-usage',
+          content: [{ type: 'text', text: 'Done' }],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 12_000,
+            cache_read_input_tokens: 700_000,
+            output_tokens: 80,
+          },
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-late-usage',
+      cwd: '/tmp/project',
+      resumeId: 'session-late-usage',
+      agentId: 'MiniMax-M3',
+    });
+
+    const completed: AgentMessage[] = [];
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-late-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(usageUpdates).toEqual([{
+      messageId: 'msg-late-usage',
+      finalized: true,
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 12_000,
+        cache_read_input_tokens: 700_000,
+        output_tokens: 80,
+      },
+    }]);
+  });
+
+  it('reports result-only usage that trails a terminal stream delta', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-result-usage', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-result-usage' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-result-usage',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-result-usage',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: {
+          input_tokens: 14_000,
+          cache_read_input_tokens: 710_000,
+          output_tokens: 90,
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-result-usage',
+      cwd: '/tmp/project',
+      resumeId: 'session-result-usage',
+      agentId: 'MiniMax-M3',
+    });
+
+    const completed: AgentMessage[] = [];
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-result-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(usageUpdates).toEqual([{
+      messageId: 'msg-result-usage',
+      finalized: true,
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 14_000,
+        cache_read_input_tokens: 710_000,
+        output_tokens: 90,
+      },
+    }]);
+  });
+
+  it('uses the SDK live context meter when a compatible endpoint reports zero usage', async () => {
+    sdkMock.setNextContextUsage({ totalTokens: 734_321 });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-live-context', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'message_start', message: { id: 'msg-live-context' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-context',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-live-context',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-live-context',
+      cwd: '/tmp/project',
+      resumeId: 'session-live-context',
+      agentId: 'MiniMax-M3',
+    });
+
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-live-context', 'hello');
+    await flush();
+
+    expect(sdkMock.runs.at(-1)?.contextUsageCalls).toBeGreaterThanOrEqual(1);
+    expect(usageUpdates.at(-1)).toEqual({
+      messageId: 'msg-live-context',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 734_321,
+        output_tokens: 0,
+      },
+    });
+  });
+
+  it('keeps MiniMax message_start cache usage when reconciling the live context total', async () => {
+    sdkMock.setNextContextUsage({ totalTokens: 452_797 });
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-live-cache', model: 'MiniMax-M3' },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'msg-live-cache',
+            usage: {
+              input_tokens: 4_930,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 447_867,
+              output_tokens: 0,
+            },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      },
+      {
+        type: 'stream_event',
+        session_id: 'session-live-cache',
+        parent_tool_use_id: null,
+        event: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      },
+      {
+        type: 'result',
+        session_id: 'session-live-cache',
+        subtype: 'success',
+        is_error: false,
+        result: 'Done',
+        usage: { input_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-live-cache',
+      cwd: '/tmp/project',
+      resumeId: 'session-live-cache',
+      agentId: 'MiniMax-M3',
+    });
+
+    const usageUpdates: Array<Record<string, unknown>> = [];
+    provider.onUsage?.((_sid, update) => usageUpdates.push(update as unknown as Record<string, unknown>));
+
+    await provider.send('route-live-cache', 'hello');
+    await flush();
+
+    expect(usageUpdates.at(-1)).toEqual({
+      messageId: 'msg-live-cache',
+      model: 'MiniMax-M3',
+      usage: {
+        input_tokens: 4_930,
+        cache_read_input_tokens: 447_867,
+        output_tokens: 0,
       },
     });
   });
@@ -997,6 +1266,65 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(completed).toEqual(['STREAM_OK']);
   });
 
+  it('retries third-party resumed sessions fresh when Claude returns the no-response seed artifact', async () => {
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'system', subtype: 'init', session_id: 'old-session', model: 'MiniMax-M3' },
+        {
+          type: 'assistant',
+          session_id: 'old-session',
+          message: {
+            content: [{ type: 'text', text: 'No response requested.' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0 },
+          },
+        },
+        {
+          type: 'result',
+          session_id: 'old-session',
+          subtype: 'success',
+          is_error: false,
+          result: 'No response requested.',
+          usage: { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0 },
+        },
+      ],
+      [
+        { type: 'system', subtype: 'init', session_id: 'fresh-session', model: 'MiniMax-M3' },
+        { type: 'assistant', session_id: 'fresh-session', message: { content: [{ type: 'text', text: 'OK' }], stop_reason: 'end_turn' } },
+        { type: 'result', session_id: 'fresh-session', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-minimax-resume',
+      cwd: '/tmp/project',
+      resumeId: 'old-session',
+      skipCreate: true,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    });
+
+    const completed: string[] = [];
+    const resumeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onSessionInfo((_sid, info) => {
+      if (info.resumeId) resumeIds.push(info.resumeId);
+    });
+
+    await provider.send('route-minimax-resume', 'hello');
+    await flush();
+    await flush();
+
+    expect(sdkMock.runs).toHaveLength(2);
+    expect(sdkMock.runs[0]?.options.resume).toBe('old-session');
+    expect(sdkMock.runs[1]?.options.sessionId).toEqual(expect.any(String));
+    expect(sdkMock.runs[1]?.options.sessionId).not.toBe('old-session');
+    expect(sdkMock.runs[1]?.prompt).toBe('hello');
+    expect(completed).toEqual(['OK']);
+    expect(resumeIds).toContain('fresh-session');
+  });
+
   it('builds tool input from input_json_delta events', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-tool-json', model: 'claude-sonnet-4-6' },
@@ -1223,6 +1551,94 @@ describe('ClaudeCodeSdkProvider', () => {
     });
     expect(JSON.stringify(tool?.input ?? null)).not.toContain(prompt);
     expect(tool?.detail?.raw).toBeUndefined();
+  });
+
+  it('surfaces local_bash in the agent process panel and wakes the parent with an explicit Bash kind', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-local-bash-task', model: 'MiniMax-M3' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-local-bash-task',
+        uuid: 'uuid-local-bash-start',
+        task_id: 'bp1xwk3v9',
+        tool_use_id: 'call-local-bash',
+        description: 'Search for income user rec references',
+        task_type: 'local_bash',
+      },
+      {
+        type: 'assistant',
+        session_id: 'session-local-bash-task',
+        parent_tool_use_id: null,
+        message: { id: 'message-local-bash-parent', content: [{ type: 'text', text: 'Waiting for Explore agents' }], stop_reason: 'end_turn' },
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-local-bash-task',
+        uuid: 'uuid-local-bash-complete',
+        task_id: 'bp1xwk3v9',
+        status: 'completed',
+        summary: 'Search for income user rec references',
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-local-bash-task',
+      sessionName: 'deck_project_claude_local_bash',
+      cwd: '/tmp/project',
+      resumeId: 'session-local-bash-task',
+    });
+    const completed: AgentMessage[] = [];
+    const tools: ToolCallEvent[] = [];
+    provider.onComplete((_sid, message) => completed.push(message));
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('route-local-bash-task', 'hello');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sdkMock.runs[0]?.closed).toBe(false);
+    expect(completed.map((message) => message.content)).toEqual(['Waiting for Explore agents']);
+    expect(sdkSubagentTools(tools).at(-1)).toMatchObject({
+      name: 'Bash',
+      status: 'complete',
+      input: {
+        action: 'claude-bash-task',
+        description: 'Search for income user rec references',
+      },
+      detail: {
+        meta: {
+          taskId: 'bp1xwk3v9',
+          taskType: 'local_bash',
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+    expect(provider.getActiveWorkSnapshot('route-local-bash-task')).toMatchObject({
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['background_monitor'],
+    });
+
+    await vi.advanceTimersByTimeAsync(1_500);
+    const queuedInputs = (sdkMock.runs[0]?.promptSource as {
+      buffer?: Array<{ message?: { content?: unknown } }>;
+    })?.buffer?.map((entry) => entry.message?.content);
+    expect(queuedInputs).toEqual(expect.arrayContaining([
+      expect.stringContaining('kind=bash means Bash/shell'),
+      expect.stringContaining('"kind":"bash"'),
+    ]));
+    expect(provider.getSessionDiagnostics('route-local-bash-task')).toMatchObject({
+      completed: false,
+      retainedSubagentMode: true,
+      currentQueryActive: true,
+    });
+    await provider.endSession('route-local-bash-task');
   });
 
   it('closes stale Claude task snapshots so background monitor evidence cannot block forever', async () => {

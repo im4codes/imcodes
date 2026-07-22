@@ -53,7 +53,8 @@ import {
 } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js';
-import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
+import { SessionSettingsDialog, type PeerAuditSettingsSession } from './components/SessionSettingsDialog.js';
+import type { SessionSettingsOpenIntent } from './session-settings-open-intent.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
@@ -70,7 +71,7 @@ import { ControlledNodesPanel } from './components/ControlledNodesPanel.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
-import { isPlausibleUsagePayload } from './usage-data.js';
+import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
@@ -99,6 +100,7 @@ import {
 } from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
   isSubSessionName,
@@ -166,6 +168,7 @@ import { shouldUseIosMacTextScale } from './native-platform.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
+import { resolveQuickAgentDelegationModel } from './quick-agent-delegation-model.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
@@ -1520,7 +1523,7 @@ export function App() {
   }, []);
 
   const [showSubDialog, setShowSubDialog] = useState(false);
-  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null } | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activeModel?: string | null; requestedModel?: string | null; providerId?: string | null; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null; transportConfig?: Record<string, unknown> | null; openIntent?: SessionSettingsOpenIntent } | null>(null);
   const [cloneSessionTarget, setCloneSessionTarget] = useState<SessionInfo | null>(null);
 
   // Derive focused (topmost) sub-session from the shared stack + open set.
@@ -2297,6 +2300,42 @@ export function App() {
     activeSession,
     Boolean(selectedShareTarget),
   );
+
+  // Session settings may stay open across a daemon rolling upgrade. Keep the
+  // authority fields live instead of freezing the identity snapshot captured
+  // when the dialog opened; otherwise peer-audit candidates remain hidden
+  // until the user closes and reopens the dialog after session_list/subsession
+  // sync starts projecting sessionInstanceId + runtimeEpoch.
+  useEffect(() => {
+    setSettingsTarget((current) => {
+      if (!current) return current;
+      const source = current.subId
+        ? subSessions.find((sub) => sub.id === current.subId || sub.sessionName === current.sessionName)
+        : sessions.find((session) => session.name === current.sessionName);
+      if (!source) return current;
+      const sessionInstanceId = source.sessionInstanceId ?? current.sessionInstanceId;
+      const runtimeEpoch = source.runtimeEpoch ?? current.runtimeEpoch;
+      const activeModel = source.activeModel ?? current.activeModel;
+      const requestedModel = source.requestedModel ?? current.requestedModel;
+      const providerId = source.providerId ?? current.providerId;
+      if (sessionInstanceId === current.sessionInstanceId
+        && runtimeEpoch === current.runtimeEpoch
+        && activeModel === current.activeModel
+        && requestedModel === current.requestedModel
+        && providerId === current.providerId) {
+        return current;
+      }
+      return {
+        ...current,
+        sessionInstanceId,
+        runtimeEpoch,
+        activeModel,
+        requestedModel,
+        providerId,
+      };
+    });
+  }, [sessions, subSessions]);
+
   const appOpenSpecAutoScopedSubSessionName = useMemo(() => {
     if (!isMobileRef.current) return null;
     const visibleById = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
@@ -3147,8 +3186,8 @@ export function App() {
             }
           }
           // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
-          if (event.sessionId.startsWith('deck_sub_') && isPlausibleUsagePayload(event.payload as Record<string, unknown>)) {
-            const payload = event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+          if (event.sessionId.startsWith('deck_sub_')) {
+            const payload = event.payload as { inputTokens?: number; cacheTokens?: number; contextWindow?: number; contextWindowSource?: UsageContextWindowSource; model?: string };
             const sub = subSessionsRef.current.find((candidate) => candidate.sessionName === event.sessionId);
             const detectedModel = detectedModelsRef.current.get(event.sessionId);
             const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(sub, detectedModel, payload.model);
@@ -3162,8 +3201,10 @@ export function App() {
               ? { ...payload, model: effectiveModel }
               : payload;
             setSubUsages((prev) => {
+              const merged = mergeUsageUpdate(prev.get(event.sessionId), displayPayload as Record<string, unknown>);
+              if (!merged) return prev;
               const next = new Map(prev);
-              next.set(event.sessionId, displayPayload);
+              next.set(event.sessionId, merged);
               return next;
             });
           }
@@ -4462,10 +4503,47 @@ export function App() {
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
-  const subSessionsSlim = useMemo(() =>
-    subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
-    [subSessions]
-  );
+  const quickDelegationSessions = useMemo(() => sessions.map((session) => {
+    const effectiveModel = resolveQuickAgentDelegationModel(
+      session,
+      detectedModels.get(session.name),
+    );
+    return effectiveModel && effectiveModel !== session.activeModel
+      ? { ...session, activeModel: effectiveModel }
+      : session;
+  }), [detectedModels, sessions]);
+  const subSessionsSlim = useMemo(() => subSessions.map((session) => ({
+    sessionName: session.sessionName,
+    type: session.type,
+    label: session.label,
+    state: session.state,
+    parentSession: session.parentSession,
+    activeModel: resolveQuickAgentDelegationModel(
+      session,
+      detectedModels.get(session.sessionName),
+      subUsages.get(session.sessionName)?.model,
+    ),
+  })), [detectedModels, subSessions, subUsages]);
+  const peerAuditSettingsSessions = useMemo<PeerAuditSettingsSession[]>(() => subSessions
+    .filter((session) => session.executionCloneKind !== EXECUTION_CLONE_KIND && typeof session.parentRunId !== 'string')
+    .map((session) => ({
+      sessionName: session.sessionName,
+      parentSession: session.parentSession,
+      type: session.type,
+      runtimeType: session.runtimeType,
+      label: session.label,
+      state: session.state,
+      sessionInstanceId: session.sessionInstanceId,
+      runtimeEpoch: session.runtimeEpoch,
+      activeModel: resolveQuickAgentDelegationModel(
+        session,
+        detectedModels.get(session.sessionName),
+        subUsages.get(session.sessionName)?.model,
+      ),
+      requestedModel: session.requestedModel,
+      modelDisplay: session.modelDisplay,
+      providerId: session.providerId,
+    })), [detectedModels, subSessions, subUsages]);
   const openShareDialogForSession = useCallback((session: SessionInfo, subSessionId?: string | null) => {
     if (!selectedServerId) return;
     const sub = subSessionId
@@ -5040,6 +5118,11 @@ export function App() {
               onRestartProject={handleRestartProject}
               onOpenSessionSettings={(session) => setSettingsTarget({
                 sessionName: session.name,
+                sessionInstanceId: session.sessionInstanceId,
+                runtimeEpoch: session.runtimeEpoch,
+                activeModel: session.activeModel,
+                requestedModel: session.requestedModel,
+                providerId: session.providerId,
                 label: session.label || '',
                 description: session.description || '',
                 cwd: session.projectDir || '',
@@ -5121,7 +5204,7 @@ export function App() {
                 serverId={selectedServerId ?? ''}
                 onPendingQuestion={surfaceAskQuestionFromHistory}
                 session={s}
-                sessions={sessions}
+                sessions={quickDelegationSessions}
                 subSessions={subSessionsSlim}
                 ws={wsRef.current}
                 connected={connected}
@@ -5139,7 +5222,7 @@ export function App() {
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
-                onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null })}
+                onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, openIntent })}
                 onShareSession={openShareDialogForSession}
                 sessionPinned={pinnedTabs.has(s.name)}
                 stopBlockedByPinned={sessions.some((session) => session.project === s.project && pinnedTabs.has(session.name))}
@@ -5349,7 +5432,7 @@ export function App() {
                 detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
-                sessions={sessions}
+                sessions={quickDelegationSessions}
                 allSubSessions={subSessionsSlim}
                 p2pSessionLabels={p2pSessionLabels}
                 onSubTransportConfigSaved={(subId, transportConfig) => updateSubLocal(subId, { transportConfig })}
@@ -5942,7 +6025,7 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
-              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null })}
+              onSettings={(openIntent) => setSettingsTarget({ sessionName: sub.sessionName, sessionInstanceId: sub.sessionInstanceId ?? undefined, runtimeEpoch: sub.runtimeEpoch ?? undefined, activeModel: sub.activeModel, requestedModel: sub.requestedModel, providerId: sub.providerId, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession, transportConfig: sub.transportConfig ?? null, openIntent })}
               onShareSession={openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
@@ -5968,7 +6051,7 @@ export function App() {
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
-              sessions={sessions}
+              sessions={quickDelegationSessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
               detectedModelHint={detectedModels.get(sub.sessionName)}
@@ -6067,6 +6150,13 @@ export function App() {
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
           transportConfig={settingsTarget.transportConfig}
+          sessionInstanceId={settingsTarget.sessionInstanceId}
+          runtimeEpoch={settingsTarget.runtimeEpoch}
+          activeModel={settingsTarget.activeModel}
+          requestedModel={settingsTarget.requestedModel}
+          providerId={settingsTarget.providerId}
+          peerAuditSessions={peerAuditSettingsSessions}
+          openIntent={settingsTarget.openIntent}
           ws={wsRef.current}
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {

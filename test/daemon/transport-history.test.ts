@@ -122,6 +122,22 @@ describe('transport-history', () => {
     expect(events[0]['text']).toBe('kept');
   });
 
+  it('drops legacy Claude synthetic seed assistant text from transport replay', async () => {
+    const session = `${TS}-synthetic-seed`;
+    const file = transportSessionFile(session);
+    await mkdir(join(homedir(), '.imcodes', 'transport'), { recursive: true });
+    await writeFile(file, [
+      JSON.stringify({ type: 'assistant.text', sessionId: session, text: 'No response requested.', _ts: 1 }),
+      JSON.stringify({ type: 'assistant.text', sessionId: session, text: 'real response', _ts: 2 }),
+      '',
+    ].join('\n'), 'utf8');
+
+    await appendTransportEvent(session, { type: 'assistant.text', sessionId: session, text: 'No response requested.' });
+
+    const events = await replayTransportHistory(session);
+    expect(events.map((event) => event['text'])).toEqual(['real response']);
+  });
+
   it('keeps privacy-safe sdk_turn_lost recovery phase history without raw provider data', async () => {
     const session = `${TS}-sdk-turn-lost-phase`;
     await appendTransportEvent(session, {

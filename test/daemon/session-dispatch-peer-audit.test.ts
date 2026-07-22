@@ -1,0 +1,206 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SessionRecord } from '../../src/store/session-store.js';
+
+const sendMock = vi.fn();
+const removeMock = vi.fn();
+const processSendMock = vi.fn();
+const injectPrivateMock = vi.fn();
+const getSessionMock = vi.fn();
+const getTransportRuntimeMock = vi.fn();
+const ensureTransportRuntimeForPendingResendMock = vi.fn();
+const enqueueResendMock = vi.fn();
+
+vi.mock('../../src/agent/session-manager.js', () => ({
+  getTransportRuntime: (...args: unknown[]) => getTransportRuntimeMock(...args),
+  ensureTransportRuntimeForPendingResend: (...args: unknown[]) => ensureTransportRuntimeForPendingResendMock(...args),
+}));
+
+vi.mock('../../src/daemon/transport-resend-queue.js', () => ({
+  enqueueResend: (...args: unknown[]) => enqueueResendMock(...args),
+}));
+
+vi.mock('../../src/daemon/command-handler.js', () => ({
+  sendProcessSessionMessageForAutomation: (...args: unknown[]) => processSendMock(...args),
+  runWithProcessSessionSendLock: async (_name: string, fn: () => Promise<unknown>) => fn(),
+  prepareProcessSessionPrivateWriter: async () => (text: string) => injectPrivateMock(text),
+}));
+
+vi.mock('../../src/store/session-store.js', () => ({
+  getSession: (...args: unknown[]) => getSessionMock(...args),
+}));
+
+vi.mock('../../src/daemon/transport-queue-projection.js', () => ({
+  buildTransportQueueSnapshotPayload: vi.fn(() => ({ queueEpoch: 'queue_epoch_1' })),
+}));
+
+const {
+  cancelQueuedPeerAuditMessage,
+  dispatchPeerAuditMessage,
+  dispatchSessionMessage,
+  dispatchSessionMessageByName,
+} = await import('../../src/daemon/session-dispatch.js');
+
+function target(patch: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    name: 'deck_sub_audit123',
+    sessionInstanceId: 'instance_audit123',
+    runtimeEpoch: 'runtime_audit123',
+    projectName: 'p',
+    projectDir: '/repo',
+    role: 'w1',
+    parentSession: 'deck_p_brain',
+    agentType: 'codex-sdk',
+    runtimeType: 'transport',
+    providerId: 'openai',
+    state: 'idle',
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: 1,
+    updatedAt: 1,
+    ...patch,
+  };
+}
+
+describe('peer-audit dedicated dispatch', () => {
+  beforeEach(() => {
+    sendMock.mockReset();
+    removeMock.mockReset();
+    processSendMock.mockReset();
+    injectPrivateMock.mockReset();
+    getSessionMock.mockReset();
+    getTransportRuntimeMock.mockReset();
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider_session_1',
+      send: sendMock,
+      removePendingMessage: removeMock,
+    });
+    ensureTransportRuntimeForPendingResendMock.mockReset();
+    ensureTransportRuntimeForPendingResendMock.mockResolvedValue(undefined);
+    enqueueResendMock.mockReset();
+    enqueueResendMock.mockReturnValue({ accepted: true, droppedOldest: false, pendingVersion: 1 });
+  });
+
+  it.each(['sent', 'queued'] as const)('returns the exact transport %s disposition and private queue metadata', async (disposition) => {
+    sendMock.mockReturnValue(disposition);
+    const result = await dispatchPeerAuditMessage({ target: target(), brief: 'bounded brief', attemptId: 'attempt_1' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.receipt.disposition).toBe(disposition);
+    expect(result.receipt.queueEpoch).toBe(disposition === 'queued' ? 'queue_epoch_1' : undefined);
+    expect(sendMock).toHaveBeenCalledWith(
+      'bounded brief',
+      expect.any(String),
+      undefined,
+      undefined,
+      { peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: expect.any(String) } },
+    );
+  });
+
+  it('cancels only the exact queued message id', () => {
+    removeMock.mockReturnValue(true);
+    expect(cancelQueuedPeerAuditMessage('deck_sub_audit123', 'message_exact')).toBe(true);
+    expect(removeMock).toHaveBeenCalledWith('message_exact');
+  });
+
+  it('injects idle process auditors privately and never through the ordinary automation send', async () => {
+    const idle = target({ agentType: 'codex', runtimeType: 'process', state: 'idle' });
+    getSessionMock.mockReturnValue(idle);
+
+    await expect(dispatchPeerAuditMessage({ target: idle, brief: 'audit', attemptId: 'attempt_2' }))
+      .resolves.toMatchObject({ ok: true, receipt: { disposition: 'sent_unrevocable' } });
+    expect(injectPrivateMock).toHaveBeenCalledWith('audit');
+    // The capability-bearing brief must not reach the timeline/history/memory path.
+    expect(processSendMock).not.toHaveBeenCalled();
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a busy process auditor without injecting', async () => {
+    const busy = target({ agentType: 'codex', runtimeType: 'process', state: 'running' });
+    getSessionMock.mockReturnValue(busy);
+
+    await expect(dispatchPeerAuditMessage({ target: busy, brief: 'audit', attemptId: 'attempt_3' }))
+      .resolves.toEqual({ ok: false, error: 'target_runtime_busy_uncancellable' });
+    expect(injectPrivateMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('sends nothing when the authoritative record diverges from the caller snapshot', async () => {
+    // Caller snapshot is idle and correctly identified; the live record has
+    // since been replaced (delete/recreate) and is busy.
+    const snapshot = target({ agentType: 'codex', runtimeType: 'process', state: 'idle' });
+    getSessionMock.mockReturnValue(target({
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'running',
+      sessionInstanceId: 'instance_recreated',
+    }));
+
+    await expect(dispatchPeerAuditMessage({ target: snapshot, brief: 'audit', attemptId: 'attempt_4' }))
+      .resolves.toEqual({ ok: false, error: 'target_ineligible' });
+    expect(injectPrivateMock).not.toHaveBeenCalled();
+  });
+
+  it('does not claim sent_unrevocable when the effect was cancelled before the write', async () => {
+    const idle = target({ agentType: 'codex', runtimeType: 'process', state: 'idle' });
+    getSessionMock.mockReturnValue(idle);
+
+    await expect(dispatchPeerAuditMessage({
+      target: idle,
+      brief: 'audit',
+      attemptId: 'attempt_5',
+      isEffectCurrent: () => false,
+    })).resolves.toEqual({ ok: false, error: 'attempt_not_found' });
+    expect(injectPrivateMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary manual dispatch on the inferred transport path for legacy records', async () => {
+    sendMock.mockReturnValue('sent');
+    const legacyTransport = target({ runtimeType: undefined, agentType: 'codex-sdk' });
+    await expect(dispatchSessionMessage(legacyTransport, 'ordinary delegation', {
+      messageId: 'send_message_12345678' as never,
+    })).resolves.toBe('sent');
+    expect(sendMock).toHaveBeenCalledWith('ordinary delegation', 'send_message_12345678');
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+
+  it('routes named external sends through transport and process runtimes', async () => {
+    sendMock.mockReturnValue('sent');
+    getSessionMock.mockReturnValueOnce(target());
+
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'transport external message'))
+      .resolves.toBe('sent');
+    expect(sendMock).toHaveBeenCalledWith(
+      'transport external message',
+      expect.stringMatching(/^send_message_/),
+    );
+    expect(processSendMock).not.toHaveBeenCalled();
+
+    sendMock.mockClear();
+    getSessionMock.mockReturnValueOnce(target({ agentType: 'codex', runtimeType: 'process' }));
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'process external message'))
+      .resolves.toBeUndefined();
+    expect(processSendMock).toHaveBeenCalledWith('deck_sub_audit123', 'process external message');
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('durably queues a named transport send while its runtime is still restoring', async () => {
+    getSessionMock.mockReturnValueOnce(target());
+    getTransportRuntimeMock.mockReturnValueOnce(undefined);
+
+    await expect(dispatchSessionMessageByName('deck_sub_audit123', 'startup-window external message'))
+      .resolves.toBe('queued');
+
+    expect(enqueueResendMock).toHaveBeenCalledWith('deck_sub_audit123', expect.objectContaining({
+      text: 'startup-window external message',
+      commandId: expect.stringMatching(/^send_message_/),
+      clientMessageId: expect.stringMatching(/^send_message_/),
+      queuedAt: expect.any(Number),
+    }));
+    const queuedEntry = enqueueResendMock.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(queuedEntry.commandId).toBe(queuedEntry.clientMessageId);
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123');
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(processSendMock).not.toHaveBeenCalled();
+  });
+});

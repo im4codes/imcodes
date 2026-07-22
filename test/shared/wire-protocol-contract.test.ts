@@ -83,6 +83,10 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
       MACHINE_EXEC: 'machine.exec',
       COMPUTER_USE: 'computer.use',
+      PEER_AUDIT_LIST_CANDIDATES: 'peer_audit.list_candidates',
+      PEER_AUDIT_QUICK_START: 'peer_audit.quick_start',
+      PEER_AUDIT_CANCEL: 'peer_audit.cancel',
+      PEER_AUDIT_REPLY: 'peer_audit.reply',
     });
   });
 

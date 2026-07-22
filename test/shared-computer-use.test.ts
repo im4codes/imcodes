@@ -5,6 +5,7 @@ import {
   COMPUTER_USE_MIN_TIMEOUT_MS,
   COMPUTER_USE_MAX_TIMEOUT_MS,
   COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS,
+  computerUseDocs,
   computerUseMaxTimeoutMs,
   decodeComputerUseHttpEnvelope,
   encodeComputerUseHttpEnvelope,
@@ -15,6 +16,17 @@ import {
 const correlationId = '1234567890abcdef';
 
 describe('computer-use shared protocol', () => {
+  it('distinguishes the built-in CDP browser path from the integrated OCU desktop path', () => {
+    expect(computerUseDocs('browser')).toContain('machine=local');
+    expect(computerUseDocs('browser')).toContain('Pass includeImage=true only when visual evidence is needed');
+    expect(computerUseDocs('browser')).toContain('automation.cdpEndpoint');
+    expect(computerUseDocs('browser')).toContain('Playwright connect_over_cdp');
+    expect(computerUseDocs('browser')).toContain('127.0.0.1 only');
+    expect(computerUseDocs('browser')).toContain("browser_* is IM.codes' built-in CDP path");
+    expect(computerUseDocs('overview')).toContain('Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path');
+    expect(computerUseDocs('overview')).toContain('do not probe for or install a separate Playwright runtime');
+  });
+
   it('validates strict request frames including shell_session1', () => {
     expect(validateComputerUseFrame({
       type: DAEMON_COMMAND_TYPES.COMPUTER_USE,

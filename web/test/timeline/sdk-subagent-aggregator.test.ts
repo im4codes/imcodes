@@ -69,7 +69,7 @@ function makeSessionStateEvent(eventId: string, state: string, ts = NOW - 500): 
 
 describe('deriveSdkSubagentStatusRows', () => {
   it('derives running rows from raw hidden events without transcript visibility state', () => {
-    const event = makeEvent('hidden-running', makeMeta({ taskId: 'task-1', model: 'haiku' }), { hidden: true });
+    const event = makeEvent('hidden-running', makeMeta({ taskId: 'task-1', taskType: 'local_bash', model: 'haiku' }), { hidden: true });
 
     const result = deriveSdkSubagentStatusRows([event], NOW, { terminalTtlMs: 300_000, maxTerminalRows: 5 });
 
@@ -82,6 +82,7 @@ describe('deriveSdkSubagentStatusRows', () => {
       active: true,
       model: 'haiku',
       taskId: 'task-1',
+      taskType: 'local_bash',
     }]);
     expect(result.diagnostics).toEqual([]);
   });

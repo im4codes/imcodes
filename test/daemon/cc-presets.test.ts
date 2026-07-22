@@ -49,6 +49,27 @@ describe('cc presets', () => {
     await expect(getPreset('MiniMax')).resolves.toMatchObject({ name: 'minimax' });
   });
 
+  it('upgrades the legacy MiniMax-M3 200K preset window to 1M', async () => {
+    const { savePresets, getPreset, resolvePresetEnv } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([{
+      name: 'minimax',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_MODEL: 'MiniMax-M3',
+      },
+      defaultModel: 'MiniMax-M3',
+      contextWindow: 200_000,
+    }]);
+
+    await expect(getPreset('minimax')).resolves.toMatchObject({
+      contextWindow: 1_000_000,
+    });
+    await expect(resolvePresetEnv('minimax')).resolves.toMatchObject({
+      IMCODES_CONTEXT_WINDOW: '1000000',
+    });
+  });
+
   it('resolves env and context hints for mixed-case preset names', async () => {
     const { resolvePresetEnv } = await import('../../src/daemon/cc-presets.js');
 

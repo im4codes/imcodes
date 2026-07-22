@@ -191,11 +191,13 @@ describe('AtPicker', () => {
     expect(screen.getByText(/type_to_search/)).toBeDefined();
   });
 
-  it('shows current main-session group agents and disables the current session', () => {
+  it('shows the current session but greys it out (cannot delegate to self)', () => {
     renderPicker();
 
     fireEvent.click(screen.getByText('agents'));
 
+    // The active session ("brain", isSelf) stays visible but disabled — a greyed
+    // row is clearer than silently dropping it, and it must be non-selectable.
     expect(screen.getByText('brain')).toBeDefined();
     expect(screen.getByText('brain').closest('div')?.getAttribute('aria-disabled')).toBe('true');
     expect(screen.getByText('worker1')).toBeDefined();

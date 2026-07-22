@@ -189,6 +189,11 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.ticket_expires_at'));
   });
 
+  it('shows that the downloaded installer is permanent and reusable', async () => {
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.usage_step4'));
+  });
+
   it('maps mint executable_not_built to a specific message', async () => {
     const { ApiError, controlledNodeDownloadErrorKey } = await import('../src/api.js');
     const { container } = render(<ControlledNodesPanel />);

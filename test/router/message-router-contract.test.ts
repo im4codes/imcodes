@@ -107,7 +107,9 @@ describe('message router contracts', () => {
 
     await router.routeMessage(inbound('/send please review'), ctx);
     expect(ctx.sendToSession).toHaveBeenCalledWith('deck_alpha_brain', 'please review');
-    expect(timelineEmitMock).toHaveBeenCalledWith('deck_alpha_brain', 'user.message', { text: 'please review' });
+    // The runtime-aware delivery boundary owns the single user.message event.
+    // The router must not duplicate it after a slow process/queued send.
+    expect(timelineEmitMock).not.toHaveBeenCalled();
 
     await router.routeMessage(inbound('plain text'), ctx);
     expect(ctx.sendToSession).toHaveBeenCalledWith('deck_alpha_brain', 'plain text');
@@ -133,5 +135,22 @@ describe('message router contracts', () => {
 
     await router.routeMessage(inbound('/help', { isCommand: true, command: 'help', args: [] }), ctx);
     expect(ctx.sendOutbound.mock.calls.at(-1)?.[3]).toContain('Available commands');
+  });
+
+  it('reports external delivery failure instead of claiming a dropped message was sent', async () => {
+    const router = await import('../../src/router/message-router.js');
+    const ctx = context();
+    router.bindChannel('slack', 'C1', 'bot-1', 'alpha', 'user-1');
+    ctx.sendToSession.mockRejectedValueOnce(new Error('transport queue unavailable'));
+
+    await router.routeMessage(inbound('message during unavailable startup'), ctx);
+
+    expect(ctx.sendOutbound).toHaveBeenCalledWith(
+      'C1',
+      'slack',
+      'bot-1',
+      'Failed to deliver message to brain. Please try again.',
+    );
+    expect(timelineEmitMock).not.toHaveBeenCalled();
   });
 });

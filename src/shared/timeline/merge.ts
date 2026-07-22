@@ -3,6 +3,10 @@ import {
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   type TimelineDetailFieldPath,
 } from '../../../shared/timeline-protocol.js';
+import {
+  usageContextWindowSourceRank,
+  type UsageContextWindowSource,
+} from '../../../shared/usage-context-window.js';
 
 export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
 export type { TimelineDetailFieldPath };
@@ -52,18 +56,65 @@ function compareNumbers(a: number | undefined, b: number | undefined): number {
   return left > right ? 1 : -1;
 }
 
+const USAGE_SNAPSHOT_PAYLOAD_KEYS = [
+  'inputTokens',
+  'cacheTokens',
+  'outputTokens',
+  'costUsd',
+  'codexStatus',
+] as const;
+
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function canShareUsageContext(preferred: TimelineEvent, alternate: TimelineEvent): boolean {
+  const preferredModel = preferred.payload.model;
+  const alternateModel = alternate.payload.model;
+  return typeof preferredModel !== 'string'
+    || typeof alternateModel !== 'string'
+    || preferredModel === alternateModel;
+}
+
 /**
- * Resolve same-eventId conflicts deterministically.
+ * A stable usage event can be updated twice by a transport provider: once with
+ * the token snapshot and later with model/context metadata from the terminal
+ * completion. Timeline storage is keyed by eventId, so treating the latter as
+ * a full replacement would erase the token snapshot and make the UI show 0.
  *
- * Preference order:
- * 1. full events over preview events
- * 2. terminal/non-streaming over streaming
- * 3. newer epoch
- * 4. newer seq
- * 5. newer ts
- * 6. incoming as tie-breaker
+ * Carry forward occupancy/cost fields, plus a stronger authoritative context
+ * window for the same model. A terminal metadata frame may contain only a
+ * model-name inference; it must not replace a provider/preset window already
+ * reported for that exact usage event.
  */
-export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+function supplementUsageSnapshot(
+  preferred: TimelineEvent,
+  alternate: TimelineEvent,
+): TimelineEvent {
+  if (preferred.type !== 'usage.update' || alternate.type !== 'usage.update') return preferred;
+  let payload: TimelineEvent['payload'] | undefined;
+  for (const key of USAGE_SNAPSHOT_PAYLOAD_KEYS) {
+    if (hasOwn(preferred.payload, key) || !hasOwn(alternate.payload, key)) continue;
+    payload ??= { ...preferred.payload };
+    payload[key] = alternate.payload[key];
+  }
+  const preferredContextRank = usageContextWindowSourceRank(preferred.payload.contextWindowSource);
+  const alternateContextRank = usageContextWindowSourceRank(alternate.payload.contextWindowSource);
+  if (
+    alternateContextRank > preferredContextRank
+    && typeof alternate.payload.contextWindow === 'number'
+    && Number.isFinite(alternate.payload.contextWindow)
+    && alternate.payload.contextWindow > 0
+    && canShareUsageContext(preferred, alternate)
+  ) {
+    payload ??= { ...preferred.payload };
+    payload.contextWindow = alternate.payload.contextWindow;
+    payload.contextWindowSource = alternate.payload.contextWindowSource as UsageContextWindowSource;
+  }
+  return payload ? { ...preferred, payload } : preferred;
+}
+
+function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
   const completenessCmp = compareCompleteness(existing, incoming);
   if (completenessCmp !== 0) return completenessCmp > 0 ? incoming : existing;
 
@@ -83,6 +134,23 @@ export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineE
   if (tsCmp !== 0) return tsCmp > 0 ? incoming : existing;
 
   return incoming;
+}
+
+/**
+ * Resolve same-eventId conflicts deterministically.
+ *
+ * Preference order:
+ * 1. full events over preview events
+ * 2. terminal/non-streaming over streaming
+ * 3. newer epoch
+ * 4. newer seq
+ * 5. newer ts
+ * 6. incoming as tie-breaker
+ */
+export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const preferred = choosePreferredTimelineEvent(existing, incoming);
+  const alternate = preferred === existing ? incoming : existing;
+  return supplementUsageSnapshot(preferred, alternate);
 }
 
 export function mergeTimelineEvents(

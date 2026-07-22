@@ -3,10 +3,72 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { vi } from 'vitest';
+
+// This suite exercises the real persistence module. `vi.unmock` is hoisted by
+// Vitest, so it clears any worker-inherited session-store mock BEFORE module
+// resolution starts. A runtime-only `vi.doUnmock` was too late under Node 22's
+// full-suite worker reuse and could yield another test's partial mock object.
+vi.unmock('../../src/store/session-store.js');
 
 // We need to test with a temp path — patch the store path
 let tempDir: string;
+const execFileAsync = promisify(execFile);
+
+async function loadStoreInFreshProcess(sessionName: string): Promise<{
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
+}> {
+  const resultMarker = '__IMCODES_SESSION_STORE_RESULT__';
+  const moduleUrl = new URL('../../src/store/session-store.ts', import.meta.url).href;
+  const script = `
+    const store = await import(process.env.IMCODES_TEST_SESSION_STORE_MODULE_URL);
+    await store.loadStore();
+    await store.flushStore();
+    console.log(${JSON.stringify(resultMarker)} + JSON.stringify(store.getSession(${JSON.stringify(sessionName)})));
+  `;
+  const { stdout } = await execFileAsync(process.execPath, [
+    '--import',
+    'tsx',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: tempDir,
+      IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
+    },
+  });
+  const resultLine = stdout.split(/\r?\n/).find((line) => line.startsWith(resultMarker));
+  if (!resultLine) {
+    throw new Error(`fresh session-store process did not emit its result: ${stdout}`);
+  }
+  return JSON.parse(resultLine.slice(resultMarker.length)) as {
+    sessionInstanceId?: string;
+    runtimeEpoch?: string;
+  };
+}
+
+async function importSessionStore() {
+  // Full-suite workers can inherit partial session-store mocks from other test
+  // files. `doUnmock` followed by a dynamic import is still order-sensitive in
+  // Node 22 worker reuse: a concurrently registered mock can win before module
+  // resolution and return only that mock's partial exports. `importActual`
+  // bypasses the mock registry for this import by contract, while resetModules
+  // below still gives each test a fresh real store instance.
+  // This file also installs a deliberate partial mock in one regression test.
+  // Clear that runtime registration before every import as well as bypassing
+  // the mock registry: some Vitest worker-reuse schedules can otherwise retain
+  // the partial factory after resetModules() and hand it to importActual().
+  vi.doUnmock('../../src/store/session-store.js');
+  return vi.importActual<typeof import('../../src/store/session-store.js')>(
+    '../../src/store/session-store.js',
+  );
+}
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'deck-test-'));
@@ -16,18 +78,32 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true });
   vi.unstubAllEnvs();
+  // The partial-mock regression test must not contaminate later tests in this
+  // file or a reused full-suite worker.
+  vi.doUnmock('../../src/store/session-store.js');
   vi.resetModules();
 });
 
 describe('session-store', () => {
+  it('reloads the real store after a worker-local partial mock registration', async () => {
+    vi.doMock('../../src/store/session-store.js', () => ({
+      listSessions: vi.fn(() => []),
+    }));
+    vi.resetModules();
+
+    const sessionStore = await importSessionStore();
+    expect(sessionStore.loadStore).toBeTypeOf('function');
+    expect(sessionStore.flushStore).toBeTypeOf('function');
+  });
+
   it('starts with empty store', async () => {
-    const { listSessions } = await import('../../src/store/session-store.js');
+    const { listSessions } = await importSessionStore();
     const sessions = listSessions();
     expect(sessions).toEqual([]);
   });
 
   it('upsert and retrieve a session', async () => {
-    const { upsertSession, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_test_brain',
       project: 'test',
@@ -44,7 +120,7 @@ describe('session-store', () => {
   });
 
   it('update session state', async () => {
-    const { upsertSession, updateSessionState, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, updateSessionState, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_p2_w1',
       project: 'p2',
@@ -59,7 +135,7 @@ describe('session-store', () => {
   });
 
   it('persists error reason on error state and clears it on recovery', async () => {
-    const { upsertSession, updateSessionState, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, updateSessionState, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_error_reason_brain',
       projectName: 'p2',
@@ -83,7 +159,7 @@ describe('session-store', () => {
   });
 
   it('remove session', async () => {
-    const { upsertSession, removeSession, getSession } = await import('../../src/store/session-store.js');
+    const { upsertSession, removeSession, getSession } = await importSessionStore();
     upsertSession({
       name: 'deck_del_brain',
       project: 'del',
@@ -98,7 +174,7 @@ describe('session-store', () => {
   });
 
   it('list returns all sessions', async () => {
-    const { upsertSession, listSessions } = await import('../../src/store/session-store.js');
+    const { upsertSession, listSessions } = await importSessionStore();
     upsertSession({ name: 's1', project: 'proj', role: 'brain', agentType: 'claude-code', state: 'idle', pid: 1, startedAt: 0 });
     upsertSession({ name: 's2', project: 'proj', role: 'w1', agentType: 'codex', state: 'running', pid: 2, startedAt: 0 });
     const sessions = listSessions();
@@ -139,7 +215,7 @@ describe('session-store', () => {
           },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       expect(getSession('deck_cc_brain')?.runtimeType).toBe('transport');
       expect(getSession('deck_codex_brain')?.runtimeType).toBe('transport');
@@ -159,7 +235,7 @@ describe('session-store', () => {
           },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       expect(getSession('deck_explicit_brain')?.runtimeType).toBe('process');
     });
@@ -183,7 +259,7 @@ describe('session-store', () => {
           },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       const s = getSession('deck_stuck_brain');
       expect(s?.state).toBe('stopped');
@@ -200,7 +276,7 @@ describe('session-store', () => {
           c: { name: 'c', projectName: 'c', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/c', state: 'stopped', restarts: 2, restartTimestamps: [10, 20], createdAt: 1, updatedAt: 1 },
         },
       });
-      const { loadStore, getSession } = await import('../../src/store/session-store.js');
+      const { loadStore, getSession } = await importSessionStore();
       await loadStore();
       expect(getSession('a')?.state).toBe('idle');
       expect(getSession('b')?.state).toBe('running');
@@ -208,10 +284,74 @@ describe('session-store', () => {
       expect(getSession('c')?.state).toBe('stopped');
       expect(getSession('c')?.restarts).toBe(2);
     });
+
+    it('migrates missing identities once and preserves them across daemon reload', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_legacy_brain: {
+            name: 'deck_legacy_brain', projectName: 'legacy', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/legacy',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      // A daemon reload is a process boundary. Exercise it with two actual
+      // Node processes so this persistence assertion cannot inherit Vitest's
+      // worker-level session-store mocks or module cache.
+      const first = await loadStoreInFreshProcess('deck_legacy_brain');
+      expect(first?.sessionInstanceId).toMatch(/^[0-9a-f-]{36}$/);
+      expect(first?.runtimeEpoch).toMatch(/^[0-9a-f-]{36}$/);
+      const reloaded = await loadStoreInFreshProcess('deck_legacy_brain');
+      expect(reloaded).toMatchObject({
+        sessionInstanceId: first?.sessionInstanceId,
+        runtimeEpoch: first?.runtimeEpoch,
+      });
+    });
+  });
+
+  it('preserves logical identity on updates and changes it after true delete/recreate', async () => {
+    const { upsertSession, removeSession, getSession } = await importSessionStore();
+    const base = {
+      name: 'deck_identity_brain', projectName: 'identity', projectDir: '/tmp/identity',
+      role: 'brain' as const, agentType: 'codex-sdk', state: 'idle' as const,
+      restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    };
+    upsertSession(base);
+    const firstId = getSession(base.name)?.sessionInstanceId;
+
+    upsertSession({ ...base, activeModel: 'gpt-5', state: 'running' });
+    expect(getSession(base.name)?.sessionInstanceId).toBe(firstId);
+
+    removeSession(base.name);
+    upsertSession({ ...base, sessionInstanceId: firstId });
+    expect(getSession(base.name)?.sessionInstanceId).not.toBe(firstId);
+  });
+
+  it('rotates runtimeEpoch only when runtime authority is replaced', async () => {
+    const { upsertSession, getSession } = await importSessionStore();
+    const base = {
+      name: 'deck_runtime_brain', projectName: 'runtime', projectDir: '/tmp/runtime',
+      role: 'brain' as const, agentType: 'codex-sdk', runtimeType: 'transport' as const,
+      providerSessionId: 'provider-1', state: 'idle' as const,
+      restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    };
+    upsertSession(base);
+    const firstEpoch = getSession(base.name)?.runtimeEpoch;
+
+    upsertSession({ ...getSession(base.name)!, activeModel: 'gpt-5', state: 'running' });
+    expect(getSession(base.name)?.runtimeEpoch).toBe(firstEpoch);
+
+    upsertSession({ ...getSession(base.name)!, providerSessionId: 'provider-2', state: 'idle' });
+    const replacedEpoch = getSession(base.name)?.runtimeEpoch;
+    expect(replacedEpoch).not.toBe(firstEpoch);
+
+    upsertSession({ ...getSession(base.name)!, state: 'running' });
+    expect(getSession(base.name)?.runtimeEpoch).toBe(replacedEpoch);
   });
 
   it('does not persist known leaked e2e sessions to sessions.json', async () => {
-    const { upsertSession, flushStore } = await import('../../src/store/session-store.js');
+    const { upsertSession, flushStore } = await importSessionStore();
     upsertSession({
       name: 'deck_bootmainabc123_brain',
       projectName: 'bootmainabc123',

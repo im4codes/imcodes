@@ -309,6 +309,71 @@ describe('ChatView', () => {
     expect(screen.queryByText('chat.user_message_expand')).toBeNull();
   });
 
+  it('parses escaped newlines for timeline display while preserving code examples', () => {
+    const rawText = 'Task: inspect\\n\\nContext:\\n- one\\nsource: `"a\\nb"`';
+    const { container } = render(
+      <ChatView
+        events={[{
+          eventId: 'ordinary-user-message',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: { text: rawText },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_timeline_display_newline"
+      />,
+    );
+
+    expect(container.querySelector('.chat-user-message-fold-content')?.textContent)
+      .toBe('Task: inspect\n\nContext:\n- one\nsource: `"a\\nb"`');
+  });
+
+  it('keeps the original timeline payload when retrying a failed message', () => {
+    const onResendFailed = vi.fn();
+    const rawText = String.raw`Task: inspect\nContext: retry`;
+    render(
+      <ChatView
+        events={[{
+          eventId: 'failed-user-message',
+          type: 'user.message',
+          ts: 1_700_000_000_000,
+          payload: {
+            text: rawText,
+            commandId: 'failed-command',
+            failed: true,
+          },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_timeline_retry_raw"
+        onResendFailed={onResendFailed}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'chat.retrySend' }));
+
+    expect(onResendFailed).toHaveBeenCalledWith('failed-command', rawText);
+  });
+
+  it('parses escaped newlines before rendering assistant timeline markdown', () => {
+    render(
+      <ChatView
+        events={[{
+          eventId: 'assistant-display-newline',
+          type: 'assistant.text',
+          ts: 1_700_000_000_000,
+          payload: { text: 'First\\nSecond with `code\\nvalue`' },
+        }] as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_assistant_display_newline"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy).toHaveBeenCalledWith('First\nSecond with `code\\nvalue`');
+  });
+
   it('suppresses the "no events" placeholder while bootstrap history is still loading (SubSessionWindow flash fix)', () => {
     // Regression test for "本地历史还是没有瞬间加载" / 暂无消息 flash:
     // SubSessionWindow forces `loading={false}` so its ChatView doesn't
@@ -1365,6 +1430,49 @@ describe('ChatView', () => {
       expect(container.textContent).toContain('Fix websocket reconnect loop');
       expect(container.textContent).toContain('chat.memory_context_section_recent');
       expect(container.textContent).toContain('Recent MCP startup injection work');
+    });
+  });
+
+  it('labels supplemental summaries in the existing expandable related-history card', async () => {
+    const { container, getByText } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-summary-sync',
+            type: 'user.message',
+            ts: 1000,
+            payload: { text: 'Continue the sibling work' },
+          },
+          {
+            eventId: 'evt-summary-sync',
+            type: 'memory.context',
+            ts: 1001,
+            payload: {
+              relatedToEventId: 'evt-user-summary-sync',
+              reason: 'message',
+              items: [
+                {
+                  id: 'summary-from-sibling',
+                  projectId: 'codedeck',
+                  summary: 'Sibling session completed the transport retry fix',
+                  projectionClass: 'recent_summary',
+                },
+              ],
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelectorAll('.chat-memory-context')).toHaveLength(1);
+    expect(container.textContent).not.toContain('Sibling session completed the transport retry fix');
+    fireEvent.click(getByText('chat.memory_context_supplemental_title'));
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('chat.memory_context_section_recent');
+      expect(container.textContent).toContain('Sibling session completed the transport retry fix');
     });
   });
 

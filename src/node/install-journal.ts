@@ -1,8 +1,8 @@
 // Recoverable install journal for the controlled node (10.10). Each phase is
 // persisted with fsync + atomic rename so a reboot resumes from the last
 // completed phase. The critical ordering fix: elevation + protected-dir creation
-// happen BEFORE redemption/persistence, so a non-root first run never burns a
-// token it cannot store (which would otherwise loop forever re-redeeming).
+// happen BEFORE redemption/persistence, so a non-root first run never creates
+// a server identity it cannot store (which would otherwise loop forever).
 import { mkdir, open, rename, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { isEnrollmentNodeTokenHash } from '../../shared/remote-exec.js';
@@ -364,8 +364,8 @@ export async function writeInstallPhase(
 
 /**
  * Whether a first run may attempt redemption. Redemption MUST come AFTER
- * elevation + the protected credential dir exists, so a used token is never
- * burned without a place to persist the resulting credential (10.10 / N5).
+ * elevation + the protected credential dir exists, so a server identity is
+ * never created without a place to persist the resulting credential.
  */
 export function mayRedeem(phase: InstallPhase): boolean {
   return phaseIndex(phase) >= phaseIndex('files_staged');

@@ -27,6 +27,27 @@ function event(overrides: Partial<TimelineEvent>): TimelineEvent {
 }
 
 describe('timeline history transport sanitization', () => {
+  it('filters already-persisted Claude synthetic seed assistant text from history payloads', () => {
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'synthetic-seed',
+        type: 'assistant.text',
+        payload: { text: 'No response requested.', streaming: false },
+      }),
+      event({
+        eventId: 'real-response',
+        type: 'assistant.text',
+        ts: 2,
+        seq: 2,
+        payload: { text: 'real response', streaming: false },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.eventId).toBe('real-response');
+    expect(result.events[0]?.payload.text).toBe('real response');
+  });
+
   it('preserves full chat text and streaming typewriter updates in history payloads', () => {
     const userText = `user:${'u'.repeat(80 * 1024)}`;
     const streamingText = `typing:${'t'.repeat(80 * 1024)}`;
@@ -263,6 +284,50 @@ describe('timeline history transport sanitization', () => {
     expect(result.events[0]?.payload.detail).toMatchObject({
       summary: 'Newest progress',
       meta: { canonicalKey: 'claude:deck_hist:task-order' },
+    });
+  });
+
+  it('preserves token occupancy and provider context when newer inferred metadata shares the usage event id', () => {
+    const eventId = 'transport:deck_hist:msg-opencode:usage';
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId,
+        type: 'usage.update',
+        ts: 10,
+        seq: 8,
+        payload: {
+          inputTokens: 22,
+          cacheTokens: 36_608,
+          outputTokens: 10,
+          model: 'opencode/deepseek-v4-flash-free',
+          contextWindow: 200_000,
+          contextWindowSource: 'provider',
+          streaming: false,
+        },
+      }),
+      event({
+        eventId,
+        type: 'usage.update',
+        ts: 10,
+        seq: 14,
+        payload: {
+          model: 'opencode/deepseek-v4-flash-free',
+          contextWindow: 1_000_000,
+        },
+      }),
+    ]);
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]).toMatchObject({
+      seq: 14,
+      payload: {
+        inputTokens: 22,
+        cacheTokens: 36_608,
+        outputTokens: 10,
+        model: 'opencode/deepseek-v4-flash-free',
+        contextWindow: 200_000,
+        contextWindowSource: 'provider',
+      },
     });
   });
 

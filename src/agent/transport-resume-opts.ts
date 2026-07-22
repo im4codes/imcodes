@@ -7,7 +7,8 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
   return agentType === 'cursor-headless'
     || agentType === 'copilot-sdk'
     || agentType === 'kimi-sdk'
-    || agentType === 'grok-sdk';
+    || agentType === 'grok-sdk'
+    || agentType === 'opencode-sdk';
 }
 
 /**

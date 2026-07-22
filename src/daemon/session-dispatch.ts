@@ -1,4 +1,10 @@
+import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
+import {
+  PEER_AUDIT_CONTRACT_VERSION,
+  PEER_AUDIT_PREFLIGHT_ERRORS,
+  type PeerAuditDispatchReceipt,
+} from '../../shared/peer-audit.js';
 import {
   AGENT_DELEGATION_CONTEXT_HEADER,
   AGENT_DELEGATION_CONTEXT_OMITTED_MARKER,
@@ -16,9 +22,12 @@ import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
-import type { SessionRecord } from '../store/session-store.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
+import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
+import { ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { enqueueResend } from './transport-resend-queue.js';
+import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import type { TimelineEvent } from './timeline-event.js';
 
@@ -139,9 +148,27 @@ export async function dispatchSessionMessage(
   message: string,
   options: SessionDispatchMessageOptions,
 ): Promise<SessionDispatchMessageResult> {
-  if (target.runtimeType === 'transport') {
+  if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     const runtime = getTransportRuntime(target.name);
-    if (!runtime) throw new Error(`no transport runtime for session ${target.name}`);
+    if (!runtime?.providerSessionId) {
+      const queued = enqueueResend(target.name, {
+        text: message,
+        commandId: options.messageId,
+        clientMessageId: options.messageId,
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        queuedAt: Date.now(),
+      });
+      if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...buildTransportQueueSnapshotPayload(target.name, 'session_dispatch_missing_runtime'),
+      }, { source: 'daemon', confidence: 'high' });
+      // Do not await provider startup on the inbound webhook path. The durable
+      // resend entry is now authoritative; launch/restore drains it and owns
+      // the eventual single user.message projection.
+      void ensureTransportRuntimeForPendingResend(target.name);
+      return 'queued';
+    }
     const result = options.sharedActor
       ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
       : runtime.send(message, options.messageId);
@@ -159,6 +186,108 @@ export async function dispatchSessionMessage(
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
   await sendProcessSessionMessageForAutomation(target.name, message);
+}
+
+/** Resolve a named session and deliver through the runtime-neutral boundary.
+ * The selected runtime owns the single user.timeline projection: transport
+ * dispatch emits its structured event, while the process sender emits before
+ * entering its serialized terminal delivery path. */
+export async function dispatchSessionMessageByName(
+  sessionName: string,
+  message: string,
+  deps: {
+    getSession?: (name: string) => SessionRecord | undefined;
+    dispatchMessage?: typeof dispatchSessionMessage;
+  } = {},
+): Promise<SessionDispatchMessageResult> {
+  const target = (deps.getSession ?? getStoredSession)(sessionName);
+  if (!target) throw new Error(`session not found: ${sessionName}`);
+  return (deps.dispatchMessage ?? dispatchSessionMessage)(target, message, {
+    dispatchId: createSendDispatchId(),
+    messageId: createSendMessageId(),
+  });
+}
+
+export type PeerAuditDispatchResult =
+  | { ok: true; receipt: PeerAuditDispatchReceipt }
+  | { ok: false; error: PeerAuditProcessInjectError };
+
+/**
+ * Peer-audit-only dispatch. This deliberately does not share the manual
+ * delegation wrapper, visible user timeline event, or process terminal-key
+ * fallback. The receipt is captured before any wrapper can discard the
+ * transport sent/queued disposition.
+ */
+export async function dispatchPeerAuditMessage(input: {
+  target: SessionRecord;
+  brief: string;
+  attemptId: string;
+  /**
+   * Effect-revision barrier for the unrevocable process path, evaluated at the
+   * final boundary under the send lock. Omitted means "no revision to check".
+   */
+  isEffectCurrent?: () => boolean;
+}): Promise<PeerAuditDispatchResult> {
+  const { target } = input;
+  if (!target.sessionInstanceId || !target.runtimeEpoch) {
+    return { ok: false, error: PEER_AUDIT_PREFLIGHT_ERRORS.TARGET_INELIGIBLE };
+  }
+  const dispatchId = createSendDispatchId();
+  const messageId = createSendMessageId();
+
+  if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
+    const runtime = getTransportRuntime(target.name);
+    if (!runtime) return { ok: false, error: PEER_AUDIT_PREFLIGHT_ERRORS.TARGET_INELIGIBLE };
+    const disposition = runtime.send(input.brief, messageId, undefined, undefined, {
+      peerAudit: {
+        contractVersion: PEER_AUDIT_CONTRACT_VERSION,
+        attemptHash: createHash('sha256').update(input.attemptId).digest('base64url'),
+      },
+    });
+    const queueEpoch = disposition === 'queued'
+      ? buildTransportQueueSnapshotPayload(target.name, 'peer_audit').queueEpoch
+      : undefined;
+    return {
+      ok: true,
+      receipt: {
+        disposition,
+        dispatchId,
+        messageId,
+        targetSessionInstanceId: target.sessionInstanceId,
+        targetRuntimeEpoch: target.runtimeEpoch,
+        ...(queueEpoch ? { queueEpoch } : {}),
+      },
+    };
+  }
+
+  // A process runtime cannot revoke a terminal injection after acceptance, so
+  // the idle/identity/effect check and the write must be one atomic critical
+  // section against authoritative state — never this pre-lock snapshot. The
+  // injector also keeps the capability-bearing brief out of the timeline,
+  // history, and memory, and never falls back to an ordinary send.
+  const injected = await injectPeerAuditBriefIntoProcessSession({
+    targetSessionName: target.name,
+    expectedSessionInstanceId: target.sessionInstanceId,
+    expectedRuntimeEpoch: target.runtimeEpoch,
+    brief: input.brief,
+    ...(input.isEffectCurrent ? { isEffectCurrent: input.isEffectCurrent } : {}),
+  });
+  if (!injected.ok) return injected;
+  return {
+    ok: true,
+    receipt: {
+      disposition: 'sent_unrevocable',
+      dispatchId,
+      messageId,
+      targetSessionInstanceId: target.sessionInstanceId,
+      targetRuntimeEpoch: target.runtimeEpoch,
+    },
+  };
+}
+
+/** Exact queued-message cancellation for a revocable transport peer audit. */
+export function cancelQueuedPeerAuditMessage(targetSessionName: string, messageId: string): boolean {
+  return Boolean(getTransportRuntime(targetSessionName)?.removePendingMessage(messageId));
 }
 
 function emitStructuredTransportUserMessage(

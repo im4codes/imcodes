@@ -12,6 +12,8 @@ import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
 import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
+import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
+import { rememberClientTimezone } from '../util/client-timezone.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -227,6 +229,9 @@ authRoutes.get('/user/me', async (c) => {
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'not_found' }, 404);
+  await rememberClientTimezone(c.env.DB, userId, c.req.header(CLIENT_TIMEZONE_HEADER)).catch((err) => {
+    logger.warn({ err, userId }, 'Failed to remember client timezone');
+  });
   return c.json(toClientUser(user));
 });
 

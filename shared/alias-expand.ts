@@ -31,6 +31,7 @@ export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpans
   'codex': 'legend',
   'copilot-sdk': 'legend',
   'cursor-headless': 'legend',
+  'opencode-sdk': 'legend',
   'opencode': 'legend',
   'gemini-sdk': 'legend',
   'grok-sdk': 'legend',

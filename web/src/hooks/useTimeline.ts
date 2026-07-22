@@ -394,6 +394,18 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 
 const MAX_MEMORY_EVENTS = 300;
 const MAX_HISTORY_EVENTS = 2000;
+
+/**
+ * The initial window stays small, but once the user has paged older history
+ * into memory, realtime events must not collapse that expanded window back to
+ * 300. Doing so made the visible conversation appear to clear after every new
+ * message. Keep the larger bounded history window until the session changes.
+ */
+function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): number {
+  return eventSets.some((events) => events.length > MAX_MEMORY_EVENTS)
+    ? MAX_HISTORY_EVENTS
+    : MAX_MEMORY_EVENTS;
+}
 const MAX_CACHED_SESSIONS = 12;
 
 // A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
@@ -844,7 +856,7 @@ function flushPendingTimelineCacheIngests(): void {
     const incoming = [...byEventId.values()];
     if (incoming.length === 0) continue;
     const existing = getCachedEvents(cacheKey) ?? [];
-    const merged = mergeTimelineEvents(existing, incoming, MAX_MEMORY_EVENTS);
+    const merged = mergeTimelineEvents(existing, incoming, retainedTimelineMergeLimit(existing));
     if (merged !== existing) setCachedEvents(cacheKey, merged);
     persistTimelineEvents(cacheKey, incoming);
   }
@@ -888,7 +900,10 @@ function getSharedTimelineBase(
   if (!shared || shared === localEvents) return localEvents;
   if (shared.length === 0) return localEvents;
   if (localEvents.length === 0) return shared;
-  return mergeTimelineEvents(shared, localEvents, maxEvents);
+  const effectiveMax = maxEvents === MAX_MEMORY_EVENTS
+    ? retainedTimelineMergeLimit(shared, localEvents)
+    : maxEvents;
+  return mergeTimelineEvents(shared, localEvents, effectiveMax);
 }
 
 /**
@@ -1057,7 +1072,7 @@ export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: str
   }
   dropPendingTimelineCacheIngest(cacheKey, event.eventId);
   const existing = getCachedEvents(cacheKey) ?? [];
-  const merged = mergeTimelineEvents(existing, [event], MAX_MEMORY_EVENTS);
+  const merged = mergeTimelineEvents(existing, [event], retainedTimelineMergeLimit(existing));
   if (merged !== existing) setCachedEvents(cacheKey, merged);
   persistTimelineEvents(cacheKey, [event]);
 }
@@ -1888,7 +1903,7 @@ export function useTimeline(
       updateHistoryStep('cache', 'done', 'bootstrap');
       if (stored.length > 0) {
         const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
-        const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
+        const restored = mergeTimelineEvents(existing, stored, retainedTimelineMergeLimit(existing));
         setCachedEvents(cacheKey!, restored);
         setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
@@ -2594,7 +2609,7 @@ export function useTimeline(
     setEvents((prev) => {
       const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       const base = removeReconciledLocalUserMessages(sharedBase, [event]);
-      const result = mergeTimelineEvents(base, [event], MAX_MEMORY_EVENTS);
+      const result = mergeTimelineEvents(base, [event], retainedTimelineMergeLimit(base));
       if (result === base) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
@@ -2606,9 +2621,12 @@ export function useTimeline(
    *  Uses two-pointer merge instead of concatenate + full sort. */
   const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
     setEvents((prev) => {
-      const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, maxEvents);
+      const effectiveMax = maxEvents === MAX_MEMORY_EVENTS
+        ? retainedTimelineMergeLimit(prev, getCachedEvents(cacheKeyRef.current ?? '') ?? [])
+        : maxEvents;
+      const sharedBase = getSharedTimelineBase(cacheKeyRef.current, prev, effectiveMax);
       const base = removeReconciledLocalUserMessages(sharedBase, incoming);
-      const result = mergeTimelineEvents(base, incoming, maxEvents);
+      const result = mergeTimelineEvents(base, incoming, effectiveMax);
       if (result === base) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
@@ -3037,7 +3055,7 @@ export function useTimeline(
     const localSnapshot = loadPersistedTimelineSnapshotWithFallback(key, rawSessionId);
     if (localSnapshot.length > 0) {
       const existing = getSharedTimelineBase(key, eventsRef.current, MAX_MEMORY_EVENTS);
-      const restored = mergeTimelineEvents(existing, localSnapshot, MAX_MEMORY_EVENTS);
+      const restored = mergeTimelineEvents(existing, localSnapshot, retainedTimelineMergeLimit(existing));
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
       const snapshotCursor = deriveLocalCursor(localSnapshot);
@@ -3054,7 +3072,7 @@ export function useTimeline(
     }
     if (stored.length > 0) {
       const existing = getSharedTimelineBase(key, eventsRef.current, MAX_MEMORY_EVENTS);
-      const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
+      const restored = mergeTimelineEvents(existing, stored, retainedTimelineMergeLimit(existing));
       setCachedEvents(key, restored);
       setEvents((prev) => (prev === restored ? prev : restored));
       // Single completeness gate (forceRefresh path): don't lock path-2 on a
@@ -3362,7 +3380,11 @@ export function useTimeline(
                 rememberSettledCommandId(echoCommandId);
                 if (idx >= 0) {
                   const withoutOptimistic = base.filter((_, index) => index !== idx);
-                  const updated = mergeTimelineEvents(withoutOptimistic, [event], MAX_MEMORY_EVENTS);
+                  const updated = mergeTimelineEvents(
+                    withoutOptimistic,
+                    [event],
+                    retainedTimelineMergeLimit(withoutOptimistic),
+                  );
                   if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
                   userMessageAlreadyMerged = true;
                   return updated;
@@ -3389,7 +3411,11 @@ export function useTimeline(
                 rememberSettledCommandId(removedCommandId);
               }
               const withoutOptimistic = base.filter((_, index) => index !== optimisticTextIdx);
-              const updated = mergeTimelineEvents(withoutOptimistic, [event], MAX_MEMORY_EVENTS);
+              const updated = mergeTimelineEvents(
+                withoutOptimistic,
+                [event],
+                retainedTimelineMergeLimit(withoutOptimistic),
+              );
               if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
               userMessageAlreadyMerged = true;
               return updated;
@@ -3528,7 +3554,11 @@ export function useTimeline(
           if (hadProvisionalTransportHistory) {
             const next = withoutProvisionalTransportHistory.length === 0
               ? msg.events
-              : mergeTimelineEvents(withoutProvisionalTransportHistory, msg.events, MAX_MEMORY_EVENTS);
+              : mergeTimelineEvents(
+                withoutProvisionalTransportHistory,
+                msg.events,
+                retainedTimelineMergeLimit(withoutProvisionalTransportHistory),
+              );
             replaceEvents(next);
           } else {
             mergeEvents(msg.events);

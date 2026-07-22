@@ -123,6 +123,20 @@ IM.codes は、自分で書いた supervisor の指示で、対応する agent s
 
 ## 主な機能
 
+### プライベートエイリアス
+
+ユーザー所有の再利用可能なテキスト断片を保存し、composer で `;` を入力して検索するか、`;;(name)` マーカーを直接挿入できます。メッセージにはマーカーが表示されたまま、IM.codes が値を帯域外で解決して agent に渡します。Agent は managed MCP tools からエイリアスの作成・検索・編集・解決もできます。一覧取得はメタデータのみを返すため、1 回の呼び出しですべての値がモデルコンテキストへ流出しません。
+
+### 制御対象ノード
+
+別のマシンを完全な IM.codes source server にせず、制限付きの controlled node として登録できます。`^` でターゲットを補完するか、`^^(name)` を直接挿入すると、許可された agent が scoped remote command、単一ファイル転送、型付き Computer Use tool をそのノードで実行できます。実行権限は所有者が有効化・取り消しでき、controlled node は通常の server/session 一覧には表示されず、各マシンは独立した認証情報を持ちます。ダウンロードリンクには有効期限がありますが、新しく取得したインストーラーは保存して複数マシンの登録に再利用できます。
+
+### Computer Use とブラウザ自動化
+
+対応 SDK agent は型付き Computer Use tool でデスクトップアプリを操作できます。クロスプラットフォームのデスクトップアプリ操作には、Leo（[iFurySt](https://github.com/iFurySt)）による MIT ライセンスの [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) を統合しています。この統合機能について同プロジェクトに明確なクレジットを表します。
+
+ブラウザ自動化は別個に IM.codes が実装した Chrome DevTools Protocol（CDP）ベースの機能です。ページの起動、検査、移動、クリック、入力、スクリプト評価に対応し、既定では構造化テキストを返し、要求時のみスクリーンショットを添付します。管理対象ブラウザはローカルループバック限定の CDP endpoint も公開するため、ローカルの Python / Node script が同じ実行中の browser instance を再利用できます。
+
 ### リモートターミナル
 SSH、VPN、ポート開放なしで、任意のブラウザから agent session の端末に完全アクセスできます。
 

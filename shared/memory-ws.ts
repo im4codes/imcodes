@@ -74,6 +74,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
   CODEX_SDK: 'codex-sdk',
   QODER_SDK: 'qoder-sdk',
   CURSOR_HEADLESS: 'cursor-headless',
+  OPENCODE_SDK: 'opencode-sdk',
   QWEN: 'qwen',
 } as const;
 
@@ -86,6 +87,7 @@ export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
   MEMORY_MCP_PROVIDER_ID.QODER_SDK,
   MEMORY_MCP_PROVIDER_ID.CURSOR_HEADLESS,
+  MEMORY_MCP_PROVIDER_ID.OPENCODE_SDK,
   MEMORY_MCP_PROVIDER_ID.QWEN,
 ] as const;
 

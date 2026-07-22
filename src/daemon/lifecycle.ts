@@ -5,6 +5,7 @@ import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
+import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
@@ -15,6 +16,7 @@ import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveE
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import { peerAuditService } from './peer-audit-service.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { startHookServer, drainQueue } from './hook-server.js';
@@ -25,7 +27,6 @@ import net from 'node:net';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
-import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
@@ -131,6 +132,17 @@ export interface DaemonContext {
   removeBinding(platform: string, channelId: string, botId: string): Promise<boolean>;
   /** Send a session event (started/stopped/error) to the CF Worker for relay to browsers. */
   sendSessionEvent(event: 'started' | 'stopped' | 'error', session: string, state: string): void;
+}
+
+/** Route an external chat message through the same runtime-neutral delivery
+ * boundary as Web/CLI sends so summary sync, serialization, and timeline
+ * ownership cannot drift from ordinary user-visible delivery. */
+export async function sendExternalMessageToSession(
+  sessionName: string,
+  text: string,
+  sender = dispatchSessionMessageByName,
+): Promise<void> {
+  await sender(sessionName, text);
 }
 
 let ctx: DaemonContext | null = null;
@@ -725,6 +737,8 @@ export async function startup(): Promise<DaemonContext> {
             serverLink.send({
               type: 'subsession.sync',
               id,
+              sessionInstanceId: session.sessionInstanceId ?? null,
+              runtimeEpoch: session.runtimeEpoch ?? null,
               // Including state here fixes "sidebar sub-session dot stuck
               // gray after reconnect" — see buildSubSessionSync for the
               // equivalent fix on the regular sync path.
@@ -806,6 +820,7 @@ export async function startup(): Promise<DaemonContext> {
       void drainQueue(e.sessionId);
     }
   });
+  peerAuditService.init();
 
   const backfillLiveContextFromTimeline = async (): Promise<void> => {
     const startedAt = Date.now();
@@ -1034,11 +1049,7 @@ export async function startup(): Promise<DaemonContext> {
           logger.warn({ err: e, platform, channelId }, 'sendOutbound failed');
         }
       },
-      sendToSession: async (sessionName, text) => {
-        const record = (await import('../store/session-store.js')).getSession(sessionName);
-        const cwd = record?.agentType === 'gemini' ? record?.projectDir : undefined;
-        await sendKeys(sessionName, text, cwd ? { cwd } : undefined);
-      },
+      sendToSession: sendExternalMessageToSession,
       persistBinding,
       removeBinding,
     });
@@ -1316,6 +1327,11 @@ async function autoReconnectProviders(): Promise<void> {
 /** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
 export async function shutdown(exitCode = 0): Promise<void> {
   logger.info('Daemon shutting down');
+
+  // Peer-audit attempts are intentionally not restart-resumable. Cancel
+  // deadlines/queued dispatches and close the dedicated reply ingress before
+  // timeline and queue stores are drained.
+  peerAuditService.shutdown();
 
   // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
   if ((BACKEND as string) === 'conpty') {

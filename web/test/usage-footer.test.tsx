@@ -16,7 +16,6 @@ vi.mock('react-i18next', () => ({
       const translations: Record<string, string> = {
         'session.state_idle': 'Agent idle — waiting for input',
         'session.state_running': 'Agent working...',
-        'session.state_running_detail': 'Agent working: {{detail}}',
         'session.state_error': 'Session error',
         'session.state_error_detail': 'Error: {{error}}',
         'session.state_stop_requested': 'Stop requested',
@@ -144,18 +143,21 @@ describe('UsageFooter', () => {
     expect(children.indexOf(ctxBar as Element)).toBeLessThan(children.indexOf(statsRow as Element));
   });
 
-  it('shows transport activity detail when running is blocked by a specific reason', () => {
+  it('hides internal transport activity reasons from the user-facing working status', () => {
     const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
         sessionName="deck_test_brain"
         sessionState="running"
-        transportActivityDetail="provider_compaction"
+        transportActivityDetail="runtime_dispatch, act, provider_compaction"
       />,
     );
 
     const liveStatus = container.querySelector('.session-live-status-inline.running');
-    expect(liveStatus?.textContent).toContain('Agent working: provider_compaction');
+    expect(liveStatus?.textContent).toContain('Agent working...');
+    expect(liveStatus?.textContent).not.toContain('runtime_dispatch');
+    expect(liveStatus?.textContent).not.toContain('act');
+    expect(liveStatus?.textContent).not.toContain('provider_compaction');
   });
 
   it('shows the concrete session error reason from the session summary', () => {
@@ -204,8 +206,39 @@ describe('UsageFooter', () => {
       expect(container.querySelector('.session-ctx-bar')?.className).toContain('is-burning');
     });
     const burn = container.querySelector('.session-ctx-burn') as HTMLElement | null;
+    const edge = container.querySelector('.session-ctx-burn-edge') as HTMLElement | null;
     expect(burn).toBeTruthy();
     expect(burn?.style.width).toBe('0.8%');
+    expect(edge).toBeTruthy();
+    expect(edge?.style.left).toBe('0.8%');
+  });
+
+  it('moves the MiniMax ctx endpoint and cache segment from live stream usage', async () => {
+    const usage = (inputTokens: number, cacheTokens: number) => ({
+      inputTokens,
+      cacheTokens,
+      contextWindow: 1_000_000,
+      contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PRESET,
+      model: 'MiniMax-M3',
+    });
+    const { container, rerender } = render(
+      <UsageFooter usage={usage(437_967, 0)} sessionName="deck_sub_minimax" />,
+    );
+
+    const input = () => container.querySelector('.session-ctx-input') as HTMLElement | null;
+    const cache = () => container.querySelector('.session-ctx-cache') as HTMLElement | null;
+    expect(input()?.style.width).toBe('43.7967%');
+    expect(cache()?.style.width).toBe('0%');
+
+    // Real MiniMax stream fixture: 5,063 uncached + 452,608 cache-read tokens.
+    rerender(<UsageFooter usage={usage(5_063, 452_608)} sessionName="deck_sub_minimax" />);
+
+    await waitFor(() => {
+      expect(cache()?.style.width).toBe('45.2608%');
+      expect(input()?.style.width).toBe('0.5063%');
+      expect(input()?.style.left).toBe('45.2608%');
+      expect((container.querySelector('.session-ctx-burn-edge') as HTMLElement | null)?.style.left).toBe('45.7671%');
+    });
   });
 
   it('keeps the robot status visible for idle or unknown agent states', () => {
@@ -481,9 +514,10 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-live-status-inline.idle')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-inline.waiting')).toBeNull();
-    expect(container.querySelector('.session-live-status-text')).toBeNull();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
+    expect(container.querySelector('.session-live-status-inline.waiting')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.waiting .session-live-status-emoji.wait')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Checking whether the task is complete...');
   });
 
   it('shows a result indicator when idle has a supervised outcome status', () => {
@@ -604,6 +638,23 @@ describe('UsageFooter', () => {
     );
 
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 258k (39%)');
+  });
+
+  it('uses a preset-sourced 1M window before model-family inference', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 100_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          contextWindowSource: USAGE_CONTEXT_WINDOW_SOURCES.PRESET,
+          model: 'claude-haiku-4-5',
+        }}
+        sessionName="deck_test_brain"
+      />,
+    );
+
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 100k / 1M (10%)');
   });
 
   it('honors Codex provider effective GPT-5.5 context window', () => {

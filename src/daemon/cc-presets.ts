@@ -13,6 +13,7 @@ import { homedir } from 'node:os';
 import {
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
+  normalizeCcPresetContextWindow,
   normalizeCcPresetName,
   type CcPreset,
   type CcPresetModelInfo,
@@ -66,10 +67,20 @@ function normalizePreset(raw: unknown): CcPreset | null {
   const defaultModel = typeof record.defaultModel === 'string'
     ? record.defaultModel.trim()
     : '';
+  const configuredContextWindow = typeof record.contextWindow === 'number'
+    && Number.isFinite(record.contextWindow)
+    && record.contextWindow > 0
+    ? record.contextWindow
+    : undefined;
+  const effectiveModel = envRecord['ANTHROPIC_MODEL']?.trim()
+    || defaultModel
+    || envRecord['OPENAI_MODEL']?.trim()
+    || undefined;
+  const contextWindow = normalizeCcPresetContextWindow(configuredContextWindow, effectiveModel);
   return {
     name,
     env: envRecord,
-    ...(typeof record.contextWindow === 'number' ? { contextWindow: record.contextWindow } : {}),
+    ...(contextWindow ? { contextWindow } : {}),
     ...(typeof record.initMessage === 'string' ? { initMessage: record.initMessage } : {}),
     ...(record.transportMode === 'qwen-compatible-api' || record.transportMode === 'claude-cli-preset'
       ? { transportMode: record.transportMode }

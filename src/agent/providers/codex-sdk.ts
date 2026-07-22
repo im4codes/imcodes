@@ -30,6 +30,7 @@ import {
   SDK_TURN_LOST_REASON,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../../shared/imcodes-send.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type {
   ActivityGeneration,
@@ -64,15 +65,18 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-serve
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_ACTIONS,
   SDK_SUBAGENT_DIAGNOSTIC,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   buildSdkSubagentSafeDetail,
   isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
   readSdkSubagentStartedAtMs,
+  sanitizeSdkSubagentText,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
@@ -218,6 +222,8 @@ interface CodexTrackedSubagentThread {
   sessionId: string;
   callId: string;
   agentId: string;
+  /** Stable orchestration path (for example `/root/disk_deep_audit`). */
+  agentPath?: string;
   agentName?: string;
   prompt?: string;
   model?: string;
@@ -229,6 +235,7 @@ interface CodexTrackedSubagentThread {
 
 interface CodexChildSubagentRolloutSnapshot {
   agentId: string;
+  agentPath?: string;
   parentThreadId: string;
   rolloutPath: string;
   cwd?: string;
@@ -267,6 +274,7 @@ function codexRolloutPayload(record: Record<string, any>): Record<string, any> {
 function readCodexChildSubagentSpawn(payload: Record<string, any>): {
   parentThreadId: string;
   agentId?: string;
+  agentPath?: string;
   agentName?: string;
 } | null {
   const source = isRecord(payload.source) ? payload.source : undefined;
@@ -282,13 +290,20 @@ function readCodexChildSubagentSpawn(payload: Record<string, any>): {
     ?? meaningfulString(spawn?.threadId)
     ?? meaningfulString(spawn?.agent_path)
     ?? meaningfulString(spawn?.agentPath);
+  const agentPath = meaningfulString(spawn?.agent_path)
+    ?? meaningfulString(spawn?.agentPath);
   const agentName = meaningfulString(payload.agent_nickname)
     ?? meaningfulString(spawn?.agent_nickname)
     ?? meaningfulString(spawn?.agentNickname)
     ?? meaningfulString(payload.agent_role)
     ?? meaningfulString(spawn?.agent_role)
     ?? meaningfulString(spawn?.agentRole);
-  return { parentThreadId, ...(agentId ? { agentId } : {}), ...(agentName ? { agentName } : {}) };
+  return {
+    parentThreadId,
+    ...(agentId ? { agentId } : {}),
+    ...(agentPath ? { agentPath } : {}),
+    ...(agentName ? { agentName } : {}),
+  };
 }
 
 function readCodexRolloutUserMessage(payload: Record<string, any>): string | undefined {
@@ -385,6 +400,7 @@ async function readCodexChildSubagentRolloutSnapshot(
   if (!agentId) return null;
   return {
     agentId,
+    ...(spawn.agentPath ? { agentPath: spawn.agentPath } : {}),
     parentThreadId: spawn.parentThreadId,
     rolloutPath,
     ...(cwd ? { cwd } : {}),
@@ -845,17 +861,47 @@ interface CodexSdkSessionState {
   nativePlanEventSeen?: boolean;
 }
 
-function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
-  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
-  if (!server) return undefined;
+/**
+ * Per-session identity for the model's SHELL tool.
+ *
+ * All codex-sdk sessions share ONE app-server process, so the daemon cannot put
+ * `IMCODES_SESSION` in the app-server's process env — every session's
+ * `imcodes send` would then impersonate a single identity. The `turn/start`
+ * `env` param we also send is silently dropped by codex 0.144.1 (only the
+ * one-off `command/exec` RPC accepts `env`; `TurnStartParams`/`ThreadStartParams`
+ * do not).
+ *
+ * `shell_environment_policy.set` DOES reach the shell tool and MERGES on top of
+ * the inherited environment (verified: PATH/HOME survive), and thread/start's
+ * `config` is applied PER-THREAD — so this gives each session's shell its own
+ * `IMCODES_SESSION` with no cross-session impersonation, making `imcodes send`
+ * auto-detect identity without the agent hand-setting it.
+ */
+function buildCodexShellEnvironmentSet(config: SessionConfig): Record<string, string> | undefined {
+  const env = config.env ?? {};
+  const sessionName = env[IMCODES_SESSION_ENV] ?? config.sessionName;
+  if (!sessionName) return undefined;
   return {
-    mcp_servers: {
-      [IMCODES_MEMORY_MCP_SERVER_NAME]: {
-        command: server.command,
-        args: server.args,
-        env: server.env,
+    [IMCODES_SESSION_ENV]: sessionName,
+    [IMCODES_SESSION_LABEL_ENV]: env[IMCODES_SESSION_LABEL_ENV] ?? config.label ?? sessionName,
+  };
+}
+
+export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
+  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+  const shellEnvSet = buildCodexShellEnvironmentSet(config);
+  if (!server && !shellEnvSet) return undefined;
+  return {
+    ...(server ? {
+      mcp_servers: {
+        [IMCODES_MEMORY_MCP_SERVER_NAME]: {
+          command: server.command,
+          args: server.args,
+          env: server.env,
+        },
       },
-    },
+    } : {}),
+    ...(shellEnvSet ? { shell_environment_policy: { set: shellEnvSet } } : {}),
   };
 }
 
@@ -1618,6 +1664,100 @@ function customToolTerminalFromOutput(item: Record<string, any>): {
     : { status: 'complete', terminalStatus: 'succeeded', terminalReason: 'provider_result', output };
 }
 
+function codexCustomToolScript(tool: ToolCallEvent | undefined): string | undefined {
+  const input = isRecord(tool?.input) ? tool.input : undefined;
+  return meaningfulString(input?.command) ?? meaningfulString(input?.script);
+}
+
+function readCodexExecCommandDescription(script: string): string | undefined {
+  const match = script.match(/\bcmd\s*:\s*("(?:\\.|[^"\\])*")/s);
+  if (!match?.[1]) return undefined;
+  try {
+    return sanitizeSdkSubagentText(JSON.parse(match[1]), 180);
+  } catch {
+    return undefined;
+  }
+}
+
+function readCodexBackgroundExecSessionId(value: unknown, depth = 0): string | undefined {
+  if (depth > 5 || value == null) return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined;
+    try {
+      return readCodexBackgroundExecSessionId(JSON.parse(trimmed), depth + 1);
+    } catch {
+      return undefined;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const sessionId = readCodexBackgroundExecSessionId(entry, depth + 1);
+      if (sessionId) return sessionId;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+
+  const sessionId = finiteNumber(value.session_id) ?? meaningfulString(value.session_id);
+  const chunkId = meaningfulString(value.chunk_id);
+  if (sessionId !== undefined && chunkId) return String(sessionId);
+
+  for (const key of ['text', 'output', 'content', 'result']) {
+    const nestedSessionId = readCodexBackgroundExecSessionId(value[key], depth + 1);
+    if (nestedSessionId) return nestedSessionId;
+  }
+  return undefined;
+}
+
+function codexBackgroundShellToolFromCustomToolOutput(
+  sessionId: string,
+  prior: ToolCallEvent | undefined,
+  outputItem: Record<string, any>,
+): ToolCallEvent | null {
+  const script = codexCustomToolScript(prior);
+  if (!script || !/\btools\.exec_command\s*\(/.test(script)) return null;
+  const runtimeSessionId = readCodexBackgroundExecSessionId(
+    outputItem.output ?? outputItem.result ?? outputItem.content,
+  );
+  if (!runtimeSessionId) return null;
+
+  const canonicalKey = makeCodexSubagentCanonicalKey(sessionId, `shell:${runtimeSessionId}`);
+  const description = readCodexExecCommandDescription(script) ?? 'Bash';
+  const detail = buildSdkSubagentSafeDetail({
+    kind: SDK_SUBAGENT_DETAIL_KIND,
+    summary: description,
+    input: {
+      action: SDK_SUBAGENT_ACTIONS.CODEX_BACKGROUND_SHELL,
+      description,
+    },
+    meta: {
+      isSdkSubagent: true,
+      schemaVersion: SDK_SUBAGENT_SCHEMA_VERSION,
+      provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+      providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+      canonicalKey,
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      rawStatus: 'running',
+      active: true,
+      terminal: false,
+      parentSessionId: sessionId,
+      parentItemId: meaningfulString(prior?.id),
+      taskId: runtimeSessionId,
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      startedAtMs: Date.now(),
+    },
+  } satisfies SdkSubagentDetail, { allowRaw: false });
+
+  return {
+    id: canonicalKey,
+    name: 'Bash',
+    status: 'running',
+    ...(detail.input ? { input: detail.input } : {}),
+    detail,
+  };
+}
+
 function rawChecklistText(item: Record<string, unknown>): string | undefined {
   for (const key of ['content', 'step', 'text', 'title', 'task', 'description', 'name']) {
     const value = item[key];
@@ -1728,11 +1868,34 @@ function readRawSpawnAgentId(record: Record<string, any>): string | undefined {
     ?? meaningfulString(record.id);
 }
 
+function readRawSpawnAgentPath(
+  call: CodexRawSpawnAgentCall,
+  output: Record<string, any>,
+): string | undefined {
+  // Codex collaboration v2 returns only `task_name: "/root/<name>"`; older
+  // builds returned a UUID in `agent_id`. Keep the orchestration path as the
+  // stable UI identity and use the UUID separately for runtime correlation.
+  const outputPath = meaningfulString(output.task_name)
+    ?? meaningfulString(output.taskName)
+    ?? meaningfulString(output.agent_path)
+    ?? meaningfulString(output.agentPath);
+  if (outputPath) return outputPath;
+  // An input task name is only a requested path. Treat it as accepted when an
+  // older successful response supplied a runtime id; otherwise a failed spawn
+  // would be misreported as a running child.
+  if (!readRawSpawnAgentId(output)) return undefined;
+  return meaningfulString(call.args.task_name)
+    ?? meaningfulString(call.args.taskName)
+    ?? meaningfulString(call.args.agent_path)
+    ?? meaningfulString(call.args.agentPath);
+}
+
 function buildRawSpawnAgentRuntimePayload(
   call: CodexRawSpawnAgentCall,
   output: Record<string, any>,
 ): Record<string, any> {
   const agentId = readRawSpawnAgentId(output);
+  const agentPath = readRawSpawnAgentPath(call, output);
   const agentName = meaningfulString(output.nickname)
     ?? meaningfulString(output.name)
     ?? meaningfulString(call.args.nickname)
@@ -1747,6 +1910,7 @@ function buildRawSpawnAgentRuntimePayload(
     ?? meaningfulString(call.args.agent_id);
   return {
     ...(agentId ? { agent_id: agentId } : {}),
+    ...(agentPath ? { agent_path: agentPath } : {}),
     status: 'running',
     ...(agentName ? { nickname: agentName } : {}),
     ...(prompt ? { prompt } : {}),
@@ -3505,12 +3669,23 @@ export class CodexSdkProvider implements TransportProvider {
     for (const snapshot of sessionSnapshots) rememberSnapshot(snapshot);
     for (const snapshot of snapshots) {
       if (state.childSubagentRolloutCompletedIds.has(snapshot.agentId)) continue;
-      const existing = this.trackedSubagentThreads.get(snapshot.agentId);
+      const existingById = this.trackedSubagentThreads.get(snapshot.agentId);
+      const existingByPath = snapshot.agentPath
+        ? [...this.trackedSubagentThreads.values()].find((candidate) => (
+            candidate.sessionId === sessionId && candidate.agentPath === snapshot.agentPath
+          ))
+        : undefined;
+      const existing = existingById ?? existingByPath;
       const tracked: CodexTrackedSubagentThread = existing ?? {
         sessionId,
         callId: `rollout:${snapshot.agentId}`,
         agentId: snapshot.agentId,
       };
+      if (existing && existing.agentId !== snapshot.agentId) {
+        this.trackedSubagentThreads.delete(existing.agentId);
+      }
+      tracked.agentId = snapshot.agentId;
+      tracked.agentPath = snapshot.agentPath ?? tracked.agentPath;
       tracked.agentName = snapshot.agentName ?? tracked.agentName;
       tracked.prompt = snapshot.prompt ?? tracked.prompt;
       tracked.model = snapshot.model ?? tracked.model;
@@ -3581,6 +3756,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.recordStrongActivity(sessionId, state, turnId);
       const priorDetail = isRecord(prior?.detail) ? prior.detail : undefined;
       const priorMeta = isRecord(priorDetail?.meta) ? priorDetail.meta : undefined;
+      const backgroundShellTool = codexBackgroundShellToolFromCustomToolOutput(sessionId, prior, item);
       this.emitTrackedProviderToolCall(sessionId, state, {
         id: callId,
         name: prior?.name ?? meaningfulString(item.name) ?? 'custom_tool',
@@ -3606,6 +3782,9 @@ export class CodexSdkProvider implements TransportProvider {
           raw: item,
         },
       });
+      if (backgroundShellTool && !state.openProviderToolCalls.has(backgroundShellTool.id)) {
+        this.emitTrackedProviderToolCall(sessionId, state, backgroundShellTool);
+      }
       return true;
     }
 
@@ -3643,11 +3822,14 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     const agentId = readRawSpawnAgentId(outputRecord);
-    if (agentId) {
-      this.trackedSubagentThreads.set(agentId, {
+    const agentPath = readRawSpawnAgentPath(call, outputRecord);
+    const trackingId = agentId ?? agentPath;
+    if (trackingId) {
+      this.trackedSubagentThreads.set(trackingId, {
         sessionId: call.sessionId,
         callId,
-        agentId,
+        agentId: trackingId,
+        ...(agentPath ? { agentPath } : {}),
         startedAtMs: call.startedAtMs,
         agentName: meaningfulString(outputRecord.nickname)
           ?? meaningfulString(outputRecord.name)
@@ -3681,6 +3863,7 @@ export class CodexSdkProvider implements TransportProvider {
   private emitTrackedSubagentSnapshot(tracked: CodexTrackedSubagentThread, status: unknown): ToolCallEvent | null {
     const tool = runtimeSubagentToolFromPayload(tracked.sessionId, {
       agent_id: tracked.agentId,
+      ...(tracked.agentPath ? { agent_path: tracked.agentPath } : {}),
       status,
       ...(tracked.agentName ? { nickname: tracked.agentName } : {}),
       ...(tracked.prompt ? { prompt: tracked.prompt } : {}),

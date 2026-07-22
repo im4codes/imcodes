@@ -346,6 +346,7 @@ html.native-ios-mac .chat-dl-btn {
 .shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; padding-left: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
+.shortcuts-model-supervision { display: inline-flex; align-items: center; gap: 4px; }
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
 .session-ctx-label { font-size: 10px; color: #7b8797; white-space: nowrap; }
 .session-ctx-bar { position: relative; width: 60px; height: 5px; background: rgba(15,23,42,0.92); border: 1px solid rgba(125,211,252,0.14); border-radius: 999px; overflow: hidden; box-shadow: inset 0 0 8px rgba(0,0,0,0.42), 0 0 10px rgba(34,211,238,0.06); }
@@ -488,10 +489,105 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-chooser-btn-hint { font-size: 11px; color: #94a3b8; }
 .chat-tool-chooser-btn-developer:hover { border-color: #60a5fa; }
 .chat-tool-chooser-footnote { font-size: 10px; color: #64748b; margin-top: 10px; }
-.shortcut-btn-auto { display: inline-flex; align-items: center; gap: 5px; padding-left: 8px; padding-right: 8px; font-weight: 600; }
-.shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; }
+.shortcut-btn-auto {
+  --shortcut-auto-primary: #94a3b8;
+  --shortcut-auto-secondary: #64748b;
+  --shortcut-auto-panel: rgba(15,23,42,0.96);
+  --shortcut-auto-scan: rgba(226,232,240,0.14);
+  --shortcut-auto-glow: rgba(148,163,184,0.16);
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: inline-flex;
+  height: 26px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 5px;
+  padding-left: 8px;
+  padding-right: 8px;
+  font-weight: 600;
+}
+.shortcut-btn-auto > * { position: relative; z-index: 2; }
+.shortcut-btn-auto-active {
+  border-color: transparent;
+  color: #e6fbff;
+  text-shadow: 0 0 9px var(--shortcut-auto-glow);
+  box-shadow: 0 0 12px var(--shortcut-auto-glow), inset 0 0 9px var(--shortcut-auto-glow);
+}
+.shortcut-btn-auto-active:hover:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
+  color: #fff;
+  box-shadow: 0 0 17px var(--shortcut-auto-glow), inset 0 0 12px var(--shortcut-auto-glow);
+}
+.shortcut-btn-auto-active::before {
+  content: '';
+  position: absolute;
+  z-index: 0;
+  inset: -42px;
+  pointer-events: none;
+  background: conic-gradient(
+    from 0turn,
+    transparent 0 10%,
+    var(--shortcut-auto-primary) 18%,
+    var(--shortcut-auto-secondary) 27%,
+    transparent 37% 60%,
+    var(--shortcut-auto-secondary) 69%,
+    var(--shortcut-auto-primary) 77%,
+    transparent 87% 100%
+  );
+  animation: shortcut-btn-auto-orbit 2.15s linear infinite;
+}
+.shortcut-btn-auto-active::after {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  inset: 1px;
+  border-radius: 5px;
+  pointer-events: none;
+  background:
+    linear-gradient(105deg, transparent 34%, var(--shortcut-auto-scan) 49%, transparent 64%) 130% 0 / 220% 100% no-repeat,
+    linear-gradient(180deg, rgba(255,255,255,0.055), transparent 48%),
+    var(--shortcut-auto-panel);
+  box-shadow: inset 0 0 10px var(--shortcut-auto-glow);
+  animation: shortcut-btn-auto-scan 1.7s linear infinite;
+}
+.shortcut-btn-auto-supervised {
+  --shortcut-auto-primary: #22d3ee;
+  --shortcut-auto-secondary: #34d399;
+  --shortcut-auto-panel: rgba(5,31,42,0.96);
+  --shortcut-auto-scan: rgba(165,243,252,0.28);
+  --shortcut-auto-glow: rgba(34,211,238,0.38);
+}
+.shortcut-btn-auto-audit {
+  --shortcut-auto-primary: #c084fc;
+  --shortcut-auto-secondary: #f59e0b;
+  --shortcut-auto-panel: rgba(35,15,51,0.96);
+  --shortcut-auto-scan: rgba(244,114,182,0.30);
+  --shortcut-auto-glow: rgba(192,132,252,0.42);
+}
+@keyframes shortcut-btn-auto-orbit {
+  to { transform: rotate(1turn); }
+}
+@keyframes shortcut-btn-auto-scan {
+  from { background-position: 130% 0, 0 0, 0 0; }
+  to { background-position: -125% 0, 0 0, 0 0; }
+}
+.shortcut-btn-peer-audit { height: 26px; box-sizing: border-box; color: #8ea3ba; }
+.shortcut-btn-peer-audit-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+.shortcut-btn-auto-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; background: var(--shortcut-auto-primary); box-shadow: 0 0 0 1px rgba(255,255,255,0.08); }
+.shortcut-btn-auto-active .shortcut-btn-auto-dot { box-shadow: 0 0 7px var(--shortcut-auto-primary), 0 0 13px var(--shortcut-auto-secondary); animation: shortcut-btn-auto-dot-pulse 1.05s ease-in-out infinite; }
+@keyframes shortcut-btn-auto-dot-pulse {
+  0%, 100% { opacity: 0.72; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
 .shortcut-btn-auto-label { letter-spacing: 0.01em; }
 .shortcut-btn-auto-caret { font-size: 10px; line-height: 1; opacity: 0.85; }
+@media (prefers-reduced-motion: reduce) {
+  .shortcut-btn-auto-active::before,
+  .shortcut-btn-auto-active::after,
+  .shortcut-btn-auto-active .shortcut-btn-auto-dot { animation: none; }
+}
 .p2p-mode-btn { letter-spacing: 0.01em; }
 .p2p-mode-btn-solo { background: #132033; border-color: #425a78; box-shadow: inset 0 0 0 1px rgba(219, 231, 245, 0.08); }
 .p2p-mode-btn-solo:hover:not(:disabled) { background: #1a3150; border-color: #60a5fa; color: #f8fafc; }
@@ -2887,6 +2983,7 @@ html.native-ios-mac .chat-dl-btn {
 .chat-sdk-agent-row.status-unknown { border-left-color: #f59e0b; }
 .chat-sdk-agent-row-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .chat-sdk-agent-provider { min-width: 0; color: #dbeafe; font-size: 12px; font-weight: 700; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sdk-agent-task-kind { flex: 0 0 auto; border: 1px solid rgba(96, 165, 250, 0.28); border-radius: 999px; padding: 1px 6px; color: #bfdbfe; background: rgba(30, 64, 175, 0.18); font-size: 9px; font-weight: 800; line-height: 1.3; white-space: nowrap; }
 .chat-sdk-agent-status { flex: 0 0 auto; color: #94a3b8; font-size: 10px; font-weight: 800; line-height: 1.2; text-transform: uppercase; }
 .chat-sdk-agent-summary { color: #cbd5e1; font-size: 12px; line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }
 .chat-sdk-agent-detail { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: start; color: #94a3b8; font-size: 10px; line-height: 1.25; min-width: 0; }
@@ -3432,7 +3529,7 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow:
     inset 0 1px 0 rgba(255,255,255,0.22),
     0 0 14px rgba(34,211,238,0.45);
-  transition: width 0.32s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.32s cubic-bezier(0.22, 0.72, 0.22, 1);
+  transition: width 0.58s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.58s cubic-bezier(0.22, 0.72, 0.22, 1);
   z-index: 2;
 }
 .subcard-ctx-input,
@@ -3455,7 +3552,7 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow:
     inset 0 1px 0 rgba(255,255,255,0.24),
     0 0 14px rgba(168,85,247,0.56);
-  transition: width 0.32s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.32s cubic-bezier(0.22, 0.72, 0.22, 1);
+  transition: width 0.58s cubic-bezier(0.22, 0.72, 0.22, 1), left 0.58s cubic-bezier(0.22, 0.72, 0.22, 1);
   z-index: 1;
 }
 .session-usage-footer .session-ctx-bar.is-burning {
@@ -3507,6 +3604,22 @@ html.native-ios-mac .chat-dl-btn {
   filter: drop-shadow(0 0 5px rgba(251,146,60,0.62)) drop-shadow(0 0 8px rgba(34,211,238,0.34));
   animation: ctx-burn-sparks 0.78s ease-out both;
 }
+.session-ctx-burn-edge {
+  position: absolute;
+  top: 50%;
+  width: 5px;
+  height: 16px;
+  z-index: 7;
+  pointer-events: none;
+  border-radius: 999px;
+  background: #fef3c7;
+  box-shadow:
+    0 0 5px rgba(255,255,255,0.96),
+    0 0 11px rgba(251,191,36,0.92),
+    0 0 17px rgba(34,211,238,0.72);
+  transform: translate(-50%, -50%);
+  animation: ctx-burn-edge 1.2s ease-out both;
+}
 @keyframes ctx-energy-scan {
   0% { opacity: 0; transform: translateX(-18%); }
   18% { opacity: 0.95; }
@@ -3519,9 +3632,16 @@ html.native-ios-mac .chat-dl-btn {
   46% { opacity: 0.86; }
   100% { opacity: 0; transform: translateY(-5px) scaleX(1.02); }
 }
+@keyframes ctx-burn-edge {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.55); }
+  18% { opacity: 1; transform: translate(-50%, -50%) scale(1.28); }
+  58% { opacity: 0.88; transform: translate(-50%, -50%) scale(0.92); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(0.72); }
+}
 @media (prefers-reduced-motion: reduce) {
   .session-ctx-burn::before,
-  .session-ctx-burn::after {
+  .session-ctx-burn::after,
+  .session-ctx-burn-edge {
     animation: none;
     opacity: 0;
   }
@@ -3594,6 +3714,11 @@ html.native-ios-mac .chat-dl-btn {
   z-index: 9999;
   padding: calc(var(--sat, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
 }
+/* Settings can be opened from controls whose portaled menus/backdrops use the
+   maximum application stack. Keep this modal in the same top stack; the
+   component itself is portaled after the invoking controls so it receives
+   pointer/touch events instead of an older invisible backdrop. */
+.session-settings-overlay { z-index: 2147483647; }
 .dialog {
   background: #1e293b; border: 1px solid #334155; border-radius: 8px;
   width: 100%;
@@ -4498,8 +4623,20 @@ html.native-ios-mac .chat-dl-btn {
 .fb-tree.fb-changes-tree > .fb-changes-section { flex: 1; min-height: 0; }
 .fb-changes-header { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: linear-gradient(180deg, #0d1422, #0a101b); border-bottom: 1px solid rgba(125,211,252,0.08); flex-shrink: 0; }
 .fb-changes-title { font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .05em; }
-.fb-changes-refresh { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 4px; }
-.fb-changes-refresh:hover { color: #e2e8f0; }
+.fb-changes-refresh { width: 25px; height: 23px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: 6px; color: #64748b; cursor: pointer; font-size: 14px; padding: 0; transition: color .16s, background .16s, border-color .16s, transform .16s; }
+.fb-changes-refresh:hover:not(:disabled) { color: #e2e8f0; background: rgba(148,163,184,.08); border-color: rgba(148,163,184,.15); }
+.fb-changes-refresh:disabled { cursor: wait; }
+.fb-changes-refresh-icon { display: inline-block; line-height: 1; }
+.fb-changes-refresh.is-refreshing { color: #38bdf8; background: rgba(14,165,233,.10); border-color: rgba(56,189,248,.22); }
+.fb-changes-refresh.is-refreshing .fb-changes-refresh-icon { animation: fb-changes-refresh-spin .75s linear infinite; }
+.fb-changes-refresh.is-success { color: #4ade80; background: rgba(34,197,94,.12); border-color: rgba(74,222,128,.28); transform: scale(1.06); }
+.fb-changes-refresh.is-error { color: #fb7185; background: rgba(244,63,94,.12); border-color: rgba(251,113,133,.30); transform: scale(1.06); }
+.fb-changes-empty { flex: 1; display: flex; align-items: center; justify-content: center; }
+@keyframes fb-changes-refresh-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .fb-changes-refresh { transition: none; }
+  .fb-changes-refresh.is-refreshing .fb-changes-refresh-icon { animation: none; }
+}
 .fb-changes-list { overflow-y: auto; flex: 1; }
 .fb-changes-group { }
 .fb-changes-group-label { font-size: 10px; color: #475569; text-transform: uppercase; letter-spacing: .05em; padding: 4px 10px 2px; font-weight: 600; }
@@ -5255,5 +5392,272 @@ html.native-ios-mac .chat-dl-btn {
   50% {
     opacity: 0.58;
     filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.9));
+  }
+}
+
+/* ── Lightweight peer-audit chooser ─────────────────────────────────────── */
+.peer-audit-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.peer-audit-modal {
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100dvh - 40px));
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 18px;
+  background: linear-gradient(155deg, rgba(15, 30, 54, 0.98), rgba(8, 18, 36, 0.98));
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(148, 163, 184, 0.06) inset;
+  color: #e2e8f0;
+}
+
+.peer-audit-chooser {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.peer-audit-chooser h3 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.3;
+  color: #f8fafc;
+}
+
+.peer-audit-chooser p,
+.peer-audit-chooser-reason {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.peer-audit-candidate-picker {
+  width: 100%;
+  min-width: 0;
+}
+
+.peer-audit-chooser-list {
+  display: grid;
+  /* Always two columns: the list spans the full dialog width, so auto-fit would
+     spread to 3-4 narrow columns instead of the intended two. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.peer-audit-chooser-list > li {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+button.peer-audit-chooser-row {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  min-height: 68px;
+  margin: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(100, 116, 139, 0.38);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.76);
+  color: #e2e8f0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: none;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+button.peer-audit-chooser-row:hover {
+  border-color: rgba(56, 189, 248, 0.72);
+  background: rgba(14, 116, 144, 0.16);
+  transform: translateY(-1px);
+}
+
+button.peer-audit-chooser-row:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+button.peer-audit-chooser-row[aria-pressed="true"] {
+  border-color: #22d3ee;
+  background: rgba(8, 145, 178, 0.2);
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.18) inset;
+}
+
+.peer-audit-chooser-row-main,
+.peer-audit-chooser-row-meta {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.peer-audit-chooser-row-main {
+  gap: 8px;
+}
+
+.peer-audit-provider-badge {
+  display: inline-flex;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.peer-audit-chooser-row-label {
+  min-width: 0;
+  overflow: hidden;
+  color: #f8fafc;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-audit-chooser-row-meta {
+  justify-content: space-between;
+  gap: 8px;
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.peer-audit-chooser-row-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-audit-chooser-empty,
+.peer-audit-chooser-loading {
+  padding: 14px;
+  border: 1px dashed rgba(100, 116, 139, 0.4);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.45);
+  color: #94a3b8;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.peer-audit-chooser-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.quick-agent-delegation-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+button.quick-agent-delegation-preset {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.72);
+  color: #cbd5e1;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.quick-agent-delegation-preset.active {
+  border-color: #22d3ee;
+  background: rgba(8, 145, 178, 0.2);
+  color: #f8fafc;
+}
+
+.quick-agent-delegation-custom {
+  box-sizing: border-box;
+  width: 100%;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  border-radius: 10px;
+  outline: none;
+  background: rgba(15, 23, 42, 0.78);
+  color: #f8fafc;
+  font: inherit;
+  line-height: 1.5;
+}
+
+.quick-agent-delegation-custom:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.24);
+}
+
+.quick-agent-delegation-state {
+  flex: 0 0 auto;
+  color: #f59e0b;
+}
+
+.peer-audit-chooser-actions button,
+.peer-audit-modal > [data-testid="peer-audit-pending"] button,
+.peer-audit-modal > [data-testid="peer-audit-result"] button,
+.peer-audit-modal > [data-testid="peer-audit-error"] button {
+  padding: 8px 13px;
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.9);
+  color: #e2e8f0;
+  font: inherit;
+}
+
+@media (max-width: 560px) {
+  .peer-audit-overlay {
+    align-items: flex-end;
+    padding: 10px;
+  }
+
+  .peer-audit-modal {
+    max-height: min(78dvh, 680px);
+    padding: 16px;
+    border-radius: 16px;
+  }
+
+  .quick-agent-delegation-presets {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .peer-audit-chooser-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 380px) {
+  .peer-audit-chooser-list {
+    grid-template-columns: 1fr;
   }
 }

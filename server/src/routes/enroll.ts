@@ -34,7 +34,6 @@ function resolveTicketEncryptionKey(c: { env: Env }): string {
 
 type EnrollRouter = Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
-const ENROLL_TTL_MS = 30 * 60 * 1000;
 const DOWNLOAD_TICKET_TTL_MS = 5 * 60 * 1000;
 const TICKET_MAX_CONSUMES = 3;
 const ATTEMPT_LEASE_MS = 30 * 1000;
@@ -118,17 +117,17 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   );
 
   const now = Date.now();
-  const expiresAt = now + ENROLL_TTL_MS;
   const ticketExpiresAt = now + DOWNLOAD_TICKET_TTL_MS;
 
   const inserted = await (c.env.DB as Database).queryOne<{ id: string }>(
     `INSERT INTO controlled_node_enrollments_v2
        (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
-        encrypted_code, consumed_count, max_consumes, ticket_expires_at, expires_at, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10, $11)
+        encrypted_code, consumed_count, max_consumes, ticket_expires_at,
+        expires_at, reusable, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, NULL, TRUE, $10)
      RETURNING id`,
     [ticketHash, codeHash, userId, os, arch, v.descriptor.sha256,
-     encryptedCode, TICKET_MAX_CONSUMES, ticketExpiresAt, expiresAt, now],
+     encryptedCode, TICKET_MAX_CONSUMES, ticketExpiresAt, now],
   );
   if (!inserted) {
     return c.json({ error: 'ticket_mint_failed' }, 500);
@@ -815,7 +814,7 @@ async function insertControlledServer(
 type RedeemResult =
   | { kind: 'created'; serverId: string; ticketId: string; userId: string; refName: string; displayName: string }
   | { kind: 'idempotent'; serverId: string; ticketId: string; userId: string; refName: string; displayName: string }
-  | { kind: 'mismatch'; existingInstallId: string | null; existingNodeTokenHash: string | null; ticketId?: string }
+  | { kind: 'mismatch'; ticketId?: string }
   | { kind: 'denied' };
 
 enrollRoutes.post('/v2/redeem', async (c) => {
@@ -838,7 +837,9 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       const row = await tx.queryOne<{
         id: string;
         owner_user_id: string;
-        expires_at: string;
+        expires_at: string | null;
+        reusable: boolean;
+        revoked_at: string | null;
         used_at: string | null;
         redeemed_server_id: string | null;
         install_id: string | null;
@@ -846,7 +847,8 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         os: string;
         arch: string;
       }>(
-        `SELECT id, owner_user_id, expires_at, used_at, redeemed_server_id,
+        `SELECT id, owner_user_id, expires_at, reusable, revoked_at,
+                used_at, redeemed_server_id,
                 install_id, node_token_hash, os, arch
            FROM controlled_node_enrollments_v2
           WHERE code_hash = $1
@@ -854,49 +856,82 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         [codeHash],
       );
       if (!row) return { kind: 'denied' as const };
-      if (Number(row.expires_at) <= now) return { kind: 'denied' as const };
+      if (row.revoked_at != null) return { kind: 'denied' as const };
+      if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
+        return { kind: 'denied' as const };
+      }
       if (row.os !== os || row.arch !== arch) {
-        return { kind: 'mismatch' as const, existingInstallId: row.install_id, existingNodeTokenHash: row.node_token_hash, ticketId: row.id };
+        return { kind: 'mismatch' as const, ticketId: row.id };
       }
 
-      if (row.used_at && row.redeemed_server_id) {
-        if (row.install_id === installId && row.node_token_hash === nodeTokenHash) {
-          const srv = await tx.queryOne<{ ref_name: string | null; display_name: string | null }>(
-            'SELECT ref_name, display_name FROM servers WHERE id = $1',
-            [row.redeemed_server_id],
-          );
-          return {
-            kind: 'idempotent' as const,
-            serverId: row.redeemed_server_id,
-            ticketId: row.id,
-            userId: row.owner_user_id,
-            refName: srv?.ref_name ?? '',
-            displayName: srv?.display_name ?? '',
-          };
+      const existing = await tx.queryOne<{
+        node_token_hash: string;
+        redeemed_server_id: string;
+        ref_name: string | null;
+        display_name: string | null;
+      }>(
+        `SELECT install.node_token_hash, install.redeemed_server_id,
+                server.ref_name, server.display_name
+           FROM controlled_node_enrollment_installs AS install
+           JOIN servers AS server ON server.id = install.redeemed_server_id
+          WHERE install.enrollment_id = $1 AND install.install_id = $2`,
+        [row.id, installId],
+      );
+      if (existing) {
+        if (existing.node_token_hash !== nodeTokenHash) {
+          return { kind: 'mismatch' as const, ticketId: row.id };
         }
         return {
-          kind: 'mismatch' as const,
-          existingInstallId: row.install_id,
-          existingNodeTokenHash: row.node_token_hash,
+          kind: 'idempotent' as const,
+          serverId: existing.redeemed_server_id,
           ticketId: row.id,
+          userId: row.owner_user_id,
+          refName: existing.ref_name ?? '',
+          displayName: existing.display_name ?? '',
         };
       }
+
+      // A legacy package remains single-use. Migration 059 backfills its
+      // original claim into the child table; this parent fallback also keeps a
+      // partially migrated row fail-closed instead of creating another node.
+      if (!row.reusable && row.used_at) {
+        return { kind: 'mismatch' as const, ticketId: row.id };
+      }
+
+      const reusedToken = await tx.queryOne<{ present: number }>(
+        `SELECT 1 AS present
+           FROM controlled_node_enrollment_installs
+          WHERE enrollment_id = $1 AND node_token_hash = $2`,
+        [row.id, nodeTokenHash],
+      );
+      if (reusedToken) return { kind: 'mismatch' as const, ticketId: row.id };
 
       const serverId = randomHex(16);
       const { refName, displayName } = await insertControlledServer(
         tx, serverId, row.owner_user_id, nodeTokenHash, hostname, os, arch,
       );
-      const upd = await tx.execute(
-        `UPDATE controlled_node_enrollments_v2
-            SET used_at = $2,
-                install_id = $3,
-                node_token_hash = $4,
-                redeemed_server_id = $5
-          WHERE id = $1 AND used_at IS NULL AND expires_at > $2`,
-        [row.id, now, installId, nodeTokenHash, serverId],
+      await tx.execute(
+        `INSERT INTO controlled_node_enrollment_installs
+           (enrollment_id, install_id, node_token_hash, redeemed_server_id, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [row.id, installId, nodeTokenHash, serverId, now],
       );
-      if (upd.changes !== 1) {
-        throw new Error('concurrent_redeem');
+
+      if (!row.reusable) {
+        const upd = await tx.execute(
+          `UPDATE controlled_node_enrollments_v2
+              SET used_at = $2,
+                  install_id = $3,
+                  node_token_hash = $4,
+                  redeemed_server_id = $5
+            WHERE id = $1
+              AND used_at IS NULL
+              AND reusable = FALSE
+              AND revoked_at IS NULL
+              AND expires_at > $2`,
+          [row.id, now, installId, nodeTokenHash, serverId],
+        );
+        if (upd.changes !== 1) throw new Error('concurrent_legacy_redeem');
       }
       return {
         kind: 'created' as const,
@@ -1010,22 +1045,47 @@ export async function runEnrollmentRetention(
       attemptsReleased += 1;
     }
   });
-  // Step 2: reaped attempt rows are then dropped by the parent
-  // enrollment sweep (ON DELETE CASCADE).
+  const retentionCutoff = now - 7 * 24 * 60 * 60 * 1000;
+  // Step 2: reusable installer parents intentionally live indefinitely, so
+  // settled download-attempt rows need their own bounded cleanup instead of
+  // relying only on parent deletion.
+  await db.execute(
+    `WITH settled AS (
+       SELECT attempt_id
+         FROM controlled_node_download_attempts
+        WHERE state IN ('committed', 'released')
+          AND updated_at < $1
+        ORDER BY updated_at ASC
+        LIMIT $2
+     )
+     DELETE FROM controlled_node_download_attempts AS attempt
+      USING settled
+      WHERE attempt.attempt_id = settled.attempt_id`,
+    [retentionCutoff, bounded],
+  );
+
+  // Step 3: active reusable installers survive ticket expiry, consumption and
+  // every successful redemption. Legacy single-use rows retain the old bounded
+  // cleanup behavior; explicitly revoked installers are reaped after retention.
   const enrollments = await db.execute(
     `WITH expired AS (
        SELECT id
          FROM controlled_node_enrollments_v2
-        WHERE expires_at < $1
-           OR revoked_at IS NOT NULL
-           OR (consumed_at IS NOT NULL AND consumed_at < $1)
-        ORDER BY expires_at ASC
+        WHERE (revoked_at IS NOT NULL AND revoked_at < $1)
+           OR (
+             reusable = FALSE
+             AND (
+               (expires_at IS NOT NULL AND expires_at < $1)
+               OR (consumed_at IS NOT NULL AND consumed_at < $1)
+             )
+           )
+        ORDER BY COALESCE(revoked_at, expires_at, consumed_at, created_at) ASC
         LIMIT $2
      )
      DELETE FROM controlled_node_enrollments_v2 AS enrollment
       USING expired
       WHERE enrollment.id = expired.id`,
-    [now - 7 * 24 * 60 * 60 * 1000, bounded],
+    [retentionCutoff, bounded],
   );
   return {
     rows: enrollments.changes,

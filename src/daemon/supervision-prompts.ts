@@ -1,6 +1,6 @@
 import {
-  AUDIT_VERDICT_MARKERS,
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_MODE,
   TASK_RUN_STATUS_MARKERS,
   classifySupervisionCustomInstructions,
   resolveSupervisionCustomInstructionsDetail,
@@ -8,6 +8,19 @@ import {
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import type { SupervisionBrokerRequest } from './supervision-broker.js';
+import {
+  PEER_AUDIT_BRIEF_REQUEST_BYTES,
+  PEER_AUDIT_BRIEF_RESULT_BYTES,
+  PEER_AUDIT_BRIEF_TOTAL_BYTES,
+  PEER_AUDIT_PATH_COUNT,
+  PEER_AUDIT_PATH_ITEM_BYTES,
+  PEER_AUDIT_PROMPT_VERSION,
+  PEER_AUDIT_VALIDATION_COUNT,
+  PEER_AUDIT_VALIDATION_ITEM_BYTES,
+  peerAuditByteLength,
+  sanitizePeerAuditUntrustedText,
+  type PeerAuditValidationItem,
+} from '../../shared/peer-audit.js';
 
 /**
  * Render the user-provided supervision-rules block for a supervision prompt,
@@ -50,6 +63,149 @@ function buildImcodesWorkflowBackgroundSection(): string {
   return SUPERVISION_IMCODES_BACKGROUND_DOCS;
 }
 
+function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): string {
+  if (request.snapshot?.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) return '';
+  return [
+    'Audit-order rule for supervised_audit:',
+    '- Peer audit MUST finish before repository commit/push finalization.',
+    '- If implementation and validation are complete and the ONLY remaining action is git add/commit/push, return continue with that exact finalization-only nextAction; the daemon will hold it until peer-audit PASS instead of sending it now.',
+    '- If fixes, tests, typecheck, lint, build, validation, documentation changes, deployment, or any other substantive work remains, return continue normally so that work happens before audit.',
+    '- Never combine substantive pre-audit work and post-audit commit/push in one nextAction.',
+    '- If both the assistant response and your reason say implementation/validation are already complete, NEVER invent generic "remaining implementation or validation" work. Return only the concrete git add/commit/push finalization nextAction.',
+    '- Do not ask the target session to arrange or resend the audit in a normal continue decision. The daemon emits a separate orchestration prompt containing the exact auditor session ID and reply-enabled send command, exactly once.',
+  ].join('\n');
+}
+
+export interface PeerAuditBriefV1Input {
+  attemptId: string;
+  replyCapability: string;
+  taskRequest: string;
+  completedResult: string;
+  acceptanceCriteria: readonly string[];
+  projectPath?: string;
+  changePath?: string;
+  changedPaths?: readonly string[];
+  validations?: readonly PeerAuditValidationItem[];
+  /** Optional broker context; explicitly non-authoritative in the brief. */
+  supervisorRationale?: string;
+}
+
+const PEER_AUDIT_ACCEPTANCE_TOTAL_BYTES = 4 * 1024;
+const PEER_AUDIT_PATHS_TOTAL_BYTES = 3 * 1024;
+const PEER_AUDIT_VALIDATIONS_TOTAL_BYTES = 4 * 1024;
+const PEER_AUDIT_RATIONALE_BYTES = 1024;
+
+function truncatePeerAuditUtf8(value: string, maxBytes: number): string {
+  if (peerAuditByteLength(value) <= maxBytes) return value;
+  const suffix = '\n[truncated]';
+  const suffixBytes = peerAuditByteLength(suffix);
+  let used = 0;
+  let output = '';
+  for (const codePoint of value) {
+    const bytes = peerAuditByteLength(codePoint);
+    if (used + bytes + suffixBytes > maxBytes) break;
+    output += codePoint;
+    used += bytes;
+  }
+  return output + suffix;
+}
+
+function sanitizePeerAuditText(value: string, maxBytes: number): string {
+  // Redact first so truncation can never split a credential and leave a usable
+  // secret fragment at the boundary. Audit-control strings from task/result
+  // text are inert data and must not become nested protocol instructions.
+  const redacted = sanitizePeerAuditUntrustedText(value)
+    .replace(/<!--\s*P2P_VERDICT:[\s\S]*?-->/gi, '[removed legacy audit marker]')
+    .replace(/^\s*\[(?:Contract|P2P Advanced Task)[^\]]*\]\s*$/gim, '[removed audit control]')
+    .replace(/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+  return truncatePeerAuditUtf8(redacted.trim(), maxBytes);
+}
+
+function boundedPeerAuditList(
+  items: readonly string[],
+  maxCount: number,
+  maxItemBytes: number,
+  maxTotalBytes: number,
+): string[] {
+  const output: string[] = [];
+  let used = 0;
+  for (const item of items.slice(0, maxCount)) {
+    const sanitized = sanitizePeerAuditText(item, maxItemBytes);
+    const bytes = peerAuditByteLength(sanitized) + 3;
+    if (used + bytes > maxTotalBytes) break;
+    output.push(sanitized);
+    used += bytes;
+  }
+  return output;
+}
+
+/** Build the complete lightweight peer-audit request. The returned text is
+ * already privacy-shaped and bounded for direct dispatch to the selected peer. */
+export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
+  const taskRequest = sanitizePeerAuditText(input.taskRequest, PEER_AUDIT_BRIEF_REQUEST_BYTES);
+  const completedResult = sanitizePeerAuditText(input.completedResult, PEER_AUDIT_BRIEF_RESULT_BYTES);
+  const acceptance = boundedPeerAuditList(
+    input.acceptanceCriteria,
+    64,
+    PEER_AUDIT_VALIDATION_ITEM_BYTES,
+    PEER_AUDIT_ACCEPTANCE_TOTAL_BYTES,
+  );
+  const paths = boundedPeerAuditList(
+    [input.projectPath, input.changePath, ...(input.changedPaths ?? [])].filter((value): value is string => !!value),
+    PEER_AUDIT_PATH_COUNT,
+    PEER_AUDIT_PATH_ITEM_BYTES,
+    PEER_AUDIT_PATHS_TOTAL_BYTES,
+  );
+  const validationLines = boundedPeerAuditList(
+    (input.validations ?? []).slice(0, PEER_AUDIT_VALIDATION_COUNT).map((item) =>
+      `${item.kind} | ${item.outcome} | ${item.label}: ${item.summary}`),
+    PEER_AUDIT_VALIDATION_COUNT,
+    PEER_AUDIT_VALIDATION_ITEM_BYTES,
+    PEER_AUDIT_VALIDATIONS_TOTAL_BYTES,
+  );
+  const rationale = input.supervisorRationale
+    ? sanitizePeerAuditText(input.supervisorRationale, PEER_AUDIT_RATIONALE_BYTES)
+    : '';
+
+  const brief = [
+    `[Contract: ${PEER_AUDIT_PROMPT_VERSION}]`,
+    'You are the independently selected peer auditor. Audit the completed result against the request and acceptance criteria below.',
+    'This is a lightweight, single-pass audit. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
+    'Prioritize the highest-value checks within six minutes. Separate observed evidence from inference.',
+    'Use every applicable existing means for NON-DESTRUCTIVE verification; static code review alone is insufficient when relevant executable validation is available.',
+    'You MAY run focused/unit/integration tests, typecheck, lint, build, read-only tools, and explicitly isolated test fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
+    'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
+    'Report exact commands/tools/devices/environments and observed outcomes. Explain unavailable checks; never invent a result.',
+    '',
+    'Task request:',
+    taskRequest || '(empty)',
+    '',
+    'Completed result:',
+    completedResult || '(empty)',
+    '',
+    'Acceptance criteria:',
+    ...(acceptance.length ? acceptance.map((item) => `- ${item}`) : ['- Verify the result materially satisfies the task request without regressions.']),
+    ...(paths.length ? ['', 'Relevant paths (names only; inspect selectively):', ...paths.map((item) => `- ${item}`)] : []),
+    ...(validationLines.length ? ['', 'Existing validation summary (claims to verify):', ...validationLines.map((item) => `- ${item}`)] : []),
+    ...(rationale ? ['', 'Non-authoritative broker rationale:', rationale] : []),
+    '',
+    'Submit exactly one structured reply. PASS requires at least one observed passed validation when an executable relevant check exists; otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
+    'Prefer the available peer_audit_reply MCP tool with these exact fields:',
+    `{ "attemptId": "${input.attemptId}", "replyCapability": "${input.replyCapability}", "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
+    'If that MCP tool is unavailable, write findings and validations JSON to disposable local files, then invoke:',
+    `imcodes audit-reply --attempt-id ${input.attemptId} --capability ${input.replyCapability} --verdict PASS --findings-file <path> --validations-file <path>`,
+    'Use --verdict REWORK when concrete fixes are required. Do not use ordinary send, send --reply, legacy verdict markers, or terminal key injection for this reply.',
+  ].join('\n');
+
+  // Static budgeting above normally leaves several KiB of headroom. Keep a
+  // final fail-closed cap as defense against future copy growth; preserve the
+  // reply instruction by refusing to emit an invalid oversized brief.
+  if (peerAuditByteLength(brief) > PEER_AUDIT_BRIEF_TOTAL_BYTES) {
+    throw new Error('peer_audit_brief_oversize');
+  }
+  return brief;
+}
+
 export function buildSupervisionDecisionPrompt(
   request: SupervisionBrokerRequest,
   contractId: string = SUPERVISION_CONTRACT_IDS.DECISION,
@@ -75,6 +231,7 @@ export function buildSupervisionDecisionPrompt(
     '- Prefer ask_human over a vague continue. If you cannot articulate a concrete nextAction, returning ask_human is the correct move — do not stall by emitting filler continues (they are downgraded to ask_human automatically and just waste a round-trip).',
     '- A factual answer to a user question (e.g. "yes, there are 3 uncommitted files") is typically complete for that turn IF no user-set rule applies. If a user rule applies (see authoritative clause above), return continue and enforce the rule. Do not otherwise treat state reports as proposed work.',
     '- When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.',
+    buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
     request.description ? `Context: ${request.description}` : '',
@@ -98,6 +255,7 @@ export function buildSupervisionDecisionRepairPrompt(
     'When decision is continue, BOTH gap and nextAction are required; nextAction must be a concrete imperative instruction, not a filler like "keep going" / "继续完成任务". If you cannot name a concrete next action, return ask_human instead — a vague continue is always downgraded to ask_human anyway.',
     'If the assistant response mentions remaining implementation work like tests, fixes, verification, commit/push, or another concrete next engineering step, return continue with a nextAction that names the exact command or deliverable.',
     'USER-SET SUPERVISION RULES in the block below are AUTHORITATIVE and override the generic heuristics above. If a user rule uses blanket wording ("always", "每次", "必须", "绝不") or applies conditionally to the current topic (a rule like "Always commit and push if asked!" applies whenever the conversation is about committing / pushing / uncommitted changes, even if the user just asked a status question), return `continue` with a nextAction that enforces the rule. Do not treat a factual answer as `complete` when it violates a user-set rule.',
+    buildAuditBeforeFinalizationRule(request),
     buildImcodesWorkflowBackgroundSection(),
     buildCustomInstructionsSection(resolveSupervisionCustomInstructionsDetail(request.snapshot)),
     'Previous invalid output:',
@@ -214,39 +372,6 @@ export function appendTaskRunContract(
     `Use ${TASK_RUN_STATUS_MARKERS.NEEDS_INPUT} only when you need the human to continue.`,
     `Use ${TASK_RUN_STATUS_MARKERS.BLOCKED} only when you are blocked and cannot proceed.`,
     'Never emit more than one task-run marker in the same terminal response.',
-  ].join('\n');
-}
-
-export function buildOpenSpecAutomationAuditPromptAppend(
-  auditMode: string,
-  taskRequest: string,
-  terminalState: string,
-  changeDir: string,
-): string {
-  return [
-    `[Contract: ${SUPERVISION_CONTRACT_IDS.OPENSPEC_IMPLEMENTATION_AUDIT}]`,
-    `Selected automation audit mode: ${auditMode}`,
-    `Task request: ${taskRequest}`,
-    `Task terminal state: ${terminalState}`,
-    `OpenSpec change directory: ${changeDir}`,
-    'Audit the implementation-only path against the attached proposal, design, tasks, specs, changed files, and validation output.',
-    'Do not rerun discussion or proposal phases.',
-    `Return exactly one verdict marker: ${AUDIT_VERDICT_MARKERS.PASS} or ${AUDIT_VERDICT_MARKERS.REWORK}.`,
-  ].join('\n');
-}
-
-export function buildContextualAutomationAuditPromptAppend(
-  auditMode: string,
-  taskRequest: string,
-  terminalState: string,
-): string {
-  return [
-    `[Contract: ${SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT}]`,
-    `Selected automation audit mode: ${auditMode}`,
-    `Task request: ${taskRequest}`,
-    `Task terminal state: ${terminalState}`,
-    'Audit the implementation result against the original request and recent execution summary.',
-    `Return exactly one verdict marker: ${AUDIT_VERDICT_MARKERS.PASS} or ${AUDIT_VERDICT_MARKERS.REWORK}.`,
   ].join('\n');
 }
 

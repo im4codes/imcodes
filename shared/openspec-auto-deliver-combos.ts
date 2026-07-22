@@ -1,11 +1,11 @@
 import {
-  OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID,
   OPENSPEC_AUTO_DELIVER_UNSUPPORTED_LEGACY_COMBO_IDS,
   OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_AUDIT_PROMPT_ID,
   OPENSPEC_AUTO_DELIVER_SPEC_AUDIT_PROMPT_ID,
   type OpenSpecAutoDeliverStage,
   type OpenSpecAutoDeliverStagePromptId,
 } from './openspec-auto-deliver-constants.js';
+import { isValidP2pComboPipeline } from './p2p-modes.js';
 
 export type OpenSpecAutoDeliverAuditRepairStage = Extract<OpenSpecAutoDeliverStage, 'spec_audit_repair' | 'implementation_audit_repair'>;
 
@@ -39,8 +39,8 @@ export function evaluateOpenSpecAutoDeliverComboCompatibility(
   ) {
     return { ok: false, reason: 'invalid_stage_prompt' };
   }
-  if (selectedTeamComboId === OPENSPEC_AUTO_DELIVER_DEFAULT_TEAM_COMBO_ID) {
+  if (isValidP2pComboPipeline(selectedTeamComboId)) {
     return { ok: true };
   }
-  return { ok: false, reason: 'custom_combo_unsupported' };
+  return { ok: false, reason: 'combo_unsupported' };
 }

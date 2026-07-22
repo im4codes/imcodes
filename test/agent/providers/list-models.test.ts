@@ -268,8 +268,9 @@ describe('ProviderModelList contract', () => {
     const { GeminiSdkProvider } = await import('../../../src/agent/providers/gemini-sdk.js');
     const { KimiSdkProvider } = await import('../../../src/agent/providers/kimi-sdk.js');
     const { GrokSdkProvider } = await import('../../../src/agent/providers/grok-sdk.js');
+    const { OpenCodeSdkProvider } = await import('../../../src/agent/providers/opencode-sdk.js');
 
-    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider, KimiSdkProvider, GrokSdkProvider]) {
+    for (const Cls of [ClaudeCodeSdkProvider, CodexSdkProvider, CopilotSdkProvider, CursorHeadlessProvider, GeminiSdkProvider, KimiSdkProvider, GrokSdkProvider, OpenCodeSdkProvider]) {
       const p = new Cls();
       expect(typeof (p as unknown as { listModels?: unknown }).listModels, `${Cls.name} must implement listModels()`).toBe('function');
     }

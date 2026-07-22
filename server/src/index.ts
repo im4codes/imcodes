@@ -44,6 +44,7 @@ import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
+import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
@@ -154,7 +155,7 @@ export function buildApp(env: Env) {
       // Non-whitelisted origins get no Access-Control-Allow-Origin header
       return all.includes(origin) ? origin : '';
     },
-    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version'],
+    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version', CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER],
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
   });

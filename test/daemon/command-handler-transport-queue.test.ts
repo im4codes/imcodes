@@ -971,7 +971,11 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(stillPresent).toBe(false);
   });
 
-  it('undo_queued_message still errors "not found" when neither the runtime nor the store has the id', async () => {
+  it('undo_queued_message acks accepted (idempotent) when neither the runtime nor the store has the id', async () => {
+    // Deleting a queued message is idempotent: if it is already absent, the goal
+    // is met. The frontend now ALWAYS sends the undo (even for an entry that only
+    // existed optimistically and never reached the store), so an "error: not
+    // found" here would spuriously roll the deleted bubble back into the UI.
     getTransportRuntimeMock.mockReturnValue({
       removePendingMessage: vi.fn(() => null),
       pendingCount: 0,
@@ -985,8 +989,46 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(serverLink.send).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-absent', status: 'error', error: 'Queued message not found' }),
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-absent', status: 'accepted' }),
     );
+    expect(serverLink.send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'cmd-undo-absent', status: 'error' }),
+    );
+  });
+
+  it('undo_queued_message acks an error (not success) when the SQLite drop throws', async () => {
+    // If drop() throws, the queue row is still there — the delete did NOT happen.
+    // Acking success would strand the message on the backend while the UI claims
+    // it is deleted, so the ack must be an error and the frontend rolls back.
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-drop-throw',
+      commandId: 'msg-drop-throw',
+      text: 'queued message',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-drop-throw', text: 'queued message' }),
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      pendingCount: 0,
+      sending: false,
+    });
+    const dropSpy = vi.spyOn(getTransportQueueStore(), 'drop').mockImplementation(() => { throw new Error('sqlite busy'); });
+    try {
+      handleWebCommand(
+        { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-drop-throw', commandId: 'cmd-undo-drop-throw' },
+        serverLink as any,
+      );
+      await flushAsync();
+      expect(serverLink.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-drop-throw', status: 'error' }),
+      );
+      expect(serverLink.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ commandId: 'cmd-undo-drop-throw', status: 'accepted' }),
+      );
+    } finally {
+      dropSpy.mockRestore();
+    }
   });
 
   it('dispatches /clear as a fresh claude-code-sdk relaunch', async () => {

@@ -226,7 +226,8 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   }),
 }));
 
-import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
+import { CodexSdkProvider, buildCodexMcpThreadConfig } from '../../src/agent/providers/codex-sdk.js';
+import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
 import { PROVIDER_ERROR_CODES, type ProviderError, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -246,6 +247,7 @@ import {
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   isSdkSubagentDetail,
   makeCodexSubagentCanonicalKey,
   type SdkSubagentDetail,
@@ -1367,6 +1369,119 @@ describe('CodexSdkProvider', () => {
     });
   });
 
+  it('promotes only backgrounded Codex exec sessions into the Agents panel lifecycle', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-background-shell', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+    await provider.send('route-background-shell', 'run one short and one long command');
+    const child = childProcessMock.children[0];
+
+    const emitExecLifecycle = (callId: string, input: string, output: unknown) => {
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { type: 'custom_tool_call', call_id: callId, name: 'exec', input },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { type: 'custom_tool_call_output', call_id: callId, output },
+        },
+      });
+    };
+
+    emitExecLifecycle(
+      'call-short',
+      'const r = await tools.exec_command({cmd:"pwd"}); text(r.output);',
+      [{ type: 'input_text', text: 'Script completed' }, { type: 'input_text', text: '/tmp/project' }],
+    );
+    await flush();
+    expect(tools.filter((tool) => isSdkSubagentDetail(tool.detail))).toHaveLength(0);
+
+    emitExecLifecycle(
+      'call-long',
+      'const r = await tools.exec_command({cmd:"sleep 30", yield_time_ms:1000}); text(JSON.stringify(r));',
+      [
+        { type: 'input_text', text: 'Script completed' },
+        {
+          type: 'input_text',
+          text: JSON.stringify({
+            chunk_id: 'chunk-long',
+            session_id: 81234,
+            wall_time_seconds: 1.01,
+            output: '',
+          }),
+        },
+      ],
+    );
+    await waitForCondition(() => tools.some((tool) => isSdkSubagentDetail(tool.detail)));
+
+    const runningShell = tools.find((tool) => (
+      isSdkSubagentDetail(tool.detail)
+      && (tool.detail as SdkSubagentDetail).meta.normalizedStatus === SDK_SUBAGENT_STATUS.RUNNING
+    ));
+    expect(runningShell).toMatchObject({
+      id: makeCodexSubagentCanonicalKey('route-background-shell', 'shell:81234'),
+      name: 'Bash',
+      status: 'running',
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'sleep 30',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.CODEX_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          taskId: '81234',
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          active: true,
+          terminal: false,
+        },
+      },
+    });
+
+    child.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        turn: {
+          id: 'turn-1',
+          status: 'completed',
+          items: [{ id: 'msg-1', type: 'agentMessage', text: 'Long command handled' }],
+        },
+      },
+    });
+    await waitForCondition(() => tools.some((tool) => (
+      isSdkSubagentDetail(tool.detail)
+      && (tool.detail as SdkSubagentDetail).meta.normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+    )));
+
+    const terminalShell = tools.find((tool) => (
+      isSdkSubagentDetail(tool.detail)
+      && (tool.detail as SdkSubagentDetail).meta.normalizedStatus === SDK_SUBAGENT_STATUS.COMPLETE
+    ));
+    expect(terminalShell).toMatchObject({
+      id: runningShell?.id,
+      status: 'complete',
+      detail: {
+        meta: {
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_SHELL,
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
   it('terminates failed, cancelled, and output-less raw custom tools', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
@@ -1956,6 +2071,168 @@ describe('CodexSdkProvider', () => {
     expect(tools).toHaveLength(3);
   });
 
+  it('shows collaboration-v2 spawn_agent outputs that identify the child only by task_name', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-task-name-spawn-agent', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_, tool) => tools.push(tool));
+
+    await provider.send('route-task-name-spawn-agent', 'spawn the disk audit helper');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call',
+          name: 'spawn_agent',
+          call_id: 'call-task-name-spawn',
+          arguments: JSON.stringify({
+            task_name: 'disk_deep_audit',
+            message: 'Audit disk usage in the background',
+          }),
+        },
+      },
+    });
+    child.emits({
+      method: 'rawResponseItem/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'function_call_output',
+          call_id: 'call-task-name-spawn',
+          output: JSON.stringify({ task_name: '/root/disk_deep_audit' }),
+        },
+      },
+    });
+    await flush();
+
+    const expectedKey = makeCodexSubagentCanonicalKey(
+      'route-task-name-spawn-agent',
+      'runtime:/root/disk_deep_audit',
+    );
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: expectedKey,
+      name: 'Codex Sub-agent',
+      status: 'running',
+      input: {
+        action: 'codex-runtime-subagent',
+        description: 'Audit disk usage in the background',
+      },
+    });
+    const detail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+    expect(detail.meta).toMatchObject({
+      canonicalKey: expectedKey,
+      agentPath: '/root/disk_deep_audit',
+      rawStatus: 'running',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      backgrounded: true,
+    });
+    expect(detail.meta.diagnosticCode).toBeUndefined();
+  });
+
+  it('merges a task_name-only spawn with its child thread rollout instead of duplicating the UI row', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-task-name-child-rollout-'));
+    const provider = createCodexProvider();
+    try {
+      await provider.connect({ binaryPath: 'codex', env: { CODEX_HOME: codexHome } });
+      await provider.createSession({ sessionKey: 'route-task-name-child-rollout', cwd: '/tmp/project' });
+
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall((_, tool) => tools.push(tool));
+
+      await provider.send('route-task-name-child-rollout', 'spawn the disk audit helper');
+      const child = childProcessMock.children[0];
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call',
+            name: 'spawn_agent',
+            call_id: 'call-task-name-rollout',
+            arguments: JSON.stringify({
+              task_name: 'disk_deep_audit',
+              message: 'Audit disk usage in the background',
+            }),
+          },
+        },
+      });
+      child.emits({
+        method: 'rawResponseItem/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'function_call_output',
+            call_id: 'call-task-name-rollout',
+            output: JSON.stringify({ task_name: '/root/disk_deep_audit' }),
+          },
+        },
+      });
+      await waitForCondition(() => tools.length === 1);
+
+      await writeCodexRolloutFile(codexHome, '019f7f0e-74ef-7873-88a9-845487b05cb7', [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: '019f7f0e-74ef-7873-88a9-845487b05cb7',
+            cwd: '/tmp/project',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: 'thread-1',
+                  agent_path: '/root/disk_deep_audit',
+                  agent_nickname: 'Rawls',
+                },
+              },
+            },
+            agent_nickname: 'Rawls',
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            last_agent_message: 'Disk audit complete.',
+          },
+        },
+      ]);
+
+      await waitForCondition(() => tools.some((tool) => tool.status === 'complete'), 10_000);
+      const expectedKey = makeCodexSubagentCanonicalKey(
+        'route-task-name-child-rollout',
+        'runtime:/root/disk_deep_audit',
+      );
+      expect(new Set(tools.map((tool) => tool.id))).toEqual(new Set([expectedKey]));
+      const completed = tools.find((tool) => tool.status === 'complete')!;
+      expect(completed).toMatchObject({
+        id: expectedKey,
+        output: 'Disk audit complete.',
+      });
+      const detail = expectCodexSubagentDetail(completed, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
+      expect(detail.meta).toMatchObject({
+        agentPath: '/root/disk_deep_audit',
+        agentName: 'Rawls',
+        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+        terminal: true,
+      });
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
   it('emits backgrounded SDK sub-agent snapshots from Codex child rollout metadata', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-child-rollout-'));
     const provider = createCodexProvider();
@@ -1977,6 +2254,7 @@ describe('CodexSdkProvider', () => {
               subagent: {
                 thread_spawn: {
                   parent_thread_id: 'thread-1',
+                  agent_path: '/root/rollout_only',
                   agent_nickname: 'Rawls',
                   agent_role: 'default',
                 },
@@ -2006,7 +2284,7 @@ describe('CodexSdkProvider', () => {
 
       const expectedKey = makeCodexSubagentCanonicalKey(
         'route-child-rollout-subagent',
-        'runtime:019f-child-rollout-only',
+        'runtime:/root/rollout_only',
       );
       expect(tools[0]).toMatchObject({
         id: expectedKey,
@@ -2017,7 +2295,7 @@ describe('CodexSdkProvider', () => {
       const runningDetail = expectCodexSubagentDetail(tools[0]!, SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT);
       expect(runningDetail.meta).toMatchObject({
         canonicalKey: expectedKey,
-        agentPath: '019f-child-rollout-only',
+        agentPath: '/root/rollout_only',
         agentName: 'Rawls',
         model: 'gpt-5.5',
         rawStatus: 'running',
@@ -2964,9 +3242,12 @@ describe('CodexSdkProvider', () => {
         },
       });
 
-      for (let i = 0; i < 80 && completed.length === 0; i++) {
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      // Rollout confirmation mixes virtual provider timers with real libuv
+      // filesystem reads. Advancing fake time alone can outrun those reads on
+      // Node 22 under full-suite load, producing a false timeout even though
+      // the provider's retry poll is correct. Use the shared bounded helper
+      // that yields both clocks, as the other rollout-authority tests do.
+      await advanceFakeTimersWithRealIoUntil(() => completed.length === 1);
       expect(completed).toEqual(['Done after command']);
       expect(provider.getSessionDiagnostics('route-idle-active-command')).toMatchObject({
         runningTurnId: null,
@@ -3150,6 +3431,51 @@ describe('CodexSdkProvider', () => {
     expect(tResume).toContain('# IM.codes runtime instructions');
     expect(tResume).toContain('Generated images:');
     codexRuntimeConfigMock.reset();
+  });
+
+  it('carries per-thread shell_environment_policy.set identity on the thread/start RPC (not just the builder)', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-shell-id',
+      sessionName: 'deck_cd_brain',
+      label: 'cd',
+      cwd: '/tmp/project',
+    });
+    await provider.send('route-shell-id', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    // Integration guard: the shell identity must actually reach the thread/start
+    // RPC config, so the model's shell tool gets its OWN IMCODES_SESSION in the
+    // shared app-server (no cross-session impersonation). A builder unit test
+    // alone would not catch the wiring being dropped between config and RPC.
+    expect((threadStartReq?.params?.config as Record<string, any> | undefined)?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_brain',
+      [IMCODES_SESSION_LABEL_ENV]: 'cd',
+    });
+    // The memory MCP config must still ride the same per-thread config object.
+    expect((threadStartReq?.params?.config as Record<string, any> | undefined)?.mcp_servers).toBeDefined();
+  });
+
+  it('carries per-thread shell_environment_policy.set identity on the thread/resume RPC (label falls back to name)', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({
+      sessionKey: 'route-shell-id-resume',
+      sessionName: 'deck_cd_w1',
+      cwd: '/tmp/project',
+      resumeId: 'thread-shell-resume',
+    });
+    await provider.send('route-shell-id-resume', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.threadId).toBe('thread-shell-resume');
+    // Resumed threads must also acquire the identity (so already-running codex
+    // sessions get it after a resume), with the label falling back to the name.
+    expect((resumeReq?.params?.config as Record<string, any> | undefined)?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_w1',
+      [IMCODES_SESSION_LABEL_ENV]: 'deck_cd_w1',
+    });
   });
 
   it('lists codex models across paginated model/list responses', async () => {
@@ -5674,5 +6000,44 @@ describe('CodexSdkProvider', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(errors.some((error) => error.details?.reason === 'sdk_turn_lost')).toBe(false);
+  });
+});
+
+describe('buildCodexMcpThreadConfig — per-thread shell identity', () => {
+  // All codex-sdk sessions share ONE app-server process, so identity for the
+  // model's shell tool CANNOT come from the app-server's process env (that would
+  // let every session impersonate one identity), and codex 0.144.1 ignores the
+  // `env` param on turn/start. It must ride the per-thread `config` as
+  // `shell_environment_policy.set`, which reaches the shell and merges over the
+  // inherited env — verified end-to-end against real codex.
+  it('injects IMCODES_SESSION into the shell via per-thread shell_environment_policy.set', () => {
+    const cfg = buildCodexMcpThreadConfig({
+      sessionKey: 'k',
+      sessionName: 'deck_cd_brain',
+      label: 'cd',
+      env: { [IMCODES_SESSION_ENV]: 'deck_cd_brain', [IMCODES_SESSION_LABEL_ENV]: 'cd' },
+    } as never) as Record<string, any>;
+    expect(cfg?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_brain',
+      [IMCODES_SESSION_LABEL_ENV]: 'cd',
+    });
+    // The pre-existing memory MCP config must still be present alongside it.
+    expect(cfg?.mcp_servers).toBeDefined();
+  });
+
+  it('falls back to the session name for the label and needs no explicit env', () => {
+    const cfg = buildCodexMcpThreadConfig({
+      sessionKey: 'k',
+      sessionName: 'deck_cd_w1',
+    } as never) as Record<string, any>;
+    expect(cfg?.shell_environment_policy?.set).toEqual({
+      [IMCODES_SESSION_ENV]: 'deck_cd_w1',
+      [IMCODES_SESSION_LABEL_ENV]: 'deck_cd_w1',
+    });
+  });
+
+  it('omits the shell identity when there is no session name (cannot impersonate)', () => {
+    const cfg = buildCodexMcpThreadConfig({ sessionKey: 'k' } as never) as Record<string, any> | undefined;
+    expect(cfg?.shell_environment_policy).toBeUndefined();
   });
 });

@@ -51,10 +51,12 @@ vi.mock('../../src/context/memory-recall-core.js', async (importOriginal) => ({
 }));
 
 import { injectGeminiMemoryWithTimeline } from '../../src/daemon/memory-inject.js';
+import { getSummarySyncFingerprints, resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 
 describe('injectGeminiMemoryWithTimeline', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAllSummarySyncHistories();
     readdirMock
       .mockResolvedValueOnce(['slug-1'])
       .mockResolvedValueOnce(['session-anything-12345678.json']);
@@ -78,6 +80,7 @@ describe('injectGeminiMemoryWithTimeline', () => {
           type: 'processed',
           projectId: 'proj',
           scope: 'personal',
+          projectionClass: 'recent_summary',
           summary: 'Fix websocket reconnect loop',
           createdAt: 1,
           hitCount: 2,
@@ -101,6 +104,8 @@ describe('injectGeminiMemoryWithTimeline', () => {
     await injectGeminiMemoryWithTimeline('deck_proj_brain', '12345678-abcd-efgh', '/proj', 'proj');
 
     expect(writeFileMock).toHaveBeenCalledTimes(1);
+    expect(searchLocalMemoryMock).toHaveBeenCalled();
+    expect(getSummarySyncFingerprints('deck_proj_brain')).toHaveLength(1);
     expect(emitMock).toHaveBeenCalledWith(
       'deck_proj_brain',
       'memory.context',

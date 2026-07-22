@@ -29,10 +29,11 @@
  *     prefer ring buffer / preferred APIs.
  */
 
-import { mkdirSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync } from 'fs';
-import { mkdir, appendFile, writeFile, readFile, rename, unlink } from 'fs/promises';
+import { mkdirSync, readdirSync, statSync, openSync, readSync, fstatSync, closeSync, createReadStream } from 'fs';
+import { mkdir, appendFile, writeFile, rename, unlink } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createInterface } from 'readline';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
@@ -42,6 +43,78 @@ import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 export const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_EVENTS_PER_FILE = 5000;
+
+// A busy provider can emit thousands of status/tool lifecycle records during a
+// single user turn. Those records are useful while they are recent, but must
+// never evict the actual conversation merely because the JSONL file reached
+// its bounded retention size. When compaction is necessary, these event types
+// are retained before filling the remaining budget with the newest auxiliary
+// events. The output is sorted back into append order before the atomic rename.
+const CONVERSATION_RETENTION_TYPES = new Set([
+  'user.message',
+  'assistant.text',
+  'ask.question',
+  'peer_audit.result',
+  'memory.compression',
+]);
+
+interface RetainedTimelineLine {
+  ordinal: number;
+  line: string;
+}
+
+function pushBoundedLine(target: RetainedTimelineLine[], value: RetainedTimelineLine, limit: number): void {
+  target.push(value);
+  // Compact in batches rather than shift() on every line, which would turn a
+  // large malformed/noisy timeline into quadratic startup work.
+  if (target.length > limit * 2) target.splice(0, target.length - limit);
+}
+
+async function selectRetainedTimelineLines(
+  filePath: string,
+  keepLast: number,
+): Promise<{ total: number; kept: string[] } | null> {
+  const conversation: RetainedTimelineLine[] = [];
+  const auxiliary: RetainedTimelineLine[] = [];
+  let total = 0;
+  const lines = createInterface({
+    input: createReadStream(filePath, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  });
+
+  try {
+    for await (const line of lines) {
+      if (!line) continue;
+      total += 1;
+      let type = '';
+      try {
+        const parsed = JSON.parse(line) as { type?: unknown };
+        if (typeof parsed.type === 'string') type = parsed.type;
+      } catch {
+        // Keep malformed lines in the auxiliary tail. Existing readers already
+        // ignore malformed JSON, and compaction must not make it more durable
+        // than a real conversation event.
+      }
+      const retained = { ordinal: total, line };
+      pushBoundedLine(
+        CONVERSATION_RETENTION_TYPES.has(type) ? conversation : auxiliary,
+        retained,
+        keepLast,
+      );
+    }
+  } finally {
+    lines.close();
+  }
+
+  if (total <= keepLast) return null;
+  const protectedTail = conversation.slice(-keepLast);
+  const auxiliaryBudget = keepLast - protectedTail.length;
+  const selected = auxiliaryBudget > 0
+    ? [...protectedTail, ...auxiliary.slice(-auxiliaryBudget)]
+    : protectedTail;
+  selected.sort((left, right) => left.ordinal - right.ordinal);
+  return { total, kept: selected.map((entry) => entry.line) };
+}
 
 export class TimelinePreferredReadError extends Error {
   constructor(
@@ -314,32 +387,48 @@ class TimelineStore {
    * reset so subsequent appends open a fresh fd against the new inode.
    */
   async truncate(sessionName: string, keepLast = MAX_EVENTS_PER_FILE): Promise<void> {
-    const filePath = this.filePath(sessionName);
-    // 1) Wait for any pending appends so they reach the live file *before*
-    //    we read its tail and rewrite it. Without this we could lose
-    //    fresh events to the rename.
-    const chain = this.sessionChains.get(sessionName);
-    if (chain) {
-      await chain.catch(() => undefined);
+    // Put compaction on the same per-session chain as appends. Merely awaiting
+    // the current chain leaves a race where a new append can start while the
+    // tmp file is being written and then be erased by rename. Reserving the
+    // chain first makes appends arriving during compaction wait for the new
+    // authoritative file.
+    const previous = this.sessionChains.get(sessionName) ?? Promise.resolve();
+    const operation = previous.then(
+      () => this.truncateOne(sessionName, keepLast),
+      () => this.truncateOne(sessionName, keepLast),
+    );
+    this.sessionChains.set(sessionName, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.sessionChains.get(sessionName) === operation) {
+        this.sessionChains.delete(sessionName);
+      }
     }
+  }
 
-    const newestFirst = readTailLines(filePath, keepLast + 1);
-    if (newestFirst.length <= keepLast) return;
-
-    const kept = newestFirst.slice(0, keepLast).reverse();
+  private async truncateOne(sessionName: string, keepLast: number): Promise<void> {
+    const filePath = this.filePath(sessionName);
+    let selection: Awaited<ReturnType<typeof selectRetainedTimelineLines>>;
+    try {
+      selection = await selectRetainedTimelineLines(filePath, keepLast);
+    } catch (err) {
+      // Preserve the former best-effort contract: a concurrently deleted or
+      // unreadable history file must not reject daemon startup.
+      logger.debug({ err, sessionName }, 'TimelineStore: truncate read failed');
+      return;
+    }
+    if (!selection) return;
+    const kept = selection.kept;
     const tmpPath = `${filePath}.tmp`;
     try {
       await writeFile(tmpPath, kept.join('\n') + '\n', 'utf-8');
       await rename(tmpPath, filePath);
-      void timelineProjection.pruneSessionToAuthoritative(sessionName, keepLast).catch((err) => {
-        logger.debug({ err, sessionName }, 'TimelineProjection: prune after truncate failed');
-      });
-      logger.info({ sessionName, after: kept.length }, 'TimelineStore: truncated');
-      // 2) Reset chain head — subsequent appends start a fresh fd against
-      //    the new file. POSIX `appendFile` re-opens by path each call, so
-      //    the rename is transparent, but clearing the cached promise
-      //    avoids holding a settled chain forever.
-      this.sessionChains.delete(sessionName);
+      // Compaction is priority-aware rather than a contiguous tail now, so a
+      // positional SQLite prune would retain rows that no longer exist in the
+      // authoritative JSONL. Rebuild the projection from the rewritten file.
+      await timelineProjection.rebuildSession(sessionName);
+      logger.info({ sessionName, before: selection.total, after: kept.length }, 'TimelineStore: truncated');
     } catch (err) {
       logger.debug({ err, sessionName }, 'TimelineStore: truncate write failed');
       // Best-effort tmp cleanup; ignore errors (file may not exist).

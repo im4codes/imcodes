@@ -14,6 +14,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
@@ -85,7 +86,6 @@ import {
   buildTransportConfigWithSupervision,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
-  parseSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
   SUPERVISION_MODE,
   type SessionSupervisionSnapshot,
@@ -99,6 +99,10 @@ import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
 } from '@shared/agent-delegation.js';
+import {
+  SESSION_SETTINGS_FOCUS,
+  type SessionSettingsOpenIntent,
+} from '../session-settings-open-intent.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -117,7 +121,7 @@ interface Props {
   /** Called when Rename is selected in the menu. */
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
-  onSettings?: () => void;
+  onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   /** Called when Share is selected in the send-adjacent more menu. */
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   /** Whether the active session tab is pinned. */
@@ -191,6 +195,10 @@ interface Props {
     qwenModel?: string | null;
     requestedModel?: string | null;
     activeModel?: string | null;
+    sessionInstanceId?: string | null;
+    runtimeEpoch?: string | null;
+    providerId?: string | null;
+    agentType?: string | null;
     modelDisplay?: string | null;
     executionTemplateEligible?: boolean;
     executionTemplateIneligibleReason?: string;
@@ -359,7 +367,7 @@ function isTextEntryKeyboardOwner(node: EventTarget | Node | null | undefined): 
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
-type ModelChoice = 'fable' | 'opus[1M]' | 'sonnet' | 'haiku';
+type ModelChoice = string;
 
 const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 const IME_ESCAPE_CANCEL_GRACE_MS = 800;
@@ -960,6 +968,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const machinePasteSuppressRef = useRef(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
+  const [peerAuditOpen, setPeerAuditOpen] = useState(false);
+  const [quickDelegationError, setQuickDelegationError] = useState<string | null>(null);
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
@@ -1190,10 +1200,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
     !!activeSession && !!entry.clientMessageId
   ), [activeSession]);
-  const isLocalQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
-    !!optimisticQueuedEntries?.some((item) => item.clientMessageId === entry.clientMessageId)
-    && !incomingQueuedTransportEntries.some((item) => item.clientMessageId === entry.clientMessageId)
-  ), [incomingQueuedTransportEntries, optimisticQueuedEntries]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // Shared alias data — feeds compose-time resolution (A′) on send and the
@@ -1464,6 +1470,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
   const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
+  const auditedSessionName = activeSession?.name ?? null;
+  const hasSavedAuditTarget = Boolean(
+    supervisionSnapshot?.auditTargetSessionName
+    && supervisionSnapshot.auditTargetSessionName !== auditedSessionName,
+  );
   const canQuickControlSupervision = !!(
     activeSession
     && serverId
@@ -1478,7 +1489,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isGrokSdk || isKimiSdk;
+  const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1526,6 +1538,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isGeminiSdk,
     isGrokSdk,
     isKimiSdk,
+    isOpenCodeSdk,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);
@@ -1546,6 +1559,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const displayedCodexModel = activeSession?.agentType === 'codex-sdk'
     ? genericTransportModel
     : (genericTransportModel ?? codexModel);
+  const claudeSessionModel = activeSession?.agentType === 'claude-code-sdk'
+    ? (resolveEffectiveSessionModel(activeSession, detectedModel) ?? null)
+    : null;
+  const claudePinnedModel = claudeSessionModel && (
+    !!activeSession?.ccPreset
+    || !normalizeClaudeCodeModelId(claudeSessionModel)
+  )
+    ? claudeSessionModel
+    : null;
+  const displayedClaudeModel = claudePinnedModel ?? model;
+  const claudeModelSuggestions = claudePinnedModel
+    ? [claudePinnedModel]
+    : CLAUDE_CODE_MODEL_IDS;
   const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
     && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
@@ -2050,11 +2076,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
   }, [autoOpen, menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
-  const quickAutoColor = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
-    ? '#34d399'
+  const quickAutoModeClass = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
+    ? 'shortcut-btn-auto-supervised shortcut-btn-auto-active'
     : quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT
-      ? '#f59e0b'
-      : '#94a3b8';
+      ? 'shortcut-btn-auto-audit shortcut-btn-auto-active'
+      : 'shortcut-btn-auto-off';
 
   const persistTransportConfig = useCallback(async (transportConfig: Record<string, unknown> | null) => {
     if (!serverId || !activeSession) return;
@@ -2070,6 +2096,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
     if (!activeSession || !serverId || !canQuickControlSupervision) return;
 
+    const openSettingsForMode = () => {
+      setAutoOpen(false);
+      onSettings?.(nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        ? {
+            supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+            focus: SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET,
+          }
+        : undefined);
+    };
+
     if (nextMode === SUPERVISION_MODE.OFF) {
       const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, { mode: SUPERVISION_MODE.OFF });
       try {
@@ -2082,35 +2118,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     if (hasInvalidSupervisionConfig) {
-      setAutoOpen(false);
-      onSettings?.();
+      openSettingsForMode();
       return;
     }
 
-    const rawSupervision = currentTransportConfig && typeof currentTransportConfig === 'object' && !Array.isArray(currentTransportConfig)
-      ? (currentTransportConfig.supervision as Record<string, unknown> | undefined)
-      : undefined;
+    // Settings persist the user's exact auditor choice. Live availability and
+    // delivery remain daemon/ordinary-delegation concerns at audit time.
+    if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasSavedAuditTarget) {
+      openSettingsForMode();
+      return;
+    }
+
     let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
     if (supervisionSnapshot) {
-      const auditCandidate = nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && rawSupervision
-        ? parseSessionSupervisionSnapshot({ ...rawSupervision, mode: SUPERVISION_MODE.SUPERVISED_AUDIT })
-        : null;
-      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !auditCandidate) {
-        setAutoOpen(false);
-        onSettings?.();
-        return;
-      }
       nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
     } else {
       const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
       if (!defaults) {
-        setAutoOpen(false);
-        onSettings?.();
+        openSettingsForMode();
         return;
       }
       if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
-        setAutoOpen(false);
-        onSettings?.();
+        openSettingsForMode();
         return;
       }
       nextSnapshot = {
@@ -2138,7 +2167,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     hasInvalidSupervisionConfig,
     onSettings,
     persistTransportConfig,
-    quickSupervisionMode,
+    hasSavedAuditTarget,
     serverId,
     showSendWarning,
     supervisionSnapshot,
@@ -2547,6 +2576,45 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+  const quickDelegationTeamMembers = useMemo(() => new Set(
+    p2pSavedConfig?.sessions
+      ? getEnabledP2pMemberNames(p2pSavedConfig.sessions, { scopeSession: rootSession })
+      : [],
+  ), [p2pSavedConfig, rootSession]);
+  const quickDelegationCandidates = useMemo<QuickAgentDelegationCandidate[]>(() => {
+    // Match the ordinary @agent picker: the current root session and its
+    // direct sub-sessions form one delegation group. `session.project` is not
+    // a safe UI scope here because daemon worker records can share the project
+    // name while belonging to hidden/legacy session generations.
+    if (!activeSession?.name || !rootSession) return [];
+    const byName = new Map<string, QuickAgentDelegationCandidate>();
+    const add = (candidate: QuickAgentDelegationCandidate) => {
+      if (candidate.sessionName === activeSession?.name) return;
+      if (candidate.agentType === 'shell' || candidate.agentType === 'script') return;
+      if (!byName.has(candidate.sessionName)) byName.set(candidate.sessionName, candidate);
+    };
+    for (const session of sessions ?? []) {
+      if (session.name !== rootSession) continue;
+      add({
+        sessionName: session.name,
+        agentType: session.agentType,
+        label: session.label,
+        model: resolveEffectiveSessionModel(session),
+        teamMember: quickDelegationTeamMembers.has(session.name),
+      });
+    }
+    for (const session of subSessions ?? []) {
+      if (session.parentSession !== rootSession) continue;
+      add({
+        sessionName: session.sessionName,
+        agentType: session.type,
+        label: session.label,
+        model: resolveEffectiveSessionModel(session),
+        teamMember: quickDelegationTeamMembers.has(session.sessionName),
+      });
+    }
+    return [...byName.values()];
+  }, [activeSession?.name, quickDelegationTeamMembers, rootSession, sessions, subSessions]);
 
   // ── Dedicated execution routing preference ──────────────────────────────
   // Reads the SHARED preference (the same one Team Settings edits). Generic
@@ -3364,11 +3432,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return commandId;
   }, [activeSession, ws]);
 
-  const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
-    if (!activeSession) return;
-    if (uploading) {
+  const finalizeSend = useCallback((
+    payload: PendingSendPayload,
+    options?: { clearComposer?: boolean; programmaticDelegation?: boolean },
+  ): 'accepted' | 'rejected' => {
+    if (!activeSession) return 'rejected';
+    if (uploading && !options?.programmaticDelegation) {
       showSendWarning(t('upload.uploading'));
-      return;
+      return 'rejected';
     }
     const isP2pSend = (
       Array.isArray(payload.extra.p2pAtTargets) && payload.extra.p2pAtTargets.length > 0
@@ -3400,11 +3471,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
     if (effectiveRuntimeType === 'transport' && !isP2pSend && !isDelegationSend && payload.text.trim() === '/stop') {
       showStopFeedback();
-      if (!cancelActiveTransportTurn()) return;
+      if (!cancelActiveTransportTurn()) return 'rejected';
       if (options?.clearComposer) clearComposerState();
-      return;
+      return 'accepted';
     }
-    if (editingQueuedMessageId && effectiveRuntimeType === 'transport') {
+    if (editingQueuedMessageId && effectiveRuntimeType === 'transport' && !options?.programmaticDelegation) {
       const previousEntry = queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId);
       let mutationCommandId: string | false = false;
       try {
@@ -3412,9 +3483,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           clientMessageId: editingQueuedMessageId,
           text: payload.text,
         });
-        if (!mutationCommandId) return;
+        if (!mutationCommandId) return 'rejected';
       } catch {
-        return;
+        return 'rejected';
       }
       if (previousEntry) {
         queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'edit', entry: previousEntry });
@@ -3431,16 +3502,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (options?.clearComposer) {
         clearComposerState();
       }
-      return;
+      return 'accepted';
     }
-    quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     const commandId = makeCommandId();
     let localFailure: string | undefined;
     try {
-      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return;
+      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return 'rejected';
     } catch (err) {
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
+    if (!localFailure) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
       && transportSendShouldQueue
       && !isP2pSend
@@ -3462,7 +3533,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     // Snapshot attachments before clearComposer wipes them so the optimistic
     // bubble surfaces the same badges the confirmed message will.
-    const attachmentSnapshot = attachments.length > 0
+    const attachmentSnapshot = !options?.programmaticDelegation && attachments.length > 0
       ? attachments.map((a) => ({
           id: a.path,
           daemonPath: a.path,
@@ -3481,6 +3552,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (options?.clearComposer) {
       clearComposerState();
     }
+    return localFailure ? 'rejected' : 'accepted';
   }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
@@ -3499,13 +3571,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
-    if (isLocalQueuedEntry(entry)) {
-      setOptimisticQueuedEntries((prev) => {
-        const source = prev ?? incomingQueuedTransportEntries;
-        return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-      });
-      return;
-    }
+    // Drop the local optimistic copy immediately for responsiveness.
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+    });
+    // ALWAYS ask the backend to drop it — even when the entry still looks "local"
+    // (present optimistically but not yet echoed in the authoritative snapshot).
+    // The WS enqueue for this message is ordered BEFORE this delete, so the daemon
+    // has almost always ALREADY persisted it to the SQLite queue. The old
+    // "local => remove locally and skip the backend undo" shortcut is exactly why
+    // deletes didn't reach the backend: the message reappeared on the next
+    // authoritative snapshot and stayed queued server-side. Deleting a message the
+    // backend never received is safe — the daemon treats an absent id as an
+    // idempotent success, so no rollback fires.
     let mutationCommandId: string | false = false;
     try {
       mutationCommandId = sendQueuedMessageMutation('session.undo_queued_message', {
@@ -3514,17 +3593,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch {
       return;
     }
-    if (!mutationCommandId) return;
+    if (!mutationCommandId) return; // WS unavailable: the local removal above stands.
     queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
     setOptimisticallyRemovedQueuedIds((prev) => {
       if (prev.has(entry.clientMessageId)) return prev;
       return new Set([...prev, entry.clientMessageId]);
     });
-    setOptimisticQueuedEntries((prev) => {
-      const source = prev ?? incomingQueuedTransportEntries;
-      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-    });
-  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, isLocalQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessageRetry = useCallback((entry: LocalQueuedTransportEntry) => {
     if (entry.status !== 'failed') return;
@@ -3611,6 +3686,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleSend = useCallback(() => {
     requestSend(buildSendPayload(), { clearComposer: true });
   }, [buildSendPayload, requestSend]);
+
+  const handleQuickAgentDelegationDispatch = useCallback((input: {
+    sessionName: string;
+    label: string;
+    task: string;
+  }) => {
+    const task = input.task.trim();
+    if (!task) {
+      setQuickDelegationError(t('delegation.warning_empty_task'));
+      return;
+    }
+    if (isDelegationUnsupportedControlText(task)) {
+      setQuickDelegationError(t('delegation.warning_control_command'));
+      return;
+    }
+    setQuickDelegationError(null);
+    const outcome = finalizeSend({
+      text: buildAgentDelegationOrchestrationPrompt({
+        targetSession: input.sessionName,
+        targetLabel: input.label,
+        task,
+      }),
+      extra: {},
+      delegation: {
+        targetSession: input.sessionName,
+        targetLabel: input.label,
+        task,
+      },
+    }, { programmaticDelegation: true });
+    if (outcome === 'accepted') {
+      setPeerAuditOpen(false);
+      return;
+    }
+    setQuickDelegationError(t('peerAuditQuick.sendFailed'));
+  }, [finalizeSend, t]);
 
   const handleDirectComboSelect = useCallback((mode: string, roundsOverride?: number) => {
     setP2pOpen(false);
@@ -4313,19 +4423,46 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           })}
         </div>}
 
+        {/* Quick peer delegation reuses the ordinary @agent orchestration path.
+            It stays separate from automatic supervision state and remains
+            visible while Auto is off. */}
         {canQuickControlSupervision && (
-          <div class="shortcuts-model" ref={autoRef}>
+          <div class="shortcuts-model shortcuts-model-supervision" ref={autoRef}>
             <button
-              class="shortcut-btn shortcut-btn-auto"
+              class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"
+              data-testid="peer-audit-icon"
+              onClick={() => {
+                setQuickDelegationError(null);
+                setPeerAuditOpen(true);
+              }}
+              disabled={disabled || peerAuditOpen}
+              title={t('peerAuditQuick.tooltip')}
+              aria-label={t('peerAuditQuick.iconLabel')}
+              aria-haspopup="dialog"
+            >
+              <svg
+                class="shortcut-btn-peer-audit-icon"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <circle cx="10.5" cy="10.5" r="6.5" />
+                <path d="m15.3 15.3 4.2 4.2" />
+                <path d="m7.7 10.6 1.8 1.8 3.8-4" />
+              </svg>
+            </button>
+            <button
+              class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}
               onClick={() => setAutoOpen((open) => !open)}
               disabled={disabled}
               title={t('session.supervision.quickTitle')}
               aria-label={t('session.supervision.quickLabel')}
+              aria-haspopup="menu"
+              aria-expanded={autoOpen}
             >
               <span
                 class="shortcut-btn-auto-dot"
                 aria-hidden="true"
-                style={{ background: quickAutoColor }}
               />
               <span class="shortcut-btn-auto-label">{t('session.supervision.quickLabel')}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
@@ -4367,6 +4504,39 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </div>
             )}
           </div>
+        )}
+
+        {peerAuditOpen && auditedSessionName && typeof document !== 'undefined' && createPortal(
+          <div
+            class="peer-audit-overlay"
+            data-testid="peer-audit-overlay"
+            role="presentation"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) {
+                setQuickDelegationError(null);
+                setPeerAuditOpen(false);
+              }
+            }}
+          >
+            <div
+              class="peer-audit-modal"
+              data-testid="peer-audit-modal"
+              role="dialog"
+              aria-modal="true"
+            >
+              <QuickAgentDelegationDialog
+                currentSessionName={auditedSessionName}
+                candidates={quickDelegationCandidates}
+                error={quickDelegationError}
+                onClose={() => {
+                  setQuickDelegationError(null);
+                  setPeerAuditOpen(false);
+                }}
+                onDispatch={handleQuickAgentDelegationDispatch}
+              />
+            </div>
+          </div>,
+          document.body,
         )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
@@ -4587,20 +4757,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               class="shortcut-btn"
               onClick={() => setModelOpen((o) => !o)}
               disabled={disabled}
-              title={model ? `Model: ${model}` : 'Model: Unknown — tap to select'}
-              style={{ color: model ? '#a78bfa' : '#6b7280', fontSize: 10 }}
+              title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
+              style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}
             >
-              {model ?? 'unknown'}
+              {displayedClaudeModel ?? 'unknown'}
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {CLAUDE_CODE_MODEL_IDS.map((m) => (
+                {claudeModelSuggestions.map((m) => (
                   <button
                     key={m}
-                    class={`menu-item ${model === m ? 'menu-item-active' : ''}`}
+                    class={`menu-item ${displayedClaudeModel === m ? 'menu-item-active' : ''}`}
                     onClick={() => handleModelSelect(m)}
                   >
-                    {model === m ? '● ' : '○ '}{m.charAt(0).toUpperCase() + m.slice(1)}
+                    {displayedClaudeModel === m ? '● ' : '○ '}{m.charAt(0).toUpperCase() + m.slice(1)}
                   </button>
                 ))}
               </div>

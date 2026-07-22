@@ -853,6 +853,14 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns).toHaveLength(2);
     expect(mocks.claudeRuns[0].prompt).toBe('offline-msg-1');
     expect(mocks.claudeRuns[1].prompt).toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
+    for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
+      const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
+        call[0] === 'deck_sdk_drain_brain'
+        && call[1] === 'user.message'
+        && (call[2] as { text?: unknown } | undefined)?.text === text
+      ));
+      expect(matchingUserEvents, `${text} should have exactly one timeline owner after restore drain`).toHaveLength(1);
+    }
   });
 
   it('launchTransportSession awaits drainResend — fresh launch with pre-populated queue dispatches in order', async () => {
@@ -1036,6 +1044,7 @@ describe('sdk transport session restore', () => {
       codexSessionId: 'codex-thread-stale-running',
       startupMemoryInjected: true,
       recentInjectionHistory: [['memory-old']],
+      summarySyncFingerprints: ['summary-old'],
       requestedModel: 'gpt-5.5',
       activeModel: 'gpt-5.5',
     });
@@ -1050,6 +1059,7 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBeUndefined();
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBeUndefined();
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toBeUndefined();
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.summarySyncFingerprints).toBeUndefined();
     expect(persistedRecords.at(-1)).toMatchObject({
       name: 'deck_sub_sdk_stale_running',
       state: 'idle',

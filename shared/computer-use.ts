@@ -265,7 +265,8 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
         'Target controlled machines accept either their stable ref_name or the complete ^^(ref_name) marker. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
-        'Browser-specific control is available through Playwright-backed browser_* tools and should be preferred over coordinate GUI control for web pages.',
+        'When the user asks to use a browser on the daemon host, call computer_use_call with machine=local and the built-in CDP-backed browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
+        'Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path; browser_* is IM.codes\' separate CDP implementation and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
@@ -292,11 +293,14 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'browser':
       return [
         'Browser control uses Chrome DevTools Protocol (CDP), the mature browser automation protocol used by Chrome/Edge tooling, and is more deterministic for web pages than screen coordinates.',
+        'For the current daemon host use computer_use_call with machine=local. browser_* is IM.codes\' built-in CDP path, separate from the integrated Open Computer Use desktop-app path; do not replace it with shell-launched Playwright.',
         'Use browser_open first with url. Optional arguments: channel=chrome|msedge|chromium, executablePath, headless=true|false, noSandbox=false, cdpEndpoint to attach to an existing browser target websocket.',
         'Then use browser_navigate, browser_snapshot, browser_click, browser_fill, browser_press, browser_evaluate, browser_close.',
+        'Every browser snapshot includes automation.cdpEndpoint, cdpHost, and cdpPort. A local Python/Node script may attach to that loopback CDP endpoint (for example Playwright connect_over_cdp) to run complex logic against the same browser instance instead of launching another browser.',
+        'The daemon-managed endpoint listens on 127.0.0.1 only. Coordinate MCP browser calls and external scripts so they do not race, and do not terminate the shared browser until the task is finished.',
         'Selectors are CSS selectors. For click/fill you may pass selector or visible text. Prefer stable CSS selectors over coordinates.',
         'Linux without DISPLAY/WAYLAND defaults to headless and uses no-sandbox/dev-shm-safe flags unless noSandbox=false is passed.',
-        'browser_snapshot returns url/title plus bounded visible text and common links/buttons/inputs; call it on demand before choosing selectors.',
+        'browser_open, browser_navigate, and browser_snapshot return url/title, bounded visible text, and common links/buttons/inputs. Pass includeImage=true only when visual evidence is needed; the optional viewport screenshot is delivered as model-visible image content.',
         'browser_evaluate runs JavaScript in the page, not a shell. Use it for read-only inspection by default; ask before submitting forms, purchases, destructive actions, or externally visible changes.',
       ].join('\n');
     case 'windows':

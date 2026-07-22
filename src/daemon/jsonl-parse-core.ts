@@ -18,6 +18,7 @@ import type { TimelineEventType, TimelineSource, TimelineConfidence } from '../s
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangeBatch } from '../../shared/file-change.js';
 import { normalizeClaudeFileChange } from './file-change-normalizer.js';
 import { resolveContextWindow } from '../shared/models/context.js';
+import { isClaudeSyntheticSeedAssistant } from '../shared/claude-synthetic-seed.js';
 
 // ── Types reproduced locally (structurally identical to jsonl-watcher) ──────
 
@@ -370,6 +371,8 @@ function parseOneLine(
   } catch {
     return;
   }
+
+  if (isClaudeSyntheticSeedAssistant(raw)) return;
 
   const lineTs = raw['timestamp'] ? new Date(raw['timestamp'] as string).getTime() : undefined;
   const ts = lineTs && isFinite(lineTs) ? lineTs : undefined;

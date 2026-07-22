@@ -120,6 +120,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { CopilotSdkProvider } = await import('./providers/copilot-sdk.js');
       return new CopilotSdkProvider();
     }
+    case 'opencode-sdk': {
+      const { OpenCodeSdkProvider } = await import('./providers/opencode-sdk.js');
+      return new OpenCodeSdkProvider();
+    }
     default:
       throw new Error(`Unknown provider: ${id}`);
   }

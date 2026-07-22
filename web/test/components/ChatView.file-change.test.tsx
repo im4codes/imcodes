@@ -38,6 +38,12 @@ vi.mock('react-i18next', () => ({
         'chat.file_change_derived_no_preview': '(no preview available)',
         'chat.file_change_coarse_hint': 'File path available, but no diff text was provided.',
         'chat.file_change_renamed_from': `${vars?.oldPath ?? ''} → ${vars?.newPath ?? ''}`,
+        'peerAuditResult.title': 'Peer audit result',
+        'peerAuditResult.attributionAuditor': `Reviewed by ${vars?.auditor ?? ''}`,
+        'peerAuditResult.elapsedMs': `Took ${vars?.seconds ?? 0}s`,
+        'peerAuditResult.findingsPreview': 'Findings',
+        'peerAuditQuick.result_unavailable': 'Peer auditor unavailable.',
+        'peerAuditQuick.disposition.sent_unrevocable': 'sent (cannot revoke)',
       };
       return map[key] ?? key;
     },
@@ -432,5 +438,31 @@ describe('ChatView file-change cards', () => {
 describe('isUserVisible', () => {
   it('treats file.change as visible chat content', () => {
     expect(isUserVisible({ type: 'file.change', payload: {} })).toBe(true);
+  });
+
+  it('treats peer audit results as visible reconnect-safe chat content', () => {
+    expect(isUserVisible({ type: 'peer_audit.result', payload: {} })).toBe(true);
+  });
+});
+
+describe('ChatView peer-audit result cards', () => {
+  it('renders stable localized outcome/disposition text without exposing wire codes', () => {
+    const event = makeEvent('peer_audit.result', {
+      outcome: 'target_unavailable',
+      auditorLabel: 'Peer CC',
+      elapsedMs: 2_100,
+      disposition: 'sent_unrevocable',
+      findingsPreview: 'Daemon was unavailable.',
+    }, { eventId: 'peer-result-1' });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.peer-audit-result-card');
+    expect(card?.getAttribute('data-event-id')).toBe('peer-result-1');
+    expect(card?.textContent).toContain('Peer auditor unavailable.');
+    expect(card?.textContent).toContain('sent (cannot revoke)');
+    expect(card?.textContent).toContain('Peer CC');
+    expect(card?.textContent).not.toContain('target_unavailable');
   });
 });

@@ -90,6 +90,22 @@ describe('styles.css regression contracts', () => {
     expect(roundButtonRule![0]).toMatch(/border:\s*1px solid rgba\(34,\s*197,\s*94/);
   });
 
+  it('active Auto supervision uses an orbiting sci-fi ring with distinct audit colors', () => {
+    const activeRule = css.match(/\.shortcut-btn-auto-active::before\s*\{[^}]*\}/);
+    expect(activeRule).not.toBeNull();
+    expect(activeRule![0]).toMatch(/conic-gradient\(/);
+    expect(activeRule![0]).toMatch(/animation:\s*shortcut-btn-auto-orbit/);
+
+    const supervisedRule = css.match(/\.shortcut-btn-auto-supervised\s*\{[^}]*\}/);
+    const auditRule = css.match(/\.shortcut-btn-auto-audit\s*\{[^}]*\}/);
+    expect(supervisedRule?.[0]).toMatch(/#22d3ee/);
+    expect(supervisedRule?.[0]).toMatch(/#34d399/);
+    expect(auditRule?.[0]).toMatch(/#c084fc/);
+    expect(auditRule?.[0]).toMatch(/#f59e0b/);
+
+    expect(cssWithoutComments).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.shortcut-btn-auto-active::before[\s\S]*?animation:\s*none/);
+  });
+
   it('mobile Team/P2P dropdown is portaled and clamped to the visual viewport', () => {
     const sessionControls = readFileSync(resolve(__dirname, '../src/components/SessionControls.tsx'), 'utf8');
     const helper = sessionControls.match(/const renderP2pDropdown = useCallback\([\s\S]*?\}, \[isOpenSpecMobile\]\);/);
@@ -114,8 +130,8 @@ describe('styles.css regression contracts', () => {
     const fillRule = css.match(/\.session-ctx-input,\s*[\s\S]*?\.subsession-card-ctx-fill\s*\{[^}]*\}/);
     expect(fillRule).not.toBeNull();
     expect(fillRule![0]).toMatch(/repeating-linear-gradient\(135deg/);
-    expect(fillRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
-    expect(fillRule![0]).toMatch(/left\s+0\.32s/);
+    expect(fillRule![0]).toMatch(/transition:\s*width\s+0\.58s/);
+    expect(fillRule![0]).toMatch(/left\s+0\.58s/);
     expect(fillRule![0]).not.toMatch(/animation\s*:/);
 
     const cacheRule = css.match(/\.session-ctx-cache,\s*[\s\S]*?\.subcard-ctx-cache\s*\{[^}]*\}/);
@@ -123,11 +139,12 @@ describe('styles.css regression contracts', () => {
     expect(cacheRule![0]).toMatch(/#c084fc/);
     expect(cacheRule![0]).toMatch(/#a855f7/);
     expect(cacheRule![0]).toMatch(/rgba\(168,\s*85,\s*247,\s*0\.56\)/);
-    expect(cacheRule![0]).toMatch(/transition:\s*width\s+0\.32s/);
+    expect(cacheRule![0]).toMatch(/transition:\s*width\s+0\.58s/);
 
     expect(css).toMatch(/\.session-usage-footer \.session-ctx-bar\.is-burning/);
     expect(css).toMatch(/\.session-ctx-burn\s*\{[\s\S]*?overflow:\s*hidden/);
     expect(css).toMatch(/\.session-ctx-burn::after\s*\{[\s\S]*?animation:\s*ctx-burn-sparks\s+0\.78s/);
+    expect(css).toMatch(/\.session-ctx-burn-edge\s*\{[\s\S]*?animation:\s*ctx-burn-edge\s+1\.2s/);
   });
 
   it('transport stop shortcut stays left while meta header controls stay right', () => {

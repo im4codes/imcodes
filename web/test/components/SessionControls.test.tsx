@@ -471,6 +471,7 @@ afterEach(() => {
     fetchSupervisorDefaultsMock.mockResolvedValue(null);
     patchSessionMock.mockResolvedValue(undefined);
     patchSubSessionMock.mockResolvedValue(undefined);
+    sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         return JSON.stringify({
@@ -1562,7 +1563,7 @@ afterEach(() => {
     });
   });
 
-  it('lists saved custom Team combos in the Auto Deliver launcher and blocks them with a compatibility reason before launch', async () => {
+  it('lists saved custom Team combos and launches Auto Deliver with the selected flow', async () => {
     const onLaunch = vi.fn();
     render(
       <OpenSpecAutoDeliverLauncher
@@ -1584,11 +1585,20 @@ afterEach(() => {
     expect(within(comboSelect).queryByRole('option', { name: 'audit>plan (Custom)' })).toBeNull();
     fireEvent.change(comboSelect, { target: { value: 'audit>plan' } });
 
-    expect(screen.getByTestId('openspec-auto-combo-warning').textContent).toBe('Custom Team combos are not supported for Auto Deliver yet');
-    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByTestId('openspec-auto-combo-warning')).toBeNull();
+    expect((screen.getByRole('button', { name: 'Start Auto Deliver' }) as HTMLButtonElement).disabled).toBe(false);
 
     fireEvent.click(screen.getByRole('button', { name: 'Start Auto Deliver' }));
-    expect(onLaunch).not.toHaveBeenCalled();
+    expect(onLaunch).toHaveBeenCalledWith('change-a', 'standard', {
+      selectedTeamComboId: 'audit>plan',
+      autoCommitPush: false,
+      materializedLimits: {
+        specAuditRepairRounds: 1,
+        implementationAuditRepairRounds: 2,
+        maxImplementationPrompts: 12,
+        maxElapsedMinutes: 480,
+      },
+    });
   });
 
   it('shows local Auto Deliver launch validation when no change is selected', () => {
@@ -4140,6 +4150,49 @@ afterEach(() => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
+  it('shows the preset model for claude-code-sdk sessions instead of stale local opus', () => {
+    localStorage.setItem('imcodes-model', 'opus[1M]');
+
+    render(<SessionControls
+      ws={makeWs() as any}
+      activeSession={makeSession({
+        name: 'deck_sub_minimax',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        ccPreset: 'minimax',
+        requestedModel: 'MiniMax-M3',
+        activeModel: 'MiniMax-M3',
+        modelDisplay: 'MiniMax-M3',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^MiniMax-M3$/i }));
+    expect(screen.getByRole('button', { name: /^● MiniMax-M3$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /opus/i })).toBeNull();
+  });
+
+  it('uses the claude-code-sdk active model when sub-session preset metadata is absent', () => {
+    localStorage.setItem('imcodes-model', 'opus[1M]');
+
+    render(<SessionControls
+      ws={makeWs() as any}
+      activeSession={makeSession({
+        name: 'deck_sub_minimax',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        requestedModel: 'MiniMax-M3',
+        activeModel: 'MiniMax-M3',
+        modelDisplay: 'MiniMax-M3',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^MiniMax-M3$/i }));
+    expect(screen.getByRole('button', { name: /^● MiniMax-M3$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /opus/i })).toBeNull();
+  });
+
   it('shows level control for qwen and sends /thinking', () => {
     const ws = makeWs();
     render(<SessionControls
@@ -4347,6 +4400,44 @@ afterEach(() => {
       commandId: expect.any(String),
     }));
     expect(screen.queryByText('queued send')).toBeNull();
+  });
+
+  it('sends the backend undo when deleting a still-local optimistic queue entry', () => {
+    // Regression: an optimistic entry is queued locally the instant you send it,
+    // but the daemon has ALSO already enqueued it (the WS enqueue is ordered
+    // before any delete). Deleting it during the window before the authoritative
+    // snapshot echoes back used to remove ONLY the local copy and skip the backend
+    // undo — so the message stayed queued server-side and reappeared on the next
+    // snapshot. The delete must always reach the backend.
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'delete me from the backend too';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(screen.getByText('delete me from the backend too')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: /delete/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.undo_queued_message',
+      sessionName: 'qwen-session',
+      clientMessageId: expect.any(String),
+      commandId: expect.any(String),
+    }));
+    expect(screen.queryByText('delete me from the backend too')).toBeNull();
   });
 
   it('keeps a deleted item hidden while a stale multi-item queue snapshot remains', () => {
@@ -4698,6 +4789,8 @@ afterEach(() => {
     const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
     expect(autoBtn.textContent).toContain('Auto');
     expect(autoBtn.textContent).not.toContain('Supervised');
+    expect(autoBtn.classList.contains('shortcut-btn-auto-off')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(false);
     fireEvent.click(autoBtn);
     expect(document.querySelector('.menu-dropdown-auto')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /supervised$/i }));
@@ -4718,9 +4811,402 @@ afterEach(() => {
         mode: 'supervised',
       }),
     }));
+    expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
   });
 
-  it('upgrades supervised mode to audit mode with default audit config', async () => {
+  it('uses a distinct active visual mode for supervised audit', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised_audit',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              auditTargetFingerprint: {
+                sessionInstanceId: 'peer-instance',
+                normalizedModelId: 'claude-opus',
+                providerFamily: 'anthropic',
+              },
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
+    expect(autoBtn.classList.contains('shortcut-btn-auto-audit')).toBe(true);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(false);
+    expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
+    expect(autoBtn.getAttribute('aria-haspopup')).toBe('menu');
+    expect(autoBtn.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('mounts the accessible Peer Audit control immediately before Auto while mode is off', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          state: 'idle',
+          transportConfig: { supervision: { mode: 'off' } },
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const peer = screen.getByTestId('peer-audit-icon');
+    const auto = screen.getByRole('button', { name: /^Auto$/ });
+    expect(peer.getAttribute('data-testid')).toBe('peer-audit-icon');
+    expect(auto.previousElementSibling).toBe(peer);
+    expect(peer.getAttribute('aria-label')).toBeTruthy();
+    expect(peer.textContent).toBe('');
+    expect(peer.querySelector('svg.shortcut-btn-peer-audit-icon')).not.toBeNull();
+    expect(peer.parentElement?.classList.contains('shortcuts-model-supervision')).toBe(true);
+  });
+
+  it('quick audit reuses ordinary @agent orchestration without local state gating', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          sessionInstanceId: undefined,
+          runtimeEpoch: undefined,
+          state: 'idle',
+          transportConfig: { supervision: { mode: 'off' } },
+        })}
+        sessions={[]}
+        subSessions={[{
+          sessionName: 'deck_sub_reviewer',
+          type: 'claude-code-sdk',
+          label: 'Reviewer',
+          state: 'unknown',
+          parentSession: 'deck_proj_brain',
+          activeModel: 'claude-opus-4-7',
+        }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    expect(screen.getByTestId('quick-agent-delegation-dialog')).toBeDefined();
+    expect(screen.getByText('Reviewer')).toBeDefined();
+    expect(screen.getByText('claude-opus-4-7')).toBeDefined();
+    expect(document.body.textContent).not.toContain('baseline_no_result');
+    expect(document.body.textContent).not.toContain('consentTitle');
+
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.sessionName).toBe('deck_proj_brain');
+    expect(sent.text).toContain('You are the current session orchestrator for an agent delegation.');
+    expect(sent.text).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect(sent.text).toContain('independently audit this session\'s most recent work');
+    expect(sent.text).toContain('imcodes send --reply "deck_sub_reviewer"');
+    expect(ws.send.mock.calls.some(([message]) => message?.type === 'peer_audit.quick_start')).toBe(false);
+    expect(ws.sendSessionCommand.mock.calls.some(([, payload]) => payload?.delegateTarget)).toBe(false);
+  });
+
+  it('quick delegation bypasses queued-message editing instead of rewriting the queued row', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          project: 'proj',
+          role: 'brain',
+          state: 'running',
+          transportPendingMessages: ['queued original'],
+          transportPendingMessageEntries: [{ clientMessageId: 'queued-1', text: 'queued original' }],
+        })}
+        sessions={[]}
+        subSessions={[{
+          sessionName: 'deck_sub_reviewer', type: 'claude-code-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain', activeModel: 'opus',
+        }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+    expect((screen.getByRole('textbox') as HTMLDivElement).textContent).toBe('queued original');
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    expect(ws.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.edit_queued_message' }));
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).toContain('Exact delegate target session: deck_sub_reviewer');
+    expect((screen.getByRole('textbox') as HTMLDivElement).textContent).toBe('queued original');
+    expect(screen.getByText(/queued · edit/i)).toBeDefined();
+  });
+
+  it('keeps the Quick dialog open with an inline error when dispatch is rejected locally', () => {
+    const ws = makeWs();
+    ws.sendSessionCommand.mockImplementationOnce(() => { throw new Error('ws failed'); });
+    sendSessionViaHttpMock.mockImplementationOnce(() => { throw new Error('http failed'); });
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+    expect(screen.getByTestId('quick-agent-delegation-dialog')).toBeDefined();
+    expect(screen.getByTestId('quick-agent-delegation-error').textContent).toBe('sendFailed');
+  });
+
+  it('rejects custom session-control text inside Quick without closing or sending', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByText('custom'));
+    fireEvent.input(screen.getByTestId('quick-agent-delegation-custom'), { target: { value: '/stop check this' } });
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+    expect(screen.getByTestId('quick-agent-delegation-error').textContent).toBe('warning_control_command');
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
+  it('limits Quick candidates to the current session group, excluding same-project worker records and other roots', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        sessions={[
+          makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain', label: 'Self' }),
+          makeTransportSession({ name: 'deck_proj_w1', project: 'proj', role: 'w1', label: 'Project peer' }),
+          makeTransportSession({ name: 'deck_other_brain', project: 'other', role: 'brain', label: 'Other project' }),
+          makeSession({ name: 'deck_proj_shell', project: 'proj', agentType: 'shell', label: 'Shell' }),
+        ]}
+        subSessions={[
+          { sessionName: 'deck_sub_child', type: 'codex-sdk', label: 'Child', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_busy', type: 'claude-code-sdk', label: 'Busy child', state: 'running', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_sibling', type: 'claude-code-sdk', label: 'Other root child', state: 'running', parentSession: 'deck_proj_w1' },
+          { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'Other child', state: 'idle', parentSession: 'deck_other_brain' },
+          { sessionName: 'deck_sub_child', type: 'codex-sdk', label: 'Duplicate child', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_shell', type: 'shell', label: 'Sub shell', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const dialog = screen.getByTestId('quick-agent-delegation-dialog');
+    expect(within(dialog).getAllByTestId('quick-agent-delegation-candidate')).toHaveLength(2);
+    expect(dialog.textContent).toContain('Child');
+    expect(dialog.textContent).toContain('Busy child');
+    expect(dialog.textContent).not.toContain('Self');
+    expect(dialog.textContent).not.toContain('Shell');
+    expect(dialog.textContent).not.toContain('Project peer');
+    expect(dialog.textContent).not.toContain('Other root child');
+    expect(dialog.textContent).not.toContain('Other project');
+    expect(dialog.textContent).not.toContain('Other child');
+    expect(dialog.textContent).not.toContain('Duplicate child');
+  });
+
+  it('keeps stopped, error, unknown, and busy lifecycle snapshots selectable for manual Quick delegation', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[
+          { sessionName: 'deck_sub_stopped', type: 'codex-sdk', label: 'Stopped snapshot', state: 'stopped', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_error', type: 'claude-code-sdk', label: 'Error snapshot', state: 'error', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_unknown', type: 'codex-sdk', label: 'Unknown snapshot', state: 'unknown', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_busy', type: 'claude-code-sdk', label: 'Busy snapshot', state: 'running', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const dialog = screen.getByTestId('quick-agent-delegation-dialog');
+    const rows = within(dialog).getAllByTestId('quick-agent-delegation-candidate') as HTMLButtonElement[];
+    expect(rows).toHaveLength(4);
+    expect(rows.every((row) => !row.disabled)).toBe(true);
+    expect(dialog.textContent).not.toContain('busy');
+    expect(dialog.textContent).not.toContain('unavailable');
+    expect(dialog.textContent).not.toContain('statePending');
+  });
+
+  it('offers the owning main session and direct siblings when Quick starts from a sub-session', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_sub_current', project: 'proj', role: 'w1' })}
+        sessions={[
+          makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain', label: 'Project main' }),
+          makeTransportSession({ name: 'deck_proj_w1', project: 'proj', role: 'w1', label: 'Hidden worker' }),
+        ]}
+        subSessions={[
+          { sessionName: 'deck_sub_current', type: 'codex-sdk', label: 'Current', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_sibling', type: 'claude-code-sdk', label: 'Sibling', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_other', type: 'codex-sdk', label: 'Other root', state: 'idle', parentSession: 'deck_other_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const dialog = screen.getByTestId('quick-agent-delegation-dialog');
+    expect(within(dialog).getAllByTestId('quick-agent-delegation-candidate')).toHaveLength(2);
+    expect(dialog.textContent).toContain('Project main');
+    expect(dialog.textContent).toContain('Sibling');
+    expect(dialog.textContent).not.toContain('Current');
+    expect(dialog.textContent).not.toContain('Hidden worker');
+    expect(dialog.textContent).not.toContain('Other root');
+  });
+
+  it('marks enabled Team members in the Quick delegation chooser', async () => {
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        return JSON.stringify({
+          sessions: {
+            deck_sub_team: { enabled: true, mode: 'audit' },
+            deck_sub_regular: { enabled: false, mode: 'review' },
+          },
+          rounds: 1,
+        });
+      }
+      return null;
+    });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[
+          { sessionName: 'deck_sub_team', type: 'claude-code-sdk', label: 'Team reviewer', state: 'idle', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_regular', type: 'codex-sdk', label: 'Regular reviewer', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    const rows = within(screen.getByTestId('quick-agent-delegation-dialog'))
+      .getAllByTestId('quick-agent-delegation-candidate');
+    expect(rows[0]!.textContent).toContain('Team reviewer');
+    expect(rows[0]!.textContent).toContain('p2p_tag');
+    expect(rows[1]!.textContent).toContain('Regular reviewer');
+    expect(rows[1]!.textContent).not.toContain('p2p_tag');
+  });
+
+  it('fails closed with an empty Quick candidate list for an orphaned sub-session', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_sub_orphan', project: 'proj' })}
+        sessions={[makeTransportSession({ name: 'deck_other_brain', project: 'other', label: 'Other' })]}
+        subSessions={[{
+          sessionName: 'deck_sub_orphan', type: 'codex-sdk', label: 'Orphan', state: 'idle', parentSession: null,
+        }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    expect(screen.getByTestId('quick-agent-delegation-empty')).toBeDefined();
+    expect(screen.queryByTestId('quick-agent-delegation-candidate')).toBeNull();
+  });
+
+  it('does not consume composer text, quotes, or attachments during Quick delegation', async () => {
+    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/quick-proof.png' } });
+    const ws = makeWs();
+    const onRemoveQuote = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quotes={['quoted context']}
+        onRemoveQuote={onRemoveQuote}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'draft stays here';
+    fireEvent.input(input);
+    const file = new File(['png'], 'quick-proof.png', { type: 'image/png' });
+    fireEvent.drop(input, { dataTransfer: { files: [file], types: ['Files'], dropEffect: 'copy' } });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('quick-proof.png'));
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+
+    expect(input.textContent).toBe('draft stays here');
+    expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('quick-proof.png');
+    expect(onRemoveQuote).not.toHaveBeenCalled();
+    const sent = gatherSendCalls(ws).at(-1)!;
+    expect(sent.text).not.toContain('quoted context');
+    expect(sent.text).not.toContain('/tmp/quick-proof.png');
+  });
+
+  it('allows Quick delegation while an unrelated composer upload is still in flight', async () => {
+    let resolveUpload: ((value: { attachment: { daemonPath: string } }) => void) | null = null;
+    uploadFileMock.mockImplementationOnce(() => new Promise((resolve) => { resolveUpload = resolve; }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({ name: 'deck_proj_brain', project: 'proj', role: 'brain' })}
+        subSessions={[{ sessionName: 'deck_sub_reviewer', type: 'codex-sdk', label: 'Reviewer', state: 'idle', parentSession: 'deck_proj_brain' }]}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const file = new File(['pending'], 'pending.txt', { type: 'text/plain' });
+    fireEvent.drop(input, { dataTransfer: { files: [file], types: ['Files'], dropEffect: 'copy' } });
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId('peer-audit-icon'));
+    fireEvent.click(screen.getByTestId('quick-agent-delegation-candidate'));
+    expect(gatherSendCalls(ws)).toHaveLength(1);
+    expect(screen.queryByTestId('quick-agent-delegation-error')).toBeNull();
+
+    await act(async () => {
+      resolveUpload?.({ attachment: { daemonPath: '/tmp/pending.txt' } });
+      await flushAsync();
+    });
+  });
+
+  it('opens Settings instead of inferring an auditor when enabling audit mode', async () => {
     const ws = makeWs();
     const onSettings = vi.fn();
     render(
@@ -4749,19 +5235,11 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
     fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
 
-    await waitFor(() => {
-      expect(patchSessionMock).toHaveBeenCalledWith('srv1', 'codex-sdk-session', expect.objectContaining({
-        transportConfig: expect.objectContaining({
-          supervision: expect.objectContaining({
-            mode: 'supervised_audit',
-            auditMode: 'audit',
-            maxAuditLoops: 2,
-            taskRunPromptVersion: 'task_run_status_v1',
-          }),
-        }),
-      }));
-    });
-    expect(onSettings).not.toHaveBeenCalled();
+    await waitFor(() => expect(onSettings).toHaveBeenCalledWith({
+      supervisionMode: 'supervised_audit',
+      focus: 'peer-audit-target',
+    }));
+    expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
   it('falls back to Settings when heavy mode snapshot is present but audit config is invalid', async () => {
@@ -4799,6 +5277,111 @@ afterEach(() => {
       expect(onSettings).toHaveBeenCalled();
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('reuses a saved name-only auditor without local model or authority gating', async () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith(
+      'srv1',
+      'deck_proj_brain',
+      expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised_audit',
+            auditTargetSessionName: 'deck_sub_peer',
+          }),
+        }),
+      }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
+  });
+
+  it('keeps legacy fingerprint metadata optional when compact audit is enabled', async () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          sessionInstanceId: 'brain-instance',
+          runtimeEpoch: 'brain-runtime',
+          activeModel: 'gpt-5.6',
+          providerId: 'openai',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              auditTargetFingerprint: {
+                sessionInstanceId: 'peer-instance',
+                normalizedModelId: 'claude-opus',
+                providerFamily: 'anthropic',
+              },
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        subSessions={[{
+          sessionName: 'deck_sub_peer',
+          type: 'claude-code-sdk',
+          label: 'Peer',
+          state: 'idle',
+          parentSession: 'deck_proj_brain',
+          sessionInstanceId: 'peer-instance',
+          runtimeEpoch: 'peer-runtime',
+          activeModel: 'claude-opus',
+          providerId: 'anthropic',
+        }]}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith(
+      'srv1',
+      'deck_proj_brain',
+      expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({ mode: 'supervised_audit' }),
+        }),
+      }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
   });
 
   it('always shows Session Settings in the Auto dropdown when settings are available', () => {
@@ -6644,6 +7227,54 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'gemini-sdk-session',
       text: '/model gemini-2.5-flash',
+    });
+  });
+
+  it('force-loads OpenCode SDK models and sends /model from the active session picker', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'opencode-sdk-session',
+          agentType: 'opencode-sdk',
+          runtimeType: 'transport',
+          activeModel: 'opencode/pickle',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === 'opencode-sdk'
+        && call[0]?.force === true
+    ))?.[0];
+    expect(request).toMatchObject({
+      type: 'transport.list_models',
+      agentType: 'opencode-sdk',
+      force: true,
+    });
+
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'opencode-sdk',
+      requestId: request?.requestId,
+      models: [
+        { id: 'opencode/pickle', name: 'OpenCode · Pickle' },
+        { id: 'anthropic/claude-sonnet-4-5', name: 'Anthropic · Claude Sonnet 4.5' },
+      ],
+      defaultModel: 'opencode/pickle',
+      isAuthenticated: true,
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^opencode\/pickle$/i }));
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: /anthropic\/claude-sonnet-4-5/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'opencode-sdk-session',
+      text: '/model anthropic/claude-sonnet-4-5',
     });
   });
 

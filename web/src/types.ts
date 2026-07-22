@@ -33,9 +33,12 @@ export interface AutoFixTaskStatus {
 
 export interface SessionInfo {
   name: string;
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
   project: string;
   role: 'brain' | `w${number}`;
   agentType: string;
+  providerId?: string;
   agentVersion?: string;
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
   error?: string | null;

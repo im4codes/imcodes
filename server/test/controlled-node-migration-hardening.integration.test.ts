@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createUser } from '../src/db/queries.js';
+import { createServer, createUser } from '../src/db/queries.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -23,6 +23,7 @@ const migFile = (name: string) => join(__dirname, '..', 'src', 'db', 'migrations
 const MIGRATION_056 = '056_controlled_node_v2_ticket_hash_hardening.sql';
 const MIGRATION_057 = '057_machine_exec_audit_immutable_server_ids.sql';
 const MIGRATION_058 = '058_controlled_node_exec_default_enabled.sql';
+const MIGRATION_059 = '059_controlled_node_reusable_installers.sql';
 const hex = (n: number) => randomBytes(n).toString('hex');
 
 let db: Database;
@@ -55,6 +56,51 @@ beforeAll(async () => {
   await runMigrations(db); // applies 052..058
 });
 afterAll(async () => { await db.close(); });
+
+describe('059 reusable controlled-node installers', () => {
+  it('makes enrollment expiry nullable while preserving legacy single-use defaults', async () => {
+    const columns = await db.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
+      `SELECT column_name, is_nullable, column_default
+         FROM information_schema.columns
+        WHERE table_name = 'controlled_node_enrollments_v2'
+          AND column_name IN ('expires_at', 'reusable')
+        ORDER BY column_name`,
+    );
+    expect(columns).toEqual([
+      { column_name: 'expires_at', is_nullable: 'YES', column_default: null },
+      { column_name: 'reusable', is_nullable: 'NO', column_default: 'false' },
+    ]);
+  });
+
+  it('backfills an already-claimed legacy identity exactly once and is idempotent', async () => {
+    const userId = `u_${hex(4)}`;
+    const serverId = `legacy_ctl_${hex(6)}`;
+    const installId = `legacy_install_${hex(4)}`;
+    const nodeTokenHash = hex(32);
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'legacy-controlled', nodeTokenHash);
+    const enrollment = await db.queryOne<{ id: string }>(
+      `INSERT INTO controlled_node_enrollments_v2
+         (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+          encrypted_code, ticket_expires_at, expires_at, created_at,
+          used_at, redeemed_server_id, install_id, node_token_hash)
+       VALUES ($1, $2, $3, 'linux', 'x64', $4, 'enc', $5, $5, $5,
+               $5, $6, $7, $8)
+       RETURNING id`,
+      [hex(32), hex(32), userId, hex(32), Date.now(), serverId, installId, nodeTokenHash],
+    );
+    const sql = await readFile(migFile(MIGRATION_059), 'utf8');
+    await db.execute(sql);
+    await db.execute(sql);
+    const rows = await db.query<{ install_id: string; node_token_hash: string; redeemed_server_id: string }>(
+      `SELECT install_id, node_token_hash, redeemed_server_id
+         FROM controlled_node_enrollment_installs
+        WHERE enrollment_id = $1`,
+      [enrollment!.id],
+    );
+    expect(rows).toEqual([{ install_id: installId, node_token_hash: nodeTokenHash, redeemed_server_id: serverId }]);
+  });
+});
 
 describe('058 controlled-node execution default', () => {
   it('defaults new server rows to executable without changing an existing explicit false', async () => {

@@ -43,6 +43,7 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'codex',
   'copilot-sdk',
   'cursor-headless',
+  'opencode-sdk',
   'opencode',
   'gemini-sdk',
   'grok-sdk',
@@ -185,6 +186,35 @@ export interface AgentDelegationOrchestrationPromptInput {
   targetSession: string;
   targetLabel?: string | null;
   task: string;
+}
+
+export const QUICK_AGENT_DELEGATION_PRESETS = ['audit', 'discussion', 'brainstorm', 'custom'] as const;
+export type QuickAgentDelegationPreset = typeof QUICK_AGENT_DELEGATION_PRESETS[number];
+
+export function buildQuickAgentDelegationTask(
+  preset: QuickAgentDelegationPreset,
+  customTask = '',
+): string {
+  if (preset === 'custom') return customTask.trim();
+  if (preset === 'discussion') {
+    return [
+      'Discuss this session\'s most recent work with the selected delegate.',
+      'Build the delegation brief from the current session context: summarize the goal, scope, recent decisions, changed areas, validation already run, open questions, and risks.',
+      'Ask the delegate to challenge the approach, identify trade-offs or missing considerations, and reply with concrete recommendations.',
+    ].join(' ');
+  }
+  if (preset === 'brainstorm') {
+    return [
+      'Brainstorm improvements and next steps for this session\'s most recent work with the selected delegate.',
+      'Build the delegation brief from the current session context: summarize the goal, constraints, recent decisions, current implementation state, and unresolved problems.',
+      'Ask the delegate for practical alternatives, edge cases, and prioritized ideas, then have it reply to this session.',
+    ].join(' ');
+  }
+  return [
+    'Ask the selected delegate to independently audit this session\'s most recent work.',
+    'Build the delegation brief from the current session context: summarize the goal, requested scope, recent decisions, changed files or artifacts, implementation state, validation already run, acceptance criteria, and known risks.',
+    'The delegate should inspect relevant files and use all applicable non-destructive tests and already-authorized tools or environments, report exact evidence or unavailable checks, prioritize concrete defects and regressions, and reply with a clear PASS or REWORK recommendation.',
+  ].join(' ');
 }
 
 export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOrchestrationPromptInput): string {

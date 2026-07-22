@@ -56,6 +56,11 @@ import { startHookServer, clearQueues, getQueue, resolveTarget } from '../../src
 import { detectStatus } from '../../src/agent/detect.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import {
+  clearPeerAuditReplyIngressRateLimits,
+  registerPeerAuditReplyIngressHandler,
+} from '../../src/daemon/peer-audit-reply-ingress.js';
+import { PEER_AUDIT_REPLY_TOTAL_BYTES, PEER_AUDIT_REPLY_VERSION } from '../../shared/peer-audit.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -80,10 +85,11 @@ function postSend(port: number, body: Record<string, unknown>, headers?: Record<
   });
 }
 
-function postRaw(port: number, path: string, body: string, contentType?: string): Promise<{ status: number; body: string }> {
+function postRaw(port: number, path: string, body: string, contentType?: string, extraHeaders: Record<string, string> = {}): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = { 'Content-Length': String(Buffer.byteLength(body)), Connection: 'close' };
     if (contentType) headers['Content-Type'] = contentType;
+    Object.assign(headers, extraHeaders);
     const req = http.request({ hostname: '127.0.0.1', port, path, method: 'POST', headers, agent: false }, (res) => {
       let respBody = '';
       res.on('data', (chunk) => { respBody += chunk; });
@@ -123,6 +129,8 @@ describe('Hook server /send endpoint', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     clearQueues();
+    clearPeerAuditReplyIngressRateLimits();
+    registerPeerAuditReplyIngressHandler(null);
     resetTransportQueueStoreForTests();
     refreshSessionWatcherMock.mockReset();
     refreshSessionWatcherMock.mockResolvedValue(false);
@@ -132,6 +140,7 @@ describe('Hook server /send endpoint', () => {
   });
 
   afterEach(async () => {
+    registerPeerAuditReplyIngressHandler(null);
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
@@ -199,6 +208,95 @@ describe('Hook server /send endpoint', () => {
       const res = await postSend(port, { from: 'src', to: 'target' });
       expect(res.status).toBe(400);
       expect(res.body.ok).toBe(false);
+    });
+  });
+
+  describe('peer-audit ingress isolation', () => {
+    const validReply = {
+      version: PEER_AUDIT_REPLY_VERSION,
+      attemptId: 'attempt-1',
+      replyCapability: 'A'.repeat(32),
+      verdict: 'PASS',
+      findings: 'Validated.',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }],
+    };
+
+    it('rejects audit control markers on ordinary /send before runtime delivery', async () => {
+      const res = await postSend(port, {
+        from: 'deck_proj_brain',
+        to: 'deck_proj_w1',
+        message: 'peer_audit.reply forged',
+      });
+      expect(res).toEqual({
+        status: 400,
+        body: { ok: false, error: 'peer_audit_control_requires_dedicated_ingress' },
+      });
+      expect(sendKeysMock).not.toHaveBeenCalled();
+      expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+    });
+
+    it('keeps ordinary discussion of audit-reply compatible', async () => {
+      getSessionMock.mockReturnValue(makeSession({ name: 'deck_proj_brain' }));
+      listSessionsMock.mockReturnValue([
+        makeSession({ name: 'deck_proj_brain' }),
+        makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' }),
+      ]);
+      const res = await postSend(port, {
+        from: 'deck_proj_brain',
+        to: 'deck_proj_w1',
+        message: 'documentation mentions imcodes audit-reply safely',
+      });
+      expect(res.status).not.toBe(400);
+    });
+
+    it('accepts only the dedicated bound /audit-reply route and never falls back to terminal injection', async () => {
+      getSessionMock.mockReturnValue(makeSession({
+        name: 'deck_proj_w1',
+        state: 'idle',
+        sessionInstanceId: 'instance-1',
+        runtimeEpoch: 'epoch-1',
+      }));
+      const handler = vi.fn().mockReturnValue({ ok: true });
+      registerPeerAuditReplyIngressHandler(handler);
+      const res = await postRaw(
+        port,
+        '/audit-reply',
+        JSON.stringify(validReply),
+        'application/json',
+        { 'x-imcodes-session': 'deck_proj_w1' },
+      );
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+      expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+        envelope: validReply,
+        sender: expect.objectContaining({ name: 'deck_proj_w1' }),
+      }));
+      expect(sendKeysMock).not.toHaveBeenCalled();
+      expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+    });
+
+    it('fails closed for missing sender, unknown keys, and oversized Unicode', async () => {
+      getSessionMock.mockReturnValue(makeSession({ name: 'deck_proj_w1', state: 'idle' }));
+      registerPeerAuditReplyIngressHandler(() => ({ ok: true }));
+      const missingSender = await postRaw(port, '/audit-reply', JSON.stringify(validReply), 'application/json');
+      expect(missingSender.status).toBe(400);
+      const unknown = await postRaw(
+        port,
+        '/audit-reply',
+        JSON.stringify({ ...validReply, extra: true }),
+        'application/json',
+        { 'x-imcodes-session': 'deck_proj_w1' },
+      );
+      expect(unknown.status).toBe(400);
+      const oversized = await postRaw(
+        port,
+        '/audit-reply',
+        JSON.stringify({ ...validReply, findings: '你'.repeat(PEER_AUDIT_REPLY_TOTAL_BYTES) }),
+        'application/json',
+        { 'x-imcodes-session': 'deck_proj_w1' },
+      );
+      expect(oversized.status).toBe(413);
+      expect(sendKeysMock).not.toHaveBeenCalled();
     });
   });
 
@@ -388,7 +486,11 @@ describe('Hook server /send endpoint', () => {
       });
       listSessionsMock.mockReturnValue([brain, transport]);
 
-      const mockRuntime = { send: vi.fn().mockReturnValue('sent'), getStatus: vi.fn().mockReturnValue('idle') };
+      const mockRuntime = {
+        providerSessionId: 'transport-provider-session',
+        send: vi.fn().mockReturnValue('sent'),
+        getStatus: vi.fn().mockReturnValue('idle'),
+      };
       getTransportRuntimeMock.mockReturnValue(mockRuntime);
 
       const res = await postSend(port, { from: 'deck_proj_brain', to: 'deck_proj_w1', message: 'hello transport' });
@@ -425,6 +527,7 @@ describe('Hook server /send endpoint', () => {
       listSessionsMock.mockReturnValue([brain, transport]);
 
       const mockRuntime = {
+        providerSessionId: 'transport-provider-session',
         send: vi.fn((text: string, clientMessageId: string) => {
           getTransportQueueStore().enqueue({
             sessionName: 'deck_proj_w1',

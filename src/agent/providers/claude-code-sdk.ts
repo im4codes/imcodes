@@ -14,6 +14,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderUsageUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -38,6 +39,7 @@ import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { claudeRateLimitsToQuotaMeta, type ClaudeRateLimitInfo } from '../claude-rate-limit.js';
 import { formatProviderQuotaLabel } from '../../../shared/provider-quota.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { CLAUDE_SYNTHETIC_SEED_TEXT } from '../../shared/claude-synthetic-seed.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -45,6 +47,7 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_SCHEMA_VERSION,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
   buildSdkSubagentSafeDetail,
   makeClaudeSubagentCanonicalKey,
   readSdkSubagentStartedAtMs,
@@ -139,6 +142,7 @@ interface ClaudeSdkSessionState {
   started: boolean;
   resumeId: string;
   currentMessageId: string | null;
+  lastCompletedMessageId?: string;
   currentText: string;
   currentQuery: ReturnType<typeof query> | null;
   currentChild: ChildProcess | null;
@@ -146,18 +150,23 @@ interface ClaudeSdkSessionState {
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
   lastAssistantUsage?: ClaudeUsageSnapshot;
+  contextUsageRequestSerial: number;
   /** Cached per-type Claude rate-limit snapshots (five_hour / seven_day*). Each
    *  `rate_limit_event` carries ONE window; accumulate across the session so the
    *  weekly window — which only surfaces near a limit — is retained once seen. */
   rateLimits?: Record<string, ClaudeRateLimitInfo>;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
+  currentPayload?: ProviderContextPayload;
+  currentAllowResumeFallback?: boolean;
+  currentStartedAsResume?: boolean;
+  currentConnectionClosedRetriesRemaining?: number;
   turnGeneration: number;
   runtimeActivityGeneration?: ActivityGeneration;
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
   resultCompletionGeneration?: number;
   taskNotificationWakeTimer: ReturnType<typeof setTimeout> | null;
-  pendingTaskNotificationWakes: Map<string, SdkSubagentNormalizedStatus>;
+  pendingTaskNotificationWakes: Map<string, ClaudeTaskWake>;
   /** Once a foreground turn settles while subagents remain active, the SDK
    * query is retained only to carry later user input and task notifications.
    * In this mode top-level terminal assistant messages, rather than trailing
@@ -248,6 +257,18 @@ interface ClaudeUsageSnapshot {
   cache_creation_input_tokens?: number;
 }
 
+function normalizeClaudeUsageSnapshot(value: unknown): ClaudeUsageSnapshot | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const usage = value as ClaudeUsageSnapshot;
+  const normalized: ClaudeUsageSnapshot = {
+    ...(typeof usage.input_tokens === 'number' ? { input_tokens: usage.input_tokens } : {}),
+    ...(typeof usage.output_tokens === 'number' ? { output_tokens: usage.output_tokens } : {}),
+    ...(typeof usage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}),
+    ...(typeof usage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: usage.cache_creation_input_tokens } : {}),
+  };
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 interface ClaudeTaskUsageSnapshot {
   total_tokens?: number;
   tool_uses?: number;
@@ -276,6 +297,14 @@ interface ClaudeTaskState {
   startedAtMs: number;
   lastUpdatedAt: number;
   parentWakeHandled?: boolean;
+}
+
+const CLAUDE_LOCAL_BASH_TASK_TYPE = SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH;
+const CLAUDE_LOCAL_AGENT_TASK_TYPE = SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT;
+
+interface ClaudeTaskWake {
+  status: SdkSubagentNormalizedStatus;
+  kind: 'bash' | 'agent' | 'task';
 }
 
 type ClaudeToolBlock = {
@@ -378,6 +407,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
   // AskUserQuestion pause/answer lifecycle — generic, provider-agnostic.
   private readonly questions = new PendingQuestionRegistry<SdkPermissionResult>();
 
@@ -468,8 +498,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
       lastAssistantUsage: existing?.lastAssistantUsage,
+      contextUsageRequestSerial: existing?.contextUsageRequestSerial ?? 0,
       rateLimits: existing?.rateLimits,
       pendingComplete: undefined,
+      currentPayload: undefined,
+      currentAllowResumeFallback: undefined,
+      currentStartedAsResume: undefined,
+      currentConnectionClosedRetriesRemaining: undefined,
       turnGeneration: existing?.turnGeneration ?? 0,
       resultCompletionTimer: null,
       taskNotificationWakeTimer: null,
@@ -617,6 +652,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     };
   }
 
+  onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
+    this.usageCallbacks.push(cb);
+    return () => {
+      const idx = this.usageCallbacks.indexOf(cb);
+      if (idx >= 0) this.usageCallbacks.splice(idx, 1);
+    };
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -651,6 +694,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.completed = false;
         state.currentMessageId = null;
         state.currentText = '';
+        this.resetClaudeTurnUsage(state);
         state.pendingComplete = undefined;
         state.pendingError = undefined;
         this.clearTaskNotificationWake(state);
@@ -693,12 +737,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   ): Promise<void> {
     state.currentText = '';
     state.currentMessageId = null;
+    this.resetClaudeTurnUsage(state);
     state.completed = false;
     state.cancelled = false;
     state.finalMetadata = undefined;
-    state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
+    state.currentPayload = payload;
+    state.currentAllowResumeFallback = allowResumeFallback;
     this.clearResultCompletionFallback(state);
     this.clearTaskNotificationWake(state);
     state.retainedSubagentMode = false;
@@ -717,6 +763,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const prompt = systemParts.hasSplitSystemText
       ? composeMessageSideProviderPrompt(payload, { includeSessionSystemText: false })
       : payload.assembledMessage;
+    const startedAsResume = state.started;
+    state.currentStartedAsResume = startedAsResume;
+    state.currentConnectionClosedRetriesRemaining = connectionClosedRetriesRemaining;
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -726,7 +775,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       includePartialMessages: true,
       agentProgressSummaries: false,
       forwardSubagentText: false,
-      ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
+      ...(startedAsResume ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
@@ -799,6 +848,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       q,
       payload,
       allowResumeFallback,
+      startedAsResume,
       turnGeneration,
       connectionClosedRetriesRemaining,
     );
@@ -810,6 +860,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     q: ReturnType<typeof query>,
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
+    startedAsResume: boolean,
     turnGeneration: number,
     connectionClosedRetriesRemaining: number,
   ): Promise<void> {
@@ -841,11 +892,30 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       const pendingComplete = state.pendingComplete;
       state.pendingComplete = undefined;
       state.pendingError = undefined;
+      state.currentPayload = undefined;
+      state.currentAllowResumeFallback = undefined;
+      state.currentStartedAsResume = undefined;
+      state.currentConnectionClosedRetriesRemaining = undefined;
       state.currentMessageId = null;
       state.currentText = '';
       if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
         state.started = false;
         logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
+        await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
+        return;
+      }
+      if (pendingComplete && allowResumeFallback && startedAsResume && this.isNoResponseRequestedResumeArtifact(state, pendingComplete)) {
+        const previousResumeId = state.resumeId;
+        state.started = false;
+        state.resumeId = randomUUID();
+        logger.warn(
+          { provider: this.id, sessionId, previousResumeId, freshResumeId: state.resumeId },
+          'Claude SDK resumed turn returned the synthetic no-response artifact; retrying with a fresh session',
+        );
+        this.emitSessionInfo(sessionId, {
+          resumeId: state.resumeId,
+          ...(state.model ? { model: state.model } : {}),
+        });
         await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
         return;
       }
@@ -893,6 +963,46 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     return typeof base === 'string' && base.trim().length > 0;
   }
 
+  private isNoResponseRequestedResumeArtifact(state: ClaudeSdkSessionState, message: AgentMessage): boolean {
+    if (message.kind !== 'text') return false;
+    return this.isNoResponseRequestedTextArtifact(state, message.content, message.metadata?.usage as ClaudeUsageSnapshot | undefined);
+  }
+
+  private isNoResponseRequestedTextArtifact(state: ClaudeSdkSessionState, content: string, usage?: ClaudeUsageSnapshot): boolean {
+    if (!this.shouldStripLeakedThink(state)) return false;
+    if (content.trim() !== CLAUDE_SYNTHETIC_SEED_TEXT) return false;
+    if (usage && typeof usage.output_tokens === 'number' && usage.output_tokens > 8) return false;
+    return true;
+  }
+
+  private retryNoResponseRequestedResumeArtifact(sessionId: string, state: ClaudeSdkSessionState, reason: string): void {
+    const payload = state.currentPayload;
+    if (!payload || !state.currentAllowResumeFallback || !state.currentStartedAsResume) return;
+    const connectionRetries = state.currentConnectionClosedRetriesRemaining ?? CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT;
+    const previousResumeId = state.resumeId;
+    try { state.currentQuery?.close(); } catch {}
+    this.terminateChild(state);
+    state.currentQuery = null;
+    state.currentChild = null;
+    state.pendingComplete = undefined;
+    state.pendingError = undefined;
+    state.currentMessageId = null;
+    state.currentText = '';
+    state.completed = false;
+    state.cancelled = false;
+    state.started = false;
+    state.resumeId = randomUUID();
+    logger.warn(
+      { provider: this.id, sessionId, previousResumeId, freshResumeId: state.resumeId, reason },
+      'Claude SDK resumed turn returned the synthetic no-response artifact; retrying with a fresh session',
+    );
+    this.emitSessionInfo(sessionId, {
+      resumeId: state.resumeId,
+      ...(state.model ? { model: state.model } : {}),
+    });
+    void this.startQuery(sessionId, state, payload, false, connectionRetries);
+  }
+
   private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage, turnGeneration: number): void {
     // A closed SDK iterator may still flush buffered frames after the runtime
     // has already started a resumed query. Those frames belong to the old turn
@@ -910,6 +1020,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       state.model = msg.model;
       state.started = true;
       this.emitSessionInfo(sessionId, { resumeId: msg.session_id, model: msg.model });
+      this.refreshClaudeContextUsage(sessionId, state, turnGeneration);
       return;
     }
 
@@ -1001,6 +1112,19 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // correct text when the message completes — visible flicker/bleed.
         state.currentText = '';
         state.currentMessageId = event.message?.id ? String(event.message.id) : null;
+        // Anthropic-compatible streaming responses publish the authoritative
+        // prompt-cache split on message_start. MiniMax follows that contract,
+        // while its trailing Claude Agent SDK result frame can contain an
+        // all-zero usage object. Capture the raw stream usage before asking the
+        // SDK control channel for the total-context fallback; otherwise the UI
+        // can track total ctx growth but permanently lose cache_read tokens.
+        this.recordClaudeUsage(
+          sessionId,
+          state,
+          event.message?.usage,
+          state.currentMessageId ?? undefined,
+        );
+        this.refreshClaudeContextUsage(sessionId, state, turnGeneration);
         return;
       }
       if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {
@@ -1079,14 +1203,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
     if (msg.type === 'assistant') {
       const isTopLevelMessage = !('parent_tool_use_id' in msg) || msg.parent_tool_use_id == null;
+      const assistantMessageId = typeof msg.message?.id === 'string' && msg.message.id
+        ? msg.message.id
+        : undefined;
+      if (isTopLevelMessage && !state.completed && assistantMessageId && !state.currentMessageId) {
+        state.currentMessageId = assistantMessageId;
+      }
       const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
-      if (assistantUsage && typeof assistantUsage === 'object') {
-        state.lastAssistantUsage = {
-          ...(typeof assistantUsage.input_tokens === 'number' ? { input_tokens: assistantUsage.input_tokens } : {}),
-          ...(typeof assistantUsage.output_tokens === 'number' ? { output_tokens: assistantUsage.output_tokens } : {}),
-          ...(typeof assistantUsage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: assistantUsage.cache_read_input_tokens } : {}),
-          ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
-        };
+      if (isTopLevelMessage) {
+        this.recordClaudeUsage(
+          sessionId,
+          state,
+          assistantUsage,
+          assistantMessageId ?? state.currentMessageId ?? undefined,
+          state.completed,
+        );
       }
       // includePartialMessages can emit message_delta(end_turn) and then flush
       // the matching full assistant frame. The stream boundary already emitted
@@ -1199,6 +1330,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // another completion. Failures for an active follow-up still flow through
       // below because send() resets completed=false before pushing its input.
       if (state.completed) {
+        // Some Claude-compatible endpoints emit a terminal message_delta and
+        // then put the only current-context usage snapshot on the trailing
+        // result frame (no full assistant frame). The terminal delta already
+        // completed the visible turn, but its usage is still authoritative for
+        // that same generation. Capture it before dropping the duplicate
+        // completion. A newly-started follow-up has completed=false, so a stale
+        // predecessor result cannot overwrite the new turn's usage.
+        if (!msg.is_error && !state.lastAssistantUsage) {
+          this.recordClaudeUsage(sessionId, state, msg.usage, state.lastCompletedMessageId, true);
+        }
         state.started = true;
         return;
       }
@@ -1261,6 +1402,96 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
   }
 
+  private recordClaudeUsage(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    usage: unknown,
+    messageId?: string,
+    finalized = false,
+  ): void {
+    const normalizedUsage = normalizeClaudeUsageSnapshot(usage);
+    if (!normalizedUsage) return;
+    const previous = state.lastAssistantUsage;
+    const normalizedContextTokens = (normalizedUsage.input_tokens ?? 0)
+      + (normalizedUsage.cache_read_input_tokens ?? 0)
+      + (normalizedUsage.cache_creation_input_tokens ?? 0);
+    const previousContextTokens = (previous?.input_tokens ?? 0)
+      + (previous?.cache_read_input_tokens ?? 0)
+      + (previous?.cache_creation_input_tokens ?? 0);
+    // Some Anthropic-compatible endpoints return an all-zero result usage
+    // object even though the SDK's getContextUsage() control request reports a
+    // real live context. Never let that lossy terminal frame erase the richer
+    // snapshot captured for this same turn.
+    const effectiveUsage = normalizedContextTokens === 0 && previousContextTokens > 0
+      ? {
+          ...normalizedUsage,
+          ...(previous?.input_tokens !== undefined ? { input_tokens: previous.input_tokens } : {}),
+          ...(previous?.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: previous.cache_read_input_tokens } : {}),
+          ...(previous?.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: previous.cache_creation_input_tokens } : {}),
+        }
+      : normalizedUsage;
+    state.lastAssistantUsage = effectiveUsage;
+    for (const cb of this.usageCallbacks) cb(sessionId, {
+      ...(messageId ? { messageId } : {}),
+      ...(finalized ? { finalized: true } : {}),
+      usage: { ...effectiveUsage },
+      ...(state.model ? { model: state.model } : {}),
+    });
+  }
+
+  /**
+   * Claude-compatible gateways can omit or zero the usage object carried by
+   * assistant/result frames. The SDK control channel has an independent live
+   * context meter; use it as a bounded, turn-owned fallback. Its maxTokens is
+   * deliberately not forwarded because preset contextWindow is the configured
+   * authority for third-party models such as MiniMax-M3.
+   */
+  private refreshClaudeContextUsage(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    turnGeneration: number,
+  ): void {
+    const queryWithContextUsage = state.currentQuery as (ReturnType<typeof query> & {
+      getContextUsage?: () => Promise<{ totalTokens?: number }>;
+    }) | null;
+    if (typeof queryWithContextUsage?.getContextUsage !== 'function') return;
+    const requestSerial = ++state.contextUsageRequestSerial;
+    const messageId = state.currentMessageId ?? state.lastCompletedMessageId;
+    void queryWithContextUsage.getContextUsage().then((contextUsage) => {
+      if (this.sessions.get(sessionId) !== state) return;
+      if (state.turnGeneration !== turnGeneration || state.contextUsageRequestSerial !== requestSerial) return;
+      const totalTokens = contextUsage?.totalTokens;
+      if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) return;
+      const roundedTotal = Math.round(totalTokens);
+      // getContextUsage() reports only the aggregate context occupancy. Preserve
+      // the cache composition already received from message_start and reconcile
+      // the uncached input remainder so input + cache_creation + cache_read is
+      // still exactly the live total. Never fabricate cache data when the
+      // stream did not provide it.
+      const previousCacheRead = Math.max(0, Math.round(state.lastAssistantUsage?.cache_read_input_tokens ?? 0));
+      const cacheRead = Math.min(previousCacheRead, roundedTotal);
+      const previousCacheCreation = Math.max(0, Math.round(state.lastAssistantUsage?.cache_creation_input_tokens ?? 0));
+      const cacheCreation = Math.min(previousCacheCreation, roundedTotal - cacheRead);
+      this.recordClaudeUsage(sessionId, state, {
+        input_tokens: roundedTotal - cacheRead - cacheCreation,
+        ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead } : {}),
+        ...(cacheCreation > 0 ? { cache_creation_input_tokens: cacheCreation } : {}),
+        output_tokens: state.lastAssistantUsage?.output_tokens ?? 0,
+      }, messageId ?? undefined);
+    }).catch((err) => {
+      logger.debug({ provider: this.id, sessionId, err }, 'Claude SDK live context usage unavailable');
+    });
+  }
+
+  private resetClaudeTurnUsage(state: ClaudeSdkSessionState): void {
+    state.lastAssistantUsage = undefined;
+    state.lastCompletedMessageId = undefined;
+    // Invalidate any getContextUsage() response still in flight for the prior
+    // foreground turn, including retained-query follow-ups where the SDK query
+    // generation itself does not change.
+    state.contextUsageRequestSerial += 1;
+  }
+
   private armResultCompletionFallback(sessionId: string, state: ClaudeSdkSessionState): void {
     if (!state.currentQuery || !state.pendingComplete) return;
     this.clearResultCompletionFallback(state);
@@ -1314,6 +1545,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (state.toolCalls.size > 0) return;
     const hasActiveSubagents = this.activeClaudeSubagentTasks(state).length > 0;
     const content = state.currentText.trim();
+    if (this.isNoResponseRequestedTextArtifact(state, content, state.lastAssistantUsage)) {
+      this.retryNoResponseRequestedResumeArtifact(sessionId, state, 'assistant-terminal');
+      return;
+    }
 
     state.started = true;
     state.completed = true;
@@ -1333,6 +1568,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         completionBoundary: 'assistant-terminal',
       },
     };
+    state.lastCompletedMessageId = completed.id;
     state.currentMessageId = null;
     state.currentText = '';
     if (!hasActiveSubagents) {
@@ -1397,6 +1633,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const task = existing ?? this.createClaudeTaskState(sessionId, state, taskId);
     if (!existing) state.subagentTasks.set(taskId, task);
     task.lastUpdatedAt = Date.now();
+    task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
 
     const toolUseId = this.pickString(msg.tool_use_id);
     if (toolUseId) task.toolUseId = toolUseId;
@@ -1404,7 +1641,6 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (msg.subtype === 'task_started') {
       task.description = this.pickShortString(msg.description) ?? task.description;
       task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
-      task.taskType = this.pickShortString(msg.task_type) ?? task.taskType;
       task.workflowName = this.pickShortString(msg.workflow_name) ?? task.workflowName;
       this.applyClaudeTaskStatus(task, 'running');
     } else if (msg.subtype === 'task_progress') {
@@ -1439,7 +1675,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // privacy-safe notification into the retained input channel so every
         // terminal can still wake the parent without reopening "working"
         // forever. parentWakeHandled makes duplicate terminal snapshots inert.
-        state.pendingTaskNotificationWakes.set(taskId, task.normalizedStatus);
+        state.pendingTaskNotificationWakes.set(taskId, {
+          status: task.normalizedStatus,
+          kind: this.claudeTaskKind(task),
+        });
         this.scheduleTaskNotificationWakeFallback(sessionId, state);
       }
     }
@@ -1468,6 +1707,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.completed = false;
     state.currentMessageId = null;
     state.currentText = '';
+    this.resetClaudeTurnUsage(state);
     state.pendingComplete = undefined;
     state.pendingError = undefined;
   }
@@ -1485,7 +1725,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         state.pendingTaskNotificationWakes.clear();
         return;
       }
-      const statuses = [...state.pendingTaskNotificationWakes.entries()].map(([taskId, status]) => ({ taskId, status }));
+      const statuses = [...state.pendingTaskNotificationWakes.entries()].map(([taskId, wake]) => ({
+        taskId,
+        status: wake.status,
+        kind: wake.kind,
+      }));
       const inputQueue = state.inputQueue;
       if (!inputQueue) {
         state.pendingTaskNotificationWakes.clear();
@@ -1496,7 +1740,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       inputQueue.push([
         '# IM.codes background task completion',
         'This is a trusted IM.codes runtime notification, not a user-authored instruction.',
-        `Background task terminal states: ${JSON.stringify(statuses)}`,
+        `Background task terminal states (kind=bash means Bash/shell, kind=agent means a true subagent): ${JSON.stringify(statuses)}`,
         'Resume now. Inspect the provider-native task result/history, then report the relevant outcome or failure.',
       ].join('\n'));
       logger.info({
@@ -2029,18 +2273,19 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state: ClaudeSdkSessionState,
     task: ClaudeTaskState,
   ): void {
-    const summary = sanitizeSdkSubagentText(task.summary) ?? 'Claude task';
+    const isBashTask = task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE;
+    const summary = sanitizeSdkSubagentText(task.summary) ?? (isBashTask ? 'Claude Bash task' : 'Claude task');
     const meta = this.buildClaudeSubagentMeta(state, task);
     const detail = buildSdkSubagentSafeDetail({
       kind: SDK_SUBAGENT_DETAIL_KIND,
       summary,
-      ...(task.description ? { input: { action: 'claude-task', description: task.description } } : {}),
+      ...(task.description ? { input: { action: isBashTask ? 'claude-bash-task' : 'claude-task', description: task.description } } : {}),
       ...(task.terminal ? { output: task.error ?? task.summary } : {}),
       meta,
     }, { allowRaw: false });
     const tool: ToolCallEvent = {
       id: task.canonicalKey,
-      name: 'Agent',
+      name: isBashTask ? 'Bash' : 'Agent',
       status: task.normalizedStatus === SDK_SUBAGENT_STATUS.ERROR
         || task.normalizedStatus === SDK_SUBAGENT_STATUS.INTERRUPTED
         || task.normalizedStatus === SDK_SUBAGENT_STATUS.UNKNOWN
@@ -2054,6 +2299,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       detail,
     };
     this.emitSubagentToolCall(sessionId, state, tool);
+  }
+
+  private claudeTaskKind(task: ClaudeTaskState): ClaudeTaskWake['kind'] {
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) return 'bash';
+    if (task.taskType === CLAUDE_LOCAL_AGENT_TASK_TYPE || task.taskType === SDK_SUBAGENT_TASK_TYPES.AGENT) return 'agent';
+    return 'task';
   }
 
   private emitClaudeSubagentDiagnostic(

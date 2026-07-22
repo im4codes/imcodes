@@ -1,10 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
+import {
+  PROVIDER_ERROR_CODES,
+  type TransportProvider,
+  type ProviderError,
+} from '../agent/transport-provider.js';
 import { ensureProviderConnected } from '../agent/provider-registry.js';
 import type { SharedContextRuntimeBackend } from '../../shared/context-types.js';
 import {
   parseTaskRunTerminalStateFromText,
   SUPERVISION_DEFAULT_TIMEOUT_MS,
+  SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
   SUPERVISION_UNAVAILABLE_REASONS,
   type SessionSupervisionSnapshot,
@@ -16,6 +21,8 @@ import {
 } from './supervision-prompts.js';
 import { resolveProcessingProviderSessionConfig } from '../context/processing-provider-config.js';
 import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
+import logger from '../util/logger.js';
+import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
 export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
 
@@ -51,6 +58,12 @@ export interface SupervisionDecision {
   nextAction?: string;
   extra?: Record<string, unknown>;
   unavailableReason?: SupervisionUnavailableReason;
+  providerFailure?: SupervisionProviderFailure;
+}
+
+export interface SupervisionProviderFailure {
+  code?: string;
+  attempts: number;
 }
 
 /** Minimum length for `nextAction` to be treated as "concrete enough" to
@@ -69,10 +82,64 @@ export interface SupervisionBrokerRequest {
 export interface SupervisionBrokerDeps {
   resolveProvider?: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;
   now?: () => number;
+  waitForRetry?: (delayMs: number) => Promise<void>;
 }
 
 const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
+const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
+const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
+const NON_RETRYABLE_PROVIDER_ERROR_CODES = new Set<string>([
+  PROVIDER_ERROR_CODES.AUTH_FAILED,
+  PROVIDER_ERROR_CODES.CONFIG_ERROR,
+  PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND,
+  PROVIDER_ERROR_CODES.PARSE_ERROR,
+  PROVIDER_ERROR_CODES.CANCELLED,
+]);
+
+type SupervisionExecutionError = Error & {
+  supervisionUnavailableReason?: SupervisionUnavailableReason;
+  supervisionProviderCode?: string;
+  supervisionProviderRetryable?: boolean;
+  supervisionProviderAttempts?: number;
+};
+
+function errorRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function normalizeProviderExecutionError(error: unknown): SupervisionExecutionError {
+  const record = errorRecord(error);
+  if (record?.supervisionUnavailableReason) return error as SupervisionExecutionError;
+
+  const message = error instanceof Error ? error.message : String(error);
+  const code = typeof record?.code === 'string' && record.code.trim()
+    ? record.code.trim()
+    : undefined;
+  // Provider adapters intentionally classify authentication/configuration and
+  // missing-runtime failures with stable non-retryable codes. A generic
+  // PROVIDER_ERROR is different: SDK adapters often cannot distinguish a
+  // transient upstream failure from a terminal one and conservatively mark it
+  // recoverable=false. Supervisor decisions are read-only ephemeral calls, so
+  // retrying that generic shape in a fresh session is safe and avoids turning a
+  // single provider hiccup into a false terminal automation failure.
+  const retryable = !code || !NON_RETRYABLE_PROVIDER_ERROR_CODES.has(code);
+
+  return Object.assign(new Error(message), {
+    supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+    ...(code ? { supervisionProviderCode: code } : {}),
+    supervisionProviderRetryable: retryable,
+  });
+}
+
+function decisionTimeoutError(): SupervisionExecutionError {
+  return Object.assign(new Error('supervision timeout'), {
+    supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT,
+    supervisionProviderRetryable: false,
+  });
+}
 /**
  * Regex guardrails that downgrade a supervisor LLM's `complete` verdict to
  * `continue` when the assistant response obviously proposes follow-up work.
@@ -287,11 +354,15 @@ function applyDecisionGuardrails(
 export class SupervisionBroker {
   private readonly resolveProvider: (backend: SharedContextRuntimeBackend) => Promise<TransportProvider>;
   private readonly now: () => number;
+  private readonly waitForRetry: (delayMs: number) => Promise<void>;
   private readonly queueChains = new Map<string, Promise<void>>();
 
   constructor(deps: SupervisionBrokerDeps = {}) {
     this.resolveProvider = deps.resolveProvider ?? ((backend) => ensureProviderConnected(backend, {}));
     this.now = deps.now ?? (() => Date.now());
+    this.waitForRetry = deps.waitForRetry ?? ((delayMs) => new Promise((resolve) => {
+      setTimeout(resolve, delayMs);
+    }));
   }
 
   async decide(request: SupervisionBrokerRequest): Promise<SupervisionDecision> {
@@ -304,7 +375,10 @@ export class SupervisionBroker {
     }
 
     const startedAt = this.now();
-    const timeoutMs = snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS;
+    const timeoutMs = Math.max(
+      snapshot.timeoutMs > 0 ? snapshot.timeoutMs : SUPERVISION_DEFAULT_TIMEOUT_MS,
+      SUPERVISION_MIN_TIMEOUT_MS,
+    );
     const key = `${snapshot.backend}:${snapshot.model}:${snapshot.preset ?? ''}`;
     const previous = this.queueChains.get(key) ?? Promise.resolve();
     let release!: () => void;
@@ -324,11 +398,29 @@ export class SupervisionBroker {
       const provider = await this.resolveProvider(snapshot.backend);
       return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot, request.cwd);
     } catch (error) {
+      const normalized = error as SupervisionExecutionError;
       const message = error instanceof Error ? error.message : String(error);
       const unavailableReason = (error && typeof error === 'object' && 'supervisionUnavailableReason' in error
-        ? (error as { supervisionUnavailableReason?: SupervisionUnavailableReason }).supervisionUnavailableReason
+        ? normalized.supervisionUnavailableReason
         : undefined) ?? SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
-      return askHuman(message, unavailableReason);
+      const providerAttempts = normalized.supervisionProviderAttempts;
+      if (unavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR) {
+        logger.warn({
+          backend: snapshot.backend,
+          model: snapshot.model,
+          providerErrorCode: normalized.supervisionProviderCode ?? 'unknown',
+          providerErrorMessage: sanitizeMcpErrorMessage(normalized, 'provider error'),
+          providerAttempts: providerAttempts ?? 1,
+        }, 'Supervisor provider decision failed');
+      }
+      const decision = askHuman(message, unavailableReason);
+      if (unavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR) {
+        decision.providerFailure = {
+          ...(normalized.supervisionProviderCode ? { code: normalized.supervisionProviderCode } : {}),
+          attempts: providerAttempts ?? 1,
+        };
+      }
+      return decision;
     } finally {
       release();
       if (this.queueChains.get(key) === current) this.queueChains.delete(key);
@@ -342,7 +434,7 @@ export class SupervisionBroker {
     snapshot: SessionSupervisionSnapshot,
     cwd?: string,
   ): Promise<SupervisionDecision> {
-    const sessionKey = `deck_supervision_${randomUUID()}`;
+    const deadlineAt = this.now() + timeoutMs;
 
     // Delegate backend/model/preset → env/agentId/settings resolution to the
     // shared processing-provider config. For qwen or claude-code-sdk with a
@@ -360,49 +452,114 @@ export class SupervisionBroker {
       const message = error instanceof Error ? error.message : String(error);
       throw Object.assign(new Error(message), {
         supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+        supervisionProviderCode: PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        supervisionProviderRetryable: false,
+        supervisionProviderAttempts: 1,
       });
     }
     const effectiveAgentId = resolved.agentId ?? snapshot.model;
 
-    const providerSessionId = await provider.createSession({
-      sessionKey,
-      fresh: true,
-      cwd,
-      ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
-      ...(resolved.env ? { env: resolved.env } : {}),
-      ...(resolved.settings ? { settings: resolved.settings } : {}),
-    });
-    // Supervision runs its own per-call onComplete/onError filtered by sid;
-    // mark the sid so transport-relay's global onDelta drops its events
-    // silently instead of per-delta "unresolved route" warnings.
-    markEphemeralProviderSid(providerSessionId);
+    let providerAttempts = 0;
+    while (true) {
+      providerAttempts += 1;
+      try {
+        return await this.evaluateInFreshProviderSession({
+          provider,
+          request,
+          snapshot,
+          cwd,
+          resolved,
+          effectiveAgentId,
+          deadlineAt,
+        });
+      } catch (error) {
+        const normalized = normalizeProviderExecutionError(error);
+        normalized.supervisionProviderAttempts = providerAttempts;
+        const retryIndex = providerAttempts - 1;
+        const delayMs = PROVIDER_RETRY_DELAYS_MS[retryIndex];
+        const remainingBudget = deadlineAt - this.now();
+        const canRetry = normalized.supervisionUnavailableReason === SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR
+          && normalized.supervisionProviderRetryable === true
+          && providerAttempts <= MAX_RECOVERABLE_PROVIDER_RETRIES
+          && delayMs !== undefined
+          && remainingBudget > delayMs + MIN_SUPERVISION_EXECUTION_BUDGET_MS;
+        if (!canRetry) throw normalized;
 
+        logger.warn({
+          backend: snapshot.backend,
+          model: snapshot.model,
+          providerId: provider.id,
+          providerErrorCode: normalized.supervisionProviderCode ?? 'unknown',
+          providerErrorMessage: sanitizeMcpErrorMessage(normalized, 'provider error'),
+          providerAttempt: providerAttempts,
+          retryDelayMs: delayMs,
+        }, 'Supervisor provider decision failed; retrying in a fresh session');
+        await this.waitForRetry(delayMs);
+      }
+    }
+  }
+
+  private remainingExecutionBudget(deadlineAt: number): number {
+    const remaining = deadlineAt - this.now();
+    if (remaining <= MIN_SUPERVISION_EXECUTION_BUDGET_MS) throw decisionTimeoutError();
+    return remaining;
+  }
+
+  private async evaluateInFreshProviderSession(input: {
+    provider: TransportProvider;
+    request: SupervisionBrokerRequest;
+    snapshot: SessionSupervisionSnapshot;
+    cwd?: string;
+    resolved: Awaited<ReturnType<typeof resolveProcessingProviderSessionConfig>>;
+    effectiveAgentId: string;
+    deadlineAt: number;
+  }): Promise<SupervisionDecision> {
+    const { provider, request, snapshot, cwd, resolved, effectiveAgentId, deadlineAt } = input;
+    const sessionKey = `deck_supervision_${randomUUID()}`;
+    let providerSessionId: string | undefined;
     try {
+      providerSessionId = await provider.createSession({
+        sessionKey,
+        fresh: true,
+        cwd,
+        ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+        ...(resolved.env ? { env: resolved.env } : {}),
+        ...(resolved.settings ? { settings: resolved.settings } : {}),
+      });
+      // Supervision runs its own per-call onComplete/onError filtered by sid;
+      // mark the sid so transport-relay's global onDelta drops its events
+      // silently instead of per-delta "unresolved route" warnings.
+      markEphemeralProviderSid(providerSessionId);
       if (provider.setSessionAgentId && effectiveAgentId) provider.setSessionAgentId(providerSessionId, effectiveAgentId);
+
       let output = await this.runDecisionAttempt(
         provider,
         providerSessionId,
         buildSupervisionDecisionPrompt(request, request.snapshot?.promptVersion),
-        timeoutMs,
+        this.remainingExecutionBudget(deadlineAt),
       );
       let parsed = parseSupervisionDecision(output);
       if (parsed) return applyDecisionGuardrails(parsed, request);
 
-      const maxRetries = Math.max(0, request.snapshot?.maxParseRetries ?? 1);
+      const maxRetries = Math.max(0, snapshot.maxParseRetries ?? 1);
       for (let retry = 0; retry < maxRetries; retry += 1) {
         output = await this.runDecisionAttempt(
           provider,
           providerSessionId,
           buildSupervisionDecisionRepairPrompt(request, output),
-          timeoutMs,
+          this.remainingExecutionBudget(deadlineAt),
         );
         parsed = parseSupervisionDecision(output);
         if (parsed) return applyDecisionGuardrails(parsed, request);
       }
       return askHuman('invalid supervisor decision', SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT);
+    } catch (error) {
+      throw normalizeProviderExecutionError(error);
     } finally {
-      unmarkEphemeralProviderSid(providerSessionId);
-      await provider.endSession(providerSessionId).catch(() => {});
+      if (providerSessionId) {
+        unmarkEphemeralProviderSid(providerSessionId);
+        await provider.endSession(providerSessionId).catch(() => {});
+      }
     }
   }
 
@@ -412,29 +569,41 @@ export class SupervisionBroker {
     prompt: string,
     timeoutMs: number,
   ): Promise<string> {
+    let settled = false;
+    const cleanups: Array<() => void> = [];
+    let settleResolve!: (value: string) => void;
+    let settleReject!: (error: unknown) => void;
     const waitForCompletion = new Promise<string>((resolve, reject) => {
-      const cleanups: Array<() => void> = [];
       const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
         while (cleanups.length > 0) cleanups.pop()?.();
         fn();
       };
-      cleanups.push(provider.onComplete((sid, message) => {
-        if (sid !== providerSessionId) return;
-        finish(() => resolve(message.content));
-      }));
-      cleanups.push(provider.onError((sid, error: ProviderError) => {
-        if (sid !== providerSessionId) return;
-        finish(() => reject(Object.assign(new Error(error.message), { supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR })));
-      }));
-      const timeout = setTimeout(() => {
-        void provider.cancel?.(providerSessionId).catch(() => {});
-        finish(() => reject(Object.assign(new Error('supervision timeout'), { supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT })));
-      }, timeoutMs);
-      cleanups.push(() => clearTimeout(timeout));
+      settleResolve = (value) => finish(() => resolve(value));
+      settleReject = (error) => finish(() => reject(error));
     });
 
+    cleanups.push(provider.onComplete((sid, message) => {
+      if (sid !== providerSessionId) return;
+      settleResolve(message.content);
+    }));
+    cleanups.push(provider.onError((sid, error: ProviderError) => {
+      if (sid !== providerSessionId) return;
+      settleReject(normalizeProviderExecutionError(error));
+    }));
+    const timeout = setTimeout(() => {
+      void provider.cancel?.(providerSessionId).catch(() => {});
+      settleReject(decisionTimeoutError());
+    }, timeoutMs);
+    cleanups.push(() => clearTimeout(timeout));
+
     void waitForCompletion.catch(() => {});
-    await provider.send(providerSessionId, prompt);
+    try {
+      await provider.send(providerSessionId, prompt);
+    } catch (error) {
+      settleReject(normalizeProviderExecutionError(error));
+    }
     return await waitForCompletion;
   }
 }

@@ -5,12 +5,11 @@
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
-import { sendKeys } from '../agent/tmux.js';
 import { getSession } from '../store/session-store.js';
 import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
 import { detectStatusAsync, type AgentType } from '../agent/detect.js';
 import { startP2pRun, type P2pTarget } from './p2p-orchestrator.js';
-import { prepareAdvancedWorkflowLaunch } from './command-handler.js';
+import { prepareAdvancedWorkflowLaunch, sendProcessSessionMessageForAutomation } from './command-handler.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
@@ -45,9 +44,16 @@ export interface CronSendDispatchResult {
 type CronSendDispatcher = (input: CronSendDispatchInput) => Promise<CronSendDispatchResult>;
 
 let cronSendDispatcherOverride: CronSendDispatcher | null = null;
+let cronProcessCommandSenderOverride: ((sessionName: string, text: string) => Promise<void>) | null = null;
 
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
   cronSendDispatcherOverride = dispatcher;
+}
+
+export function __setCronProcessCommandSenderForTests(
+  sender: ((sessionName: string, text: string) => Promise<void>) | null,
+): void {
+  cronProcessCommandSenderOverride = sender;
 }
 
 export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: string): string {
@@ -172,8 +178,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         });
       }
     } else {
-      await sendKeys(name, command, { cwd: session.projectDir });
-      timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
+      await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command);
     }
 
     // Capture agent response: collect assistant.text events until session goes idle

@@ -75,6 +75,12 @@ import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionCloneParentStage } from '../../shared/execution-clone.js';
+import {
+  PEER_AUDIT_VALIDATION_KINDS,
+  PEER_AUDIT_VALIDATION_OUTCOMES,
+  type PeerAuditReplyEnvelope,
+} from '../../shared/peer-audit.js';
+import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
@@ -143,6 +149,7 @@ export interface MemoryMcpToolDeps {
   orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
+  peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
   archiveMemory?: (id: string) => Promise<boolean> | boolean;
   restoreArchivedMemory?: (id: string) => Promise<boolean> | boolean;
@@ -1070,6 +1077,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
+    [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: async (input) => {
+      if (!deps.peerAuditReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit reply ingress is unavailable');
+      // This is deliberately structure-only. Evidence policy runs only after
+      // the daemon ingress has bound capability and live sender/destination.
+      const decoded = decodePeerAuditReplyCommandStructure(input);
+      if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
+      const result = await deps.peerAuditReply(decoded.value);
+      return result.ok === false
+        ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'peer audit reply rejected'))
+        : { status: 'ok', accepted: true };
+    },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
       const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
@@ -1447,10 +1465,48 @@ function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>)
   return wrapped;
 }
 
-function toolResult(result: ToolResult): CallToolResult {
+function computerUseTopLevelContent(result: ToolResult): CallToolResult['content'] {
+  if (result.status !== 'ok' || !('result' in result) || !result.result || typeof result.result !== 'object') {
+    return [{ type: 'text', text: JSON.stringify(result) }];
+  }
+  const computerResult = result.result as { content?: unknown };
+  if (!Array.isArray(computerResult.content)) return [{ type: 'text', text: JSON.stringify(result) }];
+  const images = computerResult.content.filter((item): item is { type: 'image'; data: string; mimeType: string } => (
+    Boolean(item)
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && (item as { type?: unknown }).type === 'image'
+    && typeof (item as { data?: unknown }).data === 'string'
+    && typeof (item as { mimeType?: unknown }).mimeType === 'string'
+  ));
+  if (images.length === 0) return [{ type: 'text', text: JSON.stringify(result) }];
+
+  // MCP clients only treat top-level ImageContent as model-visible vision
+  // input. Keep the complete typed result in structuredContent, but do not
+  // duplicate multi-megabyte base64 into the text block.
+  const textResult = {
+    ...result,
+    result: {
+      ...(result.result as Record<string, unknown>),
+      content: computerResult.content.map((item) => (
+        images.includes(item as { type: 'image'; data: string; mimeType: string })
+          ? { type: 'image', mimeType: (item as { mimeType: string }).mimeType, attached: true }
+          : item
+      )),
+    },
+  };
+  return [
+    { type: 'text', text: JSON.stringify(textResult) },
+    ...images.map((item) => ({ type: 'image' as const, data: item.data, mimeType: item.mimeType })),
+  ];
+}
+
+function toolResult(result: ToolResult, name?: MemoryMcpToolName): CallToolResult {
   return {
     structuredContent: result,
-    content: [{ type: 'text', text: JSON.stringify(result) }],
+    content: name === MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL
+      ? computerUseTopLevelContent(result)
+      : [{ type: 'text', text: JSON.stringify(result) }],
     isError: result.status === 'error',
   };
 }
@@ -1503,6 +1559,18 @@ const schemas = {
     text: z.string().describe('Stable preference text.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: z.object({
+    attemptId: z.string(),
+    replyCapability: z.string(),
+    verdict: z.enum(['PASS', 'REWORK']),
+    findings: z.string(),
+    validations: z.array(z.object({
+      kind: z.enum(PEER_AUDIT_VALIDATION_KINDS),
+      label: z.string(),
+      outcome: z.enum(PEER_AUDIT_VALIDATION_OUTCOMES),
+      summary: z.string(),
+    }).strict()),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
     query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
@@ -1725,7 +1793,7 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
           }).catch(() => {});
         };
       }
-      return toolResult(await handlers[name](args, context));
+      return toolResult(await handlers[name](args, context), name);
     });
   }
 }

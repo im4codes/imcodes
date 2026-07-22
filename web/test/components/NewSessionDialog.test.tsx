@@ -105,19 +105,20 @@ describe('NewSessionDialog', () => {
     const optgroups = Array.from(select.querySelectorAll('optgroup'));
     expect(optgroups.map((group) => group.label)).toEqual(['SDK', 'CLI']);
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options.slice(0, 10)).toEqual([
+    expect(options.slice(0, 11)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
       'copilot-sdk',
       'cursor-headless',
+      'opencode-sdk',
       'gemini-sdk',
       'grok-sdk',
       'kimi-sdk',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(10)).toEqual([
+    expect(options.slice(11)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -784,6 +785,46 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'kimi-sdk',
       requestedModel: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
+  it('uses a provider-qualified OpenCode SDK model when starting a session', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    const agentTypeSelect = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
+    fireEvent.input(agentTypeSelect, { target: { value: 'opencode-sdk' } });
+
+    await waitFor(() => expect(ws.send.mock.calls.some((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'opencode-sdk'
+    ))).toBe(true));
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'opencode-sdk'
+    ))?.[0];
+    expect(request).toMatchObject({
+      type: 'transport.list_models',
+      agentType: 'opencode-sdk',
+      force: true,
+    });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'opencode-sdk',
+      requestId: request?.requestId,
+      models: [{ id: 'anthropic/claude-sonnet-4-5', name: 'Anthropic · Claude Sonnet 4.5' }],
+      defaultModel: 'anthropic/claude-sonnet-4-5',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'anthropic/claude-sonnet-4-5' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[1], { target: { value: 'anthropic/claude-sonnet-4-5' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'opencode-sdk',
+      requestedModel: 'anthropic/claude-sonnet-4-5',
     }));
   });
 

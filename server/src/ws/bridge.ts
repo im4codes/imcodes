@@ -33,6 +33,8 @@ import {
 import { validateComputerUseResultFrame } from '../../../shared/computer-use.js';
 import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource-events.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
+import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/peer-audit.js';
+import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -1183,6 +1185,23 @@ export class WsBridge {
 
   /** Per-request P2P workflow pending map — routes request-scoped responses via requestId unicast. */
   private pendingP2pWorkflowRequests = new Map<string, PendingP2pWorkflowRequest>();
+
+  /**
+   * Peer-audit RPC unicast router. Bound by `(responseType, commandId)` to the
+   * originating browser socket. Daemon reconnect bumps `daemonGeneration`,
+   * which atomically invalidates all outstanding routes. Default deny:
+   * any peer-audit response without a matching route is dropped, never
+   * broadcast.
+   */
+  private readonly peerAuditRouter: PeerAuditUnicastRouter = new PeerAuditUnicastRouter(
+    undefined,
+    0,
+    {
+      send: (socket, json) => { safeSend(socket, json); },
+      increment: (metric, tags) => { incrementCounter(metric, tags); },
+      logWarn: (scope, fields, message) => { logger.warn(fields as Record<string, unknown>, message); },
+    },
+  );
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
   private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
@@ -2386,6 +2405,10 @@ export class WsBridge {
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
+    // Invalidate every pending peer-audit response route: the prior daemon
+    // is gone, and any reply that arrives for it must not be delivered to a
+    // browser that has since reconnected.
+    this.peerAuditRouter.setDaemonGeneration(this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
     this.controlledFileTransferCapabilities.clear();
@@ -2584,6 +2607,9 @@ export class WsBridge {
             // execute on a fresh generation after the relay gave up (10.6).
             if (parsed.type === DAEMON_COMMAND_TYPES.MACHINE_EXEC) continue;
             if (parsed.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) continue;
+            if (parsed.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES
+              || parsed.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START
+              || parsed.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_CANCEL) continue;
             if (parsed.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE) {
               this.requestDaemonUpgrade({
                 targetVersion: (parsed as { targetVersion?: unknown }).targetVersion,
@@ -3305,6 +3331,52 @@ export class WsBridge {
         }
         // Malformed: no sessionName — fall through to regular forwarding,
         // the daemon will ignore it. Don't drop silently here.
+      }
+
+      // Peer-audit controls are non-queueing RPCs. Never replay an audit after
+      // the browser timed out against an older daemon generation.
+      if ((msg.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES
+        || msg.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START
+        || msg.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_CANCEL)
+        && typeof msg.commandId === 'string') {
+        const responseType = msg.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES
+          ? PEER_AUDIT_MESSAGES.CANDIDATES
+          : msg.type === DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START
+            ? PEER_AUDIT_MESSAGES.QUICK_RESULT
+            : PEER_AUDIT_MESSAGES.CANCEL_RESULT;
+        if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) {
+          safeSend(ws, JSON.stringify({ type: responseType, commandId: msg.commandId, ok: false, error: PEER_AUDIT_COMMAND_ERRORS.DAEMON_UNAVAILABLE }));
+          return;
+        }
+        // Reserve the unicast route BEFORE forwarding to daemon. This
+        // ensures a late reply cannot be broadcast even if the request
+        // hits an idle daemon or fails to land.
+        const reservation = this.peerAuditRouter.insert({
+          socket: ws,
+          commandId: msg.commandId,
+          requestType: msg.type,
+          responseType,
+        });
+        if (!reservation.ok) {
+          // Per-socket / global capacity reached. Fail closed: refuse the
+          // request rather than letting it leak via broadcast.
+          safeSend(ws, JSON.stringify({
+            type: responseType,
+            commandId: msg.commandId,
+            ok: false,
+            error: PEER_AUDIT_COMMAND_ERRORS.ROUTE_RESERVATION_FAILED,
+            reason: reservation.reason,
+          }));
+          return;
+        }
+        try {
+          this.daemonWs.send(raw);
+        } catch {
+          // Forward failed; release the reserved route and report.
+          this.peerAuditRouter.drop(responseType, msg.commandId, ws);
+          safeSend(ws, JSON.stringify({ type: responseType, commandId: msg.commandId, ok: false, error: PEER_AUDIT_COMMAND_ERRORS.DAEMON_UNAVAILABLE }));
+        }
+        return;
       }
 
       this.sendToDaemon(raw);
@@ -4597,6 +4669,8 @@ export class WsBridge {
           type: 'subsession.created',
           id: msg.id,
           sessionName: `deck_sub_${msg.id}`,
+          sessionInstanceId: msg.sessionInstanceId || null,
+          runtimeEpoch: msg.runtimeEpoch || null,
           sessionType,
           cwd: msg.cwd || null,
           label: msg.label || null,
@@ -4883,6 +4957,21 @@ export class WsBridge {
       if (sessionId) {
         this.updateActiveDispatchFromDaemonMessage(sessionId, msg);
         this.sendToTransportSubscribers(sessionId, JSON.stringify(msg));
+      }
+      return;
+    }
+
+    // Peer-audit RPC responses: route ONLY to the originating browser via
+    // the unicast router. Default deny: any peer-audit response without a
+    // matching route is dropped (NOT broadcast) — late replies after socket
+    // close, expired TTL, daemon reconnect, or mismatched commandId are all
+    // dropped silently with a metric increment.
+    if (type === PEER_AUDIT_MESSAGES.CANDIDATES
+      || type === PEER_AUDIT_MESSAGES.QUICK_RESULT
+      || type === PEER_AUDIT_MESSAGES.CANCEL_RESULT) {
+      const resolved = this.peerAuditRouter.resolve(msg);
+      if (resolved && resolved.socket.readyState === WebSocket.OPEN) {
+        safeSend(resolved.socket, JSON.stringify(msg));
       }
       return;
     }
@@ -5314,6 +5403,7 @@ export class WsBridge {
     this.transportSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
+    this.peerAuditRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
     for (const [reqId, pending] of this.pendingTimelineRequests) {
       if (pending.socket === ws) {
@@ -5947,6 +6037,9 @@ export class WsBridge {
     if (
       parsedType === DAEMON_COMMAND_TYPES.MACHINE_EXEC
       || parsedType === DAEMON_COMMAND_TYPES.COMPUTER_USE
+      || parsedType === DAEMON_COMMAND_TYPES.PEER_AUDIT_LIST_CANDIDATES
+      || parsedType === DAEMON_COMMAND_TYPES.PEER_AUDIT_QUICK_START
+      || parsedType === DAEMON_COMMAND_TYPES.PEER_AUDIT_CANCEL
       || parsedType === FILE_TRANSFER_MSG.UPLOAD_FETCH
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM

@@ -19,8 +19,10 @@ import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
+  SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
@@ -51,6 +53,8 @@ import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
+import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
   deriveSdkSubagentStatusRows,
   type SdkSubagentDiagnostic,
@@ -457,8 +461,16 @@ function pickMergedToolInput(
   callInput: string,
   resultInput: string,
 ): string {
-  if (toolName === 'WebSearch' && resultInput) {
-    if (!callInput || isGenericWebSearchLabel(callInput)) return resultInput;
+  if (toolName === 'WebSearch') {
+    const callGeneric = !callInput || isGenericWebSearchLabel(callInput);
+    const resultGeneric = !resultInput || isGenericWebSearchLabel(resultInput);
+    // Reasoning-model web search sometimes reports `action: { type: 'other' }`
+    // with an empty query — codex/OpenAI withholds the actual query, so there
+    // is nothing to show. Drop the cryptic "(other)" token and render a bare
+    // "WebSearch" row instead of leaking the raw enum to the user.
+    if (callGeneric && resultGeneric) return '';
+    if (callGeneric) return resultInput;
+    return callInput;
   }
   return callInput || resultInput;
 }
@@ -1026,6 +1038,24 @@ function sdkAgentsProviderLabel(t: ChatTranslate, row: Pick<SdkSubagentStatusRow
   }
 }
 
+function sdkAgentsTaskKindLabel(t: ChatTranslate, row: SdkSubagentStatusRow): string {
+  if (row.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH) return t('chat.sdk_agents_task_bash');
+  if (row.taskType === SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT || row.taskType === SDK_SUBAGENT_TASK_TYPES.AGENT) {
+    return t('chat.sdk_agents_task_agent');
+  }
+  switch (row.providerKind) {
+    case SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_COLLAB_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.CODEX_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.GEMINI_RUNTIME_AGENT:
+    case SDK_SUBAGENT_PROVIDER_KINDS.GROK_RUNTIME_AGENT:
+      return t('chat.sdk_agents_task_agent');
+    default:
+      return t('chat.sdk_agents_task_background');
+  }
+}
+
 function sdkAgentsStatusLabel(t: ChatTranslate, status: SdkSubagentStatusRow['normalizedStatus'] | SdkSubagentDiagnostic['normalizedStatus']): string {
   switch (status) {
     case SDK_SUBAGENT_STATUS.PENDING:
@@ -1231,6 +1261,7 @@ function SdkAgentsRow({ row, now }: { row: SdkSubagentStatusRow; now: number }) 
     <div class={`chat-sdk-agent-row ${row.active ? 'active' : 'terminal'} status-${statusClass}`}>
       <div class="chat-sdk-agent-row-top">
         <span class="chat-sdk-agent-provider">{sdkAgentsProviderLabel(t, row)}</span>
+        <span class="chat-sdk-agent-task-kind">{sdkAgentsTaskKindLabel(t, row)}</span>
         <span class="chat-sdk-agent-status">{statusLabel}</span>
       </div>
       <div class="chat-sdk-agent-summary">{summary}</div>
@@ -1731,8 +1762,11 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     return () => window.clearInterval(timer);
   }, [hasAgentsStatusRows, preview]);
   const canShowAgentsControl = !preview;
-  const hasRunningSdkAgents = sdkAgentsStatus.runningCount > 0;
-  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasRunningSdkAgents;
+  // Keep the panel mounted for every retained sub-agent row, not only while at
+  // least one child is currently running. Otherwise a just-finished child (or
+  // a provider diagnostic) makes the entire list disappear even though the
+  // aggregator still has authoritative status to show.
+  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
@@ -3059,7 +3093,7 @@ const AssistantBlock = memo(function AssistantBlock({
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
+      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} />
       <ChatTime ts={ts} />
     </div>
   );
@@ -3166,7 +3200,8 @@ const ChatEvent = memo(function ChatEvent({
   const { t } = useTranslation();
   switch (event.type) {
     case 'user.message': {
-      let userText = String(event.payload.text ?? '');
+      const rawUserText = String(event.payload.text ?? '');
+      let userText = parseTimelineDisplayText(rawUserText);
       const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges
       if (attachments && attachments.length > 0) {
@@ -3176,8 +3211,8 @@ const ChatEvent = memo(function ChatEvent({
       }
       const isPending = !!event.payload.pending;
       const isFailed = !!event.payload.failed;
-      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
+      const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
       return (
@@ -3221,7 +3256,7 @@ const ChatEvent = memo(function ChatEvent({
                 <button
                   type="button"
                   class="chat-user-retry-btn"
-                  onClick={() => onResendFailed(commandId, String(event.payload.text ?? ''))}
+                  onClick={() => onResendFailed(commandId, rawUserText)}
                 >
                   {t('chat.retrySend', 'Retry')}
                 </button>
@@ -3232,6 +3267,48 @@ const ChatEvent = memo(function ChatEvent({
         </div>
       );
     }
+
+    case 'peer_audit.result': {
+      const outcome = String(event.payload.outcome ?? 'target_unavailable');
+      const outcomeKey = outcome === 'pass'
+        ? 'result_pass'
+        : outcome === 'rework'
+          ? 'result_rework'
+          : outcome === 'timeout'
+            ? 'result_timeout'
+            : outcome === 'cancelled'
+              ? 'result_cancelled'
+              : 'result_unavailable';
+      const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
+      const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
+      const findingsPreview = typeof event.payload.findingsPreview === 'string'
+        ? event.payload.findingsPreview
+        : '';
+      const disposition = isPeerAuditRuntimeDisposition(event.payload.disposition)
+        ? event.payload.disposition
+        : null;
+      return (
+        <section class="chat-event chat-system peer-audit-result-card" data-event-id={event.eventId}>
+          <strong>{t('peerAuditResult.title')}</strong>
+          <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
+          <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
+          <div>{t(`peerAuditQuick.${outcomeKey}`)}</div>
+          {disposition && (
+            <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
+          )}
+          {findingsPreview && (
+            <details>
+              <summary>{t('peerAuditResult.findingsPreview')}</summary>
+              <ChatMarkdown text={findingsPreview} />
+            </details>
+          )}
+          <ChatTime ts={event.ts} />
+        </section>
+      );
+    }
+
+    case 'peer_audit.status':
+      return null;
 
     case 'tool.call': {
       const toolName = String(event.payload.tool ?? 'tool');
@@ -3584,6 +3661,8 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   const statusSummary = getMemoryContextStatusSummary(t, payload, contextItemCount);
   const statusDetail = getMemoryContextStatusDetail(t, payload);
   const isStatusOnly = contextItemCount === 0 && !!payload.status;
+  const hasSupplementalSummaries = reason === 'message'
+    && items.some((item) => item.projectionClass === 'recent_summary');
   // The startup-memory dump and the per-message recall both render as
   // memory-context cards, but they're conceptually different things:
   //   - startup: a one-shot "pre-loaded project history" preamble
@@ -3593,7 +3672,9 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
   // fresh recall (see the daemon-restart dedup fix that pairs with this).
   const titleKey = reason === 'startup'
     ? 'chat.memory_context_startup_title'
-    : 'chat.memory_context_title';
+    : hasSupplementalSummaries
+      ? 'chat.memory_context_supplemental_title'
+      : 'chat.memory_context_title';
 
   if (isStatusOnly) {
     // Skipped/empty recall cards were showing title + summary + query + detail

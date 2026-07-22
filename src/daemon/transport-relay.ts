@@ -279,8 +279,13 @@ function normalizeUsageUpdatePayload(
   if (!usage && !model) return null;
   const session = getSession(sessionName);
   const effectiveModel = resolveEffectiveSessionModel(session, model);
-  const presetCtx = session?.presetContextWindow
-    ?? (session?.ccPreset ? getCachedPresetContextWindow(session.ccPreset) : undefined);
+  // A preset can be edited while an SDK session remains alive. Prefer the
+  // current preset cache over the launch-time copy stored on that session so a
+  // changed 1M window takes effect on the very next usage frame.
+  const cachedPresetCtx = session?.ccPreset
+    ? getCachedPresetContextWindow(session.ccPreset)
+    : undefined;
+  const presetCtx = cachedPresetCtx ?? session?.presetContextWindow;
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
@@ -303,11 +308,13 @@ function normalizeUsageUpdatePayload(
     explicitContextWindow ?? presetCtx,
     effectiveModel,
     1_000_000,
-    { preferExplicit: explicitContextWindow !== undefined },
+    { preferExplicit: explicitContextWindow !== undefined || presetCtx !== undefined },
   );
   const contextWindowSource = explicitContextWindow !== undefined && contextWindow === explicitContextWindow
     ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
-    : undefined;
+    : presetCtx !== undefined && contextWindow === presetCtx
+      ? USAGE_CONTEXT_WINDOW_SOURCES.PRESET
+      : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
     ...(typeof cacheTokens === 'number' ? { cacheTokens } : {}),
@@ -829,10 +836,21 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
     if (usagePayload) {
       const tracked = inFlightMessages.get(sessionName);
-      const usageEventId = `${tracked?.eventId ?? `transport:${sessionName}:usage`}:usage`;
+      const finalized = update.finalized === true;
+      const providerMessageId = typeof update.messageId === 'string' && update.messageId
+        ? update.messageId
+        : undefined;
+      const usageEventId = providerMessageId
+        ? `transport:${sessionName}:${providerMessageId}:usage`
+        : `${tracked?.eventId ?? `transport:${sessionName}:usage`}:usage`;
       timelineEmitter.emit(sessionName, 'usage.update', {
         ...usagePayload,
-        streaming: true,
+        // A full Claude assistant/result frame can arrive after the terminal
+        // stream boundary. Its cache split is newer and more authoritative
+        // than the aggregate getContextUsage() snapshot already persisted by
+        // onComplete, so emit it as a terminal replacement with the same id.
+        // Ordinary live-meter updates remain streaming-only and disk-free.
+        streaming: !finalized,
       }, { source: 'daemon', confidence: 'high', eventId: usageEventId });
     }
   });
