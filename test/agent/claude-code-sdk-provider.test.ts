@@ -2276,6 +2276,59 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(JSON.stringify(terminal?.input ?? null)).not.toContain('/tmp/full-output.log');
   });
 
+  it('preserves authoritative completion output when a late notification reports a conflicting terminal status', async () => {
+    const sessionName = 'deck_project_claude_late_degraded_notification';
+    const { tools } = await collectToolsForMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-route-subagent-late-degraded', model: 'claude-sonnet-4-6' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        session_id: 'session-route-subagent-late-degraded',
+        uuid: 'uuid-task-late-degraded-start',
+        task_id: 'task-late-degraded-1',
+        description: 'Run a background Bash verification',
+        task_type: 'local_bash',
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-route-subagent-late-degraded',
+        uuid: 'uuid-task-late-degraded-complete',
+        task_id: 'task-late-degraded-1',
+        status: 'completed',
+        summary: 'Background command completed (exit code 0)',
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        session_id: 'session-route-subagent-late-degraded',
+        uuid: 'uuid-task-late-degraded-stopped',
+        task_id: 'task-late-degraded-1',
+        status: 'stopped',
+        summary: 'No completion record was found for this background shell command from the previous session.',
+      },
+      { type: 'result', session_id: 'session-route-subagent-late-degraded', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ], 'route-subagent-late-degraded', sessionName);
+
+    const subagents = sdkSubagentTools(tools);
+    expect(subagents).toHaveLength(2);
+    expect(subagents.at(-1)).toMatchObject({
+      id: makeClaudeSubagentCanonicalKey(sessionName, 'task-late-degraded-1'),
+      name: 'Bash',
+      status: 'complete',
+      output: 'Background command completed (exit code 0)',
+      detail: {
+        summary: 'Background command completed (exit code 0)',
+        meta: {
+          rawStatus: 'completed',
+          normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+          active: false,
+          terminal: true,
+        },
+      },
+    });
+  });
+
   it.each(['failed', 'stopped', 'killed'] as const)('emits terminal error SDK subagent snapshots for Claude task_notification %s', async (status) => {
     const sessionName = `deck_project_claude_${status}`;
     const { tools } = await collectToolsForMessages([
