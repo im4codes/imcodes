@@ -25,7 +25,8 @@ export function normalizeClaudeCodeModelId(value: string | null | undefined): Cl
 }
 
 export const DEFAULT_CODEX_AUTOMATION_MODEL = 'gpt-5.3-codex-spark' as const;
-export const CODEX_MODEL_IDS = ['gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', DEFAULT_CODEX_AUTOMATION_MODEL, 'gpt-5.2'] as const;
+export const DEFAULT_CODEX_SESSION_MODEL = 'gpt-5.6-sol' as const;
+export const CODEX_MODEL_IDS = [DEFAULT_CODEX_SESSION_MODEL, 'gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', DEFAULT_CODEX_AUTOMATION_MODEL, 'gpt-5.2'] as const;
 export type CodexModelId = typeof CODEX_MODEL_IDS[number];
 
 export const GEMINI_MODEL_IDS = [

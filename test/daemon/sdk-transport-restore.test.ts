@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { isAuthoritativeCleanIdlePayload } from '../../shared/session-activity-types.js';
+import { DEFAULT_CODEX_SESSION_MODEL } from '../../src/shared/models/options.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -957,7 +958,7 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cx_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
   });
 
-  it('uses gpt-5.6 instead of Claude-family models when launching codex-sdk', async () => {
+  it('uses the ChatGPT-compatible Codex default instead of Claude-family models when launching codex-sdk', async () => {
     await connectProvider('codex-sdk', {});
     await launchTransportSession({
       name: 'deck_sdk_cx_launch_opus_brain',
@@ -969,8 +970,8 @@ describe('sdk transport session restore', () => {
       fresh: true,
     });
 
-    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.requestedModel).toBe('gpt-5.6');
-    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.modelDisplay).toBe('gpt-5.6');
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.requestedModel).toBe(DEFAULT_CODEX_SESSION_MODEL);
+    expect(mocks.store.get('deck_sdk_cx_launch_opus_brain')?.modelDisplay).toBe(DEFAULT_CODEX_SESSION_MODEL);
 
     const runtime = getTransportRuntime('deck_sdk_cx_launch_opus_brain');
     expect(runtime).toBeDefined();
@@ -979,11 +980,11 @@ describe('sdk transport session restore', () => {
 
     expect(codexRunForSession('deck_sdk_cx_launch_opus_brain', 'start')).toMatchObject({
       mode: 'start',
-      options: expect.objectContaining({ model: 'gpt-5.6' }),
+      options: expect.objectContaining({ model: DEFAULT_CODEX_SESSION_MODEL }),
     });
   });
 
-  it('uses gpt-5.6 instead of stored Claude-family models when restoring codex-sdk', async () => {
+  it('uses the ChatGPT-compatible Codex default instead of stored Claude-family models when restoring codex-sdk', async () => {
     mocks.store.set('deck_sdk_cx_opus_brain', {
       name: 'deck_sdk_cx_opus_brain',
       projectName: 'sdkcxopus',
@@ -1006,8 +1007,8 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.requestedModel).toBe('gpt-5.6');
-    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.modelDisplay).toBe('gpt-5.6');
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.requestedModel).toBe(DEFAULT_CODEX_SESSION_MODEL);
+    expect(mocks.store.get('deck_sdk_cx_opus_brain')?.modelDisplay).toBe(DEFAULT_CODEX_SESSION_MODEL);
 
     const runtime = getTransportRuntime('deck_sdk_cx_opus_brain');
     expect(runtime).toBeDefined();
@@ -1017,7 +1018,7 @@ describe('sdk transport session restore', () => {
     expect(codexRunForSession('deck_sdk_cx_opus_brain', 'resume')).toMatchObject({
       mode: 'resume',
       id: 'codex-thread-opus-restore',
-      options: expect.objectContaining({ model: 'gpt-5.6' }),
+      options: expect.objectContaining({ model: DEFAULT_CODEX_SESSION_MODEL }),
     });
   });
 
