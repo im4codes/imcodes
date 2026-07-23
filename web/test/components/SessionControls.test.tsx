@@ -126,6 +126,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.tab_unpin') return 'Unpin';
       if (key === 'session.clone.menu') return 'Copy session group';
       if (key === 'session.supervision.quickLabel') return 'Auto';
+      if (key === 'session.supervision.quickAuditLabel') return 'Audit';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
       if (key === 'session.approval.pending') return 'Approval required';
       if (key === 'session.approval.allow') return 'Allow';
@@ -4813,6 +4814,8 @@ afterEach(() => {
     }));
     expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(true);
     expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);
+    expect(autoBtn.textContent).toContain('supervised');
+    expect(autoBtn.textContent).not.toContain('Auto');
   });
 
   it('uses a distinct active visual mode for supervised audit', () => {
@@ -4850,6 +4853,8 @@ afterEach(() => {
     );
 
     const autoBtn = screen.getByRole('button', { name: /^Auto$/ });
+    expect(autoBtn.textContent).toContain('Audit');
+    expect(autoBtn.textContent).not.toContain('supervised_audit');
     expect(autoBtn.classList.contains('shortcut-btn-auto-audit')).toBe(true);
     expect(autoBtn.classList.contains('shortcut-btn-auto-supervised')).toBe(false);
     expect(autoBtn.classList.contains('shortcut-btn-auto-active')).toBe(true);

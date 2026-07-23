@@ -746,6 +746,7 @@
       "modeLabel": "模式",
       "invalidStoredConfig": "已儲存的監督設定無效。修復並儲存前，自動化會保持停用。",
       "quickLabel": "自動",
+      "quickAuditLabel": "稽核",
       "quickTitle": "自動模式"
     },
     "approval": {

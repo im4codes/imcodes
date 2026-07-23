@@ -746,6 +746,7 @@
       "modeLabel": "模式",
       "invalidStoredConfig": "已保存的监督配置无效。修复并保存前，自动化将保持禁用。",
       "quickLabel": "自动",
+      "quickAuditLabel": "审计",
       "quickTitle": "自动模式"
     },
     "approval": {

@@ -883,12 +883,18 @@ export function SessionSettingsDialog({
     maxParseRetries: supervisionParseRetries,
     maxAutoContinueStreak: supervisionAutoContinueStreak,
     maxAutoContinueTotal: supervisionAutoContinueTotal,
+    // Remember the auditor on this session even while audit mode is not
+    // selected, so switching back to audit can reuse it without prompting.
+    ...((selectedPeerAuditCandidate?.name ?? peerAuditTargetName)
+      ? {
+          auditTargetSessionName: selectedPeerAuditCandidate?.name ?? peerAuditTargetName ?? undefined,
+          peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
+        }
+      : {}),
     ...(isAuditMode
       ? {
           maxAuditLoops: supervisionAuditLoops,
           taskRunPromptVersion,
-          auditTargetSessionName: selectedPeerAuditCandidate?.name ?? peerAuditTargetName ?? undefined,
-          peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
         }
       : {}),
   }), [

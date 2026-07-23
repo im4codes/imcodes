@@ -746,6 +746,7 @@
       "modeLabel": "모드",
       "invalidStoredConfig": "저장된 감독 설정이 잘못되었습니다. 수정하고 저장할 때까지 자동화는 비활성화됩니다.",
       "quickLabel": "자동",
+      "quickAuditLabel": "감사",
       "quickTitle": "자동 모드"
     },
     "approval": {
