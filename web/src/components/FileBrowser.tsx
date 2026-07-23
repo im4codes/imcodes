@@ -1861,7 +1861,6 @@ export function FileBrowser({
               controls
               preload="metadata"
               playsInline
-              style={{ maxWidth: '100%', maxHeight: '100%', width: '100%', background: '#000' }}
             >
               <source src={preview.streamUrl} type={preview.mimeType} />
               {t('file_browser.preview_video_unsupported')}

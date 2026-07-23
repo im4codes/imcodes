@@ -76,7 +76,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(tempDir, { recursive: true, force: true });
+  // A fresh-process persistence test can finish while the filesystem is still
+  // settling its final sessions.json write. Let Node retry the recursive
+  // removal if that brief race recreates an entry during directory traversal.
+  rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   vi.unstubAllEnvs();
   // The partial-mock regression test must not contaminate later tests in this
   // file or a reused full-suite worker.

@@ -178,6 +178,57 @@ describe('ChatView SDK agents panel', () => {
       .toEqual(['Bash / Shell', 'Agent', 'Bash / Shell']);
   });
 
+  it('reuses the Agents panel in preview for background Bash and Agent work only', () => {
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
+    const backgroundBash = makeSdkEvent('bash-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:bash-preview',
+      taskId: 'bash-preview',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+      childStatusSummary: 'Running focused tests',
+    }));
+    const backgroundAgent = makeSdkEvent('agent-running', makeMeta({
+      canonicalKey: 'claude:deck_agents:agent-preview',
+      taskId: 'agent-preview',
+      taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_AGENT,
+      childStatusSummary: 'Reviewing the result',
+    }));
+    const ordinaryBash: TimelineEvent = {
+      eventId: 'ordinary-bash',
+      sessionId: 'deck_agents',
+      ts: Date.now(),
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: {
+        tool: 'Bash',
+        input: { command: 'pwd' },
+        detail: { kind: 'tool_use', summary: 'ordinary short bash' },
+      },
+    };
+
+    const { container } = render(
+      <ChatView
+        events={[ordinaryBash, backgroundBash, backgroundAgent]}
+        loading={false}
+        sessionId="deck_agents"
+        preview
+      />,
+    );
+
+    const panel = container.querySelector('.chat-sdk-agents-panel');
+    expect(panel).toBeTruthy();
+    expect(panel?.textContent).toContain('2 running');
+    expect(panel?.textContent).toContain('Bash / Shell');
+    expect(panel?.textContent).toContain('Agent');
+    expect(panel?.textContent).toContain('Running focused tests');
+    expect(panel?.textContent).toContain('Reviewing the result');
+    expect(panel?.textContent).not.toContain('ordinary short bash');
+    expect(container.querySelectorAll('.chat-sdk-agent-row')).toHaveLength(2);
+    expect(container.querySelector('.chat-sdk-agents-toggle')).toBeTruthy();
+  });
+
   it('renders the Agents toggle immediately before refresh and shows the running badge', () => {
     const onForceSync = vi.fn();
     const { container } = render(

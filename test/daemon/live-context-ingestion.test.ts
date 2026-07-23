@@ -991,6 +991,7 @@ describe('LiveContextIngestion', () => {
     });
 
     await ingestion.backfillSessionFromEvents(session.name, [
+      makeEvent('user.message', 99, { text: '/model gpt-5.4' }),
       makeEvent('user.message', 100, { text: 'Summarize the deployment plan' }),
       makeEvent('assistant.text', 101, { text: 'Deployment plan captured' }),
     ]);
@@ -1001,6 +1002,8 @@ describe('LiveContextIngestion', () => {
         summary: expect.stringContaining('**Assistant:** Deployment plan captured'),
       }),
     ]);
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })[0]?.summary)
+      .not.toContain('/model gpt-5.4');
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
       totalRecords: 1,
       stagedEventCount: 0,

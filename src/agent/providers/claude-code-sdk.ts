@@ -1658,12 +1658,28 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (typeof patch?.is_backgrounded === 'boolean') task.backgrounded = patch.is_backgrounded;
       this.applyClaudeTaskStatus(task, this.pickString(patch?.status));
     } else if (msg.subtype === 'task_notification') {
-      task.summary = this.pickShortString(msg.summary) ?? task.summary;
-      task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
-      task.outputFile = this.pickShortString(msg.output_file) ?? task.outputFile;
-      task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
-      this.applyClaudeTaskStatus(task, this.pickString(msg.status));
+      const statusAccepted = this.applyClaudeTaskStatus(task, this.pickString(msg.status));
+      // Claude can replay a degraded notification after a session boundary
+      // (for example, "stopped" with no completion record) even though the
+      // same task already delivered an authoritative completed result. Keep
+      // the accepted terminal state and its matching output together instead
+      // of allowing rejected status metadata to overwrite the visible result.
+      if (statusAccepted) {
+        task.summary = this.pickShortString(msg.summary) ?? task.summary;
+        task.model = this.readRuntimeSubagentModel(msg) ?? task.model;
+        task.outputFile = this.pickShortString(msg.output_file) ?? task.outputFile;
+        task.usage = this.normalizeClaudeTaskUsage(msg.usage) ?? task.usage;
+      }
     }
+
+    // Claude registers local_bash only after the shell command has detached
+    // from the foreground turn. task_updated(is_backgrounded) can arrive later
+    // (or not at all before the parent completes), so derive the non-blocking
+    // ownership immediately from the provider-native task type. Without this,
+    // TransportSessionRuntime treats the row as a foreground open tool and
+    // synthesizes a false success when the parent turn settles, even though the
+    // background process is still running.
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) task.backgrounded = true;
 
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
@@ -2200,11 +2216,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (status !== 'running') state.runtimeAgentToolCalls.delete(tool.id);
   }
 
-  private applyClaudeTaskStatus(task: ClaudeTaskState, rawStatus: string | undefined): void {
-    if (!rawStatus) return;
+  private applyClaudeTaskStatus(task: ClaudeTaskState, rawStatus: string | undefined): boolean {
+    if (!rawStatus) return true;
     const { normalizedStatus, terminal, diagnosticCode } = this.normalizeClaudeTaskStatus(rawStatus);
     if (task.terminal && (normalizedStatus === SDK_SUBAGENT_STATUS.RUNNING || normalizedStatus === SDK_SUBAGENT_STATUS.PENDING)) {
-      return;
+      return false;
     }
     if (
       task.terminal
@@ -2212,7 +2228,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       && terminal
       && normalizedStatus === SDK_SUBAGENT_STATUS.UNKNOWN
     ) {
-      return;
+      return false;
     }
     if (
       task.terminal
@@ -2220,7 +2236,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       && terminal
       && normalizedStatus !== task.normalizedStatus
     ) {
-      return;
+      return false;
     }
 
     task.rawStatus = rawStatus;
@@ -2229,6 +2245,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     task.normalizedStatus = normalizedStatus;
     task.terminal = terminal;
     task.active = this.isClaudeSubagentActive(normalizedStatus) && !terminal;
+    return true;
   }
 
   private normalizeClaudeTaskStatus(rawStatus: string): {

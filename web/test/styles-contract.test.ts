@@ -41,6 +41,40 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('fits portrait videos by available preview height without stretching them to full width', () => {
+    const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
+    expect(videoContainerRule).not.toBeNull();
+    expect(videoContainerRule![0]).toMatch(/height:\s*100%/);
+    expect(videoContainerRule![0]).toMatch(/box-sizing:\s*border-box/);
+
+    const videoRule = css.match(/\.fb-preview-video video\s*\{[^}]*\}/);
+    expect(videoRule).not.toBeNull();
+    expect(videoRule![0]).toMatch(/width:\s*auto/);
+    expect(videoRule![0]).toMatch(/height:\s*100%/);
+    expect(videoRule![0]).toMatch(/max-width:\s*100%/);
+    expect(videoRule![0]).toMatch(/max-height:\s*100%/);
+    expect(videoRule![0]).toMatch(/object-fit:\s*contain/);
+    expect(videoRule![0]).not.toMatch(/[;{]\s*width:\s*100%/);
+
+    const fileBrowser = readFileSync(resolve(__dirname, '../src/components/FileBrowser.tsx'), 'utf8');
+    const videoElement = fileBrowser.match(/<video[\s\S]*?>/);
+    expect(videoElement).not.toBeNull();
+    expect(videoElement![0]).not.toContain('style=');
+  });
+
+  it('stacks the existing Agents panel in narrow sub-session previews', () => {
+    const previewSplitRule = css.match(/\.subcard-preview \.chat-view-wrap\.chat-split\s*\{[^}]*\}/);
+    expect(previewSplitRule).not.toBeNull();
+    expect(previewSplitRule![0]).toMatch(/flex-direction:\s*column\s*!important/);
+
+    const previewAgentsRule = css.match(/\.subcard-preview \.chat-sdk-agents-panel\s*\{[^}]*\}/);
+    expect(previewAgentsRule).not.toBeNull();
+    expect(previewAgentsRule![0]).toMatch(/width:\s*100%\s*!important/);
+    expect(previewAgentsRule![0]).toMatch(/min-width:\s*0/);
+    expect(previewAgentsRule![0]).toMatch(/max-height:\s*min\(42%,\s*120px\)/);
+    expect(previewAgentsRule![0]).toMatch(/border-top:\s*1px solid #334155/);
+  });
+
   it('sub-session accents stay on card/button top borders and window full borders', () => {
     const cardRule = css.match(/\.subcard\s*\{[^}]*\}/);
     expect(cardRule).not.toBeNull();
