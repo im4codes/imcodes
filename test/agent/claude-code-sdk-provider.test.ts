@@ -1613,6 +1613,7 @@ describe('ClaudeCodeSdkProvider', () => {
         meta: {
           taskId: 'bp1xwk3v9',
           taskType: 'local_bash',
+          backgrounded: true,
           normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
           active: false,
           terminal: true,

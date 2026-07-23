@@ -1665,6 +1665,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       this.applyClaudeTaskStatus(task, this.pickString(msg.status));
     }
 
+    // Claude registers local_bash only after the shell command has detached
+    // from the foreground turn. task_updated(is_backgrounded) can arrive later
+    // (or not at all before the parent completes), so derive the non-blocking
+    // ownership immediately from the provider-native task type. Without this,
+    // TransportSessionRuntime treats the row as a foreground open tool and
+    // synthesizes a false success when the parent turn settles, even though the
+    // background process is still running.
+    if (task.taskType === CLAUDE_LOCAL_BASH_TASK_TYPE) task.backgrounded = true;
+
     if (task.terminal && !task.parentWakeHandled) {
       task.parentWakeHandled = true;
       if (state.currentQuery && state.completed && state.retainedSubagentMode) {

@@ -23,6 +23,7 @@ import {
   SDK_SUBAGENT_PROVIDERS,
   SDK_SUBAGENT_PROVIDER_KINDS,
   SDK_SUBAGENT_STATUS,
+  SDK_SUBAGENT_TASK_TYPES,
 } from '../../shared/sdk-subagent-status.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
@@ -728,6 +729,53 @@ describe('TransportSessionRuntime', () => {
         terminalReason: 'provider_result',
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+    );
+  });
+
+  it('does not synthesize a terminal for Claude local_bash when its foreground turn completes', async () => {
+    runtime.send('start a detached render', 'cmd-local-bash-parent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const canonicalKey = 'claude:deck_test_brain:background-render';
+    mock.fireTool('sess-1', {
+      id: canonicalKey,
+      name: 'Bash',
+      status: 'running',
+      input: {
+        action: 'claude-bash-task',
+        description: 'Render all video frames',
+      },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'Claude Bash task',
+        meta: {
+          isSdkSubagent: true,
+          schemaVersion: 1,
+          provider: SDK_SUBAGENT_PROVIDERS.CLAUDE_CODE_SDK,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.CLAUDE_TASK,
+          canonicalKey,
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          rawStatus: 'running',
+          active: true,
+          terminal: false,
+          backgrounded: true,
+          taskType: SDK_SUBAGENT_TASK_TYPES.LOCAL_BASH,
+          taskId: 'background-render',
+        },
+      },
+    });
+    await flushDispatch();
+
+    expect((runtime as unknown as { _openTools: Map<string, unknown> })._openTools.size).toBe(0);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(runtime.getStatus()).toBe('idle');
+    expect(timelineEmitterEmitMock).not.toHaveBeenCalledWith(
+      'deck_test_brain',
+      'tool.result',
+      expect.objectContaining({ toolCallId: canonicalKey }),
+      expect.anything(),
     );
   });
 
