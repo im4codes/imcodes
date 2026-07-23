@@ -131,6 +131,12 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Never combine substantive pre-audit work and post-audit commit/push in one nextAction.');
     expect(prompt).toContain('NEVER invent generic "remaining implementation or validation" work');
     expect(prompt).toContain('exact auditor session ID and reply-enabled send command, exactly once');
+    expect(prompt).toContain('"requiresAudit":true');
+    expect(prompt).toContain('Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit.');
+    expect(prompt).toContain('must automation start a NEW peer audit now?');
+    expect(prompt).toContain('already delegated a matching audit and is waiting for PASS/REWORK');
+    expect(prompt).toContain('never recursively audit an audit-status turn');
+    expect(prompt).toContain('A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.');
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {
@@ -189,5 +195,6 @@ describe('supervision prompts', () => {
     );
     expect(prompt).toContain('IM.codes capability background');
     expect(prompt).toContain('openspec status --change "<name>" --json');
+    expect(prompt).toContain('requiresAudit is REQUIRED');
   });
 });

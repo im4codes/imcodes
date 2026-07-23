@@ -98,10 +98,11 @@ beforeEach(() => {
 
 describe('parseSupervisionDecision', () => {
   it('parses raw and fenced JSON candidates', () => {
-    expect(parseSupervisionDecision('{"decision":"complete","reason":"ok","confidence":0.9}')).toEqual({
+    expect(parseSupervisionDecision('{"decision":"complete","reason":"ok","confidence":0.9,"requiresAudit":false}')).toEqual({
       decision: 'complete',
       reason: 'ok',
       confidence: 0.9,
+      requiresAudit: false,
     });
     expect(parseSupervisionDecision('```json\n{"decision":"continue","reason":"keep going","confidence":0.1}\n```')).toEqual({
       decision: 'continue',
@@ -114,6 +115,7 @@ describe('parseSupervisionDecision', () => {
     expect(parseSupervisionDecision('Decision:\n{"decision":"complete","reason":"ok","confidence":0.9}')).toBeNull();
     expect(parseSupervisionDecision('{"decision":"complete","reason":"ok"}')).toBeNull();
     expect(parseSupervisionDecision('{"decision":"complete","reason":"ok","confidence":1.1}')).toBeNull();
+    expect(parseSupervisionDecision('{"decision":"complete","reason":"ok","confidence":0.9,"requiresAudit":"yes"}')).toBeNull();
   });
 });
 

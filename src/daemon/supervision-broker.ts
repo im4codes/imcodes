@@ -39,6 +39,9 @@ export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
  *  - `decision`: complete / continue / ask_human — the verdict.
  *  - `reason`: human-readable explanation (shown in UI / logs).
  *  - `confidence`: supervisor's self-reported confidence, 0..1.
+ *  - `requiresAudit`: whether a completed task warrants a separate peer
+ *    audit. Read-only checks and factual lookups do not; implementation,
+ *    mutations, fixes, and complex debugging do.
  *  - `gap`: what is specifically missing to close out the task. Required
  *    (strongly preferred) when `decision === 'continue'`.
  *  - `nextAction`: imperative, specific instruction for the target agent's
@@ -54,6 +57,7 @@ export interface SupervisionDecision {
   decision: SupervisionDecisionKind;
   reason: string;
   confidence: number;
+  requiresAudit?: boolean;
   gap?: string;
   nextAction?: string;
   extra?: Record<string, unknown>;
@@ -230,6 +234,7 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
   if (!DECISIONS.has(record.decision as SupervisionDecisionKind)) return null;
   if (typeof record.reason !== 'string' || !record.reason.trim()) return null;
   if (typeof record.confidence !== 'number' || !Number.isFinite(record.confidence) || record.confidence < 0 || record.confidence > 1) return null;
+  if (record.requiresAudit !== undefined && typeof record.requiresAudit !== 'boolean') return null;
   // gap / nextAction / extra are all optional at parse time — the guardrail
   // below is where "continue without nextAction" gets downgraded to
   // ask_human. Keeping the parser permissive means a still-correct
@@ -244,6 +249,7 @@ export function parseSupervisionDecision(text: string): SupervisionDecision | nu
     decision: record.decision as SupervisionDecisionKind,
     reason: record.reason.trim(),
     confidence: record.confidence,
+    ...(typeof record.requiresAudit === 'boolean' ? { requiresAudit: record.requiresAudit } : {}),
     ...(gap ? { gap } : {}),
     ...(nextAction ? { nextAction } : {}),
     ...(extra ? { extra } : {}),
