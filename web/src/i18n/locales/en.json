@@ -746,6 +746,7 @@
       "modeLabel": "Mode",
       "invalidStoredConfig": "Stored supervision config is invalid. Automation is disabled until you repair and save it.",
       "quickLabel": "Auto",
+      "quickAuditLabel": "Audit",
       "quickTitle": "Auto mode"
     },
     "approval": {

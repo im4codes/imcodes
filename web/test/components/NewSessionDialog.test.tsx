@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
+import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -404,7 +405,7 @@ describe('NewSessionDialog', () => {
     fireEvent.input(agentTypeSelect, { target: { value: agentTypeSelect.value } });
     await waitFor(() => {
       const modelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
-      expect(modelSelect.value).toBe('gpt-5.6');
+      expect(modelSelect.value).toBe(DEFAULT_CODEX_SESSION_MODEL);
     });
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[1], { target: { value: 'high' } });
@@ -412,7 +413,7 @@ describe('NewSessionDialog', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'codex-sdk',
-      requestedModel: 'gpt-5.6',
+      requestedModel: DEFAULT_CODEX_SESSION_MODEL,
       thinking: 'high',
     }));
   });

@@ -746,6 +746,7 @@
       "modeLabel": "Modo",
       "invalidStoredConfig": "La configuración guardada de supervisión no es válida. La automatización seguirá desactivada hasta que la repares y la guardes.",
       "quickLabel": "Auto",
+      "quickAuditLabel": "Auditoría",
       "quickTitle": "Modo automático"
     },
     "approval": {

@@ -263,7 +263,7 @@ async function waitForCondition(check: () => boolean, timeoutMs = 3000, interval
 
 function addTransportSession(
   name: string,
-  runtime: { status?: string; sending?: boolean; pendingCount?: number },
+  runtime: { status?: string; sending?: boolean; pendingCount?: number; backgroundWorkCount?: number },
   overrides: Record<string, any> = {},
 ) {
   mocks.store.set(name, {
@@ -286,6 +286,7 @@ function addTransportSession(
     getStatus: () => runtime.status ?? 'idle',
     sending: runtime.sending ?? false,
     pendingCount: runtime.pendingCount ?? 0,
+    backgroundWorkCount: runtime.backgroundWorkCount ?? 0,
   });
 }
 
@@ -439,6 +440,35 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
       type: DAEMON_MSG.UPGRADE_BLOCKED,
       reason: 'transport_busy',
       activeSessionNames: ['deck_queued_brain'],
+    });
+    expect(mocks.spawnCalls).toEqual([]);
+  });
+
+  it('blocks daemon.upgrade while an idle Claude session owns a detached background Bash', async () => {
+    addTransportSession(
+      'deck_claude_background_bash',
+      { status: 'idle', backgroundWorkCount: 1 },
+      { agentType: 'claude-code-sdk', providerId: 'claude-code-sdk' },
+    );
+
+    const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
+    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' }, serverLink as any);
+    await flushAsync();
+
+    expect(getBlockedMessage(serverLink)).toMatchObject({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: 'transport_busy',
+      activeSessionNames: ['deck_claude_background_bash'],
+      blockedSessions: [
+        {
+          name: 'deck_claude_background_bash',
+          transport: {
+            status: 'idle',
+            backgroundWorkCount: 1,
+            blockReason: 'background_work',
+          },
+        },
+      ],
     });
     expect(mocks.spawnCalls).toEqual([]);
   });

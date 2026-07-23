@@ -6,6 +6,7 @@ import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from '@shared/feature-flags.js';
+import { DEFAULT_CODEX_AUTOMATION_MODEL } from '../../../src/shared/models/options.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -436,7 +437,7 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'gpt-5.6',
+      primaryContextModel: DEFAULT_CODEX_AUTOMATION_MODEL,
       primaryContextPreset: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
@@ -562,18 +563,22 @@ describe('SharedContextManagementPanel', () => {
     expect(screen.getAllByLabelText('model:qwen:qwen3-coder-plus').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
   });
 
-  it('offers GPT-5.6 for Codex-backed memory processing', async () => {
+  it('defaults Codex-backed memory processing to Spark while keeping GPT-5.6 selectable', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
     });
+    await waitFor(() => {
+      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'true')).toBe(true);
+    });
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk'));
     });
 
     expect(await screen.findByLabelText('model:codex-sdk:gpt-5.6')).toBeDefined();
+    expect(screen.getByLabelText(`model:codex-sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`).getAttribute('aria-pressed')).toBe('true');
   });
 
   it('allows selecting a backup model directly from backend-specific chips', async () => {
@@ -603,7 +608,9 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
     });
 
-    expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'false')).toBe(true);
+    await waitFor(() => {
+      expect(screen.getAllByLabelText('model:claude-code-sdk:sonnet').some((el) => el.getAttribute('aria-pressed') === 'false')).toBe(true);
+    });
 
     await act(async () => {
       fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));

@@ -1,7 +1,6 @@
 import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
 import type { ContextMemoryProjectView, ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import {
@@ -39,6 +38,7 @@ import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
   doesSharedContextBackendSupportPresets,
   getDefaultSharedContextModelForBackend,
   isKnownSharedContextModelForBackend,
@@ -1610,7 +1610,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingSaving, setProcessingSaving] = useState(false);
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
   const [processingPrimaryBackend, setProcessingPrimaryBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-  const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
+  const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL);
   const [processingPrimaryPreset, setProcessingPrimaryPreset] = useState('');
   const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
@@ -2380,7 +2380,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     if (!serverId) {
       setProcessingSnapshot(null);
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-      setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
+      setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL);
       setProcessingPrimaryPreset('');
       setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
@@ -3959,7 +3959,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 />
                 <LabeledValue
                   label={t('sharedContext.management.processingSavedPrimary')}
-                  value={processingSnapshot?.persisted.primaryContextModel ?? DEFAULT_PRIMARY_CONTEXT_MODEL}
+                  value={processingSnapshot?.persisted.primaryContextModel ?? DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL}
                 />
                 <LabeledValue
                   label={t('sharedContext.management.processingSavedBackupBackend')}

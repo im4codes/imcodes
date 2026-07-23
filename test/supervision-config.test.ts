@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CODEX_MODEL_IDS } from '../src/shared/models/options.js';
+import { CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.js';
 import { PEER_AUDIT_PROMPT_VERSION } from '../shared/peer-audit.js';
 import {
@@ -31,6 +31,14 @@ import {
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('defaults automatic supervision and audit to Codex 5.3 Spark', () => {
+    const config = normalizeSupervisorDefaultConfig(null);
+
+    expect(DEFAULT_SUPERVISION_BACKEND).toBe('codex-sdk');
+    expect(config.backend).toBe('codex-sdk');
+    expect(config.model).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+  });
+
   it('uses 30 seconds as both the default and minimum supervision timeout', () => {
     expect(DEFAULT_SUPERVISION_TIMEOUT_MS).toBe(30_000);
     expect(SUPERVISION_MIN_TIMEOUT_MS).toBe(30_000);

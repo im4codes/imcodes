@@ -8130,7 +8130,8 @@ export interface TransportUpgradeBlockReason {
   status: string;
   sending: boolean;
   pendingCount: number;
-  blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending';
+  backgroundWorkCount?: number;
+  blockReason: 'status_thinking' | 'status_streaming' | 'sending' | 'pending' | 'background_work';
 }
 
 export function getTransportSessionUpgradeBlockReason(
@@ -8142,6 +8143,22 @@ export function getTransportSessionUpgradeBlockReason(
   const status = runtime.getStatus();
   const sending = !!runtime.sending;
   const pendingCount = runtime.pendingCount ?? 0;
+  const backgroundWorkCount = Math.max(0, runtime.backgroundWorkCount ?? 0);
+
+  // Detached provider work is intentionally non-blocking for ordinary user
+  // input, but a daemon restart would still kill its process. Protect it before
+  // applying the foreground phantom-turn escape: a quiet background shell can
+  // legitimately emit no provider activity until its terminal notification.
+  if (backgroundWorkCount > 0) {
+    return {
+      status,
+      sending,
+      pendingCount,
+      backgroundWorkCount,
+      blockReason: 'background_work',
+    };
+  }
+
   let blockReason: TransportUpgradeBlockReason['blockReason'] | null = null;
   if (TRANSPORT_IN_PROGRESS_STATUSES.has(status)) {
     blockReason = status === 'streaming' ? 'status_streaming' : 'status_thinking';

@@ -90,6 +90,10 @@ interface ActiveTaskRunState {
   hasLiveSnapshotUpdate: boolean;
   userText: string;
   phase: TaskRunPhase;
+  // Whether this run still needs a NEW peer-audit dispatch. It becomes false
+  // as soon as either automation or the current session delegates the audit,
+  // and stays false while waiting for the reply.
+  requiresAudit: boolean;
   continueLoops: number;
   continueStreakCount: number;
   lastContinueBucket?: string;
@@ -150,6 +154,14 @@ function isDelegatedAuditReplyText(text: string | undefined): boolean {
   // this ordinary delegation path. Requiring both fields prevents unrelated
   // chat text from opening the automatic-audit verdict gate.
   return /^Task:\s*\S/im.test(text) && /^Result:\s*\S/im.test(text);
+}
+
+function isReplyEnabledPeerAuditDelegationText(text: string | undefined, replyToSession: string): boolean {
+  if (!text) return false;
+  const hasExactReplyRoute = text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
+    && text.includes(buildAgentDelegationReplyInstruction(replyToSession));
+  const asksForAudit = /(?:\b(?:independent(?:ly)?\s+)?(?:peer\s+)?audit\b|独立(?:只读)?(?:审计|审核|复审)|(?:审计|审核|复审)(?:当前|本次|这次|最近))/iu.test(text);
+  return hasExactReplyRoute && asksForAudit;
 }
 
 interface AuditBaseline {
@@ -735,6 +747,7 @@ class SupervisionAutomation {
       hasLiveSnapshotUpdate: false,
       userText: text,
       phase: 'execution',
+      requiresAudit: snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
       continueLoops: 0,
       continueStreakCount: 0,
       evaluating: false,
@@ -803,6 +816,39 @@ class SupervisionAutomation {
     payload: Record<string, unknown>;
   }): void {
     for (const run of this.activeRuns.values()) {
+      const targetsConfiguredAuditor = run.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        && run.snapshot.auditTargetSessionName === event.sessionId;
+      if (
+        targetsConfiguredAuditor
+        && run.phase === 'execution'
+        && event.type === 'user.message'
+        && isReplyEnabledPeerAuditDelegationText(trimString(event.payload.text), run.sessionName)
+      ) {
+        const target = getSession(event.sessionId);
+        if (!target) continue;
+        run.phase = 'auditing';
+        run.requiresAudit = false;
+        run.evaluating = false;
+        run.terminalState = 'complete';
+        run.auditReplyObserved = false;
+        run.auditAttemptId = randomUUID();
+        run.auditStartedAt = Date.now();
+        run.auditTargetSessionInstanceId = target.sessionInstanceId;
+        run.auditTargetDispatchObservedAt = Date.now();
+        run.auditTargetObservedActive = false;
+        run.auditTargetRecoveryAttempts = 0;
+        run.auditTargetRecoveryLimitNotified = false;
+        run.sawAssistantOutput = false;
+        run.lastAssistantText = undefined;
+        this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
+        this.emitAutomationNote(
+          run.sessionName,
+          'Auto: observed the existing reply-enabled peer-audit delegation; waiting for its PASS/REWORK receipt without sending another request.',
+          'supervision-audit-delegated',
+        );
+        this.armAuditDeadline(run);
+      }
+
       if (
         run.phase !== 'auditing'
         || run.auditReplyObserved
@@ -1093,6 +1139,7 @@ class SupervisionAutomation {
     const latest = this.activeRuns.get(run.sessionName);
     if (!latest || latest.generation !== run.generation || latest.phase !== evaluatedPhase) return;
     latest.evaluating = false;
+    latest.requiresAudit = decision.requiresAudit !== false;
 
     switch (decision.decision) {
       case 'complete': {
@@ -1101,10 +1148,21 @@ class SupervisionAutomation {
           this.emitAutomationNote(run.sessionName, 'Auto: peer audit passed and post-audit finalization completed.', 'supervision-post-audit-complete');
           this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
           this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
-        } else if (latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+        } else if (
+          latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+          && latest.requiresAudit
+        ) {
           await this.startAudit(latest);
         } else {
-          this.emitAutomationNote(run.sessionName, 'Auto: task looks complete.', 'supervision-complete');
+          const auditSkipped = latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+            && !latest.requiresAudit;
+          this.emitAutomationNote(
+            run.sessionName,
+            auditSkipped
+              ? 'Auto: task looks complete; the supervisor determined that no new peer audit is needed.'
+              : 'Auto: task looks complete.',
+            auditSkipped ? 'supervision-audit-skipped' : 'supervision-complete',
+          );
           this.emitTerminalStatus(run.sessionName, 'supervision_complete', SUPERVISION_COMPLETE_LABEL);
           this.finishRun(run.sessionName, 'complete', { preserveStatus: true });
         }
@@ -1207,6 +1265,7 @@ class SupervisionAutomation {
     if (!current || current.generation !== run.generation) return;
 
     current.phase = 'auditing';
+    current.requiresAudit = false;
     current.evaluating = false;
     current.auditReplyObserved = false;
     current.auditAttemptId = randomUUID();
@@ -1383,6 +1442,7 @@ class SupervisionAutomation {
     }
     const reworkBrief = buildReworkBrief(current, findings);
     current.phase = 'execution';
+    current.requiresAudit = true;
     current.ignoreIdleUntilPostAuditTurnActivity = options.settledWithoutIdle === true;
     current.evaluating = false;
     current.sawAssistantOutput = false;

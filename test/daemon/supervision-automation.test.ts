@@ -289,6 +289,87 @@ describe('SupervisionAutomation', () => {
     await cleanupProjectDir();
   });
 
+  it('skips peer audit when the supervisor classifies a completed turn as ordinary read-only work', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValueOnce({
+      decision: 'complete',
+      reason: 'read-only deployment status check is complete',
+      confidence: 0.96,
+      requiresAudit: false,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-read-only-check',
+      '检查当前测试环境的部署状态',
+      snapshot,
+    );
+    beginRun('cmd-read-only-check', '检查当前测试环境的部署状态');
+
+    completeTurn('当前环境尚未部署最新提交。');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          automationKind: 'supervision-audit-skipped',
+        }),
+      }),
+    ]));
+  });
+
+  it('adopts an existing reply-enabled audit delegation and sends no second request before its receipt', async () => {
+    const snapshot = await seedSession('supervised_audit');
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-existing-audit',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-existing-audit', 'implement the feature');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: Independently audit the completed implementation and return PASS or REWORK.',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain'),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain', actorDisplayName: 'Brain' },
+    });
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      requiresAudit: false,
+      auditReplyObserved: false,
+    });
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+
+    completeTurn('已将只读审计交给 CC1，等待 PASS/REWORK 回执。');
+    await sleep(25);
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      requiresAudit: false,
+      auditReplyObserved: false,
+    });
+
+    completeDelegatedAudit('PASS', 'Existing delegated audit passed.');
+    await sleep(25);
+
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+  });
+
   it('asks the current session to prepare and delegate the audit, then clears only after the reply-backed PASS', async () => {
     const snapshot = await seedSession('supervised_audit');
 

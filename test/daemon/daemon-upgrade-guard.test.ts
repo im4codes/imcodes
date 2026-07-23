@@ -277,14 +277,43 @@ describe('getTransportSessionUpgradeBlockReason — phantom-turn staleness', () 
   const NOW = 1_000_000_000;
   const STALE_MS = 60_000;
 
-  function mockRuntime(over: { status: string; sending?: boolean; pendingCount?: number; lastActivityAt?: number }) {
+  function mockRuntime(over: {
+    status: string;
+    sending?: boolean;
+    pendingCount?: number;
+    backgroundWorkCount?: number;
+    lastActivityAt?: number;
+  }) {
     vi.spyOn(sessionManager, 'getTransportRuntime').mockReturnValue({
       getStatus: () => over.status,
       sending: over.sending ?? false,
       pendingCount: over.pendingCount ?? 0,
+      backgroundWorkCount: over.backgroundWorkCount ?? 0,
       ...(over.lastActivityAt !== undefined ? { lastActivityAt: over.lastActivityAt } : {}),
     } as any);
   }
+
+  it('blocks an idle transport session while provider-native background work is active', () => {
+    mockRuntime({ status: 'idle', backgroundWorkCount: 1 });
+    expect(getTransportSessionUpgradeBlockReason('deck_background')).toMatchObject({
+      status: 'idle',
+      sending: false,
+      pendingCount: 0,
+      backgroundWorkCount: 1,
+      blockReason: 'background_work',
+    });
+  });
+
+  it('does not classify a quiet background Bash as a phantom foreground turn', () => {
+    mockRuntime({
+      status: 'idle',
+      backgroundWorkCount: 1,
+      lastActivityAt: NOW - STALE_MS - 1,
+    });
+    expect(
+      getTransportSessionUpgradeBlockReason('deck_quiet_background', { now: NOW, staleTurnMs: STALE_MS }),
+    ).toMatchObject({ blockReason: 'background_work', backgroundWorkCount: 1 });
+  });
 
   it('does NOT block a "streaming" turn whose activity is older than the stale threshold', () => {
     mockRuntime({ status: 'streaming', sending: true, lastActivityAt: NOW - STALE_MS - 1 });

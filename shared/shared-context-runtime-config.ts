@@ -1,6 +1,10 @@
 import type { ContextModelConfig, SharedContextRuntimeBackend } from './context-types.js';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from './context-model-defaults.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
+import {
+  CLAUDE_CODE_MODEL_IDS,
+  CODEX_MODEL_IDS,
+  DEFAULT_CODEX_AUTOMATION_MODEL,
+} from '../src/shared/models/options.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_MEMORY_SCORING_WEIGHTS,
@@ -11,13 +15,14 @@ import {
 export { DEFAULT_MEMORY_SCORING_WEIGHTS, normalizeMemoryScoringWeights } from './memory-scoring.js';
 
 export const SHARED_CONTEXT_RUNTIME_BACKENDS = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const satisfies readonly SharedContextRuntimeBackend[];
-export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'claude-code-sdk';
+export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'codex-sdk';
 export const DEFAULT_CONTEXT_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = {
   'claude-code-sdk': DEFAULT_PRIMARY_CONTEXT_MODEL,
-  'codex-sdk': CODEX_MODEL_IDS[0],
+  'codex-sdk': DEFAULT_CODEX_AUTOMATION_MODEL,
   qwen: 'qwen3-coder-plus',
   openclaw: DEFAULT_PRIMARY_CONTEXT_MODEL,
 };
+export const DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL = DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND];
 
 export const SHARED_CONTEXT_RUNTIME_CONFIG_MSG = {
   APPLY: 'shared_context.runtime_config.apply',
@@ -47,7 +52,7 @@ export interface SharedContextRuntimeConfigSnapshot {
 export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
   return {
     primaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
-    primaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
+    primaryContextModel: DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
     primaryContextPreset: undefined,
     backupContextBackend: undefined,
     backupContextModel: undefined,
@@ -186,6 +191,6 @@ export function buildSharedContextRuntimeConfigSnapshot(
     envPrimaryOverrideActive: false,
     envBackupOverrideActive: false,
     defaultPrimaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
-    defaultPrimaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
+    defaultPrimaryContextModel: DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
   };
 }

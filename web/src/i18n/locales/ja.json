@@ -746,6 +746,7 @@
       "modeLabel": "モード",
       "invalidStoredConfig": "保存済みの監督設定が無効です。修正して保存するまで自動化は無効のままです。",
       "quickLabel": "自動",
+      "quickAuditLabel": "監査",
       "quickTitle": "自動モード"
     },
     "approval": {

@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
+import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -123,7 +124,7 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gpt-5.6',
+      requestedModel: DEFAULT_CODEX_SESSION_MODEL,
       thinking: 'high',
     });
   });
@@ -172,7 +173,7 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('replaces the Claude default with GPT-5.6 when switching to codex-sdk', async () => {
+  it('replaces the Claude default with the ChatGPT-compatible Codex default when switching to codex-sdk', async () => {
     const onStart = vi.fn();
     render(
       <StartSubSessionDialog
@@ -188,11 +189,11 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
     const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
-    await waitFor(() => expect(modelInput.value).toBe('gpt-5.6'));
+    await waitFor(() => expect(modelInput.value).toBe(DEFAULT_CODEX_SESSION_MODEL));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gpt-5.6',
+      requestedModel: DEFAULT_CODEX_SESSION_MODEL,
       thinking: 'high',
     });
   });

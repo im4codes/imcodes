@@ -567,6 +567,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const activeToolCount = state.toolCalls.size + Array.from(state.runtimeAgentToolCalls.values()).length;
     const activeSubagentTasks = this.activeClaudeSubagentTasks(state);
     const blockingSubagentCount = activeSubagentTasks.filter((task) => task.backgrounded !== true).length;
+    const backgroundedSubagentCount = activeSubagentTasks.length - blockingSubagentCount;
     const onlyBackgroundedSubagents = activeSubagentTasks.length > 0 && blockingSubagentCount === 0;
     const waitingForTaskNotification = state.completed && !state.pendingComplete && blockingSubagentCount > 0;
     const backgroundActive = Boolean(
@@ -576,16 +577,20 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     );
     const busyReasons: SessionActivityBusyReason[] = [];
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
-    if (blockingSubagentCount > 0 || backgroundActive) busyReasons.push('background_monitor');
+    if (activeSubagentTasks.length > 0 || backgroundActive) busyReasons.push('background_monitor');
     return {
       status: 'current',
-      activeWorkCount: activeToolCount + blockingSubagentCount + (backgroundActive ? 1 : 0),
+      activeWorkCount: activeToolCount + activeSubagentTasks.length + (backgroundActive ? 1 : 0),
       // Subagent-only window: the main turn already settled and the query is held
       // open ONLY for the subagents. They are real work (activeWorkCount above
       // stays truthful, and closeSettledQueryIfNoSubagents still needs it), but they
       // are NOT turn work — reporting them here lets the runtime dispatch a new
-      // message instead of queueing it behind the subagent.
-      backgroundWorkCount: waitingForTaskNotification ? blockingSubagentCount : 0,
+      // message instead of queueing it behind the subagent. Explicitly detached
+      // local_bash tasks are background work from their first snapshot; retaining
+      // them here also lets lifecycle-sensitive consumers (notably auto-upgrade)
+      // protect the process without making ordinary sends wait for it.
+      backgroundWorkCount: backgroundedSubagentCount
+        + (waitingForTaskNotification ? blockingSubagentCount : 0),
       activeToolCount,
       busyReasons,
       activityGeneration: state.runtimeActivityGeneration,
@@ -2044,6 +2049,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     let expired = 0;
     for (const task of state.subagentTasks.values()) {
       if (!task.active || task.terminal) continue;
+      // Detached work is allowed to be quiet for arbitrarily long periods
+      // (for example a multi-hour local_bash render). Expiring it solely from
+      // lifecycle-message silence would both lie to the UI and let auto-upgrade
+      // kill the still-running process. Explicit stop/end-session/restart paths
+      // remain responsible for terminating or reconciling detached tasks.
+      if (task.backgrounded === true) continue;
       if (now - task.lastUpdatedAt < staleMs) continue;
       task.rawStatus = 'stale';
       task.normalizedStatus = SDK_SUBAGENT_STATUS.STALE;

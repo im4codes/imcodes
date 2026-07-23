@@ -2081,6 +2081,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     : quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT
       ? 'shortcut-btn-auto-audit shortcut-btn-auto-active'
       : 'shortcut-btn-auto-off';
+  const quickSupervisionLabel = quickSupervisionMode === SUPERVISION_MODE.SUPERVISED
+    ? t('session.supervision.mode.supervised')
+    : quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      ? t('session.supervision.quickAuditLabel')
+      : t('session.supervision.quickLabel');
 
   const persistTransportConfig = useCallback(async (transportConfig: Record<string, unknown> | null) => {
     if (!serverId || !activeSession) return;
@@ -4464,7 +4469,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 class="shortcut-btn-auto-dot"
                 aria-hidden="true"
               />
-              <span class="shortcut-btn-auto-label">{t('session.supervision.quickLabel')}</span>
+              <span class="shortcut-btn-auto-label">{quickSupervisionLabel}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
             </button>
             {autoOpen && (

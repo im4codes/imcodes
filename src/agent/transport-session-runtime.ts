@@ -200,6 +200,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   activityGeneration: ActivityGeneration;
   completedTurn?: PeerAuditCompletedTurnEvidence;
   blockingWorkCount: number;
+  backgroundWorkCount: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
 }
@@ -918,6 +919,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       activityGeneration: this.currentActivityGeneration(),
       ...(this._lastCompletedTurn ? { completedTurn: { ...this._lastCompletedTurn } } : {}),
       blockingWorkCount: activitySnapshot.blockingWorkCount,
+      backgroundWorkCount: activitySnapshot.backgroundWorkCount,
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
     };
@@ -1508,12 +1510,14 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private getActivitySnapshot(): {
     blockingWorkCount: number;
+    backgroundWorkCount: number;
     activeToolCount: number;
     busyReasons: SessionActivityBusyReason[];
     providerSnapshot: ProviderActiveWorkSnapshot | null;
   } {
     const busyReasons: SessionActivityBusyReason[] = [];
     let blockingWorkCount = 0;
+    let backgroundWorkCount = 0;
     const add = (reason: SessionActivityBusyReason, count = 1) => {
       if (count <= 0) return;
       blockingWorkCount += count;
@@ -1542,6 +1546,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           // blocking/idle behaviour is bit-for-bit unchanged.
           const background = Math.max(0, providerSnapshot.backgroundWorkCount ?? 0);
           const total = providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0;
+          backgroundWorkCount = Math.min(total, background);
           const turnWork = Math.max(0, total - background);
           if (turnWork > 0 || background === 0) {
             add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
@@ -1557,6 +1562,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     return {
       blockingWorkCount,
+      backgroundWorkCount,
       activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
@@ -1980,6 +1986,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   getStatus(): AgentStatus { return this._status; }
+
+  /** Provider-reported work that may outlive a settled turn. It does not gate
+   *  user input, but lifecycle operations such as daemon auto-upgrade must not
+   *  tear it down before the provider sends a terminal update. */
+  get backgroundWorkCount(): number { return this.getActivitySnapshot().backgroundWorkCount; }
 
   /** Epoch ms of the last provider event or turn dispatch. The daemon-upgrade
    *  gate uses `Date.now() - lastActivityAt` to detect a phantom in-progress

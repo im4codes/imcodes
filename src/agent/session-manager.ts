@@ -47,6 +47,7 @@ import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
+import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
@@ -76,8 +77,6 @@ import { serializeContextNamespace } from '../context/context-keys.js';
 import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
-
-const DEFAULT_CODEX_SDK_STARTUP_MODEL = 'gpt-5.6';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -126,7 +125,7 @@ function sanitizeCodexSdkStartupModel(value: string | null | undefined): string 
     || lower.includes('_haiku')
     || lower.includes('claude-')
     || lower.includes('claude_');
-  return isClaudeModel ? DEFAULT_CODEX_SDK_STARTUP_MODEL : trimmed;
+  return isClaudeModel ? DEFAULT_CODEX_SESSION_MODEL : trimmed;
 }
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
