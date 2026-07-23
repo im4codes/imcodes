@@ -4,7 +4,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
+import {
+  CLAUDE_CODE_MODEL_IDS,
+  CODEX_MODEL_IDS,
+  DEFAULT_CODEX_AUTOMATION_MODEL,
+} from '../../../src/shared/models/options.js';
 
 const patchSessionMock = vi.fn();
 const patchSubSessionMock = vi.fn();
@@ -191,7 +195,7 @@ describe('SessionSettingsDialog supervision', () => {
     }));
   });
 
-  it('offers GPT-5.6 in the Auto supervision model picker', async () => {
+  it('defaults Auto and audit settings to Codex 5.3 Spark while keeping GPT-5.6 selectable', async () => {
     render(
       <SessionSettingsDialog
         serverId="srv-1"
@@ -206,10 +210,11 @@ describe('SessionSettingsDialog supervision', () => {
       />,
     );
 
-    changeSelect(screen.getAllByRole('combobox')[3]!, 'supervised');
-    changeSelect(screen.getAllByRole('combobox')[4]!, 'codex-sdk');
-    const modelSelect = screen.getAllByRole('combobox')[5] as HTMLSelectElement;
+    const backendSelect = screen.getAllByRole('combobox')[1] as HTMLSelectElement;
+    const modelSelect = screen.getAllByRole('combobox')[2] as HTMLSelectElement;
     await waitFor(() => {
+      expect(backendSelect.value).toBe('codex-sdk');
+      expect(modelSelect.value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
       expect(Array.from(modelSelect.options, (option) => option.value)).toContain('gpt-5.6');
     });
   });
@@ -299,7 +304,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     await waitFor(() => {
       expect(screen.queryByText('backendRequired')).toBeNull();
-      expect(screen.getByText(`summaryBackendModel:codex_sdk:${CODEX_MODEL_IDS[0]}`)).toBeDefined();
+      expect(screen.getByText(`summaryBackendModel:codex_sdk:${DEFAULT_CODEX_AUTOMATION_MODEL}`)).toBeDefined();
       expect((screen.getByRole('button', { name: /save/i }) as HTMLButtonElement).disabled).toBe(false);
     });
   });

@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import {
   DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
+  DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
+  defaultSharedContextRuntimeConfig,
   getDefaultSharedContextModelForBackend,
   normalizeMemoryScoringWeights,
   normalizeMemoryRecallMinScore,
@@ -9,6 +13,15 @@ import {
 } from '../shared/shared-context-runtime-config.js';
 
 describe('shared-context-runtime-config', () => {
+  it('defaults memory compression to Codex 5.3 Spark', () => {
+    const result = defaultSharedContextRuntimeConfig();
+
+    expect(DEFAULT_PRIMARY_CONTEXT_BACKEND).toBe('codex-sdk');
+    expect(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+    expect(result.primaryContextBackend).toBe('codex-sdk');
+    expect(result.primaryContextModel).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+  });
+
   it('uses backend-specific defaults when model is missing', () => {
     const result = normalizeSharedContextRuntimeConfig({
       primaryContextBackend: 'qwen',

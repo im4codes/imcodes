@@ -3,6 +3,7 @@ import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/opt
 import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_CONTEXT_MODEL_BY_BACKEND,
+  DEFAULT_PRIMARY_CONTEXT_BACKEND,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
   getDefaultSharedContextModelForBackend,
   inferSharedContextRuntimeBackend,
@@ -45,6 +46,7 @@ export const SUPERVISION_USER_DEFAULT_PREF_KEY = 'supervision.user_default' as c
 export const SUPERVISION_SUPPORTED_BACKENDS = SHARED_CONTEXT_RUNTIME_BACKENDS;
 export const SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES = TRANSPORT_SESSION_AGENT_TYPES;
 export const SUPERVISION_UNSUPPORTED_TARGET_SESSION_TYPES = PROCESS_SESSION_AGENT_TYPES;
+export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = DEFAULT_PRIMARY_CONTEXT_BACKEND;
 
 const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
   'audit',
@@ -266,7 +268,7 @@ export function normalizeSupervisorDefaultConfig(
 
   const normalizedBackend = normalizeSharedContextRuntimeBackend(merged.backend)
     ?? inferSharedContextRuntimeBackend(merged.model)
-    ?? SUPERVISION_SUPPORTED_BACKENDS[0];
+    ?? DEFAULT_SUPERVISION_BACKEND;
   // Presets are only meaningful for backends that declare preset support
   // (qwen or claude-code-sdk). Reuse the shared runtime normalizer so supervision
   // preserves the exact same trim/gating semantics as shared context config.
@@ -685,7 +687,6 @@ export function isSupportedSupervisionSessionType(value: string | null | undefin
   return isSupportedSupervisionTargetSessionType(value);
 }
 
-export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = SUPERVISION_SUPPORTED_BACKENDS[0];
 export const DEFAULT_SUPERVISION_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = DEFAULT_CONTEXT_MODEL_BY_BACKEND;
 
 /**
