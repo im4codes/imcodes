@@ -1757,11 +1757,14 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
   useEffect(() => {
-    if (preview || !hasAgentsStatusRows) return undefined;
+    if (!hasAgentsStatusRows) return undefined;
     const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [hasAgentsStatusRows, preview]);
-  const canShowAgentsControl = !preview;
+  }, [hasAgentsStatusRows]);
+  // Preview cards reuse the existing Agents panel when background work exists.
+  // The aggregator only accepts sdkSubagent events, so ordinary Bash tool calls
+  // never make this control or panel appear.
+  const canShowAgentsControl = !preview || hasAgentsStatusRows;
   // Keep the panel mounted for every retained sub-agent row, not only while at
   // least one child is currently running. Otherwise a just-finished child (or
   // a provider diagnostic) makes the entire list disappear even though the
