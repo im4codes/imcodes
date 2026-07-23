@@ -1,6 +1,7 @@
 export const SESSION_COMPACT_COMMAND = '/compact' as const;
 export const SESSION_CLEAR_COMMAND = '/clear' as const;
 export const SESSION_STOP_COMMAND = '/stop' as const;
+export const SESSION_MODEL_COMMAND = '/model' as const;
 export const SESSION_CONTROL_METADATA_COMMAND_FIELD = 'controlCommand' as const;
 export const SESSION_CONTROL_TIMELINE_STATE_COMPACTING = 'compacting' as const;
 export const SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT = 'user_compact' as const;
@@ -92,6 +93,14 @@ export function isSessionCompactCommandText(text: string): boolean {
 
 export function isSessionClearCommandText(text: string): boolean {
   return isSessionControlCommandText(text, 'clear');
+}
+
+/** Match a complete model-switch command while leaving ordinary prose untouched. */
+export function isSessionModelSwitchCommandText(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized.startsWith(SESSION_MODEL_COMMAND)) return false;
+  const argumentsText = normalized.slice(SESSION_MODEL_COMMAND.length);
+  return /^\s+\S+(?:\s+.*)?$/.test(argumentsText);
 }
 
 export function isDaemonHandledSessionControlSend(text: string): boolean {

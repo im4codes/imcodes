@@ -13,6 +13,7 @@ import { scheduleMarkdownMemoryIngest } from './md-ingest-worker.js';
 import { subscribeRuntimeMemoryCacheInvalidation } from './runtime-memory-cache-bus.js';
 import { serializeContextTarget } from './context-keys.js';
 import { incrementCounter } from '../util/metrics.js';
+import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 
 const BOOTSTRAP_CACHE_MS = 30_000;
 const INGEST_RETRY_BUFFER_MAX_EVENTS = 256;
@@ -649,13 +650,16 @@ function toSessionTarget(sessionName: string, bootstrap: TransportContextBootstr
 
 function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventType' | 'content' | 'metadata'> | null {
   switch (event.type) {
-    case 'user.message':
+    case 'user.message': {
       if (event.payload.memoryExcluded === true) return null;
+      const text = stringifyContent(event.payload.text);
+      if (text && isSessionModelSwitchCommandText(text)) return null;
       return {
         eventType: 'user.turn',
-        content: stringifyContent(event.payload.text),
+        content: text,
         metadata: { timelineType: event.type },
       };
+    }
     case 'assistant.text': {
       const text = stringifyContent(event.payload.text);
       if (event.payload.streaming === true || event.payload.memoryExcluded === true) return null;

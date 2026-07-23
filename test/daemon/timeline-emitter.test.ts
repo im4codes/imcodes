@@ -95,6 +95,20 @@ describe('TimelineEmitter — seq counter', () => {
     expect(events[0]?.payload.text).toBe('retry');
   });
 
+  it('marks model-switch user messages as excluded from memory while keeping them visible', () => {
+    const event = emitter.emit('session-a', 'user.message', {
+      text: '/model anthropic/claude-sonnet-4-5',
+      commandId: 'cmd-model',
+    });
+
+    expect(event?.payload).toMatchObject({
+      text: '/model anthropic/claude-sonnet-4-5',
+      commandId: 'cmd-model',
+      memoryExcluded: true,
+    });
+    expect(emitter.replay('session-a', 0).events).toHaveLength(1);
+  });
+
 
   it('marks pure API failure assistant text as non-memory answer text at emit time', () => {
     const event = emitter.emit('session-a', 'assistant.text', {

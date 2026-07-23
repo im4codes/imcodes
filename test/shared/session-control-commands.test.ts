@@ -4,6 +4,7 @@ import {
   getSessionControlTimelineFeedback,
   getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
+  isSessionModelSwitchCommandText,
   isSessionControlCommandText,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
@@ -89,5 +90,14 @@ describe('session control command abstraction', () => {
     expect(isSessionControlCommandText('/compact now', 'compact')).toBe(false);
     expect(classifySessionControlCommand('/clear please')).toBeNull();
     expect(shouldResetProcessPreferenceContextForSessionControl('/model gpt-5.4')).toBe(false);
+  });
+
+  it('recognizes complete model-switch commands without matching ordinary prose', () => {
+    expect(isSessionModelSwitchCommandText('/model gpt-5.4')).toBe(true);
+    expect(isSessionModelSwitchCommandText('  /model anthropic/claude-sonnet-4-5  ')).toBe(true);
+    expect(isSessionModelSwitchCommandText('/model\tgpt-5.4')).toBe(true);
+    expect(isSessionModelSwitchCommandText('/model')).toBe(false);
+    expect(isSessionModelSwitchCommandText('/modelfoo')).toBe(false);
+    expect(isSessionModelSwitchCommandText('Please run /model gpt-5.4')).toBe(false);
   });
 });
