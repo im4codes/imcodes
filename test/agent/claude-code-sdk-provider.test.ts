@@ -1764,6 +1764,62 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('does not expire a quiet detached Claude task before its real terminal update', async () => {
+    const previousStaleMs = process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+    process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = '1000';
+    try {
+      sdkMock.setNextMessages([
+        { type: 'system', subtype: 'init', session_id: 'session-route-detached-long', model: 'claude-sonnet-4-6' },
+        {
+          type: 'system',
+          subtype: 'task_started',
+          session_id: 'session-route-detached-long',
+          uuid: 'uuid-task-detached-long-start',
+          task_id: 'task-detached-long-1',
+          tool_use_id: 'tool-use-detached-long',
+          description: 'Render a long video',
+          task_type: 'local_bash',
+        },
+        { type: 'result', session_id: 'session-route-detached-long', subtype: 'success', is_error: false, result: 'Foreground done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ]);
+
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-detached-long',
+        sessionName: 'deck_project_claude_detached_long',
+        cwd: '/tmp/project',
+        resumeId: 'session-route-detached-long',
+      });
+      const tools: ToolCallEvent[] = [];
+      provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+      await provider.send('route-detached-long', 'hello');
+      await flush();
+
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 1_001);
+      expect(provider.getActiveWorkSnapshot('route-detached-long')).toMatchObject({
+        activeWorkCount: 1,
+        backgroundWorkCount: 1,
+        busyReasons: ['background_monitor'],
+      });
+      expect(sdkSubagentTools(tools).at(-1)?.detail).toMatchObject({
+        meta: {
+          taskId: 'task-detached-long-1',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          backgrounded: true,
+          active: true,
+          terminal: false,
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+      if (previousStaleMs === undefined) delete process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS;
+      else process.env.IMCODES_CLAUDE_SUBAGENT_STALE_MS = previousStaleMs;
+    }
+  });
+
   it('stops active Claude tasks through SDK stopTask before local cancellation state', async () => {
     vi.useFakeTimers();
     sdkMock.setWaitForClose(true);

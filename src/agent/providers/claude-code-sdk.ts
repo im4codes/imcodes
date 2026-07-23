@@ -2049,6 +2049,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     let expired = 0;
     for (const task of state.subagentTasks.values()) {
       if (!task.active || task.terminal) continue;
+      // Detached work is allowed to be quiet for arbitrarily long periods
+      // (for example a multi-hour local_bash render). Expiring it solely from
+      // lifecycle-message silence would both lie to the UI and let auto-upgrade
+      // kill the still-running process. Explicit stop/end-session/restart paths
+      // remain responsible for terminating or reconciling detached tasks.
+      if (task.backgrounded === true) continue;
       if (now - task.lastUpdatedAt < staleMs) continue;
       task.rawStatus = 'stale';
       task.normalizedStatus = SDK_SUBAGENT_STATUS.STALE;
