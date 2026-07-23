@@ -1710,7 +1710,7 @@ describe('ClaudeCodeSdkProvider', () => {
     }
   });
 
-  it('excludes backgrounded Claude tasks from provider active-work snapshots after the foreground turn completes', async () => {
+  it('reports detached Claude tasks as non-blocking background work after the foreground turn completes', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-route-subagent-backgrounded', model: 'claude-sonnet-4-6' },
       {
@@ -1748,9 +1748,10 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     expect(provider.getActiveWorkSnapshot('route-subagent-backgrounded')).toMatchObject({
-      activeWorkCount: 0,
+      activeWorkCount: 1,
+      backgroundWorkCount: 1,
       activeToolCount: 0,
-      busyReasons: [],
+      busyReasons: ['background_monitor'],
     });
     expect(sdkSubagentTools(tools).at(-1)?.detail).toMatchObject({
       meta: {

@@ -63,6 +63,9 @@ describe('transport runtime — background work does not gate dispatch', () => {
     const snapshot = (rt as any).getActivitySnapshot();
 
     expect(snapshot.blockingWorkCount).toBe(0); // hasActiveTurnWork() === false → send dispatches
+    expect(snapshot.backgroundWorkCount).toBe(1);
+    expect(rt.backgroundWorkCount).toBe(1);
+    expect(rt.getDiagnosticSnapshot().backgroundWorkCount).toBe(1);
     // The subagent is still surfaced so the UI can show it running.
     expect(snapshot.busyReasons).toContain('background_monitor');
   });
