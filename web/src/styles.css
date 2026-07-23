@@ -3354,6 +3354,12 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
 
 .subcard-preview { flex: 1; overflow-y: auto; overflow-x: hidden; }
+/* A preview card is much narrower than a full chat window. Reuse the existing
+   Agents panel, but stack it below the chat so its 240-360px desktop sidebar
+   width cannot collapse the card's chat preview. The panel body remains
+   scrollable and is capped to preserve most of the card for conversation. */
+.subcard-preview .chat-view-wrap.chat-split { height: 100%; flex-direction: column !important; }
+.subcard-preview .chat-sdk-agents-panel { width: 100% !important; min-width: 0; min-height: 0; max-height: min(42%, 120px); flex-shrink: 0; border-left: 0; border-top: 1px solid #334155; }
 .subcard-preview-terminal { display: flex; min-height: 0; }
 .subcard-preview-terminal .terminal-wrap { width: 100%; height: 100%; min-height: 0; }
 .subcard-scroll-bottom { position: absolute; bottom: 6px; right: 10px; width: 26px; height: 26px; border-radius: 50%; background: #334155; border: 1px solid #475569; color: #e2e8f0; font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; z-index: 5; opacity: 0.8; transition: opacity 0.15s; line-height: 1; padding: 0; }

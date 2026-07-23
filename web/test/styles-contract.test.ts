@@ -41,6 +41,19 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('stacks the existing Agents panel in narrow sub-session previews', () => {
+    const previewSplitRule = css.match(/\.subcard-preview \.chat-view-wrap\.chat-split\s*\{[^}]*\}/);
+    expect(previewSplitRule).not.toBeNull();
+    expect(previewSplitRule![0]).toMatch(/flex-direction:\s*column\s*!important/);
+
+    const previewAgentsRule = css.match(/\.subcard-preview \.chat-sdk-agents-panel\s*\{[^}]*\}/);
+    expect(previewAgentsRule).not.toBeNull();
+    expect(previewAgentsRule![0]).toMatch(/width:\s*100%\s*!important/);
+    expect(previewAgentsRule![0]).toMatch(/min-width:\s*0/);
+    expect(previewAgentsRule![0]).toMatch(/max-height:\s*min\(42%,\s*120px\)/);
+    expect(previewAgentsRule![0]).toMatch(/border-top:\s*1px solid #334155/);
+  });
+
   it('sub-session accents stay on card/button top borders and window full borders', () => {
     const cardRule = css.match(/\.subcard\s*\{[^}]*\}/);
     expect(cardRule).not.toBeNull();
