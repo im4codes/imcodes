@@ -30,6 +30,13 @@ import logger from '../../util/logger.js';
 
 const LOOPBACK_HOST = '127.0.0.1';
 const MODEL_CACHE_TTL_MS = 30_000;
+// OpenCode loads its models.dev catalog (including each model's `limit.context`)
+// asynchronously after an `opencode serve` process starts. A session created in
+// that window primes the model→context-window map from a catalog that still
+// lacks limits, so usage frames ship without an authoritative window and the UI
+// falls back to a 1M guess. When a live usage frame can't resolve its model's
+// window we force one throttled catalog refetch so the next frame self-heals.
+const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 
 type SdkResult<T> = Promise<{ data: T; response?: { status?: number } }>;
@@ -181,6 +188,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
   private providerToRoute = new Map<string, string>();
   private modelCache: { at: number; value: ProviderModelList } | null = null;
   private modelContextWindows = new Map<string, number>();
+  private lastContextWindowRefreshAt = 0;
+  private contextWindowRefreshInFlight = false;
   private approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS;
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -235,6 +244,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
     this.client = null;
     this.modelCache = null;
     this.modelContextWindows.clear();
+    this.lastContextWindowRefreshAt = 0;
+    this.contextWindowRefreshInFlight = false;
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
@@ -391,12 +402,35 @@ export class OpenCodeSdkProvider implements TransportProvider {
         ...(firstProvider && defaultModelId ? { defaultModel: `${firstProvider.id}/${defaultModelId}` } : {}),
         ...(connected.size === 0 ? { error: 'OpenCode has no connected model provider' } : {}),
       };
-      this.modelContextWindows = nextContextWindows;
+      // Merge rather than replace so an authoritative window, once learned,
+      // survives a later cold/partial/failed refresh or a transient provider
+      // disconnect that drops the model from `connected`. reset() clears the
+      // map when the provider fully disconnects.
+      for (const [id, windowTokens] of nextContextWindows) this.modelContextWindows.set(id, windowTokens);
       this.modelCache = { at: Date.now(), value };
       return value;
     } catch (error) {
       return { models: [], isAuthenticated: false, error: errorMessage(error) };
     }
+  }
+
+  /**
+   * OpenCode's per-model `limit.context` can be absent from the first catalog
+   * snapshot after a server starts (models.dev loads asynchronously). When a
+   * live usage frame cannot resolve its model's window, force one throttled
+   * catalog refetch so the next frame carries the authoritative limit instead
+   * of the UI's 1M fallback. No-op once the window is known.
+   */
+  private scheduleContextWindowRefresh(model: string): void {
+    if (this.modelContextWindows.has(model)) return;
+    if (this.contextWindowRefreshInFlight) return;
+    const now = Date.now();
+    if (now - this.lastContextWindowRefreshAt < CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS) return;
+    this.lastContextWindowRefreshAt = now;
+    this.contextWindowRefreshInFlight = true;
+    void this.listModels(true)
+      .catch(() => {})
+      .finally(() => { this.contextWindowRefreshInFlight = false; });
   }
 
   setSessionAgentId(sessionId: string, agentId: string): void {
@@ -630,9 +664,20 @@ export class OpenCodeSdkProvider implements TransportProvider {
         return;
       case 'session.status': {
         const status = event.properties?.status;
+        if (status?.type === 'idle') {
+          this.completeOnce(state, 'session.status');
+          return;
+        }
+        // A delayed/stale `busy` or `retry` frame can arrive AFTER the turn has
+        // already completed — e.g. when the running tool restarts the network
+        // (an OpenClash/VPN restart) and OpenCode flushes its event stream out
+        // of order. Re-emitting a progress label here strands the footer on
+        // "OpenCode is working…" even though the session is idle. Only surface
+        // progress while a turn is actually live; send() re-arms state.busy for
+        // the next turn, and completeOnce/failOnce clear it.
+        if (!state.busy) return;
         if (status?.type === 'busy') this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
         else if (status?.type === 'retry') this.emitStatus(state.routeId, { status: 'retrying', label: safeString(status.message) ?? 'OpenCode is retrying…' });
-        else if (status?.type === 'idle') this.completeOnce(state, 'session.status');
         return;
       }
       case 'session.idle':
@@ -797,6 +842,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
   private emitUsage(state: OpenCodeSessionState, messageId: unknown, tokens: any, cost: unknown, finalized: boolean): void {
     if (!tokens || typeof tokens !== 'object') return;
     const modelContextWindow = state.model ? this.modelContextWindows.get(state.model) : undefined;
+    if (state.model && modelContextWindow === undefined) this.scheduleContextWindowRefresh(state.model);
     const inputTokens = positiveNumber(tokens.input) ?? 0;
     const outputTokens = positiveNumber(tokens.output) ?? 0;
     const cacheReadTokens = positiveNumber(tokens.cache?.read) ?? 0;

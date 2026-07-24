@@ -264,6 +264,113 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('self-heals the model context window when the first catalog snapshot lacked limits', async () => {
+    const harness = createHarness();
+    let serveWarm = false;
+    const catalog = (withLimit: boolean) => ({
+      connected: ['anthropic'],
+      default: { anthropic: 'claude-sonnet-4-5' },
+      all: [{
+        id: 'anthropic',
+        name: 'Anthropic',
+        models: {
+          'claude-sonnet-4-5': {
+            id: 'claude-sonnet-4-5',
+            name: 'Claude Sonnet 4.5',
+            reasoning: true,
+            // Cold models.dev snapshot: no `limit` yet. Warms up on refetch.
+            ...(withLimit ? { limit: { context: 200_000, output: 128_000 } } : {}),
+          },
+        },
+      }],
+    });
+    harness.client.provider.list = vi.fn(() => result(catalog(serveWarm)));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      harness.startOptions.push(options as unknown as Record<string, unknown>);
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const usage: any[] = [];
+    provider.onUsage((sessionId, update) => usage.push({ sessionId, ...update }));
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'route-heal',
+      sessionName: 'deck_proj_brain',
+      cwd: '/tmp/project',
+      agentId: 'anthropic/claude-sonnet-4-5',
+    });
+
+    // The cold prime cached a catalog without limits; catalog now warms up.
+    const primeListCalls = harness.client.provider.list.mock.calls.length;
+    serveWarm = true;
+
+    // First usage frame can't resolve the window → ships without one (the relay
+    // would then fall back to a 1M guess) and must trigger a catalog refetch.
+    harness.queue.push({
+      type: 'message.updated',
+      properties: { info: { id: 'msg-1', sessionID: 'oc-session-1', role: 'assistant', providerID: 'anthropic', modelID: 'claude-sonnet-4-5', tokens: { input: 10, output: 5, cache: { read: 3, write: 2 } } } },
+    });
+    await vi.waitFor(() => expect(usage).toHaveLength(1));
+    expect(usage[0].usage).not.toHaveProperty('model_context_window');
+
+    // The miss forces exactly one refetch, which now carries the real limit.
+    await vi.waitFor(() => expect(harness.client.provider.list.mock.calls.length).toBeGreaterThan(primeListCalls));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Next usage frame self-heals to the authoritative 200k window, not 1M.
+    harness.queue.push({
+      type: 'message.updated',
+      properties: { info: { id: 'msg-2', sessionID: 'oc-session-1', role: 'assistant', providerID: 'anthropic', modelID: 'claude-sonnet-4-5', tokens: { input: 12, output: 6, cache: { read: 4, write: 2 } } } },
+    });
+    await vi.waitFor(() => expect(usage.at(-1)?.usage?.model_context_window).toBe(200_000));
+
+    await provider.disconnect();
+  });
+
+  it('ignores a stale busy status frame that arrives after the turn completed', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      harness.startOptions.push(options as unknown as Record<string, unknown>);
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    const completions: any[] = [];
+    provider.onStatus((_sid, s) => statuses.push(s));
+    provider.onComplete((_sid, m) => completions.push(m));
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-status',
+      cwd: '/tmp/project',
+      agentId: 'anthropic/claude-sonnet-4-5',
+    });
+
+    await provider.send(routeId, 'go');
+    expect(statuses.at(-1)).toMatchObject({ status: 'working' });
+
+    // A busy frame is honored while the turn is live (proves the event loop routes it).
+    harness.queue.push({ type: 'session.status', properties: { sessionID: 'oc-session-1', status: { type: 'busy' } } });
+    await vi.waitFor(() => expect(statuses.filter((s) => s.status === 'working').length).toBeGreaterThanOrEqual(2));
+
+    // Turn completes → status cleared + completion emitted.
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(statuses.at(-1)).toMatchObject({ status: null, label: null });
+    const countAfterComplete = statuses.length;
+
+    // A STALE busy frame (a delayed SSE flush after the tool restarted the
+    // network) must NOT re-show "working" — regression: the footer got stranded
+    // on "OpenCode is working…" while the session was already idle.
+    harness.queue.push({ type: 'session.status', properties: { sessionID: 'oc-session-1', status: { type: 'busy' } } });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(statuses.length).toBe(countAfterComplete);
+    expect(statuses.at(-1)).toMatchObject({ status: null });
+
+    await provider.disconnect();
+  });
+
   it('never echoes normalized user context as assistant text and buffers parts until their role is known', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
