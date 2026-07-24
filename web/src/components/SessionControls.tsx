@@ -2112,7 +2112,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     };
 
     if (nextMode === SUPERVISION_MODE.OFF) {
-      const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, { mode: SUPERVISION_MODE.OFF });
+      const nextTransportConfig = buildTransportConfigWithSupervision(
+        currentTransportConfig,
+        supervisionSnapshot
+          ? { ...supervisionSnapshot, mode: SUPERVISION_MODE.OFF }
+          : { mode: SUPERVISION_MODE.OFF },
+      );
       try {
         await persistTransportConfig(nextTransportConfig);
         setAutoOpen(false);
