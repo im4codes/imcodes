@@ -5328,6 +5328,65 @@ afterEach(() => {
     expect(onSettings).not.toHaveBeenCalled();
   });
 
+  it('keeps the current session auditor when quick mode is turned off and reuses it on audit', async () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv1"
+        activeSession={makeTransportSession({
+          name: 'deck_proj_brain',
+          role: 'brain',
+          state: 'idle',
+          transportConfig: {
+            supervision: {
+              mode: 'supervised_audit',
+              backend: 'codex-sdk',
+              model: 'gpt-5.6-sol',
+              timeoutMs: 12000,
+              promptVersion: 'supervision_decision_v1',
+              auditTargetSessionName: 'deck_sub_peer',
+              peerAuditPromptVersion: 'supervision_peer_audit_v1',
+            },
+          },
+        })}
+        onSettings={onSettings}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /off$/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith(
+      'srv1',
+      'deck_proj_brain',
+      expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'off',
+            auditTargetSessionName: 'deck_sub_peer',
+          }),
+        }),
+      }),
+    ));
+
+    fireEvent.click(screen.getByRole('button', { name: /^Auto$/ }));
+    fireEvent.click(screen.getByRole('button', { name: /supervised_audit$/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith(
+      'srv1',
+      'deck_proj_brain',
+      expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'supervised_audit',
+            auditTargetSessionName: 'deck_sub_peer',
+          }),
+        }),
+      }),
+    ));
+    expect(onSettings).not.toHaveBeenCalled();
+  });
+
   it('keeps legacy fingerprint metadata optional when compact audit is enabled', async () => {
     const onSettings = vi.fn();
     render(
