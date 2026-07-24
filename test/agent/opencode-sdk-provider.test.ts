@@ -264,6 +264,125 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('never echoes normalized user context as assistant text and buffers parts until their role is known', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const deltas: any[] = [];
+    const completions: any[] = [];
+    provider.onDelta((sessionId, delta) => deltas.push({ sessionId, ...delta }));
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-role-filter',
+      cwd: '/tmp/project',
+      agentId: 'anthropic/claude-sonnet-4-5',
+    });
+    const assembledMessage = [
+      '[Related past work]',
+      '<related-past-work advisory="true">',
+      '- Keep this as reference only',
+      '</related-past-work>',
+      '',
+      'run deploy-subs.sh',
+    ].join('\n');
+    await provider.send(routeId, assembledMessage);
+
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-user',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-user',
+          type: 'text',
+          text: assembledMessage,
+        },
+      },
+    });
+    await Promise.resolve();
+    expect(deltas).toHaveLength(0);
+
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-user',
+          sessionID: 'oc-session-1',
+          role: 'user',
+          agent: 'build',
+          model: { providerID: 'anthropic', modelID: 'claude-sonnet-4-5' },
+          time: { created: 1 },
+        },
+      },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-user',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-user',
+          type: 'text',
+          text: `${assembledMessage}\nignored update`,
+        },
+      },
+    });
+    await Promise.resolve();
+    expect(deltas).toHaveLength(0);
+
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-assistant',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-assistant',
+          type: 'text',
+          text: 'Deployment complete',
+        },
+      },
+    });
+    await Promise.resolve();
+    expect(deltas).toHaveLength(0);
+
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-assistant',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'anthropic',
+          modelID: 'claude-sonnet-4-5',
+          cost: 0.01,
+          tokens: { input: 10, output: 2, cache: { read: 0, write: 0 } },
+          time: { created: 2 },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(deltas).toHaveLength(1));
+    expect(deltas[0]).toMatchObject({
+      sessionId: 'route-role-filter',
+      messageId: 'msg-assistant',
+      delta: 'Deployment complete',
+      role: 'assistant',
+    });
+    expect(deltas[0].delta).not.toContain('[Related past work]');
+
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(completions[0]).toMatchObject({
+      id: 'msg-assistant',
+      content: 'Deployment complete',
+      status: 'complete',
+    });
+    await provider.disconnect();
+  });
+
   it('ignores the initial zero-token placeholder and completes with authoritative usage', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

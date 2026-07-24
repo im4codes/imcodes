@@ -84,6 +84,8 @@ interface OpenCodeSessionState {
   completionEmitted: boolean;
   terminalErrorEmitted: boolean;
   currentMessageId: string | null;
+  messageRoles: Map<string, 'user' | 'assistant'>;
+  pendingParts: Map<string, Array<{ part: Record<string, any>; delta?: string }>>;
   textParts: Map<string, string>;
   toolSignatures: Map<string, string>;
   lastUsageSignature: string | null;
@@ -303,6 +305,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
       completionEmitted: false,
       terminalErrorEmitted: false,
       currentMessageId: null,
+      messageRoles: new Map(),
+      pendingParts: new Map(),
       textParts: new Map(),
       toolSignatures: new Map(),
       lastUsageSignature: null,
@@ -420,6 +424,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.completionEmitted = false;
     state.terminalErrorEmitted = false;
     state.currentMessageId = null;
+    state.messageRoles.clear();
+    state.pendingParts.clear();
     state.textParts.clear();
     state.toolSignatures.clear();
     state.lastUsageSignature = null;
@@ -650,8 +656,22 @@ export class OpenCodeSdkProvider implements TransportProvider {
   }
 
   private processMessage(state: OpenCodeSessionState, info: Record<string, any> | undefined): boolean {
-    if (!info || info.role !== 'assistant') return false;
-    state.currentMessageId = safeString(info.id) ?? state.currentMessageId;
+    if (!info) return false;
+    const messageId = safeString(info.id);
+    const role = info.role === 'user'
+      ? 'user'
+      : info.role === 'assistant'
+        ? 'assistant'
+        : undefined;
+    if (!messageId || !role) return false;
+    state.messageRoles.set(messageId, role);
+    const pendingParts = state.pendingParts.get(messageId);
+    state.pendingParts.delete(messageId);
+    if (role !== 'assistant') return false;
+    state.currentMessageId = messageId;
+    for (const pending of pendingParts ?? []) {
+      this.processAssistantPart(state, pending.part, pending.delta);
+    }
     if (safeString(info.modelID) && safeString(info.providerID)) {
       const model = `${info.providerID}/${info.modelID}`;
       if (state.model !== model) {
@@ -668,6 +688,20 @@ export class OpenCodeSdkProvider implements TransportProvider {
 
   private processPart(state: OpenCodeSessionState, part: Record<string, any> | undefined, delta?: string): void {
     if (!part || safeString(part.sessionID) !== state.providerSessionId) return;
+    const messageId = safeString(part.messageID);
+    if (!messageId) return;
+    const role = state.messageRoles.get(messageId);
+    if (role === 'user') return;
+    if (role !== 'assistant') {
+      const pendingParts = state.pendingParts.get(messageId) ?? [];
+      pendingParts.push({ part, ...(delta === undefined ? {} : { delta }) });
+      state.pendingParts.set(messageId, pendingParts);
+      return;
+    }
+    this.processAssistantPart(state, part, delta);
+  }
+
+  private processAssistantPart(state: OpenCodeSessionState, part: Record<string, any>, delta?: string): void {
     state.currentMessageId = safeString(part.messageID) ?? state.currentMessageId;
     if (part.type === 'text') {
       const partId = safeString(part.id) ?? randomUUID();
