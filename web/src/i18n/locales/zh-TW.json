@@ -771,7 +771,8 @@
     "sdk_recommendation": {
       "title": "推薦使用 SDK 模式。",
       "body": "SDK 工作階段支援即時串流輸出，比 CLI/tmux 工作階段更穩定。",
-      "process_hint": "CLI（行程）模式已不再維護 —— 請在上方選擇一個 SDK 選項。"
+      "warn_title": "CLI（行程）模式：維護已降級。",
+      "warn_body": "此後端已降為低優先級，修復與更新會減少。建議在上方改用 SDK 選項，獲得即時串流輸出與更穩定的體驗。"
     }
   },
   "server": {

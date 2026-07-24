@@ -771,7 +771,8 @@
     "sdk_recommendation": {
       "title": "推荐使用 SDK 模式。",
       "body": "SDK 会话支持实时流式输出，比 CLI/tmux 会话更稳定。",
-      "process_hint": "CLI（进程）模式已不再维护 —— 请在上方选择一个 SDK 选项。"
+      "warn_title": "CLI（进程）模式：维护已降级。",
+      "warn_body": "该后端已降为低优先级，修复与更新会减少。建议在上方改用 SDK 选项，获得实时流式输出与更稳定的体验。"
     }
   },
   "server": {

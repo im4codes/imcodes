@@ -771,7 +771,8 @@
     "sdk_recommendation": {
       "title": "Recomendado: modo SDK.",
       "body": "Las sesiones SDK transmiten la salida en tiempo real y son más estables que las sesiones CLI/tmux.",
-      "process_hint": "El modo CLI (proceso) ya no recibe mantenimiento; elige una opción SDK arriba."
+      "warn_title": "Modo CLI (proceso): mantenimiento reducido.",
+      "warn_body": "Este backend ahora tiene menor prioridad y recibe menos correcciones y actualizaciones. Elige una opción SDK arriba para streaming en tiempo real y mayor estabilidad."
     }
   },
   "server": {
