@@ -135,8 +135,11 @@ function isRecoverableTmuxServerError(error: unknown): boolean {
   );
 }
 
-function isDuplicateInitSessionError(error: unknown): boolean {
-  return getTmuxErrorText(error).includes('duplicate session: imcodes_init');
+/** Definitive "there is no tmux server yet" — safe to lazy-start on demand. */
+function isNoTmuxServerRunning(error: unknown): boolean {
+  const stderr = getTmuxErrorText(error);
+  return stderr.includes('no server running')
+    || stderr.includes('No such file or directory');
 }
 
 async function tryEnsureTmuxServerOnce(): Promise<void> {
@@ -146,23 +149,23 @@ async function tryEnsureTmuxServerOnce(): Promise<void> {
     return;
   } catch (e: any) {
     const stderr = getTmuxErrorText(e);
-    if (isRecoverableTmuxServerError(e)) {
-      // tmux server is dead — start it
-      try {
-        await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
-      } catch (initError) {
-        if (!isDuplicateInitSessionError(initError)) throw initError;
-      }
-      // Kill the temp session, server stays alive
-      await execFile('tmux', ['kill-session', '-t', 'imcodes_init']).catch(() => {});
+    if (stderr.includes('no sessions') || isNoTmuxServerRunning(e)) {
+      // Either the server is up with no sessions, or there is no server yet.
+      //
+      // GitHub #38: we deliberately do NOT spin up a throwaway `imcodes_init`
+      // session to force a server into existence. Starting one session and
+      // immediately killing it tears the server back down (tmux exits when its
+      // last session dies), so the very next real `tmux new-session` races the
+      // teardown and fails with "server exited unexpectedly". Instead we leave
+      // the server absent: the first real `new-session` starts it atomically
+      // with nothing to race, and every read/query path already treats an
+      // absent server as "no sessions".
       tmuxServerChecked = true;
       return;
     }
-    if (stderr.includes('no sessions')) {
-      // Server running but no sessions — fine
-      tmuxServerChecked = true;
-      return;
-    }
+    // Transient error (socket exists but the server is refusing or mid-restart,
+    // e.g. an early-boot systemd ordering race). Let ensureTmuxServer back off
+    // and retry rather than assuming the server is permanently gone.
     throw e;
   }
 }
@@ -198,7 +201,7 @@ async function ensureTmuxServer(): Promise<void> {
         lastErr = e;
         // Only retry for recoverable/transient errors. Non-recoverable
         // (e.g. tmux binary missing) fail fast.
-        if (!isRecoverableTmuxServerError(e) && !isDuplicateInitSessionError(e)) {
+        if (!isRecoverableTmuxServerError(e)) {
           throw e;
         }
       }
