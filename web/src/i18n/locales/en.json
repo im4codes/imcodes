@@ -767,6 +767,11 @@
     "executionGroup": {
       "title": "Execution workers (run {{run}})",
       "unknownRun": "pending"
+    },
+    "sdk_recommendation": {
+      "title": "Recommended: SDK mode.",
+      "body": "SDK sessions stream output in real time and are more stable than CLI/tmux sessions.",
+      "process_hint": "CLI (process) mode is no longer maintained — pick an SDK option above."
     }
   },
   "server": {
@@ -2723,7 +2728,12 @@
     "unavailable": "unavailable",
     "sendFailed": "The delegation was not accepted. Check the connection and try again.",
     "modeLabel": "Delegation preset",
-    "mode": { "audit": "Audit", "discussion": "Discuss", "brainstorm": "Brainstorm", "custom": "Custom" },
+    "mode": {
+      "audit": "Audit",
+      "discussion": "Discuss",
+      "brainstorm": "Brainstorm",
+      "custom": "Custom"
+    },
     "customPlaceholder": "What should the selected agent do?",
     "dispatch": "Delegate",
     "consentTitle": "Confirm cross-provider data export",

@@ -767,6 +767,11 @@
     "executionGroup": {
       "title": "실행 워커 (실행 {{run}})",
       "unknownRun": "대기 중"
+    },
+    "sdk_recommendation": {
+      "title": "SDK 모드를 권장합니다.",
+      "body": "SDK 세션은 출력을 실시간으로 스트리밍하며 CLI/tmux 세션보다 안정적입니다.",
+      "process_hint": "CLI(프로세스) 모드는 더 이상 유지 관리되지 않습니다. 위에서 SDK 옵션을 선택하세요."
     }
   },
   "server": {
@@ -2722,7 +2727,12 @@
     "unavailable": "사용할 수 없음",
     "sendFailed": "위임이 접수되지 않았습니다. 연결을 확인하고 다시 시도하세요.",
     "modeLabel": "위임 프리셋",
-    "mode": { "audit": "감사", "discussion": "토론", "brainstorm": "브레인스토밍", "custom": "직접 입력" },
+    "mode": {
+      "audit": "감사",
+      "discussion": "토론",
+      "brainstorm": "브레인스토밍",
+      "custom": "직접 입력"
+    },
     "customPlaceholder": "선택한 에이전트에게 무엇을 요청할까요?",
     "dispatch": "위임",
     "consentTitle": "벤더 간 데이터 전송 확인",

@@ -767,6 +767,11 @@
     "executionGroup": {
       "title": "Trabajadores de ejecución (ejecución {{run}})",
       "unknownRun": "pendiente"
+    },
+    "sdk_recommendation": {
+      "title": "Recomendado: modo SDK.",
+      "body": "Las sesiones SDK transmiten la salida en tiempo real y son más estables que las sesiones CLI/tmux.",
+      "process_hint": "El modo CLI (proceso) ya no recibe mantenimiento; elige una opción SDK arriba."
     }
   },
   "server": {
@@ -2723,7 +2728,12 @@
     "unavailable": "no disponible",
     "sendFailed": "La delegación no fue aceptada. Comprueba la conexión e inténtalo de nuevo.",
     "modeLabel": "Modo de delegación",
-    "mode": { "audit": "Auditar", "discussion": "Debatir", "brainstorm": "Ideas", "custom": "Personalizado" },
+    "mode": {
+      "audit": "Auditar",
+      "discussion": "Debatir",
+      "brainstorm": "Ideas",
+      "custom": "Personalizado"
+    },
     "customPlaceholder": "¿Qué debe hacer el agente seleccionado?",
     "dispatch": "Delegar",
     "consentTitle": "Confirmar exportación entre proveedores",
