@@ -10,6 +10,7 @@ import {
   getSessionAgentLabel,
   SESSION_AGENT_GROUP_LABEL_KEYS,
 } from "./session-agent-options.js";
+import { SdkModeRecommendation } from "./SdkModeRecommendation.js";
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -722,6 +723,7 @@ export function NewSessionDialog({
               </optgroup>
             ))}
           </select>
+          <SdkModeRecommendation agentType={agentType} />
           {/*
            * R-3-cycle-N — drop the nested flex layout for the help text.
            * The previous `<label display:flex>` + inner `<span flex:1

@@ -20,6 +20,7 @@ import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
 import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../agent/session-close.js';
 import { emitSessionInlineError } from './session-error.js';
+import { resolveSubSessionCwd } from './subsession-cwd.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -94,6 +95,19 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const agentType = sub.type as AgentType;
   const projectName = parentProjectName(sub, sessionName);
   const storedBeforeLaunch = getSession(sessionName);
+
+  // Sub-sessions run inside their parent project. If the record carries no
+  // usable cwd — a fresh create without one, or a restore whose projectDir was
+  // persisted empty by this very bug — inherit it from the parent so the
+  // shell/agent launches in the project instead of the terminal backend's
+  // default directory. Every downstream consumer keys off sub.cwd: the tmux
+  // `-c` start-directory, the `cd`-prefixed launch command, node-pty's spawn
+  // cwd on Windows, and the persisted projectDir.
+  sub.cwd = resolveSubSessionCwd(
+    sub.cwd,
+    sub.parentSession ? getSession(sub.parentSession)?.projectDir : undefined,
+    storedBeforeLaunch?.projectDir,
+  ) ?? sub.cwd;
 
   // Provider-family-independent forced-fresh flag. When a record explicitly
   // requests `fresh:true` (e.g. an execution clone), the launch path MUST start

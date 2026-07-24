@@ -209,7 +209,31 @@ describe('tmux shell-injection prevention', () => {
     expect(newSessionCalls.length).toBe(3);
   });
 
-  it('serializes tmux server priming so concurrent calls do not race on imcodes_init', async () => {
+  it('#38: never creates-and-kills a throwaway imcodes_init session when no tmux server is running', async () => {
+    // Regression for the tmux-startup race: priming a fresh server by creating
+    // `imcodes_init` and immediately killing it tore the server back down, so
+    // the real `new-session` raced the teardown and died with "server exited
+    // unexpectedly". The fix lets the real `new-session` start the server
+    // directly, so `imcodes_init` must never be touched.
+    vi.resetModules();
+    const freshTmux = await import('../../src/agent/tmux.js');
+    execFileCalls.length = 0;
+    failNextTmuxSubcommand = 'list-sessions';
+    failNextTmuxErrorText = 'no server running';
+
+    await freshTmux.newSession('deck_test_brain_c', 'bash');
+
+    const initTouches = execFileCalls.filter((c) => c.args.includes('imcodes_init'));
+    expect(initTouches).toEqual([]);
+
+    // The real session is still created — the server is started lazily by it.
+    const targetSession = execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain_c',
+    );
+    expect(targetSession.length).toBe(1);
+  });
+
+  it('#38: concurrent first-launches on a dead server issue no imcodes_init and both create their real session', async () => {
     vi.resetModules();
     const freshTmux = await import('../../src/agent/tmux.js');
     execFileCalls.length = 0;
@@ -221,48 +245,13 @@ describe('tmux shell-injection prevention', () => {
       freshTmux.newSession('deck_test_brain_b', 'bash'),
     ]);
 
-    const initSessions = execFileCalls.filter(
-      (c) => c.args[0] === 'new-session' && c.args[3] === 'imcodes_init',
-    );
-    expect(initSessions.length).toBe(1);
-
-    const killInit = execFileCalls.filter(
-      (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
-    );
-    expect(killInit.length).toBe(1);
-  });
-
-  it('recovers when tmux priming temp session already exists', async () => {
-    vi.resetModules();
-    const freshTmux = await import('../../src/agent/tmux.js');
-    execFileCalls.length = 0;
-    failNextTmuxSubcommand = 'list-sessions';
-    failNextTmuxErrorText = 'no server running';
-    let initAttempted = false;
-    failNextTmuxCall = (_cmd, args) => {
-      if (!initAttempted && args[0] === 'new-session' && args[3] === 'imcodes_init') {
-        initAttempted = true;
-        return Object.assign(new Error('duplicate session: imcodes_init'), {
-          stderr: 'duplicate session: imcodes_init\n',
-        });
-      }
-      return null;
-    };
-
-    await freshTmux.newSession('deck_test_brain_c', 'bash');
-
-    const initSessions = execFileCalls.filter(
-      (c) => c.args[0] === 'new-session' && c.args[3] === 'imcodes_init',
-    );
-    expect(initSessions.length).toBe(1);
-    const killInit = execFileCalls.filter(
-      (c) => c.args[0] === 'kill-session' && c.args[2] === 'imcodes_init',
-    );
-    expect(killInit.length).toBe(1);
-    const targetSession = execFileCalls.filter(
-      (c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain_c',
-    );
-    expect(targetSession.length).toBe(1);
+    expect(execFileCalls.filter((c) => c.args.includes('imcodes_init'))).toEqual([]);
+    expect(execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain_a',
+    ).length).toBe(1);
+    expect(execFileCalls.filter(
+      (c) => c.args[0] === 'new-session' && c.args[3] === 'deck_test_brain_b',
+    ).length).toBe(1);
   });
 });
 

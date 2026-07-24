@@ -767,6 +767,12 @@
     "executionGroup": {
       "title": "実行ワーカー（実行 {{run}}）",
       "unknownRun": "保留中"
+    },
+    "sdk_recommendation": {
+      "title": "SDK モードを推奨します。",
+      "body": "SDK セッションは出力をリアルタイムでストリーミングし、CLI/tmux セッションより安定しています。",
+      "warn_title": "CLI（プロセス）モード：メンテナンス縮小。",
+      "warn_body": "このバックエンドは優先度が下がり、修正や更新が少なくなります。リアルタイムのストリーミングと安定性のため、上の SDK オプションを選んでください。"
     }
   },
   "server": {
@@ -2722,7 +2728,12 @@
     "unavailable": "利用不可",
     "sendFailed": "委任が受け付けられませんでした。接続を確認して再試行してください。",
     "modeLabel": "委任プリセット",
-    "mode": { "audit": "監査", "discussion": "議論", "brainstorm": "ブレインストーム", "custom": "カスタム" },
+    "mode": {
+      "audit": "監査",
+      "discussion": "議論",
+      "brainstorm": "ブレインストーム",
+      "custom": "カスタム"
+    },
     "customPlaceholder": "選択したエージェントに何を依頼しますか？",
     "dispatch": "委任",
     "consentTitle": "ベンダー間データ送信の確認",

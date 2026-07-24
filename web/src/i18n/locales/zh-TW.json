@@ -767,6 +767,12 @@
     "executionGroup": {
       "title": "執行工作階段（執行 {{run}}）",
       "unknownRun": "待定"
+    },
+    "sdk_recommendation": {
+      "title": "推薦使用 SDK 模式。",
+      "body": "SDK 工作階段支援即時串流輸出，比 CLI/tmux 工作階段更穩定。",
+      "warn_title": "CLI（行程）模式：維護已降級。",
+      "warn_body": "此後端已降為低優先級，修復與更新會減少。建議在上方改用 SDK 選項，獲得即時串流輸出與更穩定的體驗。"
     }
   },
   "server": {
@@ -2723,7 +2729,12 @@
     "unavailable": "無法使用",
     "sendFailed": "委派未被接受，請檢查連線後重試。",
     "modeLabel": "委派預設",
-    "mode": { "audit": "稽核", "discussion": "討論", "brainstorm": "腦力激盪", "custom": "自訂" },
+    "mode": {
+      "audit": "稽核",
+      "discussion": "討論",
+      "brainstorm": "腦力激盪",
+      "custom": "自訂"
+    },
     "customPlaceholder": "希望選定的智慧體做什麼？",
     "dispatch": "立即委派",
     "consentTitle": "確認跨廠商資料外送",

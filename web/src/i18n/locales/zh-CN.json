@@ -767,6 +767,12 @@
     "executionGroup": {
       "title": "执行工作会话（运行 {{run}}）",
       "unknownRun": "待定"
+    },
+    "sdk_recommendation": {
+      "title": "推荐使用 SDK 模式。",
+      "body": "SDK 会话支持实时流式输出，比 CLI/tmux 会话更稳定。",
+      "warn_title": "CLI（进程）模式：维护已降级。",
+      "warn_body": "该后端已降为低优先级，修复与更新会减少。建议在上方改用 SDK 选项，获得实时流式输出与更稳定的体验。"
     }
   },
   "server": {
@@ -2723,7 +2729,12 @@
     "unavailable": "不可用",
     "sendFailed": "委派未被接受，请检查连接后重试。",
     "modeLabel": "委派预设",
-    "mode": { "audit": "审计", "discussion": "讨论", "brainstorm": "头脑风暴", "custom": "自定义" },
+    "mode": {
+      "audit": "审计",
+      "discussion": "讨论",
+      "brainstorm": "头脑风暴",
+      "custom": "自定义"
+    },
     "customPlaceholder": "希望选定的智能体做什么？",
     "dispatch": "立即委派",
     "consentTitle": "确认跨厂商数据外发",
