@@ -128,6 +128,7 @@ vi.mock('../../src/daemon/session-error.js', () => ({
 }));
 
 import { subSessionName, detectShells, startSubSession, stopSubSession, rebuildSubSessions, readSubSessionResponse, normalizeShellBinForHost } from '../../src/daemon/subsession-manager.js';
+import { resolveSubSessionCwd } from '../../src/daemon/subsession-cwd.js';
 import { upsertSession } from '../../src/store/session-store.js';
 import { startWatchingFile, startWatching } from '../../src/daemon/jsonl-watcher.js';
 
@@ -324,6 +325,72 @@ describe('startSubSession — shellBin host normalization', () => {
 
     expect(upsertSession).toHaveBeenCalledWith(
       expect.not.objectContaining({ shellBin: 'C:\\Windows\\system32\\cmd.exe' }),
+    );
+  });
+});
+
+describe('resolveSubSessionCwd', () => {
+  it('keeps an explicit cwd', () => {
+    expect(resolveSubSessionCwd('/proj', '/parent')).toBe('/proj');
+  });
+  it('inherits the parent project dir when cwd is missing or blank', () => {
+    expect(resolveSubSessionCwd(undefined, '/parent')).toBe('/parent');
+    expect(resolveSubSessionCwd(null, '/parent')).toBe('/parent');
+    expect(resolveSubSessionCwd('', '/parent')).toBe('/parent');
+    expect(resolveSubSessionCwd('   ', '/parent')).toBe('/parent');
+  });
+  it('falls back to a stored project dir before giving up', () => {
+    expect(resolveSubSessionCwd(undefined, undefined, '/stored')).toBe('/stored');
+    expect(resolveSubSessionCwd('', '  ', '/stored')).toBe('/stored');
+  });
+  it('returns undefined when nothing usable is available', () => {
+    expect(resolveSubSessionCwd(undefined, undefined)).toBeUndefined();
+    expect(resolveSubSessionCwd('', '  ', '')).toBeUndefined();
+  });
+});
+
+describe('startSubSession — inherits parent project cwd', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(false);
+    newSessionMock.mockResolvedValue(undefined);
+    getDriverMock.mockReturnValue({
+      buildLaunchCommand: vi.fn(() => 'cd "/Users/k/projects/ssr" && /opt/homebrew/bin/fish'),
+      buildResumeCommand: vi.fn(() => '/opt/homebrew/bin/fish'),
+      postLaunch: undefined,
+    });
+  });
+
+  it('launches a shell sub-session in the parent project dir when no cwd was provided', async () => {
+    // Regression: an empty cwd previously left tmux/ConPTY at their default
+    // directory ("/") instead of the project.
+    getSessionMock.mockImplementation((name: string) =>
+      name === 'deck_ssr_brain'
+        ? { name: 'deck_ssr_brain', projectName: 'ssr', projectDir: '/Users/k/projects/ssr' }
+        : null,
+    );
+
+    await startSubSession({
+      id: 'shell-no-cwd',
+      type: 'shell',
+      parentSession: 'deck_ssr_brain',
+    });
+
+    // tmux `-c` start-directory / ConPTY node-pty spawn cwd
+    expect(newSessionMock).toHaveBeenCalledWith(
+      'deck_sub_shell-no-cwd',
+      expect.any(String),
+      expect.objectContaining({ cwd: '/Users/k/projects/ssr' }),
+    );
+    // driver's `cd`-prefixed launch command also keys off the inherited cwd
+    const buildLaunchCommand = getDriverMock.mock.results[0]?.value.buildLaunchCommand as ReturnType<typeof vi.fn>;
+    expect(buildLaunchCommand).toHaveBeenCalledWith(
+      'deck_sub_shell-no-cwd',
+      expect.objectContaining({ cwd: '/Users/k/projects/ssr' }),
+    );
+    // persisted record backfills the correct projectDir
+    expect(upsertSession).toHaveBeenCalledWith(
+      expect.objectContaining({ projectDir: '/Users/k/projects/ssr' }),
     );
   });
 });

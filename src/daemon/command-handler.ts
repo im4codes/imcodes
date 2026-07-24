@@ -48,6 +48,7 @@ import {
   subSessionName,
   type SubSessionRecord,
 } from './subsession-manager.js';
+import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
@@ -5805,11 +5806,18 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       logger.warn({ err: e, id }, 'Failed to resolve Gemini session ID — using snapshot-diff fallback');
     }
   }
-  const cwd = cmd.cwd as string | null | undefined;
   const shellBin = cmd.shellBin as string | null | undefined;
   const ccSessionId = cmd.ccSessionId as string | null | undefined;
   const parentSession = cmd.parentSession as string | null | undefined;
   const ccPreset = cmd.ccPreset as string | null | undefined;
+  // Inherit the parent project's directory when the client didn't send an
+  // explicit cwd, so the sub-session's shell/agent launches inside the project
+  // (not the tmux server root "/" or the daemon cwd). Covers both the transport
+  // and process/tmux branches below.
+  const cwd = resolveSubSessionCwd(
+    cmd.cwd as string | null | undefined,
+    parentSession ? getSession(parentSession)?.projectDir : undefined,
+  );
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
