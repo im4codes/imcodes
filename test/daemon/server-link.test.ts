@@ -15,7 +15,7 @@ vi.mock('../../src/util/daemon-status.js', () => ({
   recordDaemonServerLinkStatus: vi.fn(),
 }));
 
-import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
+import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests, setServerLinkReconnectResyncHandler } from '../../src/daemon/server-link.js';
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
@@ -342,5 +342,58 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledTimes(2);
     // The previous WS instance must have been explicitly closed.
     expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires the reconnect state-resync handler on RE-connect only, not the first connect', async () => {
+    // Regression for deck_sub_26624c1t: live timeline events (incl. the
+    // authoritative session.state idle) are control-plane and silently dropped
+    // while the socket is down — with no replay, a turn that settles during an
+    // outage leaves every browser rendering "working" forever. The open handler
+    // must invoke the registered resync hook after every reconnect so the
+    // session layer can re-broadcast current authoritative states. The FIRST
+    // connect must NOT fire it (daemon startup already runs a full session sync).
+    const resync = vi.fn();
+    setServerLinkReconnectResyncHandler(resync);
+    vi.useFakeTimers();
+    try {
+      link.connect();
+      const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+        | (() => void)
+        | undefined;
+      expect(openHandler).toBeDefined();
+
+      // First successful open — startup path, no resync.
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0); // flush the scheduled setImmediate
+      expect(resync).not.toHaveBeenCalled();
+
+      // Re-connect (same socket object in this harness; the handler's stale-ws
+      // guard passes because this.ws is unchanged).
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(resync).toHaveBeenCalledTimes(1);
+    } finally {
+      setServerLinkReconnectResyncHandler(null);
+    }
+  });
+
+  it('survives a throwing resync handler without breaking the open handshake', async () => {
+    setServerLinkReconnectResyncHandler(() => {
+      throw new Error('resync boom');
+    });
+    vi.useFakeTimers();
+    try {
+      link.connect();
+      const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+        | (() => void)
+        | undefined;
+      openHandler?.();
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0);
+      // No throw escaped to the test — the handler failure is contained.
+      expect(link.isConnected()).toBe(true);
+    } finally {
+      setServerLinkReconnectResyncHandler(null);
+    }
   });
 });

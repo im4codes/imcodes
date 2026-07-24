@@ -159,6 +159,17 @@ const SILENT_CONNECTION_RECYCLE_MS = 30_000;
 // silence checks stand down until inbound can actually be read again.
 const LOOP_PROBE_MS = 1_000;
 const EVENT_LOOP_STALL_THRESHOLD_MS = 3_000; // probe overdue by >3 s ⇒ loop stalled
+
+/**
+ * Invoked (async, best-effort) after every successful RE-connect so the session
+ * layer can re-broadcast authoritative per-session state that live control-plane
+ * relays dropped while the link was down. Registered from daemon startup
+ * (lifecycle) to avoid a server-link → session-manager import cycle.
+ */
+let serverLinkReconnectResyncHandler: (() => void) | null = null;
+export function setServerLinkReconnectResyncHandler(handler: (() => void) | null): void {
+  serverLinkReconnectResyncHandler = handler;
+}
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   // Distinct from session-group-clone — gates the dedicated execution-clone
@@ -250,6 +261,10 @@ export class ServerLink {
   private backoffMs = INITIAL_BACKOFF_MS;
   private stopping = false;
   private reconnecting = false;
+  /** True once this link has completed at least one successful open. Gates the
+   *  reconnect state-resync so a daemon's FIRST connect (startup already runs
+   *  its own full session sync) does not double-broadcast. */
+  private hadConnectedBefore = false;
   private lastPong = 0;               // timestamp of last received message (any message counts as proof of life)
   private seq = 0;
   private readonly workerUrl: string;
@@ -376,6 +391,25 @@ export class ServerLink {
       // because the new socket is OPEN. Without this kick the queue would
       // sit there until the next enqueue happened to schedule another flush.
       this.flushDataPlaneAfterReconnect();
+
+      // Control-plane messages (live timeline events, incl. the authoritative
+      // `session.state: idle`) are DROPPED by trySend while the socket is not
+      // OPEN — there is no queue or replay for them. A turn that settles inside
+      // an outage window therefore leaves the server and every browser showing
+      // "working" forever. On every RE-connect, let the session layer
+      // re-broadcast each transport session's current authoritative state so
+      // the lost snapshot heals within one round-trip.
+      if (this.hadConnectedBefore && serverLinkReconnectResyncHandler) {
+        const handler = serverLinkReconnectResyncHandler;
+        setImmediate(() => {
+          try {
+            handler();
+          } catch (err) {
+            logger.warn({ err }, 'ServerLink: reconnect state resync handler failed');
+          }
+        });
+      }
+      this.hadConnectedBefore = true;
 
       // Refresh the supervisor global-defaults cache on every (re)connect so
       // user edits to "Global custom instructions" land in the daemon within

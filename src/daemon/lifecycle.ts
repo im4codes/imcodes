@@ -1,9 +1,9 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute } from '../agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
-import { ServerLink } from './server-link.js';
+import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -684,6 +684,14 @@ export async function startup(): Promise<DaemonContext> {
   let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
+    // Heal the exact loss window observed on deck_sub_26624c1t: an
+    // authoritative `session.state: idle` emitted while the ServerLink socket
+    // was down is silently dropped (control-plane, no replay), leaving the
+    // server + every browser rendering the session "working" forever. After
+    // each RE-connect, re-broadcast every transport session's current state.
+    setServerLinkReconnectResyncHandler(() => {
+      resyncTransportSessionStatesAfterLinkRestore();
+    });
     serverLink.onMessage((msg) => {
       handleWebCommand(msg, serverLink!);
     });
