@@ -1551,6 +1551,7 @@
     "upload_file": "파일 업로드",
     "uploading": "업로드 중...",
     "upload_failed": "업로드 실패",
+    "insufficient_capacity": "서버의 디스크 공간이 부족합니다",
     "file_too_large": "파일이 너무 큽니다 (최대 {{max}}MB)",
     "long_text_attached": "긴 붙여넣기 텍스트가 {{name}} 첨부파일로 추가되었습니다",
     "long_text_requires_attachment": "이 붙여넣기 내용은 입력창에 직접 넣기엔 너무 깁니다. 파일로 업로드하세요.",

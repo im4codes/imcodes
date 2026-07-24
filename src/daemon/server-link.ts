@@ -8,6 +8,8 @@ import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
 import type { EmbeddingStatus } from '../../shared/embedding-status.js';
+import type { DiskUsage } from '../../shared/disk-usage.js';
+import { getDiskUsage, refreshDiskUsage } from './disk-usage.js';
 import { recordDaemonServerLinkStatus } from '../util/daemon-status.js';
 import {
   P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
@@ -46,6 +48,8 @@ interface SystemStats {
    *  goes stale across reconnects. See `getEmbeddingStatus` for state
    *  semantics. */
   embedding: EmbeddingStatus;
+  /** Mounted-filesystem capacity for the desktop status bar (mobile ignores it). */
+  disks: DiskUsage[];
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
@@ -65,6 +69,7 @@ function collectSystemStats(): SystemStats {
     load15: +load15.toFixed(2),
     uptime: os.uptime(),
     embedding: getEmbeddingStatus(),
+    disks: getDiskUsage(),
   };
 }
 
@@ -850,6 +855,8 @@ export class ServerLink {
         }, 10_000);
       }
     }, HEARTBEAT_MS);
+    // Warm the disk-usage cache so the first stats message already carries it.
+    void refreshDiskUsage();
     // Stats updates more frequently than heartbeat
     this.statsTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {

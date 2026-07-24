@@ -13,6 +13,7 @@ import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_MSG,
+  FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_PATH_HANDLE_ERROR,
   type AttachmentRef,
   type FileUploadRequest,
@@ -250,13 +251,23 @@ async function finalizeUploadedFile(params: {
   logger.info({ uploadId, filename, size }, 'File upload complete');
 }
 
+/** ENOSPC — the disk filled up mid-write. libuv surfaces it as error.code on
+ *  both POSIX and Windows; the message text is a defensive fallback. */
+function isNoSpaceError(err: unknown): boolean {
+  if ((err as { code?: unknown } | null)?.code === 'ENOSPC') return true;
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes('enospc') || msg.includes('no space left');
+}
+
 function sendUploadError(serverLink: FileTransferSender, uploadId: string, filename: string | undefined, err: unknown): void {
   const errMsg = err instanceof Error ? err.message : String(err);
-  logger.error({ uploadId, filename, err }, 'File upload failed');
+  const code = isNoSpaceError(err) ? FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY : undefined;
+  logger.error({ uploadId, filename, err, code }, 'File upload failed');
   const response: FileUploadError = {
     type: 'file.upload_error',
     uploadId,
     message: errMsg,
+    ...(code ? { code } : {}),
   };
   serverLink.send(response);
 }

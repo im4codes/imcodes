@@ -1552,6 +1552,7 @@
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",
     "upload_failed": "上傳失敗",
+    "insufficient_capacity": "伺服器磁碟空間不足",
     "file_too_large": "檔案過大（最大 {{max}}MB）",
     "long_text_attached": "過長貼上內容已作為 {{name}} 附件加入",
     "long_text_requires_attachment": "這段貼上內容太長，不能直接放進輸入框，請改成檔案上傳。",

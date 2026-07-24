@@ -1552,6 +1552,7 @@
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",
     "upload_failed": "Error al subir",
+    "insufficient_capacity": "Espacio en disco insuficiente en el servidor",
     "file_too_large": "Archivo demasiado grande (máx. {{max}}MB)",
     "long_text_attached": "El texto pegado largo se adjuntó como {{name}}",
     "long_text_requires_attachment": "Este pegado es demasiado grande para el cuadro de texto. Súbelo como archivo.",

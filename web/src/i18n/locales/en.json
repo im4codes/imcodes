@@ -1552,6 +1552,7 @@
     "upload_file": "Upload file",
     "uploading": "Uploading...",
     "upload_failed": "Upload failed",
+    "insufficient_capacity": "Insufficient disk space on the server",
     "file_too_large": "File too large (max {{max}}MB)",
     "long_text_attached": "Large pasted text attached as {{name}}",
     "long_text_requires_attachment": "Paste is too large for inline input here. Upload it as a file instead.",

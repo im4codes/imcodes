@@ -76,6 +76,13 @@ export const FILE_TRANSFER_PATH_HANDLE_CAPABILITY = 'file.transfer.path_handle.v
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
 
+/** Machine-readable upload-error codes shared by the daemon (producer), server
+ *  (relay) and web (localized display). */
+export const FILE_TRANSFER_UPLOAD_ERROR_CODE = {
+  /** The daemon ran out of disk space writing the upload (ENOSPC). */
+  INSUFFICIENT_CAPACITY: 'insufficient_capacity',
+} as const;
+
 // ── Server → Daemon messages ──────────────────────────────────────────────────
 
 export const FILE_TRANSFER_MSG = {
@@ -156,6 +163,8 @@ export interface FileUploadError {
   type: 'file.upload_error';
   uploadId: string;
   message: string;
+  /** Machine-readable code so the UI can localize (e.g. ENOSPC → "insufficient capacity"). */
+  code?: string;
 }
 
 export interface FileUploadProgress {

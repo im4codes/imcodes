@@ -16,6 +16,7 @@ import type {
 } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
+import { isInsufficientCapacityError } from '../upload-error.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -3120,7 +3121,8 @@ function AttachmentDownloadButton({
 
   const handleError = (err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
+    if (isInsufficientCapacityError(msg)) setError(t('upload.insufficient_capacity'));
+    else if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
     else if (msg.includes('410') || msg.includes('expired')) setError(t('upload.download_expired'));
     else if (msg.includes('404')) setError(t('upload.download_expired'));
     else setError(t('upload.upload_failed'));
