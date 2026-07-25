@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
@@ -56,8 +59,31 @@ function projection(overrides: Partial<ProcessedContextProjection> = {}): Proces
 }
 
 describe('memory MCP tool schema firewall', () => {
+  let shortRefDir: string;
+  let priorShortRefPath: string | undefined;
+  let priorLegacyPath: string | undefined;
+
   beforeEach(() => {
+    // Registering a handle now persists it, and the default target is the
+    // context store — which would build a real SQLite database, WAL and log in
+    // the runner's home directory just from exercising these handlers. Point
+    // persistence at a scratch file, and the legacy cache at a path that does
+    // not exist, so nothing here touches a real home.
+    shortRefDir = mkdtempSync(join(tmpdir(), 'imc-mcp-shortref-'));
+    priorShortRefPath = process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    priorLegacyPath = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    process.env.IMCODES_MEMORY_SHORT_REF_PATH = join(shortRefDir, 'refs.json');
+    process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = join(shortRefDir, 'absent-legacy.json');
     resetMemoryShortRefsForTests();
+  });
+
+  afterEach(() => {
+    resetMemoryShortRefsForTests();
+    if (priorShortRefPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_PATH = priorShortRefPath;
+    if (priorLegacyPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = priorLegacyPath;
+    rmSync(shortRefDir, { recursive: true, force: true });
   });
 
   it('submits peer audit replies only through the strict structured dependency', async () => {
@@ -287,18 +313,52 @@ describe('memory MCP tool schema firewall', () => {
   it('declares how many records an ambiguous ref covers when expansion is bounded', async () => {
     // Expansion is capped, so a caller told it received "every match" would stop
     // looking while the answer sat in an omitted record.
+    //
+    // The orchestrator MUST be injected: without it the handler falls through to
+    // the real one, which builds an actual SQLite store (plus WAL and a log) in
+    // the runner's home directory.
     const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
     const ids = ['c1', 'c2', 'c3', 'c4', 'c5'];
     const ref = registerMemoryShortRef({ kind: 'projection', id: ids[0]!, namespace });
     seedMemoryShortRefCollisionForTests(ref, ids.map((id) => ({ kind: 'projection' as const, id, namespace })));
+    const getMemorySourcesOrchestrator = vi.fn(async (projectionId: string) => ({
+      status: 'ok' as const,
+      projectionId,
+      sourceEventCount: 1,
+      sources: [{ eventId: `evt-${projectionId}`, status: 'ok', content: `body ${projectionId}` }],
+    }));
     const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
-      getProcessedProjectionById: vi.fn((id: string) => projection({ id, namespace })),
+      getMemorySourcesOrchestrator,
       isMemoryFeatureEnabled: () => true,
     });
 
     const result = await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref }) as Record<string, unknown>;
     expect(result).toMatchObject({ status: 'ok', ambiguousRef: true, candidateCount: 5, truncated: true });
-    expect((result.candidates as unknown[]).length).toBeLessThan(5);
+    const candidates = result.candidates as Array<Record<string, unknown>>;
+    // Exactly the cap, carrying real expanded content — `length < 5` alone would
+    // also pass on an empty array.
+    expect(candidates).toHaveLength(4);
+    expect(candidates.map((candidate) => candidate.projectionId)).toEqual(['c1', 'c2', 'c3', 'c4']);
+    expect(candidates[0]).toMatchObject({ kind: 'projection', sources: [expect.objectContaining({ content: 'body c1' })] });
+  });
+
+  it('marks an ambiguous ref untruncated when every candidate fits', async () => {
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ref = registerMemoryShortRef({ kind: 'projection', id: 'pair-a', namespace });
+    seedMemoryShortRefCollisionForTests(ref, [
+      { kind: 'projection', id: 'pair-a', namespace },
+      { kind: 'projection', id: 'pair-b', namespace },
+    ]);
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getMemorySourcesOrchestrator: vi.fn(async (projectionId: string) => ({
+        status: 'ok' as const, projectionId, sourceEventCount: 0, sources: [],
+      })),
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref }) as Record<string, unknown>;
+    expect(result).toMatchObject({ ambiguousRef: true, candidateCount: 2, truncated: false });
+    expect((result.candidates as unknown[])).toHaveLength(2);
   });
 
   it('short-circuits memory disabled gates before backend calls', async () => {

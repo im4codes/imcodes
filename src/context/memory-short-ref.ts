@@ -121,9 +121,10 @@ function importLegacyShortRefFile(): Array<{ ref: string; entry: MemoryShortRefE
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { schemaVersion?: unknown; entries?: unknown[] };
     // Older derivations produced handles that denote different records now.
     if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION || !Array.isArray(parsed.entries)) return imported;
+    let discarded = 0;
     for (const raw of parsed.entries) {
       const normalized = normalizeEntry(raw);
-      if (!normalized) continue;
+      if (!normalized) { discarded += 1; continue; }
       const bucket = entriesByRef.get(normalized.ref) ?? [];
       if (bucket.some((entry) => entry.kind === normalized.entry.kind
         && entry.id === normalized.entry.id
@@ -132,6 +133,7 @@ function importLegacyShortRefFile(): Array<{ ref: string; entry: MemoryShortRefE
       entriesByRef.set(normalized.ref, bucket);
       imported.push(normalized);
     }
+    reportDiscardedShortRefRows('legacy_file', discarded);
     if (imported.length > 0) {
       incrementCounter('mem.short_ref.legacy_import', { source: 'json_file' });
       // The counter lives in an in-process map that a restart clears, so the
@@ -187,9 +189,10 @@ function ensurePersistedLoaded(): void {
     // resolve to the wrong memory. Drop the whole file and re-register lazily.
     if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION) return;
     if (!Array.isArray(parsed.entries)) return;
+    let discarded = 0;
     for (const raw of parsed.entries) {
       const normalized = normalizeEntry(raw);
-      if (!normalized) continue;
+      if (!normalized) { discarded += 1; continue; }
       const bucket = entriesByRef.get(normalized.ref) ?? [];
       if (!bucket.some((entry) => entry.kind === normalized.entry.kind
         && entry.id === normalized.entry.id
@@ -198,6 +201,7 @@ function ensurePersistedLoaded(): void {
         entriesByRef.set(normalized.ref, bucket);
       }
     }
+    reportDiscardedShortRefRows('json_file', discarded);
     pruneShortRefs();
   } catch (error) {
     // A missing file is the normal first run. Anything else — unreadable, or
@@ -310,12 +314,21 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
     let loaded = 0;
     let discarded = 0;
     for (const row of rows) {
+      // A row that stored a namespace but can no longer produce one must be
+      // dropped, not loaded namespace-less: the entry would look healthy while
+      // being unresolvable for every namespaced caller — silent handle loss
+      // wearing the shape of a successful load.
+      const storedNamespaceJson = typeof row.namespaceJson === 'string' && row.namespaceJson.trim()
+        ? row.namespaceJson
+        : undefined;
+      const namespace = storedNamespaceJson ? safeParseNamespace(storedNamespaceJson) : undefined;
+      if (storedNamespaceJson && !isContextNamespace(namespace)) { discarded += 1; continue; }
       const normalized = normalizeEntry({
         ref: row.ref,
         kind: row.kind,
         id: row.id,
         lastSeenAt: row.lastSeenAt,
-        namespace: typeof row.namespaceJson === 'string' ? safeParseNamespace(row.namespaceJson) : undefined,
+        namespace,
       });
       if (!normalized) { discarded += 1; continue; }
       const bucket = entriesByRef.get(normalized.ref) ?? [];
