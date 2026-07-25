@@ -58,10 +58,6 @@ function sameNamespace(a: ContextNamespace | undefined, b: ContextNamespace | un
   return namespaceKey(a) === namespaceKey(b);
 }
 
-function newestEntry(entries: MemoryShortRefEntry[]): MemoryShortRefEntry | undefined {
-  return [...entries].sort((a, b) => (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0))[0];
-}
-
 function pruneShortRefs(): void {
   let count = 0;
   for (const bucket of entriesByRef.values()) count += bucket.length;
@@ -404,8 +400,24 @@ export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace)
   ensurePersistedLoaded();
   const bucket = entriesByRef.get(normalizeRef(ref));
   if (!bucket || bucket.length === 0) return undefined;
-  const exact = namespace ? newestEntry(bucket.filter((entry) => sameNamespace(entry.namespace, namespace))) : undefined;
-  if (exact) return exact;
+  if (namespace) {
+    const sameNs = bucket.filter((entry) => sameNamespace(entry.namespace, namespace));
+    // Registration keys entries by (kind, id, namespace), so more than one
+    // survivor here means two different records genuinely derived the same
+    // handle. Picking the newest would hand back the wrong memory with no
+    // signal — the exact failure this handle scheme exists to prevent. At 65
+    // bits this should never happen, so treat it as unresolvable and report it.
+    if (sameNs.length > 1) {
+      incrementCounter('mem.short_ref.collision', { kind: sameNs[0]!.kind });
+      warnOncePerHour('mem.short_ref.collision', {
+        ref: normalizeRef(ref),
+        ids: sameNs.map((entry) => entry.id).slice(0, 4),
+      });
+      return undefined;
+    }
+    const exact = sameNs[0];
+    if (exact) return exact;
+  }
   // Cross-namespace isolation: a handle registered under another namespace must
   // NOT resolve here, even when it is the only entry for this ref. Callers other
   // than get_memory_sources (archive/delete/update) also resolve refs, so this

@@ -110,7 +110,12 @@ describe('memory short refs', () => {
     });
   });
 
-  it('resolves same-namespace short-ref conflicts to the newest seen entry', () => {
+  it('refuses to resolve a same-namespace collision instead of guessing the newest', () => {
+    // Two different records deriving one handle used to resolve to whichever was
+    // seen last, handing back the wrong memory with no signal. That was tolerable
+    // when the derivation collided routinely; with a 65-bit digest a same-
+    // namespace collision should never occur, so it is treated as unresolvable
+    // (and reported) rather than silently answered with the wrong record.
     const namespace = { scope: 'user_private' as const, userId: 'user-1', projectId: 'repo-1' };
     const ref = 'obs:collide000000';
     seedColliding(ref, [
@@ -118,14 +123,11 @@ describe('memory short refs', () => {
       { kind: 'observation', id: 'cccccccccc-9999-8888-7777-666666666666', namespace, lastSeenAt: 200 },
     ]);
 
-    expect(resolveMemoryShortRef(ref, namespace)).toMatchObject({
-      id: 'cccccccccc-9999-8888-7777-666666666666',
-    });
+    expect(resolveMemoryShortRef(ref, namespace)).toBeUndefined();
 
+    // Still unresolvable after a reload — the collision is a property of the
+    // data, not of this process's in-memory state.
     reloadMemoryShortRefsForTests();
-
-    expect(resolveMemoryShortRef(ref, namespace)).toMatchObject({
-      id: 'cccccccccc-9999-8888-7777-666666666666',
-    });
+    expect(resolveMemoryShortRef(ref, namespace)).toBeUndefined();
   });
 });
