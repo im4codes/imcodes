@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { listMemoryShortRefs } from '../../src/store/context-store.js';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   loadMemoryShortRefsFromStore,
+  makeMemoryShortRef,
   registerMemoryShortRefs,
   resetMemoryShortRefsForTests,
   resolveMemoryShortRef,
@@ -19,11 +22,16 @@ import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '.
 describe('memory short refs — durable store persistence', () => {
   let tempDir: string;
   let priorPath: string | undefined;
+  let priorLegacyPath: string | undefined;
 
   beforeEach(async () => {
     // Unset so the store (not the JSON file) is the persistence target.
     priorPath = process.env.IMCODES_MEMORY_SHORT_REF_PATH;
     delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    // Warm-load also imports the retired JSON cache. Point it at a path that
+    // does not exist so these assertions never read the developer's real file.
+    priorLegacyPath = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = '/nonexistent/imcodes-test/legacy-short-refs.json';
     tempDir = await createIsolatedSharedContextDb('memory-short-ref-store');
     resetMemoryShortRefsForTests();
   });
@@ -33,6 +41,8 @@ describe('memory short refs — durable store persistence', () => {
     resetContextStoreClientForTests();
     if (priorPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
     else process.env.IMCODES_MEMORY_SHORT_REF_PATH = priorPath;
+    if (priorLegacyPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = priorLegacyPath;
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -72,6 +82,32 @@ describe('memory short refs — durable store persistence', () => {
     registerMemoryShortRefs([entry]);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(listMemoryShortRefs().length).toBe(afterFirst);
+  });
+
+  it('imports handles from the retired JSON cache and moves them into the store', async () => {
+    // The JSON file is a read-only fallback during the migration: handles it
+    // still holds are valid, so carry them over rather than stranding them until
+    // their memory is injected again. The file itself is never written or
+    // deleted — it just stops being needed.
+    const legacyPath = join(tempDir, 'legacy-short-refs.json');
+    process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = legacyPath;
+    const legacyId = '45663d84-d3bb-4f9a-bf65-eba630b45d66';
+    const legacyRef = makeMemoryShortRef('projection', legacyId);
+    writeFileSync(legacyPath, JSON.stringify({
+      schemaVersion: 2,
+      entries: [{ ref: legacyRef, kind: 'projection', id: legacyId, namespace, lastSeenAt: 123 }],
+    }), 'utf8');
+
+    const before = readFileSync(legacyPath, 'utf8');
+    const loaded = await loadMemoryShortRefsFromStore();
+    expect(loaded).toBeGreaterThanOrEqual(1);
+    expect(resolveMemoryShortRef(legacyRef, namespace)).toMatchObject({ id: legacyId });
+
+    // Imported handles land in the store, so the next start no longer needs the file.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(listMemoryShortRefs().some((row) => row.id === legacyId)).toBe(true);
+    // And the file is left exactly as it was.
+    expect(readFileSync(legacyPath, 'utf8')).toBe(before);
   });
 
   it('keeps cross-namespace isolation after a store warm-load', async () => {

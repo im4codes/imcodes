@@ -5,7 +5,8 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 export type MemoryShortRefKind = 'projection' | 'observation';
 
@@ -95,6 +96,53 @@ function pruneShortRefs(): void {
 function shortRefStorePath(): string | undefined {
   const configured = process.env.IMCODES_MEMORY_SHORT_REF_PATH?.trim();
   return configured ? configured : undefined;
+}
+
+/**
+ * Where the retired JSON cache lives. Read-only: handles are only ever written
+ * to the store now. Overridable so tests never read the developer's real file.
+ */
+function legacyShortRefFilePath(): string {
+  const configured = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH?.trim();
+  return configured ? configured : join(homedir(), '.imcodes', 'memory-short-refs.json');
+}
+
+/**
+ * One-way bridge off the retired JSON cache.
+ *
+ * Handles written while persistence still went to a file are valid, so import
+ * them into the store on the first warm-load rather than stranding them until
+ * their memory happens to be injected again. Strictly read-only, and the file is
+ * left in place as a manual recovery point — it is simply never written again.
+ * The counter shows when this stops finding anything, which is when the file can
+ * be dropped for good.
+ */
+function importLegacyShortRefFile(): Array<{ ref: string; entry: MemoryShortRefEntry }> {
+  const path = legacyShortRefFilePath();
+  const imported: Array<{ ref: string; entry: MemoryShortRefEntry }> = [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { schemaVersion?: unknown; entries?: unknown[] };
+    // Older derivations produced handles that denote different records now.
+    if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION || !Array.isArray(parsed.entries)) return imported;
+    for (const raw of parsed.entries) {
+      const normalized = normalizeEntry(raw);
+      if (!normalized) continue;
+      const bucket = entriesByRef.get(normalized.ref) ?? [];
+      if (bucket.some((entry) => entry.kind === normalized.entry.kind
+        && entry.id === normalized.entry.id
+        && sameNamespace(entry.namespace, normalized.entry.namespace))) continue;
+      bucket.push(normalized.entry);
+      entriesByRef.set(normalized.ref, bucket);
+      imported.push(normalized);
+    }
+    if (imported.length > 0) incrementCounter('mem.short_ref.legacy_import', { source: 'json_file' });
+  } catch (error) {
+    // A missing file is the expected steady state once everyone has migrated.
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
+      reportShortRefFailure('load_file', error, { path, legacy: true });
+    }
+  }
+  return imported;
 }
 
 function isMemoryShortRefKind(value: unknown): value is MemoryShortRefKind {
@@ -266,6 +314,11 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       entriesByRef.set(normalized.ref, bucket);
       loaded += 1;
     }
+    // Carry over anything still only in the retired JSON cache, and write it to
+    // the store so the next start no longer depends on that file.
+    const legacy = importLegacyShortRefFile();
+    if (legacy.length > 0) persistShortRefs(legacy);
+    loaded += legacy.length;
     pruneShortRefs();
     persistedLoaded = true;
     return loaded;
