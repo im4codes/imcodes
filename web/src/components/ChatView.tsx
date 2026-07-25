@@ -30,7 +30,11 @@ import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-previe
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { AgentTodoList } from './AgentTodoList.js';
-import { computeFollowThresholds } from './chat-follow-thresholds.js';
+import {
+  CHAT_MOUNT_SETTLE_MS,
+  CHAT_MOUNT_SETTLE_TICK_MS,
+  computeFollowThresholds,
+} from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
@@ -2143,6 +2147,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const lastLoadOlderAtRef = useRef(0);
   const LOAD_OLDER_COOLDOWN_MS = 1000;
 
+  // Mirror `loadingOlder` into a ref so the mount-settle interval can read the
+  // CURRENT value. Adding the prop to that effect's deps instead would restart
+  // the settle window every time a load-older starts or finishes, which is both
+  // wasteful and wrong (the window is meant to track the mount, not history
+  // fetches), and reading the captured prop would leave it permanently stale.
+  const loadingOlderRef = useRef(loadingOlder);
+  loadingOlderRef.current = loadingOlder;
+
+  // Latest `events` identity, for the mount-settle interval to tell a LAYOUT
+  // settle apart from a DATA change. Anything driven by new events is owned by
+  // the content-update layout effect and its follow rules (which deliberately
+  // decline to scroll for some updates); the settle window must never
+  // second-guess that, only handle height moving under unchanged data.
+  const latestEventsRef = useRef(events);
+  latestEventsRef.current = events;
+
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
   const disengageFollow = () => {
@@ -2280,6 +2300,54 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     ro.observe(el);
     return () => ro.disconnect();
   }, [preview]);
+
+  // Hold the bottom through the post-mount layout settle.
+  //
+  // The ResizeObserver above only reacts to `clientHeight`, so anything that
+  // changes CONTENT height after the initial pin is invisible to it — and the
+  // blocks that mount ABOVE every message are the worst case, because growth
+  // above the viewport with `scrollTop` frozen slides the whole log down and the
+  // user ends up looking at older content: the reported "refresh 后上弹".
+  // Culprits that need no images at all: the "Load older" row appearing when
+  // `hasOlderHistory` flips after the first history response, the
+  // `.chat-load-older-status` row, `AgentTodoList` (first child of the scroller),
+  // and the tool-chooser banner gated on an async `usePref` fetch. None of them
+  // change `renderedRevision`, so the content-update layout effect never re-pins
+  // either, and `overflow-anchor: none` means the engine will not help.
+  //
+  // So for a bounded window after mount/session-change, re-assert the bottom
+  // whenever total height changes. Deliberately narrow: it only acts while follow
+  // is still engaged (a gentle scroll-up disengages it and this goes inert
+  // immediately — the exact complaint behind the earlier Safari jitter fixes), it
+  // never engages follow itself, it stays out of the way of the load-older anchor,
+  // and it only fires on an actual height change so a quiet mount costs nothing.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let lastScrollHeight = el.scrollHeight;
+    let seenEvents = latestEventsRef.current;
+    const deadline = Date.now() + CHAT_MOUNT_SETTLE_MS;
+    const timer = setInterval(() => {
+      if (Date.now() > deadline) { clearInterval(timer); return; }
+      const following = preview || autoScrollRef.current;
+      if (!following) { clearInterval(timer); return; }
+      if (loadingOlderRef.current || scrollAnchorRef.current) return;
+      const nextScrollHeight = el.scrollHeight;
+      // A DATA change is not ours to act on: the content-update layout effect
+      // owns those and deliberately declines to follow some of them (a
+      // non-rendered status update must not yank the viewport). Re-baseline and
+      // stand down, so this window only ever reacts to height moving on its own.
+      if (latestEventsRef.current !== seenEvents) {
+        seenEvents = latestEventsRef.current;
+        lastScrollHeight = nextScrollHeight;
+        return;
+      }
+      if (nextScrollHeight === lastScrollHeight) return;
+      lastScrollHeight = nextScrollHeight;
+      scrollToBottom(false);
+    }, CHAT_MOUNT_SETTLE_TICK_MS);
+    return () => clearInterval(timer);
+  }, [sessionId, preview]);
 
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
