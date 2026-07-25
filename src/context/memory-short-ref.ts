@@ -1,4 +1,5 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { isMemoryScope } from '../../shared/memory-scope.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
@@ -57,6 +58,26 @@ function namespaceKey(namespace: ContextNamespace | undefined): string {
 
 function sameNamespace(a: ContextNamespace | undefined, b: ContextNamespace | undefined): boolean {
   return namespaceKey(a) === namespaceKey(b);
+}
+
+/**
+ * Namespace key for the persisted row.
+ *
+ * `namespaceKey()` separates fields with NUL, which is fine in memory but is
+ * truncated by SQLite's NUL-terminated TEXT — the stored key collapsed to just
+ * the scope, which also degraded the (ref, kind, id, namespace_key) primary key
+ * so two namespaces sharing a scope could overwrite each other. JSON keeps the
+ * same field order without an embedded NUL.
+ */
+function namespaceStorageKey(namespace: ContextNamespace | undefined): string {
+  if (!namespace) return '';
+  return JSON.stringify([
+    namespace.scope,
+    namespace.userId ?? '',
+    namespace.projectId ?? '',
+    namespace.workspaceId ?? '',
+    namespace.enterpriseId ?? '',
+  ]);
 }
 
 function pruneShortRefs(): void {
@@ -154,10 +175,33 @@ function isMemoryShortRefKind(value: unknown): value is MemoryShortRefKind {
   return value === 'projection' || value === 'observation';
 }
 
+/** Namespace identity fields; every one must be a string when present. */
+const NAMESPACE_IDENTITY_FIELDS = ['projectId', 'userId', 'workspaceId', 'enterpriseId'] as const;
+
+/**
+ * Decode a stored namespace, refusing anything it cannot fully validate.
+ *
+ * `{ ok: false }` means the row carried a namespace that is not usable, and the
+ * caller must discard the whole row. Degrading such a row to namespace-less
+ * instead — which an earlier `scope is a non-empty string` check did — loads an
+ * entry that looks healthy but can never resolve for a namespaced caller, and
+ * counts it as loaded, so the handle disappears with no signal at all.
+ */
+function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace | undefined } | { ok: false } {
+  if (raw === undefined || raw === null) return { ok: true, namespace: undefined };
+  if (typeof raw !== 'object') return { ok: false };
+  const record = raw as Record<string, unknown>;
+  if (!isMemoryScope(record.scope)) return { ok: false };
+  for (const field of NAMESPACE_IDENTITY_FIELDS) {
+    const value = record[field];
+    if (value !== undefined && typeof value !== 'string') return { ok: false };
+  }
+  return { ok: true, namespace: record as unknown as ContextNamespace };
+}
+
 function isContextNamespace(value: unknown): value is ContextNamespace {
-  if (!value || typeof value !== 'object') return false;
-  const scope = (value as { scope?: unknown }).scope;
-  return typeof scope === 'string' && scope.length > 0;
+  const decoded = decodeNamespace(value);
+  return decoded.ok && decoded.namespace !== undefined;
 }
 
 function normalizeEntry(raw: unknown): { ref: string; entry: MemoryShortRefEntry } | undefined {
@@ -167,7 +211,11 @@ function normalizeEntry(raw: unknown): { ref: string; entry: MemoryShortRefEntry
   const kind = record.kind;
   const id = typeof record.id === 'string' && record.id.trim() ? record.id.trim() : undefined;
   if (!ref || !isMemoryShortRefKind(kind) || !id) return undefined;
-  const namespace = isContextNamespace(record.namespace) ? record.namespace : undefined;
+  // A row that carries a namespace it cannot validate is discarded, never
+  // silently loaded namespace-less.
+  const decodedNamespace = decodeNamespace(record.namespace);
+  if (!decodedNamespace.ok) return undefined;
+  const namespace = decodedNamespace.namespace;
   const lastSeenAt = typeof record.lastSeenAt === 'number' && Number.isFinite(record.lastSeenAt)
     ? record.lastSeenAt
     : undefined;
@@ -277,7 +325,7 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
     ref,
     kind: entry.kind,
     id: entry.id,
-    namespaceKey: namespaceKey(entry.namespace),
+    namespaceKey: namespaceStorageKey(entry.namespace),
     namespaceJson: entry.namespace ? JSON.stringify(entry.namespace) : null,
     lastSeenAt: entry.lastSeenAt ?? Date.now(),
   }));
@@ -321,8 +369,15 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       const storedNamespaceJson = typeof row.namespaceJson === 'string' && row.namespaceJson.trim()
         ? row.namespaceJson
         : undefined;
-      const namespace = storedNamespaceJson ? safeParseNamespace(storedNamespaceJson) : undefined;
-      if (storedNamespaceJson && !isContextNamespace(namespace)) { discarded += 1; continue; }
+      const decoded = decodeNamespace(storedNamespaceJson ? safeParseNamespace(storedNamespaceJson) : undefined);
+      if (!decoded.ok) { discarded += 1; continue; }
+      const namespace = decoded.namespace;
+      // namespace_key is what the row was written under. If it disagrees with
+      // the namespace the JSON decodes to — including a key that says "scoped"
+      // while the JSON is missing — the row's identity is corrupt and loading it
+      // would place the handle under the wrong namespace.
+      const storedNamespaceKey = typeof row.namespaceKey === 'string' ? row.namespaceKey : '';
+      if (storedNamespaceKey !== namespaceStorageKey(namespace)) { discarded += 1; continue; }
       const normalized = normalizeEntry({
         ref: row.ref,
         kind: row.kind,
