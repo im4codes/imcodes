@@ -222,4 +222,60 @@ describe('isRunningTimelineEvent', () => {
       { type: 'usage.update', payload: { model: 'gpt-5.5' } },
     ] as any)).toBe(true);
   });
+
+  /**
+   * Regression for deck_sub_704c1g42 (2026-07-25 08:53:32 → 08:54:06): the
+   * daemon emitted `session.state: running`, then the agent thought for 34 s
+   * emitting only `agent.status` labels. The tail therefore ended at the
+   * `memory.context` of that send, which used to fall through to `return false`
+   * — reporting "no active turn" for the whole window. `SubSessionWindow` then
+   * fed that into `resolveTimelineBackedSessionState`, whose stale-running guard
+   * overrode the timeline's `running` with the store snapshot, and the footer
+   * rendered IDLE while the agent was demonstrably editing files.
+   */
+  it('stays active through the memory.context tail of a context-injecting send', () => {
+    const events = [
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'command.ack', payload: { commandId: 'cmd-x', status: 'accepted' } },
+      { type: 'assistant.thinking', payload: { text: '' } },
+      { type: 'session.state', payload: { state: 'running', blockingWorkCount: 3 } },
+      { type: 'user.message', payload: { text: '远程桌面只干一件事那里 字幕缺了下载安装的字幕吧' } },
+      { type: 'memory.context', payload: { query: 'x', injectedText: '[Related past work]' } },
+      { type: 'agent.status', payload: { status: 'requesting', label: null } },
+      { type: 'agent.status', payload: { status: 'thinking', label: 'Thinking (1.9k tokens)' } },
+    ];
+    expect(hasActiveTimelineTurn(events as any)).toBe(true);
+  });
+
+  it('stays active when telemetry metadata is the tail after real work', () => {
+    // file.change / memory.compression / queue snapshots are pure metadata and
+    // must not be read as "the turn ended".
+    for (const tail of [
+      { type: 'file.change', payload: { batch: {} } },
+      { type: 'memory.compression', payload: { outcome: 'success' } },
+      { type: 'transport.queue.snapshot', payload: {} },
+      { type: 'peer_audit.status', payload: {} },
+    ]) {
+      expect(hasActiveTimelineTurn([
+        { type: 'session.state', payload: { state: 'running', blockingWorkCount: 1 } },
+        { type: 'user.message', payload: { text: 'go' } },
+        { type: 'memory.context', payload: {} },
+        tail,
+      ] as any)).toBe(true);
+    }
+  });
+
+  it('still reports inactive when metadata trails an authoritative clean idle', () => {
+    // The fix must not resurrect a settled turn: walking through metadata has to
+    // land on the authoritative idle and report no active work.
+    expect(hasActiveTimelineTurn([
+      { type: 'user.message', payload: { text: 'go' } },
+      { type: 'tool.call', payload: { toolCallId: 'A', tool: 'Bash' } },
+      { type: 'tool.result', payload: { toolCallId: 'A', terminalStatus: 'succeeded' } },
+      { type: 'assistant.text', payload: { text: 'done', streaming: false } },
+      { type: 'session.state', payload: authoritativeIdlePayload },
+      { type: 'memory.compression', payload: { outcome: 'success' } },
+      { type: 'memory.context', payload: {} },
+    ] as any)).toBe(false);
+  });
 });

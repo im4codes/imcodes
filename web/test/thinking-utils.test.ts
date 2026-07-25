@@ -104,6 +104,26 @@ describe('getActiveThinkingTs', () => {
       { type: 'agent.status', ts: 12, payload: { label: 'still thinking' } },
     ] as any)).toBe(10);
   });
+
+  it('walks through metadata events so the thinking timer survives memory injection', () => {
+    // memory.context / memory.compression / file.change are telemetry: they must
+    // not end a thinking sequence. Before the fix, memory.context terminated the
+    // scan and the elapsed-thinking timer silently disappeared.
+    expect(getActiveThinkingTs([
+      { type: 'assistant.thinking', ts: 10 },
+      { type: 'memory.context', ts: 11, payload: { query: 'x' } },
+      { type: 'file.change', ts: 12, payload: { batch: {} } },
+      { type: 'agent.status', ts: 13, payload: { label: 'Thinking (1.9k tokens)' } },
+    ] as any)).toBe(10);
+  });
+
+  it('still ends thinking on real user/assistant turn boundaries', () => {
+    expect(getActiveThinkingTs([
+      { type: 'assistant.thinking', ts: 10 },
+      { type: 'assistant.text', ts: 11, payload: { text: 'answered', streaming: false } },
+      { type: 'memory.context', ts: 12, payload: {} },
+    ] as any)).toBe(null);
+  });
 });
 
 describe('getActiveStatusText', () => {

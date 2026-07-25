@@ -1,19 +1,29 @@
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
-import { isAuthoritativeCleanIdlePayload, isWorkingSessionState, reduceTimelineActivity } from '../../shared/session-activity-types.js';
+import {
+  TIMELINE_METADATA_EVENT_TYPES,
+  isAuthoritativeCleanIdlePayload,
+  isWorkingSessionState,
+  reduceTimelineActivity,
+} from '../../shared/session-activity-types.js';
 
 const RUNNING_TIMELINE_EVENT_TYPES = new Set<TimelineEvent['type']>([
   'assistant.thinking',
   'tool.call',
 ]);
 
-const NEUTRAL_TAIL_EVENT_TYPES = new Set<TimelineEvent['type']>([
+const NEUTRAL_TAIL_EVENT_TYPES = new Set<string>([
   'agent.status',
   'usage.update',
   'tool.result',
   'mode.state',
   'terminal.snapshot',
   'command.ack',
+  // Pure metadata/telemetry (memory.context, file.change, queue snapshots, …).
+  // These must never terminate the tail scan: `memory.context` is the tail for
+  // the whole pre-first-tool thinking window of every context-injecting send,
+  // and stopping there reported "no active turn" while the agent was working.
+  ...TIMELINE_METADATA_EVENT_TYPES,
 ]);
 
 type TimelineTailEvent = Pick<TimelineEvent, 'type'> & {

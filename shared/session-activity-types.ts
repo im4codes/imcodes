@@ -1,3 +1,6 @@
+import { TIMELINE_EVENT_FILE_CHANGE } from './file-change.js';
+import { EXECUTION_CLONE_TIMELINE } from './execution-clone.js';
+
 export type SessionActivityBusyReason =
   | 'runtime_dispatch'
   | 'active_dispatch_entry'
@@ -185,6 +188,37 @@ export const WORKING_SESSION_STATES: ReadonlySet<string> = new Set([
 export function isWorkingSessionState(value: unknown): boolean {
   return typeof value === 'string' && WORKING_SESSION_STATES.has(value);
 }
+
+/**
+ * Timeline events that are pure metadata/telemetry: they say nothing about
+ * whether a turn is still running, so any tail scan looking for activity
+ * evidence must WALK THROUGH them rather than stop.
+ *
+ * This is not cosmetic. `memory.context` is emitted immediately after the
+ * `user.message` of every context-injecting send, i.e. it is the tail event for
+ * the whole "model is thinking before its first tool call" window. While it
+ * terminated the scan, `hasActiveTimelineTurn()` returned false for that entire
+ * window, and `resolveTimelineBackedSessionState()` then overrode the daemon's
+ * `session.state: running` with the (possibly lagging) store snapshot — the
+ * session rendered IDLE while the agent was demonstrably working. Observed live
+ * on deck_sub_704c1g42: `running` at 08:53:32 followed by 34 s of thinking with
+ * a `memory.context` tail, footer asleep the whole time.
+ *
+ * Shared so the tail-activity scan and the thinking scan cannot drift apart.
+ */
+export const TIMELINE_METADATA_EVENT_TYPES: readonly string[] = [
+  'memory.context',
+  'memory.compression',
+  TIMELINE_EVENT_FILE_CHANGE,
+  'peer_audit.status',
+  'peer_audit.result',
+  'transport.queue.snapshot',
+  'transport.queue.delivery',
+  'transport.queue.receipt',
+  'transport.queue.failure',
+  'transport.queue.reset',
+  EXECUTION_CLONE_TIMELINE.TERMINAL,
+];
 
 export function normalizeActivityGeneration(value: ActivityGenerationLike): string | null {
   if (value == null) return null;
