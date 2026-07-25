@@ -1361,6 +1361,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   const [revealingOlder, setRevealingOlder] = useState(false);
   const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Scroll anchor preservation: pre-prepend scrollHeight, restored after the
+  // taller list commits. Declared with the reveal state it serves (both the
+  // local render-limit reveal and the HTTP load-older prepend set it).
+  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
   // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
@@ -1822,6 +1826,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   };
 
   const revealHiddenOlderItems = () => {
+    // Raising the render limit mounts CHAT_RENDER_ITEM_INCREMENT more items
+    // ABOVE the viewport. Without an anchor the browser keeps `scrollTop`, so
+    // the same offset now points that much higher in the list and the reading
+    // position lurches toward older history — the "scrolled to the end and it
+    // jumps up a section" report. Worse, it lands the view back inside the
+    // `scrollTop < 100` trigger zone, so the next cooldown tick reveals again
+    // and jumps again. Capture the pre-reveal height here (not at the call
+    // sites) so every caller — the scroll auto-trigger and the manual
+    // "load older" button — is anchored identically; the restore effect below
+    // re-adds the delta.
+    const scrollEl = scrollRef.current;
+    if (scrollEl) scrollAnchorRef.current = { scrollHeight: scrollEl.scrollHeight };
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
     setRevealingOlder(true);
     setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
@@ -2112,8 +2128,6 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Scroll auto-trigger for Load Older
   const lastLoadOlderAtRef = useRef(0);
   const LOAD_OLDER_COOLDOWN_MS = 1000;
-  // Scroll anchor preservation: save scrollHeight before prepend, restore after
-  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
 
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
