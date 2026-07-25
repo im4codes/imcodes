@@ -99,10 +99,17 @@ describe('native app resume refresh chain', () => {
 
     expect(reconnectNow).toHaveBeenCalledWith(true);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Resume MUST drop the lower bound. While the app was backgrounded it had no
+    // session subscription, so the server discarded its timeline events outright
+    // (no queue, no replay). Those events sit BELOW the local tail, so the old
+    // `afterTs: <localTail>` request could never reach them — that is exactly the
+    // "notification arrived but the chat is empty until I press ↻" bug. This test
+    // asserts the resume chain fires; the cursor value it used to pin was just
+    // whatever the tail-anchored implementation produced.
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: 999 }),
+      expect.objectContaining({ afterTs: undefined }),
     );
 
     removeListener();
@@ -177,10 +184,11 @@ describe('native app resume refresh chain', () => {
 
     expect(reconnectNow).toHaveBeenCalledWith(true);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Same contract as above: a resume backfill carries no lower bound.
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: 999 }),
+      expect.objectContaining({ afterTs: undefined }),
     );
   });
 });
