@@ -51,6 +51,7 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 }));
 
 import { ensureSessionFile } from '../../src/daemon/codex-watcher.js';
+import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 
 describe('ensureSessionFile', () => {
   beforeEach(() => {
@@ -107,7 +108,7 @@ describe('ensureSessionFile', () => {
       'memory.context',
       expect.objectContaining({
         reason: 'startup',
-        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [proj] Fix websocket reconnect loop\n</related-past-work>',
+        injectedText: `[Related past work]\n<related-past-work advisory="true">\n- [proj] (${makeMemoryShortRef('projection', 'mem-1')}) Fix websocket reconnect loop\n</related-past-work>`,
       }),
       expect.any(Object),
     );

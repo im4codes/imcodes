@@ -6,6 +6,7 @@ import type {
   MemoryContextTimelineStatus,
 } from '../shared/timeline/types.js';
 import { buildRelatedPastWorkText } from '../../shared/memory-recall-format.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import type {
   ContextAuthorityDecision,
   MemoryRecallInjectionSurface,
@@ -46,7 +47,7 @@ export function buildMemoryContextTimelinePayload(
     relevanceScore: item.relevanceScore,
   }));
   const injectedText = options?.injectedText
-    ?? (timelineItems.length > 0 ? buildRelatedPastWorkText(timelineItems) : undefined);
+    ?? (timelineItems.length > 0 ? buildRelatedPastWorkText(attachMemoryShortRefs(timelineItems)) : undefined);
   return {
     ...(query ? { query } : {}),
     ...(injectedText ? { injectedText } : {}),

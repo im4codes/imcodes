@@ -962,6 +962,7 @@ import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
@@ -12466,8 +12467,8 @@ async function prependLocalMemory(
     const semanticHitIds = finalItems.filter((item) => item.type === 'processed').map((item) => item.id);
     const hitIds = [...summaryItems.map((item) => item.id), ...semanticHitIds];
     const sections: string[] = [];
-    if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(summaryItems));
-    if (finalItems.length > 0) sections.push(buildRelatedPastWorkText(finalItems));
+    if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(attachMemoryShortRefs(summaryItems)));
+    if (finalItems.length > 0) sections.push(buildRelatedPastWorkText(attachMemoryShortRefs(finalItems)));
     const injectedText = sections.join('\n\n');
     const timelineItems = [...summaryItems, ...finalItems];
     const timelinePayload = buildMemoryContextTimelinePayload(query, timelineItems);

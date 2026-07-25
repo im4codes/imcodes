@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1399,7 +1400,9 @@ describe('handleWebCommand memory context timeline', () => {
       expect.objectContaining({
         relatedToEventId: 'evt-user-1',
         query: 'Fix reconnect issues in websocket client',
-        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [codedeck] Fix websocket reconnect loop\n</related-past-work>',
+        // Each line carries a redeemable handle so the agent can call
+        // get_memory_sources when the summary alone isn't enough.
+        injectedText: `[Related past work]\n<related-past-work advisory="true">\n- [codedeck] (${makeMemoryShortRef('projection', 'mem-1')}) Fix websocket reconnect loop\n</related-past-work>`,
         items: [
           expect.objectContaining({
             id: 'mem-1',

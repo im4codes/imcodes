@@ -7,7 +7,7 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { registerMemoryShortRef, resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
+import { makeMemoryShortRef, registerMemoryShortRef, resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
@@ -435,7 +435,7 @@ describe('memory MCP tool schema firewall', () => {
       items: [
         {
           projectionId,
-          ref: 'proj:1111111111',
+          ref: makeMemoryShortRef('projection', projectionId),
           recordKind: 'projection',
           sourceLookup: { tool: 'get_memory_sources', kind: 'projection', projectionId },
           summary: 'MCP provider readiness fixed for Gemini, Copilot, and Qwen.',
@@ -457,7 +457,7 @@ describe('memory MCP tool schema firewall', () => {
       limit: 5,
     }));
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
-      ref: 'proj:1111111111',
+      ref: makeMemoryShortRef('projection', projectionId),
       kind: 'projection',
     })).resolves.toMatchObject({
       status: 'ok',
@@ -502,7 +502,7 @@ describe('memory MCP tool schema firewall', () => {
       items: [
         {
           observationId,
-          ref: 'obs:aaaaaaaaaa',
+          ref: makeMemoryShortRef('observation', observationId),
           recordKind: 'observation',
           sourceLookup: { tool: 'get_memory_sources', kind: 'observation', observationId },
           observationClass: 'note',
@@ -518,7 +518,7 @@ describe('memory MCP tool schema firewall', () => {
       serverId: 'attacker-srv',
     });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({
-      ref: 'obs:aaaaaaaaaa',
+      ref: makeMemoryShortRef('observation', observationId),
       kind: 'observation',
     })).resolves.toMatchObject({
       status: 'ok',

@@ -16,6 +16,7 @@ import { AGENT_SEND_DOCS } from './imcodes-workflow-docs.js';
 import type { MemorySearchResultItem } from '../context/memory-search.js';
 import { selectStartupMemoryForBootstrap } from '../context/memory-recall-client.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import logger from '../util/logger.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
@@ -139,7 +140,7 @@ export async function injectGeminiMemoryWithTimeline(
 export async function readProcessedMemory(projectName: string): Promise<string | null> {
   const items = await readProcessedMemoryItems(projectName);
   if (items.length === 0) return null;
-  return buildStartupProjectMemoryText(items);
+  return buildStartupProjectMemoryText(attachMemoryShortRefs(items));
 }
 
 export async function readProcessedMemoryItems(projectName: string): Promise<MemorySearchResultItem[]> {
@@ -170,7 +171,7 @@ export async function buildSessionBootstrapContextWithItems(
 ): Promise<{ text: string; items: MemorySearchResultItem[] }> {
   const projectContext = await readProjectMemory(cwd);
   const items = await readProcessedMemoryItems(projectName);
-  const processedMemory = items.length > 0 ? buildStartupProjectMemoryText(items) : null;
+  const processedMemory = items.length > 0 ? buildStartupProjectMemoryText(attachMemoryShortRefs(items)) : null;
   const parts: string[] = [];
   if (projectContext) parts.push(projectContext);
   if (processedMemory) parts.push(processedMemory);

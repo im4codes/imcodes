@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SKILL_REGISTRY_FILE_NAME, SKILL_REGISTRY_SCHEMA_VERSION, makeSkillUri } from '../../shared/skill-registry-types.js';
 import { configureSharedContextRuntime } from '../../src/context/shared-context-runtime.js';
-import { resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
+import { makeMemoryShortRef, resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -583,8 +583,11 @@ describe('resolveTransportContextBootstrap', () => {
       { summary: 'Important architecture memory', projectionClass: 'durable_memory_candidate' },
       { summary: 'Recent startup memory', projectionClass: 'recent_summary' },
     ]);
-    expect(startup?.injectedText).toContain('[important] Important architecture memory');
-    expect(startup?.injectedText).toContain('[recent] Recent startup memory');
+    // Each injected line carries a redeemable handle between the label and the
+    // summary, so the agent can call get_memory_sources when the summary alone
+    // isn't enough. base32 handle alphabet is a-z2-7.
+    expect(startup?.injectedText).toMatch(/\[important\] \(proj:[a-z2-7]{13}\) Important architecture memory/);
+    expect(startup?.injectedText).toMatch(/\[recent\] \(proj:[a-z2-7]{13}\) Recent startup memory/);
   });
 
   it('injects only active or promoted observations as a lightweight startup index', async () => {
@@ -647,8 +650,8 @@ describe('resolveTransportContextBootstrap', () => {
       }),
     ]);
     expect(startup?.injectedText).toContain('<persistent-memory-index advisory="true">');
-    const activeRef = `obs:${active.id.slice(0, 10)}`;
-    const promotedRef = `obs:${promoted.id.slice(0, 10)}`;
+    const activeRef = makeMemoryShortRef('observation', active.id);
+    const promotedRef = makeMemoryShortRef('observation', promoted.id);
     expect(startup?.injectedText).toContain(`ref: ${activeRef}`);
     expect(startup?.injectedText).toContain(`ref: ${promotedRef}`);
     expect(startup?.injectedText).not.toContain(active.id);

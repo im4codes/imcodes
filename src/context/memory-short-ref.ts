@@ -1,4 +1,6 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { createHash } from 'node:crypto';
+import { encodeBase32 } from '../util/base32.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -12,7 +14,21 @@ export interface MemoryShortRefEntry {
   lastSeenAt?: number;
 }
 
-const MAX_SHORT_REF_ENTRIES = 4096;
+const MAX_SHORT_REF_ENTRIES = 10_000;
+
+/**
+ * base32 characters kept from the md5 digest. 5 bits per character, so 13 chars
+ * ≈ 65 bits: a birthday collision needs ~6e9 distinct ids in one namespace,
+ * versus the previous 40-bit handle which collided at ~0.5% by 100k ids.
+ * Collisions here are not benign — a handle that maps to several records
+ * resolves to an arbitrary one, i.e. the agent silently fetches the WRONG
+ * memory. base32 carries the same 65 bits in 13 chars that hex needs 16 for.
+ */
+const MEMORY_SHORT_REF_LENGTH = 13;
+
+/** Bumped whenever the ref derivation changes, so cached refs from an older
+ *  algorithm are dropped instead of resolving to a stale/wrong record. */
+const SHORT_REF_SCHEMA_VERSION = 2;
 const entriesByRef = new Map<string, MemoryShortRefEntry[]>();
 let persistedLoaded = false;
 
@@ -101,7 +117,11 @@ function ensurePersistedLoaded(): void {
   const path = shortRefStorePath();
   if (!path) return;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { entries?: unknown[] };
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { schemaVersion?: unknown; entries?: unknown[] };
+    // Refs cached by an older derivation must NOT be trusted: the same ref
+    // string can denote a different record under the new algorithm, which would
+    // resolve to the wrong memory. Drop the whole file and re-register lazily.
+    if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION) return;
     if (!Array.isArray(parsed.entries)) return;
     for (const raw of parsed.entries) {
       const normalized = normalizeEntry(raw);
@@ -131,7 +151,7 @@ function persistShortRefs(): void {
   try {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: SHORT_REF_SCHEMA_VERSION,
       entries: entries.slice(0, MAX_SHORT_REF_ENTRIES),
     }), 'utf8');
   } catch {
@@ -139,13 +159,31 @@ function persistShortRefs(): void {
   }
 }
 
+/**
+ * Derive the compact handle for an id.
+ *
+ * A hash prefix — NOT a prefix of the id itself. The previous algorithm kept the
+ * first 10 hex-looking characters of the id, which scavenged them from arbitrary
+ * positions across the string. For structured ids such as
+ * `md-ingest:personal::::::::local/<hash>:CLAUDE.md:<sha256>` every record that
+ * shares the constant prefix collapsed onto the SAME ref (the discriminating
+ * sha256 sits past the 10th kept character), so one ref mapped to dozens of
+ * records and resolution silently picked whichever was newest.
+ *
+ * A digest gives a uniform distribution for ANY id shape. Being a pure function
+ * of the id also means the handle is reproducible: the same memory always yields
+ * the same handle across sessions, restarts and machines, so the ref→id table is
+ * a REBUILDABLE index rather than the only source of truth (a random handle
+ * would be permanently dead if that table were ever lost). md5 is used purely
+ * as a fast non-cryptographic digest here, never for security.
+ */
 export function makeMemoryShortRef(kind: MemoryShortRefKind, id: string): string {
-  const compact = id.replace(/[^a-f0-9]/gi, '').slice(0, 10) || id.slice(0, 10);
+  const digest = createHash('md5').update(id, 'utf8').digest();
+  const compact = encodeBase32(digest).slice(0, MEMORY_SHORT_REF_LENGTH);
   return `${refPrefix(kind)}:${compact}`;
 }
 
-export function registerMemoryShortRef(entry: MemoryShortRefEntry): string {
-  ensurePersistedLoaded();
+function registerMemoryShortRefWithoutPersist(entry: MemoryShortRefEntry): string {
   const ref = normalizeRef(makeMemoryShortRef(entry.kind, entry.id));
   const bucket = entriesByRef.get(ref) ?? [];
   const nextEntry = { ...entry, lastSeenAt: entry.lastSeenAt ?? Date.now() };
@@ -154,9 +192,32 @@ export function registerMemoryShortRef(entry: MemoryShortRefEntry): string {
     || !sameNamespace(existing.namespace, entry.namespace));
   next.push(nextEntry);
   entriesByRef.set(ref, next);
+  return ref;
+}
+
+export function registerMemoryShortRef(entry: MemoryShortRefEntry): string {
+  ensurePersistedLoaded();
+  const ref = registerMemoryShortRefWithoutPersist(entry);
   pruneShortRefs();
   persistShortRefs();
   return ref;
+}
+
+/**
+ * Batch variant for surfaces that register many refs at once (startup/recall
+ * memory injection registers every injected item so the agent can redeem the
+ * ref via get_memory_sources). Persists ONCE instead of per entry — the
+ * per-entry path rewrites the whole cache file, which would otherwise mean N
+ * full-file writes on the session send path.
+ */
+export function registerMemoryShortRefs(entries: readonly MemoryShortRefEntry[]): string[] {
+  ensurePersistedLoaded();
+  const refs = entries.map((entry) => registerMemoryShortRefWithoutPersist(entry));
+  if (refs.length > 0) {
+    pruneShortRefs();
+    persistShortRefs();
+  }
+  return refs;
 }
 
 export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace): MemoryShortRefEntry | undefined {
@@ -165,6 +226,10 @@ export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace)
   if (!bucket || bucket.length === 0) return undefined;
   const exact = namespace ? newestEntry(bucket.filter((entry) => sameNamespace(entry.namespace, namespace))) : undefined;
   if (exact) return exact;
+  // Cross-namespace isolation: a handle registered under another namespace must
+  // NOT resolve here, even when it is the only entry for this ref. Callers other
+  // than get_memory_sources (archive/delete/update) also resolve refs, so this
+  // stays the strict boundary rather than deferring to a downstream check.
   if (namespace) return undefined;
   return bucket.length === 1 ? bucket[0] : undefined;
 }

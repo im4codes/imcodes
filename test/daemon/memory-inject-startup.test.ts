@@ -52,6 +52,7 @@ vi.mock('../../src/context/memory-recall-core.js', async (importOriginal) => ({
 
 import { injectGeminiMemoryWithTimeline } from '../../src/daemon/memory-inject.js';
 import { getSummarySyncFingerprints, resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
+import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 
 describe('injectGeminiMemoryWithTimeline', () => {
   beforeEach(() => {
@@ -111,7 +112,7 @@ describe('injectGeminiMemoryWithTimeline', () => {
       'memory.context',
       expect.objectContaining({
         reason: 'startup',
-        injectedText: '[Related past work]\n<related-past-work advisory="true">\n- [proj] Fix websocket reconnect loop\n</related-past-work>',
+        injectedText: `[Related past work]\n<related-past-work advisory="true">\n- [proj] (${makeMemoryShortRef('projection', 'mem-1')}) Fix websocket reconnect loop\n</related-past-work>`,
         items: [
           expect.objectContaining({
             id: 'mem-1',

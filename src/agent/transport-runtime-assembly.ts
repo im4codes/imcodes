@@ -21,6 +21,7 @@ import type {
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
 
 export interface TransportRuntimeAssemblyInput {
@@ -265,7 +266,7 @@ function filterStartupMemoryForAuthority(
     authoritySource: 'processed_remote',
     sourceKind: resolveRecallSourceKind(remoteItems),
     items: remoteItems,
-    injectedText: buildStartupProjectMemoryText(remoteItems),
+    injectedText: buildStartupProjectMemoryText(attachMemoryShortRefs(remoteItems)),
   };
 }
 
