@@ -62,7 +62,7 @@ import {
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
-import { normalizeActivityGeneration } from '../../shared/session-activity-types.js';
+import { isServerLinkResyncStatePayload, normalizeActivityGeneration } from '../../shared/session-activity-types.js';
 import type { TransportRuntimeDiagnosticSnapshot } from '../agent/transport-session-runtime.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
@@ -822,6 +822,13 @@ export async function startup(): Promise<DaemonContext> {
 
   // Wire timeline idle events → P2P orchestrator + queued message drain (covers all agent types: CC, codex, gemini, etc.)
   timelineEmitter.on((e) => {
+    // A link-restore resync re-states what the daemon already knew so the server
+    // and browsers can catch up. It is NOT a fresh idle transition: running the
+    // side effects below for it made every reconnect drain the queue of every
+    // transport session at once, delivering messages that had been queued for
+    // days and flooding the user with notifications. Remote consumers still get
+    // the event; local listeners must ignore it.
+    if (e.type === 'session.state' && isServerLinkResyncStatePayload(e.payload)) return;
     liveContextIngestion.handleTimelineEvent(e);
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);

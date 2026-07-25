@@ -190,6 +190,30 @@ export function isWorkingSessionState(value: unknown): boolean {
 }
 
 /**
+ * `decisionReason` stamped on a `session.state` that is a RE-BROADCAST of state
+ * the daemon already knew, emitted after the server link is restored so the
+ * server and browsers can resync. It carries no new information.
+ *
+ * Daemon-local listeners MUST ignore it. Treating it as a genuine idle
+ * transition made every reconnect replay a full "turn finished" edge for every
+ * transport session, which re-ran `drainQueue()` across all of them: queued
+ * messages that had been sitting for days were delivered at once, every agent
+ * answered, and each answer fired an idle hook — hundreds of push notifications
+ * quoting days-old messages. The resync must inform remote consumers WITHOUT
+ * re-triggering local side effects.
+ */
+export const SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC = 'server_link_resync' as const;
+
+/** True when a `session.state` payload is a link-restore re-broadcast. */
+export function isServerLinkResyncStatePayload(payload: unknown): boolean {
+  return Boolean(payload)
+    && typeof payload === 'object'
+    && !Array.isArray(payload)
+    && (payload as { decisionReason?: unknown }).decisionReason
+      === SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC;
+}
+
+/**
  * Timeline events that are pure metadata/telemetry: they say nothing about
  * whether a turn is still running, so any tail scan looking for activity
  * evidence must WALK THROUGH them rather than stop.

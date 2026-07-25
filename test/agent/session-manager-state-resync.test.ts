@@ -28,7 +28,11 @@ import {
   setSessionPersistCallback,
 } from '../../src/agent/session-manager.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
-import { isAuthoritativeIdlePayloadShape } from '../../shared/session-activity-types.js';
+import {
+  SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC,
+  isAuthoritativeIdlePayloadShape,
+  isServerLinkResyncStatePayload,
+} from '../../shared/session-activity-types.js';
 import { upsertSession, removeSession } from '../../src/store/session-store.js';
 import type { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 
@@ -152,5 +156,45 @@ describe('resyncTransportSessionStatesAfterLinkRestore', () => {
   it('is a no-op with no live transport runtimes', () => {
     expect(resyncTransportSessionStatesAfterLinkRestore([])).toBe(0);
     expect(emitSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('server-link resync payload marking', () => {
+  /**
+   * Incident: after a server/daemon reconnect the user got hundreds of push
+   * notifications, some quoting messages queued two days earlier.
+   *
+   * lifecycle.ts wires `timelineEmitter.on(...)` so that ANY
+   * `session.state: idle` runs `notifySessionIdle()` + `drainQueue()`. The
+   * resync re-broadcasts idle for EVERY transport session on EVERY reconnect,
+   * so each reconnect replayed a "turn finished" edge across all of them,
+   * draining every stale queue at once. Every agent answered, every answer fired
+   * an idle hook, and the phone got flooded.
+   *
+   * The resync payload must therefore be identifiable so daemon-local listeners
+   * can ignore it while the server and browsers still receive it.
+   */
+  it('marks resync state payloads so local listeners can skip them', () => {
+    const emitSpy = vi.spyOn(timelineEmitter, 'emit').mockImplementation(() => null as never);
+    try {
+      resyncTransportSessionStatesAfterLinkRestore([
+        [IDLE_SESSION, makeRuntime({ status: 'idle' })],
+      ]);
+      const [, , payload] = emitSpy.mock.calls[0] as unknown as [string, string, Record<string, unknown>];
+      expect(payload.state).toBe('idle');
+      expect(payload.decisionReason).toBe(SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC);
+      expect(isServerLinkResyncStatePayload(payload)).toBe(true);
+    } finally {
+      emitSpy.mockRestore();
+    }
+  });
+
+  it('does not mark an ordinary live idle as a resync', () => {
+    // The live onStatusChange path uses `activity_reconciler_clear`; only that
+    // one may drive drainQueue / notifySessionIdle.
+    expect(isServerLinkResyncStatePayload({ state: 'idle', decisionReason: 'activity_reconciler_clear' })).toBe(false);
+    expect(isServerLinkResyncStatePayload({ state: 'idle' })).toBe(false);
+    expect(isServerLinkResyncStatePayload(null)).toBe(false);
+    expect(isServerLinkResyncStatePayload('server_link_resync')).toBe(false);
   });
 });

@@ -52,7 +52,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
-import { buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import { SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC, buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -1583,7 +1583,7 @@ export function resyncTransportSessionStatesAfterLinkRestore(
   for (const [sessionName, runtime] of list) {
     try {
       const built = buildTransportSessionStatePayload(sessionName, runtime, runtime.getStatus(), {
-        decisionReason: 'server_link_resync',
+        decisionReason: SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC,
         clearSource: 'server-link-resync',
         queueReason: 'server_link_resync',
       });
