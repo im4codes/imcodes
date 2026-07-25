@@ -98,6 +98,17 @@ async function waitForRunPhase(phase: 'execution' | 'auditing' | 'finalizing', t
   }
 }
 
+/** Wait until the automation has finished the run (no active run left).
+ *  Same real-check-queue yield as `waitForRunPhase`, so a terminal run cannot
+ *  be asserted before the automation has actually torn it down. */
+async function waitForRunEnd(timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (supervisionAutomation.getActiveRun('deck_supervision_brain') !== undefined) {
+    if (performance.now() >= deadline) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 let projectDir: string | null = null;
 
 beforeEach(() => {
@@ -1848,10 +1859,18 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-loop-one', 'implement the feature', snapshot);
     beginRun('cmd-loop-one', 'implement the feature');
 
+    // Each step waits for the phase it depends on instead of a fixed sleep.
+    // Dispatching the audit is async (broker decision + filesystem baseline
+    // discovery); sleep(25) covered that locally but not on a loaded CI runner.
+    // Completing the delegated audit before the run reached `auditing` derailed
+    // the sequence, and call[1] then held the audit-orchestration prompt rather
+    // than the rework brief — the macOS CI failure this replaces.
     completeTurn('implemented the feature');
-    await sleep(25);
+    await waitForRunPhase('auditing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
     completeDelegatedAudit('REWORK', 'first audit needs fixes');
-    await sleep(25);
+    await waitForRunPhase('execution');
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
@@ -1860,13 +1879,16 @@ describe('SupervisionAutomation', () => {
     });
 
     completeTurn('implemented the requested rework');
-    await sleep(25);
+    await waitForRunPhase('auditing');
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
     expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain('imcodes send --reply');
+
+    // maxAuditLoops = 1, so the second REWORK must end the run WITHOUT another
+    // rework dispatch. Wait for teardown, then assert the count never grew.
     completeDelegatedAudit('REWORK', 'second audit still needs fixes');
-    await sleep(25);
-    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    await waitForRunEnd();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
   });
 
   it('ignores deprecated combo auditMode and still starts exactly one lightweight peer audit', async () => {
