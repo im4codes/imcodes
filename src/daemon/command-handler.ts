@@ -6088,12 +6088,40 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
         if (result === 'sent') {
           emitTransportUserMessageEvent(sessionName, answer);
         } else {
+          // DEADLOCK BREAK. `queuePlacement: 'front'` only wins against other
+          // QUEUED messages — it still waits for the active turn to settle. But
+          // the active turn is usually the very turn that is paused ON this
+          // question, so it can only settle once the answer arrives: the answer
+          // waits for the turn, the turn waits for the answer, and the user sees
+          // "answered, nothing happened". Providers without
+          // `answerPendingQuestion` (everything except claude-code-sdk today)
+          // hit this on every dialog.
+          //
+          // A dialog answer is a control response, not an ordinary queued send
+          // (see CLAUDE.md: approval/feedback responses must use the priority
+          // path and must not be blocked by the ordinary send queue). `cancel()`
+          // is exactly that priority path: it cuts in line, settles the active
+          // turn LOCALLY without waiting on the provider, keeps queued messages
+          // intact, and then drains — so our front entry becomes the next turn
+          // immediately. This is the "force-interrupt that re-steers the model"
+          // the branch above always intended.
+          //
+          // The drain emits the visible `user.message` for the queued entry, so
+          // do NOT emit it here as well or the answer renders twice.
           timelineEmitter.emit(
             sessionName,
             'session.state',
             buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_ask_answer'),
             { source: 'daemon', confidence: 'high' },
           );
+          try {
+            await runtime.cancel();
+          } catch (err) {
+            logger.warn(
+              { err, sessionName },
+              'ask.answer: force-interrupt of the paused turn failed; answer stays queued at the front',
+            );
+          }
         }
       } else {
         // Timed out / already self-continued and no live runtime snapshot is
