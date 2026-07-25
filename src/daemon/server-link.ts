@@ -21,7 +21,7 @@ import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
-import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -34,6 +34,11 @@ import {
   stringifyForServerSend,
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
+import { incrementCounter } from '../util/metrics.js';
+import {
+  TIMELINE_DELIVERY_METRICS,
+  countableTimelineEventType,
+} from '../../shared/timeline-delivery-telemetry.js';
 
 interface SystemStats {
   cpu: number;
@@ -155,6 +160,10 @@ const WATCHDOG_MS = 10_000;           // check connection health every 10s
 // getOpenSocketSilenceMs() still prevents this from false-reconnecting a healthy
 // socket during the daemon's own load spikes (it reports 0 silence then).
 const SILENT_CONNECTION_RECYCLE_MS = 30_000;
+// Throttle for the dropped-timeline-event warning. The counter records every
+// drop; the log line is a human-facing heartbeat so a flapping link is visible
+// in daemon.log without one line per lost message.
+const TIMELINE_DROP_LOG_THROTTLE_MS = 30_000;
 // Event-loop stall guard. Under heavy local load the daemon's event loop can
 // freeze for tens of seconds. The silence-based reconnects measure
 // `now - lastPong`, which during a freeze blames the SERVER for the daemon's
@@ -270,6 +279,9 @@ export class ServerLink {
    *  reconnect state-resync so a daemon's FIRST connect (startup already runs
    *  its own full session sync) does not double-broadcast. */
   private hadConnectedBefore = false;
+  /** Running total of content-bearing timeline events dropped while link down. */
+  private timelineDropsWhileLinkDown = 0;
+  private lastTimelineDropLogAt = 0;
   private lastPong = 0;               // timestamp of last received message (any message counts as proof of life)
   private seq = 0;
   private readonly workerUrl: string;
@@ -515,6 +527,15 @@ export class ServerLink {
       // since the daemon must never die from transient disconnects.
       // Callers that need delivery confirmation should check isConnected()
       // or await a response event before acting on `send()`.
+      //
+      // "Silently" used to be literal. Live timeline events are control-plane, so
+      // this branch is where a chat message vanishes with no queue and no replay
+      // — the browser then only recovers it via a no-lower-bound backfill. Now
+      // that activation/reconnect heals that automatically, an increase in the
+      // underlying drop rate would be invisible, so count it. Only
+      // content-bearing events are counted; `agent.status` fires ~1/s during a
+      // turn and would bury the signal.
+      this.recordTimelineDropWhileLinkDown(msg);
       return false;
     }
     try {
@@ -778,6 +799,34 @@ export class ServerLink {
       helloEpoch: this.helloEpoch,
       sentAt,
     });
+  }
+
+  /**
+   * Count a content-bearing timeline event lost because the link was down.
+   *
+   * Periodically warns with the running total so a flapping link shows up in the
+   * daemon log as an accumulating number instead of silence. The counter itself
+   * is the durable signal; the log line is for humans reading `daemon.log`.
+   */
+  private recordTimelineDropWhileLinkDown(msg: unknown): void {
+    if (messageTypeOf(msg) !== TIMELINE_MESSAGES.EVENT) return;
+    const eventType = countableTimelineEventType((msg as { event?: unknown } | null)?.event);
+    if (!eventType) return;
+    incrementCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType });
+    this.timelineDropsWhileLinkDown += 1;
+    const now = Date.now();
+    if (now - this.lastTimelineDropLogAt < TIMELINE_DROP_LOG_THROTTLE_MS) return;
+    this.lastTimelineDropLogAt = now;
+    logger.warn({
+      droppedTotal: this.timelineDropsWhileLinkDown,
+      eventType,
+      readyState: this.ws?.readyState ?? 'no-socket',
+    }, 'ServerLink: dropped content-bearing timeline event while link was down (browser must heal via backfill)');
+  }
+
+  /** Total content-bearing timeline events dropped while the link was down. */
+  get timelineDropCountWhileLinkDown(): number {
+    return this.timelineDropsWhileLinkDown;
   }
 
   /** Reports whether the underlying WebSocket is currently OPEN. */

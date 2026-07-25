@@ -115,6 +115,10 @@ import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDisc
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import { resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import logger from '../util/logger.js';
+import {
+  TIMELINE_DELIVERY_METRICS,
+  countableTimelineEventType,
+} from '../../../shared/timeline-delivery-telemetry.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -590,6 +594,9 @@ type TimelineDataPlaneJob = {
 const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
 let idlePushSettleMs = process.env.NODE_ENV === 'test' ? 0 : 300;
+// Human-facing heartbeat for no-subscriber drops. The counter records each one;
+// this keeps the log readable when a whole app-background window is discarded.
+const TIMELINE_NO_SUBSCRIBER_LOG_THROTTLE_MS = 30_000;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
 const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 // Bumped from 128 → 4096 and 15s → 60s as part of the commit-42dfabec
@@ -1216,6 +1223,9 @@ export class WsBridge {
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
+  /** Content-bearing timeline events discarded because nobody was subscribed. */
+  private timelineNoSubscriberDrops = 0;
+  private lastTimelineNoSubscriberLogAt = 0;
   private pendingIdlePushes = new Map<string, {
     timer: ReturnType<typeof setTimeout> | null;
     db: Database;
@@ -4522,7 +4532,8 @@ export class WsBridge {
       // Bypass TerminalForwardQueue: timeline events are control-plane and
       // must never queue behind PTY data. Critical for cancel/stop UX —
       // session.state(idle) used to arrive seconds after the push notification.
-      this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
+      const timelineRecipients = this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
+      this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
       return;
     }
 
@@ -5165,7 +5176,7 @@ export class WsBridge {
    *    subscriptions to); we dedup per-WS so the same JSON is never sent
    *    twice.
    */
-  private sendJsonToSessionSubscribers(sessionName: string, json: string): void {
+  private sendJsonToSessionSubscribers(sessionName: string, json: string): number {
     const sent = new Set<WebSocket>();
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
@@ -5185,6 +5196,47 @@ export class WsBridge {
       sent.add(ws);
       safeSend(ws, outgoing);
     }
+    return sent.size;
+  }
+
+  /**
+   * Observe the fan-out result for a live timeline event.
+   *
+   * With zero subscribers both loops in `sendJsonToSessionSubscribers` simply never
+   * execute a body: the event is discarded with no queue, no replay and — until now
+   * — no trace. That is the normal state of a BACKGROUNDED app, which is exactly why
+   * "the push notification arrived but the chat was empty" was so reproducible. The
+   * browser now heals this with a no-lower-bound backfill on activation, so without
+   * a counter a rising drop rate would be permanently masked by recovery.
+   *
+   * Takes the already-parsed event and the recipient count the fan-out returned:
+   * this runs for every event of every session, so it must not re-parse the
+   * serialized copy. Only content-bearing events are counted; status/usage chatter
+   * fires about once a second during a turn and would drown the signal.
+   */
+  private recordTimelineFanout(sessionName: string, event: unknown, recipientCount: number): void {
+    const eventType = countableTimelineEventType(event);
+    if (!eventType) return;
+    if (recipientCount > 0) {
+      incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_DELIVERED, { eventType });
+      return;
+    }
+    incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_NO_SUBSCRIBER_DROPPED, { eventType });
+    this.timelineNoSubscriberDrops += 1;
+    const now = Date.now();
+    if (now - this.lastTimelineNoSubscriberLogAt < TIMELINE_NO_SUBSCRIBER_LOG_THROTTLE_MS) return;
+    this.lastTimelineNoSubscriberLogAt = now;
+    logger.warn({
+      serverId: this.serverId,
+      sessionName,
+      eventType,
+      droppedTotal: this.timelineNoSubscriberDrops,
+    }, 'Timeline event discarded: no subscribed viewer (client must heal via backfill)');
+  }
+
+  /** Total content-bearing timeline events discarded for lack of a subscriber. */
+  get timelineNoSubscriberDropCount(): number {
+    return this.timelineNoSubscriberDrops;
   }
 
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {

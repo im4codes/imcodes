@@ -16,6 +16,8 @@ vi.mock('../../src/util/daemon-status.js', () => ({
 }));
 
 import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests, setServerLinkReconnectResyncHandler } from '../../src/daemon/server-link.js';
+import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
@@ -342,6 +344,50 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledTimes(2);
     // The previous WS instance must have been explicitly closed.
     expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts content-bearing timeline events dropped while the link is down', () => {
+    // This branch is where a chat message vanishes: live timeline events are
+    // control-plane, so a non-OPEN socket drops them with no queue and no replay.
+    // The browser now heals it via a no-lower-bound backfill, so without this
+    // counter a rising drop rate would be masked by the recovery.
+    resetMetricsForTests();
+    mockWsInstance.readyState = 3; // CLOSED
+
+    const before = getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'assistant.text' });
+    expect(link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'assistant.text', eventId: 'e1', sessionId: 's', ts: 1, payload: { text: 'lost' } },
+    })).toBeUndefined();
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'assistant.text' }))
+      .toBe(before + 1);
+    expect(link.timelineDropCountWhileLinkDown).toBe(1);
+  });
+
+  it('does not count high-frequency status chatter as a lost message', () => {
+    // agent.status fires ~1/s during a turn; counting it would bury the signal.
+    resetMetricsForTests();
+    mockWsInstance.readyState = 3;
+
+    link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'agent.status', eventId: 'e2', sessionId: 's', ts: 2, payload: { status: 'thinking' } },
+    });
+    link.send({ type: 'heartbeat' });
+
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'agent.status' })).toBe(0);
+    expect(link.timelineDropCountWhileLinkDown).toBe(0);
+  });
+
+  it('counts nothing while the link is OPEN', () => {
+    resetMetricsForTests();
+    mockWsInstance.readyState = 1; // OPEN
+    link.connect();
+    link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'assistant.text', eventId: 'e3', sessionId: 's', ts: 3, payload: { text: 'delivered' } },
+    });
+    expect(link.timelineDropCountWhileLinkDown).toBe(0);
   });
 
   it('fires the reconnect state-resync handler on RE-connect only, not the first connect', async () => {
