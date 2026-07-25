@@ -2012,7 +2012,21 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Stamp when the pin banner toggles so the ResizeObserver can tell its own
   // ~60px height shift apart from a genuine viewport resize (sub-session bar,
   // keyboard) and skip re-pinning to bottom for the former. See bannerToggleAtRef.
+  //
+  // Compare against the previous value instead of just running on the dep change:
+  // an effect keyed on `[pinnedAboveViewport]` ALSO runs on mount, which stamped a
+  // 300ms suppression window over the most layout-unstable moment there is — the
+  // first frames after a page refresh, when `--vvh` is applied from an effect, the
+  // composer rehydrates its saved draft, and the sub-session bar runs its 200ms
+  // max-height transition. Every one of those shrinks `.chat-view` while
+  // `scrollTop` stays put (the list sets `overflow-anchor: none`, so the engine
+  // never compensates), and the suppressed ResizeObserver consumed the change
+  // without re-pinning — leaving the view permanently a little above the bottom
+  // after every reload. Mount is not a toggle, so it must not stamp.
+  const prevPinnedAboveViewportRef = useRef(pinnedAboveViewport);
   useEffect(() => {
+    if (prevPinnedAboveViewportRef.current === pinnedAboveViewport) return;
+    prevPinnedAboveViewportRef.current = pinnedAboveViewport;
     bannerToggleAtRef.current = Date.now();
   }, [pinnedAboveViewport]);
 
