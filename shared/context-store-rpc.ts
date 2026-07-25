@@ -39,6 +39,9 @@ export type ContextStoreRpcPriority =
 
 // ── L1: allowlisted direct store wrappers (each maps 1:1 to a context-store.ts export) ──
 export const CONTEXT_STORE_L1_OPS = [
+  // memory short-ref handle map (ref → id), durable across daemon restarts
+  'listMemoryShortRefs',
+  'upsertMemoryShortRefs',
   // reads
   'getProcessedProjectionById',
   'listProcessedProjections',

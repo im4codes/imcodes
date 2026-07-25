@@ -445,6 +445,21 @@ function ensureDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS idx_pinned_namespace ON context_pinned_notes(namespace_key);
 
+    -- ref → id map for the compact memory handles injected into agent context.
+    -- Durable so a handle still resolves after a daemon restart. Replaces a
+    -- whole-file JSON rewrite per registration whose failures were swallowed —
+    -- a full disk silently stopped persisting handles entirely.
+    CREATE TABLE IF NOT EXISTS memory_short_refs (
+      ref TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      id TEXT NOT NULL,
+      namespace_key TEXT NOT NULL DEFAULT '',
+      namespace_json TEXT,
+      last_seen_at INTEGER NOT NULL,
+      PRIMARY KEY (ref, kind, id, namespace_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_short_refs_seen ON memory_short_refs(last_seen_at);
+
     CREATE TABLE IF NOT EXISTS context_replication_state (
       namespace_key TEXT PRIMARY KEY,
       pending_projection_ids_json TEXT NOT NULL,
@@ -2736,6 +2751,57 @@ export function listPinnedNotes(namespaceKey: string): PinnedNote[] {
     origin: isMemoryOrigin(row.origin) ? row.origin : 'manual_pin',
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
+  }));
+}
+
+export interface MemoryShortRefRow {
+  ref: string;
+  kind: string;
+  id: string;
+  namespaceKey: string;
+  namespaceJson: string | null;
+  lastSeenAt: number;
+}
+
+/** Persist memory handles. Batched into one transaction: the in-memory index
+ *  registers a whole injected block at once. */
+export function upsertMemoryShortRefs(rows: readonly MemoryShortRefRow[]): number {
+  if (rows.length === 0) return 0;
+  const database = ensureDb();
+  const statement = database.prepare(`
+    INSERT INTO memory_short_refs (ref, kind, id, namespace_key, namespace_json, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(ref, kind, id, namespace_key) DO UPDATE SET
+      namespace_json = excluded.namespace_json,
+      last_seen_at = excluded.last_seen_at
+  `);
+  database.exec('BEGIN');
+  try {
+    for (const row of rows) {
+      statement.run(row.ref, row.kind, row.id, row.namespaceKey, row.namespaceJson, row.lastSeenAt);
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+  return rows.length;
+}
+
+/** Newest-first so a bounded warm-load keeps the most recently used handles. */
+export function listMemoryShortRefs(limit?: number): MemoryShortRefRow[] {
+  const database = ensureDb();
+  const sql = 'SELECT * FROM memory_short_refs ORDER BY last_seen_at DESC'
+    + (typeof limit === 'number' && limit > 0 ? ' LIMIT ?' : '');
+  const statement = database.prepare(sql);
+  const rows = (typeof limit === 'number' && limit > 0 ? statement.all(limit) : statement.all()) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    ref: String(row.ref),
+    kind: String(row.kind),
+    id: String(row.id),
+    namespaceKey: String(row.namespace_key ?? ''),
+    namespaceJson: row.namespace_json == null ? null : String(row.namespace_json),
+    lastSeenAt: Number(row.last_seen_at),
   }));
 }
 

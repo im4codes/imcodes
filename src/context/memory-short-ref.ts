@@ -1,6 +1,7 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -140,7 +141,7 @@ function ensurePersistedLoaded(): void {
   }
 }
 
-function persistShortRefs(): void {
+function persistShortRefsToFile(): void {
   const path = shortRefStorePath();
   if (!path) return;
   const entries: Array<{ ref: string } & MemoryShortRefEntry> = [];
@@ -156,6 +157,87 @@ function persistShortRefs(): void {
     }), 'utf8');
   } catch {
     // Ref persistence is a convenience cache. Do not break memory search/source reads.
+  }
+}
+
+/**
+ * Persist the handles just registered.
+ *
+ * Default path is the context store (SQLite): an incremental upsert of only the
+ * touched rows, rather than rewriting a whole JSON file on every registration —
+ * that rewrite silently stopped persisting anything once the disk filled up,
+ * because the write error was swallowed. Fire-and-forget so the synchronous
+ * registration path (called from render functions) never blocks on I/O.
+ *
+ * `IMCODES_MEMORY_SHORT_REF_PATH` still selects the JSON file, which keeps tests
+ * hermetic and gives a debuggable plain-text dump.
+ */
+function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemoryShortRefEntry }>): void {
+  if (shortRefStorePath()) {
+    persistShortRefsToFile();
+    return;
+  }
+  if (touched.length === 0) return;
+  const rows = touched.map(({ ref, entry }) => ({
+    ref,
+    kind: entry.kind,
+    id: entry.id,
+    namespaceKey: namespaceKey(entry.namespace),
+    namespaceJson: entry.namespace ? JSON.stringify(entry.namespace) : null,
+    lastSeenAt: entry.lastSeenAt ?? Date.now(),
+  }));
+  void getContextStoreClient()
+    .run('upsertMemoryShortRefs', [rows])
+    .catch(() => {
+      // Non-fatal: the in-memory index still serves this process, handles are a
+      // pure function of the id, and sourceLookup full ids remain canonical.
+    });
+}
+
+/**
+ * Warm the in-memory index from the context store once at daemon startup.
+ *
+ * Resolution stays synchronous (it is called from synchronous render paths), so
+ * the store is read once here instead of per lookup. Handles registered before
+ * this resolves are unaffected — the in-memory index is authoritative in-process.
+ */
+export async function loadMemoryShortRefsFromStore(): Promise<number> {
+  if (shortRefStorePath()) return 0;
+  try {
+    const rows = await getContextStoreClient()
+      .run<Array<Record<string, unknown>>>('listMemoryShortRefs', [MAX_SHORT_REF_ENTRIES]);
+    if (!Array.isArray(rows)) return 0;
+    let loaded = 0;
+    for (const row of rows) {
+      const normalized = normalizeEntry({
+        ref: row.ref,
+        kind: row.kind,
+        id: row.id,
+        lastSeenAt: row.lastSeenAt,
+        namespace: typeof row.namespaceJson === 'string' ? safeParseNamespace(row.namespaceJson) : undefined,
+      });
+      if (!normalized) continue;
+      const bucket = entriesByRef.get(normalized.ref) ?? [];
+      if (bucket.some((entry) => entry.kind === normalized.entry.kind
+        && entry.id === normalized.entry.id
+        && sameNamespace(entry.namespace, normalized.entry.namespace))) continue;
+      bucket.push(normalized.entry);
+      entriesByRef.set(normalized.ref, bucket);
+      loaded += 1;
+    }
+    pruneShortRefs();
+    persistedLoaded = true;
+    return loaded;
+  } catch {
+    return 0;
+  }
+}
+
+function safeParseNamespace(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
   }
 }
 
@@ -199,7 +281,7 @@ export function registerMemoryShortRef(entry: MemoryShortRefEntry): string {
   ensurePersistedLoaded();
   const ref = registerMemoryShortRefWithoutPersist(entry);
   pruneShortRefs();
-  persistShortRefs();
+  persistShortRefs([{ ref, entry }]);
   return ref;
 }
 
@@ -215,7 +297,7 @@ export function registerMemoryShortRefs(entries: readonly MemoryShortRefEntry[])
   const refs = entries.map((entry) => registerMemoryShortRefWithoutPersist(entry));
   if (refs.length > 0) {
     pruneShortRefs();
-    persistShortRefs();
+    persistShortRefs(refs.map((ref, index) => ({ ref, entry: entries[index]! })));
   }
   return refs;
 }
