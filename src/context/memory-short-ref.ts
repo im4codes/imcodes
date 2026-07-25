@@ -2,6 +2,8 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { warnOncePerHour } from '../util/rate-limited-warn.js';
+import { incrementCounter } from '../util/metrics.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -188,9 +190,17 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
   }));
   void getContextStoreClient()
     .run('upsertMemoryShortRefs', [rows])
-    .catch(() => {
-      // Non-fatal: the in-memory index still serves this process, handles are a
-      // pure function of the id, and sourceLookup full ids remain canonical.
+    .catch((error: unknown) => {
+      // Non-fatal for this process — the in-memory index still resolves, handles
+      // are a pure function of the id, and sourceLookup full ids stay canonical.
+      // But it IS the failure this change exists to make visible: handles that
+      // never land stop resolving after a restart. Surface it rather than
+      // repeating the swallowed-write bug in a new location.
+      incrementCounter('mem.startup.silent_failure', { source: 'memory-short-ref-upsert' });
+      warnOncePerHour('mem.startup.silent_failure.memory-short-ref-upsert', {
+        error: error instanceof Error ? error.message : String(error),
+        rows: rows.length,
+      });
     });
 }
 

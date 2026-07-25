@@ -2775,14 +2775,18 @@ export function upsertMemoryShortRefs(rows: readonly MemoryShortRefRow[]): numbe
       namespace_json = excluded.namespace_json,
       last_seen_at = excluded.last_seen_at
   `);
-  database.exec('BEGIN');
+  // IMMEDIATE, like every other write transaction here: the worker and the
+  // startup cold-fallback path can both hold a write connection, and a deferred
+  // transaction upgrading to a write under WAL fails with SQLITE_BUSY instead of
+  // waiting for the lock.
+  database.exec('BEGIN IMMEDIATE');
   try {
     for (const row of rows) {
       statement.run(row.ref, row.kind, row.id, row.namespaceKey, row.namespaceJson, row.lastSeenAt);
     }
     database.exec('COMMIT');
   } catch (error) {
-    database.exec('ROLLBACK');
+    try { database.exec('ROLLBACK'); } catch { /* a failing rollback must not mask the original error */ }
     throw error;
   }
   return rows.length;
