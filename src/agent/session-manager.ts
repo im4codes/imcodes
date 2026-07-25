@@ -1587,7 +1587,17 @@ export function resyncTransportSessionStatesAfterLinkRestore(
         clearSource: 'server-link-resync',
         queueReason: 'server_link_resync',
       });
-      timelineEmitter.emit(sessionName, 'session.state', built.payload, {
+      // A resync RE-STATES what the daemon already knew; it is never a fresh
+      // completion, so it must never raise a push. Without this every link
+      // restore fanned one "Task complete" notification per idle session:
+      // observed live on the 43 deployment as ~90 dispatches inside 500ms,
+      // 276ms after four daemons re-authenticated following a gateway blip. The
+      // server's age guard cannot catch these because the events are newly
+      // minted (ts = now) even though the state they describe is old.
+      timelineEmitter.emit(sessionName, 'session.state', {
+        ...built.payload,
+        [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
+      }, {
         source: 'daemon',
         confidence: 'high',
         eventId: `transport-state-resync:${sessionName}:${epoch}`,

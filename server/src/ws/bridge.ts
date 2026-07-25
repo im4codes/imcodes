@@ -123,6 +123,7 @@ import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
+import { isServerLinkResyncStatePayload } from '../../../shared/session-activity-types.js';
 import {
   DAEMON_UPGRADE_DELIVERY_STATUS,
 } from '../../../shared/daemon-upgrade.js';
@@ -2790,6 +2791,20 @@ export class WsBridge {
             const payload = event.payload as Record<string, unknown>;
             const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
             if (payload[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
+            // A daemon link-restore resync re-states every session's CURRENT
+            // state so browsers stop rendering a stale "working" spinner. It is
+            // a re-announcement, never a fresh completion, so it must not push:
+            // one link restore would otherwise fan one "Task complete" per idle
+            // session (seen on the 43 deployment as ~90 dispatches in 500ms right
+            // after four daemons re-authenticated). The age guard below cannot
+            // catch it — resync events are newly minted even though the state
+            // they describe is old.
+            //
+            // Checked HERE as well as suppressed at the daemon, on purpose:
+            // daemons are user-installed and upgrade on their own schedule, so a
+            // daemon-only fix leaves every not-yet-updated daemon still storming
+            // until it happens to update. This makes a server deploy sufficient.
+            if (isServerLinkResyncStatePayload(payload)) return;
             if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
             this.scheduleIdleEventPush(db, env, {
               type: 'session.idle',

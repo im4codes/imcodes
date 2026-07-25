@@ -28,6 +28,7 @@ import {
   setSessionPersistCallback,
 } from '../../src/agent/session-manager.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import {
   SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC,
   isAuthoritativeIdlePayloadShape,
@@ -184,6 +185,29 @@ describe('server-link resync payload marking', () => {
       expect(payload.state).toBe('idle');
       expect(payload.decisionReason).toBe(SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC);
       expect(isServerLinkResyncStatePayload(payload)).toBe(true);
+    } finally {
+      emitSpy.mockRestore();
+    }
+  });
+
+  it('marks the resync idle as push-suppressed so a link restore cannot fan notifications', () => {
+    // The 43-deployment storm: a gateway blip dropped four daemons' sockets, all
+    // reconnected, and 276ms later ~90 push dispatches went out inside 500ms —
+    // one "Task complete" per idle session, quoting long-finished work. The
+    // server's PUSH_TIMELINE_EVENT_MAX_AGE_MS guard cannot catch these because a
+    // resync event is newly minted even though the state it reports is old, so
+    // the suppression has to be explicit.
+    // Local spy: this describe block has no shared one (see the sibling test).
+    const emitSpy = vi.spyOn(timelineEmitter, 'emit').mockImplementation(() => null as never);
+    try {
+      resyncTransportSessionStatesAfterLinkRestore([
+        [IDLE_SESSION, makeRuntime({ status: 'idle' })],
+      ]);
+      const [, , payload] = emitSpy.mock.calls[0] as unknown as [string, string, Record<string, unknown>];
+      expect(payload[TIMELINE_SUPPRESS_PUSH_FIELD]).toBe(true);
+      // Suppressing the push must NOT weaken the idle: the whole point of the
+      // resync is to un-stick a "working" footer, which a weak idle cannot do.
+      expect(isAuthoritativeIdlePayloadShape(payload)).toBe(true);
     } finally {
       emitSpy.mockRestore();
     }
