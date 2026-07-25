@@ -148,8 +148,12 @@ function ensurePersistedLoaded(): void {
       }
     }
     pruneShortRefs();
-  } catch {
-    // Missing or corrupt cache is non-fatal: sourceLookup full ids remain canonical.
+  } catch (error) {
+    // A missing file is the normal first run. Anything else — unreadable, or
+    // corrupt JSON — silently strands every handle written before this start,
+    // which is the same invisible failure this module exists to avoid.
+    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return;
+    reportShortRefFailure('load_file', error, { path });
   }
 }
 
@@ -180,7 +184,7 @@ function persistShortRefsToFile(): void {
  * hourly-throttled warning. `stage` is a constant per call site — error text and
  * volatile fields stay in the warning payload, never in metric labels.
  */
-function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load', error: unknown, extra: Record<string, unknown> = {}): void {
+function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load' | 'load_file', error: unknown, extra: Record<string, unknown> = {}): void {
   incrementCounter('mem.short_ref.persist_failure', { stage });
   warnOncePerHour(`mem.short_ref.persist_failure.${stage}`, {
     ...extra,
@@ -237,7 +241,13 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
   try {
     const rows = await getContextStoreClient()
       .run<Array<Record<string, unknown>>>('listMemoryShortRefs', [MAX_SHORT_REF_ENTRIES]);
-    if (!Array.isArray(rows)) return 0;
+    if (!Array.isArray(rows)) {
+      // Contract violation rather than an ordinary failure, but the effect is
+      // the same as a failed load — report instead of returning a 0 that reads
+      // as "nothing stored".
+      reportShortRefFailure('warm_load', new Error('listMemoryShortRefs returned a non-array response'));
+      return 0;
+    }
     let loaded = 0;
     for (const row of rows) {
       const normalized = normalizeEntry({

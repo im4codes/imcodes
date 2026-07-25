@@ -1,9 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runMock, incrementCounterMock, warnOncePerHourMock } = vi.hoisted(() => ({
+const { runMock, incrementCounterMock, warnOncePerHourMock, writeFileSyncMock, mkdirSyncMock } = vi.hoisted(() => ({
   runMock: vi.fn(),
   incrementCounterMock: vi.fn(),
   warnOncePerHourMock: vi.fn(),
+  writeFileSyncMock: vi.fn(),
+  mkdirSyncMock: vi.fn(),
+}));
+
+// The production-route test below strips VITEST/NODE_ENV so it exercises the
+// real routing. Should the routing regress, the file branch would reactivate and
+// write to the runner's actual home directory — a red test must never touch a
+// developer's real data, and the true-negative procedure for this file would
+// trigger exactly that. Stub the writes so the failure state is hermetic, which
+// also lets the test assert positively that no file was written.
+vi.mock('node:fs', () => ({
+  writeFileSync: writeFileSyncMock,
+  mkdirSync: mkdirSyncMock,
+  readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
 }));
 
 vi.mock('../../src/store/context-store-worker-client.js', () => ({
@@ -84,6 +98,8 @@ describe('memory short refs — persistence failures stay observable', () => {
       expect(runMock).toHaveBeenCalledWith('upsertMemoryShortRefs', [
         expect.arrayContaining([expect.objectContaining({ id: entry.id, kind: 'projection' })]),
       ]);
+      // The file branch must stay dormant without an explicit path override.
+      expect(writeFileSyncMock).not.toHaveBeenCalled();
     } finally {
       if (priorVitest === undefined) delete process.env.VITEST;
       else process.env.VITEST = priorVitest;
