@@ -1,41 +1,17 @@
-export type MetricLabels = Record<string, string>;
-
-const counters = new Map<string, number>();
-const MAX_COUNTERS = 1000;
-
-function labelsKey(labels?: MetricLabels): string {
-  if (!labels) return '';
-  const entries = Object.entries(labels)
-    .filter(([, value]) => typeof value === 'string')
-    .sort(([a], [b]) => a.localeCompare(b));
-  return entries.map(([key, value]) => `${key}=${value}`).join(',');
-}
-
-function counterKey(name: string, labels?: MetricLabels): string {
-  const suffix = labelsKey(labels);
-  return suffix ? `${name}{${suffix}}` : name;
-}
-
-export function incrementCounter(name: string, labels?: MetricLabels): void {
-  addCounter(name, 1, labels);
-}
-
-export function addCounter(name: string, amount: number, labels?: MetricLabels): void {
-  if (!name) return;
-  if (!Number.isFinite(amount) || amount <= 0) return;
-  const key = counterKey(name, labels);
-  if (!counters.has(key) && counters.size >= MAX_COUNTERS) return;
-  counters.set(key, (counters.get(key) ?? 0) + amount);
-}
-
-export function getCounter(name: string, labels?: MetricLabels): number {
-  return counters.get(counterKey(name, labels)) ?? 0;
-}
-
-export function snapshotCounters(): Record<string, number> {
-  return Object.fromEntries(counters.entries());
-}
-
-export function resetMetricsForTests(): void {
-  counters.clear();
-}
+/**
+ * Server-facing entry point for in-process counters.
+ *
+ * The implementation lives in `shared/metrics.ts` so the daemon and the server
+ * cannot drift apart again. Note the scope: counters are per-process, and the
+ * server runs multiple replicas, so a number here reflects ONE pod's traffic and
+ * resets on every deploy.
+ */
+export {
+  addCounter,
+  counterKeyCount,
+  getCounter,
+  incrementCounter,
+  resetMetricsForTests,
+  snapshotCounters,
+} from '../../../shared/metrics.js';
+export type { MetricLabels } from '../../../shared/metrics.js';
