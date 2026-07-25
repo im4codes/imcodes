@@ -963,6 +963,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         // the caller can use. Expand every candidate and let the caller judge,
         // flagged so it is never mistaken for a single authoritative answer.
         if (candidates.length > 1) {
+          // The single-candidate path below rejects a kind that disagrees with
+          // the ref; the ambiguous path must enforce the same contract rather
+          // than quietly ignoring the caller's constraint.
+          if (kind && candidates.some((candidate) => candidate.kind !== kind)) {
+            return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied ref');
+          }
           const expanded = [];
           for (const candidate of candidates.slice(0, AMBIGUOUS_REF_CANDIDATE_CAP)) {
             const identity = candidate.kind === 'observation'
@@ -988,6 +994,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             status: 'ok',
             ref,
             ambiguousRef: true,
+            // Expansion is bounded, so say how many records the handle actually
+            // covers. Reporting only the expanded subset while calling it every
+            // match would send the caller away believing it had seen them all.
+            candidateCount: candidates.length,
+            truncated: candidates.length > expanded.length,
             candidates: expanded,
             sourceEventCount: 0,
             sources: [],

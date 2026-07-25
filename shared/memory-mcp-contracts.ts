@@ -272,7 +272,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source snippets by projection id, observation id, or compact ref. Use it after search_memory or startup memory for exact prior facts and provenance-sensitive answers. Missing and cross-namespace ids return the same empty list.',
+    description: 'Fetch source snippets by projection id, observation id, or compact ref. Use it after search_memory or startup memory for exact prior facts and provenance-sensitive answers. Missing and cross-namespace ids return the same empty list. Rarely a ref denotes more than one record; the reply then sets ambiguousRef with `sources` empty and every match under `candidates` (each with its own projectionId / observationId and sources), plus candidateCount and truncated. Do NOT read that empty `sources` as "no memory" — decide which candidate answers the question and cite it by its own id, never by the ambiguous ref.',
     inputSchema: objectSchema({
       projectionId: stringSchema('Projection id from search_memory.sourceLookup for projection hits. Caller identity and namespace are runtime-bound.'),
       observationId: stringSchema('Observation id from search_memory.sourceLookup for observation hits. Caller identity and namespace are runtime-bound.'),
@@ -284,8 +284,15 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       observationId: stringSchema('Requested observation id when expanding an observation hit.'),
       sources: { type: 'array', description: 'Source snippets visible to the caller namespace.', items: { type: 'object', additionalProperties: true } },
       projectionSource: { type: 'object', description: 'Processed projection summary snippet, included when available so callers can cite compacted memories even when raw source events are unavailable or less informative.', additionalProperties: true },
-      ambiguousRef: { type: 'boolean', description: 'Set when the supplied ref denotes more than one record, so `candidates` carries every match instead of `sources` carrying one. Decide which candidate answers the question, then cite it by its own projectionId / observationId.' },
-      candidates: { type: 'array', description: 'Every record the ambiguous ref resolves to, each with its own id and expanded sources.', items: { type: 'object', additionalProperties: true } },
+      status: stringSchema('Result status.'),
+      ref: stringSchema('The compact ref that was expanded, echoed back.'),
+      sourceEventCount: { type: 'number', description: 'Number of source events backing the requested record.' },
+      partial: { type: 'boolean', description: 'Set when some source events could not be returned.' },
+      originServerId: stringSchema('Server that owns the record, when it was fetched remotely.'),
+      ambiguousRef: { type: 'boolean', description: 'Set when the supplied ref denotes more than one record, so `candidates` carries the matches instead of `sources` carrying one. Decide which candidate answers the question, then cite it by its own projectionId / observationId.' },
+      candidateCount: { type: 'number', description: 'How many records the ambiguous ref covers in total, which may exceed the expanded `candidates`.' },
+      truncated: { type: 'boolean', description: 'Set when `candidates` holds only part of candidateCount because expansion is bounded.' },
+      candidates: { type: 'array', description: 'Records the ambiguous ref resolves to, each with its own id and expanded sources. Bounded — see candidateCount / truncated.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: {

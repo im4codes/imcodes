@@ -7,7 +7,7 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { makeMemoryShortRef, registerMemoryShortRef, resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
+import { makeMemoryShortRef, registerMemoryShortRef, resetMemoryShortRefsForTests, seedMemoryShortRefCollisionForTests } from '../../src/context/memory-short-ref.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 function caller(overrides: Partial<McpRuntimeCaller> = {}): McpRuntimeCaller {
@@ -258,6 +258,47 @@ describe('memory MCP tool schema firewall', () => {
       changed: true,
     });
     expect(archiveMemory).toHaveBeenCalledWith('proj-ref');
+  });
+
+  it('rejects a kind that disagrees with an ambiguous ref instead of expanding it', async () => {
+    // The single-candidate path validates the requested kind; the ambiguous
+    // path returned candidates regardless, silently dropping the caller's
+    // constraint. Resolver-level tests could not see this — it needs the handler.
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ref = registerMemoryShortRef({ kind: 'projection', id: 'collide-a', namespace });
+    registerMemoryShortRef({ kind: 'projection', id: 'collide-b', namespace });
+    // Force both onto one handle so the ambiguous branch is exercised.
+    seedMemoryShortRefCollisionForTests(ref, [
+      { kind: 'projection', id: 'collide-a', namespace },
+      { kind: 'projection', id: 'collide-b', namespace },
+    ]);
+    const getProcessedProjectionById = vi.fn(() => projection({ id: 'collide-a', namespace }));
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getProcessedProjectionById,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref, kind: 'observation' })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+  });
+
+  it('declares how many records an ambiguous ref covers when expansion is bounded', async () => {
+    // Expansion is capped, so a caller told it received "every match" would stop
+    // looking while the answer sat in an omitted record.
+    const namespace: ContextNamespace = { scope: 'personal', userId: 'user-1', projectId: 'repo-1' };
+    const ids = ['c1', 'c2', 'c3', 'c4', 'c5'];
+    const ref = registerMemoryShortRef({ kind: 'projection', id: ids[0]!, namespace });
+    seedMemoryShortRefCollisionForTests(ref, ids.map((id) => ({ kind: 'projection' as const, id, namespace })));
+    const handlers = createMemoryMcpToolHandlers(caller({ namespace }), {
+      getProcessedProjectionById: vi.fn((id: string) => projection({ id, namespace })),
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]({ ref }) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: 'ok', ambiguousRef: true, candidateCount: 5, truncated: true });
+    expect((result.candidates as unknown[]).length).toBeLessThan(5);
   });
 
   it('short-circuits memory disabled gates before backend calls', async () => {

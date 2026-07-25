@@ -4,6 +4,7 @@ import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
+import logger from '../util/logger.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -86,8 +87,8 @@ function pruneShortRefs(): void {
  * process wasn't a test, which inverted the intended routing: tests took the
  * store path while real daemons kept writing the JSON file, so the migration off
  * that file (and the failure reporting added alongside it) never executed
- * anywhere it mattered. Handles are a pure function of the id and re-register on
- * the next injection, so no import of the legacy file is needed.
+ * anywhere it mattered. Handles written to that file while it was still the
+ * write target are carried over once by importLegacyShortRefFile().
  */
 function shortRefStorePath(): string | undefined {
   const configured = process.env.IMCODES_MEMORY_SHORT_REF_PATH?.trim();
@@ -131,7 +132,13 @@ function importLegacyShortRefFile(): Array<{ ref: string; entry: MemoryShortRefE
       entriesByRef.set(normalized.ref, bucket);
       imported.push(normalized);
     }
-    if (imported.length > 0) incrementCounter('mem.short_ref.legacy_import', { source: 'json_file' });
+    if (imported.length > 0) {
+      incrementCounter('mem.short_ref.legacy_import', { source: 'json_file' });
+      // The counter lives in an in-process map that a restart clears, so the
+      // "has this stopped finding anything yet" question needs a durable line
+      // in the log too — that is the signal for retiring the fallback.
+      logger.info({ imported: imported.length, path }, 'memory short-ref: imported handles from the retired JSON cache');
+    }
   } catch (error) {
     // A missing file is the expected steady state once everyone has migrated.
     if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
@@ -228,6 +235,14 @@ function persistShortRefsToFile(): void {
  * hourly-throttled warning. `stage` is a constant per call site — error text and
  * volatile fields stay in the warning payload, never in metric labels.
  */
+/** Rows dropped while loading are a silent form of handle loss, so count them
+ *  under a fixed-cardinality source and warn once per hour. */
+function reportDiscardedShortRefRows(source: 'warm_load' | 'legacy_file' | 'json_file', discarded: number): void {
+  if (discarded <= 0) return;
+  incrementCounter('mem.short_ref.discarded_row', { source });
+  warnOncePerHour(`mem.short_ref.discarded_row.${source}`, { discarded });
+}
+
 function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load' | 'load_file', error: unknown, extra: Record<string, unknown> = {}): void {
   incrementCounter('mem.short_ref.persist_failure', { stage });
   warnOncePerHour(`mem.short_ref.persist_failure.${stage}`, {
@@ -293,6 +308,7 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       return 0;
     }
     let loaded = 0;
+    let discarded = 0;
     for (const row of rows) {
       const normalized = normalizeEntry({
         ref: row.ref,
@@ -301,7 +317,7 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
         lastSeenAt: row.lastSeenAt,
         namespace: typeof row.namespaceJson === 'string' ? safeParseNamespace(row.namespaceJson) : undefined,
       });
-      if (!normalized) continue;
+      if (!normalized) { discarded += 1; continue; }
       const bucket = entriesByRef.get(normalized.ref) ?? [];
       if (bucket.some((entry) => entry.kind === normalized.entry.kind
         && entry.id === normalized.entry.id
@@ -310,6 +326,10 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       entriesByRef.set(normalized.ref, bucket);
       loaded += 1;
     }
+    // A well-formed array of malformed rows loads nothing and leaves every
+    // earlier handle unresolvable — indistinguishable from an empty store
+    // unless the discards are reported.
+    reportDiscardedShortRefRows('warm_load', discarded);
     // Carry over anything still only in the retired JSON cache, and write it to
     // the store so the next start no longer depends on that file.
     const legacy = importLegacyShortRefFile();
@@ -439,6 +459,16 @@ export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace)
   // stays the strict boundary rather than deferring to a downstream check.
   if (namespace) return undefined;
   return bucket.length === 1 ? bucket[0] : undefined;
+}
+
+/**
+ * Force several records onto one handle. A 65-bit digest collision cannot be
+ * produced by registering real ids, so the ambiguous-handle paths would
+ * otherwise be untestable above the resolver.
+ */
+export function seedMemoryShortRefCollisionForTests(ref: string, entries: readonly MemoryShortRefEntry[]): void {
+  ensurePersistedLoaded();
+  entriesByRef.set(normalizeRef(ref), entries.map((entry) => ({ ...entry, lastSeenAt: entry.lastSeenAt ?? Date.now() })));
 }
 
 export function resetMemoryShortRefsForTests(): void {
