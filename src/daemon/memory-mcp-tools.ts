@@ -94,7 +94,10 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
-import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
+import { registerMemoryShortRef, resolveMemoryShortRef, resolveMemoryShortRefCandidates } from '../context/memory-short-ref.js';
+
+/** Upper bound on records expanded for one colliding handle. */
+const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import {
@@ -952,8 +955,45 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       if (!projectId) return emptySources();
       if (ref) {
-        const resolved = resolveMemoryShortRef(ref, scopedCaller.namespace);
-        if (!resolved) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
+        const candidates = resolveMemoryShortRefCandidates(ref, scopedCaller.namespace);
+        if (candidates.length === 0) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
+        // A digest collision (two records deriving one handle) should never
+        // happen at 65 bits. If it does, answering with one of them would be a
+        // silently wrong memory — but refusing outright throws away information
+        // the caller can use. Expand every candidate and let the caller judge,
+        // flagged so it is never mistaken for a single authoritative answer.
+        if (candidates.length > 1) {
+          const expanded = [];
+          for (const candidate of candidates.slice(0, AMBIGUOUS_REF_CANDIDATE_CAP)) {
+            const identity = candidate.kind === 'observation'
+              ? { kind: candidate.kind, observationId: candidate.id }
+              : { kind: candidate.kind, projectionId: candidate.id };
+            try {
+              if (candidate.kind === 'observation') {
+                expanded.push({ ...identity, ...(await memoryGetSources({ observationId: candidate.id, kind: 'observation' }, scopedCaller)) });
+                continue;
+              }
+              const candidateResult = await orchestrator(candidate.id, scopedCaller);
+              if (candidateResult.status === 'error') {
+                expanded.push({ ...identity, unavailable: candidateResult.message });
+                continue;
+              }
+              const { status: _candidateStatus, ...candidatePayload } = candidateResult;
+              expanded.push({ ...identity, ...candidatePayload });
+            } catch {
+              expanded.push({ ...identity, unavailable: 'expansion failed' });
+            }
+          }
+          return {
+            status: 'ok',
+            ref,
+            ambiguousRef: true,
+            candidates: expanded,
+            sourceEventCount: 0,
+            sources: [],
+          };
+        }
+        const resolved = candidates[0]!;
         if (kind && kind !== resolved.kind) {
           return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied ref');
         }

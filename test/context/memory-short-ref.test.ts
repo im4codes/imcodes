@@ -9,6 +9,7 @@ import {
   reloadMemoryShortRefsForTests,
   resetMemoryShortRefsForTests,
   resolveMemoryShortRef,
+  resolveMemoryShortRefCandidates,
 } from '../../src/context/memory-short-ref.js';
 
 describe('memory short refs', () => {
@@ -108,6 +109,24 @@ describe('memory short refs', () => {
     expect(resolveMemoryShortRef(ref)).toMatchObject({
       id: 'dddddddddd-1111-2222-3333-444444444444',
     });
+  });
+
+  it('surfaces every record behind a colliding handle so a reader can choose', () => {
+    // Refusing outright would throw away information the caller can use, so read
+    // paths get all matches; only callers that ACT on the result (see the strict
+    // accessor below) refuse.
+    const namespace = { scope: 'user_private' as const, userId: 'user-1', projectId: 'repo-1' };
+    const ref = 'obs:collide000001';
+    seedColliding(ref, [
+      { kind: 'observation', id: 'aaaa1111-2222-3333-4444-555555555555', namespace, lastSeenAt: 100 },
+      { kind: 'observation', id: 'bbbb9999-8888-7777-6666-666666666666', namespace, lastSeenAt: 200 },
+    ]);
+
+    const candidates = resolveMemoryShortRefCandidates(ref, namespace);
+    expect(candidates.map((entry) => entry.id).sort()).toEqual([
+      'aaaa1111-2222-3333-4444-555555555555',
+      'bbbb9999-8888-7777-6666-666666666666',
+    ]);
   });
 
   it('refuses to resolve a same-namespace collision instead of guessing the newest', () => {

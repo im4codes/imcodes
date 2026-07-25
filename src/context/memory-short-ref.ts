@@ -396,25 +396,40 @@ export function registerMemoryShortRefs(entries: readonly MemoryShortRefEntry[])
   return refs;
 }
 
+/**
+ * Every record in this namespace that derived `ref` — normally one.
+ *
+ * Registration keys entries by (kind, id, namespace), so two survivors mean a
+ * genuine digest collision. Rather than silently answering with one of them,
+ * read paths can surface both and let the caller pick; a 65-bit collision should
+ * never occur, so it is also counted and warned about.
+ */
+export function resolveMemoryShortRefCandidates(ref: string, namespace: ContextNamespace): MemoryShortRefEntry[] {
+  ensurePersistedLoaded();
+  const bucket = entriesByRef.get(normalizeRef(ref));
+  if (!bucket || bucket.length === 0) return [];
+  const sameNs = bucket.filter((entry) => sameNamespace(entry.namespace, namespace));
+  if (sameNs.length > 1) {
+    incrementCounter('mem.short_ref.collision', { kind: sameNs[0]!.kind });
+    warnOncePerHour('mem.short_ref.collision', {
+      ref: normalizeRef(ref),
+      ids: sameNs.map((entry) => entry.id).slice(0, 4),
+    });
+  }
+  return sameNs;
+}
+
 export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace): MemoryShortRefEntry | undefined {
   ensurePersistedLoaded();
   const bucket = entriesByRef.get(normalizeRef(ref));
   if (!bucket || bucket.length === 0) return undefined;
   if (namespace) {
-    const sameNs = bucket.filter((entry) => sameNamespace(entry.namespace, namespace));
-    // Registration keys entries by (kind, id, namespace), so more than one
-    // survivor here means two different records genuinely derived the same
-    // handle. Picking the newest would hand back the wrong memory with no
-    // signal — the exact failure this handle scheme exists to prevent. At 65
-    // bits this should never happen, so treat it as unresolvable and report it.
-    if (sameNs.length > 1) {
-      incrementCounter('mem.short_ref.collision', { kind: sameNs[0]!.kind });
-      warnOncePerHour('mem.short_ref.collision', {
-        ref: normalizeRef(ref),
-        ids: sameNs.map((entry) => entry.id).slice(0, 4),
-      });
-      return undefined;
-    }
+    const sameNs = resolveMemoryShortRefCandidates(ref, namespace);
+    // More than one survivor means two different records genuinely derived the
+    // same handle. Callers that ACT on the result (archive/delete/update) must
+    // never operate on a guess, so this strict accessor refuses. Read paths can
+    // use resolveMemoryShortRefCandidates and present the alternatives instead.
+    if (sameNs.length > 1) return undefined;
     const exact = sameNs[0];
     if (exact) return exact;
   }

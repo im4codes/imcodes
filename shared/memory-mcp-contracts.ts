@@ -284,6 +284,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       observationId: stringSchema('Requested observation id when expanding an observation hit.'),
       sources: { type: 'array', description: 'Source snippets visible to the caller namespace.', items: { type: 'object', additionalProperties: true } },
       projectionSource: { type: 'object', description: 'Processed projection summary snippet, included when available so callers can cite compacted memories even when raw source events are unavailable or less informative.', additionalProperties: true },
+      ambiguousRef: { type: 'boolean', description: 'Set when the supplied ref denotes more than one record, so `candidates` carries every match instead of `sources` carrying one. Decide which candidate answers the question, then cite it by its own projectionId / observationId.' },
+      candidates: { type: 'array', description: 'Every record the ambiguous ref resolves to, each with its own id and expanded sources.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: {
