@@ -12,7 +12,11 @@ vi.mock('../../src/store/context-store-worker-client.js', () => ({
 vi.mock('../../src/util/metrics.js', () => ({ incrementCounter: incrementCounterMock }));
 vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: warnOncePerHourMock }));
 
-import { registerMemoryShortRefs, resetMemoryShortRefsForTests } from '../../src/context/memory-short-ref.js';
+import {
+  registerMemoryShortRefs,
+  resetMemoryShortRefsForTests,
+  resolveMemoryShortRef,
+} from '../../src/context/memory-short-ref.js';
 
 /**
  * The whole point of moving handles off the JSON file was that its write errors
@@ -51,20 +55,65 @@ describe('memory short refs — persistence failures stay observable', () => {
     await vi.waitFor(() => expect(incrementCounterMock).toHaveBeenCalled());
 
     expect(incrementCounterMock).toHaveBeenCalledWith(
-      'mem.startup.silent_failure',
-      { source: 'memory-short-ref-upsert' },
+      'mem.short_ref.persist_failure',
+      { stage: 'persist_store' },
     );
     expect(warnOncePerHourMock).toHaveBeenCalledWith(
-      'mem.startup.silent_failure.memory-short-ref-upsert',
+      'mem.short_ref.persist_failure.persist_store',
       expect.objectContaining({ error: 'context_store_unavailable' }),
     );
+  });
+
+  it('routes a production process to the store, not a JSON file', async () => {
+    // Regression: the path resolver returned ~/.imcodes/memory-short-refs.json
+    // for any process that wasn't a test, which inverted the routing — real
+    // daemons kept writing the JSON file while only tests exercised the store,
+    // so the migration and its failure reporting never ran where they mattered.
+    //
+    // The ambient VITEST flag makes a plain assertion here useless: it sends the
+    // OLD code down the store branch too, and the test passes either way. Drop
+    // the test markers so this exercises the real production route.
+    const priorVitest = process.env.VITEST;
+    const priorNodeEnv = process.env.NODE_ENV;
+    delete process.env.VITEST;
+    process.env.NODE_ENV = 'production';
+    try {
+      runMock.mockResolvedValue(1);
+      registerMemoryShortRefs([entry]);
+      await vi.waitFor(() => expect(runMock).toHaveBeenCalled());
+      expect(runMock).toHaveBeenCalledWith('upsertMemoryShortRefs', [
+        expect.arrayContaining([expect.objectContaining({ id: entry.id, kind: 'projection' })]),
+      ]);
+    } finally {
+      if (priorVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = priorVitest;
+      if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = priorNodeEnv;
+    }
   });
 
   it('keeps registration non-fatal and in-memory resolution working when the write fails', async () => {
     runMock.mockRejectedValue(new Error('SQLITE_BUSY'));
     // Registration must not throw: the caller is a synchronous render path.
-    expect(() => registerMemoryShortRefs([entry])).not.toThrow();
+    let refs: string[] = [];
+    expect(() => { refs = registerMemoryShortRefs([entry]); }).not.toThrow();
     await vi.waitFor(() => expect(warnOncePerHourMock).toHaveBeenCalled());
+    // The unpersisted handle still resolves for the life of this process.
+    expect(resolveMemoryShortRef(refs[0]!, entry.namespace)).toMatchObject({ id: entry.id });
+  });
+
+  it('reports a failed warm-load instead of returning an ambiguous zero', async () => {
+    // A warm-load failure leaves every handle issued before this restart
+    // unresolvable for the whole process, and `0` alone is indistinguishable
+    // from "nothing was stored".
+    runMock.mockRejectedValue(new Error('context_store_unavailable'));
+    const { loadMemoryShortRefsFromStore } = await import('../../src/context/memory-short-ref.js');
+
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBe(0);
+    expect(incrementCounterMock).toHaveBeenCalledWith(
+      'mem.short_ref.persist_failure',
+      { stage: 'warm_load' },
+    );
   });
 
   it('stays quiet on a successful write', async () => {

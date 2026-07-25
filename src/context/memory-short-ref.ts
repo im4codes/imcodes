@@ -5,8 +5,7 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 
 export type MemoryShortRefKind = 'projection' | 'observation';
 
@@ -80,11 +79,22 @@ function pruneShortRefs(): void {
   }
 }
 
+/**
+ * JSON file target, or undefined to use the context store.
+ *
+ * ONLY an explicit `IMCODES_MEMORY_SHORT_REF_PATH` selects the file. The default
+ * — including production — is the store.
+ *
+ * This used to fall back to `~/.imcodes/memory-short-refs.json` whenever the
+ * process wasn't a test, which inverted the intended routing: tests took the
+ * store path while real daemons kept writing the JSON file, so the migration off
+ * that file (and the failure reporting added alongside it) never executed
+ * anywhere it mattered. Handles are a pure function of the id and re-register on
+ * the next injection, so no import of the legacy file is needed.
+ */
 function shortRefStorePath(): string | undefined {
   const configured = process.env.IMCODES_MEMORY_SHORT_REF_PATH?.trim();
-  if (configured) return configured;
-  if (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test') return undefined;
-  return join(homedir(), '.imcodes', 'memory-short-refs.json');
+  return configured ? configured : undefined;
 }
 
 function isMemoryShortRefKind(value: unknown): value is MemoryShortRefKind {
@@ -157,9 +167,25 @@ function persistShortRefsToFile(): void {
       schemaVersion: SHORT_REF_SCHEMA_VERSION,
       entries: entries.slice(0, MAX_SHORT_REF_ENTRIES),
     }), 'utf8');
-  } catch {
-    // Ref persistence is a convenience cache. Do not break memory search/source reads.
+  } catch (error) {
+    // Non-fatal, but never silent: an unwritable file is exactly how handles
+    // used to disappear without a trace.
+    reportShortRefFailure('persist_file', error, { path });
   }
+}
+
+/**
+ * A handle that fails to persist still resolves in this process but dies on the
+ * next restart, so every such failure gets a fixed-cardinality counter and an
+ * hourly-throttled warning. `stage` is a constant per call site — error text and
+ * volatile fields stay in the warning payload, never in metric labels.
+ */
+function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load', error: unknown, extra: Record<string, unknown> = {}): void {
+  incrementCounter('mem.short_ref.persist_failure', { stage });
+  warnOncePerHour(`mem.short_ref.persist_failure.${stage}`, {
+    ...extra,
+    error: error instanceof Error ? error.message : String(error),
+  });
 }
 
 /**
@@ -194,13 +220,8 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
       // Non-fatal for this process — the in-memory index still resolves, handles
       // are a pure function of the id, and sourceLookup full ids stay canonical.
       // But it IS the failure this change exists to make visible: handles that
-      // never land stop resolving after a restart. Surface it rather than
-      // repeating the swallowed-write bug in a new location.
-      incrementCounter('mem.startup.silent_failure', { source: 'memory-short-ref-upsert' });
-      warnOncePerHour('mem.startup.silent_failure.memory-short-ref-upsert', {
-        error: error instanceof Error ? error.message : String(error),
-        rows: rows.length,
-      });
+      // never land stop resolving after a restart.
+      reportShortRefFailure('persist_store', error, { rows: rows.length });
     });
 }
 
@@ -238,7 +259,11 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
     pruneShortRefs();
     persistedLoaded = true;
     return loaded;
-  } catch {
+  } catch (error) {
+    // A failed warm-load means every handle issued before this restart is
+    // unresolvable for the life of the process — report rather than return a
+    // zero that is indistinguishable from "nothing stored".
+    reportShortRefFailure('warm_load', error);
     return 0;
   }
 }
