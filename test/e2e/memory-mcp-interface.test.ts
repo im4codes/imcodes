@@ -13,6 +13,7 @@ import {
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
+import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
@@ -199,7 +200,7 @@ describe('memory MCP interface e2e', () => {
       }));
       expect(search).toMatchObject({ status: 'ok' });
       const items = search.items as Array<Record<string, unknown>>;
-      const expectedRef = `obs:${observationId.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`;
+      const expectedRef = makeMemoryShortRef('observation', observationId);
       expect(items[0]).toMatchObject({
         observationId,
         ref: expectedRef,
@@ -275,7 +276,7 @@ describe('memory MCP interface e2e', () => {
       const listedItems = listed.items as Array<Record<string, unknown>>;
       expect(listedItems.find((item) => item.projectionId === projection.id)).toMatchObject({
         projectionId: projection.id,
-        ref: `proj:${projection.id.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`,
+        ref: makeMemoryShortRef('projection', projection.id),
         recordKind: 'projection',
         projectionClass: 'recent_summary',
         sourceLookup: {
@@ -305,7 +306,7 @@ describe('memory MCP interface e2e', () => {
         },
       });
       expect(['exact', 'semantic', 'trigram']).toContain(hit?.matchKind);
-      const expectedRef = `proj:${projection.id.replace(/[^a-f0-9]/gi, '').slice(0, 10)}`;
+      const expectedRef = makeMemoryShortRef('projection', projection.id);
       expect(hit?.ref).toBe(expectedRef);
 
       const sources = structured(await client.callTool({
