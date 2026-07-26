@@ -65,13 +65,12 @@ function sameNamespace(a: ContextNamespace | undefined, b: ContextNamespace | un
 /**
  * Namespace key for the persisted row.
  *
- * `namespaceKey()` separates fields with NUL, which is fine in memory but reads
- * back from node:sqlite as just the leading scope: the driver stops at the first
- * NUL when converting TEXT to a JS string. The bytes are stored intact and the
- * primary key was never affected — a previous version of this comment claimed a
- * collapsed primary key, which measurement disproved — but a key that cannot be
- * read back is useless for verifying a row against its namespace. JSON keeps the
- * same field order with no embedded NUL, so it survives the round trip.
+ * `namespaceKey()` separates fields with NUL, which is fine in memory. Older
+ * node:sqlite versions returned only the leading scope when reading it as TEXT;
+ * current versions return the complete string. The bytes are stored intact and
+ * the primary key was never affected, but the version-dependent read shape is a
+ * poor persisted identity. JSON keeps the same field order with no embedded NUL
+ * and round-trips consistently.
  */
 function namespaceStorageKey(namespace: ContextNamespace | undefined): string {
   if (!namespace) return '';
@@ -439,15 +438,16 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       // under the wrong namespace.
       //
       // Rows written before the key became a JSON tuple used NUL-separated
-      // fields, and node:sqlite truncates a NUL-containing TEXT value at the
-      // first NUL when it converts to a JS string — so those rows read back as
-      // just the scope. (The bytes are stored intact and the primary key was
-      // never affected; an earlier comment here claimed otherwise and was
-      // wrong.) Accept that legacy shape so an upgrade does not discard every
-      // handle written before it.
+      // fields. Older node:sqlite versions truncate that TEXT value at the
+      // first NUL when converting it to a JS string, while current versions
+      // return the complete string. Accept both read-back shapes so upgrading
+      // Node cannot discard every handle written before the key migration.
       const storedNamespaceKey = typeof row.namespaceKey === 'string' ? row.namespaceKey : '';
+      const legacyNamespaceKey = namespaceKey(namespace);
       const legacyTruncatedKey = namespace ? namespace.scope : '';
-      if (storedNamespaceKey !== namespaceStorageKey(namespace) && storedNamespaceKey !== legacyTruncatedKey) {
+      if (storedNamespaceKey !== namespaceStorageKey(namespace)
+        && storedNamespaceKey !== legacyNamespaceKey
+        && storedNamespaceKey !== legacyTruncatedKey) {
         discarded += 1;
         continue;
       }

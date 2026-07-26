@@ -15,10 +15,10 @@ import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '.
  * reproduce.
  *
  * Keys used to be NUL-separated. The bytes store fine and the primary key is
- * unaffected, but node:sqlite stops at the first NUL when converting TEXT to a
- * JS string, so such a row reads back as just its scope. Verifying that against
- * the current JSON-tuple key would discard every handle written before the
- * format changed — an upgrade that silently empties the cache.
+ * unaffected. Older node:sqlite versions returned only the leading scope,
+ * while current versions return the complete NUL-containing JS string.
+ * Verifying either legacy shape only against the current JSON-tuple key would
+ * discard every handle written before the format changed.
  */
 describe('memory short refs — legacy NUL-separated namespace keys', () => {
   let tempDir: string;
@@ -62,9 +62,23 @@ describe('memory short refs — legacy NUL-separated namespace keys', () => {
     expect(resolveMemoryShortRef(ref, namespace)).toMatchObject({ id });
   });
 
+  it('still accepts the truncated read-back shape from older node:sqlite versions', async () => {
+    const id = 'eeeeeeee-1111-2222-3333-444444444444';
+    const ref = makeMemoryShortRef('projection', id);
+    upsertMemoryShortRefs([{
+      ref, kind: 'projection', id,
+      namespaceKey: namespace.scope,
+      namespaceJson: JSON.stringify(namespace),
+      lastSeenAt: 1,
+    }]);
+
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBeGreaterThanOrEqual(1);
+    expect(resolveMemoryShortRef(ref, namespace)).toMatchObject({ id });
+  });
+
   it('keeps two legacy rows that differ only by namespace apart', async () => {
-    // The legacy key reads back as the shared scope, so accepting it must not
-    // let one namespace's handle answer for another's.
+    // Accepting either legacy key shape must not let one namespace's handle
+    // answer for another's.
     const id = 'aaaaaaaa-1111-2222-3333-444444444444';
     const ref = makeMemoryShortRef('projection', id);
     const other = { scope: 'personal' as const, userId: 'u2', projectId: 'p2' };
