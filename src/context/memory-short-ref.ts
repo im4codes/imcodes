@@ -37,6 +37,7 @@ const MEMORY_SHORT_REF_LENGTH = 13;
  *  algorithm are dropped instead of resolving to a stale/wrong record. */
 const SHORT_REF_SCHEMA_VERSION = 2;
 const entriesByRef = new Map<string, MemoryShortRefEntry[]>();
+const persistedRefHydrations = new Map<string, Promise<number>>();
 let persistedLoaded = false;
 let shortRefHealth: MemoryShortRefHealth | undefined;
 
@@ -341,7 +342,10 @@ function persistShortRefsToFile(): void {
  */
 /** Rows dropped while loading are a silent form of handle loss, so count them
  *  under a fixed-cardinality source and warn once per hour. */
-function reportDiscardedShortRefRows(source: 'warm_load' | 'legacy_file' | 'json_file', discarded: number): void {
+function reportDiscardedShortRefRows(
+  source: 'warm_load' | 'hydrate_ref' | 'legacy_file' | 'json_file',
+  discarded: number,
+): void {
   if (discarded <= 0) return;
   incrementCounter('mem.short_ref.discarded_row', { source });
   warnOncePerHour(`mem.short_ref.discarded_row.${source}`, { discarded });
@@ -351,7 +355,11 @@ function reportDiscardedShortRefRows(source: 'warm_load' | 'legacy_file' | 'json
   recordShortRefFailure(`discarded_${source}`, `${discarded} unusable row(s) discarded`);
 }
 
-function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load' | 'load_file', error: unknown, extra: Record<string, unknown> = {}): void {
+function reportShortRefFailure(
+  stage: 'persist_store' | 'persist_file' | 'warm_load' | 'hydrate_ref' | 'load_file',
+  error: unknown,
+  extra: Record<string, unknown> = {},
+): void {
   const message = error instanceof Error ? error.message : String(error);
   incrementCounter('mem.short_ref.persist_failure', { stage });
   warnOncePerHour(`mem.short_ref.persist_failure.${stage}`, { ...extra, error: message });
@@ -416,12 +424,83 @@ function persistShortRefs(touched: ReadonlyArray<{ ref: string; entry: MemorySho
     });
 }
 
+function normalizePersistedShortRefRow(
+  row: Record<string, unknown>,
+): { ref: string; entry: MemoryShortRefEntry } | undefined {
+  // A row that stored a namespace but can no longer produce one must be
+  // dropped, not loaded namespace-less: the entry would look healthy while
+  // being unresolvable for every namespaced caller — silent handle loss
+  // wearing the shape of a successful load.
+  const namespaceColumnPresent = typeof row.namespaceJson === 'string' && row.namespaceJson.trim().length > 0;
+  const parsed = namespaceColumnPresent ? safeParseNamespace(row.namespaceJson as string) : undefined;
+  if (namespaceColumnPresent && parsed === undefined) return undefined;
+  const decoded = decodeNamespace(parsed);
+  if (!decoded.ok) return undefined;
+  const namespace = decoded.namespace;
+  // namespace_key records what the row was written under; a disagreement
+  // means the row's identity is corrupt and loading it would file the handle
+  // under the wrong namespace.
+  //
+  // Rows written before the key became a JSON tuple used NUL-separated
+  // fields. Older node:sqlite versions truncate that TEXT value at the
+  // first NUL when converting it to a JS string, while current versions
+  // return the complete string. Accept both read-back shapes so upgrading
+  // Node cannot discard every handle written before the key migration.
+  const storedNamespaceKey = typeof row.namespaceKey === 'string' ? row.namespaceKey : '';
+  const legacyNamespaceKey = namespaceKey(namespace);
+  const legacyTruncatedKey = namespace ? namespace.scope : '';
+  // Rows written before the owner was made explicit recorded their key WITHOUT
+  // it, so the keys recomputed from the backfilled namespace no longer match.
+  // Accept that shape ONLY when decodeNamespace actually backfilled the owner.
+  const preBackfillNamespace = decoded.preBackfillNamespace;
+  if (storedNamespaceKey !== namespaceStorageKey(namespace)
+    && storedNamespaceKey !== legacyNamespaceKey
+    && storedNamespaceKey !== legacyTruncatedKey
+    && !(preBackfillNamespace
+      && (storedNamespaceKey === namespaceStorageKey(preBackfillNamespace)
+        || storedNamespaceKey === namespaceKey(preBackfillNamespace)))) {
+    return undefined;
+  }
+  return normalizeEntry({
+    ref: row.ref,
+    kind: row.kind,
+    id: row.id,
+    lastSeenAt: row.lastSeenAt,
+    namespace,
+  });
+}
+
+function mergePersistedShortRefRows(
+  rows: readonly Record<string, unknown>[],
+  options: { touchLastSeenAt?: boolean } = {},
+): { loaded: number; discarded: number } {
+  let loaded = 0;
+  let discarded = 0;
+  const touchedAt = options.touchLastSeenAt ? Date.now() : undefined;
+  for (const row of rows) {
+    const normalized = normalizePersistedShortRefRow(row);
+    if (!normalized) {
+      discarded += 1;
+      continue;
+    }
+    if (touchedAt !== undefined) normalized.entry.lastSeenAt = touchedAt;
+    const bucket = entriesByRef.get(normalized.ref) ?? [];
+    if (bucket.some((entry) => entry.kind === normalized.entry.kind
+      && entry.id === normalized.entry.id
+      && sameNamespace(entry.namespace, normalized.entry.namespace))) continue;
+    bucket.push(normalized.entry);
+    entriesByRef.set(normalized.ref, bucket);
+    loaded += 1;
+  }
+  return { loaded, discarded };
+}
+
 /**
  * Warm the in-memory index from the context store once at daemon startup.
  *
- * Resolution stays synchronous (it is called from synchronous render paths), so
- * the store is read once here instead of per lookup. Handles registered before
- * this resolves are unaffected — the in-memory index is authoritative in-process.
+ * Synchronous render paths continue to use this warm index. Independent MCP
+ * processes additionally perform an indexed SQLite lookup on a local miss,
+ * because another process can persist a handle after this warm-load finishes.
  */
 export async function loadMemoryShortRefsFromStore(): Promise<number> {
   if (shortRefStorePath()) return 0;
@@ -435,79 +514,12 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       reportShortRefFailure('warm_load', new Error('listMemoryShortRefs returned a non-array response'));
       return 0;
     }
-    let loaded = 0;
-    let discarded = 0;
-    for (const row of rows) {
-      // A row that stored a namespace but can no longer produce one must be
-      // dropped, not loaded namespace-less: the entry would look healthy while
-      // being unresolvable for every namespaced caller — silent handle loss
-      // wearing the shape of a successful load.
-      // Absent means the column itself carried nothing. A column that IS present
-      // but cannot be parsed is corruption, not "no namespace" — degrading it to
-      // namespace-less loads an entry that looks healthy while being
-      // unresolvable for every namespaced caller.
-      const namespaceColumnPresent = typeof row.namespaceJson === 'string' && row.namespaceJson.trim().length > 0;
-      const parsed = namespaceColumnPresent ? safeParseNamespace(row.namespaceJson as string) : undefined;
-      if (namespaceColumnPresent && parsed === undefined) { discarded += 1; continue; }
-      const decoded = decodeNamespace(parsed);
-      if (!decoded.ok) { discarded += 1; continue; }
-      const namespace = decoded.namespace;
-      // namespace_key records what the row was written under; a disagreement
-      // means the row's identity is corrupt and loading it would file the handle
-      // under the wrong namespace.
-      //
-      // Rows written before the key became a JSON tuple used NUL-separated
-      // fields. Older node:sqlite versions truncate that TEXT value at the
-      // first NUL when converting it to a JS string, while current versions
-      // return the complete string. Accept both read-back shapes so upgrading
-      // Node cannot discard every handle written before the key migration.
-      const storedNamespaceKey = typeof row.namespaceKey === 'string' ? row.namespaceKey : '';
-      const legacyNamespaceKey = namespaceKey(namespace);
-      const legacyTruncatedKey = namespace ? namespace.scope : '';
-      // Rows written before the owner was made explicit recorded their key WITHOUT
-      // it, so the keys recomputed from the backfilled namespace no longer match
-      // and the row would be rejected here as corrupt — turning the rescue in
-      // decodeNamespace into a no-op. Accept the pre-backfill shape too; it is the
-      // same identity, one field less spelled out.
-      //
-      // ONLY for rows whose owner was actually backfilled. Offering this
-      // alternative unconditionally also excused a row carrying an explicit owner
-      // (or a shared scope) whose key was the owner-less tuple — a genuine
-      // key/JSON disagreement that this check exists to catch. Those rows could
-      // never cross-resolve (they are filed under the validated JSON namespace),
-      // but an integrity check should not be broader than its own comment.
-      // The exact namespace this row was written with, when the owner was
-      // backfilled — not a reconstruction of it.
-      const preBackfillNamespace = decoded.preBackfillNamespace;
-      if (storedNamespaceKey !== namespaceStorageKey(namespace)
-        && storedNamespaceKey !== legacyNamespaceKey
-        && storedNamespaceKey !== legacyTruncatedKey
-        && !(preBackfillNamespace
-          && (storedNamespaceKey === namespaceStorageKey(preBackfillNamespace)
-            || storedNamespaceKey === namespaceKey(preBackfillNamespace)))) {
-        discarded += 1;
-        continue;
-      }
-      const normalized = normalizeEntry({
-        ref: row.ref,
-        kind: row.kind,
-        id: row.id,
-        lastSeenAt: row.lastSeenAt,
-        namespace,
-      });
-      if (!normalized) { discarded += 1; continue; }
-      const bucket = entriesByRef.get(normalized.ref) ?? [];
-      if (bucket.some((entry) => entry.kind === normalized.entry.kind
-        && entry.id === normalized.entry.id
-        && sameNamespace(entry.namespace, normalized.entry.namespace))) continue;
-      bucket.push(normalized.entry);
-      entriesByRef.set(normalized.ref, bucket);
-      loaded += 1;
-    }
+    const merged = mergePersistedShortRefRows(rows);
+    let loaded = merged.loaded;
     // A well-formed array of malformed rows loads nothing and leaves every
     // earlier handle unresolvable — indistinguishable from an empty store
     // unless the discards are reported.
-    reportDiscardedShortRefRows('warm_load', discarded);
+    reportDiscardedShortRefRows('warm_load', merged.discarded);
     // Carry over anything still only in the retired JSON cache, and write it to
     // the store so the next start no longer depends on that file.
     const legacy = importLegacyShortRefFile();
@@ -640,6 +652,83 @@ export function resolveMemoryShortRef(ref: string, namespace?: ContextNamespace)
 }
 
 /**
+ * Hydrate one handle from SQLite after an in-process miss.
+ *
+ * The memory MCP server is a separate, long-lived process. Startup/recall can
+ * persist new handles from the daemon after the MCP process has populated its
+ * local Map, so a one-time warm-load cannot keep the two processes coherent.
+ * Querying by exact ref uses the memory_short_refs primary-key prefix and avoids
+ * rescanning the bounded warm-load window on every miss.
+ */
+async function hydrateMemoryShortRefFromStore(ref: string): Promise<number> {
+  if (shortRefStorePath()) return 0;
+  const normalizedRef = normalizeRef(ref);
+  if (!normalizedRef) return 0;
+  const existing = persistedRefHydrations.get(normalizedRef);
+  if (existing) return existing;
+  const hydration = (async () => {
+    try {
+      const rows = await getContextStoreClient()
+        .run<Array<Record<string, unknown>>>('listMemoryShortRefsByRef', [normalizedRef]);
+      if (!Array.isArray(rows)) {
+        reportShortRefFailure('hydrate_ref', new Error('listMemoryShortRefsByRef returned a non-array response'), {
+          ref: normalizedRef,
+        });
+        return 0;
+      }
+      // This ref is being actively redeemed. Promote hydrated rows in the
+      // process-local LRU before pruning so an old persisted handle cannot be
+      // inserted and immediately evicted while the index is at its 10k cap.
+      const merged = mergePersistedShortRefRows(rows, { touchLastSeenAt: true });
+      reportDiscardedShortRefRows('hydrate_ref', merged.discarded);
+      pruneShortRefs();
+      return merged.loaded;
+    } catch (error) {
+      reportShortRefFailure('hydrate_ref', error, { ref: normalizedRef });
+      return 0;
+    }
+  })();
+  persistedRefHydrations.set(normalizedRef, hydration);
+  try {
+    return await hydration;
+  } finally {
+    if (persistedRefHydrations.get(normalizedRef) === hydration) {
+      persistedRefHydrations.delete(normalizedRef);
+    }
+  }
+}
+
+/**
+ * Async resolver for MCP reads. It preserves the synchronous resolver's exact
+ * namespace and collision semantics, adding only an indexed SQLite retry when
+ * this process has no candidate in the caller namespace.
+ */
+export async function resolveMemoryShortRefCandidatesWithStore(
+  ref: string,
+  namespace: ContextNamespace,
+): Promise<MemoryShortRefEntry[]> {
+  const candidates = resolveMemoryShortRefCandidates(ref, namespace);
+  if (candidates.length > 0) return candidates;
+  await hydrateMemoryShortRefFromStore(ref);
+  return resolveMemoryShortRefCandidates(ref, namespace);
+}
+
+/**
+ * Strict async resolver for MCP mutations. Ambiguous handles and handles from a
+ * different namespace remain unresolved; the store lookup never authorizes a
+ * cross-namespace fallback.
+ */
+export async function resolveMemoryShortRefWithStore(
+  ref: string,
+  namespace?: ContextNamespace,
+): Promise<MemoryShortRefEntry | undefined> {
+  const resolved = resolveMemoryShortRef(ref, namespace);
+  if (resolved) return resolved;
+  await hydrateMemoryShortRefFromStore(ref);
+  return resolveMemoryShortRef(ref, namespace);
+}
+
+/**
  * Force several records onto one handle. A 65-bit digest collision cannot be
  * produced by registering real ids, so the ambiguous-handle paths would
  * otherwise be untestable above the resolver.
@@ -651,12 +740,14 @@ export function seedMemoryShortRefCollisionForTests(ref: string, entries: readon
 
 export function resetMemoryShortRefsForTests(): void {
   entriesByRef.clear();
+  persistedRefHydrations.clear();
   shortRefHealth = undefined;
   persistedLoaded = true;
 }
 
 export function reloadMemoryShortRefsForTests(): void {
   entriesByRef.clear();
+  persistedRefHydrations.clear();
   persistedLoaded = false;
   ensurePersistedLoaded();
 }

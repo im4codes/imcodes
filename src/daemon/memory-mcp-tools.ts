@@ -94,7 +94,11 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
-import { registerMemoryShortRef, resolveMemoryShortRef, resolveMemoryShortRefCandidates } from '../context/memory-short-ref.js';
+import {
+  registerMemoryShortRef,
+  resolveMemoryShortRefCandidatesWithStore,
+  resolveMemoryShortRefWithStore,
+} from '../context/memory-short-ref.js';
 
 /** Upper bound on records expanded for one colliding handle. */
 const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
@@ -762,13 +766,16 @@ function canManageProjectionNamespace(projectionNamespace: ContextNamespace, cal
   return !projectionUserId || projectionUserId === LEGACY_DAEMON_LOCAL_USER_ID || projectionUserId === callerUserId;
 }
 
-function resolveProjectionRefArg(args: Record<string, unknown>, namespace: ContextNamespace): string | ToolResult {
+async function resolveProjectionRefArg(
+  args: Record<string, unknown>,
+  namespace: ContextNamespace,
+): Promise<string | ToolResult> {
   const projectionId = stringArg(args, 'projectionId');
   const ref = stringArg(args, 'ref');
   if (projectionId && ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'ref cannot be combined with projectionId');
   if (projectionId) return projectionId;
   if (!ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId or ref is required');
-  const resolved = resolveMemoryShortRef(ref, namespace);
+  const resolved = await resolveMemoryShortRefWithStore(ref, namespace);
   if (!resolved || resolved.kind !== 'projection') {
     return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
   }
@@ -955,7 +962,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       if (!projectId) return emptySources();
       if (ref) {
-        const candidates = resolveMemoryShortRefCandidates(ref, scopedCaller.namespace);
+        const candidates = await resolveMemoryShortRefCandidatesWithStore(ref, scopedCaller.namespace);
         if (candidates.length === 0) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
         // A digest collision (two records deriving one handle) should never
         // happen at 65 bits. If it does, answering with one of them would be a
@@ -1041,7 +1048,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1054,7 +1061,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1067,7 +1074,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1082,7 +1089,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const text = stringArg(args, 'text');
       if (!text) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'text is required');
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1105,7 +1112,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'feedback must be not_relevant or relevant');
       }
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;

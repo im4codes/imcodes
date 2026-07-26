@@ -13,7 +13,7 @@
  * so it is still visible to whoever reconnects after the fact.
  */
 export interface MemoryShortRefHealth {
-  /** Where the last failure happened (persist_store, persist_file, warm_load, load_file). */
+  /** Where the last failure happened (persist_store, persist_file, warm_load, hydrate_ref, load_file). */
   stage: string;
   /** Failures since the process started; keeps a single blip distinguishable from a stuck disk. */
   failures: number;

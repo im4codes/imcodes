@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
-import { listMemoryShortRefs } from '../../src/store/context-store.js';
+import {
+  listMemoryShortRefs,
+  listMemoryShortRefsByRef,
+  upsertMemoryShortRefs,
+} from '../../src/store/context-store.js';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -9,6 +13,9 @@ import {
   registerMemoryShortRefs,
   resetMemoryShortRefsForTests,
   resolveMemoryShortRef,
+  resolveMemoryShortRefCandidatesWithStore,
+  resolveMemoryShortRefWithStore,
+  seedMemoryShortRefCollisionForTests,
 } from '../../src/context/memory-short-ref.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -120,5 +127,105 @@ describe('memory short refs — durable store persistence', () => {
 
     expect(resolveMemoryShortRef(ref!, { ...namespace, projectId: 'other-repo' })).toBeUndefined();
     expect(resolveMemoryShortRef(ref!, namespace)).toMatchObject({ id: 'cccccccccc-1111-2222-3333-444444444444' });
+  });
+
+  it('hydrates an exact ref persisted after this process cache was populated', async () => {
+    const localId = 'local-cache-entry';
+    const remoteId = 'persisted-by-another-process';
+    const remoteRef = makeMemoryShortRef('projection', remoteId);
+
+    // Populate this process's Map first, then write a different ref straight to
+    // SQLite as another daemon/MCP process would. A one-time warm-load cannot
+    // observe this later write.
+    seedMemoryShortRefCollisionForTests(makeMemoryShortRef('projection', localId), [{
+      kind: 'projection',
+      id: localId,
+      namespace,
+    }]);
+    upsertMemoryShortRefs([{
+      ref: remoteRef,
+      kind: 'projection',
+      id: remoteId,
+      namespaceKey: JSON.stringify([
+        namespace.scope,
+        namespace.userId,
+        namespace.projectId,
+        '',
+        '',
+      ]),
+      namespaceJson: JSON.stringify(namespace),
+      lastSeenAt: Date.now(),
+    }]);
+
+    expect(resolveMemoryShortRef(remoteRef, namespace)).toBeUndefined();
+    expect(listMemoryShortRefsByRef(remoteRef)).toHaveLength(1);
+
+    await expect(resolveMemoryShortRefCandidatesWithStore(remoteRef, namespace))
+      .resolves.toEqual([
+        expect.objectContaining({ kind: 'projection', id: remoteId }),
+      ]);
+    await expect(resolveMemoryShortRefWithStore(remoteRef, namespace))
+      .resolves.toMatchObject({ kind: 'projection', id: remoteId });
+  });
+
+  it('does not cross namespaces while hydrating an exact persisted ref', async () => {
+    const id = 'persisted-private-entry';
+    const ref = makeMemoryShortRef('projection', id);
+    upsertMemoryShortRefs([{
+      ref,
+      kind: 'projection',
+      id,
+      namespaceKey: JSON.stringify([
+        namespace.scope,
+        namespace.userId,
+        namespace.projectId,
+        '',
+        '',
+      ]),
+      namespaceJson: JSON.stringify(namespace),
+      lastSeenAt: Date.now(),
+    }]);
+
+    await expect(resolveMemoryShortRefCandidatesWithStore(ref, {
+      ...namespace,
+      userId: 'other-user',
+    })).resolves.toEqual([]);
+    await expect(resolveMemoryShortRefWithStore(ref, {
+      ...namespace,
+      projectId: 'other-repo',
+    })).resolves.toBeUndefined();
+    await expect(resolveMemoryShortRefWithStore(ref, namespace))
+      .resolves.toMatchObject({ id });
+  });
+
+  it('keeps an old hydrated ref long enough to resolve when the local LRU is full', async () => {
+    for (let index = 0; index < 10_000; index += 1) {
+      seedMemoryShortRefCollisionForTests(`proj:cached${String(index).padStart(7, '0')}`, [{
+        kind: 'projection',
+        id: `cached-${index}`,
+        namespace,
+        lastSeenAt: 1_000 + index,
+      }]);
+    }
+    const id = 'old-persisted-ref-at-lru-cap';
+    const ref = makeMemoryShortRef('projection', id);
+    upsertMemoryShortRefs([{
+      ref,
+      kind: 'projection',
+      id,
+      namespaceKey: JSON.stringify([
+        namespace.scope,
+        namespace.userId,
+        namespace.projectId,
+        '',
+        '',
+      ]),
+      namespaceJson: JSON.stringify(namespace),
+      lastSeenAt: 1,
+    }]);
+
+    expect(resolveMemoryShortRef(ref, namespace)).toBeUndefined();
+    await expect(resolveMemoryShortRefWithStore(ref, namespace))
+      .resolves.toMatchObject({ id });
   });
 });

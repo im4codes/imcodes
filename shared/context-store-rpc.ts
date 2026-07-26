@@ -41,6 +41,7 @@ export type ContextStoreRpcPriority =
 export const CONTEXT_STORE_L1_OPS = [
   // memory short-ref handle map (ref → id), durable across daemon restarts
   'listMemoryShortRefs',
+  'listMemoryShortRefsByRef',
   'upsertMemoryShortRefs',
   // reads
   'getProcessedProjectionById',

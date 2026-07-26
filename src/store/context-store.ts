@@ -2799,6 +2799,25 @@ export function listMemoryShortRefs(limit?: number): MemoryShortRefRow[] {
     + (typeof limit === 'number' && limit > 0 ? ' LIMIT ?' : '');
   const statement = database.prepare(sql);
   const rows = (typeof limit === 'number' && limit > 0 ? statement.all(limit) : statement.all()) as Array<Record<string, unknown>>;
+  return mapMemoryShortRefRows(rows);
+}
+
+/**
+ * Exact lookup used when another process persisted a handle after this
+ * process's in-memory short-ref index was populated. The primary key starts
+ * with `ref`, so this is an indexed point lookup rather than another warm-load.
+ */
+export function listMemoryShortRefsByRef(ref: string): MemoryShortRefRow[] {
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT * FROM memory_short_refs
+    WHERE ref = ?
+    ORDER BY last_seen_at DESC
+  `).all(ref) as Array<Record<string, unknown>>;
+  return mapMemoryShortRefRows(rows);
+}
+
+function mapMemoryShortRefRows(rows: Array<Record<string, unknown>>): MemoryShortRefRow[] {
   return rows.map((row) => ({
     ref: String(row.ref),
     kind: String(row.kind),

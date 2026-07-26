@@ -18,9 +18,12 @@ import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.j
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
   archiveEventsForMaterialization,
+  ensureContextNamespace,
   listContextObservations,
   recordContextEvent,
   resetContextStoreForTests,
+  upsertMemoryShortRefs,
+  writeContextObservation,
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -249,6 +252,115 @@ describe('memory MCP interface e2e', () => {
             content: text,
           }),
         ],
+      });
+    });
+  });
+
+  it('redeems and mutates refs persisted after the independent MCP process starts', async () => {
+    // The MCP project scoping layer intentionally maps user_private to the
+    // project-local personal namespace before resolving refs.
+    const lateRefNamespace = {
+      scope: 'personal' as const,
+      userId: USER_ID,
+      projectId: PROJECT_NAME,
+    };
+    const readable = writeProcessedProjection({
+      namespace: lateRefNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-late-ref-readable'],
+      summary: 'projection persisted after MCP startup remains directly redeemable',
+      content: { ownerUserId: USER_ID, eventCount: 1 },
+      origin: 'chat_compacted',
+      createdAt: 1_100,
+      updatedAt: 1_100,
+    });
+    const manageable = writeProcessedProjection({
+      namespace: lateRefNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-late-ref-manageable'],
+      summary: 'projection persisted after MCP startup remains manageable by ref',
+      content: { ownerUserId: USER_ID, eventCount: 1 },
+      origin: 'chat_compacted',
+      createdAt: 1_200,
+      updatedAt: 1_200,
+    });
+    const observationNamespace = ensureContextNamespace(lateRefNamespace, 1_250);
+    const observation = writeContextObservation({
+      namespaceId: observationNamespace.id,
+      scope: lateRefNamespace.scope,
+      class: 'note',
+      origin: 'agent_learned',
+      fingerprint: 'late-cross-process-observation-ref',
+      content: { text: 'observation persisted after MCP startup remains directly redeemable' },
+      text: 'observation persisted after MCP startup remains directly redeemable',
+      sourceEventIds: ['evt-late-ref-observation'],
+      state: 'active',
+      now: 1_250,
+    });
+    const readableRef = makeMemoryShortRef('projection', readable.id);
+    const manageableRef = makeMemoryShortRef('projection', manageable.id);
+    const observationRef = makeMemoryShortRef('observation', observation.id);
+
+    await withStdioClient(childEnv(), async (client) => {
+      // Ensure the child is fully started before another process writes these
+      // rows. No search/list call is allowed to register them in the child Map.
+      await client.listTools();
+      upsertMemoryShortRefs([
+        { ref: readableRef, kind: 'projection', id: readable.id },
+        { ref: manageableRef, kind: 'projection', id: manageable.id },
+        { ref: observationRef, kind: 'observation', id: observation.id },
+      ].map((entry, index) => ({
+        ...entry,
+        namespaceKey: JSON.stringify([
+          lateRefNamespace.scope,
+          lateRefNamespace.userId,
+          lateRefNamespace.projectId,
+          '',
+          '',
+        ]),
+        namespaceJson: JSON.stringify(lateRefNamespace),
+        lastSeenAt: Date.now() + index,
+      })));
+
+      const sources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: { ref: readableRef, kind: 'projection' },
+      }));
+      expect(sources).toMatchObject({
+        status: 'ok',
+        projectionId: readable.id,
+        sourceEventCount: 1,
+        projectionSource: expect.objectContaining({
+          eventId: 'evt-late-ref-readable',
+          content: readable.summary,
+        }),
+      });
+
+      const observationSources = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
+        arguments: { ref: observationRef, kind: 'observation' },
+      }));
+      expect(observationSources).toMatchObject({
+        status: 'ok',
+        observationId: observation.id,
+        sourceEventCount: 1,
+        sources: [
+          expect.objectContaining({
+            eventId: 'evt-late-ref-observation',
+            status: 'observation',
+            content: 'observation persisted after MCP startup remains directly redeemable',
+          }),
+        ],
+      });
+
+      const archived = structured(await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
+        arguments: { ref: manageableRef },
+      }));
+      expect(archived).toMatchObject({
+        status: 'ok',
+        projectionId: manageable.id,
+        changed: true,
       });
     });
   });
