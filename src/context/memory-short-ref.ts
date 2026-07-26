@@ -1,5 +1,5 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
-import { isMemoryScope } from '../../shared/memory-scope.js';
+import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
@@ -140,8 +140,15 @@ function importLegacyShortRefFile(): Array<{ ref: string; entry: MemoryShortRefE
   const imported: Array<{ ref: string; entry: MemoryShortRefEntry }> = [];
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { schemaVersion?: unknown; entries?: unknown[] };
-    // Older derivations produced handles that denote different records now.
-    if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION || !Array.isArray(parsed.entries)) return imported;
+    // Older derivations produced handles that denote different records now, so
+    // rejecting that whole file is expected and stays quiet.
+    if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION) return imported;
+    // A current-schema file whose entries are not an array is corrupt, and every
+    // handle in it vanishes — that is a failure, not a steady state.
+    if (!Array.isArray(parsed.entries)) {
+      reportShortRefFailure('load_file', new Error('legacy cache entries is not an array'), { path, legacy: true });
+      return imported;
+    }
     let discarded = 0;
     for (const raw of parsed.entries) {
       const normalized = normalizeEntry(raw);
@@ -196,7 +203,19 @@ function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace 
     const value = record[field];
     if (value !== undefined && typeof value !== 'string') return { ok: false };
   }
-  return { ok: true, namespace: record as unknown as ContextNamespace };
+  // A scope also dictates which identity fields must be present and which are
+  // forbidden. `{ scope: 'personal' }` with no userId/projectId is structurally
+  // fine but names no actual namespace, so it would resolve for nobody.
+  const namespace = record as unknown as ContextNamespace;
+  const identity = {
+    user_id: namespace.userId,
+    project_id: namespace.projectId,
+    workspace_id: namespace.workspaceId,
+    org_id: namespace.enterpriseId,
+    tenant_id: namespace.localTenant,
+  };
+  if (!validateMemoryScopeIdentity(record.scope, identity).ok) return { ok: false };
+  return { ok: true, namespace };
 }
 
 function isContextNamespace(value: unknown): value is ContextNamespace {
@@ -236,7 +255,12 @@ function ensurePersistedLoaded(): void {
     // string can denote a different record under the new algorithm, which would
     // resolve to the wrong memory. Drop the whole file and re-register lazily.
     if (parsed.schemaVersion !== SHORT_REF_SCHEMA_VERSION) return;
-    if (!Array.isArray(parsed.entries)) return;
+    // Current schema with non-array entries is corruption, not an empty cache:
+    // every handle in the file disappears, so it has to be reported.
+    if (!Array.isArray(parsed.entries)) {
+      reportShortRefFailure('load_file', new Error('cache entries is not an array'), { path });
+      return;
+    }
     let discarded = 0;
     for (const raw of parsed.entries) {
       const normalized = normalizeEntry(raw);

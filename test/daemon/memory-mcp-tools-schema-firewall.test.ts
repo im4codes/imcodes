@@ -10,6 +10,8 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: vi.fn() }));
+
 import { makeMemoryShortRef, registerMemoryShortRef, resetMemoryShortRefsForTests, seedMemoryShortRefCollisionForTests } from '../../src/context/memory-short-ref.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
@@ -65,10 +67,15 @@ describe('memory MCP tool schema firewall', () => {
 
   beforeEach(() => {
     // Registering a handle now persists it, and the default target is the
-    // context store — which would build a real SQLite database, WAL and log in
-    // the runner's home directory just from exercising these handlers. Point
+    // context store — which would build a real SQLite database and WAL in the
+    // runner's home directory just from exercising these handlers. Point
     // persistence at a scratch file, and the legacy cache at a path that does
-    // not exist, so nothing here touches a real home.
+    // not exist. The collision cases also emit a throttled warning, so the
+    // warning module is stubbed above to keep that content out of the daemon
+    // log. Two writes remain outside this suite's reach and are NOT claimed to
+    // be isolated: the daemon logger creates its file when the module is
+    // imported, and one pre-existing observation-expansion case below builds the
+    // context store.
     shortRefDir = mkdtempSync(join(tmpdir(), 'imc-mcp-shortref-'));
     priorShortRefPath = process.env.IMCODES_MEMORY_SHORT_REF_PATH;
     priorLegacyPath = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
