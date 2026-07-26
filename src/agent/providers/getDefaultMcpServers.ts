@@ -10,10 +10,17 @@ import {
   IMCODES_DAEMON_USER_ID_ENV,
 } from '../../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import {
+  LEGACY_DAEMON_LOCAL_USER_ID,
+  normalizeDaemonLocalMemoryNamespace,
+} from '../../../shared/memory-namespace.js';
 
 export const IMCODES_MEMORY_MCP_COMMAND = 'imcodes';
 export const IMCODES_MEMORY_MCP_ARGS = ['memory', 'mcp'] as const;
-const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
+// Was a local copy of the sentinel that shared/memory-namespace.ts already
+// exports. Four such copies existed, which is how the two halves of the
+// register/resolve invariant came to disagree in the first place.
+const DAEMON_LOCAL_MEMORY_USER_ID = LEGACY_DAEMON_LOCAL_USER_ID;
 
 export interface DefaultMcpServerConfig {
   type: 'stdio';
@@ -42,14 +49,16 @@ function projectNameFromSessionName(sessionName: string | undefined): string | u
   return rest.slice(0, idx) || undefined;
 }
 
+/**
+ * The namespace this MCP server RESOLVES memory handles under. Shares one helper
+ * with handle registration (see normalizeDaemonLocalMemoryNamespace): when only
+ * this side filled in the daemon-local owner, every injected handle was registered
+ * under a different namespace and redeemed to nothing.
+ */
 function namespaceForMcp(config: SessionConfig): SessionConfig['contextNamespace'] {
   const namespace = config.contextNamespace ?? undefined;
   if (!namespace) return undefined;
-  if (namespace.userId?.trim()) return namespace;
-  if (namespace.scope === 'personal' || namespace.scope === 'user_private') {
-    return { ...namespace, userId: DAEMON_LOCAL_MEMORY_USER_ID };
-  }
-  return namespace;
+  return normalizeDaemonLocalMemoryNamespace(namespace);
 }
 
 function buildIdentityEnv(config: SessionConfig): Record<string, string> {

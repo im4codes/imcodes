@@ -1,5 +1,6 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
+import { normalizeDaemonLocalMemoryNamespace } from '../../shared/memory-namespace.js';
 import { MEMORY_SHORT_REF_HEALTH_ERROR_MAX_CHARS, type MemoryShortRefHealth } from '../../shared/memory-short-ref-health.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
@@ -215,7 +216,15 @@ function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace 
   // A scope also dictates which identity fields must be present and which are
   // forbidden. `{ scope: 'personal' }` with no userId/projectId is structurally
   // fine but names no actual namespace, so it would resolve for nobody.
-  const namespace = record as unknown as ContextNamespace;
+  //
+  // Owner-private rows written before registration filled the owner in have no
+  // `userId`, and `personal` requires one — so they failed validation and were
+  // DISCARDED at every daemon start. That silently destroyed 290 of 302 stored
+  // handles on a real machine. This store is per-device and a device has exactly
+  // one owner, so an owner-less owner-private row is not ambiguous: it belongs to
+  // this daemon. Backfill the sentinel and keep the row instead of dropping the
+  // user's memory handles on a technicality.
+  const namespace = normalizeDaemonLocalMemoryNamespace(record as unknown as ContextNamespace);
   const identity = {
     user_id: namespace.userId,
     project_id: namespace.projectId,
@@ -445,9 +454,17 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       const storedNamespaceKey = typeof row.namespaceKey === 'string' ? row.namespaceKey : '';
       const legacyNamespaceKey = namespaceKey(namespace);
       const legacyTruncatedKey = namespace ? namespace.scope : '';
+      // Rows written before the owner was made explicit recorded their key WITHOUT
+      // it, so the keys recomputed from the backfilled namespace no longer match
+      // and the row would be rejected here as corrupt — turning the rescue in
+      // decodeNamespace into a no-op. Accept the pre-backfill shape too; it is the
+      // same identity, one field less spelled out.
+      const ownerlessNamespace = namespace ? { ...namespace, userId: '' } : undefined;
       if (storedNamespaceKey !== namespaceStorageKey(namespace)
         && storedNamespaceKey !== legacyNamespaceKey
-        && storedNamespaceKey !== legacyTruncatedKey) {
+        && storedNamespaceKey !== legacyTruncatedKey
+        && storedNamespaceKey !== namespaceStorageKey(ownerlessNamespace)
+        && storedNamespaceKey !== namespaceKey(ownerlessNamespace)) {
         discarded += 1;
         continue;
       }

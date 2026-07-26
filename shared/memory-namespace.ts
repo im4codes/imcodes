@@ -14,6 +14,35 @@ import type { ContextNamespace as LegacyContextNamespace } from './context-types
  */
 export const LEGACY_DAEMON_LOCAL_USER_ID = 'daemon-local';
 
+/**
+ * Fill in the implicit daemon-local owner so a memory handle is REGISTERED under
+ * the same namespace it will be RESOLVED under.
+ *
+ * A handle (`proj:…` / `obs:…`) only redeems when those two namespaces are
+ * byte-identical — the resolver compares the whole namespace key and refuses a
+ * cross-namespace match deliberately. This rule previously existed in exactly one
+ * of the two places that need it: the MCP server was configured with `userId`
+ * filled in for personal/user_private scopes, while handle registration derived
+ * its namespace straight from recall-item fields, and recall items carry no
+ * `userId`. Every handle injected into an agent's context was therefore stored
+ * under `userId: ''` and could never match a resolver asking for
+ * `userId: 'daemon-local'`. The row persisted correctly and still resolved to
+ * nothing — the failure surfaced as "handle not saved" while it sat in the table.
+ *
+ * Both sides derive it from here now, so they cannot drift apart again.
+ *
+ * Scopes that are not user-owned are returned untouched: inventing an owner for
+ * them would mint a namespace no resolver ever asks for, which is the identical
+ * dead-handle bug pointing the other way.
+ */
+export function normalizeDaemonLocalMemoryNamespace<T extends { scope: string; userId?: string }>(namespace: T): T {
+  if (namespace.userId?.trim()) return namespace;
+  if (namespace.scope === 'personal' || namespace.scope === 'user_private') {
+    return { ...namespace, userId: LEGACY_DAEMON_LOCAL_USER_ID };
+  }
+  return namespace;
+}
+
 export type MemoryNamespaceVisibility = 'owner_private' | 'shared_authorized';
 
 export interface MemoryNamespaceInput {

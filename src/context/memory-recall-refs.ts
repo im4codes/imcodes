@@ -1,4 +1,5 @@
 import type { ContextNamespace, ContextScope } from '../../shared/context-types.js';
+import { normalizeDaemonLocalMemoryNamespace } from '../../shared/memory-namespace.js';
 import { registerMemoryShortRefs, type MemoryShortRefEntry, type MemoryShortRefKind } from './memory-short-ref.js';
 
 /**
@@ -33,17 +34,33 @@ function shortRefKind(type: MemoryShortRefSource['type']): MemoryShortRefKind | 
   return 'projection';
 }
 
-/** The namespace the record is STORED in, so the cached entry lines up with what
- *  the record fetch authorizes against. */
+/**
+ * The namespace this handle must be registered under.
+ *
+ * Recall items carry `scope` and `projectId` but never `userId`, so deriving the
+ * namespace from item fields alone stored every injected handle with an empty
+ * owner. Two things then went wrong at once: the MCP resolver asks with
+ * `userId: 'daemon-local'` and `resolveMemoryShortRef` refuses a cross-namespace
+ * match, so the handle redeemed to zero sources; and `personal` declares
+ * `requiredIdentityFields: ['user_id', 'project_id']`, so the warm loader
+ * DISCARDED the row outright on the next daemon start. 290 of 302 stored handles
+ * (96%) were in that state — the failure the user saw as "记忆句柄未保存" while the
+ * rows sat in the table.
+ *
+ * The owner is not optional for owner-private memory; on a single-user device it is
+ * simply implicit. Making it explicit here — with the same helper the MCP server
+ * config uses — is what keeps registration, resolution and the scope policy in
+ * agreement instead of two of the three.
+ */
 function namespaceForItem(item: MemoryShortRefSource): ContextNamespace | undefined {
   if (!item.scope) return undefined;
-  return {
+  return normalizeDaemonLocalMemoryNamespace({
     scope: item.scope as ContextScope,
     ...(item.projectId ? { projectId: item.projectId } : {}),
     ...(item.userId ? { userId: item.userId } : {}),
     ...(item.workspaceId ? { workspaceId: item.workspaceId } : {}),
     ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
-  };
+  });
 }
 
 /**
