@@ -98,6 +98,25 @@ async function waitForRunPhase(phase: 'execution' | 'auditing' | 'finalizing', t
   }
 }
 
+/** Wait until the automation has finished the run (no active run left).
+ *  Same real-check-queue yield as `waitForRunPhase`, so a terminal run cannot
+ *  be asserted before the automation has actually torn it down. */
+async function waitForRunEnd(timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (supervisionAutomation.getActiveRun('deck_supervision_brain') !== undefined) {
+    if (performance.now() >= deadline) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+async function waitForTransportSendCount(expectedCount: number, timeoutMs = 10_000) {
+  const deadline = performance.now() + timeoutMs;
+  while (mockTransportRuntime.send.mock.calls.length < expectedCount) {
+    if (performance.now() >= deadline) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 let projectDir: string | null = null;
 
 beforeEach(() => {
@@ -1183,12 +1202,199 @@ describe('SupervisionAutomation', () => {
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
-    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
-    expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).not.toContain('Commit the completed changes and push to origin/dev.');
+    const reworkPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
+    expect(reworkPrompt).toContain('Audit verdict: REWORK');
+    expect(reworkPrompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a new matching peer audit returns PASS.');
+    expect(reworkPrompt).not.toContain('Commit the completed changes and push to origin/dev.');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'execution',
       reworkDispatches: 1,
     });
+  });
+
+  it('requires a fresh PASS after REWORK before releasing deferred commit and push', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'only repository finalization remains',
+        confidence: 0.9,
+        gap: 'changes are uncommitted',
+        nextAction: 'Commit the completed changes and push to origin/dev.',
+      })
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'the rework and validation are complete',
+        confidence: 0.9,
+        requiresAudit: false,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-rework-fresh-pass-before-push',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-rework-fresh-pass-before-push', 'implement the feature');
+    completeTurn('Implementation and validation are complete.');
+    await waitForRunPhase('auditing');
+
+    completeDelegatedAudit('REWORK', 'Add the missing regression coverage.');
+    await waitForRunPhase('execution');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+    completeTurn('The requested rework and validation are complete; no repository finalization was performed.');
+    await waitForRunPhase('auditing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain('imcodes send --reply');
+    expect(mockTransportRuntime.send.mock.calls.some((call) =>
+      String(call[0]).includes('Commit the completed changes and push to origin/dev.'))).toBe(false);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      freshAuditRequiredAfterRework: true,
+      deferredFinalization: {
+        nextAction: 'Commit the completed changes and push to origin/dev.',
+      },
+    });
+
+    completeDelegatedAudit('PASS', 'The corrected implementation and regression coverage pass.');
+    await waitForRunPhase('finalizing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
+    expect(String(mockTransportRuntime.send.mock.calls[3]?.[0])).toContain(
+      'Commit the completed changes and push to origin/dev.',
+    );
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'finalizing',
+      freshAuditRequiredAfterRework: false,
+    });
+  });
+
+  it.each([
+    ['merge', 'Merge the repaired branch into master.'],
+    ['release', 'Create the release for the repaired change.'],
+    ['publish', 'Publish the repaired package.'],
+    ['deploy', 'Deploy the repaired change to production.'],
+    ['Chinese merge', '将当前分支合并到 master。'],
+    ['Chinese release', '发布当前版本。'],
+    ['Chinese deploy', '部署当前版本到生产环境。'],
+    ['Chinese go-live', '将当前版本上线。'],
+  ])('holds %s finalization after REWORK until a fresh PASS', async (_kind, finalizationAction) => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'the initial implementation is ready for audit',
+        confidence: 0.9,
+        requiresAudit: true,
+      })
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'the requested rework and validation are complete; only delivery finalization remains',
+        confidence: 0.9,
+        requiresAudit: false,
+        gap: 'the repaired change has not been finalized',
+        nextAction: finalizationAction,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      `cmd-rework-${_kind}-fresh-pass`,
+      'implement and deliver the feature',
+      snapshot,
+    );
+    beginRun(`cmd-rework-${_kind}-fresh-pass`, 'implement and deliver the feature');
+    completeTurn('The initial implementation and validation are complete.');
+    await waitForRunPhase('auditing');
+
+    completeDelegatedAudit('REWORK', 'Repair the audit finding before delivery.');
+    await waitForRunPhase('execution');
+    completeTurn('The audit finding is repaired and validation passes. No finalization was performed.');
+    await waitForRunPhase('auditing');
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain('imcodes send --reply');
+    expect(mockTransportRuntime.send.mock.calls.some((call) =>
+      String(call[0]).includes(finalizationAction))).toBe(false);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      freshAuditRequiredAfterRework: true,
+      deferredFinalization: { nextAction: finalizationAction },
+    });
+
+    completeDelegatedAudit('PASS', 'The repaired change passes the fresh audit.');
+    await waitForRunPhase('finalizing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
+    expect(String(mockTransportRuntime.send.mock.calls[3]?.[0])).toContain(finalizationAction);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'finalizing',
+      freshAuditRequiredAfterRework: false,
+    });
+  });
+
+  it('strips mixed pre-audit validation and publish/deploy finalization until fresh PASS', async () => {
+    const snapshot = await seedSession('supervised_audit', false, 1);
+    const mixedAction = 'Run the focused tests, then deploy and publish the repaired release.';
+    const finalizationAction = 'Deploy and publish the repaired release.';
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'the initial implementation is ready for audit',
+        confidence: 0.9,
+        requiresAudit: true,
+      })
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'focused validation remains before delivery finalization',
+        confidence: 0.9,
+        requiresAudit: false,
+        gap: 'the focused tests have not run',
+        nextAction: mixedAction,
+      })
+      .mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'the repaired implementation and focused tests are complete; only delivery finalization remains',
+        confidence: 0.9,
+        requiresAudit: false,
+        gap: 'the repaired release has not been delivered',
+        nextAction: finalizationAction,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-rework-mixed-publish-deploy',
+      'implement and deliver the feature',
+      snapshot,
+    );
+    beginRun('cmd-rework-mixed-publish-deploy', 'implement and deliver the feature');
+    completeTurn('The initial implementation is complete.');
+    await waitForRunPhase('auditing');
+
+    completeDelegatedAudit('REWORK', 'Repair the finding and run focused tests.');
+    await waitForRunPhase('execution');
+    completeTurn('The finding is repaired, but the focused tests still need to run.');
+    await waitForTransportSendCount(3);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    const preAuditContinue = String(mockTransportRuntime.send.mock.calls[2]?.[0]);
+    expect(preAuditContinue).toContain('Complete only the remaining substantive implementation or validation work');
+    expect(preAuditContinue).toContain('Do not stage, commit, or push; do not merge, release, publish, or deploy.');
+    expect(preAuditContinue).not.toContain(mixedAction);
+    expect(preAuditContinue).not.toContain(finalizationAction);
+
+    completeTurn('The repaired implementation and focused tests now pass; no finalization was performed.');
+    await waitForRunPhase('auditing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
+    expect(String(mockTransportRuntime.send.mock.calls[3]?.[0])).toContain('imcodes send --reply');
+    expect(mockTransportRuntime.send.mock.calls.some((call) =>
+      String(call[0]).includes(finalizationAction))).toBe(false);
+
+    completeDelegatedAudit('PASS', 'The repaired implementation and focused tests pass audit.');
+    await waitForRunPhase('finalizing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(5);
+    expect(String(mockTransportRuntime.send.mock.calls[4]?.[0])).toContain(finalizationAction);
   });
 
   it('keeps ordinary supervised commit and push continuation immediate', async () => {
@@ -1848,10 +2054,18 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-loop-one', 'implement the feature', snapshot);
     beginRun('cmd-loop-one', 'implement the feature');
 
+    // Each step waits for the phase it depends on instead of a fixed sleep.
+    // Dispatching the audit is async (broker decision + filesystem baseline
+    // discovery); sleep(25) covered that locally but not on a loaded CI runner.
+    // Completing the delegated audit before the run reached `auditing` derailed
+    // the sequence, and call[1] then held the audit-orchestration prompt rather
+    // than the rework brief — the macOS CI failure this replaces.
     completeTurn('implemented the feature');
-    await sleep(25);
+    await waitForRunPhase('auditing');
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
     completeDelegatedAudit('REWORK', 'first audit needs fixes');
-    await sleep(25);
+    await waitForRunPhase('execution');
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     expect(String(mockTransportRuntime.send.mock.calls[1]?.[0])).toContain('Audit verdict: REWORK');
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
@@ -1860,13 +2074,16 @@ describe('SupervisionAutomation', () => {
     });
 
     completeTurn('implemented the requested rework');
-    await sleep(25);
+    await waitForRunPhase('auditing');
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
     expect(String(mockTransportRuntime.send.mock.calls[2]?.[0])).toContain('imcodes send --reply');
+
+    // maxAuditLoops = 1, so the second REWORK must end the run WITHOUT another
+    // rework dispatch. Wait for teardown, then assert the count never grew.
     completeDelegatedAudit('REWORK', 'second audit still needs fixes');
-    await sleep(25);
-    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
+    await waitForRunEnd();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
   });
 
   it('ignores deprecated combo auditMode and still starts exactly one lightweight peer audit', async () => {

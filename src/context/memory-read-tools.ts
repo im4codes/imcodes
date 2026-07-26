@@ -16,7 +16,11 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 
 const MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('MemoryToolCaller');
 const INTERNAL_MEMORY_TOOL_CALLER_BRAND: unique symbol = Symbol('InternalMemoryToolCaller');
-const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
+// Alias of the shared sentinel, not a second definition: this module already
+// imports LEGACY_DAEMON_LOCAL_USER_ID. Two literals of the same value in one
+// codebase are how the register/resolve halves of the handle namespace drifted
+// apart in the first place.
+const DAEMON_LOCAL_MEMORY_USER_ID = LEGACY_DAEMON_LOCAL_USER_ID;
 
 /**
  * Caller identity passed to public read-tool handlers.

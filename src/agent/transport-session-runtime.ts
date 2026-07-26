@@ -80,6 +80,7 @@ import {
   resolveSummarySyncSourceKind,
 } from '../context/summary-sync.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
@@ -3298,8 +3299,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         : 'degraded-message-side';
       const combinedItems = [...summaryItems, ...items];
       const sections: string[] = [];
-      if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(summaryItems));
-      if (items.length > 0) sections.push(buildRelatedPastWorkText(items));
+      if (summaryItems.length > 0) sections.push(buildStartupProjectMemoryText(attachMemoryShortRefs(summaryItems)));
+      if (items.length > 0) sections.push(buildRelatedPastWorkText(attachMemoryShortRefs(items)));
       const injectedText = sections.join('\n\n');
       const sourceKind = resolveSummarySyncSourceKind(combinedItems);
       const payload = buildMemoryContextTimelinePayload(query, combinedItems, 'message', {

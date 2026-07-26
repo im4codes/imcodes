@@ -115,12 +115,21 @@ import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDisc
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import { resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import logger from '../util/logger.js';
+import {
+  TIMELINE_DELIVERY_METRICS,
+  countableTimelineEventType,
+} from '../../../shared/timeline-delivery-telemetry.js';
 import { incrementCounter } from '../util/metrics.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
+import { isServerLinkResyncStatePayload } from '../../../shared/session-activity-types.js';
 import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+  DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
 import {
   P2P_WORKFLOW_MSG,
@@ -226,6 +235,8 @@ const MAX_QUEUE_SIZE = 100;
 const DAEMON_UPGRADE_BLOCKED_RETRY_MS = 60_000;
 const DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS = 5_000;
 const DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS = 15 * 60 * 1000;
+const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
 const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
   'p2p_active',
   'auto_deliver_active',
@@ -590,6 +601,9 @@ type TimelineDataPlaneJob = {
 const WATCH_RECENT_TEXT_CAP = 5;
 const WATCH_RECENT_TEXT_MAX_CHARS = 160;
 let idlePushSettleMs = process.env.NODE_ENV === 'test' ? 0 : 300;
+// Human-facing heartbeat for no-subscriber drops. The counter records each one;
+// this keeps the log readable when a whole app-background window is discarded.
+const TIMELINE_NO_SUBSCRIBER_LOG_THROTTLE_MS = 30_000;
 const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
 const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 // Bumped from 128 → 4096 and 15s → 60s as part of the commit-42dfabec
@@ -1129,6 +1143,11 @@ export class WsBridge {
    * auth check has settled.
    */
   private authPromise: Promise<void> | null = null;
+  /** Connection generation that advertised outbox-sync support during auth. */
+  private upgradeBlockedSyncRequiredGeneration: number | null = null;
+  /** Connection generation whose persisted blocker replay has completed. */
+  private upgradeBlockedSyncCompleteGeneration: number | null = null;
+  private seenUpgradeBlockedFailures = new Map<string, number>();
   private browserRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
@@ -1216,6 +1235,9 @@ export class WsBridge {
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
+  /** Content-bearing timeline events discarded because nobody was subscribed. */
+  private timelineNoSubscriberDrops = 0;
+  private lastTimelineNoSubscriberLogAt = 0;
   private pendingIdlePushes = new Map<string, {
     timer: ReturnType<typeof setTimeout> | null;
     db: Database;
@@ -2404,6 +2426,7 @@ export class WsBridge {
     // generation (they resolve as indeterminate) so a reconnect never delivers a
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
+    const connectionGeneration = this.daemonGeneration;
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
     // Invalidate every pending peer-audit response route: the prior daemon
     // is gone, and any reply that arrives for it must not be delivered to a
@@ -2416,6 +2439,8 @@ export class WsBridge {
     // late-arriving messages don't await a stale (and possibly resolved
     // for a different `ws`) auth.
     this.authPromise = null;
+    this.upgradeBlockedSyncRequiredGeneration = null;
+    this.upgradeBlockedSyncCompleteGeneration = null;
 
     // Auth timeout
     this.authTimer = setTimeout(() => {
@@ -2426,6 +2451,11 @@ export class WsBridge {
     }, AUTH_TIMEOUT_MS);
 
     ws.on('message', async (data, isBinary) => {
+      // A replaced socket can still emit already-buffered frames while ws is in
+      // CLOSING. Never let those frames borrow the replacement connection's
+      // authenticated/shared bridge state.
+      if (this.daemonWs !== ws || this.daemonGeneration !== connectionGeneration) return;
+
       // Handle binary raw PTY frames
       if (isBinary) {
         // Binary PTY data is a FULL-daemon capability. Never route unauthenticated
@@ -2453,10 +2483,11 @@ export class WsBridge {
       // `ws.close(4001, 'auth_required')` even though auth was about to
       // succeed milliseconds later. See `authPromise` field doc above.
       if (this.authPromise) {
-        try { await this.authPromise; } catch { /* ignore — closed below */ }
+        const pendingAuth = this.authPromise;
+        try { await pendingAuth; } catch { /* ignore — closed below */ }
         // The connection may have been closed while we awaited (auth
         // failed / timed out / replaced). Bail out before processing.
-        if (this.daemonWs !== ws) return;
+        if (this.daemonWs !== ws || this.daemonGeneration !== connectionGeneration) return;
       }
 
       if (!this.authenticated) {
@@ -2475,7 +2506,19 @@ export class WsBridge {
         // Resolving (vs rejecting) avoids unhandled-rejection warnings
         // when no concurrent handler is currently awaiting.
         let resolveAuth!: () => void;
-        this.authPromise = new Promise<void>((res) => { resolveAuth = res; });
+        const localAuthPromise = new Promise<void>((res) => { resolveAuth = res; });
+        this.authPromise = localAuthPromise;
+        const isCurrentAuthConnection = (): boolean =>
+          this.daemonWs === ws && this.daemonGeneration === connectionGeneration;
+        const finishLocalAuth = (): void => {
+          resolveAuth();
+          // A replacement connection owns a different auth promise. A stale
+          // continuation may release only its own waiters; it must never clear
+          // the replacement's auth barrier.
+          if (this.authPromise === localAuthPromise) {
+            this.authPromise = null;
+          }
+        };
 
         const tokenHash = sha256Hex(msg.token);
         let server: { token_hash: string; user_id?: string; node_role?: string | null; revoked_at?: number | null } | null = null;
@@ -2485,16 +2528,23 @@ export class WsBridge {
             [this.serverId],
           );
         } catch (err) {
-          resolveAuth();
-          this.authPromise = null;
+          const stillCurrent = isCurrentAuthConnection();
+          finishLocalAuth();
+          if (!stillCurrent) return;
           throw err;
+        }
+        // The DB lookup is the first asynchronous auth boundary. A replacement
+        // may have installed a new socket and auth promise while it was pending.
+        // Never let the stale continuation overwrite generation-bound state.
+        if (!isCurrentAuthConnection()) {
+          finishLocalAuth();
+          return;
         }
 
         if (!server || server.token_hash !== tokenHash) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth failed');
           ws.close(4001, 'auth_failed');
-          resolveAuth();
-          this.authPromise = null;
+          finishLocalAuth();
           return;
         }
 
@@ -2502,8 +2552,7 @@ export class WsBridge {
         if (server.revoked_at != null) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth rejected: revoked');
           ws.close(4003, 'revoked');
-          resolveAuth();
-          this.authPromise = null;
+          finishLocalAuth();
           return;
         }
 
@@ -2511,6 +2560,15 @@ export class WsBridge {
         // in the auth frame is IGNORED (10.2). A controlled node's WS is only a
         // presence/heartbeat + MACHINE_EXEC_RESULT surface.
         this.daemonNodeRole = server.node_role === NODE_ROLE.CONTROLLED ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL;
+        const supportsUpgradeBlockedSync = this.daemonNodeRole === NODE_ROLE.FULL
+          && msg[DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]
+            === DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION;
+        this.upgradeBlockedSyncRequiredGeneration = supportsUpgradeBlockedSync
+          ? connectionGeneration
+          : null;
+        this.upgradeBlockedSyncCompleteGeneration = supportsUpgradeBlockedSync
+          ? null
+          : connectionGeneration;
         this.controlledFileTransferCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
           ? new Set(
               (Array.isArray(msg.capabilities) ? msg.capabilities : [])
@@ -2536,9 +2594,18 @@ export class WsBridge {
         // controlled node — it is a restricted presence/exec-result surface (10.2).
         if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED && typeof server.user_id === 'string' && server.user_id.trim()) {
           try {
-            this.sendMemoryFeatureConfigApply(await this.readUserMemoryFeatureFlags(server.user_id));
+            const memoryFeatureFlags = await this.readUserMemoryFeatureFlags(server.user_id);
+            if (!isCurrentAuthConnection()) {
+              finishLocalAuth();
+              return;
+            }
+            this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
           } catch (err) {
             logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
+          }
+          if (!isCurrentAuthConnection()) {
+            finishLocalAuth();
+            return;
           }
         }
         this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
@@ -2644,7 +2711,11 @@ export class WsBridge {
           this.graceTimer = null;
         }
         this.daemonOfflineAnnounced = false;
-        await this.replayInflightToDaemon();
+        await this.replayInflightToDaemon(ws, connectionGeneration);
+        if (!isCurrentAuthConnection()) {
+          finishLocalAuth();
+          return;
+        }
         this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_ONLINE }));
         this.startAckHousekeepingIfNeeded();
 
@@ -2653,8 +2724,20 @@ export class WsBridge {
         // (e.g. the `daemon.hello` that landed before auth finished)
         // will resume past their `await this.authPromise` and observe
         // `this.authenticated === true`.
-        resolveAuth();
-        this.authPromise = null;
+        finishLocalAuth();
+        // Do not arm an auto-upgrade timer until the auth turn has fully
+        // yielded. daemon.upgrade_blocked is sent immediately after auth by a
+        // reconnecting daemon, and its handler was waiting on authPromise. A
+        // next-turn flush lets that persisted terminal blocker run first,
+        // regardless of how long replayInflightToDaemon() made auth take.
+        setImmediate(() => {
+          if (
+            this.daemonWs !== ws
+            || this.daemonGeneration !== connectionGeneration
+            || !this.authenticated
+          ) return;
+          this.flushPendingDaemonUpgrade(ws);
+        });
         return;
       }
 
@@ -2714,6 +2797,22 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED_SYNC) {
+        if (
+          this.daemonWs === ws
+          && this.daemonGeneration === connectionGeneration
+          && this.upgradeBlockedSyncRequiredGeneration === connectionGeneration
+          && msg.revision === DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION
+        ) {
+          this.upgradeBlockedSyncCompleteGeneration = connectionGeneration;
+          setImmediate(() => {
+            if (this.daemonWs !== ws || this.daemonGeneration !== connectionGeneration) return;
+            this.flushPendingDaemonUpgrade(ws);
+          });
+        }
+        return;
+      }
+
       if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
         this.handleDaemonP2pWorkflowHello(msg);
         return;
@@ -2738,7 +2837,7 @@ export class WsBridge {
       }
 
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        this.handleDaemonUpgradeBlocked(msg, ws);
+        if (!this.handleDaemonUpgradeBlocked(msg, ws)) return;
       }
 
       if (msg.type === 'heartbeat') {
@@ -2780,6 +2879,20 @@ export class WsBridge {
             const payload = event.payload as Record<string, unknown>;
             const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
             if (payload[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
+            // A daemon link-restore resync re-states every session's CURRENT
+            // state so browsers stop rendering a stale "working" spinner. It is
+            // a re-announcement, never a fresh completion, so it must not push:
+            // one link restore would otherwise fan one "Task complete" per idle
+            // session (seen on the 43 deployment as ~90 dispatches in 500ms right
+            // after four daemons re-authenticated). The age guard below cannot
+            // catch it — resync events are newly minted even though the state
+            // they describe is old.
+            //
+            // Checked HERE as well as suppressed at the daemon, on purpose:
+            // daemons are user-installed and upgrade on their own schedule, so a
+            // daemon-only fix leaves every not-yet-updated daemon still storming
+            // until it happens to update. This makes a server deploy sufficient.
+            if (isServerLinkResyncStatePayload(payload)) return;
             if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
             this.scheduleIdleEventPush(db, env, {
               type: 'session.idle',
@@ -2801,6 +2914,8 @@ export class WsBridge {
         // closed, the awaiting handlers will fall through and observe
         // `this.daemonWs !== ws` and bail out.
         this.authPromise = null;
+        this.upgradeBlockedSyncRequiredGeneration = null;
+        this.upgradeBlockedSyncCompleteGeneration = null;
         this.recentTextBySession.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
@@ -2840,6 +2955,9 @@ export class WsBridge {
     });
 
     ws.on('error', (err) => {
+      // Errors from a replaced socket belong to its abandoned generation and
+      // must not reject requests owned by the current daemon connection.
+      if (this.daemonWs !== ws || this.daemonGeneration !== connectionGeneration) return;
       logger.error({ serverId: this.serverId, err }, 'Daemon WS error');
       this.rejectAllPendingFileTransfers('daemon_error');
       this.rejectAllPendingMemorySourcesRequests('daemon_error');
@@ -4522,7 +4640,8 @@ export class WsBridge {
       // Bypass TerminalForwardQueue: timeline events are control-plane and
       // must never queue behind PTY data. Critical for cancel/stop UX —
       // session.state(idle) used to arrive seconds after the push notification.
-      this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
+      const timelineRecipients = this.sendJsonToSessionSubscribers(sessionId, JSON.stringify(msg));
+      this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
       return;
     }
 
@@ -4906,6 +5025,11 @@ export class WsBridge {
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
+        // Memory-handle persistence failures ride this frame because the
+        // daemon's own counter and log cannot leave a machine whose disk is
+        // full. Rebuilding the payload without them put the signal in a hole:
+        // it reached this pod and went no further.
+        ...(isPlainRecord(msg.shortRefHealth) ? { shortRefHealth: msg.shortRefHealth } : {}),
       }));
       return;
     }
@@ -5165,7 +5289,7 @@ export class WsBridge {
    *    subscriptions to); we dedup per-WS so the same JSON is never sent
    *    twice.
    */
-  private sendJsonToSessionSubscribers(sessionName: string, json: string): void {
+  private sendJsonToSessionSubscribers(sessionName: string, json: string): number {
     const sent = new Set<WebSocket>();
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
@@ -5185,6 +5309,47 @@ export class WsBridge {
       sent.add(ws);
       safeSend(ws, outgoing);
     }
+    return sent.size;
+  }
+
+  /**
+   * Observe the fan-out result for a live timeline event.
+   *
+   * With zero subscribers both loops in `sendJsonToSessionSubscribers` simply never
+   * execute a body: the event is discarded with no queue, no replay and — until now
+   * — no trace. That is the normal state of a BACKGROUNDED app, which is exactly why
+   * "the push notification arrived but the chat was empty" was so reproducible. The
+   * browser now heals this with a no-lower-bound backfill on activation, so without
+   * a counter a rising drop rate would be permanently masked by recovery.
+   *
+   * Takes the already-parsed event and the recipient count the fan-out returned:
+   * this runs for every event of every session, so it must not re-parse the
+   * serialized copy. Only content-bearing events are counted; status/usage chatter
+   * fires about once a second during a turn and would drown the signal.
+   */
+  private recordTimelineFanout(sessionName: string, event: unknown, recipientCount: number): void {
+    const eventType = countableTimelineEventType(event);
+    if (!eventType) return;
+    if (recipientCount > 0) {
+      incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_DELIVERED, { eventType });
+      return;
+    }
+    incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_NO_SUBSCRIBER_DROPPED, { eventType });
+    this.timelineNoSubscriberDrops += 1;
+    const now = Date.now();
+    if (now - this.lastTimelineNoSubscriberLogAt < TIMELINE_NO_SUBSCRIBER_LOG_THROTTLE_MS) return;
+    this.lastTimelineNoSubscriberLogAt = now;
+    logger.warn({
+      serverId: this.serverId,
+      sessionName,
+      eventType,
+      droppedTotal: this.timelineNoSubscriberDrops,
+    }, 'Timeline event discarded: no subscribed viewer (client must heal via backfill)');
+  }
+
+  /** Total content-bearing timeline events discarded for lack of a subscriber. */
+  get timelineNoSubscriberDropCount(): number {
+    return this.timelineNoSubscriberDrops;
   }
 
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
@@ -5636,20 +5801,46 @@ export class WsBridge {
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
-  private async replayInflightToDaemon(): Promise<void> {
+  private async replayInflightToDaemon(expectedWs: WebSocket, expectedGeneration: number): Promise<void> {
     const ordered = [...this.inflightCommands.values()].sort((a, b) => a.sentAt - b.sentAt);
     for (const entry of ordered) {
+      if (this.daemonWs !== expectedWs || this.daemonGeneration !== expectedGeneration) return;
       if (entry.state === 'acked') continue;
       try {
-        await this.dispatchInflightToDaemon(entry, entry.dispatchAttempts > 0);
+        await this.dispatchInflightToDaemon(
+          entry,
+          entry.dispatchAttempts > 0,
+          { ws: expectedWs, generation: expectedGeneration },
+        );
       } catch (err) {
         logger.warn({ commandId: entry.commandId, err }, 'replayInflightToDaemon failed for entry');
       }
     }
   }
 
-  private async dispatchInflightToDaemon(entry: InflightCommand, markBridgeRetry: boolean): Promise<void> {
+  private async dispatchInflightToDaemon(
+    entry: InflightCommand,
+    markBridgeRetry: boolean,
+    expectedConnection?: { ws: WebSocket; generation: number },
+  ): Promise<void> {
+    if (
+      expectedConnection
+      && (
+        this.daemonWs !== expectedConnection.ws
+        || this.daemonGeneration !== expectedConnection.generation
+      )
+    ) return;
     if (!await this.revalidateInflightShareCommand(entry)) return;
+    // Share revalidation can await DB/coverage work. If auth was replaced while
+    // it was pending, leave the entry for the new generation's replay rather
+    // than sending it through the replacement socket from a stale auth flow.
+    if (
+      expectedConnection
+      && (
+        this.daemonWs !== expectedConnection.ws
+        || this.daemonGeneration !== expectedConnection.generation
+      )
+    ) return;
     const rawPayload = markBridgeRetry
       ? this.withBridgeRetryMarker(entry.rawPayload, entry.dispatchAttempts + 1)
       : entry.rawPayload;
@@ -5874,19 +6065,80 @@ export class WsBridge {
     return this.seenCommandAcks.has(commandId);
   }
 
-  private handleDaemonUpgradeBlocked(msg: Record<string, unknown>, ws: WebSocket): void {
+  private handleDaemonUpgradeBlocked(msg: Record<string, unknown>, ws: WebSocket): boolean {
     const serverVersion = process.env.APP_VERSION;
-    if (!serverVersion || serverVersion === '0.0.0' || !this.daemonVersion || this.daemonVersion === serverVersion) return;
+    const failureId = typeof msg.failureId === 'string' && msg.failureId.length > 0 && msg.failureId.length <= 128
+      ? msg.failureId
+      : null;
+    const failedTargetVersion = typeof msg.targetVersion === 'string' ? msg.targetVersion : null;
+    const failureUpgradeId = typeof msg.upgradeId === 'string' && msg.upgradeId.length > 0 && msg.upgradeId.length <= 128
+      ? msg.upgradeId
+      : null;
+    if (!serverVersion || serverVersion === '0.0.0' || !this.daemonVersion || this.daemonVersion === serverVersion) {
+      if (failureId) {
+        this.sendDaemonUpgradeBlockedAck(
+          ws,
+          failureId,
+          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.OBSOLETE,
+        );
+      }
+      return false;
+    }
+    if (
+      msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED
+      && failedTargetVersion
+      && failedTargetVersion !== serverVersion
+    ) {
+      this.sendDaemonUpgradeBlockedAck(
+        ws,
+        failureId,
+        DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.OBSOLETE,
+      );
+      return false;
+    }
 
     const retryDelayMs = this.daemonUpgradeBlockedRetryDelayMs(msg);
     if (retryDelayMs == null) {
+      const replayBeforeSync = this.upgradeBlockedSyncRequiredGeneration === this.daemonGeneration
+        && this.upgradeBlockedSyncCompleteGeneration !== this.daemonGeneration;
+      const supersededByManual = msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED
+        && failedTargetVersion != null
+        && (
+          this.daemonUpgradeCoordinator.isTerminalFailureSupersededByManual(
+            failedTargetVersion,
+            failureUpgradeId,
+          )
+          || (
+            failureUpgradeId == null
+            && replayBeforeSync
+            && this.daemonUpgradeCoordinator.hasManualLifecycleForTarget(failedTargetVersion)
+          )
+        );
+      if (supersededByManual) {
+        this.sendDaemonUpgradeBlockedAck(
+          ws,
+          failureId,
+          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.SUPERSEDED,
+        );
+        return false;
+      }
+      this.daemonUpgradeCoordinator.blockTargetAfterTerminalFailure(serverVersion);
+      const duplicate = failureId ? this.hasSeenUpgradeBlockedFailure(failureId) : false;
+      if (failureId) {
+        this.rememberUpgradeBlockedFailure(failureId);
+        this.sendDaemonUpgradeBlockedAck(
+          ws,
+          failureId,
+          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+        );
+      }
       logger.info({
         serverId: this.serverId,
         daemonVersion: this.daemonVersion,
         serverVersion,
         reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
       }, 'daemon.upgrade blocked by non-retryable reason');
-      return;
+      return !duplicate;
     }
 
     const result = this.daemonUpgradeCoordinator.retryAutoAfterBlocked({
@@ -5905,6 +6157,44 @@ export class WsBridge {
         nextAttemptAt: result.nextAttemptAt,
         upgradeId: result.upgradeId,
       }, 'daemon.upgrade blocked by transient daemon state — retry scheduled');
+    }
+    return true;
+  }
+
+  private sendDaemonUpgradeBlockedAck(
+    ws: WebSocket,
+    failureId: string | null,
+    disposition: DaemonUpgradeBlockedAckDisposition,
+  ): void {
+    if (!failureId) return;
+    try {
+      ws.send(JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId,
+        disposition,
+      }));
+    } catch {
+      // The daemon retains the blocker until it receives this ACK and will
+      // replay it after reconnect, rebuilding the coordinator gate.
+    }
+  }
+
+  private hasSeenUpgradeBlockedFailure(failureId: string, now = Date.now()): boolean {
+    const seenAt = this.seenUpgradeBlockedFailures.get(failureId);
+    return seenAt !== undefined && now - seenAt <= DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS;
+  }
+
+  private rememberUpgradeBlockedFailure(failureId: string, now = Date.now()): void {
+    for (const [id, seenAt] of this.seenUpgradeBlockedFailures) {
+      if (now - seenAt > DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS) {
+        this.seenUpgradeBlockedFailures.delete(id);
+      }
+    }
+    this.seenUpgradeBlockedFailures.set(failureId, now);
+    while (this.seenUpgradeBlockedFailures.size > DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX) {
+      const oldest = this.seenUpgradeBlockedFailures.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.seenUpgradeBlockedFailures.delete(oldest);
     }
   }
 
@@ -5939,7 +6229,7 @@ export class WsBridge {
     });
   }
 
-  private flushPendingDaemonUpgrade(ws: WebSocket): void {
+  private flushPendingDaemonUpgrade(ws: WebSocket): RequestDaemonUpgradeResult | null {
     const result = this.daemonUpgradeCoordinator.flushPending({
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
       isDaemonReady: () => this.isDaemonReadyForUpgrade(),
@@ -5959,10 +6249,13 @@ export class WsBridge {
         nextAttemptAt: result.nextAttemptAt,
       }, 'Pending daemon.upgrade is waiting for npm publication');
     }
+    return result;
   }
 
   private isDaemonReadyForUpgrade(): boolean {
-    return Boolean(this.daemonWs && this.authenticated);
+    const syncReady = this.upgradeBlockedSyncRequiredGeneration !== this.daemonGeneration
+      || this.upgradeBlockedSyncCompleteGeneration === this.daemonGeneration;
+    return Boolean(this.daemonWs && this.authenticated && this.authPromise === null && syncReady);
   }
 
   private sendDirectToDaemon(message: Record<string, unknown>): void {
@@ -5981,6 +6274,8 @@ export class WsBridge {
       this.daemonWs = null;
       this.authenticated = false;
       this.authPromise = null;
+      this.upgradeBlockedSyncRequiredGeneration = null;
+      this.upgradeBlockedSyncCompleteGeneration = null;
       this.daemonP2pWorkflowCapabilities = null;
       this.controlledFileTransferCapabilities.clear();
     }

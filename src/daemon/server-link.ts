@@ -3,11 +3,21 @@ import { performance } from 'node:perf_hooks';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+} from '../../shared/daemon-upgrade.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
+import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
 import type { EmbeddingStatus } from '../../shared/embedding-status.js';
+import type { DiskUsage } from '../../shared/disk-usage.js';
+import { getDiskUsage, refreshDiskUsage } from './disk-usage.js';
+import { getMemoryShortRefHealth } from '../context/memory-short-ref.js';
+import type { MemoryShortRefHealth } from '../../shared/memory-short-ref-health.js';
 import { recordDaemonServerLinkStatus } from '../util/daemon-status.js';
 import {
   P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
@@ -19,7 +29,7 @@ import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
-import { TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -32,6 +42,11 @@ import {
   stringifyForServerSend,
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
+import { incrementCounter } from '../util/metrics.js';
+import {
+  TIMELINE_DELIVERY_METRICS,
+  countableTimelineEventType,
+} from '../../shared/timeline-delivery-telemetry.js';
 
 interface SystemStats {
   cpu: number;
@@ -46,10 +61,17 @@ interface SystemStats {
    *  goes stale across reconnects. See `getEmbeddingStatus` for state
    *  semantics. */
   embedding: EmbeddingStatus;
+  /** Mounted-filesystem capacity for the desktop status bar (mobile ignores it). */
+  disks: DiskUsage[];
+  /** Sticky memory-handle persistence failure, omitted while healthy. Rides the
+   *  heartbeat because the counter and the daemon log both stay on the machine
+   *  whose disk is usually what failed. */
+  shortRefHealth?: MemoryShortRefHealth;
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): SystemStats {
+  const shortRefHealth = getMemoryShortRefHealth();
   const memTotal = os.totalmem();
   const memFree = os.freemem();
   const [load1, load5, load15] = os.loadavg();
@@ -65,6 +87,8 @@ function collectSystemStats(): SystemStats {
     load15: +load15.toFixed(2),
     uptime: os.uptime(),
     embedding: getEmbeddingStatus(),
+    disks: getDiskUsage(),
+    ...(shortRefHealth ? { shortRefHealth } : {}),
   };
 }
 
@@ -150,6 +174,10 @@ const WATCHDOG_MS = 10_000;           // check connection health every 10s
 // getOpenSocketSilenceMs() still prevents this from false-reconnecting a healthy
 // socket during the daemon's own load spikes (it reports 0 silence then).
 const SILENT_CONNECTION_RECYCLE_MS = 30_000;
+// Throttle for the dropped-timeline-event warning. The counter records every
+// drop; the log line is a human-facing heartbeat so a flapping link is visible
+// in daemon.log without one line per lost message.
+const TIMELINE_DROP_LOG_THROTTLE_MS = 30_000;
 // Event-loop stall guard. Under heavy local load the daemon's event loop can
 // freeze for tens of seconds. The silence-based reconnects measure
 // `now - lastPong`, which during a freeze blames the SERVER for the daemon's
@@ -159,6 +187,17 @@ const SILENT_CONNECTION_RECYCLE_MS = 30_000;
 // silence checks stand down until inbound can actually be read again.
 const LOOP_PROBE_MS = 1_000;
 const EVENT_LOOP_STALL_THRESHOLD_MS = 3_000; // probe overdue by >3 s ⇒ loop stalled
+
+/**
+ * Invoked (async, best-effort) after every successful RE-connect so the session
+ * layer can re-broadcast authoritative per-session state that live control-plane
+ * relays dropped while the link was down. Registered from daemon startup
+ * (lifecycle) to avoid a server-link → session-manager import cycle.
+ */
+let serverLinkReconnectResyncHandler: (() => void) | null = null;
+export function setServerLinkReconnectResyncHandler(handler: (() => void) | null): void {
+  serverLinkReconnectResyncHandler = handler;
+}
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   // Distinct from session-group-clone — gates the dedicated execution-clone
@@ -250,6 +289,13 @@ export class ServerLink {
   private backoffMs = INITIAL_BACKOFF_MS;
   private stopping = false;
   private reconnecting = false;
+  /** True once this link has completed at least one successful open. Gates the
+   *  reconnect state-resync so a daemon's FIRST connect (startup already runs
+   *  its own full session sync) does not double-broadcast. */
+  private hadConnectedBefore = false;
+  /** Running total of content-bearing timeline events dropped while link down. */
+  private timelineDropsWhileLinkDown = 0;
+  private lastTimelineDropLogAt = 0;
   private lastPong = 0;               // timestamp of last received message (any message counts as proof of life)
   private seq = 0;
   private readonly workerUrl: string;
@@ -346,7 +392,14 @@ export class ServerLink {
       });
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
-      ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token, daemonVersion: this.daemonVersion }));
+      ws.send(JSON.stringify({
+        type: 'auth',
+        serverId: this.serverId,
+        token: this.token,
+        daemonVersion: this.daemonVersion,
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
       this.sendDaemonHello();
       // Wire transport relay so provider callbacks can send events to browsers via this socket.
       setTransportRelaySend((msg) => {
@@ -370,12 +423,53 @@ export class ServerLink {
       outbox.flushOnReconnect(sender).catch((err) => {
         logger.warn({ err }, 'AckOutbox flush on reconnect failed');
       });
+      const sendUpgradeBlockedFrame = (message: unknown): boolean => {
+        if (this.ws !== ws) return false;
+        return this.trySend(message);
+      };
+      getDefaultUpgradeBlockedOutbox()
+        .flushOnReconnect(sendUpgradeBlockedFrame, this.daemonVersion)
+        .then(() => {
+          // Connection-bound barrier: the server must not arm an automatic
+          // upgrade until this daemon has finished reading and replaying its
+          // persisted terminal blocker. Binding the sender to `ws` prevents a
+          // delayed flush from an old connection from certifying a replacement.
+          sendUpgradeBlockedFrame({
+            type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+            revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+          });
+        })
+        .catch((err) => {
+          // Fail closed. Without a successful outbox read we cannot prove that
+          // the previous install did not terminally fail, so no sync-complete
+          // frame is sent and the server keeps automatic upgrade gated.
+          logger.warn({ err }, 'UpgradeBlockedOutbox flush on reconnect failed');
+        });
 
       // Resume the data-plane drain after reconnect. Anything that piled up
       // in `dataPlaneSendQueue` while the link was down is now safe to send
       // because the new socket is OPEN. Without this kick the queue would
       // sit there until the next enqueue happened to schedule another flush.
       this.flushDataPlaneAfterReconnect();
+
+      // Control-plane messages (live timeline events, incl. the authoritative
+      // `session.state: idle`) are DROPPED by trySend while the socket is not
+      // OPEN — there is no queue or replay for them. A turn that settles inside
+      // an outage window therefore leaves the server and every browser showing
+      // "working" forever. On every RE-connect, let the session layer
+      // re-broadcast each transport session's current authoritative state so
+      // the lost snapshot heals within one round-trip.
+      if (this.hadConnectedBefore && serverLinkReconnectResyncHandler) {
+        const handler = serverLinkReconnectResyncHandler;
+        setImmediate(() => {
+          try {
+            handler();
+          } catch (err) {
+            logger.warn({ err }, 'ServerLink: reconnect state resync handler failed');
+          }
+        });
+      }
+      this.hadConnectedBefore = true;
 
       // Refresh the supervisor global-defaults cache on every (re)connect so
       // user edits to "Global custom instructions" land in the daemon within
@@ -422,6 +516,22 @@ export class ServerLink {
       }
       try {
         const msg = JSON.parse(event.data);
+        if (
+          msg?.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && typeof msg.failureId === 'string'
+          && (
+            msg.disposition === DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED
+            || msg.disposition === DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.OBSOLETE
+            || msg.disposition === DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.SUPERSEDED
+          )
+        ) {
+          void getDefaultUpgradeBlockedOutbox()
+            .acknowledge(msg.failureId, msg.disposition)
+            .catch((err) => {
+              logger.warn({ err, failureId: msg.failureId }, 'UpgradeBlockedOutbox ack handling failed');
+            });
+          return;
+        }
         if (msg?.type === 'heartbeat_ack') {
           // Heartbeat acks are the CLI/status proof-of-life source. They must
           // not be throttled behind a just-written heartbeat-sent record, or
@@ -476,6 +586,15 @@ export class ServerLink {
       // since the daemon must never die from transient disconnects.
       // Callers that need delivery confirmation should check isConnected()
       // or await a response event before acting on `send()`.
+      //
+      // "Silently" used to be literal. Live timeline events are control-plane, so
+      // this branch is where a chat message vanishes with no queue and no replay
+      // — the browser then only recovers it via a no-lower-bound backfill. Now
+      // that activation/reconnect heals that automatically, an increase in the
+      // underlying drop rate would be invisible, so count it. Only
+      // content-bearing events are counted; `agent.status` fires ~1/s during a
+      // turn and would bury the signal.
+      this.recordTimelineDropWhileLinkDown(msg);
       return false;
     }
     try {
@@ -741,6 +860,34 @@ export class ServerLink {
     });
   }
 
+  /**
+   * Count a content-bearing timeline event lost because the link was down.
+   *
+   * Periodically warns with the running total so a flapping link shows up in the
+   * daemon log as an accumulating number instead of silence. The counter itself
+   * is the durable signal; the log line is for humans reading `daemon.log`.
+   */
+  private recordTimelineDropWhileLinkDown(msg: unknown): void {
+    if (messageTypeOf(msg) !== TIMELINE_MESSAGES.EVENT) return;
+    const eventType = countableTimelineEventType((msg as { event?: unknown } | null)?.event);
+    if (!eventType) return;
+    incrementCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType });
+    this.timelineDropsWhileLinkDown += 1;
+    const now = Date.now();
+    if (now - this.lastTimelineDropLogAt < TIMELINE_DROP_LOG_THROTTLE_MS) return;
+    this.lastTimelineDropLogAt = now;
+    logger.warn({
+      droppedTotal: this.timelineDropsWhileLinkDown,
+      eventType,
+      readyState: this.ws?.readyState ?? 'no-socket',
+    }, 'ServerLink: dropped content-bearing timeline event while link was down (browser must heal via backfill)');
+  }
+
+  /** Total content-bearing timeline events dropped while the link was down. */
+  get timelineDropCountWhileLinkDown(): number {
+    return this.timelineDropsWhileLinkDown;
+  }
+
   /** Reports whether the underlying WebSocket is currently OPEN. */
   isConnected(): boolean {
     return !!this.ws && this.ws.readyState === WebSocket.OPEN;
@@ -816,6 +963,8 @@ export class ServerLink {
         }, 10_000);
       }
     }, HEARTBEAT_MS);
+    // Warm the disk-usage cache so the first stats message already carries it.
+    void refreshDiskUsage();
     // Stats updates more frequently than heartbeat
     this.statsTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {

@@ -180,4 +180,117 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     await flushPromises();
     expect(sent).toHaveLength(2);
   });
+
+  it('cancels a scheduled auto send and terminally blocks only that target until manual override', async () => {
+    vi.useFakeTimers();
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const targetVersion = '2026.7.3192-dev.3593';
+    const request = {
+      targetVersion,
+      source: 'auto' as const,
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+      now: 0,
+    };
+
+    expect(coordinator.request(request).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(coordinator.blockTargetAfterTerminalFailure(targetVersion, 1)).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+    expect(sent).toEqual([]);
+    expect(coordinator.request({ ...request, now: 5_001 })).toMatchObject({
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
+      reason: 'terminal_install_failure',
+    });
+
+    expect(coordinator.request({
+      ...request,
+      source: 'manual',
+      now: 5_002,
+    }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('keeps an offline manual lifecycle authoritative over reconnect auto traffic', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const targetVersion = '2026.7.3192-dev.3593';
+    let ready = false;
+    const base = {
+      targetVersion,
+      skipPublicationGate: true,
+      isDaemonReady: () => ready,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+    };
+
+    const manual = coordinator.request({ ...base, source: 'manual' });
+    expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+
+    const authAuto = coordinator.request({ ...base, source: 'auto' });
+    expect(authAuto).toMatchObject({
+      upgradeId: manual.upgradeId,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS,
+    });
+
+    ready = true;
+    const flushed = coordinator.flushPending({
+      skipPublicationGate: true,
+      isDaemonReady: () => ready,
+      isStillCurrent: () => true,
+      send: (message) => sent.push(message),
+    });
+    expect(flushed).toMatchObject({
+      upgradeId: manual.upgradeId,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
+    });
+    expect(sent).toEqual([{
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      upgradeId: manual.upgradeId,
+      targetVersion,
+    }]);
+  });
+
+  it('identifies an older failure superseded by a newer manual lifecycle', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const targetVersion = '2026.7.3192-dev.3593';
+    coordinator.blockTargetAfterTerminalFailure(targetVersion, 1);
+    const manual = coordinator.request({
+      targetVersion,
+      source: 'manual',
+      skipPublicationGate: true,
+      isDaemonReady: () => false,
+      send: () => {},
+      now: 2,
+    });
+
+    expect(coordinator.isTerminalFailureSupersededByManual(targetVersion, 'older-upgrade')).toBe(true);
+    expect(coordinator.isTerminalFailureSupersededByManual(targetVersion, manual.upgradeId)).toBe(false);
+    expect(coordinator.hasManualLifecycleForTarget(targetVersion)).toBe(true);
+  });
+
+  it('allows a fresh auto lifecycle when the requested target version changes', async () => {
+    vi.useFakeTimers();
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    coordinator.blockTargetAfterTerminalFailure('2026.7.3192-dev.3593', 0);
+
+    expect(coordinator.request({
+      targetVersion: '2026.7.3193-dev.3594',
+      source: 'auto',
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: (message) => sent.push(message),
+      now: 1,
+    }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+    expect(sent).toHaveLength(1);
+  });
 });

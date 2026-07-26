@@ -2,6 +2,8 @@ export const DAEMON_MSG = {
   RECONNECTED: 'daemon.reconnected',
   DISCONNECTED: 'daemon.disconnected',
   UPGRADE_BLOCKED: 'daemon.upgrade_blocked',
+  UPGRADE_BLOCKED_ACK: 'daemon.upgrade_blocked_ack',
+  UPGRADE_BLOCKED_SYNC: 'daemon.upgrade_blocked_sync',
   // Emitted by the daemon right after it spawns the (detached) upgrade script,
   // just before the running process is killed & restarted. The server relays it
   // to browsers so the UI can show an "upgrading…" state next to the daemon

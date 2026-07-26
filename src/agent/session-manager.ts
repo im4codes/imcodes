@@ -52,7 +52,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
-import { buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import { SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC, buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -1477,6 +1477,142 @@ async function drainTransportResendQueueIntoRuntime(
   }
 }
 
+interface TransportSessionStatePayloadBuild {
+  /** Raw status mapped to the session-state vocabulary ('running' | 'idle' | 'error' | …). */
+  mapped: string;
+  /** `mapped` after the blocking-work override (idle with blocking work → running). */
+  effectiveState: string;
+  payload: Record<string, unknown>;
+  providerErrorMessage?: string;
+}
+
+/**
+ * Build the `session.state` timeline payload for a transport session's CURRENT
+ * runtime status. Shared between the live `onStatusChange` edge emitter and the
+ * server-link reconnect resync so both produce byte-identical authoritative
+ * payloads (`isAuthoritativeIdlePayloadShape` requires the exact idle field
+ * contract — see the pendingCount/pendingVersion alias note below).
+ */
+function buildTransportSessionStatePayload(
+  sessionName: string,
+  runtime: TransportSessionRuntime,
+  status: string,
+  decision: { decisionReason: string; clearSource: string; queueReason: string },
+): TransportSessionStatePayloadBuild {
+  const mapped = isWorkingSessionState(status) ? 'running' : status;
+  // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
+  // During running/streaming, command-handler's 'queued' event is the sole queue-update
+  // authority. This keeps queued messages visible in the UI until the drained turn completes.
+  const activity = runtime.getDiagnosticSnapshot();
+  const effectiveState = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
+  const providerError = runtime.lastProviderError;
+  const payload: Record<string, unknown> = { state: effectiveState };
+  if (effectiveState === 'running') {
+    payload.activityGeneration = activity.activityGeneration;
+    payload.blockingWorkCount = activity.blockingWorkCount;
+    payload.activeWorkCount = activity.blockingWorkCount;
+    payload.activeToolCount = activity.activeToolCount;
+    payload.busyReasons = activity.busyReasons;
+  }
+  if (effectiveState === 'idle') {
+    payload.authoritative = true;
+    payload.activityGeneration = activity.activityGeneration;
+    payload.blockingWorkCount = 0;
+    payload.activeWorkCount = 0;
+    payload.activeToolCount = 0;
+    payload.busyReasons = [];
+    payload.decisionReason = decision.decisionReason;
+    payload.clearInputs = [
+      { source: decision.clearSource, reason: 'clear', count: 0 },
+    ];
+    if (activity.completedTurn) {
+      payload[PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD] = activity.completedTurn;
+    }
+    const queuePayload = buildTransportQueueSnapshotPayload(sessionName, decision.queueReason);
+    Object.assign(payload, queuePayload);
+    // Canonical authoritative-idle contract fields. The shared validator
+    // (`isAuthoritativeIdlePayloadShape`) requires numeric `pendingCount` and
+    // `pendingVersion`; the queue snapshot only carries
+    // `pendingMessageVersion`/`pendingMessageEntries`, so without these two
+    // aliases the web demotes every daemon idle to a WEAK idle — and any
+    // unmatched tool.call in the timeline then keeps the session rendered
+    // "working" forever even though the reconciler proved clean idle
+    // (observed live on deck_sub_3l6z4l39).
+    payload.pendingCount = queuePayload.pendingMessageEntries.length;
+    payload.pendingVersion = queuePayload.pendingMessageVersion;
+  } else if (mapped === 'error' && providerError?.message) {
+    payload.error = providerError.message;
+  }
+  return {
+    mapped,
+    effectiveState,
+    payload,
+    ...(providerError?.message ? { providerErrorMessage: providerError.message } : {}),
+  };
+}
+
+/** Monotonic epoch so each reconnect resync gets its own stable eventId set. */
+let transportStateResyncEpoch = 0;
+
+/**
+ * Re-broadcast every live transport session's CURRENT authoritative
+ * `session.state` after the server link is restored.
+ *
+ * Why: live `timeline.event` messages are control-plane — `ServerLink.trySend`
+ * silently drops them while the socket is not OPEN, and there is no replay.
+ * A turn that settles during a link outage therefore emits its authoritative
+ * idle into a dead socket: the server (and every browser) keeps rendering the
+ * session as "working" forever, queued composer sends stay held, and no later
+ * event ever corrects it (observed live: deck_sub_26624c1t stuck "working"
+ * 23:46→01:43 while the daemon store/timeline were idle the whole time).
+ *
+ * The resync also re-pushes the session record through the persist callback so
+ * a store PUT lost in the same outage heals too. Payloads reuse the exact
+ * builder the live path uses, so authoritative-idle shape guarantees hold.
+ *
+ * `entries` is injectable for tests; production callers pass nothing.
+ */
+export function resyncTransportSessionStatesAfterLinkRestore(
+  entries?: ReadonlyArray<readonly [string, TransportSessionRuntime]>,
+): number {
+  const list = entries ?? [...transportRuntimes.entries()];
+  if (list.length === 0) return 0;
+  transportStateResyncEpoch += 1;
+  const epoch = transportStateResyncEpoch;
+  let emitted = 0;
+  for (const [sessionName, runtime] of list) {
+    try {
+      const built = buildTransportSessionStatePayload(sessionName, runtime, runtime.getStatus(), {
+        decisionReason: SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC,
+        clearSource: 'server-link-resync',
+        queueReason: 'server_link_resync',
+      });
+      // A resync RE-STATES what the daemon already knew; it is never a fresh
+      // completion, so it must never raise a push. Without this every link
+      // restore fanned one "Task complete" notification per idle session:
+      // observed live on the 43 deployment as ~90 dispatches inside 500ms,
+      // 276ms after four daemons re-authenticated following a gateway blip. The
+      // server's age guard cannot catch these because the events are newly
+      // minted (ts = now) even though the state they describe is old.
+      timelineEmitter.emit(sessionName, 'session.state', {
+        ...built.payload,
+        [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-state-resync:${sessionName}:${epoch}`,
+      });
+      const record = getSession(sessionName);
+      if (record) emitSessionPersist(record, sessionName);
+      emitted += 1;
+    } catch (err) {
+      logger.warn({ err, session: sessionName }, 'transport session state resync failed');
+    }
+  }
+  logger.info({ sessions: emitted, epoch }, 'ServerLink resync: re-broadcast transport session states');
+  return emitted;
+}
+
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const persistTransportState = (state: unknown, error?: string): void => {
@@ -1501,52 +1637,13 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     if (status === 'thinking') {
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
-    const mapped = isWorkingSessionState(status) ? 'running' : status;
-    // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
-    // During running/streaming, command-handler's 'queued' event is the sole queue-update
-    // authority. This keeps queued messages visible in the UI until the drained turn completes.
-    const activity = runtime.getDiagnosticSnapshot();
-    const effectiveMapped = mapped === 'idle' && activity.blockingWorkCount > 0 ? 'running' : mapped;
-    const providerError = runtime.lastProviderError;
-    persistTransportState(effectiveMapped, mapped === 'error' ? providerError?.message : undefined);
-    const payload: Record<string, unknown> = { state: effectiveMapped };
-    if (effectiveMapped === 'running') {
-      payload.activityGeneration = activity.activityGeneration;
-      payload.blockingWorkCount = activity.blockingWorkCount;
-      payload.activeWorkCount = activity.blockingWorkCount;
-      payload.activeToolCount = activity.activeToolCount;
-      payload.busyReasons = activity.busyReasons;
-    }
-    if (effectiveMapped === 'idle') {
-      payload.authoritative = true;
-      payload.activityGeneration = activity.activityGeneration;
-      payload.blockingWorkCount = 0;
-      payload.activeWorkCount = 0;
-      payload.activeToolCount = 0;
-      payload.busyReasons = [];
-      payload.decisionReason = 'activity_reconciler_clear';
-      payload.clearInputs = [
-        { source: 'transport-runtime', reason: 'clear', count: 0 },
-      ];
-      if (activity.completedTurn) {
-        payload[PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD] = activity.completedTurn;
-      }
-      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'transport_status_idle');
-      Object.assign(payload, queuePayload);
-      // Canonical authoritative-idle contract fields. The shared validator
-      // (`isAuthoritativeIdlePayloadShape`) requires numeric `pendingCount` and
-      // `pendingVersion`; the queue snapshot only carries
-      // `pendingMessageVersion`/`pendingMessageEntries`, so without these two
-      // aliases the web demotes every daemon idle to a WEAK idle — and any
-      // unmatched tool.call in the timeline then keeps the session rendered
-      // "working" forever even though the reconciler proved clean idle
-      // (observed live on deck_sub_3l6z4l39).
-      payload.pendingCount = queuePayload.pendingMessageEntries.length;
-      payload.pendingVersion = queuePayload.pendingMessageVersion;
-    } else if (mapped === 'error' && providerError?.message) {
-      payload.error = providerError.message;
-    }
-    timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
+    const built = buildTransportSessionStatePayload(sessionName, runtime, status, {
+      decisionReason: 'activity_reconciler_clear',
+      clearSource: 'transport-runtime',
+      queueReason: 'transport_status_idle',
+    });
+    persistTransportState(built.effectiveState, built.mapped === 'error' ? built.providerErrorMessage : undefined);
+    timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
     if (status === 'error') {
       void recoverTransportRuntimeAfterError(sessionName, runtime);
     }

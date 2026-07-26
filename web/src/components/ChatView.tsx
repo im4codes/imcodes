@@ -16,6 +16,7 @@ import type {
 } from '../ws-client.js';
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
+import { isInsufficientCapacityError } from '../upload-error.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -29,7 +30,11 @@ import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-previe
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import { AgentTodoList } from './AgentTodoList.js';
-import { computeFollowThresholds } from './chat-follow-thresholds.js';
+import {
+  CHAT_MOUNT_SETTLE_MS,
+  CHAT_MOUNT_SETTLE_TICK_MS,
+  computeFollowThresholds,
+} from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
 import { HtmlFullscreenPreview, openHtmlPreviewInNewWindow, type HtmlFullscreenPreviewState } from './HtmlFullscreenPreview.js';
 import { isLikelyDomainPath, renderChatPathActions, type ChatPathDownloadHandler } from '../chat-path-actions.js';
@@ -1360,6 +1365,10 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   const [revealingOlder, setRevealingOlder] = useState(false);
   const revealingOlderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Scroll anchor preservation: pre-prepend scrollHeight, restored after the
+  // taller list commits. Declared with the reveal state it serves (both the
+  // local render-limit reveal and the HTTP load-older prepend set it).
+  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
   // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
   // Zoomed text modal — opened by double-tap on a chat bubble on touch devices.
@@ -1821,6 +1830,18 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   };
 
   const revealHiddenOlderItems = () => {
+    // Raising the render limit mounts CHAT_RENDER_ITEM_INCREMENT more items
+    // ABOVE the viewport. Without an anchor the browser keeps `scrollTop`, so
+    // the same offset now points that much higher in the list and the reading
+    // position lurches toward older history — the "scrolled to the end and it
+    // jumps up a section" report. Worse, it lands the view back inside the
+    // `scrollTop < 100` trigger zone, so the next cooldown tick reveals again
+    // and jumps again. Capture the pre-reveal height here (not at the call
+    // sites) so every caller — the scroll auto-trigger and the manual
+    // "load older" button — is anchored identically; the restore effect below
+    // re-adds the delta.
+    const scrollEl = scrollRef.current;
+    if (scrollEl) scrollAnchorRef.current = { scrollHeight: scrollEl.scrollHeight };
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
     setRevealingOlder(true);
     setRenderItemLimit((limit) => limit + CHAT_RENDER_ITEM_INCREMENT);
@@ -1995,7 +2016,21 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Stamp when the pin banner toggles so the ResizeObserver can tell its own
   // ~60px height shift apart from a genuine viewport resize (sub-session bar,
   // keyboard) and skip re-pinning to bottom for the former. See bannerToggleAtRef.
+  //
+  // Compare against the previous value instead of just running on the dep change:
+  // an effect keyed on `[pinnedAboveViewport]` ALSO runs on mount, which stamped a
+  // 300ms suppression window over the most layout-unstable moment there is — the
+  // first frames after a page refresh, when `--vvh` is applied from an effect, the
+  // composer rehydrates its saved draft, and the sub-session bar runs its 200ms
+  // max-height transition. Every one of those shrinks `.chat-view` while
+  // `scrollTop` stays put (the list sets `overflow-anchor: none`, so the engine
+  // never compensates), and the suppressed ResizeObserver consumed the change
+  // without re-pinning — leaving the view permanently a little above the bottom
+  // after every reload. Mount is not a toggle, so it must not stamp.
+  const prevPinnedAboveViewportRef = useRef(pinnedAboveViewport);
   useEffect(() => {
+    if (prevPinnedAboveViewportRef.current === pinnedAboveViewport) return;
+    prevPinnedAboveViewportRef.current = pinnedAboveViewport;
     bannerToggleAtRef.current = Date.now();
   }, [pinnedAboveViewport]);
 
@@ -2111,8 +2146,22 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   // Scroll auto-trigger for Load Older
   const lastLoadOlderAtRef = useRef(0);
   const LOAD_OLDER_COOLDOWN_MS = 1000;
-  // Scroll anchor preservation: save scrollHeight before prepend, restore after
-  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
+
+  // Mirror `loadingOlder` into a ref so the mount-settle interval can read the
+  // CURRENT value. Adding the prop to that effect's deps instead would restart
+  // the settle window every time a load-older starts or finishes, which is both
+  // wasteful and wrong (the window is meant to track the mount, not history
+  // fetches), and reading the captured prop would leave it permanently stale.
+  const loadingOlderRef = useRef(loadingOlder);
+  loadingOlderRef.current = loadingOlder;
+
+  // Latest `events` identity, for the mount-settle interval to tell a LAYOUT
+  // settle apart from a DATA change. Anything driven by new events is owned by
+  // the content-update layout effect and its follow rules (which deliberately
+  // decline to scroll for some updates); the settle window must never
+  // second-guess that, only handle height moving under unchanged data.
+  const latestEventsRef = useRef(events);
+  latestEventsRef.current = events;
 
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
@@ -2251,6 +2300,54 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
     ro.observe(el);
     return () => ro.disconnect();
   }, [preview]);
+
+  // Hold the bottom through the post-mount layout settle.
+  //
+  // The ResizeObserver above only reacts to `clientHeight`, so anything that
+  // changes CONTENT height after the initial pin is invisible to it — and the
+  // blocks that mount ABOVE every message are the worst case, because growth
+  // above the viewport with `scrollTop` frozen slides the whole log down and the
+  // user ends up looking at older content: the reported "refresh 后上弹".
+  // Culprits that need no images at all: the "Load older" row appearing when
+  // `hasOlderHistory` flips after the first history response, the
+  // `.chat-load-older-status` row, `AgentTodoList` (first child of the scroller),
+  // and the tool-chooser banner gated on an async `usePref` fetch. None of them
+  // change `renderedRevision`, so the content-update layout effect never re-pins
+  // either, and `overflow-anchor: none` means the engine will not help.
+  //
+  // So for a bounded window after mount/session-change, re-assert the bottom
+  // whenever total height changes. Deliberately narrow: it only acts while follow
+  // is still engaged (a gentle scroll-up disengages it and this goes inert
+  // immediately — the exact complaint behind the earlier Safari jitter fixes), it
+  // never engages follow itself, it stays out of the way of the load-older anchor,
+  // and it only fires on an actual height change so a quiet mount costs nothing.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let lastScrollHeight = el.scrollHeight;
+    let seenEvents = latestEventsRef.current;
+    const deadline = Date.now() + CHAT_MOUNT_SETTLE_MS;
+    const timer = setInterval(() => {
+      if (Date.now() > deadline) { clearInterval(timer); return; }
+      const following = preview || autoScrollRef.current;
+      if (!following) { clearInterval(timer); return; }
+      if (loadingOlderRef.current || scrollAnchorRef.current) return;
+      const nextScrollHeight = el.scrollHeight;
+      // A DATA change is not ours to act on: the content-update layout effect
+      // owns those and deliberately declines to follow some of them (a
+      // non-rendered status update must not yank the viewport). Re-baseline and
+      // stand down, so this window only ever reacts to height moving on its own.
+      if (latestEventsRef.current !== seenEvents) {
+        seenEvents = latestEventsRef.current;
+        lastScrollHeight = nextScrollHeight;
+        return;
+      }
+      if (nextScrollHeight === lastScrollHeight) return;
+      lastScrollHeight = nextScrollHeight;
+      scrollToBottom(false);
+    }, CHAT_MOUNT_SETTLE_TICK_MS);
+    return () => clearInterval(timer);
+  }, [sessionId, preview]);
 
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
@@ -3120,7 +3217,8 @@ function AttachmentDownloadButton({
 
   const handleError = (err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
+    if (isInsufficientCapacityError(msg)) setError(t('upload.insufficient_capacity'));
+    else if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
     else if (msg.includes('410') || msg.includes('expired')) setError(t('upload.download_expired'));
     else if (msg.includes('404')) setError(t('upload.download_expired'));
     else setError(t('upload.upload_failed'));
@@ -3745,6 +3843,9 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
                     <div key={item.id} class="chat-memory-context-item">
                       <div class="chat-memory-context-item-summary">{item.summary}</div>
                       <div class="chat-memory-context-item-meta">
+                        {item.ref && (
+                          <code class="chat-memory-context-chip chat-memory-context-ref">{item.ref}</code>
+                        )}
                         <span class="chat-memory-context-chip">{item.projectId}</span>
                         {score && <span class="chat-memory-context-chip">{t('chat.memory_context_score', { score })}</span>}
                         {typeof item.hitCount === 'number' && item.hitCount > 0 ? (

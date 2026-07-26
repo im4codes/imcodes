@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "仍有工作階段正在執行任務。等它回到 idle 再升級 daemon。",
     "upgrade_blocked_cooldown_active": "daemon 最近剛完成升級，冷卻結束後會自動重試。",
     "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。",
+    "upgrade_blocked_install_failed": "npm 安裝期間自動升級失敗。請檢查 daemon 主機上的升級日誌；daemon 將繼續執行目前版本。",
     "upgrade_blocked_unknown": "daemon 暫時忙碌，稍後會自動重試升級。"
   },
   "discussion": {
@@ -1552,6 +1553,7 @@
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",
     "upload_failed": "上傳失敗",
+    "insufficient_capacity": "伺服器磁碟空間不足",
     "file_too_large": "檔案過大（最大 {{max}}MB）",
     "long_text_attached": "過長貼上內容已作為 {{name}} 附件加入",
     "long_text_requires_attachment": "這段貼上內容太長，不能直接放進輸入框，請改成檔案上傳。",
@@ -2599,7 +2601,9 @@
       "layerDiagnostics": "技能層級診斷",
       "enforced": "強制",
       "additive": "附加"
-    }
+    },
+    "short_ref_failure_short": "記憶句柄未儲存",
+    "short_ref_failure_detail": "記憶句柄已停止儲存({{stage}},{{failures}} 次失敗,最近 {{when}}):{{error}}。現在簽發的句柄在 daemon 重啟後將無法解析。"
   },
   "todos": {
     "title": "任務清單",

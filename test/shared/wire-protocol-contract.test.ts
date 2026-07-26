@@ -68,6 +68,8 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       RECONNECTED: 'daemon.reconnected',
       DISCONNECTED: 'daemon.disconnected',
       UPGRADE_BLOCKED: 'daemon.upgrade_blocked',
+      UPGRADE_BLOCKED_ACK: 'daemon.upgrade_blocked_ack',
+      UPGRADE_BLOCKED_SYNC: 'daemon.upgrade_blocked_sync',
       UPGRADING: 'daemon.upgrading',
       MACHINE_EXEC_CHUNK: 'machine.exec_chunk',
       MACHINE_EXEC_RESULT: 'machine.exec_result',

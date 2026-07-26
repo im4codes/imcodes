@@ -215,7 +215,7 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
-  it('reveals locally cached older messages at the top without preserving the previous anchor', async () => {
+  it('reveals locally cached older messages at the top while preserving the reading position', async () => {
     const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
       eventId: `user-${index}`,
       type: 'user.message',
@@ -256,7 +256,64 @@ describe('ChatView', () => {
     await waitFor(() => {
       expect(screen.getByText('message-0')).toBeTruthy();
     });
-    expect(scrollTopValue).toBe(0);
+    // Mounting the older items grows scrollHeight 1200 → 1800 ABOVE the
+    // viewport. The anchor must re-add that 600px delta so the message the user
+    // was reading stays under their eyes. Leaving scrollTop at 0 (the previous
+    // behaviour) silently teleported the viewport a whole reveal-chunk back into
+    // older history — reported on mobile as "scrolled to the end and it jumps up
+    // a section". The revealed content is still reachable by scrolling up.
+    expect(scrollTopValue).toBe(600);
+  });
+
+  it('does not move the viewport when a near-top scroll auto-reveals older items', async () => {
+    // Mobile repro: the auto-trigger fires at scrollTop < 100, so the user is
+    // near — but not at — the top. Without anchoring, the reveal jumped them up
+    // by the whole added height AND left them inside the < 100 trigger zone, so
+    // the next cooldown tick jumped again. Anchoring must both hold the position
+    // and carry them out of the trigger zone.
+    const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
+      eventId: `user-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `message-${index}` },
+    }));
+
+    const { container } = render(
+      <ChatView
+        events={events as any}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_reveal_no_jump_brain"
+      />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', {
+      configurable: true,
+      get: () => (container.textContent?.includes('message-0') ? 5000 : 1200),
+    });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    scrollTopValue = 50; // near the top, inside the auto-reveal trigger zone
+    fireEvent.wheel(scrollEl, { deltaY: -20 });
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => {
+      expect(screen.getByText('message-0')).toBeTruthy();
+    });
+    // 50 + (5000 - 1200) = 3850: same content under the viewport, and safely
+    // out of the < 100 re-trigger zone so the reveal cannot loop.
+    expect(scrollTopValue).toBe(3850);
+    expect(scrollTopValue).toBeGreaterThanOrEqual(100);
   });
 
   it('collapses sent user messages longer than ten hard lines by default', () => {
@@ -1655,6 +1712,7 @@ describe('ChatView', () => {
               items: [
                 {
                   id: 'mem-transport-1',
+                  ref: 'proj:transportrefa',
                   projectId: 'repo-1',
                   summary: 'Fixed transport recall visibility',
                   relevanceScore: 0.91,
@@ -1675,6 +1733,8 @@ describe('ChatView', () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain('Fixed transport recall visibility');
+      expect(container.textContent).toContain('proj:transportrefa');
+      expect(container.querySelector('.chat-memory-context-ref')?.textContent).toBe('proj:transportrefa');
       expect(container.querySelector('.chat-memory-context')?.getAttribute('data-related-to')).toBe('evt-user-transport');
     });
   });

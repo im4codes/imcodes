@@ -1,6 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
@@ -13,6 +15,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.p2p_discussions') return 'Team discussions';
       if (key === 'repo.info_title') return 'Repository information';
       if (key === 'subsessionBar.scheduled_tasks') return 'Scheduled Tasks';
+      if (key === 'memory.short_ref_failure_short') return 'memory handles failing';
+      if (key === 'memory.short_ref_failure_detail') {
+        return `stage=${vars?.stage} failures=${vars?.failures} at=${vars?.when} error=${vars?.error}`;
+      }
       return key;
     },
   }),
@@ -49,6 +55,9 @@ import { SubSessionBar } from '../../src/components/SubSessionBar.js';
 import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
+import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
+
+const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   return {
@@ -1056,4 +1065,104 @@ describe('SubSessionBar', () => {
     });
   });
 
+  // The health record already travelled daemon -> bridge -> browser; these cover the
+  // last hop, where it either becomes something an operator sees or dies silently.
+  const failingHealth = {
+    stage: 'persist_store',
+    failures: 3,
+    lastFailureAt: new Date(2026, 4, 12, 7, 8, 9).getTime(),
+    lastError: 'ENOSPC: no space left on device',
+  };
+
+  function renderBarWithStats(collapsed: boolean, statsWs: ReturnType<typeof makeStatsWs>) {
+    return render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={collapsed}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+  }
+
+  it.each([['collapsed', true], ['expanded', false]] as const)(
+    'surfaces a short-ref persistence failure in the %s status bar',
+    async (_label, collapsed) => {
+      const statsWs = makeStatsWs();
+      const view = renderBarWithStats(collapsed, statsWs);
+      await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+
+      // A healthy daemon must not show the marker, otherwise it is noise and
+      // gets ignored exactly when it matters.
+      act(() => { statsWs.emit(daemonStatsMessage); });
+      expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeNull();
+
+      act(() => { statsWs.emit({ ...daemonStatsMessage, shortRefHealth: failingHealth }); });
+
+      const alert = view.container.querySelector('.daemon-stat-shortref-alert') as HTMLElement;
+      expect(alert).toBeTruthy();
+      expect(alert.textContent).toContain('memory handles failing');
+      // The tooltip has to name the stage, the count and the underlying error;
+      // "something is wrong" is not actionable at 3am.
+      expect(alert.title).toContain('persist_store');
+      expect(alert.title).toContain('failures=3');
+      expect(alert.title).toContain('ENOSPC');
+    },
+  );
+
+  it('keeps the marker visible on mobile, unlike the disk readout', async () => {
+    // Disk usage is desktop-only by request, but a failure that silently breaks
+    // memory recall should not depend on which client happens to be open.
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit({
+        ...daemonStatsMessage,
+        disks: [{ mount: '/', usedBytes: 5 * 1024 ** 4, totalBytes: 8 * 1024 ** 4, usedPercent: 62 }],
+        shortRefHealth: failingHealth,
+      });
+    });
+
+    expect(view.container.querySelector('.daemon-stat-disk')).toBeNull();
+    expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeTruthy();
+  });
+
+  it('ships both alert strings in every locale, with the placeholders the tooltip passes', () => {
+    // The t() mock above would happily render a key that does not exist in
+    // production, so check the real locale files rather than trusting it.
+    for (const locale of SUPPORTED_LOCALES) {
+      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
+      const short = raw.memory?.short_ref_failure_short;
+      const detail = raw.memory?.short_ref_failure_detail;
+      expect(short, `${locale}: memory.short_ref_failure_short`).toBeTruthy();
+      expect(detail, `${locale}: memory.short_ref_failure_detail`).toBeTruthy();
+      for (const placeholder of ['stage', 'failures', 'when', 'error']) {
+        expect(detail, `${locale}: {{${placeholder}}}`).toContain(`{{${placeholder}}}`);
+      }
+    }
+  });
 });

@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "Una sesión todavía tiene trabajo activo. Espera a que quede inactiva antes de actualizar el daemon.",
     "upgrade_blocked_cooldown_active": "El daemon se actualizó recientemente. La actualización automática volverá a intentarlo después del tiempo de espera.",
     "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces.",
+    "upgrade_blocked_install_failed": "La actualización automática falló durante la instalación de npm. Revisa el registro de actualización del host; el daemon seguirá usando la versión actual.",
     "upgrade_blocked_unknown": "El daemon está ocupado temporalmente. La actualización automática volverá a intentarlo."
   },
   "discussion": {
@@ -1552,6 +1553,7 @@
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",
     "upload_failed": "Error al subir",
+    "insufficient_capacity": "Espacio en disco insuficiente en el servidor",
     "file_too_large": "Archivo demasiado grande (máx. {{max}}MB)",
     "long_text_attached": "El texto pegado largo se adjuntó como {{name}}",
     "long_text_requires_attachment": "Este pegado es demasiado grande para el cuadro de texto. Súbelo como archivo.",
@@ -2599,7 +2601,9 @@
       "layerDiagnostics": "Diagnóstico de capas de habilidades",
       "enforced": "Obligatoria",
       "additive": "Aditiva"
-    }
+    },
+    "short_ref_failure_short": "identificadores de memoria sin guardar",
+    "short_ref_failure_detail": "Los identificadores de memoria dejaron de guardarse ({{stage}}, {{failures}} fallo(s), último {{when}}): {{error}}. Los emitidos ahora no se resolverán tras reiniciar el daemon."
   },
   "todos": {
     "title": "Tareas",

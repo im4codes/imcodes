@@ -1,12 +1,13 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute } from '../agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
-import { ServerLink } from './server-link.js';
+import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
+import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
@@ -62,7 +63,7 @@ import {
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
-import { normalizeActivityGeneration } from '../../shared/session-activity-types.js';
+import { isServerLinkResyncStatePayload, normalizeActivityGeneration } from '../../shared/session-activity-types.js';
 import type { TransportRuntimeDiagnosticSnapshot } from '../agent/transport-session-runtime.js';
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
@@ -540,6 +541,14 @@ export async function startup(): Promise<DaemonContext> {
   startCleanupTimer();
   logger.info('File transfer initialized');
 
+  // Warm the memory short-ref index so handles injected before this restart
+  // still resolve. Resolution is synchronous (it runs inside render paths), so
+  // the durable map is read once here rather than per lookup. Best-effort: a
+  // cold index only means a handle re-registers on its next injection.
+  void loadMemoryShortRefsFromStore()
+    .then((loaded) => { if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed'); })
+    .catch(() => { /* non-fatal: handles are a pure function of the id */ });
+
   // Clean up old timeline files (>7 days) and truncate oversized ones.
   //
   // Both calls walk every JSONL file in ~/.imcodes/timeline. With a backlog
@@ -684,6 +693,14 @@ export async function startup(): Promise<DaemonContext> {
   let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
+    // Heal the exact loss window observed on deck_sub_26624c1t: an
+    // authoritative `session.state: idle` emitted while the ServerLink socket
+    // was down is silently dropped (control-plane, no replay), leaving the
+    // server + every browser rendering the session "working" forever. After
+    // each RE-connect, re-broadcast every transport session's current state.
+    setServerLinkReconnectResyncHandler(() => {
+      resyncTransportSessionStatesAfterLinkRestore();
+    });
     serverLink.onMessage((msg) => {
       handleWebCommand(msg, serverLink!);
     });
@@ -814,6 +831,13 @@ export async function startup(): Promise<DaemonContext> {
 
   // Wire timeline idle events → P2P orchestrator + queued message drain (covers all agent types: CC, codex, gemini, etc.)
   timelineEmitter.on((e) => {
+    // A link-restore resync re-states what the daemon already knew so the server
+    // and browsers can catch up. It is NOT a fresh idle transition: running the
+    // side effects below for it made every reconnect drain the queue of every
+    // transport session at once, delivering messages that had been queued for
+    // days and flooding the user with notifications. Remote consumers still get
+    // the event; local listeners must ignore it.
+    if (e.type === 'session.state' && isServerLinkResyncStatePayload(e.payload)) return;
     liveContextIngestion.handleTimelineEvent(e);
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);

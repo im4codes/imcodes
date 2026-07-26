@@ -134,6 +134,21 @@ describe('memory MCP shared contracts', () => {
     }
   });
 
+  it('tells the model an ambiguous ref is bounded and that empty sources is not "no memory"', () => {
+    // This description is what the model actually reads — registerMemoryMcpTools
+    // publishes it verbatim. It previously promised "every match" while the
+    // implementation expanded at most four, so a caller could stop looking with
+    // the answer sitting in an omitted record; and an ambiguous reply carries an
+    // empty `sources`, which reads as "no memory" unless the text says otherwise.
+    const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
+
+    expect(getSources.description).toContain('up to four');
+    expect(getSources.description).not.toMatch(/every match/i);
+    expect(getSources.description).toContain('candidateCount');
+    expect(getSources.description).toContain('truncated');
+    expect(getSources.description).toMatch(/not.*no memory/i);
+  });
+
   it('documents when search_memory results should be expanded through get_memory_sources', () => {
     const search = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY];
     const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];

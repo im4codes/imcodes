@@ -24,6 +24,8 @@ import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
+import type { DiskUsage } from '@shared/disk-usage.js';
+import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
 import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
@@ -48,6 +50,8 @@ interface DaemonStats {
   load15: number;
   uptime: number;
   embedding?: EmbeddingStatus | null;
+  disks?: DiskUsage[] | null;
+  shortRefHealth?: MemoryShortRefHealth | null;
 }
 
 type DiscussionSummary = P2pProgressDiscussion & {
@@ -172,6 +176,75 @@ function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
+}
+
+/** Format a used/total byte pair in a shared GB or TB unit — never smaller
+ *  units, so disk sizes always read as e.g. "440/460GB" or "1.2/2.0TB". */
+function formatDiskPair(usedBytes: number, totalBytes: number): string {
+  const useTb = totalBytes >= 1024 ** 4;
+  const div = useTb ? 1024 ** 4 : 1024 ** 3;
+  const unit = useTb ? 'TB' : 'GB';
+  const fmt = (b: number) => {
+    const v = b / div;
+    return v >= 100 ? v.toFixed(0) : v.toFixed(1);
+  };
+  return `${fmt(usedBytes)}/${fmt(totalBytes)}${unit}`;
+}
+
+function shortMountLabel(mount: string): string {
+  if (mount === '/') return '/';
+  const seg = mount.replace(/[\\/]+$/, '').split(/[/\\]/).filter(Boolean).pop();
+  return seg || mount;
+}
+
+function diskUsageColor(usedPercent: number): string | undefined {
+  return usedPercent >= 90 ? '#f87171' : usedPercent >= 75 ? '#fbbf24' : undefined;
+}
+
+/**
+ * Desktop-only disk-capacity readout for the daemon stats strip. Shows up to two
+ * partitions inline; with more than two, only the fullest shows inline (plus a
+ * "+N" hint) and every partition is listed in the hover tooltip. Mobile clients
+ * receive no disk data, so this renders nothing there.
+ */
+/**
+ * Memory handles stopped persisting. The daemon can only report this over the
+ * socket — its counter is process-local and its log shares the disk that is
+ * usually what failed — so this marker is the one place an operator sees it.
+ */
+function renderShortRefAlert(health: MemoryShortRefHealth | null | undefined, t: (k: string, v?: Record<string, unknown>) => string): JSX.Element | null {
+  if (!health) return null;
+  const when = new Date(health.lastFailureAt).toLocaleString();
+  return (
+    <span
+      class="daemon-stat-shortref-alert"
+      style={{ color: '#f87171' }}
+      title={t('memory.short_ref_failure_detail', { stage: health.stage, failures: health.failures, when, error: health.lastError })}
+    >
+      <span style={{ fontSize: '0.65em', verticalAlign: 'middle' }}>⚠️</span>
+      {t('memory.short_ref_failure_short')}
+    </span>
+  );
+}
+
+function renderDiskStats(disks: DiskUsage[] | null | undefined): JSX.Element | null {
+  if (!disks || disks.length === 0) return null;
+  const tooltip = disks
+    .map((d) => `${shortMountLabel(d.mount)}  ${formatDiskPair(d.usedBytes, d.totalBytes)} (${d.usedPercent}%)`)
+    .join('\n');
+  const inline = disks.length <= 2 ? disks : disks.slice(0, 1);
+  return (
+    <span class="daemon-stat-disk" title={tooltip}>
+      {inline.map((d, i) => (
+        <span style={{ color: diskUsageColor(d.usedPercent) }}>
+          {i > 0 ? ' ' : ''}
+          <span style={{ fontSize: '0.65em', verticalAlign: 'middle' }}>💾</span>
+          {formatDiskPair(d.usedBytes, d.totalBytes)}
+        </span>
+      ))}
+      {disks.length > 2 && <span style={{ opacity: 0.7 }}>+{disks.length - 1}</span>}
+    </span>
+  );
 }
 
 function formatLocalDateTime(timestamp: number): string {
@@ -801,6 +874,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           // icon falls through to its "unknown" rendering instead of
           // showing a misleading "ready".
           embedding: (msg as { embedding?: EmbeddingStatus | null }).embedding ?? null,
+          // Older daemons don't ship `disks`; null means "no data" so the
+          // desktop strip simply hides the readout (and mobile never shows it).
+          disks: msg.disks ?? null,
+          shortRefHealth: msg.shortRefHealth ?? null,
         });
       }
     });
@@ -900,6 +977,18 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 <span class="daemon-stat-load">
                   Load {stats.load1}
                 </span>
+                {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
+                  <>
+                    <span class="daemon-stat-sep"> · </span>
+                    {renderDiskStats(stats.disks)}
+                  </>
+                )}
+                {stats.shortRefHealth && (
+                  <>
+                    <span class="daemon-stat-sep"> · </span>
+                    {renderShortRefAlert(stats.shortRefHealth, t)}
+                  </>
+                )}
                 <span class="daemon-stat-sep"> · </span>
                 <EmbeddingStatusIcon status={stats.embedding} />
                 <span class="daemon-stat-sep"> · </span>
@@ -935,6 +1024,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               {' '}
               <span class="daemon-stat-load">≡{Number(stats.load1).toFixed(1)}</span>
               {' '}
+              {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
+                <>{renderDiskStats(stats.disks)}{' '}</>
+              )}
+              {stats.shortRefHealth && (<>{renderShortRefAlert(stats.shortRefHealth, t)}{' '}</>)}
               <EmbeddingStatusIcon status={stats.embedding} compact />
               {desktopLayoutCapable && (
                 <>

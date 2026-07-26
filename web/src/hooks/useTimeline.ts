@@ -3202,7 +3202,19 @@ export function useTimeline(
       // 15s does NOT refire on every focus/visibility/appStateChange tick.
       // App-resume's resetCooldowns:true path explicitly clears the map
       // so a real foreground from background still bypasses this.
-      fireHttpBackfillRef.current(0, { phase: 'refresh', cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS });
+      // `manualLatestWindow` (no lower bound), NOT the cheap tail catch-up.
+      // Activation follows a window in which live events were provably dropped:
+      // the server relays timeline events ONLY to currently-subscribed viewers
+      // (bridge.ts sendJsonToSessionSubscribers — no subscriber means silent
+      // discard, no queue, no replay), and a backgrounded app has no
+      // subscription at all. A push notification arriving is itself proof the
+      // app was backgrounded. A tail-anchored backfill asks for
+      // `(localNewest - 1ms, …]`, so the moment ANY newer event lands (and
+      // `agent.status`/`usage.update` are cursor-eligible and fire every second
+      // during a turn) the dropped events sit below the cursor and become
+      // permanently unreachable — the user is left with only the ↻ button. This
+      // is the same reasoning the seed/IDB paths above already use.
+      fireHttpBackfillRef.current(0, { phase: 'refresh', cooldownMs: ACTIVE_REFRESH_COOLDOWN_MS, mode: 'manualLatestWindow' });
     };
     window.addEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
     return () => window.removeEventListener(ACTIVE_TIMELINE_REFRESH_EVENT, handler);
@@ -3670,7 +3682,14 @@ export function useTimeline(
           });
           setRefreshing(true);
           sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
-          fireHttpBackfillRef.current(600, { phase: 'refresh', visible: true });
+          // `manualLatestWindow`: a daemon reconnect means the daemon→server link
+          // was down, and live timeline events are control-plane — `trySend`
+          // drops them silently with no queue and no replay, and the reconnect
+          // resync re-broadcasts only `session.state`, never assistant.text /
+          // tool.* / user.message. So events were almost certainly lost below the
+          // local tail, where a tail-anchored `(localNewest - 1ms, …]` request can
+          // never reach them.
+          fireHttpBackfillRef.current(600, { phase: 'refresh', visible: true, mode: 'manualLatestWindow' });
         }
       }
       // ── Browser WS disconnected: reset in-flight pagination to prevent stuck state ──

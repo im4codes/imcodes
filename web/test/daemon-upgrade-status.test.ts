@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
+import appSource from '../src/app.tsx?raw';
 import {
   nextDaemonUpgradingState,
   daemonUpgradingLabel,
@@ -21,15 +22,15 @@ describe('nextDaemonUpgradingState', () => {
     expect(nextDaemonUpgradingState(DAEMON_MSG.UPGRADING, null as unknown)).toEqual({ targetVersion: '' });
   });
 
-  it('clears the badge when the daemon comes back (online / reconnected)', () => {
+  it('clears the badge when the daemon comes back or reports the upgrade blocked', () => {
     expect(nextDaemonUpgradingState(MSG_DAEMON_ONLINE)).toBeNull();
     expect(nextDaemonUpgradingState(DAEMON_MSG.RECONNECTED)).toBeNull();
+    expect(nextDaemonUpgradingState(DAEMON_MSG.UPGRADE_BLOCKED)).toBeNull();
   });
 
   it('leaves the badge untouched (undefined) for unrelated messages', () => {
     // undefined is the "keep current state" sentinel — distinct from null (clear).
     expect(nextDaemonUpgradingState(DAEMON_MSG.DISCONNECTED)).toBeUndefined();
-    expect(nextDaemonUpgradingState(DAEMON_MSG.UPGRADE_BLOCKED)).toBeUndefined();
     expect(nextDaemonUpgradingState(MSG_DAEMON_OFFLINE)).toBeUndefined();
     expect(nextDaemonUpgradingState('daemon.stats')).toBeUndefined();
     expect(nextDaemonUpgradingState('session_list')).toBeUndefined();
@@ -39,6 +40,17 @@ describe('nextDaemonUpgradingState', () => {
     // The whole point: during an upgrade the daemon disconnects, but the badge
     // stays up until the new version reconnects. So DISCONNECTED is a no-op.
     expect(nextDaemonUpgradingState(DAEMON_MSG.DISCONNECTED)).toBeUndefined();
+  });
+
+  it('applies the badge reducer before toast throttling can skip blocker presentation', () => {
+    const reducerIndex = appSource.indexOf('const upgradingNext = nextDaemonUpgradingState(');
+    const blockerToastIndex = appSource.indexOf('if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED)');
+
+    expect(reducerIndex).toBeGreaterThan(-1);
+    expect(blockerToastIndex).toBeGreaterThan(-1);
+    expect(reducerIndex).toBeLessThan(blockerToastIndex);
+    expect(appSource.slice(blockerToastIndex, blockerToastIndex + 1200))
+      .not.toContain('if (!shouldShowDaemonUpgradeBlockedToast');
   });
 });
 

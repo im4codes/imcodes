@@ -7,9 +7,14 @@
  * Only assistant.text, user.message, and session.state=idle end thinking.
  * Tool calls, status updates, and other events are skipped (don't end thinking).
  */
-import { isAuthoritativeCleanIdlePayload, isWorkingSessionState, reduceTimelineActivity } from '../../shared/session-activity-types.js';
+import {
+  TIMELINE_METADATA_EVENT_TYPES,
+  isAuthoritativeCleanIdlePayload,
+  isWorkingSessionState,
+  reduceTimelineActivity,
+} from '../../shared/session-activity-types.js';
 
-const THINKING_SKIP_TYPES = new Set([
+const THINKING_SKIP_TYPES = new Set<string>([
   'agent.status',
   'usage.update',
   'tool.call',
@@ -17,6 +22,9 @@ const THINKING_SKIP_TYPES = new Set([
   'mode.state',
   'terminal.snapshot',
   'command.ack',
+  // Metadata/telemetry never ends a thinking sequence — see
+  // TIMELINE_METADATA_EVENT_TYPES.
+  ...TIMELINE_METADATA_EVENT_TYPES,
 ]);
 
 export function getActiveThinkingTs(events: Array<{ type: string; ts: number; payload?: Record<string, unknown> }>): number | null {

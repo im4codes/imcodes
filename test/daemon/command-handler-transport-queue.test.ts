@@ -878,10 +878,12 @@ describe('handleWebCommand transport queue behavior', () => {
       now: 102,
     });
     const send = vi.fn(() => 'queued');
+    const cancel = vi.fn(async () => {});
     getProviderMock.mockReturnValue({ id: 'mock-provider' });
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
       send,
+      cancel,
       pendingCount: 3,
       pendingMessages: ['selected option', 'queued msg', 'queued msg 2'],
       pendingEntries: [
@@ -929,6 +931,73 @@ describe('handleWebCommand transport queue behavior', () => {
     const answerStateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
     expect(answerStateCall?.[2]).not.toHaveProperty('pendingCount');
     expect(answerStateCall?.[2]).not.toHaveProperty('pendingMessages');
+    // Front placement alone only beats other QUEUED messages — it still waits
+    // for the active turn, which is the very turn paused on this question. The
+    // answer must therefore force-interrupt it (priority path) or the two wait
+    // on each other forever.
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('force-interrupts the paused turn so a queued ask.answer cannot deadlock', async () => {
+    // Regression: user answers the dialog and nothing happens. `send` returns
+    // 'queued' because the question-paused turn still counts as active work, so
+    // the answer sits at the queue front waiting for a turn that can only end
+    // once the answer is delivered. Every provider WITHOUT
+    // `answerPendingQuestion` (codex-sdk, gemini, qwen, opencode, copilot,
+    // grok, kimi, openclaw) took this path on every dialog.
+    const send = vi.fn(() => 'queued');
+    const cancel = vi.fn(async () => {});
+    getProviderMock.mockReturnValue({ id: 'mock-provider' });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      cancel,
+      pendingCount: 1,
+      pendingMessages: ['picked B'],
+      pendingEntries: [{ clientMessageId: 'ans', text: 'picked B' }],
+      pendingVersion: 1,
+    });
+
+    handleWebCommand({
+      type: 'ask.answer',
+      sessionName: 'deck_transport_brain',
+      answer: 'picked B',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledWith('picked B', undefined, undefined, undefined, { queuePlacement: 'front' });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    // The drain emits the visible user.message for the queued entry; emitting it
+    // here too would render the answer twice.
+    const userMessageEmits = emitMock.mock.calls.filter((call) => call[1] === 'user.message');
+    expect(userMessageEmits).toHaveLength(0);
+  });
+
+  it('does not interrupt anything when the ask.answer was delivered directly', async () => {
+    // Idle session: `send` returns 'sent', so there is no paused turn to break
+    // out of. Cancelling here would abort unrelated work for no reason.
+    const send = vi.fn(() => 'sent');
+    const cancel = vi.fn(async () => {});
+    getProviderMock.mockReturnValue({ id: 'mock-provider' });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      cancel,
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+      pendingVersion: 0,
+    });
+
+    handleWebCommand({
+      type: 'ask.answer',
+      sessionName: 'deck_transport_brain',
+      answer: 'picked A',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(cancel).not.toHaveBeenCalled();
   });
 
   it('undo_queued_message deletes a SQLite-only queued orphan when the runtime in-memory queue is empty', async () => {

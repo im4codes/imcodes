@@ -94,7 +94,14 @@ import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
-import { registerMemoryShortRef, resolveMemoryShortRef } from '../context/memory-short-ref.js';
+import {
+  registerMemoryShortRef,
+  resolveMemoryShortRefCandidatesWithStore,
+  resolveMemoryShortRefWithStore,
+} from '../context/memory-short-ref.js';
+
+/** Upper bound on records expanded for one colliding handle. */
+const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import {
@@ -759,13 +766,16 @@ function canManageProjectionNamespace(projectionNamespace: ContextNamespace, cal
   return !projectionUserId || projectionUserId === LEGACY_DAEMON_LOCAL_USER_ID || projectionUserId === callerUserId;
 }
 
-function resolveProjectionRefArg(args: Record<string, unknown>, namespace: ContextNamespace): string | ToolResult {
+async function resolveProjectionRefArg(
+  args: Record<string, unknown>,
+  namespace: ContextNamespace,
+): Promise<string | ToolResult> {
   const projectionId = stringArg(args, 'projectionId');
   const ref = stringArg(args, 'ref');
   if (projectionId && ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'ref cannot be combined with projectionId');
   if (projectionId) return projectionId;
   if (!ref) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'projectionId or ref is required');
-  const resolved = resolveMemoryShortRef(ref, namespace);
+  const resolved = await resolveMemoryShortRefWithStore(ref, namespace);
   if (!resolved || resolved.kind !== 'projection') {
     return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'projection is not available in the caller namespace');
   }
@@ -952,8 +962,56 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       if (!projectId) return emptySources();
       if (ref) {
-        const resolved = resolveMemoryShortRef(ref, scopedCaller.namespace);
-        if (!resolved) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
+        const candidates = await resolveMemoryShortRefCandidatesWithStore(ref, scopedCaller.namespace);
+        if (candidates.length === 0) return { status: 'ok', ref, sourceEventCount: 0, sources: [] };
+        // A digest collision (two records deriving one handle) should never
+        // happen at 65 bits. If it does, answering with one of them would be a
+        // silently wrong memory — but refusing outright throws away information
+        // the caller can use. Expand every candidate and let the caller judge,
+        // flagged so it is never mistaken for a single authoritative answer.
+        if (candidates.length > 1) {
+          // The single-candidate path below rejects a kind that disagrees with
+          // the ref; the ambiguous path must enforce the same contract rather
+          // than quietly ignoring the caller's constraint.
+          if (kind && candidates.some((candidate) => candidate.kind !== kind)) {
+            return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied ref');
+          }
+          const expanded = [];
+          for (const candidate of candidates.slice(0, AMBIGUOUS_REF_CANDIDATE_CAP)) {
+            const identity = candidate.kind === 'observation'
+              ? { kind: candidate.kind, observationId: candidate.id }
+              : { kind: candidate.kind, projectionId: candidate.id };
+            try {
+              if (candidate.kind === 'observation') {
+                expanded.push({ ...identity, ...(await memoryGetSources({ observationId: candidate.id, kind: 'observation' }, scopedCaller)) });
+                continue;
+              }
+              const candidateResult = await orchestrator(candidate.id, scopedCaller);
+              if (candidateResult.status === 'error') {
+                expanded.push({ ...identity, unavailable: candidateResult.message });
+                continue;
+              }
+              const { status: _candidateStatus, ...candidatePayload } = candidateResult;
+              expanded.push({ ...identity, ...candidatePayload });
+            } catch {
+              expanded.push({ ...identity, unavailable: 'expansion failed' });
+            }
+          }
+          return {
+            status: 'ok',
+            ref,
+            ambiguousRef: true,
+            // Expansion is bounded, so say how many records the handle actually
+            // covers. Reporting only the expanded subset while calling it every
+            // match would send the caller away believing it had seen them all.
+            candidateCount: candidates.length,
+            truncated: candidates.length > expanded.length,
+            candidates: expanded,
+            sourceEventCount: 0,
+            sources: [],
+          };
+        }
+        const resolved = candidates[0]!;
         if (kind && kind !== resolved.kind) {
           return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'source lookup kind does not match the supplied ref');
         }
@@ -990,7 +1048,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1003,7 +1061,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1016,7 +1074,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       const args = pickAllowedMcpArgs(input, ['projectionId', 'ref']);
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1031,7 +1089,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const text = stringArg(args, 'text');
       if (!text) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'text is required');
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;
@@ -1054,7 +1112,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'feedback must be not_relevant or relevant');
       }
       const scopedCaller = scopedCallerForDeps(caller, deps);
-      const projectionId = resolveProjectionRefArg(args, scopedCaller.namespace);
+      const projectionId = await resolveProjectionRefArg(args, scopedCaller.namespace);
       if (typeof projectionId !== 'string') return projectionId;
       const projection = await loadManageableProjection(projectionId, scopedCaller, getProcessedProjectionById);
       if (isToolResultValue(projection)) return projection;

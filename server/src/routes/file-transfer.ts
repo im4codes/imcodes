@@ -9,6 +9,7 @@ import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
@@ -685,8 +686,13 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       );
 
       if (result.type === 'file.upload_error') {
-        logger.warn({ serverId, uploadId, error: result.message }, 'Daemon upload error');
-        return c.json({ error: 'upload_failed', message: result.message }, 500);
+        const code = typeof (result as { code?: unknown }).code === 'string'
+          ? (result as { code: string }).code
+          : 'upload_failed';
+        logger.warn({ serverId, uploadId, error: result.message, code }, 'Daemon upload error');
+        // 507 Insufficient Storage when the daemon's disk is full; 500 otherwise.
+        const status = code === FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY ? 507 : 500;
+        return c.json({ error: code, message: result.message }, status);
       }
 
       const attachment = result.attachment as AttachmentRef;

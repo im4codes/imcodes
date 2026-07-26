@@ -29,6 +29,7 @@ import {
 } from '../../shared/memory-recall-format.js';
 import { isMemoryScope } from '../../shared/memory-scope.js';
 import { registerMemoryShortRef } from '../context/memory-short-ref.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
@@ -298,7 +299,7 @@ function renderStartupMemoryText(
     .filter((item) => item.type === 'observation');
   const sections: string[] = [];
   if (memoryItems.length > 0) {
-    sections.push(buildStartupProjectMemoryText(memoryItems));
+    sections.push(buildStartupProjectMemoryText(attachMemoryShortRefs(memoryItems)));
   }
   if (observationItems.length > 0) {
     sections.push(renderStartupObservationIndexText(observationItems));

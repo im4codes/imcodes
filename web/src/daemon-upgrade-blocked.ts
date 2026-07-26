@@ -1,3 +1,5 @@
+import { DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
+
 export const DAEMON_UPGRADE_BLOCKED_TOAST_THROTTLE_MS = 15 * 60_000;
 
 export type DaemonUpgradeBlockedToastState = {
@@ -14,6 +16,7 @@ export type DaemonUpgradeBlockedToastKey =
   | 'toast.upgrade_blocked_session_busy'
   | 'toast.upgrade_blocked_cooldown_active'
   | 'toast.upgrade_blocked_toolchain_unavailable'
+  | 'toast.upgrade_blocked_install_failed'
   | 'toast.upgrade_blocked_unknown';
 
 /**
@@ -31,6 +34,7 @@ export function daemonUpgradeBlockedToastKey(reason: string): DaemonUpgradeBlock
     case 'session_busy': return 'toast.upgrade_blocked_session_busy';
     case 'cooldown_active': return 'toast.upgrade_blocked_cooldown_active';
     case 'toolchain_unavailable': return 'toast.upgrade_blocked_toolchain_unavailable';
+    case DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED: return 'toast.upgrade_blocked_install_failed';
     default: return 'toast.upgrade_blocked_unknown';
   }
 }

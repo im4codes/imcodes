@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "В сессии ещё выполняется работа. Дождитесь состояния idle перед обновлением daemon.",
     "upgrade_blocked_cooldown_active": "daemon недавно обновлялся. Автообновление повторится после периода ожидания.",
     "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого.",
+    "upgrade_blocked_install_failed": "Автообновление завершилось с ошибкой во время установки npm. Проверьте журнал обновления на хосте daemon; работа продолжится на текущей версии.",
     "upgrade_blocked_unknown": "daemon временно занят. Автообновление повторит попытку."
   },
   "discussion": {
@@ -1551,6 +1552,7 @@
     "upload_file": "Загрузить файл",
     "uploading": "Загрузка...",
     "upload_failed": "Ошибка загрузки",
+    "insufficient_capacity": "Недостаточно места на диске сервера",
     "file_too_large": "Файл слишком большой (макс. {{max}}МБ)",
     "long_text_attached": "Большой вставленный текст прикреплен как {{name}}",
     "long_text_requires_attachment": "Эта вставка слишком большая для поля ввода. Загрузите ее как файл.",
@@ -2598,7 +2600,9 @@
       "layerDiagnostics": "Диагностика слоев навыков",
       "enforced": "Обязательный",
       "additive": "Добавочный"
-    }
+    },
+    "short_ref_failure_short": "дескрипторы памяти не сохраняются",
+    "short_ref_failure_detail": "Дескрипторы памяти перестали сохраняться ({{stage}}, ошибок: {{failures}}, последняя {{when}}): {{error}}. Выданные сейчас не разрешатся после перезапуска daemon."
   },
   "todos": {
     "title": "Задачи",

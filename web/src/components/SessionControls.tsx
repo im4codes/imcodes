@@ -23,6 +23,7 @@ import { insertMachineMarkerAtCaret } from '../util/machine-insert.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
+import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
@@ -4019,7 +4020,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
         let errorMessage: string;
-        if (body.includes('daemon_offline')) {
+        if (isInsufficientCapacityError(body)) {
+          errorMessage = t('upload.insufficient_capacity');
+        } else if (body.includes('daemon_offline')) {
           errorMessage = t('upload.daemon_offline');
         } else if (body.includes('file_too_large')) {
           errorMessage = t('upload.file_too_large', { max: MAX_UPLOAD_SIZE_MB });

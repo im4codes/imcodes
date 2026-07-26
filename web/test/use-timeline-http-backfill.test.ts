@@ -1147,6 +1147,88 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('recovers events dropped while backgrounded: activation asks for the full newest window', async () => {
+    // The "push notification arrived but the chat shows nothing until I hit ↻"
+    // bug. The server relays timeline events ONLY to currently-subscribed
+    // viewers, so a backgrounded app (exactly the state a push proves) has its
+    // events silently discarded — no queue, no replay. On activation the
+    // backfill therefore MUST drop the lower bound: a tail-anchored
+    // `(localNewest - 1ms, …]` request can never reach events that were dropped
+    // below the local tail, and `agent.status`/`usage.update` push that cursor
+    // forward every second during a turn, so the gap goes permanently invisible.
+    const sessionName = `deck_bg_gap_${Date.now()}`;
+    const serverId = `srv-bg-gap-${Date.now()}`;
+
+    const localTail: TimelineEvent = {
+      eventId: `${sessionName}-tail`,
+      sessionId: sessionName,
+      ts: 5_000,
+      epoch: 1,
+      seq: 20,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'local-tail' },
+    };
+    // Emitted while the app was backgrounded, i.e. BELOW the local tail ts.
+    const droppedWhileBackgrounded: TimelineEvent = {
+      eventId: `${sessionName}-dropped`,
+      sessionId: sessionName,
+      ts: 4_000,
+      epoch: 1,
+      seq: 18,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'dropped-while-backgrounded' },
+    };
+    ingestTimelineEventForCache(serverId, sessionName, localTail);
+    fetchSpy.mockResolvedValue({
+      events: [localTail, droppedWhileBackgrounded],
+      epoch: 1,
+      hasMore: false,
+      nextCursor: null,
+    });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-bg'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-bg'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, events.map((e) => String(e.payload.text ?? '')).join('|'));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('local-tail');
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    fetchSpy.mockClear();
+
+    __resetBackfillCooldownsForTests();
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+
+    expect(fetchSpy).toHaveBeenCalled();
+    // No activation fetch may carry a numeric lower bound — that is the bug.
+    expect(fetchSpy).not.toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.objectContaining({ afterTs: expect.any(Number) }),
+    );
+    // End-to-end: the dropped event is visible without a manual ↻.
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toContain('dropped-while-backgrounded');
+    });
+  });
+
   it('uses HTTP-backfilled command.ack to mark daemon receipt while keeping the optimistic send pending', async () => {
     const sessionName = `deck_http_backfill_ack_${Date.now()}`;
     const serverId = `srv-http-ack-${Date.now()}`;

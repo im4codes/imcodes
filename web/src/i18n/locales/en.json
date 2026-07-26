@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "A session still has active work. Wait until it goes idle before upgrading the daemon.",
     "upgrade_blocked_cooldown_active": "The daemon was upgraded recently. Automatic upgrade will retry after the cooldown.",
     "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then.",
+    "upgrade_blocked_install_failed": "Automatic upgrade failed during npm install. Check the daemon host's upgrade log; it will remain on the current version.",
     "upgrade_blocked_unknown": "The daemon is temporarily busy. Automatic upgrade will retry."
   },
   "discussion": {
@@ -1552,6 +1553,7 @@
     "upload_file": "Upload file",
     "uploading": "Uploading...",
     "upload_failed": "Upload failed",
+    "insufficient_capacity": "Insufficient disk space on the server",
     "file_too_large": "File too large (max {{max}}MB)",
     "long_text_attached": "Large pasted text attached as {{name}}",
     "long_text_requires_attachment": "Paste is too large for inline input here. Upload it as a file instead.",
@@ -2599,7 +2601,9 @@
       "layerDiagnostics": "Skill layer diagnostics",
       "enforced": "Enforced",
       "additive": "Additive"
-    }
+    },
+    "short_ref_failure_short": "memory handles not saved",
+    "short_ref_failure_detail": "Memory handles stopped being saved ({{stage}}, {{failures}} failure(s), last {{when}}): {{error}}. Handles issued now will not resolve after a daemon restart."
   },
   "todos": {
     "title": "Tasks",

@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "セッションに実行中の処理があります。idle になってから daemon をアップグレードしてください。",
     "upgrade_blocked_cooldown_active": "daemon は最近アップグレードされました。クールダウン後に自動アップグレードを再試行します。",
     "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。",
+    "upgrade_blocked_install_failed": "npm のインストール中に自動アップグレードが失敗しました。daemon ホストのアップグレードログを確認してください。現在のバージョンで実行を続けます。",
     "upgrade_blocked_unknown": "daemon は一時的にビジーです。自動アップグレードを再試行します。"
   },
   "discussion": {
@@ -1551,6 +1552,7 @@
     "upload_file": "ファイルをアップロード",
     "uploading": "アップロード中...",
     "upload_failed": "アップロード失敗",
+    "insufficient_capacity": "サーバーのディスク容量が不足しています",
     "file_too_large": "ファイルが大きすぎます（最大 {{max}}MB）",
     "long_text_attached": "長い貼り付けテキストを {{name}} として添付しました",
     "long_text_requires_attachment": "この貼り付け内容は入力欄に直接入れるには長すぎます。ファイルとしてアップロードしてください。",
@@ -2598,7 +2600,9 @@
       "layerDiagnostics": "スキルレイヤー診断",
       "enforced": "強制",
       "additive": "追加"
-    }
+    },
+    "short_ref_failure_short": "メモリハンドル未保存",
+    "short_ref_failure_detail": "メモリハンドルの保存が停止しました({{stage}}、{{failures}} 件、最終 {{when}}):{{error}}。現在発行されたハンドルは daemon 再起動後に解決できません。"
   },
   "todos": {
     "title": "タスク",

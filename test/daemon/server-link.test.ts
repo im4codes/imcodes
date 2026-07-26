@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const upgradeBlockedOutboxMock = vi.hoisted(() => ({
+  flushOnReconnect: vi.fn(async () => false),
+  acknowledge: vi.fn(async () => true),
+}));
+
+vi.mock('../../src/daemon/upgrade-blocked-outbox.js', () => ({
+  getDefaultUpgradeBlockedOutbox: () => upgradeBlockedOutboxMock,
+}));
+
 // Mock WebSocket before importing ServerLink
 const mockWsInstance = {
   send: vi.fn(),
@@ -15,11 +24,18 @@ vi.mock('../../src/util/daemon-status.js', () => ({
   recordDaemonServerLinkStatus: vi.fn(),
 }));
 
-import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests } from '../../src/daemon/server-link.js';
+import { ServerLink, __setServerLinkDataPlaneQueueConfigForTests, setServerLinkReconnectResyncHandler } from '../../src/daemon/server-link.js';
+import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
+import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+} from '../../shared/daemon-upgrade.js';
 
 const recordDaemonServerLinkStatusMock = vi.mocked(recordDaemonServerLinkStatus);
 
@@ -28,6 +44,7 @@ describe('ServerLink', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    upgradeBlockedOutboxMock.flushOnReconnect.mockResolvedValue(false);
     link = new ServerLink({
       workerUrl: 'wss://test.workers.dev',
       serverId: 'srv-123',
@@ -52,6 +69,76 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledWith(
       expect.stringContaining('wss://test.workers.dev'),
     );
+  });
+
+  it('replays one persisted terminal upgrade failure after the link opens', async () => {
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    expect(openHandler).toBeDefined();
+
+    openHandler?.();
+
+    expect(upgradeBlockedOutboxMock.flushOnReconnect).toHaveBeenCalledTimes(1);
+    expect(upgradeBlockedOutboxMock.flushOnReconnect).toHaveBeenCalledWith(
+      expect.any(Function),
+      link.daemonVersion,
+    );
+  });
+
+  it('advertises blocker-sync support and certifies the connection only after outbox replay settles', async () => {
+    let resolveFlush!: (value: boolean) => void;
+    upgradeBlockedOutboxMock.flushOnReconnect.mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => { resolveFlush = resolve; }),
+    );
+
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+
+    const beforeFlush = mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(beforeFlush[0]).toMatchObject({
+      type: 'auth',
+      [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+        DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    });
+    expect(beforeFlush.some((message) => message.type === DAEMON_MSG.UPGRADE_BLOCKED_SYNC)).toBe(false);
+
+    resolveFlush(false);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)))).toContainEqual(expect.objectContaining({
+      type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+      revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    }));
+  });
+
+  it('records the server acknowledgement without exposing it to ordinary message handlers', async () => {
+    link.connect();
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    const ordinaryHandler = vi.fn();
+    link.onMessage(ordinaryHandler);
+
+    messageHandler?.({
+      data: JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId: 'failure-1',
+        disposition: DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      }),
+    } as MessageEvent);
+    await Promise.resolve();
+
+    expect(upgradeBlockedOutboxMock.acknowledge).toHaveBeenCalledWith(
+      'failure-1',
+      DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+    );
+    expect(ordinaryHandler).not.toHaveBeenCalled();
   });
 
   it('send() silently drops messages when not connected (fire-and-forget safe)', () => {
@@ -342,5 +429,102 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledTimes(2);
     // The previous WS instance must have been explicitly closed.
     expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts content-bearing timeline events dropped while the link is down', () => {
+    // This branch is where a chat message vanishes: live timeline events are
+    // control-plane, so a non-OPEN socket drops them with no queue and no replay.
+    // The browser now heals it via a no-lower-bound backfill, so without this
+    // counter a rising drop rate would be masked by the recovery.
+    resetMetricsForTests();
+    mockWsInstance.readyState = 3; // CLOSED
+
+    const before = getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'assistant.text' });
+    expect(link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'assistant.text', eventId: 'e1', sessionId: 's', ts: 1, payload: { text: 'lost' } },
+    })).toBeUndefined();
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'assistant.text' }))
+      .toBe(before + 1);
+    expect(link.timelineDropCountWhileLinkDown).toBe(1);
+  });
+
+  it('does not count high-frequency status chatter as a lost message', () => {
+    // agent.status fires ~1/s during a turn; counting it would bury the signal.
+    resetMetricsForTests();
+    mockWsInstance.readyState = 3;
+
+    link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'agent.status', eventId: 'e2', sessionId: 's', ts: 2, payload: { status: 'thinking' } },
+    });
+    link.send({ type: 'heartbeat' });
+
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.DAEMON_LINK_DOWN_DROPPED, { eventType: 'agent.status' })).toBe(0);
+    expect(link.timelineDropCountWhileLinkDown).toBe(0);
+  });
+
+  it('counts nothing while the link is OPEN', () => {
+    resetMetricsForTests();
+    mockWsInstance.readyState = 1; // OPEN
+    link.connect();
+    link.send({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { type: 'assistant.text', eventId: 'e3', sessionId: 's', ts: 3, payload: { text: 'delivered' } },
+    });
+    expect(link.timelineDropCountWhileLinkDown).toBe(0);
+  });
+
+  it('fires the reconnect state-resync handler on RE-connect only, not the first connect', async () => {
+    // Regression for deck_sub_26624c1t: live timeline events (incl. the
+    // authoritative session.state idle) are control-plane and silently dropped
+    // while the socket is down — with no replay, a turn that settles during an
+    // outage leaves every browser rendering "working" forever. The open handler
+    // must invoke the registered resync hook after every reconnect so the
+    // session layer can re-broadcast current authoritative states. The FIRST
+    // connect must NOT fire it (daemon startup already runs a full session sync).
+    const resync = vi.fn();
+    setServerLinkReconnectResyncHandler(resync);
+    vi.useFakeTimers();
+    try {
+      link.connect();
+      const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+        | (() => void)
+        | undefined;
+      expect(openHandler).toBeDefined();
+
+      // First successful open — startup path, no resync.
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0); // flush the scheduled setImmediate
+      expect(resync).not.toHaveBeenCalled();
+
+      // Re-connect (same socket object in this harness; the handler's stale-ws
+      // guard passes because this.ws is unchanged).
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(resync).toHaveBeenCalledTimes(1);
+    } finally {
+      setServerLinkReconnectResyncHandler(null);
+    }
+  });
+
+  it('survives a throwing resync handler without breaking the open handshake', async () => {
+    setServerLinkReconnectResyncHandler(() => {
+      throw new Error('resync boom');
+    });
+    vi.useFakeTimers();
+    try {
+      link.connect();
+      const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+        | (() => void)
+        | undefined;
+      openHandler?.();
+      openHandler?.();
+      await vi.advanceTimersByTimeAsync(0);
+      // No throw escaped to the test — the handler failure is contained.
+      expect(link.isConnected()).toBe(true);
+    } finally {
+      setServerLinkReconnectResyncHandler(null);
+    }
   });
 });

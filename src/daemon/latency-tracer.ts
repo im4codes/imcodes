@@ -4,6 +4,7 @@ import { homedir, loadavg } from 'node:os';
 import { PerformanceObserver, monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import logger from '../util/logger.js';
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 
@@ -643,6 +644,8 @@ export function classifyServerSendPlane(msgType: string | undefined): ServerSend
     || msgType === 'session.idle'
     || msgType === 'daemon.hello'
     || msgType === 'daemon.stats'
+    || msgType === DAEMON_MSG.UPGRADE_BLOCKED
+    || msgType === DAEMON_MSG.UPGRADE_BLOCKED_SYNC
     || msgType === 'heartbeat'
     // Live timeline events carry the chat stream/typewriter updates and
     // session.state transitions. They must bypass bulk history/data replay.
