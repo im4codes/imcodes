@@ -1,4 +1,5 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import { MEMORY_MCP_ENV_KEYS, type MemoryMcpEnvSource } from '../../shared/memory-mcp-env.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
 import { isValidImcodesSessionName } from '../../shared/session-scope.js';
@@ -23,7 +24,8 @@ export class MemoryMcpCallerEnvError extends Error {
   }
 }
 
-const DAEMON_LOCAL_MEMORY_USER_ID = 'daemon-local';
+// Alias of the shared sentinel rather than a fourth copy of the literal.
+const DAEMON_LOCAL_MEMORY_USER_ID = LEGACY_DAEMON_LOCAL_USER_ID;
 
 function optionalString(value: string | undefined): string | null {
   const trimmed = value?.trim();

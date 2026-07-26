@@ -165,6 +165,33 @@ describe('injected memory handles resolve for the agent they were injected into'
     expect(resolveMemoryShortRef('proj:legacyownerless', RESOLVER_NAMESPACE)?.id).toBe('legacy-id-1');
   });
 
+  it('does not excuse an owner-less KEY on a row that carries an explicit owner', async () => {
+    // The rescue must only forgive rows that actually needed it. Offering the
+    // owner-less key shape to every row also excused a genuine key/JSON
+    // disagreement — the exact corruption this integrity check exists to catch.
+    // (Found by the independent audit of the first version of this fix.)
+    resetMemoryShortRefsForTests();
+    runMock.mockReset();
+    runMock.mockImplementation(async (name: string) => (
+      name === 'listMemoryShortRefs'
+        ? [{
+            ref: 'proj:mismatchedowner',
+            kind: 'projection',
+            id: 'mismatch-id-1',
+            // Key says nobody owns it; JSON says user-42 does. Inconsistent.
+            namespaceKey: JSON.stringify(['personal', '', PROJECT, '', '']),
+            namespaceJson: JSON.stringify({ scope: 'personal', projectId: PROJECT, userId: 'user-42' }),
+            lastSeenAt: Date.now(),
+          }]
+        : undefined
+    ));
+
+    expect(await loadMemoryShortRefsFromStore()).toBe(0);
+    expect(resolveMemoryShortRef('proj:mismatchedowner', {
+      scope: 'personal', projectId: PROJECT, userId: 'user-42',
+    })).toBeUndefined();
+  });
+
   it('keeps SHARED scopes isolated by owner — sharing does not transfer ownership', () => {
     // The narrow boundary: the owner is only implied for owner-private scopes. A
     // shared record can genuinely belong to somebody else, so collapsing owners

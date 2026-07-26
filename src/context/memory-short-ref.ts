@@ -200,7 +200,9 @@ const NAMESPACE_IDENTITY_FIELDS = [
  * entry that looks healthy but can never resolve for a namespaced caller, and
  * counts it as loaded, so the handle disappears with no signal at all.
  */
-function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace | undefined } | { ok: false } {
+function decodeNamespace(
+  raw: unknown,
+): { ok: true; namespace: ContextNamespace | undefined; ownerBackfilled?: boolean } | { ok: false } {
   // Only a value that is not there at all means "no namespace". An explicit
   // null — including a column holding the JSON text `null` — is a value that
   // failed to describe a namespace, and degrading it to namespace-less loads a
@@ -224,7 +226,9 @@ function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace 
   // one owner, so an owner-less owner-private row is not ambiguous: it belongs to
   // this daemon. Backfill the sentinel and keep the row instead of dropping the
   // user's memory handles on a technicality.
-  const namespace = normalizeDaemonLocalMemoryNamespace(record as unknown as ContextNamespace);
+  const rawNamespace = record as unknown as ContextNamespace;
+  const namespace = normalizeDaemonLocalMemoryNamespace(rawNamespace);
+  const ownerBackfilled = namespace !== rawNamespace;
   const identity = {
     user_id: namespace.userId,
     project_id: namespace.projectId,
@@ -233,7 +237,7 @@ function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace 
     tenant_id: namespace.localTenant,
   };
   if (!validateMemoryScopeIdentity(record.scope, identity).ok) return { ok: false };
-  return { ok: true, namespace };
+  return { ok: true, namespace, ...(ownerBackfilled ? { ownerBackfilled } : {}) };
 }
 
 function isContextNamespace(value: unknown): value is ContextNamespace {
@@ -459,12 +463,22 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       // and the row would be rejected here as corrupt — turning the rescue in
       // decodeNamespace into a no-op. Accept the pre-backfill shape too; it is the
       // same identity, one field less spelled out.
-      const ownerlessNamespace = namespace ? { ...namespace, userId: '' } : undefined;
+      //
+      // ONLY for rows whose owner was actually backfilled. Offering this
+      // alternative unconditionally also excused a row carrying an explicit owner
+      // (or a shared scope) whose key was the owner-less tuple — a genuine
+      // key/JSON disagreement that this check exists to catch. Those rows could
+      // never cross-resolve (they are filed under the validated JSON namespace),
+      // but an integrity check should not be broader than its own comment.
+      const ownerlessNamespace = decoded.ownerBackfilled && namespace
+        ? { ...namespace, userId: '' }
+        : undefined;
       if (storedNamespaceKey !== namespaceStorageKey(namespace)
         && storedNamespaceKey !== legacyNamespaceKey
         && storedNamespaceKey !== legacyTruncatedKey
-        && storedNamespaceKey !== namespaceStorageKey(ownerlessNamespace)
-        && storedNamespaceKey !== namespaceKey(ownerlessNamespace)) {
+        && !(ownerlessNamespace
+          && (storedNamespaceKey === namespaceStorageKey(ownerlessNamespace)
+            || storedNamespaceKey === namespaceKey(ownerlessNamespace)))) {
         discarded += 1;
         continue;
       }
