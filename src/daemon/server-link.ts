@@ -10,6 +10,8 @@ import { getEmbeddingStatus } from '../context/embedding.js';
 import type { EmbeddingStatus } from '../../shared/embedding-status.js';
 import type { DiskUsage } from '../../shared/disk-usage.js';
 import { getDiskUsage, refreshDiskUsage } from './disk-usage.js';
+import { getMemoryShortRefHealth } from '../context/memory-short-ref.js';
+import type { MemoryShortRefHealth } from '../../shared/memory-short-ref-health.js';
 import { recordDaemonServerLinkStatus } from '../util/daemon-status.js';
 import {
   P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
@@ -55,10 +57,15 @@ interface SystemStats {
   embedding: EmbeddingStatus;
   /** Mounted-filesystem capacity for the desktop status bar (mobile ignores it). */
   disks: DiskUsage[];
+  /** Sticky memory-handle persistence failure, omitted while healthy. Rides the
+   *  heartbeat because the counter and the daemon log both stay on the machine
+   *  whose disk is usually what failed. */
+  shortRefHealth?: MemoryShortRefHealth;
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): SystemStats {
+  const shortRefHealth = getMemoryShortRefHealth();
   const memTotal = os.totalmem();
   const memFree = os.freemem();
   const [load1, load5, load15] = os.loadavg();
@@ -75,6 +82,7 @@ function collectSystemStats(): SystemStats {
     uptime: os.uptime(),
     embedding: getEmbeddingStatus(),
     disks: getDiskUsage(),
+    ...(shortRefHealth ? { shortRefHealth } : {}),
   };
 }
 

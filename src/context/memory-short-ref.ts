@@ -1,5 +1,6 @@
 import type { ContextNamespace } from '../../shared/context-types.js';
 import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
+import { MEMORY_SHORT_REF_HEALTH_ERROR_MAX_CHARS, type MemoryShortRefHealth } from '../../shared/memory-short-ref-health.js';
 import { createHash } from 'node:crypto';
 import { encodeBase32 } from '../util/base32.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
@@ -36,6 +37,7 @@ const MEMORY_SHORT_REF_LENGTH = 13;
 const SHORT_REF_SCHEMA_VERSION = 2;
 const entriesByRef = new Map<string, MemoryShortRefEntry[]>();
 let persistedLoaded = false;
+let shortRefHealth: MemoryShortRefHealth | undefined;
 
 function refPrefix(kind: MemoryShortRefKind): 'proj' | 'obs' {
   return kind === 'projection' ? 'proj' : 'obs';
@@ -322,11 +324,27 @@ function reportDiscardedShortRefRows(source: 'warm_load' | 'legacy_file' | 'json
 }
 
 function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load' | 'load_file', error: unknown, extra: Record<string, unknown> = {}): void {
+  const message = error instanceof Error ? error.message : String(error);
   incrementCounter('mem.short_ref.persist_failure', { stage });
-  warnOncePerHour(`mem.short_ref.persist_failure.${stage}`, {
-    ...extra,
-    error: error instanceof Error ? error.message : String(error),
-  });
+  warnOncePerHour(`mem.short_ref.persist_failure.${stage}`, { ...extra, error: message });
+  // Both signals above stay on this machine: the counter is a process-local map
+  // and the warning lands in the daemon log, on the same disk whose exhaustion
+  // is usually what failed — with write errors swallowed. Hold the failure in
+  // memory so the heartbeat can carry it off the box over the socket instead.
+  shortRefHealth = {
+    stage,
+    failures: (shortRefHealth?.failures ?? 0) + 1,
+    lastFailureAt: Date.now(),
+    lastError: message.slice(0, MEMORY_SHORT_REF_HEALTH_ERROR_MAX_CHARS),
+  };
+}
+
+/**
+ * Latest persistence failure, or undefined while healthy. Sticky rather than
+ * edge-triggered, so a reader that connects after the failure still sees it.
+ */
+export function getMemoryShortRefHealth(): MemoryShortRefHealth | undefined {
+  return shortRefHealth;
 }
 
 /**
@@ -582,6 +600,7 @@ export function seedMemoryShortRefCollisionForTests(ref: string, entries: readon
 
 export function resetMemoryShortRefsForTests(): void {
   entriesByRef.clear();
+  shortRefHealth = undefined;
   persistedLoaded = true;
 }
 
