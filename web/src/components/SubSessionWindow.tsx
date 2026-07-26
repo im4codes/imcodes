@@ -46,7 +46,6 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
-import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 
@@ -340,7 +339,6 @@ export function SubSessionWindow({
   }, [showFileBrowser, isMobile, onDesktopFileBrowserOpen, onDesktopFileBrowserClose]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
-  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
   const [composerText, setComposerText] = useState('');
   const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
   const executionRouting = useExecutionRouting(serverId ?? null);
@@ -524,15 +522,6 @@ export function SubSessionWindow({
       else termScrollRef.current?.();
     }, 50);
   }, []);
-  const memorySummaryProjectId = useMemo(() => {
-    const parent = sub.parentSession
-      ? sessions?.find((session) => session.name === sub.parentSession)
-      : undefined;
-    return sub.contextNamespace?.projectId
-      ?? parent?.contextNamespace?.projectId
-      ?? null;
-  }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
-
   const executionTemplateDisplayName = useMemo(() => {
     const template = executionRouting.templateSessionName;
     if (!template) return null;
@@ -567,8 +556,8 @@ export function SubSessionWindow({
       // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
       // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
       // dispatched through the delegation path, not the direct human
-      // handleSend path, so — like memory-summary sync / P2P / agent
-      // send_message — it deliberately carries NO resolvedAliases. A `;;(name)`
+      // handleSend path, so — like P2P / agent send_message — it deliberately
+      // carries NO resolvedAliases. A `;;(name)`
       // typed here reaches the (LLM) clone literally. See design.md
       // "Send-surface coverage → Scope boundary".
       ws.sendExecutionClones({
@@ -588,29 +577,6 @@ export function SubSessionWindow({
       window.setTimeout(() => setExecutionClonesBusy(false), 1200);
     }
   }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sub.sessionName, ws]);
-
-  const handleSyncMemorySummaries = useCallback(async () => {
-    if (!ws || !connected || syncingMemorySummaries) return;
-    setSyncingMemorySummaries(true);
-    try {
-      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId, undefined, {
-        sources: [localPersonalMemorySummarySource(ws)],
-      });
-      if (!text) return;
-      const commandId = globalThis.crypto?.randomUUID?.()
-        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      // Alias A′ opt-out (Cx1-2): generated memory-summary sync, not a
-      // human-composed message, so it deliberately carries no resolvedAliases.
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
-      requestActiveTimelineRefreshAfterUserAction();
-      addOptimisticUserMessage(text, commandId);
-      scrollToBottom();
-    } catch {
-      // Non-blocking context sync: leave normal chat/send controls untouched.
-    } finally {
-      setSyncingMemorySummaries(false);
-    }
-  }, [addOptimisticUserMessage, connected, memorySummaryProjectId, scrollToBottom, sub.sessionName, syncingMemorySummaries, t, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
@@ -1012,9 +978,6 @@ export function SubSessionWindow({
           transportActivityDetail={transportActivityDetail}
           sessionError={sessionInfo?.error}
           now={thinkingNow}
-          onSyncMemorySummaries={handleSyncMemorySummaries}
-          syncMemorySummariesBusy={syncingMemorySummaries}
-          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
           onRunExecutionClones={handleRunExecutionClones}
           runExecutionClonesBusy={executionClonesBusy}
           runExecutionClonesDisabled={

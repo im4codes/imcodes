@@ -46,10 +46,6 @@ interface Props {
   sessionError?: string | null;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
-  /** Sends recent memory summaries into the current agent as sync-only context. */
-  onSyncMemorySummaries?: () => void;
-  syncMemorySummariesBusy?: boolean;
-  syncMemorySummariesDisabled?: boolean;
   /** Dispatches the current composer task to dedicated execution clones. */
   onRunExecutionClones?: () => void;
   runExecutionClonesBusy?: boolean;
@@ -66,7 +62,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onSyncMemorySummaries, syncMemorySummariesBusy, syncMemorySummariesDisabled, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, wsClient, connected }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, wsClient, connected }: Props) {
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 
@@ -360,18 +356,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           >
             📊
           </button>
-          {onSyncMemorySummaries && (
-            <button
-              type="button"
-              class={`shortcut-btn shortcut-btn-icon shortcut-btn-memory-sync${syncMemorySummariesBusy ? ' is-busy' : ''}`}
-              title={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
-              aria-label={syncMemorySummariesBusy ? t('chat.memory_summary_sync_busy') : t('chat.memory_summary_sync')}
-              disabled={syncMemorySummariesDisabled}
-              onClick={onSyncMemorySummaries}
-            >
-              ↻
-            </button>
-          )}
           <span class="shortcut-btn-tools-wrapper">
             {/* Undecided-state bubble. Points the user at the wrench so the
              *  first-run choice surface is obvious even before they scroll

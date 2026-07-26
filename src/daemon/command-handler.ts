@@ -10686,11 +10686,10 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     includeArchived,
   };
   const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
-  // The browser's manual "sync recent summaries" path must consume handles
-  // issued by the daemon. It previously derived a legacy 10-character value in
-  // Web code without registering it, so the displayed `proj:` token was dead.
-  // Keep ordinary management-list reads side-effect free; only the explicit
-  // sync caller asks us to register and persist handles.
+  // Any caller requesting short refs must consume handles issued by the daemon,
+  // never values derived independently in UI code. Keep ordinary management-list
+  // reads side-effect free; only an explicit includeShortRefs request registers
+  // and persists handles.
   const referencedRecords = cmd.includeShortRefs === true
     ? attachMemoryShortRefs(records.map((record) => ({
         ...record,

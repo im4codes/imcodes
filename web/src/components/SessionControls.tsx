@@ -2629,8 +2629,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // ── Dedicated execution routing preference ──────────────────────────────
   // Reads the SHARED preference (the same one Team Settings edits). Generic
-  // execution dispatch now lives in UsageFooter next to the summary-sync
-  // action; SessionControls still consumes the preference for P2P/Team and
+  // execution dispatch now lives in UsageFooter; SessionControls still
+  // consumes the preference for P2P/Team and
   // OpenSpec-specific execution surfaces.
   const executionRouting = useExecutionRouting(serverId ?? null);
   const configuredExecutionSession = executionRouting.templateSessionName;

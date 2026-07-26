@@ -74,30 +74,24 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('renders the execution-clone launcher before summary sync and calls its handler', () => {
+  it('renders the execution-clone launcher and calls its handler', () => {
     const onRunExecutionClones = vi.fn();
-    const onSyncMemorySummaries = vi.fn();
-    const { container } = render(
+    render(
       <UsageFooter
         usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
         sessionName="deck_test_brain"
         onRunExecutionClones={onRunExecutionClones}
         runExecutionClonesTitle="Run clones"
         runExecutionClonesCount={3}
-        onSyncMemorySummaries={onSyncMemorySummaries}
       />,
     );
 
     const cloneButton = screen.getByLabelText('Run clones');
-    const syncButton = screen.getByLabelText('chat.memory_summary_sync');
-    const buttons = Array.from(container.querySelectorAll('button'));
-    expect(buttons.indexOf(cloneButton as HTMLButtonElement)).toBeLessThan(buttons.indexOf(syncButton as HTMLButtonElement));
     expect(cloneButton.textContent).toContain('🤖');
     expect(cloneButton.textContent).toContain('×3');
 
     fireEvent.click(cloneButton);
     expect(onRunExecutionClones).toHaveBeenCalledTimes(1);
-    expect(onSyncMemorySummaries).not.toHaveBeenCalled();
   });
 
   it('disables the execution-clone launcher when requested', () => {
@@ -301,8 +295,12 @@ describe('UsageFooter', () => {
     expect(toolPref.save).toHaveBeenCalledWith(false);
   });
 
-  it('renders memory summary sync button before the tools toggle and calls the sync handler', () => {
-    const onSync = vi.fn();
+  it('does not render the retired manual memory-summary sync button', () => {
+    const legacySyncProps = {
+      onSyncMemorySummaries: vi.fn(),
+      syncMemorySummariesBusy: false,
+      syncMemorySummariesDisabled: false,
+    };
     const { container } = render(
       <UsageFooter
         usage={{
@@ -312,20 +310,13 @@ describe('UsageFooter', () => {
           model: 'coder-model',
         }}
         sessionName="deck_test_brain"
-        onSyncMemorySummaries={onSync}
+        {...legacySyncProps}
       />,
     );
 
-    const syncButton = container.querySelector('.shortcut-btn-memory-sync') as HTMLButtonElement | null;
-    const toolsButton = container.querySelector('.shortcut-btn-tools') as HTMLButtonElement | null;
-    expect(syncButton).toBeTruthy();
-    expect(syncButton?.getAttribute('aria-label')).toBe('chat.memory_summary_sync');
-    expect(Array.from(syncButton!.parentElement!.children).indexOf(syncButton!)).toBeLessThan(
-      Array.from(toolsButton!.parentElement!.parentElement!.children).indexOf(toolsButton!.parentElement!),
-    );
-
-    fireEvent.click(syncButton!);
-    expect(onSync).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('.shortcut-btn-memory-sync')).toBeNull();
+    expect(screen.queryByLabelText('chat.memory_summary_sync')).toBeNull();
+    expect(legacySyncProps.onSyncMemorySummaries).not.toHaveBeenCalled();
   });
 
   it('keeps the robot idle when only stale thinking remains, and renders running states inline', () => {
