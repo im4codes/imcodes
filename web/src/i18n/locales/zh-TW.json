@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "仍有工作階段正在執行任務。等它回到 idle 再升級 daemon。",
     "upgrade_blocked_cooldown_active": "daemon 最近剛完成升級，冷卻結束後會自動重試。",
     "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。",
+    "upgrade_blocked_install_failed": "npm 安裝期間自動升級失敗。請檢查 daemon 主機上的升級日誌；daemon 將繼續執行目前版本。",
     "upgrade_blocked_unknown": "daemon 暫時忙碌，稍後會自動重試升級。"
   },
   "discussion": {

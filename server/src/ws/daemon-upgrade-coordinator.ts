@@ -17,7 +17,13 @@ const AUTO_UPGRADE_MAX_ATTEMPTS = 3;
 
 export type DaemonUpgradeSource = 'auto' | 'manual' | 'replay';
 
-type UpgradeLifecycleState = 'pending_offline' | 'pending_publication' | 'scheduled' | 'sent' | 'superseded';
+type UpgradeLifecycleState =
+  | 'pending_offline'
+  | 'pending_publication'
+  | 'scheduled'
+  | 'sent'
+  | 'terminal_blocked'
+  | 'superseded';
 
 interface UpgradeState {
   upgradeId: string;
@@ -76,15 +82,39 @@ export class DaemonUpgradeCoordinator {
     }
 
     const now = input.now ?? Date.now();
-    const current = this.current?.targetVersion === targetVersion ? this.current : null;
+    let current = this.current?.targetVersion === targetVersion ? this.current : null;
     if (this.current && this.current.targetVersion !== targetVersion) {
+      const terminalTargetChanged = this.current.status === 'terminal_blocked';
       this.supersedeCurrent(now);
+      if (terminalTargetChanged) this.lastAutoSentAt = null;
     }
 
+    if (current?.status === 'terminal_blocked') {
+      if (input.source !== 'manual') {
+        return {
+          ok: true,
+          upgradeId: current.upgradeId,
+          targetVersion,
+          deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
+          reason: 'terminal_install_failure',
+        };
+      }
+      this.supersedeCurrent(now);
+      current = null;
+    }
+
+    // A user-issued manual request is authoritative over reconnect-driven
+    // auto/replay traffic for the same target. In particular, an offline
+    // manual request remains pending while auth is incomplete; the auth
+    // version-mismatch probe must not silently demote it back to `auto`.
+    const effectiveInput = current?.source === 'manual' && input.source !== 'manual'
+      ? { ...input, source: 'manual' as const }
+      : input;
+
     if (current?.status === 'pending_publication') {
-      current.source = input.source;
+      current.source = effectiveInput.source;
       current.updatedAt = now;
-      if (!input.isDaemonReady()) {
+      if (!effectiveInput.isDaemonReady()) {
         current.status = 'pending_offline';
         return {
           ok: true,
@@ -93,10 +123,14 @@ export class DaemonUpgradeCoordinator {
           deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
         };
       }
-      const publication = this.ensureTargetPublished(current, input, now);
+      const publication = this.ensureTargetPublished(current, effectiveInput, now);
       if (publication) return publication;
-    } else if (current && current.status !== 'superseded' && (current.status !== 'pending_offline' || !input.isDaemonReady())) {
-      if (input.source === 'auto') {
+    } else if (
+      current
+      && current.status !== 'superseded'
+      && (current.status !== 'pending_offline' || !effectiveInput.isDaemonReady())
+    ) {
+      if (effectiveInput.source === 'auto') {
         const nextAutoAt = this.nextAutoAttemptAt(now);
         if (nextAutoAt > now) {
           return {
@@ -129,7 +163,7 @@ export class DaemonUpgradeCoordinator {
     const state = current ?? {
       upgradeId: randomUUID(),
       targetVersion,
-      source: input.source,
+      source: effectiveInput.source,
       status: 'pending_offline' as UpgradeLifecycleState,
       attempt: 0,
       createdAt: now,
@@ -139,11 +173,11 @@ export class DaemonUpgradeCoordinator {
       publicationResumeInput: null,
       publicationCallbackRegistered: false,
     };
-    state.source = input.source;
+    state.source = effectiveInput.source;
     state.updatedAt = now;
     this.current = state;
 
-    if (!input.isDaemonReady()) {
+    if (!effectiveInput.isDaemonReady()) {
       state.status = 'pending_offline';
       return {
         ok: true,
@@ -153,15 +187,15 @@ export class DaemonUpgradeCoordinator {
       };
     }
 
-    if (input.source === 'auto') {
-      const publication = this.ensureTargetPublished(state, input, now);
+    if (effectiveInput.source === 'auto') {
+      const publication = this.ensureTargetPublished(state, effectiveInput, now);
       if (publication) return publication;
-      return this.scheduleAutoSend(state, input, now);
+      return this.scheduleAutoSend(state, effectiveInput, now);
     }
 
-    const publication = this.ensureTargetPublished(state, input, now);
+    const publication = this.ensureTargetPublished(state, effectiveInput, now);
     if (publication) return publication;
-    this.sendNow(state, input, now);
+    this.sendNow(state, effectiveInput, now);
     return {
       ok: true,
       upgradeId: state.upgradeId,
@@ -219,6 +253,81 @@ export class DaemonUpgradeCoordinator {
       deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
       nextAttemptAt: new Date(now + retryDelayMs).toISOString(),
     };
+  }
+
+  /**
+   * Cancel any pending send and keep the failed target terminally blocked.
+   * Auto/replay requests for the same target remain blocked; an explicit manual
+   * request or a different target version creates a fresh lifecycle.
+   */
+  blockTargetAfterTerminalFailure(targetVersion: unknown, now = Date.now()): boolean {
+    let normalized: string;
+    try {
+      normalized = normalizeDaemonUpgradeTargetVersion(targetVersion);
+    } catch {
+      return false;
+    }
+
+    if (this.current && this.current.targetVersion !== normalized) {
+      this.supersedeCurrent(now);
+    }
+    const state = this.current ?? {
+      upgradeId: randomUUID(),
+      targetVersion: normalized,
+      source: 'auto' as DaemonUpgradeSource,
+      status: 'terminal_blocked' as UpgradeLifecycleState,
+      attempt: 0,
+      createdAt: now,
+      updatedAt: now,
+      lastSentAt: null,
+      timer: null,
+      publicationResumeInput: null,
+      publicationCallbackRegistered: false,
+    };
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null;
+    state.status = 'terminal_blocked';
+    state.updatedAt = now;
+    state.publicationResumeInput = null;
+    state.publicationCallbackRegistered = false;
+    this.current = state;
+    return true;
+  }
+
+  /**
+   * A terminal failure belongs to the upgrade command that produced it.
+   * If a newer manual lifecycle for the same target has a different id, the
+   * old persisted failure was explicitly superseded and must not re-block it.
+   */
+  isTerminalFailureSupersededByManual(targetVersion: unknown, failureUpgradeId: unknown): boolean {
+    let normalized: string;
+    try {
+      normalized = normalizeDaemonUpgradeTargetVersion(targetVersion);
+    } catch {
+      return false;
+    }
+    return Boolean(
+      typeof failureUpgradeId === 'string'
+      && failureUpgradeId.length > 0
+      && this.current?.targetVersion === normalized
+      && this.current.source === 'manual'
+      && this.current.status !== 'terminal_blocked'
+      && this.current.upgradeId !== failureUpgradeId,
+    );
+  }
+
+  hasManualLifecycleForTarget(targetVersion: unknown): boolean {
+    let normalized: string;
+    try {
+      normalized = normalizeDaemonUpgradeTargetVersion(targetVersion);
+    } catch {
+      return false;
+    }
+    return Boolean(
+      this.current?.targetVersion === normalized
+      && this.current.source === 'manual'
+      && this.current.status !== 'terminal_blocked',
+    );
   }
 
   clearIfTargetVersionMatches(targetVersion: string | null | undefined): void {

@@ -3486,42 +3486,6 @@ export function App() {
           }
         }
       }
-      if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
-        const now = Date.now();
-        if (!shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) return;
-        lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
-        const message = trans(daemonUpgradeBlockedToastKey(msg.reason));
-        const id = Date.now() + Math.random();
-        setToasts((prev) => [...prev, {
-          id,
-          sessionName: '',
-          project: '',
-          kind: 'notification',
-          title: trans('toast.upgrade_blocked_title'),
-          message,
-        }]);
-        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
-      }
-      if (msg.type === DAEMON_MSG.DISCONNECTED) {
-        // Mark projection stale immediately — that's just a data-freshness
-        // hint, not the user-facing status badge. But do NOT flip the
-        // "Daemon Offline" badge yet: the server side still has a
-        // RECONNECT_GRACE_MS window during which the daemon can reconnect
-        // and inflight commands are replayed without surfacing any failure.
-        // Matching that grace period here prevents the badge from flashing
-        // on every pod restart / brief network blip while the user's turn
-        // is actually landing fine. If the daemon does stay gone, the
-        // server will broadcast MSG_DAEMON_OFFLINE (no reconnect event) and
-        // this timer fires, putting the badge into the Daemon-Offline
-        // state. RECONNECTED / session_list clear the timer below.
-        watchProjectionStore.setSnapshotStatus('stale');
-        if (daemonOfflineGraceTimerRef.current) clearTimeout(daemonOfflineGraceTimerRef.current);
-        daemonOfflineGraceTimerRef.current = setTimeout(() => {
-          daemonOfflineGraceTimerRef.current = null;
-          setDaemonOnline(false);
-          setServers((prev) => markServerOffline(prev, selectedServerId));
-        }, RECONNECT_GRACE_MS);
-      }
       {
         // Daemon-upgrade badge lifecycle (pure reducer): UPGRADING begins it
         // (so the version shows "upgrading…" through the restart instead of a
@@ -3546,6 +3510,43 @@ export function App() {
             }, DAEMON_UPGRADING_MAX_MS);
           }
         }
+      }
+      if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        const now = Date.now();
+        if (shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) {
+          lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
+          const message = trans(daemonUpgradeBlockedToastKey(msg.reason));
+          const id = Date.now() + Math.random();
+          setToasts((prev) => [...prev, {
+            id,
+            sessionName: '',
+            project: '',
+            kind: 'notification',
+            title: trans('toast.upgrade_blocked_title'),
+            message,
+          }]);
+          setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+        }
+      }
+      if (msg.type === DAEMON_MSG.DISCONNECTED) {
+        // Mark projection stale immediately — that's just a data-freshness
+        // hint, not the user-facing status badge. But do NOT flip the
+        // "Daemon Offline" badge yet: the server side still has a
+        // RECONNECT_GRACE_MS window during which the daemon can reconnect
+        // and inflight commands are replayed without surfacing any failure.
+        // Matching that grace period here prevents the badge from flashing
+        // on every pod restart / brief network blip while the user's turn
+        // is actually landing fine. If the daemon does stay gone, the
+        // server will broadcast MSG_DAEMON_OFFLINE (no reconnect event) and
+        // this timer fires, putting the badge into the Daemon-Offline
+        // state. RECONNECTED / session_list clear the timer below.
+        watchProjectionStore.setSnapshotStatus('stale');
+        if (daemonOfflineGraceTimerRef.current) clearTimeout(daemonOfflineGraceTimerRef.current);
+        daemonOfflineGraceTimerRef.current = setTimeout(() => {
+          daemonOfflineGraceTimerRef.current = null;
+          setDaemonOnline(false);
+          setServers((prev) => markServerOffline(prev, selectedServerId));
+        }, RECONNECT_GRACE_MS);
       }
       if (msg.type === MSG_DAEMON_ONLINE || msg.type === DAEMON_MSG.RECONNECTED) {
         void checkForAppUpdate();

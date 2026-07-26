@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 import {
   DAEMON_UPGRADE_BLOCKED_TOAST_THROTTLE_MS,
   daemonUpgradeBlockedToastKey,
@@ -15,6 +16,7 @@ describe('daemon upgrade blocked toast', () => {
     expect(daemonUpgradeBlockedToastKey('session_busy')).toBe('toast.upgrade_blocked_session_busy');
     expect(daemonUpgradeBlockedToastKey('cooldown_active')).toBe('toast.upgrade_blocked_cooldown_active');
     expect(daemonUpgradeBlockedToastKey('toolchain_unavailable')).toBe('toast.upgrade_blocked_toolchain_unavailable');
+    expect(daemonUpgradeBlockedToastKey(DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED)).toBe('toast.upgrade_blocked_install_failed');
     expect(daemonUpgradeBlockedToastKey('future_reason')).toBe('toast.upgrade_blocked_unknown');
   });
 

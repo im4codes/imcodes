@@ -30,18 +30,26 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const runtimes = new Map<string, { getStatus: () => string; sending: boolean; pendingCount: number }>();
   const spawnCalls: Array<{ command: string; args: readonly string[] }> = [];
+  const spawnedChildren: Array<{
+    command: string;
+    emit: (event: string, ...args: unknown[]) => void;
+  }> = [];
   const writeCalls: Array<{ path: string; data: string }> = [];
+  const upgradeBlockedReport = vi.fn(async () => false);
   let compressionState = { active: false, activeCount: 0, queued: 0, idle: true };
   return {
     store,
     runtimes,
     spawnCalls,
+    spawnedChildren,
     writeCalls,
+    upgradeBlockedReport,
     getCompressionState: () => compressionState,
     setCompressionState: (next: typeof compressionState) => { compressionState = next; },
   };
@@ -62,6 +70,12 @@ vi.mock('../../src/store/session-store.js', () => ({
   updateSessionState: vi.fn(),
 }));
 
+vi.mock('../../src/daemon/upgrade-blocked-outbox.js', () => ({
+  getDefaultUpgradeBlockedOutbox: () => ({
+    report: mocks.upgradeBlockedReport,
+  }),
+}));
+
 vi.mock('../../src/agent/session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/agent/session-manager.js')>();
   return {
@@ -78,12 +92,25 @@ vi.mock('../../src/agent/session-manager.js', async (importOriginal) => {
 // caring about platform.
 function captureSpawn(command: string, args: readonly string[]) {
   mocks.spawnCalls.push({ command, args });
-  return {
+  const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+  const child = {
     unref: vi.fn(),
-    on: vi.fn(),
+    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      const existing = handlers.get(event) ?? [];
+      existing.push(handler);
+      handlers.set(event, existing);
+      return child;
+    }),
     stdout: { on: vi.fn() },
     stderr: { on: vi.fn() },
   } as any;
+  mocks.spawnedChildren.push({
+    command,
+    emit: (event, ...eventArgs) => {
+      for (const handler of handlers.get(event) ?? []) handler(...eventArgs);
+    },
+  });
+  return child;
 }
 
 vi.mock('child_process', async (importOriginal) => {
@@ -303,6 +330,8 @@ describe('daemon.upgrade gate (e2e regression for 3389fab2)', () => {
     mocks.store.clear();
     mocks.runtimes.clear();
     mocks.spawnCalls.length = 0;
+    mocks.spawnedChildren.length = 0;
+    mocks.upgradeBlockedReport.mockClear();
     mocks.setCompressionState({ active: false, activeCount: 0, queued: 0, idle: true });
   });
 
@@ -573,6 +602,7 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     mocks.store.clear();
     mocks.runtimes.clear();
     mocks.spawnCalls.length = 0;
+    mocks.spawnedChildren.length = 0;
     mocks.writeCalls.length = 0;
   });
 
@@ -580,16 +610,27 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     vi.clearAllMocks();
   });
 
-  async function captureUpgradeScript(): Promise<string> {
+  async function captureUpgradeAttempt(): Promise<{
+    script: string;
+    serverLink: { send: ReturnType<typeof vi.fn> };
+  }> {
     const serverLink = { send: vi.fn() } as { send: ReturnType<typeof vi.fn> };
-    handleWebCommand({ type: 'daemon.upgrade', targetVersion: '99.99.99-test' } as any, serverLink as any);
+    handleWebCommand({
+      type: 'daemon.upgrade',
+      targetVersion: '99.99.99-test',
+      upgradeId: 'upgrade-attempt-test',
+    } as any, serverLink as any);
     await waitForCondition(
       () => mocks.writeCalls.some((c) => c.path.endsWith('upgrade.sh')),
       5000,
     );
     const script = mocks.writeCalls.find((c) => c.path.endsWith('upgrade.sh'));
     if (!script) throw new Error('upgrade.sh was never written');
-    return script.data;
+    return { script: script.data, serverLink };
+  }
+
+  async function captureUpgradeScript(): Promise<string> {
+    return (await captureUpgradeAttempt()).script;
   }
 
   it('captures the real install exit code (regression: pre-fix logged "(exit 0)" on every failure)', async () => {
@@ -624,6 +665,57 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     expect(sh).toContain('retryable npm failure ($RETRY_REASON) — retrying');
     expect(sh).toMatch(/non-retryable npm failure — not retrying/);
     expect(sh).toMatch(/tail -20 "\$INSTALL_OUT"/);
+  });
+
+  it('cleans stale npm staging before install and retries only matching rename collisions', async () => {
+    const sh = await captureUpgradeScript();
+
+    const cleanupIdx = sh.indexOf('cleanup_stale_imcodes_staging_dirs "$GLOBAL_ROOT"');
+    const installIdx = sh.indexOf('install -g --ignore-scripts --prefer-online');
+    expect(cleanupIdx).toBeGreaterThan(-1);
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(cleanupIdx).toBeLessThan(installIdx);
+    expect(sh).toContain('is_recoverable_layout_output "$INSTALL_OUT" "$GLOBAL_ROOT"');
+    expect(sh).toContain('recover_stale_layout_from_output "$INSTALL_OUT" "$GLOBAL_ROOT"');
+    expect(sh).toContain('RETRY_REASON="stale-staging-dir"');
+    expect(sh).toMatch(/ENOTEMPTY\|EEXIST/);
+    expect(sh).toContain('[ "$error_syscall" = "rename" ]');
+    expect(sh).toContain('[ "$error_path" = "$global_root/imcodes" ]');
+  });
+
+  it('reports a final detached npm install failure to the server with bounded diagnostics', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const statusDir = '/tmp/imcodes-upgrade-gate-test';
+    const statusPath = `${statusDir}/upgrade-status.json`;
+    realFs.mkdirSync(statusDir, { recursive: true });
+    try {
+      const { serverLink } = await captureUpgradeAttempt();
+      const bashChild = mocks.spawnedChildren.find((entry) => entry.command === '/bin/bash');
+      expect(bashChild).toBeDefined();
+      realFs.writeFileSync(statusPath, JSON.stringify({
+        state: 'blocked',
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        retryReason: 'stale-staging-dir',
+        attempts: 5,
+        exitCode: 217,
+      }));
+
+      bashChild!.emit('exit', 75, null);
+
+      await vi.waitFor(() => expect(mocks.upgradeBlockedReport).toHaveBeenCalledWith(expect.objectContaining({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        upgradeId: 'upgrade-attempt-test',
+        retryReason: 'stale-staging-dir',
+        attempts: 5,
+        exitCode: 217,
+      }), expect.any(Function)));
+      expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      }));
+    } finally {
+      realFs.rmSync(statusPath, { force: true });
+    }
   });
 
   it('uses an atomic single-flight lock before touching the global npm install', async () => {

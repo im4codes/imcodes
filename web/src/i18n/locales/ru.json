@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "В сессии ещё выполняется работа. Дождитесь состояния idle перед обновлением daemon.",
     "upgrade_blocked_cooldown_active": "daemon недавно обновлялся. Автообновление повторится после периода ожидания.",
     "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого.",
+    "upgrade_blocked_install_failed": "Автообновление завершилось с ошибкой во время установки npm. Проверьте журнал обновления на хосте daemon; работа продолжится на текущей версии.",
     "upgrade_blocked_unknown": "daemon временно занят. Автообновление повторит попытку."
   },
   "discussion": {

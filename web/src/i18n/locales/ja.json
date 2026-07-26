@@ -860,6 +860,7 @@
     "upgrade_blocked_session_busy": "セッションに実行中の処理があります。idle になってから daemon をアップグレードしてください。",
     "upgrade_blocked_cooldown_active": "daemon は最近アップグレードされました。クールダウン後に自動アップグレードを再試行します。",
     "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。",
+    "upgrade_blocked_install_failed": "npm のインストール中に自動アップグレードが失敗しました。daemon ホストのアップグレードログを確認してください。現在のバージョンで実行を続けます。",
     "upgrade_blocked_unknown": "daemon は一時的にビジーです。自動アップグレードを再試行します。"
   },
   "discussion": {

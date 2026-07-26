@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const upgradeBlockedOutboxMock = vi.hoisted(() => ({
+  flushOnReconnect: vi.fn(async () => false),
+  acknowledge: vi.fn(async () => true),
+}));
+
+vi.mock('../../src/daemon/upgrade-blocked-outbox.js', () => ({
+  getDefaultUpgradeBlockedOutbox: () => upgradeBlockedOutboxMock,
+}));
+
 // Mock WebSocket before importing ServerLink
 const mockWsInstance = {
   send: vi.fn(),
@@ -22,6 +31,11 @@ import { recordDaemonServerLinkStatus } from '../../src/util/daemon-status.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+} from '../../shared/daemon-upgrade.js';
 
 const recordDaemonServerLinkStatusMock = vi.mocked(recordDaemonServerLinkStatus);
 
@@ -30,6 +44,7 @@ describe('ServerLink', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    upgradeBlockedOutboxMock.flushOnReconnect.mockResolvedValue(false);
     link = new ServerLink({
       workerUrl: 'wss://test.workers.dev',
       serverId: 'srv-123',
@@ -54,6 +69,76 @@ describe('ServerLink', () => {
     expect(MockWebSocket).toHaveBeenCalledWith(
       expect.stringContaining('wss://test.workers.dev'),
     );
+  });
+
+  it('replays one persisted terminal upgrade failure after the link opens', async () => {
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    expect(openHandler).toBeDefined();
+
+    openHandler?.();
+
+    expect(upgradeBlockedOutboxMock.flushOnReconnect).toHaveBeenCalledTimes(1);
+    expect(upgradeBlockedOutboxMock.flushOnReconnect).toHaveBeenCalledWith(
+      expect.any(Function),
+      link.daemonVersion,
+    );
+  });
+
+  it('advertises blocker-sync support and certifies the connection only after outbox replay settles', async () => {
+    let resolveFlush!: (value: boolean) => void;
+    upgradeBlockedOutboxMock.flushOnReconnect.mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => { resolveFlush = resolve; }),
+    );
+
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+
+    const beforeFlush = mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(beforeFlush[0]).toMatchObject({
+      type: 'auth',
+      [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+        DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    });
+    expect(beforeFlush.some((message) => message.type === DAEMON_MSG.UPGRADE_BLOCKED_SYNC)).toBe(false);
+
+    resolveFlush(false);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)))).toContainEqual(expect.objectContaining({
+      type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+      revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    }));
+  });
+
+  it('records the server acknowledgement without exposing it to ordinary message handlers', async () => {
+    link.connect();
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    const ordinaryHandler = vi.fn();
+    link.onMessage(ordinaryHandler);
+
+    messageHandler?.({
+      data: JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId: 'failure-1',
+        disposition: DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      }),
+    } as MessageEvent);
+    await Promise.resolve();
+
+    expect(upgradeBlockedOutboxMock.acknowledge).toHaveBeenCalledWith(
+      'failure-1',
+      DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+    );
+    expect(ordinaryHandler).not.toHaveBeenCalled();
   });
 
   it('send() silently drops messages when not connected (fire-and-forget safe)', () => {

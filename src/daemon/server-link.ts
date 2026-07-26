@@ -3,9 +3,15 @@ import { performance } from 'node:perf_hooks';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+} from '../../shared/daemon-upgrade.js';
 import { setTransportRelaySend } from './transport-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
+import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
 import { getEmbeddingStatus } from '../context/embedding.js';
 import type { EmbeddingStatus } from '../../shared/embedding-status.js';
 import type { DiskUsage } from '../../shared/disk-usage.js';
@@ -386,7 +392,14 @@ export class ServerLink {
       });
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
-      ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token, daemonVersion: this.daemonVersion }));
+      ws.send(JSON.stringify({
+        type: 'auth',
+        serverId: this.serverId,
+        token: this.token,
+        daemonVersion: this.daemonVersion,
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
       this.sendDaemonHello();
       // Wire transport relay so provider callbacks can send events to browsers via this socket.
       setTransportRelaySend((msg) => {
@@ -410,6 +423,28 @@ export class ServerLink {
       outbox.flushOnReconnect(sender).catch((err) => {
         logger.warn({ err }, 'AckOutbox flush on reconnect failed');
       });
+      const sendUpgradeBlockedFrame = (message: unknown): boolean => {
+        if (this.ws !== ws) return false;
+        return this.trySend(message);
+      };
+      getDefaultUpgradeBlockedOutbox()
+        .flushOnReconnect(sendUpgradeBlockedFrame, this.daemonVersion)
+        .then(() => {
+          // Connection-bound barrier: the server must not arm an automatic
+          // upgrade until this daemon has finished reading and replaying its
+          // persisted terminal blocker. Binding the sender to `ws` prevents a
+          // delayed flush from an old connection from certifying a replacement.
+          sendUpgradeBlockedFrame({
+            type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+            revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+          });
+        })
+        .catch((err) => {
+          // Fail closed. Without a successful outbox read we cannot prove that
+          // the previous install did not terminally fail, so no sync-complete
+          // frame is sent and the server keeps automatic upgrade gated.
+          logger.warn({ err }, 'UpgradeBlockedOutbox flush on reconnect failed');
+        });
 
       // Resume the data-plane drain after reconnect. Anything that piled up
       // in `dataPlaneSendQueue` while the link was down is now safe to send
@@ -481,6 +516,22 @@ export class ServerLink {
       }
       try {
         const msg = JSON.parse(event.data);
+        if (
+          msg?.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && typeof msg.failureId === 'string'
+          && (
+            msg.disposition === DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED
+            || msg.disposition === DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.OBSOLETE
+            || msg.disposition === DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.SUPERSEDED
+          )
+        ) {
+          void getDefaultUpgradeBlockedOutbox()
+            .acknowledge(msg.failureId, msg.disposition)
+            .catch((err) => {
+              logger.warn({ err, failureId: msg.failureId }, 'UpgradeBlockedOutbox ack handling failed');
+            });
+          return;
+        }
         if (msg?.type === 'heartbeat_ack') {
           // Heartbeat acks are the CLI/status proof-of-life source. They must
           // not be throttled behind a just-written heartbeat-sent record, or

@@ -1,5 +1,23 @@
 export const DAEMON_UPGRADE_TARGET_LATEST = 'latest';
 
+export const DAEMON_UPGRADE_BLOCK_REASON = {
+  INSTALL_FAILED: 'install_failed',
+} as const;
+
+export const DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL = {
+  AUTH_REVISION_FIELD: 'upgradeBlockedSyncRevision',
+  REVISION: 1,
+} as const;
+
+export const DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION = {
+  ACCEPTED: 'accepted',
+  OBSOLETE: 'obsolete',
+  SUPERSEDED: 'superseded',
+} as const;
+
+export type DaemonUpgradeBlockedAckDisposition =
+  (typeof DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION)[keyof typeof DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION];
+
 export const DAEMON_UPGRADE_DELIVERY_STATUS = {
   SENT: 'sent',
   PENDING_OFFLINE: 'pending_offline',

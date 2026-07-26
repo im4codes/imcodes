@@ -129,6 +129,13 @@ import {
   resolveWindowsUpgradeRunnerPath,
 } from '../util/windows-upgrade-script.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
+import {
+  buildPosixUpgradeLayoutRecoveryScript,
+  parsePosixUpgradeFailureStatus,
+  POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE,
+} from '../util/posix-upgrade-layout-recovery.js';
+import { warnOncePerHour } from '../util/rate-limited-warn.js';
+import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
 import { encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
@@ -156,7 +163,11 @@ import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
+import {
+  DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_TARGET_LATEST,
+  normalizeDaemonUpgradeTargetVersion,
+} from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, normalizeCcPresetName, type CcPreset } from '../../shared/cc-presets.js';
 import {
   MEMORY_MCP_PROVIDER_IDS,
@@ -1628,9 +1639,13 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.DAEMON_UPGRADE:
       try {
         const normalizedTarget = normalizeDaemonUpgradeTargetVersion(cmd.targetVersion);
+        const upgradeId = typeof cmd.upgradeId === 'string' && cmd.upgradeId.length > 0 && cmd.upgradeId.length <= 128
+          ? cmd.upgradeId
+          : undefined;
         void handleDaemonUpgrade(
           normalizedTarget === DAEMON_UPGRADE_TARGET_LATEST ? undefined : normalizedTarget,
           serverLink,
+          upgradeId,
         );
       } catch {
         logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
@@ -6895,7 +6910,11 @@ async function resolveUpgradeRegistry(): Promise<{ base: string; explicit: boole
   return { base, explicit: base !== INSTALLER_OFFICIAL_NPM_REGISTRY };
 }
 
-async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
+async function handleDaemonUpgrade(
+  targetVersion?: string,
+  serverLink?: ServerLink,
+  upgradeId?: string,
+): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
   // ── Opt-out: forcibly disable the daemon's self-upgrade ───────────────────
@@ -7198,6 +7217,7 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
 
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
   const logFile = join(scriptDir, 'upgrade.log');
+  const statusFile = join(scriptDir, 'upgrade-status.json');
   const scriptPath = join(scriptDir, 'upgrade.sh');
   // Build the platform-specific restart command.
   // We always restart regardless of whether npm install succeeded, so the daemon
@@ -7367,9 +7387,22 @@ launchctl load -w "${plist}"`;
 
 LOG="${logFile}"
 SCRIPT_DIR="${scriptDir}"
+UPGRADE_STATUS_FILE="${statusFile}"
 CLEANUP_AFTER_SEC=${CLEANUP_AFTER_SEC}
 REGISTRY_ARG="${registryArg}"
 log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
+
+${buildPosixUpgradeLayoutRecoveryScript()}
+
+write_install_failure_status() {
+  local retry_reason="$1"
+  local attempts="$2"
+  local exit_code="$3"
+  local status_tmp="$UPGRADE_STATUS_FILE.tmp.$$"
+  printf '{"state":"blocked","reason":"${DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED}","retryReason":"%s","attempts":%s,"exitCode":%s}\\n' \
+    "$retry_reason" "$attempts" "$exit_code" > "$status_tmp" 2>>"$LOG" || return 1
+  mv "$status_tmp" "$UPGRADE_STATUS_FILE" 2>>"$LOG"
+}
 
 schedule_self_cleanup() {
   if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR" ]; then
@@ -7558,6 +7591,12 @@ GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>>"$LOG")
 log "[step 1] global root: $GLOBAL_ROOT"
 GLOBAL_PKG="$GLOBAL_ROOT/imcodes"
 
+# npm's rename destination is created before the incoming package's
+# preinstall hook can run, so the package-level cleanup cannot heal this
+# failure. Remove interrupted reify leftovers here, before npm starts.
+cleanup_stale_imcodes_staging_dirs "$GLOBAL_ROOT" "$UPGRADE_LOCK_STALE_AFTER_SEC" \
+  || log "[step 1.5] stale npm staging cleanup was incomplete; install may retry targeted recovery"
+
 # Remove existing npm link if any — it shadows install and prevents real upgrade.
 if [ -L "$GLOBAL_PKG" ]; then
   log "[step 1] removing pre-existing npm link: $GLOBAL_PKG -> $(readlink "$GLOBAL_PKG")"
@@ -7609,6 +7648,7 @@ INSTALL_OUT="${scriptDir}/install-attempt.log"
 INSTALL_RC=1
 ATTEMPT=0
 MAX_ATTEMPTS=5
+RETRY_REASON="not-classified"
 # Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
 # 15s / 30s / 60s / 120s keeps the common npm publish-CDN window quick
 # without stretching a bad target into a 10-minute local stall.
@@ -7633,6 +7673,7 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     VIEW_RC=$?
     cat "$INSTALL_OUT" >> "$LOG"
     if [ "$VIEW_RC" -ne 0 ] && is_etarget_output "$INSTALL_OUT"; then
+      RETRY_REASON="target-not-visible"
       log "[step 2] ${pkgSpec} not visible in registry yet"
       if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
         log "[step 2] target never became visible across $MAX_ATTEMPTS attempts — giving up before heavyweight install"
@@ -7671,6 +7712,12 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   elif is_transient_npm_output "$INSTALL_OUT"; then
     IS_RETRYABLE=1
     RETRY_REASON="transient-network"
+  elif is_recoverable_layout_output "$INSTALL_OUT" "$GLOBAL_ROOT"; then
+    IS_RETRYABLE=1
+    RETRY_REASON="stale-staging-dir"
+    if ! recover_stale_layout_from_output "$INSTALL_OUT" "$GLOBAL_ROOT"; then
+      log "[step 2] targeted stale staging cleanup failed; retrying remains bounded"
+    fi
   fi
   if [ "$IS_RETRYABLE" -ne 1 ]; then
     log "[step 2] non-retryable npm failure — not retrying. Tail of npm output:"
@@ -7687,9 +7734,11 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
 done
 if [ "$INSTALL_RC" -ne 0 ]; then
   log "[step 2] install FAILED after $ATTEMPT attempts (final exit $INSTALL_RC) — keeping current daemon running"
+  write_install_failure_status "$RETRY_REASON" "$ATTEMPT" "$INSTALL_RC" \
+    || log "[step 2] failed to write upgrade status marker: $UPGRADE_STATUS_FILE"
   log "=== upgrade aborted ==="
   schedule_self_cleanup
-  exit 0
+  exit ${POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE}
 fi
 log "[step 2] install succeeded after $ATTEMPT attempt(s)"
 
@@ -7985,6 +8034,40 @@ schedule_self_cleanup
   const child = spawn('/bin/bash', [scriptPath], {
     detached: true,
     stdio: 'ignore',
+  });
+  child.on('exit', (code, signal) => {
+    if (code !== POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE) return;
+    let status = null;
+    try {
+      status = parsePosixUpgradeFailureStatus(readFileSync(statusFile, 'utf8'));
+    } catch {
+      // The exit code is still authoritative even if the diagnostic marker
+      // could not be read (for example, the tmp directory was removed).
+    }
+    const diagnostic = {
+      targetVersion: targetVersion ?? DAEMON_UPGRADE_TARGET_LATEST,
+      log: logFile,
+      retryReason: status?.retryReason ?? 'unknown',
+      exitCode: status?.exitCode ?? code,
+      ...(signal ? { signal } : {}),
+      ...(status?.attempts !== undefined ? { attempts: status.attempts } : {}),
+    };
+    warnOncePerHour('daemon.upgrade.install_failed', diagnostic);
+    const blockedMessage = {
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      failureId: randomUUID(),
+      ...(upgradeId ? { upgradeId } : {}),
+      fromVersion: DAEMON_VERSION,
+      ...diagnostic,
+      ts: Date.now(),
+    } as const;
+    void getDefaultUpgradeBlockedOutbox()
+      .report(blockedMessage, (message) => serverLink?.trySend?.(message) ?? false)
+      .catch((err) => {
+        logger.warn({ err, failureId: blockedMessage.failureId }, 'daemon.upgrade: failed to persist install failure');
+      });
+    releaseUpgradeMemoryFreeze();
   });
   child.unref();
 

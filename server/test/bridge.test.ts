@@ -35,6 +35,12 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
+  DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
+  DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_DELIVERY_STATUS,
+} from '../../shared/daemon-upgrade.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../shared/peer-audit.js';
 import {
@@ -297,6 +303,7 @@ function makeTimelineOwnershipDb(options: {
 
 vi.mock('../src/security/crypto.js', () => ({
   sha256Hex: (_s: string) => 'valid-hash',
+  randomHex: (bytes: number) => 'a'.repeat(bytes * 2),
 }));
 
 vi.mock('../src/routes/push.js', () => ({
@@ -585,7 +592,10 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(2);
     });
 
-    it('does not retry auto daemon.upgrade after non-retryable daemon upgrade blockers', async () => {
+    it.each([
+      'toolchain_unavailable',
+      DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+    ])('does not retry auto daemon.upgrade after non-retryable blocker %s', async (reason) => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -600,7 +610,7 @@ describe('WsBridge', () => {
 
       expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
 
-      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'toolchain_unavailable' }));
+      ws.emit('message', JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason }));
       await flushAsync();
       await vi.advanceTimersByTimeAsync(60_000);
       await flushAsync();
@@ -608,7 +618,334 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
     });
 
-    it('does not send a stale scheduled daemon.upgrade after the daemon socket is replaced', async () => {
+    it('cancels the auth-scheduled auto upgrade when a persisted install failure replays', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-after-link-down',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: '2026.7.3192-dev.3593',
+        retryReason: 'stale-staging-dir',
+        exitCode: 217,
+        log: '/tmp/imcodes-upgrade-test/upgrade.log',
+        ts: Date.now(),
+      }));
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(ws.sentStrings.some((raw) => {
+        const message = JSON.parse(raw) as Record<string, unknown>;
+        return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && message.failureId === 'failure-after-link-down'
+          && message.disposition === 'accepted';
+      })).toBe(true);
+
+      const autoRetry = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'auto',
+      });
+      expect(autoRetry).toMatchObject({
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
+        reason: 'terminal_install_failure',
+      });
+    });
+
+    it('does not arm auto upgrade while slow auth replay keeps a persisted blocker waiting', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_slow_auth_brain' } as const;
+      const liveCoverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-slow-auth'],
+        primaryShareId: 'share-slow-auth',
+        authorizedAt: Date.now(),
+      } as const;
+      bridge.setShareCoverageResolverForTests(async () => liveCoverage);
+
+      const sharedBrowser = new MockWs();
+      bridge.handleShareBrowserConnection(sharedBrowser as never, 'shared-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-slow-auth',
+        target,
+        snapshot: liveCoverage,
+      });
+      sharedBrowser.emit('message', JSON.stringify({
+        type: 'session.send',
+        commandId: 'slow-auth-command',
+        sessionName: target.sessionName,
+        text: 'hold auth replay',
+      }));
+      await flushAsync();
+      expect(bridge._getInflightCountForTest()).toBe(1);
+
+      let resolveCoverage!: (value: typeof liveCoverage) => void;
+      const coveragePending = new Promise<typeof liveCoverage>((resolve) => {
+        resolveCoverage = resolve;
+      });
+      bridge.setShareCoverageResolverForTests(async () => coveragePending);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-during-slow-auth',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      resolveCoverage(liveCoverage);
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(daemonWs.sentStrings.some((raw) => {
+        const message = JSON.parse(raw) as Record<string, unknown>;
+        return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && message.failureId === 'failure-during-slow-auth'
+          && message.disposition === 'accepted';
+      })).toBe(true);
+    });
+
+    it('waits for daemon outbox sync even when auth finishes more than five seconds earlier', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-after-delayed-outbox-read',
+        upgradeId: 'old-auto-upgrade',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+        revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(daemonWs.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId: 'failure-after-delayed-outbox-read',
+        disposition: DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      });
+    });
+
+    it('starts a normal auto upgrade only after an empty outbox sync completes', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+        revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+    });
+
+    it('keeps an offline manual override ahead of reconnect auto and supersedes the retained old blocker', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {} as never);
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      const firstUpgrade = firstWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .find((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE);
+      expect(firstUpgrade?.upgradeId).toEqual(expect.any(String));
+
+      firstWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-before-manual-override',
+        upgradeId: firstUpgrade?.upgradeId,
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      firstWs.emit('close');
+
+      const manual = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'manual',
+      });
+      expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+      expect(manual.upgradeId).not.toBe(firstUpgrade?.upgradeId);
+
+      // Move beyond the auto retry interval so this regression cannot pass
+      // merely because the previous auto attempt is still rate-limited. The
+      // reconnect auto request must preserve manual authority on its own.
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000 + 1);
+
+      const reconnectWs = new MockWs();
+      bridge.handleDaemonConnection(reconnectWs as never, makeDb('valid-hash'), {} as never);
+      reconnectWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      reconnectWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-before-manual-override',
+        upgradeId: firstUpgrade?.upgradeId,
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      reconnectWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+        revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      await flushAsync();
+
+      const reconnectMessages = reconnectWs.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      expect(reconnectMessages.filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE)).toEqual([{
+        type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+        upgradeId: manual.upgradeId,
+        targetVersion: process.env.APP_VERSION,
+      }]);
+      expect(reconnectMessages).toContainEqual({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_ACK,
+        failureId: 'failure-before-manual-override',
+        disposition: DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.SUPERSEDED,
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+      expect(reconnectWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+    });
+
+    it('acks an old-target install failure as obsolete without blocking the new target', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3193-dev.3594';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+      }));
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-for-old-target',
+        fromVersion: '2026.7.3157-dev.3556',
+        targetVersion: '2026.7.3192-dev.3593',
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushAsync();
+
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+      expect(ws.sentStrings.some((raw) => {
+        const message = JSON.parse(raw) as Record<string, unknown>;
+        return message.type === DAEMON_MSG.UPGRADE_BLOCKED_ACK
+          && message.failureId === 'failure-for-old-target'
+          && message.disposition === 'obsolete';
+      })).toBe(true);
+    });
+
+    it('sends a deferred daemon.upgrade only to the replacement socket and ignores stale frames', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -626,7 +963,287 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(staleWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
+
+      const rawBrowser = new MockWs();
+      bridge.handleBrowserConnection(rawBrowser as never, 'raw-user', makeDb('valid-hash'));
+      rawBrowser.emit('message', JSON.stringify({
+        type: 'terminal.subscribe',
+        session: 'deck_stale_socket_binary',
+        raw: true,
+      }));
+      await flushAsync();
+      rawBrowser.sent.length = 0;
+
+      // ws can emit already-buffered frames while the replaced socket is still
+      // CLOSING. Neither binary data nor a terminal blocker from generation 1
+      // may borrow generation 2's authenticated bridge state.
+      staleWs.emit('message', packFrame('deck_stale_socket_binary', Buffer.from('stale')), true);
+      staleWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        failureId: 'failure-from-replaced-socket',
+        fromVersion: '2026.4.904-dev.100',
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect.soft(rawBrowser.sent.filter((item) => Buffer.isBuffer(item))).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000 + 1);
+      const nextAuto = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'auto',
+      });
+      expect.soft(nextAuto.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    });
+
+    it('does not let an error from a replaced socket reject current-generation requests', async () => {
+      const bridge = WsBridge.get(serverId);
+      const staleWs = new MockWs();
+      bridge.handleDaemonConnection(staleWs as never, makeDb('valid-hash'), {} as never);
+      staleWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, makeDb('valid-hash'), {} as never);
+      replacementWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      const pending = bridge.requestTimelineHistory({
+        sessionName: 'deck_replacement_request',
+        timeoutMs: 10_000,
+      });
+      const outbound = replacementWs.sentStrings.find((raw) => raw.includes('"type":"timeline.history_request"'));
+      expect(outbound).toBeTruthy();
+      const requestId = JSON.parse(outbound!).requestId as string;
+      let settled = false;
+      const observed = pending.then(
+        (value) => {
+          settled = true;
+          return { status: 'resolved' as const, value };
+        },
+        (error: unknown) => {
+          settled = true;
+          return { status: 'rejected' as const, error };
+        },
+      );
+
+      staleWs.emit('error', new Error('stale socket error'));
+      await flushAsync();
+      expect(settled).toBe(false);
+
+      replacementWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_replacement_request',
+        requestId,
+        events: [],
+        epoch: 1,
+      }));
+      await expect(observed).resolves.toMatchObject({
+        status: 'resolved',
+        value: {
+          type: 'timeline.history',
+          requestId,
+          epoch: 1,
+        },
+      });
+    });
+
+    it('does not let a stale in-flight auth certify or dispatch through its replacement connection', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.3192-dev.3593';
+      markDaemonUpgradeTargetVersionPublishedForTest(process.env.APP_VERSION);
+
+      type AuthRow = {
+        token_hash: string;
+        node_role: 'full';
+        revoked_at: null;
+      };
+      const makeDeferredAuthDb = () => {
+        let resolveQuery!: (value: AuthRow) => void;
+        const queryPromise = new Promise<AuthRow>((resolve) => {
+          resolveQuery = resolve;
+        });
+        const db = {
+          queryOne: () => queryPromise,
+          query: async () => [],
+          execute: async () => ({ changes: 1 }),
+          exec: async () => {},
+          transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) =>
+            fn(db as unknown as import('../src/db/client.js').Database),
+          close: () => {},
+        } as unknown as import('../src/db/client.js').Database;
+        return { db, resolveQuery };
+      };
+
+      const bridge = WsBridge.get(serverId);
+      const manual = bridge.requestDaemonUpgrade({
+        targetVersion: process.env.APP_VERSION,
+        source: 'manual',
+      });
+      expect(manual.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE);
+
+      const firstAuth = makeDeferredAuthDb();
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(firstWs as never, firstAuth.db, {} as never);
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+
+      const replacementAuth = makeDeferredAuthDb();
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, replacementAuth.db, {} as never);
+      replacementWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '2026.7.3157-dev.3556',
+        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await flushAsync();
+
+      // Finish generation 1 after generation 2 has installed its own socket
+      // and auth promise. The stale continuation must not authenticate gen 2,
+      // clear its promise, or rewrite its blocker-sync generation.
+      firstAuth.resolveQuery({
+        token_hash: 'valid-hash',
+        node_role: 'full',
+        revoked_at: null,
+      });
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(false);
       expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      // Generation 2 may authenticate, but remains unable to dispatch the
+      // pending manual upgrade until its own persisted-blocker sync arrives.
+      replacementAuth.resolveQuery({
+        token_hash: 'valid-hash',
+        node_role: 'full',
+        revoked_at: null,
+      });
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await flushAsync();
+      expect(replacementWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+
+      replacementWs.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED_SYNC,
+        revision: DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      await flushAsync();
+
+      const upgrades = replacementWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((message) => message.type === DAEMON_COMMAND_TYPES.DAEMON_UPGRADE);
+      expect(upgrades).toEqual([{
+        type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+        upgradeId: manual.upgradeId,
+        targetVersion: process.env.APP_VERSION,
+      }]);
+      expect(firstWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+    });
+
+    it('does not replay an inflight command through a replacement while stale auth revalidation settles', async () => {
+      const bridge = WsBridge.get(serverId);
+      const firstWs = new MockWs();
+      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {} as never);
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_stale_auth_replay_brain' } as const;
+      const liveCoverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-stale-auth-replay'],
+        primaryShareId: 'share-stale-auth-replay',
+        authorizedAt: Date.now(),
+      } as const;
+      bridge.setShareCoverageResolverForTests(async () => liveCoverage);
+      const sharedBrowser = new MockWs();
+      bridge.handleShareBrowserConnection(sharedBrowser as never, 'shared-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-stale-auth-replay',
+        target,
+        snapshot: liveCoverage,
+      });
+      sharedBrowser.emit('message', JSON.stringify({
+        type: 'session.send',
+        commandId: 'stale-auth-replay-command',
+        sessionName: target.sessionName,
+        text: 'must reach only the authenticated replacement',
+      }));
+      await flushAsync();
+      expect(bridge._getInflightCountForTest()).toBe(1);
+
+      let resolveCoverage!: (value: typeof liveCoverage) => void;
+      const coveragePending = new Promise<typeof liveCoverage>((resolve) => {
+        resolveCoverage = resolve;
+      });
+      bridge.setShareCoverageResolverForTests(async () => coveragePending);
+
+      firstWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+      }));
+      await flushAsync();
+
+      let resolveReplacementAuth!: (value: {
+        token_hash: string;
+        node_role: 'full';
+        revoked_at: null;
+      }) => void;
+      const replacementQuery = new Promise<{
+        token_hash: string;
+        node_role: 'full';
+        revoked_at: null;
+      }>((resolve) => {
+        resolveReplacementAuth = resolve;
+      });
+      const replacementDb = {
+        queryOne: () => replacementQuery,
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) =>
+          fn(replacementDb as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const replacementWs = new MockWs();
+      bridge.handleDaemonConnection(replacementWs as never, replacementDb, {} as never);
+      replacementWs.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+      }));
+      await flushAsync();
+
+      // Let generation 1's share revalidation finish after generation 2 owns
+      // the bridge. Its auth flow must leave the entry buffered, not send it
+      // through generation 2 before that socket authenticates.
+      resolveCoverage(liveCoverage);
+      await flushAsync();
+      expect(bridge.isAuthenticated).toBe(false);
+      expect(replacementWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(0);
+
+      resolveReplacementAuth({
+        token_hash: 'valid-hash',
+        node_role: 'full',
+        revoked_at: null,
+      });
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(replacementWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(1);
+      expect(firstWs.sentStrings.filter((raw) => raw.includes('"type":"session.send"'))).toHaveLength(0);
     });
   });
 
@@ -1009,7 +1626,7 @@ describe('WsBridge', () => {
       const daemonWs = new MockWs();
       bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
       daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
-      await flushAsync();
+      await flushOneBridgeDataPlaneTurn();
 
       const upgradeMessages = daemonWs.sentStrings.filter((s) => s.includes('"type":"daemon.upgrade"'));
       expect(upgradeMessages).toHaveLength(1);

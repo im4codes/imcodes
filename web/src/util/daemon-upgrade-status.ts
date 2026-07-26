@@ -11,6 +11,8 @@ export type DaemonUpgradingState = { targetVersion: string } | null;
  *   version (empty string when the daemon didn't supply a usable one).
  * - `MSG_DAEMON_ONLINE` / `DAEMON_MSG.RECONNECTED` → the (possibly upgraded)
  *   daemon is back, so clear the badge (`null`).
+ * - `DAEMON_MSG.UPGRADE_BLOCKED` → the detached upgrade stopped and the
+ *   current daemon remains active, so clear the badge immediately.
  * - anything else → `undefined`, meaning "not relevant, keep current state".
  *
  * Returning a discriminated `undefined` (vs `null`) lets the caller distinguish
@@ -23,7 +25,11 @@ export function nextDaemonUpgradingState(
   if (msgType === DAEMON_MSG.UPGRADING) {
     return { targetVersion: typeof rawTargetVersion === 'string' ? rawTargetVersion : '' };
   }
-  if (msgType === MSG_DAEMON_ONLINE || msgType === DAEMON_MSG.RECONNECTED) {
+  if (
+    msgType === MSG_DAEMON_ONLINE
+    || msgType === DAEMON_MSG.RECONNECTED
+    || msgType === DAEMON_MSG.UPGRADE_BLOCKED
+  ) {
     return null;
   }
   return undefined;

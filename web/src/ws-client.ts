@@ -8,6 +8,7 @@ import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
 import type { ResourceChangedMessage } from '@shared/resource-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
@@ -153,7 +154,8 @@ export type ServerMessage =
       | 'transport_busy'
       | 'session_busy'
       | 'cooldown_active'
-      | 'toolchain_unavailable';
+      | 'toolchain_unavailable'
+      | typeof DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED;
     activeRunIds?: string[];
     activeSessionNames?: string[];
     blockedSessions?: TransportUpgradeBlockedSession[];
@@ -163,6 +165,15 @@ export type ServerMessage =
     lastUpgradeAt?: number | null;
     nodeBinPresent?: boolean;
     npmAvailable?: boolean;
+    failureId?: string;
+    fromVersion?: string;
+    targetVersion?: string;
+    retryReason?: string;
+    attempts?: number;
+    exitCode?: number;
+    log?: string;
+    signal?: string;
+    ts?: number;
   }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }> }
