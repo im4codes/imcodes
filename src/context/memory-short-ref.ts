@@ -63,11 +63,13 @@ function sameNamespace(a: ContextNamespace | undefined, b: ContextNamespace | un
 /**
  * Namespace key for the persisted row.
  *
- * `namespaceKey()` separates fields with NUL, which is fine in memory but is
- * truncated by SQLite's NUL-terminated TEXT — the stored key collapsed to just
- * the scope, which also degraded the (ref, kind, id, namespace_key) primary key
- * so two namespaces sharing a scope could overwrite each other. JSON keeps the
- * same field order without an embedded NUL.
+ * `namespaceKey()` separates fields with NUL, which is fine in memory but reads
+ * back from node:sqlite as just the leading scope: the driver stops at the first
+ * NUL when converting TEXT to a JS string. The bytes are stored intact and the
+ * primary key was never affected — a previous version of this comment claimed a
+ * collapsed primary key, which measurement disproved — but a key that cannot be
+ * read back is useless for verifying a row against its namespace. JSON keeps the
+ * same field order with no embedded NUL, so it survives the round trip.
  */
 function namespaceStorageKey(namespace: ContextNamespace | undefined): string {
   if (!namespace) return '';
@@ -390,18 +392,33 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       // dropped, not loaded namespace-less: the entry would look healthy while
       // being unresolvable for every namespaced caller — silent handle loss
       // wearing the shape of a successful load.
-      const storedNamespaceJson = typeof row.namespaceJson === 'string' && row.namespaceJson.trim()
-        ? row.namespaceJson
-        : undefined;
-      const decoded = decodeNamespace(storedNamespaceJson ? safeParseNamespace(storedNamespaceJson) : undefined);
+      // Absent means the column itself carried nothing. A column that IS present
+      // but cannot be parsed is corruption, not "no namespace" — degrading it to
+      // namespace-less loads an entry that looks healthy while being
+      // unresolvable for every namespaced caller.
+      const namespaceColumnPresent = typeof row.namespaceJson === 'string' && row.namespaceJson.trim().length > 0;
+      const parsed = namespaceColumnPresent ? safeParseNamespace(row.namespaceJson as string) : undefined;
+      if (namespaceColumnPresent && parsed === undefined) { discarded += 1; continue; }
+      const decoded = decodeNamespace(parsed);
       if (!decoded.ok) { discarded += 1; continue; }
       const namespace = decoded.namespace;
-      // namespace_key is what the row was written under. If it disagrees with
-      // the namespace the JSON decodes to — including a key that says "scoped"
-      // while the JSON is missing — the row's identity is corrupt and loading it
-      // would place the handle under the wrong namespace.
+      // namespace_key records what the row was written under; a disagreement
+      // means the row's identity is corrupt and loading it would file the handle
+      // under the wrong namespace.
+      //
+      // Rows written before the key became a JSON tuple used NUL-separated
+      // fields, and node:sqlite truncates a NUL-containing TEXT value at the
+      // first NUL when it converts to a JS string — so those rows read back as
+      // just the scope. (The bytes are stored intact and the primary key was
+      // never affected; an earlier comment here claimed otherwise and was
+      // wrong.) Accept that legacy shape so an upgrade does not discard every
+      // handle written before it.
       const storedNamespaceKey = typeof row.namespaceKey === 'string' ? row.namespaceKey : '';
-      if (storedNamespaceKey !== namespaceStorageKey(namespace)) { discarded += 1; continue; }
+      const legacyTruncatedKey = namespace ? namespace.scope : '';
+      if (storedNamespaceKey !== namespaceStorageKey(namespace) && storedNamespaceKey !== legacyTruncatedKey) {
+        discarded += 1;
+        continue;
+      }
       const normalized = normalizeEntry({
         ref: row.ref,
         kind: row.kind,
