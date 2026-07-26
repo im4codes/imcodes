@@ -199,8 +199,12 @@ const NAMESPACE_IDENTITY_FIELDS = ['projectId', 'userId', 'workspaceId', 'enterp
  * counts it as loaded, so the handle disappears with no signal at all.
  */
 function decodeNamespace(raw: unknown): { ok: true; namespace: ContextNamespace | undefined } | { ok: false } {
-  if (raw === undefined || raw === null) return { ok: true, namespace: undefined };
-  if (typeof raw !== 'object') return { ok: false };
+  // Only a value that is not there at all means "no namespace". An explicit
+  // null — including a column holding the JSON text `null` — is a value that
+  // failed to describe a namespace, and degrading it to namespace-less loads a
+  // handle no namespaced caller can ever reach.
+  if (raw === undefined) return { ok: true, namespace: undefined };
+  if (raw === null || typeof raw !== 'object') return { ok: false };
   const record = raw as Record<string, unknown>;
   if (!isMemoryScope(record.scope)) return { ok: false };
   for (const field of NAMESPACE_IDENTITY_FIELDS) {

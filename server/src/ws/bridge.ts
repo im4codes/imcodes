@@ -4932,6 +4932,11 @@ export class WsBridge {
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
+        // Memory-handle persistence failures ride this frame because the
+        // daemon's own counter and log cannot leave a machine whose disk is
+        // full. Rebuilding the payload without them put the signal in a hole:
+        // it reached this pod and went no further.
+        ...(isPlainRecord(msg.shortRefHealth) ? { shortRefHealth: msg.shortRefHealth } : {}),
       }));
       return;
     }

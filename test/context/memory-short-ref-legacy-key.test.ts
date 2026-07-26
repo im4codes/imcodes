@@ -101,3 +101,63 @@ describe('memory short refs — legacy NUL-separated namespace keys', () => {
     expect(resolveMemoryShortRef(ref)).toBeUndefined();
   });
 });
+
+describe('memory short refs — namespace values that name nothing reachable', () => {
+  let tempDir: string;
+  let priorPath: string | undefined;
+  let priorLegacy: string | undefined;
+
+  beforeEach(async () => {
+    priorPath = process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    priorLegacy = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = '/nonexistent/imcodes-test/legacy.json';
+    tempDir = await createIsolatedSharedContextDb('memory-short-ref-identity');
+    resetMemoryShortRefsForTests();
+  });
+
+  afterEach(async () => {
+    resetMemoryShortRefsForTests();
+    resetContextStoreClientForTests();
+    if (priorPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_PATH = priorPath;
+    if (priorLegacy === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = priorLegacy;
+    await cleanupIsolatedSharedContextDb(tempDir);
+  });
+
+  // Each row below pairs the namespace with the key that namespaceStorageKey
+  // would produce for it, so the key-consistency check agrees and ONLY the
+  // scope/identity rules can reject the row. Earlier tests always used a valid
+  // key, which meant a mismatch masked whether identity was checked at all.
+  const keyFor = (ns: Record<string, string>) => JSON.stringify([
+    ns.scope, ns.userId ?? '', ns.projectId ?? '', ns.workspaceId ?? '', ns.enterpriseId ?? '',
+  ]);
+
+  it('discards a personal-scope row missing the identity that scope requires', async () => {
+    const id = 'cccccccc-1111-2222-3333-444444444444';
+    const ref = makeMemoryShortRef('projection', id);
+    const ns = { scope: 'personal', userId: 'u1' }; // no projectId
+    upsertMemoryShortRefs([{
+      ref, kind: 'projection', id,
+      namespaceKey: keyFor(ns), namespaceJson: JSON.stringify(ns), lastSeenAt: 1,
+    }]);
+
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBe(0);
+    expect(resolveMemoryShortRef(ref, ns as never)).toBeUndefined();
+  });
+
+  it('discards a row whose namespace column holds the JSON text null', async () => {
+    // Parses successfully, so a parse-failure guard alone lets it through; it
+    // still describes no namespace.
+    const id = 'dddddddd-1111-2222-3333-444444444444';
+    const ref = makeMemoryShortRef('projection', id);
+    upsertMemoryShortRefs([{
+      ref, kind: 'projection', id,
+      namespaceKey: '', namespaceJson: 'null', lastSeenAt: 1,
+    }]);
+
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBe(0);
+    expect(resolveMemoryShortRef(ref)).toBeUndefined();
+  });
+});
