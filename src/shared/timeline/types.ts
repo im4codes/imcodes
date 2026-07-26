@@ -164,6 +164,8 @@ export interface PeerAuditStatusTimelinePayload {
 
 export interface MemoryContextTimelineItem {
   id: string;
+  /** Redeemable projection/observation handle shown to users and agents. */
+  ref?: string;
   projectId: string;
   scope?: string;
   enterpriseId?: string;

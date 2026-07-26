@@ -32,8 +32,14 @@ export function buildMemoryContextTimelinePayload(
     .map((item) => ({ ...item, text: item.text.trim() }))
     .filter((item) => item.text);
   if (items.length === 0 && preferenceItems.length === 0) return null;
-  const timelineItems: MemoryContextTimelineItem[] = items.map((item) => ({
+  // Register once, then reuse the exact same handles in both the agent-facing
+  // injected text and the user-facing timeline payload. Mapping first used to
+  // drop `type`, which made observation evidence look like a projection in the
+  // reconstructed injectedText and left the web card with no ref at all.
+  const referencedItems = attachMemoryShortRefs(items);
+  const timelineItems: MemoryContextTimelineItem[] = referencedItems.map((item) => ({
     id: item.id,
+    ...(item.ref ? { ref: item.ref } : {}),
     projectId: item.projectId,
     ...('scope' in item && item.scope ? { scope: item.scope } : {}),
     ...('enterpriseId' in item && item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
@@ -47,7 +53,7 @@ export function buildMemoryContextTimelinePayload(
     relevanceScore: item.relevanceScore,
   }));
   const injectedText = options?.injectedText
-    ?? (timelineItems.length > 0 ? buildRelatedPastWorkText(attachMemoryShortRefs(timelineItems)) : undefined);
+    ?? (referencedItems.length > 0 ? buildRelatedPastWorkText(referencedItems) : undefined);
   return {
     ...(query ? { query } : {}),
     ...(injectedText ? { injectedText } : {}),

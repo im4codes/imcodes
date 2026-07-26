@@ -3843,6 +3843,9 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
                     <div key={item.id} class="chat-memory-context-item">
                       <div class="chat-memory-context-item-summary">{item.summary}</div>
                       <div class="chat-memory-context-item-meta">
+                        {item.ref && (
+                          <code class="chat-memory-context-chip chat-memory-context-ref">{item.ref}</code>
+                        )}
                         <span class="chat-memory-context-chip">{item.projectId}</span>
                         {score && <span class="chat-memory-context-chip">{t('chat.memory_context_score', { score })}</span>}
                         {typeof item.hitCount === 'number' && item.hitCount > 0 ? (

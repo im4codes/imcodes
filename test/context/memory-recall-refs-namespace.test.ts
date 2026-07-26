@@ -43,6 +43,7 @@ vi.mock('../../src/store/context-store-worker-client.js', () => ({
 }));
 
 import { attachMemoryShortRefs } from '../../src/context/memory-recall-refs.js';
+import { buildMemoryContextTimelinePayload } from '../../src/daemon/memory-context-timeline.js';
 import {
   loadMemoryShortRefsFromStore,
   resetMemoryShortRefsForTests,
@@ -111,6 +112,21 @@ describe('injected memory handles resolve for the agent they were injected into'
     });
     expect(resolved?.id).toBe('obs-id-1');
     expect(resolved?.kind).toBe('observation');
+  });
+
+  it('preserves the same observation handle in injected text and the web timeline payload', () => {
+    const payload = buildMemoryContextTimelinePayload('remember this observation', [{
+      id: 'obs-timeline-1',
+      type: 'observation',
+      scope: 'user_private',
+      projectId: PROJECT,
+      summary: 'The user prefers compact audit reports',
+    }]);
+
+    const item = payload?.items[0];
+    expect(item?.ref).toMatch(/^obs:[a-z2-7]{13}$/);
+    expect(payload?.injectedText).toContain(`(${item?.ref})`);
+    expect(payload?.injectedText).not.toContain('(proj:');
   });
 
   it('still redeems after a daemon restart, via the row that actually reached the store', async () => {

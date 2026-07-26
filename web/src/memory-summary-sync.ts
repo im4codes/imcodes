@@ -47,15 +47,25 @@ function newestRecords(records: ContextMemoryRecordView[], projectId: string, li
 
 function mergeMemoryRecordsByPriority(recordGroups: ContextMemoryRecordView[][]): ContextMemoryRecordView[] {
   const merged: ContextMemoryRecordView[] = [];
-  const seen = new Set<string>();
+  const indexByKey = new Map<string, number>();
   for (const records of recordGroups) {
     for (const record of records) {
       const summary = record.summary.trim();
       const key = record.id
         ? `id:${record.id}`
         : `summary:${record.projectId}:${record.projectionClass}:${summary}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const existingIndex = indexByKey.get(key);
+      if (existingIndex !== undefined) {
+        // Cloud stays authoritative for summary content/order, while a matching
+        // local daemon result can enrich it with the persisted short ref that
+        // only the daemon is able to issue.
+        const existing = merged[existingIndex];
+        if (existing && !existing.ref && record.ref) {
+          merged[existingIndex] = { ...existing, ref: record.ref };
+        }
+        continue;
+      }
+      indexByKey.set(key, merged.length);
       merged.push(record);
     }
   }
@@ -109,16 +119,12 @@ export function localPersonalMemorySummarySource(
         projectId: input.projectId,
         projectionClass: input.projectionClass,
         limit: input.limit,
+        includeShortRefs: true,
       });
     } catch (error) {
       finish(() => reject(error));
     }
   });
-}
-
-function projectionRef(projectionId: string): string {
-  const compact = projectionId.replace(/[^a-f0-9]/gi, '').slice(0, 10) || projectionId.slice(0, 10);
-  return `proj:${compact.toLowerCase()}`;
 }
 
 function sourceLookupLine(projectionId: string): string {
@@ -185,7 +191,8 @@ export async function buildMemorySummarySyncMessage(
     remainingSummaryChars -= trimmed.text.length;
     truncated = truncated || trimmed.truncated;
     const project = record.projectId ? `[${record.projectId}] ` : '';
-    lines.push(`${lines.length + 1}. [ref: ${projectionRef(record.id)}] ${project}${trimmed.text}\n   ${sourceLookupLine(record.id)}`);
+    const ref = record.ref ? `[ref: ${record.ref}] ` : '';
+    lines.push(`${lines.length + 1}. ${ref}${project}${trimmed.text}\n   ${sourceLookupLine(record.id)}`);
   }
   if (lines.length === 0) return null;
 

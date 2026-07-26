@@ -1712,6 +1712,7 @@ describe('ChatView', () => {
               items: [
                 {
                   id: 'mem-transport-1',
+                  ref: 'proj:transportrefa',
                   projectId: 'repo-1',
                   summary: 'Fixed transport recall visibility',
                   relevanceScore: 0.91,
@@ -1732,6 +1733,8 @@ describe('ChatView', () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain('Fixed transport recall visibility');
+      expect(container.textContent).toContain('proj:transportrefa');
+      expect(container.querySelector('.chat-memory-context-ref')?.textContent).toBe('proj:transportrefa');
       expect(container.querySelector('.chat-memory-context')?.getAttribute('data-related-to')).toBe('evt-user-transport');
     });
   });

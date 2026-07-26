@@ -305,6 +305,8 @@ export interface ContextMemoryProjectView {
 
 export interface ContextMemoryRecordView {
   id: string;
+  /** Daemon-issued, persisted projection handle when this record is addressable. */
+  ref?: string;
   scope: MemoryScope;
   projectId: string;
   ownerUserId?: string;

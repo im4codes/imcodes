@@ -605,6 +605,7 @@ describe('handleWebCommand memory context timeline', () => {
       type: MEMORY_WS.PERSONAL_QUERY,
       requestId: 'personal-list',
       projectId: 'github.com/acme/repo',
+      includeShortRefs: true,
       [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
         actorId: 'user-bob',
         userId: 'user-bob',
@@ -645,6 +646,7 @@ describe('handleWebCommand memory context timeline', () => {
       requestId: 'personal-list',
       records: [expect.objectContaining({
         id: 'bob-proj',
+        ref: makeMemoryShortRef('projection', 'bob-proj'),
         summary: 'Bob private project memory',
         ownerUserId: 'user-bob',
         createdByUserId: 'user-bob',
@@ -1406,6 +1408,7 @@ describe('handleWebCommand memory context timeline', () => {
         items: [
           expect.objectContaining({
             id: 'mem-1',
+            ref: makeMemoryShortRef('projection', 'mem-1'),
             projectId: 'codedeck',
             relevanceScore: 0.812,
             hitCount: 4,

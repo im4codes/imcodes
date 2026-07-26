@@ -38,8 +38,9 @@ describe('memory summary sync message', () => {
     });
     expect(message).toContain('SYNC ONLY');
     expect(message).toContain('Recent summaries (2/5, max 7200 chars):');
-    expect(message).toContain('1. [ref: proj:aaaaaaaaaa] [repo-1] Newest summary');
-    expect(message).toContain('2. [ref: proj:1111111111] [repo-1] Older summary');
+    expect(message).toContain('1. [repo-1] Newest summary');
+    expect(message).toContain('2. [repo-1] Older summary');
+    expect(message).not.toContain('[ref:');
     expect(message).toContain('"tool":"get_memory_sources"');
     expect(message).toContain('"kind":"projection"');
     expect(message).toContain('"projectionId":"aaaaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"');
@@ -64,8 +65,8 @@ describe('memory summary sync message', () => {
   it('merges cloud and local summaries while keeping cloud records first for duplicates', async () => {
     const localSource = vi.fn().mockResolvedValue({
       records: [
-        { id: 'duplicate-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local duplicate summary', updatedAt: 700 },
-        { id: 'local-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local only summary', updatedAt: 600 },
+        { id: 'duplicate-summary', ref: 'proj:duplicateaaaa', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local duplicate summary', updatedAt: 700 },
+        { id: 'local-summary', ref: 'proj:localsummaryaa', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local only summary', updatedAt: 600 },
       ],
     });
     getPersonalCloudMemory.mockResolvedValueOnce({
@@ -92,6 +93,8 @@ describe('memory summary sync message', () => {
     expect(message).toContain('Local only summary');
     expect(message).toContain('Cloud duplicate summary');
     expect(message).toContain('Cloud only summary');
+    expect(message).toContain('[ref: proj:duplicateaaaa] [repo-1] Cloud duplicate summary');
+    expect(message).toContain('[ref: proj:localsummaryaa] [repo-1] Local only summary');
     expect(message).not.toContain('Local duplicate summary');
   });
 
@@ -144,7 +147,7 @@ describe('memory summary sync message', () => {
               requestId: message.requestId,
               stats: {},
               records: [
-                { id: 'local-ws-summary', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local ws summary', updatedAt: 700 },
+                { id: 'local-ws-summary', ref: 'proj:localwssumaaa', projectId: 'repo-1', projectionClass: 'recent_summary', summary: 'Local ws summary', updatedAt: 700 },
               ],
             });
           }
@@ -160,6 +163,7 @@ describe('memory summary sync message', () => {
       projectId: 'repo-1',
       projectionClass: 'recent_summary',
       limit: 4,
+      includeShortRefs: true,
     });
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -170,6 +174,7 @@ describe('memory summary sync message', () => {
       limit: 4,
     }));
     expect(view?.records[0].summary).toBe('Local ws summary');
+    expect(view?.records[0].ref).toBe('proj:localwssumaaa');
     expect(handlers.size).toBe(0);
   });
 
@@ -198,8 +203,9 @@ describe('memory summary sync message', () => {
       limit: 10,
     });
     expect(message).toContain('Recent summaries (10/10, max 7200 chars):');
-    expect(message).toContain('1. [ref: proj:a12] [repo-1] Summary 12');
-    expect(message).toContain('10. [ref: proj:a3] [repo-1] Summary 3');
+    expect(message).toContain('1. [repo-1] Summary 12');
+    expect(message).toContain('10. [repo-1] Summary 3');
+    expect(message).not.toContain('[ref:');
     expect(message).not.toContain('Summary 2');
   });
 
