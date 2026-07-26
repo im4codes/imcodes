@@ -165,6 +165,33 @@ describe('injected memory handles resolve for the agent they were injected into'
     expect(resolveMemoryShortRef('proj:legacyownerless', RESOLVER_NAMESPACE)?.id).toBe('legacy-id-1');
   });
 
+  it('rescues a row whose owner was whitespace, not just absent or empty', async () => {
+    // Found by the second independent audit, with a real-SQLite probe: the
+    // normalizer treats a whitespace-only owner as missing, so such a row IS
+    // backfilled — but the loader used to rebuild the pre-backfill key by ASSUMING
+    // the owner had been `''`, so a row that stored `" "` in both its JSON and its
+    // key was discarded anyway. The pre-backfill namespace is now carried through
+    // verbatim instead of reconstructed, which removes the assumption.
+    resetMemoryShortRefsForTests();
+    runMock.mockReset();
+    runMock.mockImplementation(async (name: string) => (
+      name === 'listMemoryShortRefs'
+        ? [{
+            ref: 'proj:whitespaceowner',
+            kind: 'projection',
+            id: 'whitespace-id-1',
+            namespaceKey: JSON.stringify(['personal', ' ', PROJECT, '', '']),
+            namespaceJson: JSON.stringify({ scope: 'personal', projectId: PROJECT, userId: ' ' }),
+            lastSeenAt: Date.now(),
+          }]
+        : undefined
+    ));
+
+    expect(await loadMemoryShortRefsFromStore()).toBe(1);
+    expect(resolveMemoryShortRef('proj:whitespaceowner', RESOLVER_NAMESPACE)?.id)
+      .toBe('whitespace-id-1');
+  });
+
   it('does not excuse an owner-less KEY on a row that carries an explicit owner', async () => {
     // The rescue must only forgive rows that actually needed it. Offering the
     // owner-less key shape to every row also excused a genuine key/JSON

@@ -202,7 +202,7 @@ const NAMESPACE_IDENTITY_FIELDS = [
  */
 function decodeNamespace(
   raw: unknown,
-): { ok: true; namespace: ContextNamespace | undefined; ownerBackfilled?: boolean } | { ok: false } {
+): { ok: true; namespace: ContextNamespace | undefined; preBackfillNamespace?: ContextNamespace } | { ok: false } {
   // Only a value that is not there at all means "no namespace". An explicit
   // null — including a column holding the JSON text `null` — is a value that
   // failed to describe a namespace, and degrading it to namespace-less loads a
@@ -228,6 +228,12 @@ function decodeNamespace(
   // user's memory handles on a technicality.
   const rawNamespace = record as unknown as ContextNamespace;
   const namespace = normalizeDaemonLocalMemoryNamespace(rawNamespace);
+  // Hand back the PRE-backfill namespace rather than a boolean, so the loader can
+  // rebuild the key this row was actually written with instead of assuming the
+  // absent owner was the empty string. The helper treats a whitespace-only owner
+  // as missing too, and a row that stored `" "` in both its JSON and its key was
+  // being discarded because the reconstruction guessed `''`. Carrying the real
+  // value removes the guess.
   const ownerBackfilled = namespace !== rawNamespace;
   const identity = {
     user_id: namespace.userId,
@@ -237,7 +243,7 @@ function decodeNamespace(
     tenant_id: namespace.localTenant,
   };
   if (!validateMemoryScopeIdentity(record.scope, identity).ok) return { ok: false };
-  return { ok: true, namespace, ...(ownerBackfilled ? { ownerBackfilled } : {}) };
+  return { ok: true, namespace, ...(ownerBackfilled ? { preBackfillNamespace: rawNamespace } : {}) };
 }
 
 function isContextNamespace(value: unknown): value is ContextNamespace {
@@ -470,15 +476,15 @@ export async function loadMemoryShortRefsFromStore(): Promise<number> {
       // key/JSON disagreement that this check exists to catch. Those rows could
       // never cross-resolve (they are filed under the validated JSON namespace),
       // but an integrity check should not be broader than its own comment.
-      const ownerlessNamespace = decoded.ownerBackfilled && namespace
-        ? { ...namespace, userId: '' }
-        : undefined;
+      // The exact namespace this row was written with, when the owner was
+      // backfilled — not a reconstruction of it.
+      const preBackfillNamespace = decoded.preBackfillNamespace;
       if (storedNamespaceKey !== namespaceStorageKey(namespace)
         && storedNamespaceKey !== legacyNamespaceKey
         && storedNamespaceKey !== legacyTruncatedKey
-        && !(ownerlessNamespace
-          && (storedNamespaceKey === namespaceStorageKey(ownerlessNamespace)
-            || storedNamespaceKey === namespaceKey(ownerlessNamespace)))) {
+        && !(preBackfillNamespace
+          && (storedNamespaceKey === namespaceStorageKey(preBackfillNamespace)
+            || storedNamespaceKey === namespaceKey(preBackfillNamespace)))) {
         discarded += 1;
         continue;
       }
