@@ -94,6 +94,9 @@ interface ActiveTaskRunState {
   // as soon as either automation or the current session delegates the audit,
   // and stays false while waiting for the reply.
   requiresAudit: boolean;
+  // Sticky safety gate set by REWORK. A broker decision cannot clear it; only
+  // a later matching peer-audit PASS may authorize repository finalization.
+  freshAuditRequiredAfterRework: boolean;
   continueLoops: number;
   continueStreakCount: number;
   lastContinueBucket?: string;
@@ -217,19 +220,19 @@ function classifyContinueBucket(decision: { nextAction?: string; gap?: string; r
   return text.slice(0, 120);
 }
 
-const REPOSITORY_FINALIZATION_ACTION_RE = /(?:\b(?:git\s+(?:add|commit|push)|commit|push|stage|staging)\b|提交|推送|暂存)/iu;
-const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|deploy|release|restart)\b|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|部署|发布|重启)/iu;
+const REPOSITORY_FINALIZATION_ACTION_RE = /(?:\b(?:git\s+(?:add|commit|push|merge)|commit|push|stage|staging|merge|release|deploy|publish)\b|提交|推送|暂存|合并|发布|部署|上线)/iu;
+const SUBSTANTIVE_PRE_AUDIT_ACTION_RE = /(?:\b(?:test|tests|testing|typecheck|lint|build|verify|verification|validate|validation|fix|repair|implement|edit|modify|update|write|refactor|restart)\b|测试|类型检查|构建|验证|修复|实现|修改|更新|编写|重构|重启)/iu;
 const COMPLETED_PRE_AUDIT_WORK_RE = /(?:\b(?:implementation|fix(?:es)?|coding|changes?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,80}\b(?:complete|completed|done|finished|pass(?:ed)?)\b|(?:修复|实现|代码|改动|测试|验证|检查|类型检查|构建)[\s\S]{0,60}(?:已完成|已经完成|均已完成|全部完成|完成并通过|已通过|验证通过|测试通过))/iu;
 const PENDING_PRE_AUDIT_WORK_RE = /(?:\b(?:still|yet|remaining|pending|missing|failed?|incomplete|need(?:s)?\s+to|must)\b[\s\S]{0,50}\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b|\b(?:implementation|fix(?:es)?|tests?|testing|typecheck|lint|build|verification|validation)\b[\s\S]{0,50}\b(?:remain(?:s|ing)?|pending|missing|fail(?:ed|ing)?|incomplete|not\s+(?:done|complete)|need(?:s)?|required)\b|(?:仍|还|尚|待|未|缺少|失败)[\s\S]{0,30}(?:测试|验证|修复|实现|构建|类型检查)|(?:测试|验证|修复|实现|构建|类型检查)[\s\S]{0,30}(?:未完成|仍需|还需|待处理|失败|缺失|未通过))/iu;
-const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Finalize only the already-audited repository changes: stage the intended task files, commit them, and push the current branch. Do not request or start another audit.';
+const POST_AUDIT_REPOSITORY_FINALIZATION_ACTION = 'Peer-audit has passed. Perform only the already-audited repository or delivery finalization requested for this task (stage/commit/push, merge, release, publish, or deploy as applicable). Do not perform additional implementation work. Do not request or start another audit.';
 
 type RepositoryFinalizationClassification = 'none' | 'finalization_only' | 'completion_evidenced_mixed';
 
 /**
  * `supervised_audit` must review the implementation before repository
  * finalization. Only hold an action whose imperative next step is purely
- * stage/commit/push work. Any instruction that also asks for tests, fixes,
- * implementation, build, deployment, or another substantive mutation stays
+ * stage/commit/push/merge/release/deploy work. Any instruction that also asks
+ * for tests, fixes, implementation, build, or another substantive mutation stays
  * in the normal pre-audit continue loop. Audit/review words are deliberately
  * not substantive here: "commit after peer-audit PASS" describes the gate
  * this function is deciding to start, rather than work the target session
@@ -748,6 +751,7 @@ class SupervisionAutomation {
       userText: text,
       phase: 'execution',
       requiresAudit: snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT,
+      freshAuditRequiredAfterRework: false,
       continueLoops: 0,
       continueStreakCount: 0,
       evaluating: false,
@@ -1139,7 +1143,7 @@ class SupervisionAutomation {
     const latest = this.activeRuns.get(run.sessionName);
     if (!latest || latest.generation !== run.generation || latest.phase !== evaluatedPhase) return;
     latest.evaluating = false;
-    latest.requiresAudit = decision.requiresAudit !== false;
+    latest.requiresAudit = latest.freshAuditRequiredAfterRework || decision.requiresAudit !== false;
 
     switch (decision.decision) {
       case 'complete': {
@@ -1220,7 +1224,7 @@ class SupervisionAutomation {
         const guardedNextAction = latest.phase === 'execution'
           && latest.snapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
           && hasRepositoryFinalizationAction(decision)
-          ? 'Complete only the remaining substantive implementation or validation work described by the supervisor. Do not stage, commit, or push; repository finalization is deferred until peer-audit PASS.'
+          ? 'Complete only the remaining substantive implementation or validation work described by the supervisor. Do not stage, commit, or push; do not merge, release, publish, or deploy. Repository and delivery finalization are deferred until peer-audit PASS.'
           : decision.nextAction;
         await this.dispatchContinue(latest, {
           reason: decision.reason,
@@ -1414,6 +1418,7 @@ class SupervisionAutomation {
     if (verdict === 'PASS') {
       this.emitOrchestratedAuditResult(current, 'pass', undefined, findings);
       current.auditAttemptId = undefined;
+      current.freshAuditRequiredAfterRework = false;
       if (current.deferredFinalization) {
         current.phase = 'finalizing';
         current.ignoreIdleUntilPostAuditTurnActivity = options.settledWithoutIdle === true;
@@ -1443,6 +1448,7 @@ class SupervisionAutomation {
     const reworkBrief = buildReworkBrief(current, findings);
     current.phase = 'execution';
     current.requiresAudit = true;
+    current.freshAuditRequiredAfterRework = true;
     current.ignoreIdleUntilPostAuditTurnActivity = options.settledWithoutIdle === true;
     current.evaluating = false;
     current.sawAssistantOutput = false;

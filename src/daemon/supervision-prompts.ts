@@ -67,11 +67,12 @@ function buildAuditBeforeFinalizationRule(request: SupervisionBrokerRequest): st
   if (request.snapshot?.mode !== SUPERVISION_MODE.SUPERVISED_AUDIT) return '';
   return [
     'Audit-order rule for supervised_audit:',
-    '- Peer audit MUST finish before repository commit/push finalization.',
-    '- If implementation and validation are complete and the ONLY remaining action is git add/commit/push, return continue with that exact finalization-only nextAction; the daemon will hold it until peer-audit PASS instead of sending it now.',
-    '- If fixes, tests, typecheck, lint, build, validation, documentation changes, deployment, or any other substantive work remains, return continue normally so that work happens before audit.',
-    '- Never combine substantive pre-audit work and post-audit commit/push in one nextAction.',
-    '- If both the assistant response and your reason say implementation/validation are already complete, NEVER invent generic "remaining implementation or validation" work. Return only the concrete git add/commit/push finalization nextAction.',
+    '- Peer audit MUST finish before repository or delivery finalization, including git add/commit/push, merge, release, publish, and deploy actions.',
+    '- A REWORK verdict means the previous audit did NOT pass and grants no repository-finalization authority. After applying the requested fixes and validations, require a fresh matching peer audit and a new PASS before any git add/commit/push, merge, release, publish, or deploy action.',
+    '- If implementation and validation are complete and the ONLY remaining action is finalization such as git add/commit/push, merge, release, publish, or deploy, return continue with that exact finalization-only nextAction; the daemon will hold it until peer-audit PASS instead of sending it now.',
+    '- If fixes, tests, typecheck, lint, build, validation, documentation changes, or any other non-finalization substantive work remains, return continue normally so that work happens before audit.',
+    '- Never combine substantive pre-audit work and post-audit finalization in one nextAction.',
+    '- If both the assistant response and your reason say implementation/validation are already complete, NEVER invent generic "remaining implementation or validation" work. Return only the concrete repository or delivery finalization nextAction (git add/commit/push, merge, release, publish, or deploy as applicable).',
     '- Do not ask the target session to arrange or resend the audit in a normal continue decision. The daemon emits a separate orchestration prompt containing the exact auditor session ID and reply-enabled send command, exactly once.',
   ].join('\n');
 }
@@ -394,5 +395,8 @@ export function buildReworkBriefPrompt(
     verdictText,
     '',
     'Apply the required fixes and continue the same task.',
+    'This REWORK verdict means the previous audit did not pass. It is not authorization to finalize the repository.',
+    'After fixing and validating the change, stop before repository finalization and report that the implementation is ready for a fresh peer audit.',
+    'Do not stage, commit, push, merge, release, publish, or deploy until a new matching peer audit returns PASS.',
   ].join('\n');
 }

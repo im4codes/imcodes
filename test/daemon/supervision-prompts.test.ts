@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
 import {
   buildPeerAuditBriefV1,
+  buildReworkBriefPrompt,
   buildSupervisionContinuePrompt,
   buildSupervisionDecisionPrompt,
   buildSupervisionDecisionRepairPrompt,
@@ -126,10 +127,14 @@ describe('supervision prompts', () => {
       assistantResponse: 'Implementation and tests are complete; changes are not committed.',
     });
 
-    expect(prompt).toContain('Peer audit MUST finish before repository commit/push finalization.');
+    expect(prompt).toContain('Peer audit MUST finish before repository or delivery finalization');
+    expect(prompt).toContain('A REWORK verdict means the previous audit did NOT pass');
+    expect(prompt).toContain('require a fresh matching peer audit and a new PASS before any git add/commit/push');
+    expect(prompt).toContain('merge, release, publish, or deploy');
     expect(prompt).toContain('the daemon will hold it until peer-audit PASS instead of sending it now');
-    expect(prompt).toContain('Never combine substantive pre-audit work and post-audit commit/push in one nextAction.');
+    expect(prompt).toContain('Never combine substantive pre-audit work and post-audit finalization in one nextAction.');
     expect(prompt).toContain('NEVER invent generic "remaining implementation or validation" work');
+    expect(prompt).toContain('Return only the concrete repository or delivery finalization nextAction (git add/commit/push, merge, release, publish, or deploy as applicable).');
     expect(prompt).toContain('exact auditor session ID and reply-enabled send command, exactly once');
     expect(prompt).toContain('"requiresAudit":true');
     expect(prompt).toContain('Set false for ordinary read-only checks, status queries, lookups, explanations, simple verification, and read-only review/audit.');
@@ -137,6 +142,20 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('already delegated a matching audit and is waiting for PASS/REWORK');
     expect(prompt).toContain('never recursively audit an audit-status turn');
     expect(prompt).toContain('A task that starts as a check but proceeds to modify/fix something requires audit unless its matching audit is already pending or passed.');
+  });
+
+  it('forbids repository finalization after REWORK until a fresh peer audit passes', () => {
+    const prompt = buildReworkBriefPrompt(
+      'deck_supervision_brain',
+      'Implement and deliver the fix',
+      'The first implementation is ready.',
+      'The auditor found a missing regression test.',
+    );
+
+    expect(prompt).toContain('This REWORK verdict means the previous audit did not pass.');
+    expect(prompt).toContain('stop before repository finalization');
+    expect(prompt).toContain('ready for a fresh peer audit');
+    expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a new matching peer audit returns PASS.');
   });
 
   it('does NOT include IM.codes workflow background in the continue prompt', () => {
