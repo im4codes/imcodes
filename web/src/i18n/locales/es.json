@@ -2600,7 +2600,9 @@
       "layerDiagnostics": "Diagnóstico de capas de habilidades",
       "enforced": "Obligatoria",
       "additive": "Aditiva"
-    }
+    },
+    "short_ref_failure_short": "identificadores de memoria sin guardar",
+    "short_ref_failure_detail": "Los identificadores de memoria dejaron de guardarse ({{stage}}, {{failures}} fallo(s), último {{when}}): {{error}}. Los emitidos ahora no se resolverán tras reiniciar el daemon."
   },
   "todos": {
     "title": "Tareas",

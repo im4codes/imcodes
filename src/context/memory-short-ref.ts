@@ -187,7 +187,9 @@ function isMemoryShortRefKind(value: unknown): value is MemoryShortRefKind {
 }
 
 /** Namespace identity fields; every one must be a string when present. */
-const NAMESPACE_IDENTITY_FIELDS = ['projectId', 'userId', 'workspaceId', 'enterpriseId'] as const;
+const NAMESPACE_IDENTITY_FIELDS = [
+  'projectId', 'userId', 'workspaceId', 'enterpriseId', 'localTenant', 'canonicalRepoId',
+] as const;
 
 /**
  * Decode a stored namespace, refusing anything it cannot fully validate.
@@ -325,6 +327,10 @@ function reportDiscardedShortRefRows(source: 'warm_load' | 'legacy_file' | 'json
   if (discarded <= 0) return;
   incrementCounter('mem.short_ref.discarded_row', { source });
   warnOncePerHour(`mem.short_ref.discarded_row.${source}`, { discarded });
+  // Discarded rows are handle loss too: those memories stop being reachable by
+  // handle after a restart. Route them to the same off-box signal as write and
+  // load failures instead of leaving them in machine-local counters.
+  recordShortRefFailure(`discarded_${source}`, `${discarded} unusable row(s) discarded`);
 }
 
 function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_load' | 'load_file', error: unknown, extra: Record<string, unknown> = {}): void {
@@ -335,6 +341,10 @@ function reportShortRefFailure(stage: 'persist_store' | 'persist_file' | 'warm_l
   // and the warning lands in the daemon log, on the same disk whose exhaustion
   // is usually what failed — with write errors swallowed. Hold the failure in
   // memory so the heartbeat can carry it off the box over the socket instead.
+  recordShortRefFailure(stage, message);
+}
+
+function recordShortRefFailure(stage: string, message: string): void {
   shortRefHealth = {
     stage,
     failures: (shortRefHealth?.failures ?? 0) + 1,

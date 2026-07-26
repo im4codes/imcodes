@@ -25,6 +25,7 @@ import { SharedStateIndicator } from './SharedStateIndicator.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import type { DiskUsage } from '@shared/disk-usage.js';
+import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
 import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
@@ -50,6 +51,7 @@ interface DaemonStats {
   uptime: number;
   embedding?: EmbeddingStatus | null;
   disks?: DiskUsage[] | null;
+  shortRefHealth?: MemoryShortRefHealth | null;
 }
 
 type DiscussionSummary = P2pProgressDiscussion & {
@@ -205,6 +207,26 @@ function diskUsageColor(usedPercent: number): string | undefined {
  * "+N" hint) and every partition is listed in the hover tooltip. Mobile clients
  * receive no disk data, so this renders nothing there.
  */
+/**
+ * Memory handles stopped persisting. The daemon can only report this over the
+ * socket — its counter is process-local and its log shares the disk that is
+ * usually what failed — so this marker is the one place an operator sees it.
+ */
+function renderShortRefAlert(health: MemoryShortRefHealth | null | undefined, t: (k: string, v?: Record<string, unknown>) => string): JSX.Element | null {
+  if (!health) return null;
+  const when = new Date(health.lastFailureAt).toLocaleString();
+  return (
+    <span
+      class="daemon-stat-shortref-alert"
+      style={{ color: '#f87171' }}
+      title={t('memory.short_ref_failure_detail', { stage: health.stage, failures: health.failures, when, error: health.lastError })}
+    >
+      <span style={{ fontSize: '0.65em', verticalAlign: 'middle' }}>⚠️</span>
+      {t('memory.short_ref_failure_short')}
+    </span>
+  );
+}
+
 function renderDiskStats(disks: DiskUsage[] | null | undefined): JSX.Element | null {
   if (!disks || disks.length === 0) return null;
   const tooltip = disks
@@ -855,6 +877,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           // Older daemons don't ship `disks`; null means "no data" so the
           // desktop strip simply hides the readout (and mobile never shows it).
           disks: msg.disks ?? null,
+          shortRefHealth: msg.shortRefHealth ?? null,
         });
       }
     });
@@ -960,6 +983,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     {renderDiskStats(stats.disks)}
                   </>
                 )}
+                {stats.shortRefHealth && (
+                  <>
+                    <span class="daemon-stat-sep"> · </span>
+                    {renderShortRefAlert(stats.shortRefHealth, t)}
+                  </>
+                )}
                 <span class="daemon-stat-sep"> · </span>
                 <EmbeddingStatusIcon status={stats.embedding} />
                 <span class="daemon-stat-sep"> · </span>
@@ -998,6 +1027,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
                 <>{renderDiskStats(stats.disks)}{' '}</>
               )}
+              {stats.shortRefHealth && (<>{renderShortRefAlert(stats.shortRefHealth, t)}{' '}</>)}
               <EmbeddingStatusIcon status={stats.embedding} compact />
               {desktopLayoutCapable && (
                 <>

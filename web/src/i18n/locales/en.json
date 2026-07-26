@@ -2600,7 +2600,9 @@
       "layerDiagnostics": "Skill layer diagnostics",
       "enforced": "Enforced",
       "additive": "Additive"
-    }
+    },
+    "short_ref_failure_short": "memory handles not saved",
+    "short_ref_failure_detail": "Memory handles stopped being saved ({{stage}}, {{failures}} failure(s), last {{when}}): {{error}}. Handles issued now will not resolve after a daemon restart."
   },
   "todos": {
     "title": "Tasks",

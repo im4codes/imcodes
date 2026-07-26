@@ -94,4 +94,15 @@ describe('memory short refs — persistence failure leaves the process', () => {
     await loadMemoryShortRefsFromStore();
     expect(getMemoryShortRefHealth()).toMatchObject({ stage: 'warm_load' });
   });
+  it('reports discarded rows too, since those handles are lost the same way', async () => {
+    // A row dropped as unusable means that memory is no longer reachable by
+    // handle after a restart — the same loss as a failed write, so it belongs on
+    // the same off-box signal rather than only in machine-local counters.
+    runMock.mockImplementation(async (op: string) => (op === 'listMemoryShortRefs'
+      ? [{ ref: 'proj:aaaaaaaaaaaaa', kind: 'projection', id: 'x', namespaceKey: '', namespaceJson: '{bad', lastSeenAt: 1 }]
+      : 1));
+
+    await loadMemoryShortRefsFromStore();
+    expect(getMemoryShortRefHealth()).toMatchObject({ stage: 'discarded_warm_load' });
+  });
 });

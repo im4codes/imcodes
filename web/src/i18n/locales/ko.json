@@ -2599,7 +2599,9 @@
       "layerDiagnostics": "스킬 계층 진단",
       "enforced": "강제",
       "additive": "추가"
-    }
+    },
+    "short_ref_failure_short": "메모리 핸들 저장 실패",
+    "short_ref_failure_detail": "메모리 핸들 저장이 중단되었습니다({{stage}}, {{failures}}회, 최근 {{when}}): {{error}}. 지금 발급된 핸들은 daemon 재시작 후 해석되지 않습니다."
   },
   "todos": {
     "title": "작업",

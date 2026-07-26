@@ -2599,7 +2599,9 @@
       "layerDiagnostics": "スキルレイヤー診断",
       "enforced": "強制",
       "additive": "追加"
-    }
+    },
+    "short_ref_failure_short": "メモリハンドル未保存",
+    "short_ref_failure_detail": "メモリハンドルの保存が停止しました({{stage}}、{{failures}} 件、最終 {{when}}):{{error}}。現在発行されたハンドルは daemon 再起動後に解決できません。"
   },
   "todos": {
     "title": "タスク",

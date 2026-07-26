@@ -2600,7 +2600,9 @@
       "layerDiagnostics": "技能層級診斷",
       "enforced": "強制",
       "additive": "附加"
-    }
+    },
+    "short_ref_failure_short": "記憶句柄未儲存",
+    "short_ref_failure_detail": "記憶句柄已停止儲存({{stage}},{{failures}} 次失敗,最近 {{when}}):{{error}}。現在簽發的句柄在 daemon 重啟後將無法解析。"
   },
   "todos": {
     "title": "任務清單",
