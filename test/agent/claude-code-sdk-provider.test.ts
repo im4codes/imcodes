@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const childProcessMock = vi.hoisted(() => ({
   // Accept both (file, args, cb) and (file, args, opts, cb) signatures.
@@ -109,6 +112,13 @@ import {
 } from '../../shared/sdk-subagent-status.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+};
 const sdkSubagentTools = (tools: ToolCallEvent[]) => tools.filter((tool) => tool.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
 
 describe('ClaudeCodeSdkProvider', () => {
@@ -121,6 +131,11 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setInterruptNeverResolves(false);
     sdkMock.setNextContextUsage(null);
     childProcessMock.spawn.mockClear();
+  });
+
+  afterEach(() => {
+    delete process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS;
+    delete process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS;
   });
 
   const collectToolsForMessages = async (
@@ -885,6 +900,176 @@ describe('ClaudeCodeSdkProvider', () => {
     }
     expect(deltas).toHaveLength(1);
     expect(errors).toHaveLength(1);
+  });
+
+  it('waits for refreshed Claude credentials and retries one transient auth 403 without exposing it', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-refresh-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '500';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'system', subtype: 'init', session_id: 'session-auth-refresh', model: 'claude-sonnet-4-6' },
+        { type: 'assistant', session_id: 'session-auth-refresh', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-refresh', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+      [
+        { type: 'result', session_id: 'session-auth-refresh', subtype: 'success', is_error: false, result: 'Recovered answer', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-refresh',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const completed: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onComplete((_sid, message) => completed.push(message.content));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-refresh', 'hello');
+      const refreshedAt = new Date(Date.now() + 5_000);
+      await utimes(credentialsPath, refreshedAt, refreshedAt);
+      await waitFor(() => completed.length === 1);
+
+      expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['hello', 'hello']);
+      expect(deltas).toEqual([]);
+      expect(completed).toEqual(['Recovered answer']);
+      expect(errors).toEqual([]);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('reports the transient auth 403 when Claude credentials do not refresh in time', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-timeout-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '25';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessages([
+      { type: 'assistant', session_id: 'session-auth-timeout', message: { content: [{ type: 'text', text: authError }] } },
+      { type: 'result', session_id: 'session-auth-timeout', subtype: 'error', is_error: true, errors: [authError] },
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-timeout',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-timeout', 'hello');
+      await waitFor(() => errors.length === 1);
+
+      expect(sdkMock.runs).toHaveLength(1);
+      expect(deltas).toEqual([]);
+      expect(errors[0]).toContain(authError);
+      expect(errors[0]).toContain('run `/logout`');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not retry a second transient auth 403 after credentials refresh', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-bounded-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '500';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'assistant', session_id: 'session-auth-bounded', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-bounded', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+      [
+        { type: 'assistant', session_id: 'session-auth-bounded', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-bounded', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-bounded',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-bounded', 'hello');
+      const refreshedAt = new Date(Date.now() + 5_000);
+      await utimes(credentialsPath, refreshedAt, refreshedAt);
+      await waitFor(() => errors.length === 1);
+
+      expect(sdkMock.runs).toHaveLength(2);
+      expect(deltas).toEqual([]);
+      expect(errors[0]).toContain(authError);
+      expect(errors[0]).toContain('run `/logout`');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels a pending credential-refresh wait without starting another Claude process', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-cancel-'));
+    const credentialsPath = join(tempHome, '.claude', '.credentials.json');
+    await mkdir(join(tempHome, '.claude'), { recursive: true });
+    await writeFile(credentialsPath, '{"version":1}\n');
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '500';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessages([
+      { type: 'assistant', session_id: 'session-auth-cancel', message: { content: [{ type: 'text', text: authError }] } },
+      { type: 'result', session_id: 'session-auth-cancel', subtype: 'error', is_error: true, errors: [authError] },
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-cancel',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const errors: string[] = [];
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-cancel', 'hello');
+      await waitFor(() => provider.getSessionDiagnostics('route-auth-cancel')?.authRefreshRetryPending === true);
+      await provider.cancel('route-auth-cancel');
+      const refreshedAt = new Date(Date.now() + 5_000);
+      await utimes(credentialsPath, refreshedAt, refreshedAt);
+      await waitFor(() => errors.length === 1);
+
+      expect(sdkMock.runs).toHaveLength(1);
+      expect(errors).toEqual(['Claude turn cancelled']);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
   });
 
   it('stops after two auto-continues and emits a recoverable terminal error', async () => {
