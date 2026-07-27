@@ -145,7 +145,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     () => ccPresets.find((preset) => preset.name === ccPreset),
     [ccPreset, ccPresets],
   );
-  const qwenPresetModels = useMemo(
+  const selectedPresetModels = useMemo(
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
@@ -244,26 +244,26 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
   useEffect(() => {
-    if (type !== 'qwen') return;
+    if ((type !== 'qwen' && type !== 'claude-code-sdk') || !selectedCcPreset) return;
     const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? '') : '';
     setRequestedModel((current) => {
-      if (qwenPresetModels.length === 0) {
+      if (selectedPresetModels.length === 0) {
         return current || fallbackModel;
       }
       if (
         fallbackModel
         && current === selectedCcPreset?.env.ANTHROPIC_MODEL
         && current !== fallbackModel
-        && qwenPresetModels.includes(fallbackModel)
+        && selectedPresetModels.includes(fallbackModel)
       ) {
         return fallbackModel;
       }
-      if (!current || !qwenPresetModels.includes(current)) {
-        return qwenPresetModels.includes(fallbackModel) ? fallbackModel : qwenPresetModels[0];
+      if (!current || !selectedPresetModels.includes(current)) {
+        return selectedPresetModels.includes(fallbackModel) ? fallbackModel : selectedPresetModels[0];
       }
       return current;
     });
-  }, [type, qwenPresetModels, selectedCcPreset]);
+  }, [type, selectedPresetModels, selectedCcPreset]);
 
   const handleStart = () => {
     const desc = description.trim() || undefined;
@@ -296,7 +296,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk' || type === 'qwen')) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -319,11 +319,18 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       ? t('new_session.compatible_api_via_qwen')
       : t('new_session.api_provider');
   const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
-  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
-  const supportsModelSelection = type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    type === 'claude-code-sdk' ? ccPreset : undefined,
+  );
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
-    type === 'qwen' && selectedCcPreset
-      ? qwenPresetModels
+    (type === 'qwen' || type === 'claude-code-sdk') && selectedCcPreset
+      ? mergeModelSuggestions(
+          selectedPresetModels,
+          transportModels.models.map((model) => model.id),
+        )
     : transportModels.models.length > 0
       ? (type === 'gemini-sdk'
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
@@ -337,11 +344,24 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         : type === 'cursor-headless'
           ? [...CURSOR_HEADLESS_MODEL_SUGGESTIONS]
         : type === 'qwen'
-            ? qwenPresetModels
+            ? selectedPresetModels
             : type === 'gemini-sdk'
               ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
               : []
-  ), [transportModels.models, type, qwenPresetModels, selectedCcPreset]);
+  ), [transportModels.models, type, selectedPresetModels, selectedCcPreset]);
+
+  useEffect(() => {
+    if (
+      (type !== 'qwen' && type !== 'claude-code-sdk')
+      || !selectedCcPreset
+      || modelSuggestions.length === 0
+    ) return;
+    const fallbackModel = getCcPresetEffectiveModel(selectedCcPreset) ?? '';
+    setRequestedModel((current) => {
+      if (current && modelSuggestions.includes(current)) return current;
+      return modelSuggestions.includes(fallbackModel) ? fallbackModel : modelSuggestions[0];
+    });
+  }, [modelSuggestions, selectedCcPreset, type]);
 
   useEffect(() => {
     if (type !== 'codex-sdk') return;
@@ -724,7 +744,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              {type === 'qwen' && modelSuggestions.length > 0 ? (
+              {(type === 'qwen' || type === 'claude-code-sdk') && modelSuggestions.length > 0 ? (
                 <select
                   class="input"
                   value={requestedModel}

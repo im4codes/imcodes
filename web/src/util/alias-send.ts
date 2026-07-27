@@ -17,7 +17,7 @@
  *    already concatenated with quotes / attachment refs / system prefixes
  *    (audit finding Cx1-3). Those segments must be appended AFTER resolution.
  *
- * Agent-originated / generated sends (e.g. memory-summary sync, auto-retry of an
+ * Agent-originated / generated sends (e.g. auto-retry of an
  * already-composed message) intentionally do NOT call this — see the opt-out
  * comments at those call sites.
  */

@@ -26,11 +26,11 @@ import { extractLatestUsage } from '../usage-data.js';
 import { getLatestTransportActivityDetail } from '../transport-activity-status.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
-import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 
@@ -164,10 +164,17 @@ export function SessionPane({
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
-  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
   const [composerText, setComposerText] = useState('');
-  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
   const executionRouting = useExecutionRouting(serverId ?? null);
+  const {
+    state: executionCloneLaunchState,
+    launch: launchExecutionClones,
+  } = useExecutionCloneLaunch({
+    ws,
+    connected,
+    sessionName,
+    ownerSessionName: sessionName,
+  });
 
   // ── Timeline ────────────────────────────────────────────────────────────────
   const {
@@ -371,56 +378,12 @@ export function SessionPane({
   const handleRunExecutionClones = useCallback(() => {
     const text = (inputRef.current?.textContent ?? composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
-    const commandId = globalThis.crypto?.randomUUID?.()
-      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setExecutionClonesBusy(true);
-    try {
-      ws.sendExecutionClones({
-        sessionName,
-        text,
-        commandId,
-        dedicatedExecutionRouting: {
-          enabled: true,
-          templateSessionName: executionRouting.templateSessionName,
-          maxParallelClones: executionRouting.limits.maxParallelClones,
-          maxQueuedClones: executionRouting.limits.maxQueuedClones,
-          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
-          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
-        },
-      });
-    } finally {
-      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
-    }
-  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sessionName, ws]);
-
-  const handleSyncMemorySummaries = useCallback(async () => {
-    if (!ws || !connected || syncingMemorySummaries) return;
-    setSyncingMemorySummaries(true);
-    try {
-      const text = await buildMemorySummarySyncMessage(
-        t,
-        session.contextNamespace?.projectId ?? null,
-        undefined,
-        { sources: [localPersonalMemorySummarySource(ws)] },
-      );
-      if (!text) return;
-      const commandId = globalThis.crypto?.randomUUID?.()
-        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      // Alias A′ opt-out (Cx1-2): this is a generated memory-summary sync, not a
-      // human-composed message, so it deliberately carries no resolvedAliases.
-      ws.sendSessionCommand('send', { sessionName, text, commandId });
-      requestActiveTimelineRefreshAfterUserAction();
-      if (hasChatTimeline) {
-        addOptimisticUserMessage(text, commandId);
-        scrollToBottom();
-      }
-    } catch {
-      // Keep the footer button non-intrusive; a failed sync should not block
-      // normal chat controls or surface stale memory as if it were sent.
-    } finally {
-      setSyncingMemorySummaries(false);
-    }
-  }, [addOptimisticUserMessage, connected, hasChatTimeline, scrollToBottom, session.contextNamespace?.projectId, sessionName, syncingMemorySummaries, t, ws]);
+    launchExecutionClones({
+      text,
+      templateSessionName: executionRouting.templateSessionName,
+      ...executionRouting.limits,
+    });
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
@@ -506,13 +469,10 @@ export function SessionPane({
           transportActivityDetail={transportActivityDetail}
           sessionError={session.error}
           now={thinkingNow}
-          onSyncMemorySummaries={handleSyncMemorySummaries}
-          syncMemorySummariesBusy={syncingMemorySummaries}
-          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
           onRunExecutionClones={handleRunExecutionClones}
-          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesBusy={executionCloneLaunchState.phase === 'pending'}
           runExecutionClonesDisabled={
-            executionClonesBusy
+            executionCloneLaunchState.phase === 'pending'
             || !connected
             || !ws
             || !hasValidExecutionTemplate
@@ -520,6 +480,7 @@ export function SessionPane({
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
+          runExecutionClonesFeedback={executionCloneLaunchState}
         />
       )}
 

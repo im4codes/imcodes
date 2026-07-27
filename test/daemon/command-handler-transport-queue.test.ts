@@ -78,6 +78,7 @@ const {
   shouldUseHistoryWorkerMock,
   getProviderMock,
   ensureProviderConnectedMock,
+  getPresetModelCatalogMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -128,6 +129,7 @@ const {
   shouldUseHistoryWorkerMock: vi.fn(() => false),
   getProviderMock: vi.fn(),
   ensureProviderConnectedMock: vi.fn(),
+  getPresetModelCatalogMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -253,6 +255,11 @@ vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
 vi.mock('../../src/agent/provider-registry.js', () => ({
   getProvider: getProviderMock,
   ensureProviderConnected: ensureProviderConnectedMock,
+}));
+
+vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/daemon/cc-presets.js')>(),
+  getPresetModelCatalog: getPresetModelCatalogMock,
 }));
 
 vi.mock('../../src/context/memory-search.js', () => ({
@@ -494,6 +501,7 @@ describe('handleWebCommand transport queue behavior', () => {
     shouldUseHistoryWorkerMock.mockReturnValue(false);
     getProviderMock.mockReset();
     ensureProviderConnectedMock.mockReset();
+    getPresetModelCatalogMock.mockReset();
     __resetTransportListModelsCacheForTests();
     clearAllTransportQueueRevisions();
     resetTransportQueueStoreForTests();
@@ -2567,6 +2575,38 @@ describe('handleWebCommand transport queue behavior', () => {
       requestId: 'passive-models',
       models: expect.arrayContaining([expect.objectContaining({ id: 'gpt-5.5' })]),
     }));
+  });
+
+  it('serves a CC preset model catalog without starting a provider runtime', async () => {
+    getPresetModelCatalogMock.mockResolvedValue({
+      preset: { name: 'MiniMax', env: {} },
+      models: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }],
+      defaultModel: 'MiniMax-M3',
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_MSG.LIST_MODELS,
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+      requestId: 'minimax-models',
+      force: true,
+    }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'minimax-models'
+    )));
+
+    expect(getPresetModelCatalogMock).toHaveBeenCalledWith('MiniMax', true);
+    expect(getProviderMock).not.toHaveBeenCalled();
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: TRANSPORT_MSG.MODELS_RESPONSE,
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+      requestId: 'minimax-models',
+      models: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }],
+      defaultModel: 'MiniMax-M3',
+      isAuthenticated: true,
+    });
   });
 
   it('allows forced transport.list_models to connect a missing local provider', async () => {

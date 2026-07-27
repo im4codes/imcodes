@@ -55,6 +55,7 @@ import type {
 } from '@shared/memory-management.js';
 import type { MemoryProjectResolveResponsePayload } from '@shared/memory-project-options.js';
 import {
+  MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
   MSG_DAEMON_ONLINE,
   MSG_DAEMON_OFFLINE,
@@ -183,7 +184,7 @@ export type ServerMessage =
   | TimelineHistoryResponseMessage
   | TimelinePageResponseMessage
   | TimelineDetailResponseMessage
-  | { type: 'command.ack'; commandId: string; status: string; session: string }
+  | { type: typeof MSG_COMMAND_ACK; commandId: string; status: string; session: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }
@@ -573,7 +574,7 @@ export class WsClient {
   private shouldStaggerNonCriticalMessage(msg: object): boolean {
     if (this.postConnectNonCriticalUntil <= Date.now()) return false;
     const type = (msg as { type?: unknown }).type;
-    if (type === 'transport.list_models') {
+    if (type === TRANSPORT_MSG.LIST_MODELS) {
       return (msg as { force?: unknown }).force !== true;
     }
     return type === 'fs.ls' || type === 'fs.git_status';
@@ -960,12 +961,14 @@ export class WsClient {
     this.send({ type: command === 'cancel' ? DAEMON_COMMAND_TYPES.SESSION_CANCEL : `session.${command}`, ...payload });
   }
 
-  sendExecutionClones(payload: object = {}): void {
+  sendExecutionClones(payload: object = {}): boolean {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
     const sessionName = (payload as { sessionName?: unknown }).sessionName;
     if (typeof sessionName === 'string' && sessionName.trim()) {
       this.setP2pWorkflowRequestScope({ sessionName });
     }
     this.send({ type: DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES, ...payload });
+    return true;
   }
 
   /**

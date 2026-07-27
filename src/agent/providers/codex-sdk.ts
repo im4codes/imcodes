@@ -123,6 +123,9 @@ const CODEX_TURN_HEARTBEAT_FAILURE_THRESHOLD = 3;
 const CODEX_TURN_HEARTBEAT_START_GRACE_MS = 15_000;
 const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
 const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
+const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
+const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
 const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
 const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
@@ -482,6 +485,13 @@ function isCodexAuthFailureMessage(message: string): boolean {
     || /authentication required/i.test(message);
 }
 
+function appendCodexAuthRecoveryGuidance(message: string, guidance: string): string {
+  const trimmed = message.trim();
+  if (!trimmed) return guidance;
+  if (trimmed.includes(guidance)) return trimmed;
+  return `${trimmed}\n${guidance}`;
+}
+
 function getCodexAuthPath(env: Record<string, string | undefined>): string {
   return resolve(getCodexHome(env), 'auth.json');
 }
@@ -768,6 +778,11 @@ interface CodexSdkSessionState {
   loaded: boolean;
   runningTurnId?: string;
   runtimeActivityGeneration?: ActivityGeneration;
+  turnDispatchGeneration: number;
+  currentTurnPayload?: ProviderContextPayload;
+  authRecoveryPending: boolean;
+  authRecoveryRetriesRemaining: number;
+  authRecoveryReplayUnsafe: boolean;
   activeTurnLease?: CodexActiveTurnLease;
   turnStartInFlight: boolean;
   runningCompact: boolean;
@@ -2325,7 +2340,7 @@ export class CodexSdkProvider implements TransportProvider {
     for (const toolId of state.openProviderToolCalls.keys()) activeToolIds.add(toolId);
     const activeToolCount = activeToolIds.size;
     const compactionActive = state.runningCompact || activeCompactionItemIds.size > 0;
-    const providerTurnActive = Boolean(state.runningTurnId || state.turnStartInFlight);
+    const providerTurnActive = Boolean(state.runningTurnId || state.turnStartInFlight || state.authRecoveryPending);
     const busyReasons: SessionActivityBusyReason[] = [];
     const providerTurnOnlyCount = providerTurnActive && activeToolCount === 0 && !compactionActive ? 1 : 0;
     if (providerTurnOnlyCount > 0) busyReasons.push('provider_wait');
@@ -2338,9 +2353,10 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
-  private getActiveWorkSessionIds(): string[] {
+  private getActiveWorkSessionIds(excludeSessionId?: string): string[] {
     const active: string[] = [];
     for (const [sessionId, state] of this.sessions) {
+      if (sessionId === excludeSessionId) continue;
       const work = this.getCurrentTurnWorkState(state);
       if (work.activeWorkCount > 0 || Boolean(state.cancelTimer)) active.push(sessionId);
     }
@@ -2353,7 +2369,9 @@ export class CodexSdkProvider implements TransportProvider {
     const activeItemIds = state.activeItemIds ?? new Set<string>();
     const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
     const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
-    const activeReason = state.runningCompact
+    const activeReason = state.authRecoveryPending
+      ? 'auth-recovery'
+      : state.runningCompact
       ? 'compact'
       : state.runningTurnId
         ? 'turn'
@@ -2431,6 +2449,11 @@ export class CodexSdkProvider implements TransportProvider {
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
+      turnDispatchGeneration: 0,
+      currentTurnPayload: undefined,
+      authRecoveryPending: false,
+      authRecoveryRetriesRemaining: 0,
+      authRecoveryReplayUnsafe: false,
       activeTurnLease: undefined,
       turnStartInFlight: false,
       runningCompact: false,
@@ -2569,7 +2592,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
-    if (state.runningTurnId || state.runningCompact || state.turnStartInFlight) {
+    if (state.runningTurnId || state.runningCompact || state.turnStartInFlight || state.authRecoveryPending) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
     await this.refreshAppServerForLatestAuth('send');
@@ -2599,7 +2622,18 @@ export class CodexSdkProvider implements TransportProvider {
       await this.startCompact(sessionId, state);
       return;
     }
-    await this.startTurn(sessionId, state, payload);
+    const turnDispatchGeneration = ++state.turnDispatchGeneration;
+    state.currentTurnPayload = payload;
+    state.authRecoveryPending = false;
+    state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
+    state.authRecoveryReplayUnsafe = false;
+    await this.startTurn(
+      sessionId,
+      state,
+      payload,
+      turnDispatchGeneration,
+      CODEX_AUTH_RECOVERY_RETRY_LIMIT,
+    );
   }
 
   private clearActiveItemEvidence(state: CodexSdkSessionState): void {
@@ -2659,6 +2693,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
     this.clearActiveItemEvidence(state);
     this.clearPendingSessionSystemTextUpdate(state);
+    this.clearCodexAuthRecoveryState(state);
     this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     return true;
   }
@@ -2705,6 +2740,7 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearRawChecklistPollTimer(state);
       this.clearChildSubagentRolloutPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
+      this.clearCodexAuthRecoveryState(state);
       this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
     }, CANCEL_INTERRUPT_TIMEOUT_MS);
     state.cancelTimer.unref?.();
@@ -2731,9 +2767,10 @@ export class CodexSdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.currentText = '';
     this.clearActiveItemEvidence(state);
-    state.cancelled = false;
+    if (!state.authRecoveryPending) state.cancelled = false;
     state.lastStatusSignature = null;
     this.clearPendingSessionSystemTextUpdate(state);
+    if (!state.authRecoveryPending) this.clearCodexAuthRecoveryState(state);
   }
 
   private settleSessionAfterAppServerDisconnect(
@@ -2882,11 +2919,11 @@ export class CodexSdkProvider implements TransportProvider {
     await this.restartAppServerPreservingSessions(reason);
   }
 
-  private async restartAppServerPreservingSessions(_reason: string): Promise<void> {
+  private async restartAppServerPreservingSessions(_reason: string, recoverySessionId?: string): Promise<void> {
     if (this.appServerRestart) return this.appServerRestart;
     const config = this.config;
     if (!config) return;
-    const activeSessionIds = this.getActiveWorkSessionIds();
+    const activeSessionIds = this.getActiveWorkSessionIds(recoverySessionId);
     if (activeSessionIds.length > 0) {
       logger.warn({
         provider: this.id,
@@ -2914,17 +2951,138 @@ export class CodexSdkProvider implements TransportProvider {
     return this.appServerRestart;
   }
 
-  private async restartAppServerAfterAuthFailure(reason: string, error: ProviderError): Promise<void> {
+  private async restartAppServerAfterAuthFailure(
+    reason: string,
+    error: ProviderError,
+    recoverySessionId?: string,
+  ): Promise<void> {
     logger.warn({
       provider: this.id,
       reason,
       code: error.code,
       message: error.message,
     }, 'Codex app-server authentication failed; restarting to load latest authentication');
-    await this.restartAppServerPreservingSessions(reason);
+    await this.restartAppServerPreservingSessions(reason, recoverySessionId);
   }
 
-  private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
+  private clearCodexAuthRecoveryState(state: CodexSdkSessionState): void {
+    state.currentTurnPayload = undefined;
+    state.authRecoveryPending = false;
+    state.authRecoveryRetriesRemaining = 0;
+    state.authRecoveryReplayUnsafe = false;
+  }
+
+  private isCodexAuthReplaySafe(state: CodexSdkSessionState): boolean {
+    return !state.authRecoveryReplayUnsafe
+      && state.currentText.trim().length === 0
+      && state.openProviderToolCalls.size === 0
+      && state.activeToolItemIds.size === 0
+      && state.activeCompactionItemIds.size === 0;
+  }
+
+  private isCodexFailedTurnAuthReplaySafe(
+    state: CodexSdkSessionState,
+    turn: Record<string, any>,
+  ): boolean {
+    if (!this.isCodexAuthReplaySafe(state)) return false;
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    return items.every((item) => {
+      if (!isRecord(item)) return false;
+      if (item.type === 'reasoning') return true;
+      return item.type === 'agentMessage' && !meaningfulString(item.text);
+    });
+  }
+
+  private emitCodexAuthRecoveryError(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    error: ProviderError,
+    guidance: string,
+  ): void {
+    this.clearCodexAuthRecoveryState(state);
+    this.clearStatus(sessionId, state);
+    this.emitError(sessionId, {
+      ...error,
+      message: appendCodexAuthRecoveryGuidance(error.message, guidance),
+    });
+  }
+
+  private async recoverCodexAuthAndReplay(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    payload: ProviderContextPayload,
+    turnDispatchGeneration: number,
+    authRecoveryRetriesRemaining: number,
+    error: ProviderError,
+    reason: string,
+  ): Promise<void> {
+    state.authRecoveryPending = true;
+    state.authRecoveryRetriesRemaining = authRecoveryRetriesRemaining;
+    this.emitStatus(sessionId, state, {
+      status: 'thinking',
+      label: 'Refreshing Codex authentication...',
+    });
+    try {
+      await this.restartAppServerAfterAuthFailure(reason, error, sessionId);
+    } catch (restartErr) {
+      if (
+        this.sessions.get(sessionId) !== state
+        || state.turnDispatchGeneration !== turnDispatchGeneration
+        || !state.authRecoveryPending
+      ) {
+        return;
+      }
+      this.emitCodexAuthRecoveryError(sessionId, state, {
+        ...error,
+        message: `${error.message}\nAutomatic Codex authentication recovery could not restart the app-server: ${errorMessage(restartErr)}`,
+      }, CODEX_AUTH_RECOVERY_GUIDANCE);
+      return;
+    }
+
+    if (
+      this.sessions.get(sessionId) !== state
+      || state.turnDispatchGeneration !== turnDispatchGeneration
+      || !state.authRecoveryPending
+    ) {
+      return;
+    }
+    if (state.cancelled) {
+      this.clearCodexAuthRecoveryState(state);
+      this.clearStatus(sessionId, state);
+      this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+      return;
+    }
+
+    state.authRecoveryPending = false;
+    state.authRecoveryRetriesRemaining = authRecoveryRetriesRemaining - 1;
+    state.authRecoveryReplayUnsafe = false;
+    state.currentText = '';
+    state.currentMessageId = null;
+    logger.warn(
+      {
+        provider: this.id,
+        sessionId,
+        threadId: state.threadId,
+        retriesRemaining: state.authRecoveryRetriesRemaining,
+      },
+      'Codex authentication recovered; replaying the original turn once',
+    );
+    await this.startTurn(
+      sessionId,
+      state,
+      payload,
+      turnDispatchGeneration,
+      authRecoveryRetriesRemaining - 1,
+    );
+  }
+
+  private async startTurn(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    payload: ProviderContextPayload,
+    turnDispatchGeneration: number,
+    authRecoveryRetriesRemaining: number,
+  ): Promise<void> {
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       const shouldInjectStableUpdate = !!(
@@ -2984,6 +3142,7 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
+      const authReplaySafe = this.isCodexAuthReplaySafe(state);
       this.rememberTerminatedTurn(state, state.runningTurnId);
       this.clearActiveTurnLease(state);
       state.runningTurnId = undefined;
@@ -2993,11 +3152,51 @@ export class CodexSdkProvider implements TransportProvider {
       this.clearRawChecklistPollTimer(state);
       this.clearPendingSessionSystemTextUpdate(state);
       const error = this.normalizeError(err);
-      if (this.isCodexAuthError(error)) {
-        await this.restartAppServerAfterAuthFailure('start-turn', error).catch((restartErr) => {
-          logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
-        });
+      if (state.cancelled) {
+        this.clearCodexAuthRecoveryState(state);
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
       }
+      if (this.isCodexAuthError(error)) {
+        if (
+          authRecoveryRetriesRemaining > 0
+          && authReplaySafe
+          && !state.cancelled
+          && this.sessions.get(sessionId) === state
+          && state.turnDispatchGeneration === turnDispatchGeneration
+        ) {
+          await this.recoverCodexAuthAndReplay(
+            sessionId,
+            state,
+            payload,
+            turnDispatchGeneration,
+            authRecoveryRetriesRemaining,
+            error,
+            'start-turn',
+          );
+          return;
+        }
+        if (!authReplaySafe && authRecoveryRetriesRemaining > 0) {
+          void this.restartAppServerAfterAuthFailure('start-turn-unsafe-replay', error, sessionId).catch((restartErr) => {
+            logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+          });
+          this.emitCodexAuthRecoveryError(
+            sessionId,
+            state,
+            error,
+            CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE,
+          );
+          return;
+        }
+        this.emitCodexAuthRecoveryError(
+          sessionId,
+          state,
+          error,
+          CODEX_AUTH_RECOVERY_GUIDANCE,
+        );
+        return;
+      }
+      this.clearCodexAuthRecoveryState(state);
       this.emitError(sessionId, error);
     }
   }
@@ -3283,6 +3482,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearStatus(sessionId, state);
     const tool = runtimeSubagentToolFromPayload(sessionId, params);
     if (!tool) return;
+    state.authRecoveryReplayUnsafe = true;
     const detail = tool.detail as SdkSubagentDetail | undefined;
     const canonicalKey = detail?.meta?.canonicalKey;
     if (canonicalKey) {
@@ -3718,6 +3918,14 @@ export class CodexSdkProvider implements TransportProvider {
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
     if (state.cancelled) return true;
+    if (
+      item.type === 'custom_tool_call'
+      || item.type === 'custom_tool_call_output'
+      || item.type === 'function_call'
+      || item.type === 'function_call_output'
+    ) {
+      state.authRecoveryReplayUnsafe = true;
+    }
     if (item.type === 'custom_tool_call') {
       const tool = customToolFromItem(sessionId, item, 'started');
       if (!tool) return false;
@@ -4092,7 +4300,9 @@ export class CodexSdkProvider implements TransportProvider {
         state.currentText = '';
       }
       state.currentMessageId = params.itemId;
-      state.currentText += String(params.delta ?? '');
+      const textDelta = String(params.delta ?? '');
+      state.currentText += textDelta;
+      if (textDelta) state.authRecoveryReplayUnsafe = true;
       const delta: MessageDelta = {
         messageId: params.itemId,
         type: 'text',
@@ -4183,6 +4393,7 @@ export class CodexSdkProvider implements TransportProvider {
         if (method === 'item/completed' && typeof item.text === 'string') {
           const prior = state.currentText;
           state.currentText = item.text;
+          if (item.text) state.authRecoveryReplayUnsafe = true;
           if (!prior && item.text) {
             const delta: MessageDelta = {
               messageId: item.id,
@@ -4241,6 +4452,10 @@ export class CodexSdkProvider implements TransportProvider {
       }
 
       if (status === 'failed') {
+        const authReplaySafe = this.isCodexFailedTurnAuthReplaySafe(state, turn);
+        const authRecoveryPayload = state.currentTurnPayload;
+        const authRecoveryRetriesRemaining = state.authRecoveryRetriesRemaining;
+        const turnDispatchGeneration = state.turnDispatchGeneration;
         this.rememberTerminatedActiveTurn(state, turnId);
         this.clearActiveTurnLease(state);
         this.clearCancelTimer(state);
@@ -4257,10 +4472,44 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
         if (this.isCodexAuthError(error)) {
-          void this.restartAppServerAfterAuthFailure('turn-failed', error).catch((restartErr) => {
-            logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
-          });
+          if (
+            authRecoveryPayload
+            && authRecoveryRetriesRemaining > 0
+            && authReplaySafe
+            && !state.cancelled
+          ) {
+            void this.recoverCodexAuthAndReplay(
+              sessionId,
+              state,
+              authRecoveryPayload,
+              turnDispatchGeneration,
+              authRecoveryRetriesRemaining,
+              error,
+              'turn-failed',
+            );
+            return;
+          }
+          if (!authReplaySafe && authRecoveryRetriesRemaining > 0) {
+            void this.restartAppServerAfterAuthFailure('turn-failed-unsafe-replay', error, sessionId).catch((restartErr) => {
+              logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
+            });
+            this.emitCodexAuthRecoveryError(
+              sessionId,
+              state,
+              error,
+              CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE,
+            );
+            return;
+          }
+          this.emitCodexAuthRecoveryError(
+            sessionId,
+            state,
+            error,
+            CODEX_AUTH_RECOVERY_GUIDANCE,
+          );
+          return;
         }
+        this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, error);
         return;
       }
@@ -4278,6 +4527,7 @@ export class CodexSdkProvider implements TransportProvider {
           this.clearActiveItemEvidence(state);
           this.clearPendingSessionSystemTextUpdate(state);
           this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'user_cancelled');
+          this.clearCodexAuthRecoveryState(state);
           return;
         }
         this.closeOpenProviderToolCalls(sessionId, state, 'error', 'cancelled', 'provider_interrupted');
@@ -4286,6 +4536,7 @@ export class CodexSdkProvider implements TransportProvider {
         state.turnStartInFlight = false;
         this.clearActiveItemEvidence(state);
         this.clearPendingSessionSystemTextUpdate(state);
+        this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -4312,6 +4563,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearActiveItemEvidence(state);
         state.cancelled = false;
         this.clearPendingSessionSystemTextUpdate(state);
+        this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
@@ -4359,6 +4611,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.turnStartInFlight = false;
     this.clearActiveItemEvidence(state);
     state.generatedImageTracking = null;
+    this.clearCodexAuthRecoveryState(state);
     this.clearStatus(sessionId, state);
     const newlyDetectedImagePaths = generatedImageTracking
       ? await this.detectNewGeneratedImagePaths(generatedImageTracking)
@@ -5397,6 +5650,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private emitTrackedProviderToolCall(sessionId: string, state: CodexSdkSessionState, tool: ToolCallEvent): void {
+    state.authRecoveryReplayUnsafe = true;
     const dedupedTool = this.dedupeCustomToolLifecycle(state, tool);
     if (!dedupedTool) return;
     tool = dedupedTool;

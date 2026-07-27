@@ -41,6 +41,15 @@ const PRESET_ENV = {
   IMCODES_CONTEXT_WINDOW: '200000',
 };
 
+const presetEnvForModel = (model: string) => ({
+  ...PRESET_ENV,
+  ANTHROPIC_MODEL: model,
+  ANTHROPIC_SMALL_FAST_MODEL: model,
+  ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+  ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+});
+
 function expectMemoryMcpEnv(
   serverConfig: unknown,
   expected: { sessionName: string; projectName: string },
@@ -60,24 +69,32 @@ function expectMemoryMcpEnv(
 vi.mock('../../src/daemon/cc-presets.js', () => ({
   getPreset: vi.fn(async (name: string) => (
     name.trim().toLowerCase() === 'minimax'
-      ? { name: 'minimax', env: PRESET_ENV, contextWindow: 200000 }
+      ? {
+          name: 'minimax',
+          env: PRESET_ENV,
+          contextWindow: 200000,
+          availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-M3' }],
+        }
       : undefined
   )),
-  resolvePresetEnv: vi.fn(async (name: string) => (
-    name.trim().toLowerCase() === 'minimax' ? { ...PRESET_ENV } : {}
+  resolvePresetEnv: vi.fn(async (name: string, _sessionId?: string, modelOverride?: string) => (
+    name.trim().toLowerCase() === 'minimax'
+      ? presetEnvForModel(modelOverride ?? 'MiniMax-M2.7')
+      : {}
   )),
-  getPresetTransportOverrides: vi.fn(async (name: string) => (
+  getPresetTransportOverrides: vi.fn(async (name: string, modelOverride?: string) => (
     name.trim().toLowerCase() === 'minimax'
       ? {
-          model: 'MiniMax-M2.7',
-          systemPrompt: 'Authoritative runtime model: MiniMax-M2.7.',
+          model: modelOverride ?? 'MiniMax-M2.7',
+          systemPrompt: `Authoritative runtime model: ${modelOverride ?? 'MiniMax-M2.7'}.`,
           contextWindow: 200000,
         }
       : {}
   )),
-  getPresetAvailableModelIds: vi.fn((preset: { env?: Record<string, string>; defaultModel?: string }) => [
+  getPresetAvailableModelIds: vi.fn((preset: { env?: Record<string, string>; defaultModel?: string; availableModels?: Array<{ id: string }> }) => [
     preset.env?.ANTHROPIC_MODEL,
     preset.defaultModel,
+    ...(preset.availableModels ?? []).map((model) => model.id),
   ].filter((model): model is string => typeof model === 'string' && model.length > 0)),
   getCachedPresetContextWindow: vi.fn((name: string) => (
     name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
@@ -1090,7 +1107,7 @@ describe('sdk transport flow e2e', () => {
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
   });
 
-  it('persists and applies cc presets for claude-code-sdk main sessions', async () => {
+  it('starts a selected compatible model without duplicating the CC preset', async () => {
     const serverLink = { send: vi.fn() } as any;
 
     handleWebCommand({
@@ -1099,6 +1116,7 @@ describe('sdk transport flow e2e', () => {
       dir: '/tmp/ccsdk-minimax-e2e',
       agentType: 'claude-code-sdk',
       ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
     }, serverLink);
     await flushAsync();
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1115,13 +1133,14 @@ describe('sdk transport flow e2e', () => {
     expect(claudeCall?.options.env).toMatchObject({
       ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
       ANTHROPIC_API_KEY: expect.any(String),
-      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      ANTHROPIC_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3',
     });
-    expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    expect(claudeCall?.options.model).toBe('MiniMax-M3');
+    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M3.');
   });
 
-  it('accepts the preset-pinned model through /model on claude-code-sdk preset sessions', async () => {
+  it('switches among discovered models inside one CC preset for later turns', async () => {
     const serverLink = { send: vi.fn() } as any;
 
     handleWebCommand({
@@ -1135,19 +1154,27 @@ describe('sdk transport flow e2e', () => {
     await waitForCondition(() => !!mocks.store.get('deck_ccsdk_minimax_model_brain'));
 
     const sessionName = 'deck_ccsdk_minimax_model_brain';
-    handleWebCommand({ type: 'session.send', session: sessionName, text: '/model MiniMax-M2.7', commandId: 'cmd-ccsdk-minimax-model' }, serverLink);
+    await waitForCondition(() => !!getTransportRuntime(sessionName));
+    handleWebCommand({ type: 'session.send', session: sessionName, text: '/model MiniMax-M3', commandId: 'cmd-ccsdk-minimax-model' }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.emitted.some((e) => (
       e.session === sessionName
       && e.type === 'assistant.text'
-      && e.payload.text === 'Switched model to MiniMax-M2.7'
+      && e.payload.text === 'Switched model to MiniMax-M3'
     )));
+    handleWebCommand({ type: 'session.send', session: sessionName, text: 'hello after switch', commandId: 'cmd-ccsdk-minimax-after-switch' }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.claudeCalls.at(-1)?.options.model === 'MiniMax-M3');
 
     const record = mocks.store.get(sessionName);
-    const usage = mocks.emitted.filter((e) => e.session === sessionName && e.type === 'usage.update' && e.payload.model === 'MiniMax-M2.7').at(-1);
-    expect(record?.modelDisplay).toBe('MiniMax-M2.7');
-    expect(record?.activeModel).toBe('MiniMax-M2.7');
+    const usage = mocks.emitted.filter((e) => e.session === sessionName && e.type === 'usage.update' && e.payload.model === 'MiniMax-M3').at(-1);
+    expect(record?.modelDisplay).toBe('MiniMax-M3');
+    expect(record?.activeModel).toBe('MiniMax-M3');
     expect(usage?.payload.contextWindow).toBe(200000);
+    expect(mocks.claudeCalls.at(-1)?.options.model).toBe('MiniMax-M3');
+    expect(String(mocks.claudeCalls.at(-1)?.options.appendSystemPrompt ?? '')).toContain(
+      'Authoritative runtime model: MiniMax-M3.',
+    );
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'command.ack',
       status: 'error',

@@ -342,10 +342,6 @@
     "tool_calls_toggle_hide": "Hide tools and thinking",
     "tool_calls_toggle_undecided": "Choose how to view AI activity",
     "tool_calls_choose_prompt": "Pick view ↓",
-    "memory_summary_sync": "Sync recent summaries",
-    "memory_summary_sync_busy": "Syncing summaries...",
-    "memory_summary_sync_instruction": "Context sync only. Digest these recent summaries as background context. Do not execute tasks, change files, call tools, or respond to this message; wait for the next user instruction.",
-    "memory_summary_sync_heading": "Recent summaries ({{count}}/{{limit}}, capped at ~{{maxChars}} chars):",
     "user_message_expand": "Show full",
     "user_message_collapse": "Collapse",
     "tool_chooser_title": "How should AI activity show?",
@@ -460,7 +456,13 @@
     "execution_clone_run_with_template": "Run current task with {{count}} clone(s) of {{name}}",
     "execution_clone_run_no_template": "Enable and select an execution session in Team settings first",
     "execution_clone_run_empty": "Type a task first",
-    "execution_clone_run_offline": "Reconnect before running execution clones"
+    "execution_clone_run_offline": "Reconnect before running execution clones",
+    "execution_clone_launch_pending": "Starting {{count}} execution clones…",
+    "execution_clone_launch_success": "Execution clones are running (up to {{count}})",
+    "execution_clone_launch_failed": "Execution clones failed: {{error}}",
+    "execution_clone_launch_unknown_error": "Unknown error",
+    "execution_clone_launch_timeout": "Execution clone launch timed out",
+    "execution_clone_launch_offline": "Execution clones were not sent because the connection is offline"
   },
   "session": {
     "restart": "↺ Restart",

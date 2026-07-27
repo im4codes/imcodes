@@ -342,10 +342,6 @@
     "tool_calls_toggle_hide": "隱藏工具和思考",
     "tool_calls_toggle_undecided": "選擇 AI 活動顯示方式",
     "tool_calls_choose_prompt": "選擇檢視 ↓",
-    "memory_summary_sync": "同步最近 summary",
-    "memory_summary_sync_busy": "正在同步 summary...",
-    "memory_summary_sync_instruction": "僅同步上下文。請把這些最近 summary 消化為背景資訊；不要執行任務、不要改檔案、不要呼叫工具，也不要回覆這則訊息，等待下一條使用者指令。",
-    "memory_summary_sync_heading": "最近 summary（{{count}}/{{limit}}，最多約 {{maxChars}} 字）：",
     "user_message_expand": "展開全文",
     "user_message_collapse": "收起",
     "tool_chooser_title": "AI 活動如何顯示？",
@@ -460,7 +456,13 @@
     "execution_clone_run_with_template": "複製 {{name}} ×{{count}} 並行執行目前任務",
     "execution_clone_run_no_template": "請先在 Team 設定啟用並選擇執行會話",
     "execution_clone_run_empty": "請先輸入任務",
-    "execution_clone_run_offline": "重新連線後才能執行複製會話"
+    "execution_clone_run_offline": "重新連線後才能執行複製會話",
+    "execution_clone_launch_pending": "正在啟動 {{count}} 個執行複製會話…",
+    "execution_clone_launch_success": "執行複製會話已開始執行（最多 {{count}} 個）",
+    "execution_clone_launch_failed": "執行複製會話啟動失敗：{{error}}",
+    "execution_clone_launch_unknown_error": "未知錯誤",
+    "execution_clone_launch_timeout": "執行複製會話啟動逾時",
+    "execution_clone_launch_offline": "連線已中斷，執行複製會話未送出"
   },
   "session": {
     "restart": "↺ 重新啟動",

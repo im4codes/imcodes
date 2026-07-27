@@ -197,6 +197,7 @@ import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_PARENT_STAGES,
+  genericExecutionCloneParentRunId,
   parseDedicatedExecutionRoutingPreference,
   type DedicatedExecutionRoutingGlobalPreference,
 } from '../../shared/execution-clone.js';
@@ -1829,7 +1830,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
         }
       })();
       break;
-    case 'transport.list_models':
+    case TRANSPORT_MSG.LIST_MODELS:
       void traceCommandAsync(cmd, 'web_command.transport_list_models', () => handleTransportListModels(cmd, serverLink));
       break;
     case REPO_MSG.DETECT:
@@ -2880,7 +2881,7 @@ async function handleSessionExecutionClones(cmd: Record<string, unknown>, server
     enabled: true,
   };
   const workerTotal = Math.max(1, pref.maxParallelClones);
-  const parentRunId = `generic-execution-${commandId}`;
+  const parentRunId = genericExecutionCloneParentRunId(commandId);
   const parentStage = EXECUTION_CLONE_PARENT_STAGES[0];
   const owningMainSessionName = callerRecord.parentSession ?? callerRecord.name;
   const projectName = callerRecord.projectName ?? getSession(owningMainSessionName)?.projectName ?? null;
@@ -4030,8 +4031,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           const preset = await getPreset(record.ccPreset);
           const presetModels = preset ? getPresetAvailableModelIds(preset) : [];
           selectedModel = presetModels.find((model) => model === requestedModel);
-          if (!presetContextWindow) {
-            presetContextWindow = (await getPresetTransportOverrides(record.ccPreset)).contextWindow;
+          if (selectedModel) {
+            const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
+            presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+            transportRuntime.setSystemPrompt(presetOverrides.systemPrompt ?? '');
           }
         } else {
           selectedModel = normalizeClaudeCodeModelId(requestedModel);
@@ -10140,6 +10143,7 @@ async function handleTransportListModels(
   serverLink: ServerLink,
 ): Promise<void> {
   const agentType = typeof cmd.agentType === 'string' ? cmd.agentType : '';
+  const ccPreset = typeof cmd.ccPreset === 'string' ? cmd.ccPreset.trim() : '';
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const force = cmd.force === true;
   const reply = (payload: {
@@ -10150,8 +10154,9 @@ async function handleTransportListModels(
   }): void => {
     try {
       serverLink.send({
-        type: 'transport.models_response',
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
         agentType,
+        ...(ccPreset ? { ccPreset } : {}),
         ...(requestId ? { requestId } : {}),
         ...payload,
       });
@@ -10196,7 +10201,23 @@ function transportListModelsCacheKey(cmd: Record<string, unknown>, agentType: st
     : typeof cmd.providerId === 'string'
       ? cmd.providerId
       : '';
-  return `${agentType}\0${provider}`;
+  const ccPreset = typeof cmd.ccPreset === 'string'
+    ? normalizeCcPresetName(cmd.ccPreset)
+    : '';
+  return `${agentType}\0${provider}\0${ccPreset}`;
+}
+
+async function loadCcPresetModels(
+  presetName: string,
+  force: boolean,
+): Promise<TransportListModelsResult> {
+  const { getPresetModelCatalog } = await import('./cc-presets.js');
+  const catalog = await getPresetModelCatalog(presetName, force);
+  return {
+    models: catalog.models,
+    ...(catalog.defaultModel ? { defaultModel: catalog.defaultModel } : {}),
+    isAuthenticated: true,
+  };
 }
 
 async function loadTransportListModels(agentType: string, force: boolean): Promise<TransportListModelsResult> {
@@ -10287,7 +10308,11 @@ async function getTransportListModels(
   const inflight = transportListModelsInflight.get(inflightKey);
   if (inflight && inflight.generation === generation) return await inflight.promise;
 
-  const promise = loadTransportListModels(agentType, force)
+  const ccPreset = typeof cmd.ccPreset === 'string' ? cmd.ccPreset.trim() : '';
+  const loadPromise = agentType === 'claude-code-sdk' && ccPreset
+    ? loadCcPresetModels(ccPreset, force)
+    : loadTransportListModels(agentType, force);
+  const promise = loadPromise
     .then((value) => {
       if (transportListModelsCacheGeneration !== generation) {
         recordTransportListModelsStaleCompletion({
@@ -10425,7 +10450,7 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
     return;
   }
 
-  const { discoverPresetModels, loadPresets, savePresets, getPreset } = await import('./cc-presets.js');
+  const { getPreset, refreshPresetModels } = await import('./cc-presets.js');
   const preset = await getPreset(presetName);
   if (!preset) {
     serverLink.send({
@@ -10438,43 +10463,23 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
     return;
   }
 
-  const normalizedName = normalizeCcPresetName(preset.name);
   try {
-    const discovered = await discoverPresetModels(preset);
-    const latestPresets = await loadPresets();
-    const latestPreset = latestPresets.find((item) => normalizeCcPresetName(item.name) === normalizedName) ?? preset;
-    const updatedPreset: CcPreset = {
-      ...latestPreset,
-      transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
-      authType: latestPreset.authType ?? 'anthropic',
-      availableModels: discovered.availableModels,
-      ...(discovered.defaultModel ? { defaultModel: discovered.defaultModel } : {}),
-      lastDiscoveredAt: Date.now(),
-      modelDiscoveryError: undefined,
-    };
-    await savePresets(latestPresets.map((item) => (
-      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
-    )));
+    const catalog = await refreshPresetModels(preset.name);
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
       ...(requestId ? { requestId } : {}),
-      presetName: updatedPreset.name,
+      presetName: catalog.preset.name,
       ok: true,
-      preset: updatedPreset,
-      models: discovered.availableModels,
-      endpoint: discovered.endpoint,
+      preset: catalog.preset,
+      models: catalog.models,
+      endpoint: catalog.endpoint,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const latestPresets = await loadPresets();
-    const latestPreset = latestPresets.find((item) => normalizeCcPresetName(item.name) === normalizedName) ?? preset;
-    const updatedPreset: CcPreset = {
-      ...latestPreset,
+    const updatedPreset = await getPreset(preset.name) ?? {
+      ...preset,
       modelDiscoveryError: message,
     };
-    await savePresets(latestPresets.map((item) => (
-      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
-    )));
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
       ...(requestId ? { requestId } : {}),
@@ -10686,11 +10691,10 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     includeArchived,
   };
   const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
-  // The browser's manual "sync recent summaries" path must consume handles
-  // issued by the daemon. It previously derived a legacy 10-character value in
-  // Web code without registering it, so the displayed `proj:` token was dead.
-  // Keep ordinary management-list reads side-effect free; only the explicit
-  // sync caller asks us to register and persist handles.
+  // Any caller requesting short refs must consume handles issued by the daemon,
+  // never values derived independently in UI code. Keep ordinary management-list
+  // reads side-effect free; only an explicit includeShortRefs request registers
+  // and persists handles.
   const referencedRecords = cmd.includeShortRefs === true
     ? attachMemoryShortRefs(records.map((record) => ({
         ...record,

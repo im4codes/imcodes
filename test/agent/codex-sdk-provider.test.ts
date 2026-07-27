@@ -26,10 +26,13 @@ const childProcessMock = vi.hoisted(() => {
   };
 
   const children: ChildRecord[] = [];
+  const heldInitializes: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldThreadStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldTurnStarts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
   const heldTurnInterrupts: Array<{ childRecord: ChildRecord; msg: Request }> = [];
+  const turnStartErrors: string[] = [];
   const threadReadResults: Array<Record<string, any> | ((msg: Request) => Record<string, any> | undefined)> = [];
+  let holdInitialize = false;
   let holdThreadStart = false;
   let holdTurnStart = false;
   let holdTurnInterrupt = false;
@@ -40,6 +43,9 @@ const childProcessMock = vi.hoisted(() => {
       result: { thread: { id: 'thread-1' } },
     });
     childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
+  };
+  const emitInitializeResult = (childRecord: ChildRecord, msg: Request) => {
+    childRecord.emits({ id: msg.id, result: { userAgent: 'test' } });
   };
   const emitTurnStartResult = (childRecord: ChildRecord, msg: Request) => {
     childRecord.emits({
@@ -62,7 +68,11 @@ const childProcessMock = vi.hoisted(() => {
           const msg = JSON.parse(line) as Request;
           childRecord.requests.push(msg);
           if (msg.method === 'initialize' && typeof msg.id === 'number') {
-            childRecord.emits({ id: msg.id, result: { userAgent: 'test' } });
+            if (holdInitialize) {
+              heldInitializes.push({ childRecord, msg });
+            } else {
+              emitInitializeResult(childRecord, msg);
+            }
           }
           if (msg.method === 'thread/start' && typeof msg.id === 'number') {
             if (holdThreadStart) {
@@ -87,7 +97,10 @@ const childProcessMock = vi.hoisted(() => {
             }
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
-            if (holdTurnStart) {
+            const turnStartError = turnStartErrors.shift();
+            if (turnStartError) {
+              childRecord.emits({ id: msg.id, error: { message: turnStartError } });
+            } else if (holdTurnStart) {
               heldTurnStarts.push({ childRecord, msg });
             } else {
               emitTurnStartResult(childRecord, msg);
@@ -154,6 +167,9 @@ const childProcessMock = vi.hoisted(() => {
     spawn,
     execFile,
     children,
+    setHoldInitialize(value: boolean) {
+      holdInitialize = value;
+    },
     setHoldThreadStart(value: boolean) {
       holdThreadStart = value;
     },
@@ -166,6 +182,10 @@ const childProcessMock = vi.hoisted(() => {
     releaseHeldTurnStarts() {
       const held = heldTurnStarts.splice(0);
       for (const entry of held) emitTurnStartResult(entry.childRecord, entry.msg);
+    },
+    releaseHeldInitializes() {
+      const held = heldInitializes.splice(0);
+      for (const entry of held) emitInitializeResult(entry.childRecord, entry.msg);
     },
     releaseHeldThreadStarts() {
       const held = heldThreadStarts.splice(0);
@@ -180,6 +200,12 @@ const childProcessMock = vi.hoisted(() => {
     },
     clearThreadReadResults() {
       threadReadResults.length = 0;
+    },
+    enqueueTurnStartError(message: string) {
+      turnStartErrors.push(message);
+    },
+    clearTurnStartErrors() {
+      turnStartErrors.length = 0;
     },
   };
 });
@@ -228,7 +254,12 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 
 import { CodexSdkProvider, buildCodexMcpThreadConfig } from '../../src/agent/providers/codex-sdk.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
-import { PROVIDER_ERROR_CODES, type ProviderError, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import {
+  PROVIDER_ERROR_CODES,
+  type AgentMessage,
+  type ProviderError,
+  type ToolCallEvent,
+} from '../../src/agent/transport-provider.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
@@ -378,10 +409,13 @@ describe('CodexSdkProvider', () => {
     childProcessMock.spawn.mockClear();
     childProcessMock.execFile.mockClear();
     childProcessMock.children.length = 0;
+    childProcessMock.setHoldInitialize(false);
     childProcessMock.setHoldThreadStart(false);
     childProcessMock.setHoldTurnStart(false);
     childProcessMock.setHoldTurnInterrupt(false);
     childProcessMock.clearThreadReadResults();
+    childProcessMock.clearTurnStartErrors();
+    childProcessMock.releaseHeldInitializes();
     childProcessMock.releaseHeldThreadStarts();
     childProcessMock.releaseHeldTurnStarts();
     childProcessMock.releaseHeldTurnInterrupts();
@@ -463,7 +497,7 @@ describe('CodexSdkProvider', () => {
     }
   });
 
-  it('restarts the app-server when Codex reports a bearer auth failure', async () => {
+  it('does not replay an auth-failed turn after tool activity has started', async () => {
     const provider = createCodexProvider();
     const errors: Array<{ code: string; recoverable: boolean; message: string }> = [];
     const tools: ToolCallEvent[] = [];
@@ -502,6 +536,7 @@ describe('CodexSdkProvider', () => {
     expect(errors).toMatchObject([{
       code: PROVIDER_ERROR_CODES.AUTH_FAILED,
       recoverable: false,
+      message: expect.stringContaining('was not replayed because provider output or tool activity had already started'),
     }]);
     expect(tools).toContainEqual(expect.objectContaining({
       id: 'ws-auth',
@@ -514,6 +549,171 @@ describe('CodexSdkProvider', () => {
     }));
     expect(childProcessMock.children).toHaveLength(2);
     expect(firstChild.child.killed).toBe(true);
+    expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'turn/start')).toBe(false);
+    await provider.disconnect();
+  });
+
+  it('replays once when turn/start rejects the request before Codex accepts it', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    childProcessMock.enqueueTurnStartError('401 Unauthorized: authentication required');
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-auth-pre-accept', cwd: '/tmp/project' });
+    await provider.send('route-auth-pre-accept', 'safe pre-accept replay');
+
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(childProcessMock.children[0]!.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    expect(childProcessMock.children[1]!.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    expect(errors).toEqual([]);
+    await provider.disconnect();
+  });
+
+  it('restarts Codex and replays one auth-failed turn when no output or tool side effect started', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    const completions: AgentMessage[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+    provider.onComplete((_sid, message) => completions.push(message));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-auth-replay', cwd: '/tmp/project' });
+    await provider.send('route-auth-replay', 'hello after idle');
+    const firstChild = childProcessMock.children[0]!;
+    const firstTurnStart = firstChild.requests.find((req) => req.method === 'turn/start');
+
+    firstChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: {
+            message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+          },
+        },
+      },
+    });
+
+    await waitForCondition(() => childProcessMock.children.length === 2);
+    const secondChild = childProcessMock.children[1]!;
+    await waitForCondition(() => secondChild.requests.some((req) => req.method === 'turn/start'));
+    const replayTurnStart = secondChild.requests.find((req) => req.method === 'turn/start');
+
+    expect(errors).toEqual([]);
+    expect(replayTurnStart?.params?.input).toEqual(firstTurnStart?.params?.input);
+    expect(secondChild.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+
+    secondChild.emits({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { id: 'auth-replay-answer', type: 'agentMessage', text: 'recovered' },
+      },
+    });
+    secondChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', error: null },
+      },
+    });
+    await waitForCondition(() => completions.length === 1);
+
+    expect(completions[0]?.content).toBe('recovered');
+    expect(errors).toEqual([]);
+    await provider.disconnect();
+  });
+
+  it('reports re-authentication guidance after the single Codex auth replay also fails', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-auth-retry-limit', cwd: '/tmp/project' });
+    await provider.send('route-auth-retry-limit', 'retry once only');
+    const firstChild = childProcessMock.children[0]!;
+    firstChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: { message: '401 Unauthorized' },
+        },
+      },
+    });
+
+    await waitForCondition(() => childProcessMock.children.length === 2);
+    const secondChild = childProcessMock.children[1]!;
+    await waitForCondition(() => secondChild.requests.some((req) => req.method === 'turn/start'));
+    secondChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: { message: 'Codex is not authenticated' },
+        },
+      },
+    });
+    await waitForCondition(() => errors.length === 1);
+
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(secondChild.requests.filter((req) => req.method === 'turn/start')).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+      recoverable: false,
+      message: expect.stringContaining('failed after one automatic retry'),
+    });
+    await provider.disconnect();
+  });
+
+  it('cancels a pending Codex auth restart without replaying the turn', async () => {
+    const provider = createCodexProvider();
+    const errors: ProviderError[] = [];
+    provider.onError((_sid, error) => errors.push(error));
+
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-auth-cancel', cwd: '/tmp/project' });
+    await provider.send('route-auth-cancel', 'cancel during auth recovery');
+    childProcessMock.setHoldInitialize(true);
+    const firstChild = childProcessMock.children[0]!;
+    firstChild.emits({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: {
+          id: 'turn-1',
+          status: 'failed',
+          error: { message: 'authentication required' },
+        },
+      },
+    });
+
+    await waitForCondition(
+      () => provider.getSessionDiagnostics('route-auth-cancel')?.activeReason === 'auth-recovery',
+    );
+    await waitForCondition(() => childProcessMock.children.length === 2);
+    await provider.cancel('route-auth-cancel');
+    childProcessMock.setHoldInitialize(false);
+    childProcessMock.releaseHeldInitializes();
+    await waitForCondition(() => errors.length === 1);
+    await flush();
+
+    expect(errors[0]).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CANCELLED,
+      recoverable: true,
+    });
+    expect(childProcessMock.children).toHaveLength(2);
+    expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'turn/start')).toBe(false);
+    expect(provider.getSessionDiagnostics('route-auth-cancel')?.activeReason).toBeNull();
     await provider.disconnect();
   });
 
@@ -557,6 +757,10 @@ describe('CodexSdkProvider', () => {
         activeToolCount: 1,
       });
 
+      firstChild.emits({
+        method: 'item/completed',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-auth-active', type: 'webSearch', action: { type: 'other' } } },
+      });
       firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
       await waitForCondition(
         () => provider.getActiveWorkSnapshot('route-auth-active')?.activeWorkCount === 0,

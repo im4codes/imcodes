@@ -21,6 +21,14 @@ export const EXECUTION_CLONE_CAPABILITY_V1 = 'execution-clone:v1' as const;
 /** Discriminant `kind` marking a sub-session record as an execution clone. */
 export const EXECUTION_CLONE_KIND = 'execution_clone' as const;
 
+/** Stable parent-run prefix for generic composer-triggered execution clones. */
+export const GENERIC_EXECUTION_CLONE_PARENT_RUN_PREFIX = 'generic-execution-' as const;
+
+/** Derive the run group id shared by daemon creation and Web group reveal. */
+export function genericExecutionCloneParentRunId(commandId: string): string {
+  return `${GENERIC_EXECUTION_CLONE_PARENT_RUN_PREFIX}${commandId}`;
+}
+
 // ── Parent stages ─────────────────────────────────────────────────────────
 
 /**

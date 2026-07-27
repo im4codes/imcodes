@@ -567,6 +567,7 @@ describe('SessionPane', () => {
     }];
     const ws = {
       connected: true,
+      onMessage: vi.fn(() => () => undefined),
       sendSessionCommand: vi.fn(() => {
         throw new Error('WebSocket not connected');
       }),

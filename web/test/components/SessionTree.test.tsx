@@ -4,6 +4,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
 import { h } from 'preact';
+import { act } from 'preact/test-utils';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -28,6 +29,7 @@ vi.mock('../../src/components/IdleFlashLayer.js', () => ({
 }));
 
 import { SessionTree } from '../../src/components/SessionTree.js';
+import { revealExecutionCloneGroup } from '../../src/execution-clone-ui.js';
 
 const sessions = [
   {
@@ -130,5 +132,43 @@ describe('SessionTree', () => {
     // Expanding the group (click its toggle) reveals the clone node.
     fireEvent.click(groupHeader.closest('button')!);
     expect(screen.getByText('Worker clone A')).toBeDefined();
+  });
+
+  it('reveals the exact clone group after its launch ack even when the parent was collapsed', () => {
+    const parentRunId = 'generic-execution-command-123';
+    const withClones = [
+      ...subSessions,
+      {
+        id: 'clone-acked',
+        sessionName: 'deck_sub_clone_acked',
+        label: 'Acked worker clone',
+        type: 'codex-sdk',
+        state: 'running',
+        parentSession: 'deck_main_brain',
+        executionCloneKind: 'execution_clone',
+        parentRunId,
+      },
+    ] as any;
+    render(
+      <SessionTree
+        serverId="srv-clone"
+        sessions={sessions}
+        subSessions={withClones}
+        activeSession={null}
+        unreadCounts={new Map()}
+        onSelectSession={vi.fn()}
+        onSelectSubSession={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Collapse'));
+    expect(screen.queryByText('Acked worker clone')).toBeNull();
+
+    act(() => revealExecutionCloneGroup({
+      ownerSessionName: 'deck_main_brain',
+      parentRunId,
+    }));
+
+    expect(screen.getByText('Acked worker clone')).toBeDefined();
+    expect(screen.getByText('Execution workers (run {{run}})').closest('button')?.getAttribute('aria-expanded')).toBe('true');
   });
 });

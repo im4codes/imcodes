@@ -93,15 +93,18 @@ describe("shared/transport-events", () => {
     expect(Object.keys(TRANSPORT_EVENT)).toHaveLength(6);
   });
 
-  it("TRANSPORT_MSG has correct values for all 7 message types", () => {
+  it("TRANSPORT_MSG has correct values for all 10 message types", () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe("chat.subscribe");
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe("chat.unsubscribe");
     expect(TRANSPORT_MSG.CHAT_HISTORY).toBe("chat.history");
+    expect(TRANSPORT_MSG.CHAT_APPROVAL).toBe("chat.approval");
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe("provider.status");
     expect(TRANSPORT_MSG.LIST_SESSIONS).toBe("provider.list_sessions");
     expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe("provider.sessions_response");
     expect(TRANSPORT_MSG.APPROVAL_RESPONSE).toBe("chat.approval_response");
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(8);
+    expect(TRANSPORT_MSG.LIST_MODELS).toBe("transport.list_models");
+    expect(TRANSPORT_MSG.MODELS_RESPONSE).toBe("transport.models_response");
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(10);
   });
 
   it("TRANSPORT_AGENT_STATUSES contains all 7 statuses", () => {

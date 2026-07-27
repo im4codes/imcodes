@@ -165,6 +165,7 @@ import {
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { shouldUseIosMacTextScale } from './native-platform.js';
+import { boundedVisualViewportHeight, createSettledViewportUpdater } from './visual-viewport.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
@@ -682,10 +683,19 @@ export function App() {
     let hadKeyboardOpen = false;
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
-      document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
+      const viewportHeight = boundedVisualViewportHeight(
+        vv.height,
+        window.innerHeight,
+        document.documentElement.clientHeight,
+      );
+      if (viewportHeight === null) return;
+      const viewportCssValue = `${viewportHeight}px`;
+      if (document.documentElement.style.getPropertyValue('--vvh') !== viewportCssValue) {
+        document.documentElement.style.setProperty('--vvh', viewportCssValue);
+      }
       // Detect keyboard open: viewport shrink + optional input-focus fallback.
       // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
-      const shrink = window.innerHeight - vv.height;
+      const shrink = Math.max(0, window.innerHeight - viewportHeight);
       // Expose the soft-keyboard height so position:fixed overlays anchored to the
       // LAYOUT viewport (e.g. the QuickInputPanel alias editor, `.qp`) can lift
       // their bottom ABOVE the keyboard. The main composer stays visible because
@@ -725,6 +735,8 @@ export function App() {
         }, 100);
       }
     };
+    const settledViewportUpdater = createSettledViewportUpdater(update);
+    const scheduleUpdate = settledViewportUpdater.schedule;
     const onFocusIn = (e: FocusEvent) => {
       const el = e.target as HTMLElement | null;
       if (!el) return;
@@ -740,17 +752,20 @@ export function App() {
         document.body.scrollTop = 0;
         document.documentElement.scrollTop = 0;
       }
-      update();
+      scheduleUpdate();
     };
     const onFocusOut = () => {
       inputFocused = false;
       hadKeyboardOpen = false;
       document.documentElement.classList.remove('input-focused');
       clearTimeout(scrollTimer);
-      update();
+      scheduleUpdate();
     };
-    update();
-    vv.addEventListener('resize', update);
+    scheduleUpdate();
+    vv.addEventListener('resize', scheduleUpdate);
+    vv.addEventListener('scroll', scheduleUpdate);
+    window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('pageshow', scheduleUpdate);
     document.addEventListener('focusin', onFocusIn);
     document.addEventListener('focusout', onFocusOut);
     // App-resume recovery: when the app returns from background (push-notification
@@ -776,11 +791,16 @@ export function App() {
         inputFocused = false;
         hadKeyboardOpen = false;
       }
-      update();
+      scheduleUpdate();
     };
     document.addEventListener('visibilitychange', onResume);
     return () => {
-      vv.removeEventListener('resize', update);
+      settledViewportUpdater.cancel();
+      clearTimeout(scrollTimer);
+      vv.removeEventListener('resize', scheduleUpdate);
+      vv.removeEventListener('scroll', scheduleUpdate);
+      window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('pageshow', scheduleUpdate);
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
       document.removeEventListener('visibilitychange', onResume);

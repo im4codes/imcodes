@@ -342,10 +342,6 @@
     "tool_calls_toggle_hide": "隐藏工具和思考",
     "tool_calls_toggle_undecided": "选择 AI 活动显示方式",
     "tool_calls_choose_prompt": "选择视图 ↓",
-    "memory_summary_sync": "同步最近 summary",
-    "memory_summary_sync_busy": "正在同步 summary...",
-    "memory_summary_sync_instruction": "仅同步上下文。请把这些最近 summary 消化为背景信息；不要执行任务、不要改文件、不要调用工具，也不要回复这条消息，等待下一条用户指令。",
-    "memory_summary_sync_heading": "最近 summary（{{count}}/{{limit}}，最多约 {{maxChars}} 字）：",
     "user_message_expand": "展开全文",
     "user_message_collapse": "收起",
     "tool_chooser_title": "AI 活动如何显示？",
@@ -460,7 +456,13 @@
     "execution_clone_run_with_template": "克隆 {{name}} ×{{count}} 并行执行当前任务",
     "execution_clone_run_no_template": "先在 Team 设置里启用并选择执行会话",
     "execution_clone_run_empty": "请先输入任务",
-    "execution_clone_run_offline": "重连后才能运行执行克隆"
+    "execution_clone_run_offline": "重连后才能运行执行克隆",
+    "execution_clone_launch_pending": "正在启动 {{count}} 个执行克隆…",
+    "execution_clone_launch_success": "执行克隆已开始运行（最多 {{count}} 个）",
+    "execution_clone_launch_failed": "执行克隆启动失败：{{error}}",
+    "execution_clone_launch_unknown_error": "未知错误",
+    "execution_clone_launch_timeout": "执行克隆启动超时",
+    "execution_clone_launch_offline": "连接已断开，执行克隆未发送"
   },
   "session": {
     "restart": "↺ 重启",

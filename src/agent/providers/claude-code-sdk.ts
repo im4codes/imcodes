@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, statSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { query, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { stripLeakedThink } from '../../util/strip-leaked-think.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
@@ -67,6 +69,12 @@ const TASK_NOTIFICATION_WAKE_GRACE_MS = 1_000;
 const CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT = 2;
 const CONNECTION_CLOSED_CONTINUE_PROMPT = 'continue';
 const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
+const CLAUDE_AUTH_REFRESH_RETRY_LIMIT = 1;
+// This is a maximum recovery window, not a fixed delay: the credential poll
+// returns as soon as the file changes. Keep enough tail for the observed slow
+// refresh path while polling quickly for the normal few-second path.
+const DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS = 2 * 60 * 1000;
+const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
@@ -161,6 +169,8 @@ interface ClaudeSdkSessionState {
   currentAllowResumeFallback?: boolean;
   currentStartedAsResume?: boolean;
   currentConnectionClosedRetriesRemaining?: number;
+  currentAuthRefreshRetriesRemaining?: number;
+  authRefreshRetryPending: boolean;
   turnGeneration: number;
   runtimeActivityGeneration?: ActivityGeneration;
   resultCompletionTimer: ReturnType<typeof setTimeout> | null;
@@ -346,9 +356,27 @@ function normalizeStatusName(status: string | undefined): string {
 }
 
 function appendClaudeAuthRecoveryGuidance(message: string): string {
+  if (isClaudeCredentialRefresh403(message)) return message;
   if (!/failed to authenticate|invalid authentication credentials|(?:api error:\s*)?401\b/i.test(message)) return message;
+  return appendClaudeAuthRecoveryGuidanceUnconditionally(message);
+}
+
+function appendClaudeAuthRecoveryGuidanceUnconditionally(message: string): string {
   if (message.includes(CLAUDE_AUTH_RECOVERY_GUIDANCE)) return message;
   return `${message}\n\n${CLAUDE_AUTH_RECOVERY_GUIDANCE}`;
+}
+
+function isClaudeCredentialRefresh403(message: string): boolean {
+  return /^failed to authenticate\.\s*api error:\s*403\s+request not allowed\.?$/i.test(
+    message.trim().replace(/\s+/g, ' '),
+  );
+}
+
+function getClaudeAuthRefreshDurationMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : fallback;
 }
 
 function getSubagentStaleWithoutTerminalMs(): number {
@@ -505,6 +533,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       currentAllowResumeFallback: undefined,
       currentStartedAsResume: undefined,
       currentConnectionClosedRetriesRemaining: undefined,
+      currentAuthRefreshRetriesRemaining: undefined,
+      authRefreshRetryPending: false,
       turnGeneration: existing?.turnGeneration ?? 0,
       resultCompletionTimer: null,
       taskNotificationWakeTimer: null,
@@ -530,6 +560,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       ? 'query'
       : state.currentChild
         ? 'child'
+        : state.authRefreshRetryPending
+          ? 'auth-refresh'
         : state.pendingComplete
           ? 'pending-complete'
           : state.resultCompletionTimer
@@ -546,6 +578,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       currentTextLength: state.currentText.length,
       currentQueryActive: Boolean(state.currentQuery),
       currentChildActive: Boolean(state.currentChild && !state.currentChild.killed),
+      authRefreshRetryPending: state.authRefreshRetryPending,
       completed: state.completed,
       cancelled: state.cancelled,
       pendingComplete: Boolean(state.pendingComplete),
@@ -572,6 +605,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const waitingForTaskNotification = state.completed && !state.pendingComplete && blockingSubagentCount > 0;
     const backgroundActive = Boolean(
       state.resultCompletionTimer
+      || state.authRefreshRetryPending
       || (state.currentQuery && !waitingForTaskNotification && !onlyBackgroundedSubagents)
       || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification && !onlyBackgroundedSubagents),
     );
@@ -605,6 +639,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const state = this.sessions.get(sessionId);
     this.questions.release(state?.sessionName ?? sessionId);
     if (state) {
+      state.cancelled = true;
       this.clearResultCompletionFallback(state);
       this.clearTaskNotificationWake(state);
       try { state.currentQuery?.close(); } catch {}
@@ -686,7 +721,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Claude SDK session: ${sessionId}`, false);
     }
-    if (state.currentQuery) {
+    if (state.currentQuery || state.authRefreshRetryPending) {
       // Subagent-only idle: the main turn already settled and the query is being
       // held open ONLY because subagents are still running (see
       // closeSettledQueryIfNoSubagents). The user sees an idle agent, so a message
@@ -710,17 +745,25 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     }
     const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
     state.runtimeActivityGeneration = payload.activityGeneration;
-    await this.startQuery(sessionId, state, payload, true, CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT);
+    await this.startQuery(
+      sessionId,
+      state,
+      payload,
+      true,
+      CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT,
+      CLAUDE_AUTH_REFRESH_RETRY_LIMIT,
+    );
   }
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     await this.cancelActiveClaudeSubagentTasks(sessionId, state);
-    if (!state.currentQuery) return;
+    if (!state.currentQuery && !state.authRefreshRetryPending) return;
     state.cancelled = true;
     this.clearResultCompletionFallback(state);
     this.clearTaskNotificationWake(state);
+    if (!state.currentQuery) return;
     try {
       await Promise.race([
         state.currentQuery.interrupt(),
@@ -739,6 +782,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     payload: ProviderContextPayload,
     allowResumeFallback: boolean,
     connectionClosedRetriesRemaining: number,
+    authRefreshRetriesRemaining: number,
   ): Promise<void> {
     state.currentText = '';
     state.currentMessageId = null;
@@ -771,6 +815,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const startedAsResume = state.started;
     state.currentStartedAsResume = startedAsResume;
     state.currentConnectionClosedRetriesRemaining = connectionClosedRetriesRemaining;
+    state.currentAuthRefreshRetriesRemaining = authRefreshRetriesRemaining;
+    const credentialsMtimeMs = this.readClaudeCredentialsMtimeMs(state);
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -856,6 +902,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       startedAsResume,
       turnGeneration,
       connectionClosedRetriesRemaining,
+      authRefreshRetriesRemaining,
+      credentialsMtimeMs,
     );
   }
 
@@ -868,6 +916,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     startedAsResume: boolean,
     turnGeneration: number,
     connectionClosedRetriesRemaining: number,
+    authRefreshRetriesRemaining: number,
+    credentialsMtimeMs: number | null,
   ): Promise<void> {
     let pendingError: ProviderError | null = null;
     try {
@@ -901,12 +951,65 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       state.currentAllowResumeFallback = undefined;
       state.currentStartedAsResume = undefined;
       state.currentConnectionClosedRetriesRemaining = undefined;
+      state.currentAuthRefreshRetriesRemaining = undefined;
       state.currentMessageId = null;
       state.currentText = '';
+      if (
+        !pendingComplete
+        && pendingError
+        && !state.cancelled
+        && isClaudeCredentialRefresh403(pendingError.message)
+      ) {
+        if (authRefreshRetriesRemaining > 0) {
+          state.authRefreshRetryPending = true;
+          const refreshed = await this.waitForClaudeCredentialsRefresh(
+            sessionId,
+            state,
+            turnGeneration,
+            credentialsMtimeMs,
+          );
+          state.authRefreshRetryPending = false;
+          if (this.sessions.get(sessionId) !== state || state.turnGeneration !== turnGeneration) return;
+          if (state.cancelled) {
+            pendingError = this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true);
+          } else if (refreshed) {
+            logger.warn(
+              { provider: this.id, sessionId, resumeId: state.resumeId },
+              'Claude credentials refreshed after a transient 403; retrying the original turn once',
+            );
+            await this.startQuery(
+              sessionId,
+              state,
+              payload,
+              allowResumeFallback,
+              connectionClosedRetriesRemaining,
+              authRefreshRetriesRemaining - 1,
+            );
+            return;
+          } else {
+            pendingError = {
+              ...pendingError,
+              message: appendClaudeAuthRecoveryGuidanceUnconditionally(pendingError.message),
+            };
+          }
+        } else {
+          pendingError = {
+            ...pendingError,
+            message: appendClaudeAuthRecoveryGuidanceUnconditionally(pendingError.message),
+          };
+        }
+      }
       if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
         state.started = false;
         logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
-        await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
+        await this.startQuery(
+          sessionId,
+          state,
+          payload,
+          false,
+          connectionClosedRetriesRemaining,
+          authRefreshRetriesRemaining,
+        );
         return;
       }
       if (pendingComplete && allowResumeFallback && startedAsResume && this.isNoResponseRequestedResumeArtifact(state, pendingComplete)) {
@@ -921,7 +1024,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           resumeId: state.resumeId,
           ...(state.model ? { model: state.model } : {}),
         });
-        await this.startQuery(sessionId, state, payload, false, connectionClosedRetriesRemaining);
+        await this.startQuery(
+          sessionId,
+          state,
+          payload,
+          false,
+          connectionClosedRetriesRemaining,
+          authRefreshRetriesRemaining,
+        );
         return;
       }
       if (
@@ -948,6 +1058,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           this.makeConnectionRecoveryPayload(payload),
           false,
           connectionClosedRetriesRemaining - 1,
+          authRefreshRetriesRemaining,
         );
         return;
       }
@@ -984,6 +1095,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const payload = state.currentPayload;
     if (!payload || !state.currentAllowResumeFallback || !state.currentStartedAsResume) return;
     const connectionRetries = state.currentConnectionClosedRetriesRemaining ?? CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT;
+    const authRefreshRetries = state.currentAuthRefreshRetriesRemaining ?? CLAUDE_AUTH_REFRESH_RETRY_LIMIT;
     const previousResumeId = state.resumeId;
     try { state.currentQuery?.close(); } catch {}
     this.terminateChild(state);
@@ -1005,7 +1117,68 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       resumeId: state.resumeId,
       ...(state.model ? { model: state.model } : {}),
     });
-    void this.startQuery(sessionId, state, payload, false, connectionRetries);
+    void this.startQuery(sessionId, state, payload, false, connectionRetries, authRefreshRetries);
+  }
+
+  private claudeCredentialsPath(state: ClaudeSdkSessionState): string {
+    const configuredHome = state.env?.['HOME'] ?? process.env.HOME;
+    return join(configuredHome?.trim() || homedir(), '.claude', '.credentials.json');
+  }
+
+  private readClaudeCredentialsMtimeMs(state: ClaudeSdkSessionState): number | null {
+    try {
+      return statSync(this.claudeCredentialsPath(state)).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
+  private async waitForClaudeCredentialsRefresh(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    turnGeneration: number,
+    previousMtimeMs: number | null,
+  ): Promise<boolean> {
+    if (
+      state.cancelled
+      || this.sessions.get(sessionId) !== state
+      || state.turnGeneration !== turnGeneration
+    ) {
+      return false;
+    }
+    if (previousMtimeMs === null) {
+      logger.warn(
+        { provider: this.id, sessionId },
+        'Claude credential file is unavailable; retrying transient auth failure once without file-based refresh detection',
+      );
+      return true;
+    }
+    const waitMs = getClaudeAuthRefreshDurationMs(
+      'IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS',
+      DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS,
+    );
+    const pollMs = getClaudeAuthRefreshDurationMs(
+      'IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS',
+      DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS,
+    );
+    const deadline = Date.now() + waitMs;
+    while (
+      !state.cancelled
+      && this.sessions.get(sessionId) === state
+      && state.turnGeneration === turnGeneration
+    ) {
+      const currentMtimeMs = this.readClaudeCredentialsMtimeMs(state);
+      if (
+        currentMtimeMs !== null
+        && currentMtimeMs > previousMtimeMs
+      ) {
+        return true;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) return false;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(pollMs, remainingMs)));
+    }
+    return false;
   }
 
   private handleMessage(sessionId: string, state: ClaudeSdkSessionState, msg: SDKMessage, turnGeneration: number): void {
@@ -1230,7 +1403,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       // re-emit its text as a duplicate bubble/completion. A genuine retained
       // task wake resets completed=false before its first assistant frame.
       if (isTopLevelMessage && state.completed) return;
-      const rawAssistantText = appendClaudeAuthRecoveryGuidance(collectAssistantText(msg));
+      const collectedAssistantText = collectAssistantText(msg);
+      const transientCredentialRefresh403 = isClaudeCredentialRefresh403(collectedAssistantText);
+      const rawAssistantText = transientCredentialRefresh403
+        ? collectedAssistantText
+        : appendClaudeAuthRecoveryGuidance(collectedAssistantText);
       const text = this.shouldStripLeakedThink(state) ? stripLeakedThink(rawAssistantText) : rawAssistantText;
       const runtimeSubagentPayload = parseRuntimeSubagentTag(text);
       if (runtimeSubagentPayload) {
@@ -1249,6 +1426,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         }
       }
       if (text) {
+        if (transientCredentialRefresh403) {
+          // Claude Code may refresh its OAuth credentials just after this
+          // diagnostic. Keep it private until consumeQuery can observe the
+          // terminal result and either retry once or report a real failure.
+          state.currentText = text;
+          return;
+        }
         if (/^API Error:\s*Connection closed mid-response/i.test(text.trim())) {
           // Keep the diagnostic long enough to classify a following is_error
           // result whose errors[] is absent, but do not project it as assistant
@@ -1354,9 +1538,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
           : [];
         // Real claude-agent-sdk failures sometimes omit errors[] and expose the
         // only useful reason in the immediately preceding assistant diagnostic.
-        const details = appendClaudeAuthRecoveryGuidance(sdkErrors.length > 0
-          ? sdkErrors.join('; ')
-          : (state.currentText.trim() || 'Claude execution failed'));
+        const sdkDetails = sdkErrors.length > 0 ? sdkErrors.join('; ') : '';
+        const precedingAssistantText = state.currentText.trim();
+        const rawDetails = isClaudeCredentialRefresh403(sdkDetails)
+          ? sdkDetails
+          : isClaudeCredentialRefresh403(precedingAssistantText)
+            ? precedingAssistantText
+            : (sdkDetails || precedingAssistantText || 'Claude execution failed');
+        const details = appendClaudeAuthRecoveryGuidance(rawDetails);
         const connectionClosed = this.isConnectionClosedMidResponseError(details);
         state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, connectionClosed, msg);
         if (connectionClosed) {

@@ -186,6 +186,7 @@ function setElementRect(el: HTMLElement, top: number, height: number): void {
 
 describe('SubSessionWindow metadata wiring', () => {
   const ws = {
+    onMessage: vi.fn(() => () => undefined),
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
     sendSnapshotRequest: vi.fn(),
@@ -762,6 +763,7 @@ describe('SubSessionWindow metadata wiring', () => {
 describe('SubSessionWindow terminal subscription raw mode', () => {
   const releaseHold = vi.fn();
   const ws = {
+    onMessage: vi.fn(() => () => undefined),
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
     holdTerminalRaw: vi.fn(() => releaseHold),
@@ -1486,6 +1488,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
 
 describe('SubSessionWindow desktop file-browser stack integration', () => {
   const ws = {
+    onMessage: vi.fn(() => () => undefined),
     subscribeTerminal: vi.fn(),
     unsubscribeTerminal: vi.fn(),
     sendSnapshotRequest: vi.fn(),

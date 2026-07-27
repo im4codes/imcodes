@@ -22,6 +22,7 @@ import {
   MIN_MAX_QUEUED_CLONES,
   defaultDedicatedExecutionRoutingPreference,
   executionTemplatePrefKey,
+  genericExecutionCloneParentRunId,
   isExecutionCloneParentStage,
   parseDedicatedExecutionRoutingPreference,
   serializeDedicatedExecutionRoutingPreference,
@@ -38,6 +39,10 @@ describe('execution-clone shared constants', () => {
   it('pins the kind discriminant and timeline event name', () => {
     expect(EXECUTION_CLONE_KIND).toBe('execution_clone');
     expect(EXECUTION_CLONE_TIMELINE.TERMINAL).toBe('execution_clone.terminal');
+  });
+
+  it('derives the generic execution parent run id from the command id', () => {
+    expect(genericExecutionCloneParentRunId('cmd-123')).toBe('generic-execution-cmd-123');
   });
 
   it('keeps the parent-stage list + guard stable', () => {

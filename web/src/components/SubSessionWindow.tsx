@@ -31,6 +31,7 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
@@ -46,7 +47,6 @@ import {
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js';
-import { buildMemorySummarySyncMessage, localPersonalMemorySummarySource } from '../memory-summary-sync.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 
@@ -340,10 +340,17 @@ export function SubSessionWindow({
   }, [showFileBrowser, isMobile, onDesktopFileBrowserOpen, onDesktopFileBrowserClose]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
-  const [syncingMemorySummaries, setSyncingMemorySummaries] = useState(false);
   const [composerText, setComposerText] = useState('');
-  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
   const executionRouting = useExecutionRouting(serverId ?? null);
+  const {
+    state: executionCloneLaunchState,
+    launch: launchExecutionClones,
+  } = useExecutionCloneLaunch({
+    ws,
+    connected,
+    sessionName: sub.sessionName,
+    ownerSessionName: sub.parentSession ?? sub.sessionName,
+  });
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
@@ -524,15 +531,6 @@ export function SubSessionWindow({
       else termScrollRef.current?.();
     }, 50);
   }, []);
-  const memorySummaryProjectId = useMemo(() => {
-    const parent = sub.parentSession
-      ? sessions?.find((session) => session.name === sub.parentSession)
-      : undefined;
-    return sub.contextNamespace?.projectId
-      ?? parent?.contextNamespace?.projectId
-      ?? null;
-  }, [sessions, sub.contextNamespace?.projectId, sub.parentSession]);
-
   const executionTemplateDisplayName = useMemo(() => {
     const template = executionRouting.templateSessionName;
     if (!template) return null;
@@ -560,57 +558,17 @@ export function SubSessionWindow({
   const handleRunExecutionClones = useCallback(() => {
     const text = (inputRef.current?.textContent ?? composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
-    const commandId = globalThis.crypto?.randomUUID?.()
-      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setExecutionClonesBusy(true);
-    try {
-      // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
-      // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
-      // dispatched through the delegation path, not the direct human
-      // handleSend path, so — like memory-summary sync / P2P / agent
-      // send_message — it deliberately carries NO resolvedAliases. A `;;(name)`
-      // typed here reaches the (LLM) clone literally. See design.md
-      // "Send-surface coverage → Scope boundary".
-      ws.sendExecutionClones({
-        sessionName: sub.sessionName,
-        text,
-        commandId,
-        dedicatedExecutionRouting: {
-          enabled: true,
-          templateSessionName: executionRouting.templateSessionName,
-          maxParallelClones: executionRouting.limits.maxParallelClones,
-          maxQueuedClones: executionRouting.limits.maxQueuedClones,
-          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
-          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
-        },
-      });
-    } finally {
-      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
-    }
-  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sub.sessionName, ws]);
-
-  const handleSyncMemorySummaries = useCallback(async () => {
-    if (!ws || !connected || syncingMemorySummaries) return;
-    setSyncingMemorySummaries(true);
-    try {
-      const text = await buildMemorySummarySyncMessage(t, memorySummaryProjectId, undefined, {
-        sources: [localPersonalMemorySummarySource(ws)],
-      });
-      if (!text) return;
-      const commandId = globalThis.crypto?.randomUUID?.()
-        ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      // Alias A′ opt-out (Cx1-2): generated memory-summary sync, not a
-      // human-composed message, so it deliberately carries no resolvedAliases.
-      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text, commandId });
-      requestActiveTimelineRefreshAfterUserAction();
-      addOptimisticUserMessage(text, commandId);
-      scrollToBottom();
-    } catch {
-      // Non-blocking context sync: leave normal chat/send controls untouched.
-    } finally {
-      setSyncingMemorySummaries(false);
-    }
-  }, [addOptimisticUserMessage, connected, memorySummaryProjectId, scrollToBottom, sub.sessionName, syncingMemorySummaries, t, ws]);
+    // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
+    // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
+    // dispatched through the delegation path, not the direct human
+    // handleSend path, so — like P2P / agent send_message — it deliberately
+    // carries NO resolvedAliases.
+    launchExecutionClones({
+      text,
+      templateSessionName: executionRouting.templateSessionName,
+      ...executionRouting.limits,
+    });
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
@@ -1012,13 +970,10 @@ export function SubSessionWindow({
           transportActivityDetail={transportActivityDetail}
           sessionError={sessionInfo?.error}
           now={thinkingNow}
-          onSyncMemorySummaries={handleSyncMemorySummaries}
-          syncMemorySummariesBusy={syncingMemorySummaries}
-          syncMemorySummariesDisabled={!connected || !ws || syncingMemorySummaries}
           onRunExecutionClones={handleRunExecutionClones}
-          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesBusy={executionCloneLaunchState.phase === 'pending'}
           runExecutionClonesDisabled={
-            executionClonesBusy
+            executionCloneLaunchState.phase === 'pending'
             || !connected
             || !ws
             || !hasValidExecutionTemplate
@@ -1026,6 +981,7 @@ export function SubSessionWindow({
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
+          runExecutionClonesFeedback={executionCloneLaunchState}
         />
       )}
 
