@@ -667,6 +667,58 @@ afterEach(() => {
 });
 
 describe('App shell', () => {
+  it('keeps Safari viewport height bounded and corrects it on visual viewport scrolling', async () => {
+    const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    const originalClientHeight = Object.getOwnPropertyDescriptor(document.documentElement, 'clientHeight');
+    const visualViewport = new EventTarget() as EventTarget & {
+      height: number;
+      offsetTop: number;
+    };
+    visualViewport.height = 1_100;
+    visualViewport.offsetTop = 0;
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: visualViewport,
+    });
+    Object.defineProperty(window, 'innerHeight', {
+      configurable: true,
+      value: 800,
+    });
+    Object.defineProperty(document.documentElement, 'clientHeight', {
+      configurable: true,
+      value: 780,
+    });
+
+    let view: ReturnType<typeof render> | null = null;
+    try {
+      const { App } = await importApp();
+      view = render(<App />);
+
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--vvh')).toBe('780px');
+      });
+
+      visualViewport.height = 720;
+      visualViewport.dispatchEvent(new Event('scroll'));
+      await waitFor(() => {
+        expect(document.documentElement.style.getPropertyValue('--vvh')).toBe('720px');
+      });
+    } finally {
+      view?.unmount();
+      document.documentElement.style.removeProperty('--vvh');
+      document.documentElement.style.removeProperty('--kbh');
+      if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
+      else Reflect.deleteProperty(window, 'visualViewport');
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+      if (originalClientHeight) {
+        Object.defineProperty(document.documentElement, 'clientHeight', originalClientHeight);
+      } else {
+        Reflect.deleteProperty(document.documentElement, 'clientHeight');
+      }
+    }
+  }, 20_000);
+
   it('renders the login page when session verification fails', async () => {
     apiFetchMock.mockImplementation(async (path: string) => {
       if (path === '/api/auth/user/me') {
