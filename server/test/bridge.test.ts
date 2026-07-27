@@ -1309,6 +1309,60 @@ describe('WsBridge', () => {
       expect(update.run.hop_counts.completed).toBe(1);
     });
 
+    it('relays daemon disk capacity stats to desktop browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const disks = [
+        {
+          mount: '/',
+          totalBytes: 500 * 1024 ** 3,
+          usedBytes: 225 * 1024 ** 3,
+          usedPercent: 45,
+        },
+      ];
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        daemonVersion: '1.2.3',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        disks,
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toMatchObject({ type: 'daemon.stats', disks });
+    });
+
+    it('omits malformed daemon disk stats instead of forwarding a non-array value', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        disks: 'not-an-array',
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toBeDefined();
+      expect(stats).not.toHaveProperty('disks');
+    });
+
     it('translates session_event → session.event', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       daemonWs.emit('message', JSON.stringify({ type: 'session_event', session: 'x' }));
