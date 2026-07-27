@@ -2949,8 +2949,7 @@ ${PREFERENCE_CONTEXT_END}`;
     timelineEmitterEmitMock.mockClear();
 
     r.send('Please recall recent transport memory around recall timeout handling', 'client-recall-hang');
-    await sleep(80);
-    await flushDispatch();
+    await waitForProviderSendCount(localMock.provider, 1);
 
     expect(searchLocalMemorySemanticMock).toHaveBeenCalled();
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
