@@ -4,6 +4,7 @@ import {
   openCodeSdkRuntimeHooks,
 } from '../../src/agent/providers/opencode-sdk.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 
 vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -355,6 +356,22 @@ describe('OpenCodeSdkProvider', () => {
     await vi.waitFor(() => expect(statuses.filter((s) => s.status === 'working').length).toBeGreaterThanOrEqual(2));
 
     // Turn completes → status cleared + completion emitted.
+    harness.queue.push({
+      type: 'message.updated',
+      properties: { info: { id: 'msg-status', sessionID: 'oc-session-1', role: 'assistant' } },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-status',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-status',
+          type: 'text',
+          text: 'Done.',
+        },
+      },
+    });
     harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
     await vi.waitFor(() => expect(completions).toHaveLength(1));
     expect(statuses.at(-1)).toMatchObject({ status: null, label: null });
@@ -537,6 +554,18 @@ describe('OpenCodeSdkProvider', () => {
     expect(usage[0].usage).not.toHaveProperty('cache_read_input_tokens');
 
     harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-final',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-placeholder',
+          type: 'text',
+          text: 'Done.',
+        },
+      },
+    });
+    harness.queue.push({
       type: 'message.updated',
       properties: {
         info: {
@@ -569,6 +598,7 @@ describe('OpenCodeSdkProvider', () => {
     expect(completions[0]).toMatchObject({
       sessionId: 'route-placeholder',
       id: 'msg-placeholder',
+      content: 'Done.',
       status: 'complete',
       metadata: {
         usage: {
@@ -583,6 +613,183 @@ describe('OpenCodeSdkProvider', () => {
     harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
     await Promise.resolve();
     expect(completions).toHaveLength(1);
+    await provider.disconnect();
+  });
+
+  it('keeps the turn running across completed tool-call steps until a final assistant message', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const tools: any[] = [];
+    const completions: any[] = [];
+    const errors: any[] = [];
+    provider.onToolCall((sessionId, tool) => tools.push({ sessionId, ...tool }));
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+    provider.onError((sessionId, error) => errors.push({ sessionId, ...error }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-tool-steps',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'inspect presets');
+
+    harness.prompt.resolve({
+      data: {
+        info: {
+          id: 'msg-tool-step',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'tool-calls',
+          time: { completed: 100 },
+          tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
+        },
+        parts: [{
+          id: 'part-tool-step',
+          callID: 'call-tool-step',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-tool-step',
+          type: 'tool',
+          tool: 'grep',
+          state: { status: 'completed', input: { pattern: 'preset' }, output: 'match' },
+        }],
+      },
+    });
+    await vi.waitFor(() => expect(tools).toHaveLength(1));
+    expect(completions).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-final',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+        },
+      },
+    });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-final',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-final',
+          type: 'text',
+          text: 'Preset inspection complete.',
+        },
+      },
+    });
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-final',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'stop',
+          time: { completed: 200 },
+          tokens: { input: 20, output: 8, cache: { read: 4, write: 0 } },
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(completions[0]).toMatchObject({
+      sessionId: routeId,
+      id: 'msg-final',
+      content: 'Preset inspection complete.',
+      status: 'complete',
+    });
+    expect(errors).toHaveLength(0);
+    await provider.disconnect();
+  });
+
+  it('reports an explicit failure when OpenCode becomes idle without a final response', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const completions: any[] = [];
+    const errors: any[] = [];
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+    provider.onError((sessionId, error) => errors.push({ sessionId, ...error }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-empty-final',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'inspect presets');
+
+    harness.prompt.resolve({
+      data: {
+        info: {
+          id: 'msg-tool-step',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'tool-calls',
+          time: { completed: 100 },
+          tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
+        },
+        parts: [{
+          id: 'part-whitespace',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-tool-step',
+          type: 'text',
+          text: '\n\n',
+        }],
+      },
+    });
+    await Promise.resolve();
+    expect(completions).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-unknown-final',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'unknown',
+          time: { completed: 200 },
+          tokens: { input: 20, output: 8, cache: { read: 4, write: 0 } },
+        },
+      },
+    });
+    await Promise.resolve();
+    expect(completions).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(completions).toHaveLength(0);
+    expect(errors[0]).toMatchObject({
+      sessionId: routeId,
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'OpenCode ended the turn without a final response.',
+      recoverable: false,
+      details: { source: 'session.idle' },
+    });
     await provider.disconnect();
   });
 

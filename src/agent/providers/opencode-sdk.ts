@@ -121,9 +121,14 @@ function positiveNumber(value: unknown): number | undefined {
 
 function isTerminalAssistantMessage(info: Record<string, any> | undefined): boolean {
   if (!info || info.role !== 'assistant') return false;
-  return Boolean(info.error)
-    || safeString(info.finish) !== undefined
-    || positiveNumber(info.time?.completed) !== undefined;
+  if (info.error) return true;
+  const finish = safeString(info.finish)?.toLowerCase();
+  // OpenCode completes a separate assistant message for every model/tool step.
+  // Those intermediate messages carry both time.completed and finish=tool-calls
+  // (or finish=unknown), while the same user turn continues with another
+  // assistant message. Only an explicit final finish ends the IM.codes turn;
+  // session.idle remains the fallback for providers that omit a final reason.
+  return finish !== undefined && finish !== 'tool-calls' && finish !== 'unknown';
 }
 
 function sessionIdFromEvent(event: Record<string, any>): string | undefined {
@@ -894,10 +899,19 @@ export class OpenCodeSdkProvider implements TransportProvider {
 
   private completeOnce(state: OpenCodeSessionState, source: string): void {
     if (!state.busy || state.completionEmitted || state.terminalErrorEmitted || state.cancelled) return;
+    const content = [...state.textParts.values()].join('');
+    if (!content.trim()) {
+      this.failOnce(state, providerError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        'OpenCode ended the turn without a final response.',
+        false,
+        { source },
+      ));
+      return;
+    }
     state.completionEmitted = true;
     state.busy = false;
     this.emitStatus(state.routeId, { status: null, label: null });
-    const content = [...state.textParts.values()].join('');
     const message: AgentMessage = {
       id: state.currentMessageId ?? state.lastUsageMessageId ?? `${state.providerSessionId}:${state.generation}`,
       sessionId: state.routeId,
