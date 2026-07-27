@@ -700,6 +700,7 @@ describe('CodexSdkProvider', () => {
     await waitForCondition(
       () => provider.getSessionDiagnostics('route-auth-cancel')?.activeReason === 'auth-recovery',
     );
+    await waitForCondition(() => childProcessMock.children.length === 2);
     await provider.cancel('route-auth-cancel');
     childProcessMock.setHoldInitialize(false);
     childProcessMock.releaseHeldInitializes();
@@ -756,6 +757,10 @@ describe('CodexSdkProvider', () => {
         activeToolCount: 1,
       });
 
+      firstChild.emits({
+        method: 'item/completed',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-auth-active', type: 'webSearch', action: { type: 'other' } } },
+      });
       firstChild.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
       await waitForCondition(
         () => provider.getActiveWorkSnapshot('route-auth-active')?.activeWorkCount === 0,

@@ -31,7 +31,7 @@
     "start": "node dist/index.ts",
     "test": "vitest run",
     "lint:no-sync-context-store": "node scripts/lint-no-sync-context-store.mjs",
-    "test:unit": "vitest run --project daemon",
+    "test:unit": "vitest run --minWorkers=1 --maxWorkers=3 --project daemon",
     "test:server": "vitest run --project server",
     "test:web": "vitest run --project web",
     "test:e2e": "vitest run --project e2e",
