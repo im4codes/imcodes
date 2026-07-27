@@ -456,7 +456,13 @@
     "execution_clone_run_with_template": "Ejecutar la tarea actual con {{count}} clon(es) de {{name}}",
     "execution_clone_run_no_template": "Activa y elige una sesión de ejecución en la configuración del equipo",
     "execution_clone_run_empty": "Escribe una tarea primero",
-    "execution_clone_run_offline": "Vuelve a conectar antes de ejecutar clones"
+    "execution_clone_run_offline": "Vuelve a conectar antes de ejecutar clones",
+    "execution_clone_launch_pending": "Iniciando {{count}} clones de ejecución…",
+    "execution_clone_launch_success": "Los clones de ejecución están en marcha (hasta {{count}})",
+    "execution_clone_launch_failed": "Error al iniciar los clones de ejecución: {{error}}",
+    "execution_clone_launch_unknown_error": "Error desconocido",
+    "execution_clone_launch_timeout": "Se agotó el tiempo para iniciar los clones de ejecución",
+    "execution_clone_launch_offline": "Los clones de ejecución no se enviaron porque la conexión está desconectada"
   },
   "session": {
     "restart": "↺ Reiniciar",

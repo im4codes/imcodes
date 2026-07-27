@@ -456,7 +456,13 @@
     "execution_clone_run_with_template": "Run current task with {{count}} clone(s) of {{name}}",
     "execution_clone_run_no_template": "Enable and select an execution session in Team settings first",
     "execution_clone_run_empty": "Type a task first",
-    "execution_clone_run_offline": "Reconnect before running execution clones"
+    "execution_clone_run_offline": "Reconnect before running execution clones",
+    "execution_clone_launch_pending": "Starting {{count}} execution clones…",
+    "execution_clone_launch_success": "Execution clones are running (up to {{count}})",
+    "execution_clone_launch_failed": "Execution clones failed: {{error}}",
+    "execution_clone_launch_unknown_error": "Unknown error",
+    "execution_clone_launch_timeout": "Execution clone launch timed out",
+    "execution_clone_launch_offline": "Execution clones were not sent because the connection is offline"
   },
   "session": {
     "restart": "↺ Restart",

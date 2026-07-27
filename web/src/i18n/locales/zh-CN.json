@@ -456,7 +456,13 @@
     "execution_clone_run_with_template": "克隆 {{name}} ×{{count}} 并行执行当前任务",
     "execution_clone_run_no_template": "先在 Team 设置里启用并选择执行会话",
     "execution_clone_run_empty": "请先输入任务",
-    "execution_clone_run_offline": "重连后才能运行执行克隆"
+    "execution_clone_run_offline": "重连后才能运行执行克隆",
+    "execution_clone_launch_pending": "正在启动 {{count}} 个执行克隆…",
+    "execution_clone_launch_success": "执行克隆已开始运行（最多 {{count}} 个）",
+    "execution_clone_launch_failed": "执行克隆启动失败：{{error}}",
+    "execution_clone_launch_unknown_error": "未知错误",
+    "execution_clone_launch_timeout": "执行克隆启动超时",
+    "execution_clone_launch_offline": "连接已断开，执行克隆未发送"
   },
   "session": {
     "restart": "↺ 重启",

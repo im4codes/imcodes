@@ -456,7 +456,13 @@
     "execution_clone_run_with_template": "{{name}} のクローン {{count}} 個で現在のタスクを並列実行",
     "execution_clone_run_no_template": "Team 設定で実行セッションを有効化して選択してください",
     "execution_clone_run_empty": "先にタスクを入力してください",
-    "execution_clone_run_offline": "再接続してから実行クローンを起動してください"
+    "execution_clone_run_offline": "再接続してから実行クローンを起動してください",
+    "execution_clone_launch_pending": "実行クローン {{count}} 個を起動しています…",
+    "execution_clone_launch_success": "実行クローンを開始しました（最大 {{count}} 個）",
+    "execution_clone_launch_failed": "実行クローンの起動に失敗しました：{{error}}",
+    "execution_clone_launch_unknown_error": "不明なエラー",
+    "execution_clone_launch_timeout": "実行クローンの起動がタイムアウトしました",
+    "execution_clone_launch_offline": "接続がオフラインのため実行クローンは送信されませんでした"
   },
   "session": {
     "restart": "↺ 再起動",

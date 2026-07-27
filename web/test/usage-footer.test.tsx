@@ -110,6 +110,40 @@ describe('UsageFooter', () => {
     expect(cloneButton.disabled).toBe(true);
   });
 
+  it('shows pending, success, and error feedback next to the execution-clone launcher', () => {
+    const baseProps = {
+      usage: { inputTokens: 0, cacheTokens: 0, contextWindow: 0 },
+      sessionName: 'deck_test_brain',
+      onRunExecutionClones: vi.fn(),
+      runExecutionClonesCount: 3,
+    };
+    const view = render(
+      <UsageFooter
+        {...baseProps}
+        runExecutionClonesBusy
+        runExecutionClonesFeedback={{ phase: 'pending', requestedCount: 3 }}
+      />,
+    );
+    expect(screen.getByRole('status').textContent).toBe('chat.execution_clone_launch_pending');
+    expect(view.container.querySelector('.shortcut-btn-execution-clones.is-busy')).toBeTruthy();
+
+    view.rerender(
+      <UsageFooter
+        {...baseProps}
+        runExecutionClonesFeedback={{ phase: 'success', requestedCount: 3 }}
+      />,
+    );
+    expect(screen.getByRole('status').textContent).toBe('chat.execution_clone_launch_success');
+
+    view.rerender(
+      <UsageFooter
+        {...baseProps}
+        runExecutionClonesFeedback={{ phase: 'error', requestedCount: 3, error: 'capacity_full' }}
+      />,
+    );
+    expect(screen.getByRole('alert').textContent).toBe('chat.execution_clone_launch_failed');
+  });
+
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
     const { container } = render(
       <UsageFooter

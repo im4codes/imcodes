@@ -456,7 +456,13 @@
     "execution_clone_run_with_template": "Запустить текущую задачу через {{count}} клон(ов) {{name}}",
     "execution_clone_run_no_template": "Сначала включите и выберите сессию выполнения в настройках Team",
     "execution_clone_run_empty": "Сначала введите задачу",
-    "execution_clone_run_offline": "Переподключитесь перед запуском клонов"
+    "execution_clone_run_offline": "Переподключитесь перед запуском клонов",
+    "execution_clone_launch_pending": "Запуск клонов выполнения: {{count}}…",
+    "execution_clone_launch_success": "Клоны выполнения запущены (до {{count}})",
+    "execution_clone_launch_failed": "Не удалось запустить клоны выполнения: {{error}}",
+    "execution_clone_launch_unknown_error": "Неизвестная ошибка",
+    "execution_clone_launch_timeout": "Время ожидания запуска клонов выполнения истекло",
+    "execution_clone_launch_offline": "Клоны выполнения не отправлены: соединение отсутствует"
   },
   "session": {
     "restart": "↺ Перезапустить",

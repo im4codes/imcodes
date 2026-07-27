@@ -31,6 +31,7 @@ import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
+import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
@@ -340,8 +341,16 @@ export function SubSessionWindow({
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const [composerText, setComposerText] = useState('');
-  const [executionClonesBusy, setExecutionClonesBusy] = useState(false);
   const executionRouting = useExecutionRouting(serverId ?? null);
+  const {
+    state: executionCloneLaunchState,
+    launch: launchExecutionClones,
+  } = useExecutionCloneLaunch({
+    ws,
+    connected,
+    sessionName: sub.sessionName,
+    ownerSessionName: sub.parentSession ?? sub.sessionName,
+  });
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
@@ -549,34 +558,17 @@ export function SubSessionWindow({
   const handleRunExecutionClones = useCallback(() => {
     const text = (inputRef.current?.textContent ?? composerText).trim();
     if (!ws || !connected || !hasValidExecutionTemplate || !executionRouting.templateSessionName || !text) return;
-    const commandId = globalThis.crypto?.randomUUID?.()
-      ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setExecutionClonesBusy(true);
-    try {
-      // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
-      // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
-      // dispatched through the delegation path, not the direct human
-      // handleSend path, so — like P2P / agent send_message — it deliberately
-      // carries NO resolvedAliases. A `;;(name)`
-      // typed here reaches the (LLM) clone literally. See design.md
-      // "Send-surface coverage → Scope boundary".
-      ws.sendExecutionClones({
-        sessionName: sub.sessionName,
-        text,
-        commandId,
-        dedicatedExecutionRouting: {
-          enabled: true,
-          templateSessionName: executionRouting.templateSessionName,
-          maxParallelClones: executionRouting.limits.maxParallelClones,
-          maxQueuedClones: executionRouting.limits.maxQueuedClones,
-          cloneHardTimeoutMs: executionRouting.limits.cloneHardTimeoutMs,
-          cloneRetentionMs: executionRouting.limits.cloneRetentionMs,
-        },
-      });
-    } finally {
-      window.setTimeout(() => setExecutionClonesBusy(false), 1200);
-    }
-  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, sub.sessionName, ws]);
+    // Alias A′ scope boundary (Cx1-2): the composer text is wrapped into a
+    // generated worker prompt (buildGenericExecutionCloneWorkerPrompt) and
+    // dispatched through the delegation path, not the direct human
+    // handleSend path, so — like P2P / agent send_message — it deliberately
+    // carries NO resolvedAliases.
+    launchExecutionClones({
+      text,
+      templateSessionName: executionRouting.templateSessionName,
+      ...executionRouting.limits,
+    });
+  }, [composerText, connected, executionRouting.limits, executionRouting.templateSessionName, hasValidExecutionTemplate, launchExecutionClones, ws]);
 
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
@@ -979,9 +971,9 @@ export function SubSessionWindow({
           sessionError={sessionInfo?.error}
           now={thinkingNow}
           onRunExecutionClones={handleRunExecutionClones}
-          runExecutionClonesBusy={executionClonesBusy}
+          runExecutionClonesBusy={executionCloneLaunchState.phase === 'pending'}
           runExecutionClonesDisabled={
-            executionClonesBusy
+            executionCloneLaunchState.phase === 'pending'
             || !connected
             || !ws
             || !hasValidExecutionTemplate
@@ -989,6 +981,7 @@ export function SubSessionWindow({
           }
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
+          runExecutionClonesFeedback={executionCloneLaunchState}
         />
       )}
 

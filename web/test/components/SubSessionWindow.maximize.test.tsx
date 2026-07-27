@@ -122,6 +122,7 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 }
 
 const ws = {
+  onMessage: vi.fn(() => () => undefined),
   subscribeTerminal: vi.fn(),
   unsubscribeTerminal: vi.fn(),
   sendSnapshotRequest: vi.fn(),

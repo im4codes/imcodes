@@ -28,6 +28,7 @@ import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { useVerticalResize } from '../hooks/useVerticalResize.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { onExecutionCloneGroupReveal } from '../execution-clone-ui.js';
 
 interface Props {
   serverId?: string | null;
@@ -254,6 +255,23 @@ function SessionTreeInner({
       return next;
     });
   }, [serverId, sessions]);
+
+  useEffect(() => onExecutionCloneGroupReveal(({ ownerSessionName, parentRunId }) => {
+    const groupKey = cloneGroupKey(ownerSessionName, parentRunId);
+    setOpenCloneGroups((prev) => {
+      if (prev.has(groupKey)) return prev;
+      const next = new Set(prev);
+      next.add(groupKey);
+      return next;
+    });
+    setCollapsed((prev) => {
+      if (!prev.has(ownerSessionName)) return prev;
+      const next = new Set(prev);
+      next.delete(ownerSessionName);
+      saveCollapsed(serverId, next);
+      return next;
+    });
+  }), [serverId]);
 
   const toggleCloneGroup = (key: string) => {
     setOpenCloneGroups((prev) => {

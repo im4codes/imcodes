@@ -197,6 +197,7 @@ import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_PARENT_STAGES,
+  genericExecutionCloneParentRunId,
   parseDedicatedExecutionRoutingPreference,
   type DedicatedExecutionRoutingGlobalPreference,
 } from '../../shared/execution-clone.js';
@@ -2880,7 +2881,7 @@ async function handleSessionExecutionClones(cmd: Record<string, unknown>, server
     enabled: true,
   };
   const workerTotal = Math.max(1, pref.maxParallelClones);
-  const parentRunId = `generic-execution-${commandId}`;
+  const parentRunId = genericExecutionCloneParentRunId(commandId);
   const parentStage = EXECUTION_CLONE_PARENT_STAGES[0];
   const owningMainSessionName = callerRecord.parentSession ?? callerRecord.name;
   const projectName = callerRecord.projectName ?? getSession(owningMainSessionName)?.projectName ?? null;
