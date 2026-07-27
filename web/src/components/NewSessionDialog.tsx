@@ -209,7 +209,7 @@ export function NewSessionDialog({
     () => ccPresets.find((preset) => preset.name === ccPreset),
     [ccPreset, ccPresets],
   );
-  const qwenPresetModels = useMemo(
+  const selectedPresetModels = useMemo(
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
@@ -527,22 +527,31 @@ export function NewSessionDialog({
   const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
     ? agentType
     : null;
-  const transportModels = useTransportModels(ws, dynamicModelsAgentType);
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    agentType === "claude-code-sdk" ? ccPreset : undefined,
+  );
   const modelSuggestions = useMemo(() => {
-    if (agentType === "qwen" && selectedCcPreset) return qwenPresetModels;
+    if ((agentType === "qwen" || agentType === "claude-code-sdk") && selectedCcPreset) {
+      return mergeModelSuggestions(
+        selectedPresetModels,
+        transportModels.models.map((model) => model.id),
+      );
+    }
     if (transportModels.models.length > 0) {
       const dynamicModelIds = transportModels.models.map((m) => m.id);
       if (agentType === "gemini-sdk") return mergeModelSuggestions(GEMINI_SDK_MODEL_FALLBACK, dynamicModelIds);
       if (agentType === "codex-sdk") return mergeModelSuggestions(CODEX_SDK_MODEL_FALLBACK, dynamicModelIds);
       return dynamicModelIds;
     }
-    if (agentType === "qwen") return qwenPresetModels;
+    if (agentType === "qwen") return selectedPresetModels;
     if (agentType === "copilot-sdk") return [...COPILOT_SDK_MODEL_FALLBACK];
     if (agentType === "codex-sdk") return [...CODEX_SDK_MODEL_FALLBACK];
     if (agentType === "cursor-headless") return [...CURSOR_HEADLESS_MODEL_FALLBACK];
     if (agentType === "gemini-sdk") return [...GEMINI_SDK_MODEL_FALLBACK];
     return [] as string[];
-  }, [transportModels.models, agentType, qwenPresetModels, selectedCcPreset]);
+  }, [transportModels.models, agentType, selectedPresetModels, selectedCcPreset]);
 
   useEffect(() => {
     if (agentType !== "codex-sdk") return;
@@ -565,7 +574,10 @@ export function NewSessionDialog({
   }, [agentType, qwenCompatibleApiPresetSelected]);
 
   useEffect(() => {
-    if (agentType !== "qwen") return;
+    if (
+      (agentType !== "qwen" && agentType !== "claude-code-sdk")
+      || !selectedCcPreset
+    ) return;
     const fallbackModel = selectedCcPreset ? (getCcPresetEffectiveModel(selectedCcPreset) ?? "") : "";
     setRequestedModel((current) => {
       if (modelSuggestions.length === 0) {

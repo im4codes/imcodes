@@ -1504,7 +1504,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const dynamicModelsAgentType = supportsDynamicTransportModels(activeSession?.agentType)
     ? activeSession!.agentType
     : null;
-  const dynamicTransportModels = useTransportModels(ws, dynamicModelsAgentType);
+  const dynamicTransportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    activeSession?.agentType === 'claude-code-sdk' ? activeSession.ccPreset : undefined,
+  );
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
     if (dynamicTransportModels.models.length > 0) {
       const dynamicModelIds = dynamicTransportModels.models.map((m) => m.id);
@@ -1570,9 +1574,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? claudeSessionModel
     : null;
   const displayedClaudeModel = claudePinnedModel ?? model;
-  const claudeModelSuggestions = claudePinnedModel
-    ? [claudePinnedModel]
-    : CLAUDE_CODE_MODEL_IDS;
+  const claudeModelSuggestions = activeSession?.agentType === 'claude-code-sdk'
+    && activeSession.ccPreset
+    ? mergeModelSuggestions(
+        claudePinnedModel ? [claudePinnedModel] : [],
+        dynamicTransportModels.models.map((candidate) => candidate.id),
+      )
+    : claudePinnedModel
+      ? [claudePinnedModel]
+      : CLAUDE_CODE_MODEL_IDS;
   const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
     && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
@@ -4768,7 +4778,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
-              onClick={() => setModelOpen((o) => !o)}
+              onClick={() => toggleModelMenu({
+                refreshDynamic: activeSession?.agentType === 'claude-code-sdk',
+              })}
               disabled={disabled}
               title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
               style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}

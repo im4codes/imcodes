@@ -1776,7 +1776,10 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       }
     }
 
-    if (typeof info.model === 'string' && info.model) {
+    const presetSelectedModelIsAuthoritative = agentType === 'claude-code-sdk'
+      && !!next.ccPreset
+      && !!next.requestedModel;
+    if (typeof info.model === 'string' && info.model && !presetSelectedModelIsAuthoritative) {
       if (next.activeModel !== info.model) {
         next.activeModel = info.model;
         changed = true;
@@ -2198,8 +2201,15 @@ export async function restoreTransportSessions(
       runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
       if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
-        extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
-        const presetOverrides = await getPresetTransportOverrides(s.ccPreset);
+        extraEnv = await resolvePresetEnv(
+          s.ccPreset,
+          s.ccSessionId ?? undefined,
+          effectiveRequestedModel,
+        );
+        const presetOverrides = await getPresetTransportOverrides(
+          s.ccPreset,
+          effectiveRequestedModel,
+        );
         if (!effectiveRequestedModel && presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
         restoredPresetContextWindow = presetOverrides.contextWindow ?? restoredPresetContextWindow;
         systemPrompt = presetOverrides.systemPrompt;
@@ -2577,8 +2587,14 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     if (effectiveCcPreset) {
       const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
-      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(effectiveCcPreset, transportResumeId)) };
-      const presetOverrides = await getPresetTransportOverrides(effectiveCcPreset);
+      transportEnv = {
+        ...(transportEnv ?? {}),
+        ...(await resolvePresetEnv(effectiveCcPreset, transportResumeId, requestedTransportModel)),
+      };
+      const presetOverrides = await getPresetTransportOverrides(
+        effectiveCcPreset,
+        requestedTransportModel,
+      );
       if (!requestedTransportModel && presetOverrides.model) requestedTransportModel = presetOverrides.model;
       presetContextWindow = presetOverrides.contextWindow;
       transportSystemPrompt = presetOverrides.systemPrompt;

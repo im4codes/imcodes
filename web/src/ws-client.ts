@@ -574,7 +574,7 @@ export class WsClient {
   private shouldStaggerNonCriticalMessage(msg: object): boolean {
     if (this.postConnectNonCriticalUntil <= Date.now()) return false;
     const type = (msg as { type?: unknown }).type;
-    if (type === 'transport.list_models') {
+    if (type === TRANSPORT_MSG.LIST_MODELS) {
       return (msg as { force?: unknown }).force !== true;
     }
     return type === 'fs.ls' || type === 'fs.git_status';

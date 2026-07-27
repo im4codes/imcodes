@@ -665,7 +665,7 @@ export function classifyServerSendPlane(msgType: string | undefined): ServerSend
   if (
     (Object.values(TIMELINE_MESSAGES) as string[]).includes(msgType)
     || msgType.startsWith('fs.')
-    || msgType === 'transport.models_response'
+    || msgType === TRANSPORT_MSG.MODELS_RESPONSE
     || msgType === 'chat.history'
     || msgType === 'diagnostics.response'
   ) {

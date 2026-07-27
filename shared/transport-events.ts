@@ -108,6 +108,10 @@ export const TRANSPORT_MSG = {
   LIST_SESSIONS: "provider.list_sessions",
   /** Daemon → Browser: response with remote sessions list. */
   SESSIONS_RESPONSE: "provider.sessions_response",
+  /** Browser → Daemon: list models for a transport provider or CC preset. */
+  LIST_MODELS: "transport.list_models",
+  /** Daemon → Browser: response with provider/preset model options. */
+  MODELS_RESPONSE: "transport.models_response",
 } as const;
 
 /** Union of all TRANSPORT_MSG values. */

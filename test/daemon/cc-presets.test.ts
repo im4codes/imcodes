@@ -37,6 +37,7 @@ describe('cc presets', () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     vi.resetModules();
     if (state.home) await rm(state.home, { recursive: true, force: true });
     state.home = '';
@@ -84,6 +85,89 @@ describe('cc presets', () => {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7',
       IMCODES_CONTEXT_WINDOW: '200000',
     });
+  });
+
+  it('applies a per-session model across the provider model aliases and runtime prompt', async () => {
+    const { resolvePresetEnv, getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+
+    await expect(resolvePresetEnv('MiniMax', undefined, 'MiniMax-M3')).resolves.toMatchObject({
+      ANTHROPIC_MODEL: 'MiniMax-M3',
+      ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3',
+    });
+    await expect(getPresetTransportOverrides('MiniMax', 'MiniMax-M3')).resolves.toMatchObject({
+      model: 'MiniMax-M3',
+      systemPrompt: expect.stringContaining('Authoritative runtime model: MiniMax-M3.'),
+    });
+  });
+
+  it('discovers and persists every page from the Anthropic-compatible models API', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'MiniMax-M3', display_name: 'MiniMax M3' },
+            { id: 'MiniMax-M2.7' },
+          ],
+          has_more: true,
+          last_id: 'MiniMax-M2.7',
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { id: 'MiniMax-M2.7' },
+            { id: 'MiniMax-M2.7-highspeed' },
+          ],
+          has_more: false,
+        }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const { refreshPresetModels, getPreset } = await import('../../src/daemon/cc-presets.js');
+
+    const catalog = await refreshPresetModels('MiniMax');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstUrl = new URL(String(fetchMock.mock.calls[0][0]));
+    const secondUrl = new URL(String(fetchMock.mock.calls[1][0]));
+    expect(`${firstUrl.origin}${firstUrl.pathname}`).toBe('https://api.minimax.io/anthropic/v1/models');
+    expect(firstUrl.searchParams.get('limit')).toBe('1000');
+    expect(secondUrl.searchParams.get('after_id')).toBe('MiniMax-M2.7');
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      headers: {
+        'x-api-key': 'test-token',
+        'anthropic-version': '2023-06-01',
+      },
+    });
+    expect(catalog.models).toEqual([
+      { id: 'MiniMax-M3', name: 'MiniMax M3' },
+      { id: 'MiniMax-M2.7' },
+      { id: 'MiniMax-M2.7-highspeed' },
+    ]);
+    expect(catalog.defaultModel).toBe('MiniMax-M2.7');
+    await expect(getPreset('minimax')).resolves.toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      availableModels: catalog.models,
+    });
+  });
+
+  it('preserves an authenticated models endpoint error instead of masking it with a fallback 404', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { discoverPresetModels, getPreset } = await import('../../src/daemon/cc-presets.js');
+    const preset = await getPreset('MiniMax');
+
+    await expect(discoverPresetModels(preset!)).rejects.toThrow('HTTP 401 Unauthorized');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/anthropic/v1/models');
   });
 
   it('builds qwen transport config for anthropic-compatible presets', async () => {

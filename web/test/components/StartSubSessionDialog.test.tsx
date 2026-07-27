@@ -263,18 +263,25 @@ describe('StartSubSessionDialog', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it('shows CC preset controls and passes preset for claude-code-sdk sub-sessions (default)', () => {
+  it('selects a CC SDK model from one preset for a sub-session', async () => {
     const onStart = vi.fn();
-    const ws = makeWs();
-    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
-      handler({
-        type: 'cc.presets.list_response',
-        presets: [
-          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
-        ],
-      });
-      return () => {};
-    });
+    const handlers = new Set<(msg: unknown) => void>();
+    const ws = {
+      ...makeWs(),
+      connected: true,
+      onMessage: vi.fn((handler: (msg: unknown) => void) => {
+        handlers.add(handler);
+        handler({
+          type: 'cc.presets.list_response',
+          presets: [{
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-M3' }],
+          }],
+        });
+        return () => handlers.delete(handler);
+      }),
+    };
 
     render(
       <StartSubSessionDialog
@@ -296,12 +303,24 @@ describe('StartSubSessionDialog', () => {
     expect(presetSelect).toBeDefined();
     presetSelect!.value = 'MiniMax';
     fireEvent.input(presetSelect!, { target: { value: presetSelect!.value } });
+    const modelSelect = await waitFor(() => {
+      const found = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax-M3'));
+      expect(found).toBeDefined();
+      return found!;
+    });
+    fireEvent.input(modelSelect, { target: { value: 'MiniMax-M3' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith(
       'claude-code-sdk', undefined, '/tmp', undefined,
-      expect.objectContaining({ ccPreset: 'MiniMax' }),
+      expect.objectContaining({ ccPreset: 'MiniMax', requestedModel: 'MiniMax-M3' }),
     );
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.list_models',
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+    }));
   });
 
   it('shows the qwen provider-specific hint for qwen sub-sessions', async () => {

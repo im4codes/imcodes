@@ -4151,11 +4151,12 @@ afterEach(() => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
-  it('shows the preset model for claude-code-sdk sessions instead of stale local opus', () => {
+  it('discovers and switches models within an active CC SDK preset session', async () => {
     localStorage.setItem('imcodes-model', 'opus[1M]');
+    const ws = makeWs();
 
     render(<SessionControls
-      ws={makeWs() as any}
+      ws={ws as any}
       activeSession={makeSession({
         name: 'deck_sub_minimax',
         agentType: 'claude-code-sdk',
@@ -4168,8 +4169,32 @@ afterEach(() => {
       quickData={makeQuickData() as any}
     />);
 
+    const request = await waitFor(() => {
+      const found = ws.send.mock.calls
+        .map((call) => call[0])
+        .find((message) => (
+          message?.type === 'transport.list_models'
+          && message?.agentType === 'claude-code-sdk'
+          && message?.ccPreset === 'minimax'
+        ));
+      expect(found).toBeDefined();
+      return found;
+    });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'claude-code-sdk',
+      ccPreset: 'minimax',
+      requestId: request.requestId,
+      models: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }],
+      defaultModel: 'MiniMax-M3',
+    }));
     fireEvent.click(screen.getByRole('button', { name: /^MiniMax-M3$/i }));
     expect(screen.getByRole('button', { name: /^● MiniMax-M3$/i })).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: /^○ MiniMax-M2.7$/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_sub_minimax',
+      text: '/model MiniMax-M2.7',
+    }));
     expect(screen.queryByRole('button', { name: /opus/i })).toBeNull();
   });
 

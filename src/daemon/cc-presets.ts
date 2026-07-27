@@ -149,7 +149,11 @@ export function getPresetAvailableModelIds(preset: Pick<CcPreset, 'availableMode
  * Resolve a preset name to env vars ready for session launch.
  * Auto-fills MODEL_ALIASES from ANTHROPIC_MODEL if set.
  */
-export async function resolvePresetEnv(presetName: string, ccSessionId?: string): Promise<Record<string, string>> {
+export async function resolvePresetEnv(
+  presetName: string,
+  ccSessionId?: string,
+  modelOverride?: string,
+): Promise<Record<string, string>> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const env = { ...preset.env };
@@ -158,12 +162,15 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   if (env['ANTHROPIC_AUTH_TOKEN'] && !env['ANTHROPIC_API_KEY']) {
     env['ANTHROPIC_API_KEY'] = env['ANTHROPIC_AUTH_TOKEN'];
   }
-  const effectiveModel = getPresetEffectiveModel(preset);
+  const effectiveModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
   if (effectiveModel) env['ANTHROPIC_MODEL'] = effectiveModel;
   // Auto-fill model aliases from ANTHROPIC_MODEL
   if (env['ANTHROPIC_MODEL']) {
     for (const alias of MODEL_ALIASES) {
-      if (!env[alias]) env[alias] = env['ANTHROPIC_MODEL'];
+      // A per-session model selection must override aliases persisted by an
+      // older one-model-per-preset config. Otherwise the SDK may still route
+      // "sonnet"/"opus"/"haiku" through the preset's previous default.
+      if (modelOverride?.trim() || !env[alias]) env[alias] = env['ANTHROPIC_MODEL'];
     }
   }
   // Set context window hint as env var so daemon can report it in usage events
@@ -176,15 +183,18 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   return env;
 }
 
-export async function getPresetTransportOverrides(presetName: string): Promise<{
+export async function getPresetTransportOverrides(
+  presetName: string,
+  modelOverride?: string,
+): Promise<{
   model?: string;
   systemPrompt?: string;
   contextWindow?: number;
 }> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
-  const env = await resolvePresetEnv(presetName);
-  const configuredModel = getPresetEffectiveModel(preset);
+  const configuredModel = modelOverride?.trim() || getPresetEffectiveModel(preset);
+  const env = await resolvePresetEnv(presetName, undefined, configuredModel);
   const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
   const runtimeFacts = [
     `Authoritative runtime fact: this session is using the Claude Code preset "${preset.name}".`,
@@ -298,9 +308,14 @@ function getDiscoveryCandidates(baseUrl: string): string[] {
   const candidates = new Set<string>();
   if (trimmed.endsWith('/models')) {
     candidates.add(trimmed);
-  } else {
+  } else if (/\/v\d+(?:$|\/)/.test(trimmed)) {
     candidates.add(`${trimmed}/models`);
-    if (!/\/v\d+(?:$|\/)/.test(trimmed)) candidates.add(`${trimmed}/v1/models`);
+  } else {
+    // Anthropic-compatible providers standardize on /v1/models. Try that
+    // first so MiniMax and the official Claude API do not pay a guaranteed
+    // 404 round-trip through the unversioned path.
+    candidates.add(`${trimmed}/v1/models`);
+    candidates.add(`${trimmed}/models`);
   }
   return [...candidates];
 }
@@ -330,6 +345,8 @@ function parseDiscoveredModels(payload: unknown): CcPresetModelInfo[] {
   return models;
 }
 
+class CompatibleModelsEndpointUnavailableError extends Error {}
+
 export async function discoverPresetModels(preset: CcPreset): Promise<{
   availableModels: CcPresetModelInfo[];
   defaultModel?: string;
@@ -344,18 +361,53 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
   let lastError: Error | null = null;
   for (const endpoint of getDiscoveryCandidates(baseUrl)) {
     try {
-      const response = await fetch(endpoint, {
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          accept: 'application/json',
-        },
-      });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+      const availableModels: CcPresetModelInfo[] = [];
+      const seen = new Set<string>();
+      let afterId: string | undefined;
+      // Anthropic's list endpoint is cursor-paginated. The page cap prevents a
+      // broken compatible gateway from returning an endless has_more loop.
+      for (let page = 0; page < 100; page += 1) {
+        const url = new URL(endpoint);
+        url.searchParams.set('limit', '1000');
+        if (afterId) url.searchParams.set('after_id', afterId);
+        const response = await fetch(url, {
+          headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            accept: 'application/json',
+          },
+        });
+        if (!response.ok) {
+          const message = `HTTP ${response.status} ${response.statusText}`.trim();
+          if (response.status === 404 || response.status === 405) {
+            throw new CompatibleModelsEndpointUnavailableError(message);
+          }
+          // Authentication, rate-limit, and provider failures prove that this
+          // endpoint exists. Do not replace a useful 401/429/5xx diagnosis
+          // with the fallback endpoint's likely 404.
+          throw new Error(message);
+        }
+        const payload = await response.json() as unknown;
+        for (const model of parseDiscoveredModels(payload)) {
+          if (seen.has(model.id)) continue;
+          seen.add(model.id);
+          availableModels.push(model);
+        }
+        const payloadRecord = payload && typeof payload === 'object'
+          ? payload as Record<string, unknown>
+          : {};
+        if (payloadRecord.has_more !== true) break;
+        const nextAfterId = typeof payloadRecord.last_id === 'string'
+          ? payloadRecord.last_id.trim()
+          : '';
+        if (!nextAfterId || nextAfterId === afterId) {
+          throw new Error('Compatible models API returned an invalid pagination cursor');
+        }
+        afterId = nextAfterId;
+        if (page === 99) {
+          throw new Error('Compatible models API exceeded the pagination limit');
+        }
       }
-      const payload = await response.json() as unknown;
-      const availableModels = parseDiscoveredModels(payload);
       if (availableModels.length === 0) {
         throw new Error('No models returned by compatible API');
       }
@@ -364,9 +416,90 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
       return { availableModels, defaultModel, endpoint };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      if (!(error instanceof CompatibleModelsEndpointUnavailableError)) throw lastError;
     }
   }
   throw lastError ?? new Error('Failed to discover models');
+}
+
+export interface CcPresetModelCatalog {
+  preset: CcPreset;
+  models: CcPresetModelInfo[];
+  defaultModel?: string;
+  endpoint?: string;
+}
+
+function getStoredPresetModelCatalog(preset: CcPreset): CcPresetModelCatalog {
+  const discovered = preset.availableModels ?? [];
+  const models = discovered.length > 0
+    ? discovered
+    : getPresetAvailableModelIds(preset).map((id) => ({ id }));
+  const effectiveModel = getPresetEffectiveModel(preset);
+  const defaultModel = effectiveModel && models.some((model) => model.id === effectiveModel)
+    ? effectiveModel
+    : models[0]?.id;
+  return {
+    preset,
+    models,
+    ...(defaultModel ? { defaultModel } : {}),
+  };
+}
+
+/**
+ * Refresh one preset's model catalog and persist it without changing the
+ * preset's default model. A preset represents provider credentials/endpoint;
+ * the selected model remains per-session state.
+ */
+export async function refreshPresetModels(presetName: string): Promise<CcPresetModelCatalog> {
+  const preset = await getPreset(presetName);
+  if (!preset) throw new Error(`Preset "${presetName}" not found`);
+  const normalizedName = normalizeCcPresetName(preset.name);
+  try {
+    const discovered = await discoverPresetModels(preset);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find(
+      (item) => normalizeCcPresetName(item.name) === normalizedName,
+    ) ?? preset;
+    const updatedPreset: CcPreset = {
+      ...latestPreset,
+      transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
+      authType: latestPreset.authType ?? 'anthropic',
+      availableModels: discovered.availableModels,
+      lastDiscoveredAt: Date.now(),
+      modelDiscoveryError: undefined,
+    };
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
+    )));
+    const catalog = getStoredPresetModelCatalog(updatedPreset);
+    return { ...catalog, endpoint: discovered.endpoint };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const latestPresets = await loadPresets();
+    const latestPreset = latestPresets.find(
+      (item) => normalizeCcPresetName(item.name) === normalizedName,
+    ) ?? preset;
+    const updatedPreset: CcPreset = {
+      ...latestPreset,
+      modelDiscoveryError: message,
+    };
+    await savePresets(latestPresets.map((item) => (
+      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
+    )));
+    throw error;
+  }
+}
+
+export async function getPresetModelCatalog(
+  presetName: string,
+  force = false,
+): Promise<CcPresetModelCatalog> {
+  const preset = await getPreset(presetName);
+  if (!preset) throw new Error(`Preset "${presetName}" not found`);
+  if (force || !preset.availableModels?.length) {
+    return await refreshPresetModels(preset.name);
+  }
+  return getStoredPresetModelCatalog(preset);
 }
 
 /** Default init message for non-Anthropic providers (no native web search). */
