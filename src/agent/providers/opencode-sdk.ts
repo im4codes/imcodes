@@ -752,6 +752,10 @@ export class OpenCodeSdkProvider implements TransportProvider {
   }
 
   private processAssistantPart(state: OpenCodeSessionState, part: Record<string, any>, delta?: string): void {
+    // The prompt result can settle the turn before the SSE stream flushes its
+    // duplicate reasoning/text/tool parts. Do not let those stale parts revive
+    // "thinking" or publish data after completeOnce/failOnce cleared `busy`.
+    if (!state.busy) return;
     state.currentMessageId = safeString(part.messageID) ?? state.currentMessageId;
     if (part.type === 'text') {
       const partId = safeString(part.id) ?? randomUUID();

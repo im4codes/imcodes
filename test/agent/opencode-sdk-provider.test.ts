@@ -329,7 +329,7 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
-  it('ignores a stale busy status frame that arrives after the turn completed', async () => {
+  it('ignores stale progress frames and parts that arrive after the turn completed', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       harness.startOptions.push(options as unknown as Record<string, unknown>);
@@ -377,10 +377,21 @@ describe('OpenCodeSdkProvider', () => {
     expect(statuses.at(-1)).toMatchObject({ status: null, label: null });
     const countAfterComplete = statuses.length;
 
-    // A STALE busy frame (a delayed SSE flush after the tool restarted the
-    // network) must NOT re-show "working" — regression: the footer got stranded
-    // on "OpenCode is working…" while the session was already idle.
+    // STALE progress (a delayed SSE flush after the prompt result settled) must
+    // not re-show "working" or "thinking" after the session is already idle.
     harness.queue.push({ type: 'session.status', properties: { sessionID: 'oc-session-1', status: { type: 'busy' } } });
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-stale-reasoning',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-status',
+          type: 'reasoning',
+          text: 'stale reasoning',
+        },
+      },
+    });
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(statuses.length).toBe(countAfterComplete);
     expect(statuses.at(-1)).toMatchObject({ status: null });
