@@ -950,6 +950,48 @@ describe('ClaudeCodeSdkProvider', () => {
     }
   });
 
+  it('retries one transient auth 403 immediately when the credential file is unavailable', async () => {
+    const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
+    const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-no-file-'));
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS = '5000';
+    process.env.IMCODES_CLAUDE_AUTH_REFRESH_POLL_MS = '5';
+    sdkMock.setNextMessageBatches([
+      [
+        { type: 'assistant', session_id: 'session-auth-no-file', message: { content: [{ type: 'text', text: authError }] } },
+        { type: 'result', session_id: 'session-auth-no-file', subtype: 'error', is_error: true, errors: [authError] },
+      ],
+      [
+        { type: 'result', session_id: 'session-auth-no-file', subtype: 'success', is_error: false, result: 'Recovered without credential file', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+      ],
+    ]);
+
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({
+        sessionKey: 'route-auth-no-file',
+        cwd: '/tmp/project',
+        env: { HOME: tempHome },
+      });
+      const deltas: string[] = [];
+      const completed: string[] = [];
+      const errors: string[] = [];
+      provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+      provider.onComplete((_sid, message) => completed.push(message.content));
+      provider.onError((_sid, error) => errors.push(error.message));
+
+      await provider.send('route-auth-no-file', 'hello');
+      await waitFor(() => completed.length === 1);
+
+      expect(sdkMock.runs.map((run) => run.prompt)).toEqual(['hello', 'hello']);
+      expect(deltas).toEqual([]);
+      expect(completed).toEqual(['Recovered without credential file']);
+      expect(errors).toEqual([]);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
   it('reports the transient auth 403 when Claude credentials do not refresh in time', async () => {
     const authError = 'Failed to authenticate. API Error: 403 Request not allowed';
     const tempHome = await mkdtemp(join(tmpdir(), 'imcodes-claude-auth-timeout-'));

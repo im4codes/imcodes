@@ -70,8 +70,11 @@ const CONNECTION_CLOSED_CONTINUE_RETRY_LIMIT = 2;
 const CONNECTION_CLOSED_CONTINUE_PROMPT = 'continue';
 const DEFAULT_SUBAGENT_STALE_WITHOUT_TERMINAL_MS = 15 * 60 * 1000;
 const CLAUDE_AUTH_REFRESH_RETRY_LIMIT = 1;
+// This is a maximum recovery window, not a fixed delay: the credential poll
+// returns as soon as the file changes. Keep enough tail for the observed slow
+// refresh path while polling quickly for the normal few-second path.
 const DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS = 2 * 60 * 1000;
-const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 1_000;
+const DEFAULT_CLAUDE_AUTH_REFRESH_POLL_MS = 500;
 const CLAUDE_AUTH_RECOVERY_GUIDANCE = 'Authentication recovery required: run `/logout`, fully exit Claude Code, then reopen it and run `/login` before retrying.';
 
 // Claude Code ships native scheduling tools (RemoteTrigger creates a claude.ai
@@ -1136,6 +1139,20 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     turnGeneration: number,
     previousMtimeMs: number | null,
   ): Promise<boolean> {
+    if (
+      state.cancelled
+      || this.sessions.get(sessionId) !== state
+      || state.turnGeneration !== turnGeneration
+    ) {
+      return false;
+    }
+    if (previousMtimeMs === null) {
+      logger.warn(
+        { provider: this.id, sessionId },
+        'Claude credential file is unavailable; retrying transient auth failure once without file-based refresh detection',
+      );
+      return true;
+    }
     const waitMs = getClaudeAuthRefreshDurationMs(
       'IMCODES_CLAUDE_AUTH_REFRESH_WAIT_MS',
       DEFAULT_CLAUDE_AUTH_REFRESH_WAIT_MS,
@@ -1153,7 +1170,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       const currentMtimeMs = this.readClaudeCredentialsMtimeMs(state);
       if (
         currentMtimeMs !== null
-        && (previousMtimeMs === null || currentMtimeMs > previousMtimeMs)
+        && currentMtimeMs > previousMtimeMs
       ) {
         return true;
       }
