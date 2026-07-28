@@ -267,12 +267,63 @@ describe('CronManager', () => {
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       targetRole: 'brain',
       targetSessionName: 'deck_sub_52123h2r',
+      completionPolicy: 'recurring',
       action: {
         type: 'command',
         command: 'Please check this task',
       },
     });
     expect(screen.queryByPlaceholderText('cron.send_target_placeholder')).toBeNull();
+  });
+
+  it('edits and persists the explicit cron lifecycle policy', async () => {
+    apiFetch
+      .mockResolvedValueOnce({
+        jobs: [cronJob({
+          id: 'bounded-job',
+          name: 'Bounded work',
+          completion_policy: 'until_complete',
+        })],
+      })
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValue({ jobs: [] });
+
+    const { container } = render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    expect(await screen.findByText('Bounded work')).toBeDefined();
+    expect(screen.getByText('cron.completion_until_complete')).toBeDefined();
+    fireEvent.click(screen.getByText('✎'));
+
+    const lifecycleSelect = Array.from(container.querySelectorAll('select'))
+      .find((select) => select.value === 'until_complete') as HTMLSelectElement | undefined;
+    expect(lifecycleSelect).toBeDefined();
+    fireEvent.input(lifecycleSelect!, { target: { value: 'recurring' } });
+    await screen.findByText('cron.completion_recurring_help');
+    fireEvent.input(lifecycleSelect!, { target: { value: 'until_complete' } });
+    await screen.findByText('cron.completion_until_complete_help');
+    fireEvent.click(screen.getByText('cron.save'));
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledWith(
+      '/api/cron/bounded-job',
+      expect.objectContaining({ method: 'PUT' }),
+    ));
+    const updateCall = apiFetch.mock.calls.find(([url]) => url === '/api/cron/bounded-job');
+    expect(JSON.parse(String(updateCall?.[1]?.body))).toMatchObject({
+      completionPolicy: 'until_complete',
+      action: {
+        type: 'command',
+        selfManaged: true,
+      },
+    });
   });
 
   it('shows persisted expiration timestamps in the browser local timezone when editing', async () => {

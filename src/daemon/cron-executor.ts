@@ -3,7 +3,11 @@
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
-import { CRON_MSG } from '../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_MSG,
+  normalizeCronCompletionPolicy,
+} from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
 import { getSession } from '../store/session-store.js';
 import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
@@ -57,7 +61,11 @@ export function __setCronProcessCommandSenderForTests(
 }
 
 export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: string): string {
-  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)}>\nUse cron_update_self to change this task. When complete, call cron_cancel_self with this id; otherwise keep it scheduled.\n</imcodes-cron-control>`;
+  const completionPolicy = normalizeCronCompletionPolicy(msg.completionPolicy);
+  const lifecycleInstruction = completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? 'This schedule repeats until its overall goal is complete. Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.'
+    : 'This is one occurrence of a recurring schedule. Complete only this occurrence and keep the schedule active. Do not call cron_cancel_self after a successful run. Cancel it only when the user explicitly asks, using this id with force=true.';
+  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\n</imcodes-cron-control>`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {

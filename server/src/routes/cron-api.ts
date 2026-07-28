@@ -8,7 +8,11 @@ import { requireAuth } from '../security/authorization.js';
 import { resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
-import { CRON_STATUS } from '../../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_STATUS,
+  normalizeCronCompletionPolicy,
+} from '../../../shared/cron-types.js';
 import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
@@ -74,6 +78,10 @@ const cronJobCreateSchema = z.object({
   action: cronActionSchema,
   timezone: z.string().min(1).max(64).optional(),
   expiresAt: z.number().nullable().optional(),
+  completionPolicy: z.enum([
+    CRON_COMPLETION_POLICY.RECURRING,
+    CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+  ]).default(CRON_COMPLETION_POLICY.RECURRING),
 });
 
 const cronJobUpdateSchema = z.object({
@@ -85,6 +93,10 @@ const cronJobUpdateSchema = z.object({
   action: cronActionSchema.optional(),
   timezone: z.string().min(1).max(64).optional(),
   expiresAt: z.number().nullable().optional(),
+  completionPolicy: z.enum([
+    CRON_COMPLETION_POLICY.RECURRING,
+    CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+  ]).optional(),
 });
 
 function getPodStickyServerId(c: { req: { param: (name: string) => string | undefined } }): string | null {
@@ -223,7 +235,18 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   const parsed = cronJobCreateSchema.safeParse(requestBody);
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
-  const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, timezone, expiresAt } = parsed.data;
+  const {
+    name,
+    cronExpr,
+    serverId,
+    projectName,
+    targetRole,
+    targetSessionName,
+    action,
+    timezone,
+    expiresAt,
+    completionPolicy,
+  } = parsed.data;
   const persistedAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
 
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
@@ -238,16 +261,29 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   const now = Date.now();
 
   await c.env.DB.execute(
-    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)`,
-    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
+    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)`,
+    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, completionPolicy, now],
   );
 
   await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName } }, c.env.DB);
   // Notify open browser views (incl. crons created externally via MCP) to refetch.
   WsBridge.publishResourceChanged(serverId, RESOURCE_TOPICS.cron, { action: 'create' });
 
-  return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action: persistedAction, timezone: timezone ?? null, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
+  return c.json({
+    id,
+    name,
+    cronExpr,
+    projectName,
+    targetRole,
+    targetSessionName: targetSessionName ?? null,
+    action: persistedAction,
+    timezone: timezone ?? null,
+    status: CRON_STATUS.ACTIVE,
+    nextRunAt: validation.nextRunAt,
+    expiresAt: expiresAt ?? null,
+    completionPolicy,
+  }, 201);
 });
 
 // PUT /api/cron/:id — update a cron job
@@ -271,6 +307,18 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
 
   const updates = parsed.data;
   const now = Date.now();
+  if (
+    isDaemonCronRequest(c, routeServerId)
+    && normalizeCronCompletionPolicy(job.completion_policy) === CRON_COMPLETION_POLICY.RECURRING
+    && updates.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    && c.req.query('force') !== 'true'
+  ) {
+    return c.json({
+      error: 'cron_force_required',
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+      message: 'Changing a recurring cron to until_complete from an agent requires force=true',
+    }, 409);
+  }
 
   // Re-validate cron expression if changed
   let nextRunAt: number | undefined;
@@ -302,6 +350,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
+  if (updates.completionPolicy !== undefined) { sets.push(`completion_policy = $${idx++}`); vals.push(updates.completionPolicy); }
   if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
 
   // Reset expired/error jobs to paused on edit
@@ -315,7 +364,19 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     vals,
   );
 
-  await logAudit({ userId, action: 'cron.update', details: { id: jobId } }, c.env.DB);
+  await logAudit({
+    userId,
+    action: 'cron.update',
+    details: {
+      id: jobId,
+      ...(updates.completionPolicy !== undefined
+        ? {
+          completionPolicy: updates.completionPolicy,
+          forced: isDaemonCronRequest(c, routeServerId) ? c.req.query('force') === 'true' : false,
+        }
+        : {}),
+    },
+  }, c.env.DB);
   WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'update' });
   return c.json({ ok: true });
 });
@@ -361,8 +422,8 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
 
-  const job = await c.env.DB.queryOne<{ server_id: string }>(
-    'SELECT server_id FROM cron_jobs WHERE id = $1 AND user_id = $2',
+  const job = await c.env.DB.queryOne<{ server_id: string; completion_policy?: string | null }>(
+    'SELECT server_id, completion_policy FROM cron_jobs WHERE id = $1 AND user_id = $2',
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
@@ -371,9 +432,31 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId: job.server_id, userId });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
+  const completionPolicy = normalizeCronCompletionPolicy(job.completion_policy);
+  const force = c.req.query('force') === 'true';
+  if (
+    isDaemonCronRequest(c, routeServerId)
+    && completionPolicy === CRON_COMPLETION_POLICY.RECURRING
+    && !force
+  ) {
+    return c.json({
+      error: 'cron_force_required',
+      completionPolicy,
+      message: 'Deleting a recurring cron from an agent requires force=true',
+    }, 409);
+  }
+
   await c.env.DB.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
 
-  await logAudit({ userId, action: 'cron.delete', details: { id: jobId } }, c.env.DB);
+  await logAudit({
+    userId,
+    action: 'cron.delete',
+    details: {
+      id: jobId,
+      completionPolicy,
+      forced: isDaemonCronRequest(c, routeServerId) ? force : false,
+    },
+  }, c.env.DB);
   WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'delete' });
   return c.json({ ok: true });
 });

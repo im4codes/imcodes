@@ -52,7 +52,7 @@ import { sessionName, getTransportRuntime } from '../../src/agent/session-manage
 import { detectStatusAsync } from '../../src/agent/detect.js';
 import { sendKeys } from '../../src/agent/tmux.js';
 import { startP2pRun } from '../../src/daemon/p2p-orchestrator.js';
-import { CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
+import { CRON_COMPLETION_POLICY, CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
 import logger from '../../src/util/logger.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -128,7 +128,23 @@ describe('executeCronJob', () => {
     }), mockServerLink);
 
     const prompt = cronProcessSendMock.mock.calls[0][1] as string;
-    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1">\nUse cron_update_self to change this task. When complete, call cron_cancel_self with this id; otherwise keep it scheduled.\n</imcodes-cron-control>');
+    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1" completion-policy="recurring">\nUse cron_update_self to change this task only when the user explicitly asks.\nThis is one occurrence of a recurring schedule. Complete only this occurrence and keep the schedule active. Do not call cron_cancel_self after a successful run. Cancel it only when the user explicitly asks, using this id with force=true.\n</imcodes-cron-control>');
+  });
+
+  it('allows an until-complete schedule to self-cancel only after its overall goal completes', async () => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-bounded-1',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      action: { type: 'command', command: 'Keep working toward the release.', selfManaged: true },
+    }), mockServerLink);
+
+    expect(cronProcessSendMock.mock.calls[0][1]).toContain(
+      'Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.',
+    );
+    expect(cronProcessSendMock.mock.calls[0][1]).not.toContain('force=true');
   });
 
   it.each(['shell', 'script'] as const)('does not inject MCP controls into %s commands', async (agentType) => {

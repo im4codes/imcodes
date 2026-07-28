@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CRON_STATUS, CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
+import { CRON_COMPLETION_POLICY, CRON_STATUS, CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -73,6 +73,7 @@ describe('jobDispatchCron', () => {
     expect(sent.cronExpr).toBe('*/10 * * * *');
     expect(sent.timezone).toBe('Asia/Shanghai');
     expect(sent.expiresAt).toBeNull();
+    expect(sent.completionPolicy).toBe(CRON_COMPLETION_POLICY.RECURRING);
     expect(sent.action).toEqual({ type: 'command', command: 'hello' });
   });
 

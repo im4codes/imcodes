@@ -41,6 +41,7 @@ import {
   PEER_AUDIT_VALIDATION_KINDS,
   PEER_AUDIT_VALIDATION_OUTCOMES,
 } from './peer-audit.js';
+import { CRON_COMPLETION_POLICY } from './cron-types.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -442,13 +443,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
-    description: `Preferred self-wakeup method: schedule a message for the current session. Identity is automatic; runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`,
+    description: `Preferred self-wakeup method: schedule a message for the current session. New jobs default to recurring and stay scheduled after each run; choose until_complete only for a bounded goal. Identity is automatic; runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`,
     inputSchema: objectSchema({
       cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
       message: stringSchema('Message delivered to the current session.'),
       name: stringSchema('Optional job name; derived from message when omitted.'),
       timezone: stringSchema('Optional cron timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead.`),
+      completionPolicy: stringSchema('Lifecycle policy. recurring keeps the schedule after each occurrence; until_complete permits self-cancel only after the overall goal is complete.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
     }, ['cronExpr', 'message']),
     outputSchema: statusSchema,
   },
@@ -462,16 +466,21 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       name: stringSchema('Optional replacement name.'),
       timezone: stringSchema('Optional replacement timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead.`),
+      completionPolicy: stringSchema('Optional lifecycle policy.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+      force: booleanSchema('Required when an agent changes a recurring job to until_complete.'),
     }, ['id']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
-    description: 'Cancel a current-session self-wakeup job when complete, by id or unique name; use all=true to cancel all.',
+    description: 'Cancel a current-session self-wakeup job by id or unique name; use all=true to cancel all. Recurring jobs require force=true and should be force-cancelled only after an explicit user request. until_complete jobs may self-cancel when their overall goal is complete.',
     inputSchema: objectSchema({
       id: stringSchema('Exact job id; exclusive with name and all.'),
       name: stringSchema('Unique exact job name; exclusive with id and all.'),
       all: booleanSchema('Cancel all current-session jobs; exclusive with id and name.'),
+      force: booleanSchema('Required to delete recurring jobs. Use only when the user explicitly asked to remove the schedule.'),
     }),
     outputSchema: statusSchema,
   },
@@ -487,6 +496,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       action: { type: 'object', description: 'Send action: { type: "send", target, message, reply?, broadcast?, idempotencyKey? }.', additionalProperties: true },
       timezone: stringSchema('Optional cron timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
+      completionPolicy: stringSchema('Optional lifecycle policy; defaults to recurring.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
     }, ['name', 'cronExpr', 'action']),
     outputSchema: statusSchema,
   },
@@ -512,14 +524,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       action: { type: 'object', description: 'Optional replacement send action.', additionalProperties: true },
       timezone: stringSchema('Optional replacement timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
+      completionPolicy: stringSchema('Optional lifecycle policy.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+      force: booleanSchema('Required when an agent changes a recurring job to until_complete.'),
     }, ['id']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
-    description: 'Delete a cron job by id. Use cron_cancel_self for current-session jobs.',
+    description: 'Delete a cron job by id. Agent deletion of recurring jobs requires force=true. Use cron_cancel_self for current-session jobs.',
     inputSchema: objectSchema({
       id: stringSchema('Job id.'),
+      force: booleanSchema('Required for agent deletion of a recurring job.'),
     }, ['id']),
     outputSchema: statusSchema,
   },

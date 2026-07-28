@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
-import { CRON_STATUS } from '../../shared/cron-types.js';
+import { CRON_COMPLETION_POLICY, CRON_STATUS } from '../../shared/cron-types.js';
 import { CLIENT_TIMEZONE_PREF_KEY } from '../../shared/client-timezone.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
@@ -68,6 +68,10 @@ function makeMockDb() {
         return null;
       }
 
+      if (s.includes('from servers where id')) {
+        return { user_id: 'user-1' } as T;
+      }
+
       if (s.includes('from user_preferences where user_id')) {
         const value = userPrefs.get(`${String(params[0])}:${String(params[1])}`);
         return (value === undefined ? null : { value }) as T | null;
@@ -108,8 +112,9 @@ function makeMockDb() {
           status: params[10],
           next_run_at: params[11],
           expires_at: params[12],
-          created_at: params[13],
-          updated_at: params[13],
+          completion_policy: params[13],
+          created_at: params[14],
+          updated_at: params[14],
           last_run_at: null,
         });
       }
@@ -186,6 +191,7 @@ async function buildTestApp(env: Env) {
   });
 
   app.route('/api/cron', cronApiRoutes);
+  app.route('/api/server/:serverId/cron', cronApiRoutes);
   return app;
 }
 
@@ -237,6 +243,7 @@ describe('Cron API routes', () => {
       expect(body.status).toBe(CRON_STATUS.ACTIVE);
       expect(body.nextRunAt).toBeTypeOf('number');
       expect(body.action).toEqual({ type: 'command', command: '/status' });
+      expect(body.completionPolicy).toBe(CRON_COMPLETION_POLICY.RECURRING);
     });
 
     it('preserves the self-managed command marker used by MCP lifecycle prompts', async () => {
@@ -247,6 +254,19 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(201);
       const body = await res.json() as Record<string, unknown>;
       expect(body.action).toEqual({ type: 'command', command: 'check progress', selfManaged: true });
+    });
+
+    it('persists an explicit until-complete lifecycle policy', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.completionPolicy).toBe(CRON_COMPLETION_POLICY.UNTIL_COMPLETE);
+      expect(Array.from(mockDb.cronJobs.values())[0]?.completion_policy).toBe(
+        CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      );
     });
 
     it('rejects share-only server-scoped cron creation with the direct-surface reason', async () => {
@@ -380,6 +400,7 @@ describe('Cron API routes', () => {
         status: CRON_STATUS.ACTIVE,
         next_run_at: Date.now() + 86400000,
         expires_at: null,
+        completion_policy: CRON_COMPLETION_POLICY.RECURRING,
         created_at: Date.now(),
         updated_at: Date.now(),
         last_run_at: null,
@@ -522,6 +543,24 @@ describe('Cron API routes', () => {
       expect(body.ok).toBe(true);
     });
 
+    it('does not let an agent bypass force by weakening recurring to until_complete first', async () => {
+      const res = await app.request(
+        '/api/server/srv-1/cron/job-update',
+        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }),
+      );
+      expect(res.status).toBe(409);
+      await expect(res.json()).resolves.toMatchObject({
+        error: 'cron_force_required',
+        completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+      });
+
+      const forced = await app.request(
+        '/api/server/srv-1/cron/job-update?force=true',
+        jsonReq('PUT', '', { completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE }),
+      );
+      expect(forced.status).toBe(200);
+    });
+
     it('resets expired job to paused', async () => {
       mockDb.cronJobs.set('job-expired-edit', {
         id: 'job-expired-edit',
@@ -577,6 +616,45 @@ describe('Cron API routes', () => {
       expect(body.ok).toBe(true);
       // Verify job was removed
       expect(mockDb.cronJobs.has('job-delete')).toBe(false);
+    });
+
+    it('blocks daemon deletion of recurring and legacy jobs unless force=true', async () => {
+      for (const [id, completionPolicy] of [
+        ['recurring-job', CRON_COMPLETION_POLICY.RECURRING],
+        ['legacy-job', undefined],
+      ] as const) {
+        mockDb.cronJobs.set(id, {
+          id,
+          server_id: 'srv-1',
+          user_id: 'user-1',
+          completion_policy: completionPolicy,
+        });
+
+        const blocked = await app.request(`/api/server/srv-1/cron/${id}`, { method: 'DELETE' });
+        expect(blocked.status).toBe(409);
+        await expect(blocked.json()).resolves.toMatchObject({
+          error: 'cron_force_required',
+          completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
+        });
+        expect(mockDb.cronJobs.has(id)).toBe(true);
+
+        const forced = await app.request(`/api/server/srv-1/cron/${id}?force=true`, { method: 'DELETE' });
+        expect(forced.status).toBe(200);
+        expect(mockDb.cronJobs.has(id)).toBe(false);
+      }
+    });
+
+    it('lets an until-complete job self-cancel without force', async () => {
+      mockDb.cronJobs.set('bounded-job', {
+        id: 'bounded-job',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        completion_policy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      });
+
+      const res = await app.request('/api/server/srv-1/cron/bounded-job', { method: 'DELETE' });
+      expect(res.status).toBe(200);
+      expect(mockDb.cronJobs.has('bounded-job')).toBe(false);
     });
   });
 

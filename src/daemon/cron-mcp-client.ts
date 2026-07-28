@@ -1,4 +1,9 @@
-import type { CronAction, CronSendAction } from '../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  type CronAction,
+  type CronCompletionPolicy,
+  type CronSendAction,
+} from '../../shared/cron-types.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { buildMemoryMcpSourceProvenance, type MemoryMcpSourceProvenance } from '../../shared/memory-mcp-provenance.js';
 import type { MCPFeatureFlagValues } from '../../shared/memory-mcp-feature-flags.js';
@@ -34,6 +39,7 @@ export interface CronCreateInput extends MemoryMcpSourceProvenance {
   action: unknown;
   timezone?: string;
   expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
   userId?: string;
   serverId?: string;
   token?: string;
@@ -49,6 +55,7 @@ export interface CronCreateSelfInput {
   message: string;
   timezone?: string;
   expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
 }
 
 export interface CronUpdateSelfInput {
@@ -59,6 +66,8 @@ export interface CronUpdateSelfInput {
   message?: string;
   timezone?: string;
   expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
+  force?: boolean;
 }
 
 export interface CronUpdateInput extends MemoryMcpSourceProvenance {
@@ -71,6 +80,8 @@ export interface CronUpdateInput extends MemoryMcpSourceProvenance {
   action?: unknown;
   timezone?: string;
   expiresAt?: number | null;
+  completionPolicy?: CronCompletionPolicy;
+  force?: boolean;
   userId?: string;
   serverId?: string;
   token?: string;
@@ -212,7 +223,7 @@ async function requestCron(
 }
 
 function buildCreateBody(
-  input: Pick<CronCreateInput, 'name' | 'cronExpr' | 'projectName' | 'targetRole' | 'targetSessionName' | 'timezone' | 'expiresAt'>,
+  input: Pick<CronCreateInput, 'name' | 'cronExpr' | 'projectName' | 'targetRole' | 'targetSessionName' | 'timezone' | 'expiresAt' | 'completionPolicy'>,
   runtimeServerId: string,
   action: CronAction,
 ): Record<string, unknown> {
@@ -226,6 +237,7 @@ function buildCreateBody(
     action,
     ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+    completionPolicy: input.completionPolicy ?? CRON_COMPLETION_POLICY.RECURRING,
   };
 }
 
@@ -260,6 +272,7 @@ function buildUpdateBody(input: CronUpdateInput, action: CronAction | undefined)
     ...(action !== undefined ? { action } : {}),
     ...(input.timezone !== undefined ? { timezone: input.timezone } : {}),
     ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+    ...(input.completionPolicy !== undefined ? { completionPolicy: input.completionPolicy } : {}),
   };
 }
 
@@ -279,7 +292,8 @@ export async function cronMcpUpdateSelf(
     command: input.message,
     selfManaged: true,
   };
-  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(input.id)}`, {
+  const suffix = `/${encodeURIComponent(input.id)}${input.force ? '?force=true' : ''}`;
+  return requestCron(identity.endpoint, identity.runtimeServerId, suffix, {
     method: 'PUT',
     body: JSON.stringify(buildUpdateBody(input, action)),
   }, options);
@@ -323,7 +337,8 @@ export async function cronMcpUpdate(
   if (expiresError) return expiresError;
   const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(input.id)}`, {
+  const suffix = `/${encodeURIComponent(input.id)}${input.force ? '?force=true' : ''}`;
+  return requestCron(identity.endpoint, identity.runtimeServerId, suffix, {
     method: 'PUT',
     body: JSON.stringify(buildUpdateBody(input, action)),
   }, options);
@@ -332,10 +347,12 @@ export async function cronMcpUpdate(
 export async function cronMcpDelete(
   id: string,
   options: CronMcpClientOptions = {},
+  force = false,
 ): Promise<CronMcpResult<{ body: unknown }>> {
   const identity = await getEndpoint(options);
   if ('status' in identity) return identity;
-  return requestCron(identity.endpoint, identity.runtimeServerId, `/${encodeURIComponent(id)}`, { method: 'DELETE' }, options);
+  const suffix = `/${encodeURIComponent(id)}${force ? '?force=true' : ''}`;
+  return requestCron(identity.endpoint, identity.runtimeServerId, suffix, { method: 'DELETE' }, options);
 }
 
 export async function cronMcpList(

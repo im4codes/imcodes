@@ -72,6 +72,7 @@ export interface DbCronJob {
   last_run_at: number | null;
   next_run_at: number | null;
   expires_at: number | null;
+  completion_policy: string;
   created_at: number;
   updated_at: number | null;
 }

@@ -7,7 +7,13 @@ import type { DbCronJob } from '../db/queries.js';
 import { WsBridge } from '../ws/bridge.js';
 import { logAudit } from '../security/audit.js';
 import { randomHex } from '../security/crypto.js';
-import { CRON_MSG, CRON_STATUS, type CronAction, type CronDispatchMessage } from '../../../shared/cron-types.js';
+import {
+  CRON_MSG,
+  CRON_STATUS,
+  normalizeCronCompletionPolicy,
+  type CronAction,
+  type CronDispatchMessage,
+} from '../../../shared/cron-types.js';
 import logger from '../util/logger.js';
 
 /** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
@@ -41,6 +47,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     cronExpr: job.cron_expr,
     timezone: job.timezone,
     expiresAt: job.expires_at,
+    completionPolicy: normalizeCronCompletionPolicy(job.completion_policy),
     ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
     action,
   };
@@ -113,6 +120,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         cronExpr: job.cron_expr,
         timezone: job.timezone,
         expiresAt: job.expires_at,
+        completionPolicy: normalizeCronCompletionPolicy(job.completion_policy),
         ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
         action,
       };

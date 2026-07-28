@@ -7,6 +7,7 @@ import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
 import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
@@ -718,14 +719,16 @@ describe('memory MCP tool schema firewall', () => {
       projectName: 'proj',
       targetRole: 'brain',
       targetSessionName: null,
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
     }), expect.objectContaining({ runtimeServerId: 'srv-1' }));
     expect(result).toMatchObject({
       status: 'ok',
       preferredCronInterface: true,
       jobId: 'job-self',
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
       controls: {
         update: { tool: 'cron_update_self', args: { id: 'job-self' } },
-        cancel: { tool: 'cron_cancel_self', args: { id: 'job-self' } },
+        cancel: { tool: 'cron_cancel_self', args: { id: 'job-self' }, forceRequired: true },
       },
     });
   });
@@ -800,6 +803,8 @@ describe('memory MCP tool schema firewall', () => {
       message: 'Check whether the work is complete',
       timezone: undefined,
       expiresAt: undefined,
+      completionPolicy: undefined,
+      force: false,
     }, expect.objectContaining({ runtimeServerId: 'srv-1' }));
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]({
@@ -816,7 +821,14 @@ describe('memory MCP tool schema firewall', () => {
       limit: 100,
       body: {
         jobs: [
-          { id: 'self-1', name: 'Daily check', project_name: 'proj', target_role: 'brain', target_session_name: null },
+          {
+            id: 'self-1',
+            name: 'Daily check',
+            project_name: 'proj',
+            target_role: 'brain',
+            target_session_name: null,
+            completion_policy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+          },
           { id: 'worker-1', name: 'Daily check', project_name: 'proj', target_role: 'w1', target_session_name: null },
           { id: 'other-project', name: 'Daily check', project_name: 'other', target_role: 'brain', target_session_name: null },
         ],
@@ -835,7 +847,71 @@ describe('memory MCP tool schema firewall', () => {
       deleted: [{ id: 'self-1', name: 'Daily check' }],
     });
     expect(cronDelete).toHaveBeenCalledOnce();
-    expect(cronDelete).toHaveBeenCalledWith('self-1', expect.objectContaining({ runtimeServerId: 'srv-1' }));
+    expect(cronDelete).toHaveBeenCalledWith('self-1', expect.objectContaining({ runtimeServerId: 'srv-1' }), false);
+  });
+
+  it('requires force for recurring self cron cancellation and forwards the explicit latch', async () => {
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const cronList = vi.fn(async () => ({
+      status: 'ok' as const,
+      limit: 100,
+      body: {
+        jobs: [
+          {
+            id: 'recurring-1',
+            name: 'Daily report',
+            project_name: 'proj',
+            target_role: 'brain',
+            target_session_name: null,
+            completion_policy: CRON_COMPLETION_POLICY.RECURRING,
+          },
+        ],
+      },
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronList,
+      cronDelete,
+      sendDeps: { listSessions: () => [sessionRecord()] },
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({
+      id: 'recurring-1',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      protected: [{ id: 'recurring-1', name: 'Daily report' }],
+    });
+    expect(cronDelete).not.toHaveBeenCalled();
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]({
+      id: 'recurring-1',
+      force: true,
+    })).resolves.toMatchObject({
+      status: 'ok',
+      count: 1,
+    });
+    expect(cronDelete).toHaveBeenCalledWith(
+      'recurring-1',
+      expect.objectContaining({ runtimeServerId: 'srv-1' }),
+      true,
+    );
+  });
+
+  it('forwards force through generic cron_delete so the server remains authoritative', async () => {
+    const cronDelete = vi.fn(async () => ({ status: 'ok' as const, body: { ok: true } }));
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      cronDelete,
+      isMemoryFeatureEnabled: () => true,
+    });
+
+    await handlers[MEMORY_MCP_TOOL_NAMES.CRON_DELETE]({ id: 'recurring-1', force: true });
+
+    expect(cronDelete).toHaveBeenCalledWith(
+      'recurring-1',
+      expect.objectContaining({ runtimeServerId: 'srv-1' }),
+      true,
+    );
   });
 
   it('requires an explicit unambiguous self-cron cancellation selector', async () => {
