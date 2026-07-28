@@ -38,6 +38,11 @@ const MODEL_CACHE_TTL_MS = 30_000;
 // window we force one throttled catalog refetch so the next frame self-heals.
 const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
+const MISSING_FINAL_RECOVERY_PROMPT = [
+  'The previous tool step finished, but you returned no final response.',
+  "Continue from the existing results and answer the user's original request now.",
+  'Do not repeat completed tool calls unless the existing result is insufficient.',
+].join(' ');
 
 type SdkResult<T> = Promise<{ data: T; response?: { status?: number } }>;
 
@@ -90,6 +95,8 @@ interface OpenCodeSessionState {
   cancelled: boolean;
   completionEmitted: boolean;
   terminalErrorEmitted: boolean;
+  missingFinalRecoveryAttempted: boolean;
+  missingFinalRecoveryInFlight: boolean;
   currentMessageId: string | null;
   messageRoles: Map<string, 'user' | 'assistant'>;
   pendingParts: Map<string, Array<{ part: Record<string, any>; delta?: string }>>;
@@ -320,6 +327,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
       cancelled: false,
       completionEmitted: false,
       terminalErrorEmitted: false,
+      missingFinalRecoveryAttempted: false,
+      missingFinalRecoveryInFlight: false,
       currentMessageId: null,
       messageRoles: new Map(),
       pendingParts: new Map(),
@@ -462,6 +471,8 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.cancelled = false;
     state.completionEmitted = false;
     state.terminalErrorEmitted = false;
+    state.missingFinalRecoveryAttempted = false;
+    state.missingFinalRecoveryInFlight = false;
     state.currentMessageId = null;
     state.messageRoles.clear();
     state.pendingParts.clear();
@@ -905,6 +916,13 @@ export class OpenCodeSdkProvider implements TransportProvider {
     if (!state.busy || state.completionEmitted || state.terminalErrorEmitted || state.cancelled) return;
     const content = [...state.textParts.values()].join('');
     if (!content.trim()) {
+      // A terminal message.updated frame can precede its text part. Wait for
+      // prompt.result or an idle authority before deciding the turn is empty.
+      if (source === 'message.updated' || state.missingFinalRecoveryInFlight) return;
+      if (!state.missingFinalRecoveryAttempted) {
+        this.recoverMissingFinalOnce(state);
+        return;
+      }
       this.failOnce(state, providerError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         'OpenCode ended the turn without a final response.',
@@ -933,6 +951,45 @@ export class OpenCodeSdkProvider implements TransportProvider {
       },
     };
     for (const callback of this.completeCallbacks) callback(state.routeId, message);
+  }
+
+  private recoverMissingFinalOnce(state: OpenCodeSessionState): void {
+    if (
+      !state.busy
+      || state.cancelled
+      || state.missingFinalRecoveryAttempted
+      || state.missingFinalRecoveryInFlight
+    ) return;
+    state.missingFinalRecoveryAttempted = true;
+    state.missingFinalRecoveryInFlight = true;
+    const generation = state.generation;
+    const model = parseModelIdentity(state.model);
+    let recoveryRequest: SdkResult<Record<string, any>>;
+    try {
+      recoveryRequest = state.client.session.prompt({
+        path: { id: state.providerSessionId },
+        query: { directory: state.cwd },
+        body: {
+          ...(model ? { model } : {}),
+          parts: [{ type: 'text', text: MISSING_FINAL_RECOVERY_PROMPT }],
+        },
+        throwOnError: true,
+      });
+    } catch (error) {
+      state.missingFinalRecoveryInFlight = false;
+      this.failOnce(state, this.normalizeError(error, 'missing final response recovery'));
+      return;
+    }
+    void recoveryRequest.then((result) => {
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      state.missingFinalRecoveryInFlight = false;
+      const terminal = this.processPromptResult(state, result.data);
+      if (terminal) this.completeOnce(state, 'recovery.prompt.result');
+    }).catch((error) => {
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      state.missingFinalRecoveryInFlight = false;
+      this.failOnce(state, this.normalizeError(error, 'missing final response recovery'));
+    });
   }
 
   private failOnce(state: OpenCodeSessionState, error: ProviderError): void {
