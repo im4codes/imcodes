@@ -11,6 +11,7 @@ import {
   ComputerUseIpcHost,
   computerUseIpcDeadlineMs,
   quoteWinArg,
+  runComputerUseIpcHelper,
   windowsPipeClientAclCommand,
 } from '../../src/node/computer-use-ipc.js';
 import type { MacosComputerUseRuntime, MacosConsoleUser } from '../../src/node/macos-computer-use.js';
@@ -50,6 +51,24 @@ describe('computer use IPC deadline', () => {
   it('keeps the full 900 second shell timeout plus transport cleanup buffer', () => {
     expect(computerUseIpcDeadlineMs({ tool: 'shell_session1', timeoutMs: 900_000 })).toBe(905_000);
     expect(computerUseIpcDeadlineMs({ tool: 'list_apps', timeoutMs: 120_000 })).toBe(125_000);
+  });
+});
+
+describe('computer use IPC helper lifecycle', () => {
+  it('closes persistent OCU/browser children when the owning node socket disconnects', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-helper-lifecycle-test-'));
+    dirs.push(dir);
+    const pipe = join(dir, 'computer-use.sock');
+    const closeRuntime = vi.fn(async () => {});
+    const server = net.createServer((socket) => {
+      socket.once('data', () => socket.destroy());
+    });
+    await new Promise<void>((resolve) => server.listen(pipe, resolve));
+
+    await runComputerUseIpcHelper(pipe, closeRuntime);
+
+    expect(closeRuntime).toHaveBeenCalledOnce();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });
 

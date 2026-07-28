@@ -1599,6 +1599,15 @@ class BrowserUseController {
 
 const browserUseController = new BrowserUseController();
 
+export async function closeComputerUseRuntimeForProcessExit(): Promise<void> {
+  mcpClient?.close();
+  mcpClient = null;
+  mcpClientBinary = '';
+  fastPointerClient?.close();
+  fastPointerClient = null;
+  await browserUseController.close();
+}
+
 async function runBrowserUseTool(request: ComputerUseRequest, timeoutMs: number, started: number): Promise<ComputerUseResult> {
   try {
     const result = await browserUseController.run(request.tool, request.arguments ?? {}, timeoutMs);

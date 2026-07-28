@@ -5,7 +5,11 @@ import net from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { runComputerUseTool, WINDOWS_DEFAULT_OCU_DIR } from './computer-use-runner.js';
+import {
+  closeComputerUseRuntimeForProcessExit,
+  runComputerUseTool,
+  WINDOWS_DEFAULT_OCU_DIR,
+} from './computer-use-runner.js';
 import { applyWindowsAclCommands, windowsComputerUseHelperAclCommands } from './installer.js';
 import {
   authorizeMacosComputerUseSocket,
@@ -502,39 +506,51 @@ export class ComputerUseIpcHost {
   }
 }
 
-export async function runComputerUseIpcHelper(pipe: string): Promise<void> {
+export async function runComputerUseIpcHelper(
+  pipe: string,
+  closeRuntime: () => Promise<void> = closeComputerUseRuntimeForProcessExit,
+): Promise<void> {
   const socket = net.createConnection(pipe);
-  await new Promise<void>((resolve, reject) => {
-    socket.once('connect', resolve);
-    socket.once('error', reject);
-  });
-  socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO } satisfies IpcHelloWire)}\n`);
-  socket.setEncoding('utf8');
-  let buffer = '';
-  socket.on('data', (chunk) => {
-    buffer += String(chunk);
-    void (async () => {
-      for (;;) {
-        const newline = buffer.indexOf('\n');
-        if (newline < 0) break;
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line) continue;
-        let parsed: IpcRequestWire;
-        try { parsed = JSON.parse(line) as IpcRequestWire; } catch { continue; }
-        const id = typeof parsed.id === 'string' ? parsed.id : '';
-        if (!id) continue;
-        const request = validateComputerUseFrame(parsed.request);
-        if (!request.ok) {
-          socket.write(`${JSON.stringify({ id, error: request.error } satisfies IpcResultWire)}\n`);
-          continue;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO } satisfies IpcHelloWire)}\n`);
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += String(chunk);
+      void (async () => {
+        for (;;) {
+          const newline = buffer.indexOf('\n');
+          if (newline < 0) break;
+          const line = buffer.slice(0, newline).trim();
+          buffer = buffer.slice(newline + 1);
+          if (!line) continue;
+          let parsed: IpcRequestWire;
+          try { parsed = JSON.parse(line) as IpcRequestWire; } catch { continue; }
+          const id = typeof parsed.id === 'string' ? parsed.id : '';
+          if (!id) continue;
+          const request = validateComputerUseFrame(parsed.request);
+          if (!request.ok) {
+            socket.write(`${JSON.stringify({ id, error: request.error } satisfies IpcResultWire)}\n`);
+            continue;
+          }
+          const result = await runComputerUseTool(request.value);
+          const frame: ComputerUseResultFrame = { type: DAEMON_MSG.COMPUTER_USE_RESULT, ...result };
+          const validated = validateComputerUseResultFrame(frame);
+          socket.write(`${JSON.stringify(validated.ok ? { id, result: validated.value } : { id, error: validated.error } satisfies IpcResultWire)}\n`);
         }
-        const result = await runComputerUseTool(request.value);
-        const frame: ComputerUseResultFrame = { type: DAEMON_MSG.COMPUTER_USE_RESULT, ...result };
-        const validated = validateComputerUseResultFrame(frame);
-        socket.write(`${JSON.stringify(validated.ok ? { id, result: validated.value } : { id, error: validated.error } satisfies IpcResultWire)}\n`);
-      }
-    })().catch((err) => socket.write(`${JSON.stringify({ id: 'unknown', error: err instanceof Error ? err.message : String(err) })}\n`));
-  });
-  await new Promise<void>((resolve) => socket.once('close', resolve));
+      })().catch((err) => {
+        if (!socket.destroyed) {
+          socket.write(`${JSON.stringify({ id: 'unknown', error: err instanceof Error ? err.message : String(err) })}\n`);
+        }
+      });
+    });
+    await new Promise<void>((resolve) => socket.once('close', resolve));
+  } finally {
+    socket.destroy();
+    await closeRuntime();
+  }
 }
