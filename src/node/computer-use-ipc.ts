@@ -60,11 +60,20 @@ type PendingIpc = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+export function computerUseIpcPipePath(
+  tempRoot: string,
+  suffix: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'win32'
+    ? `\\\\.\\pipe\\imcodes-computer-use-${suffix}`
+    // Darwin sockaddr_un.sun_path is only 104 bytes including the trailing NUL.
+    : join(tempRoot, `iccu-${suffix}.sock`);
+}
+
 function pipePath(): string {
   const suffix = `${process.pid}-${randomBytes(8).toString('hex')}`;
-  return process.platform === 'win32'
-    ? `\\\\.\\pipe\\imcodes-computer-use-${suffix}`
-    : join(tmpdir(), `imcodes-computer-use-${suffix}.sock`);
+  return computerUseIpcPipePath(tmpdir(), suffix);
 }
 
 export function quoteWinArg(value: string): string {

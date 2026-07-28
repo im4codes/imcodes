@@ -10,6 +10,7 @@ import {
   COMPUTER_USE_IPC_HELPER_HELLO,
   ComputerUseIpcHost,
   computerUseIpcDeadlineMs,
+  computerUseIpcPipePath,
   quoteWinArg,
   runComputerUseIpcHelper,
   windowsPipeClientAclCommand,
@@ -55,10 +56,21 @@ describe('computer use IPC deadline', () => {
 });
 
 describe('computer use IPC helper lifecycle', () => {
+  it('keeps the macOS socket path below the sockaddr_un byte limit', () => {
+    const macTempDir = `/var/folders/ab/${'c'.repeat(32)}/T`;
+    const path = computerUseIpcPipePath(
+      macTempDir,
+      `1234567890-${'f'.repeat(16)}`,
+      'darwin',
+    );
+
+    expect(Buffer.byteLength(path)).toBeLessThanOrEqual(103);
+  });
+
   it('closes persistent OCU/browser children when the owning node socket disconnects', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-helper-lifecycle-test-'));
+    const dir = await mkdtemp(join(tmpdir(), 'icu-'));
     dirs.push(dir);
-    const pipe = join(dir, 'computer-use.sock');
+    const pipe = join(dir, 'c.sock');
     const closeRuntime = vi.fn(async () => {});
     const server = net.createServer((socket) => {
       socket.once('data', () => socket.destroy());
@@ -145,7 +157,7 @@ describe('computer use IPC macOS GUI-session boundary', () => {
       });
       expect(authorizeSocket).toHaveBeenCalledOnce();
       expect(runDoctor).toHaveBeenCalledWith(user, runtime);
-      expect(launchHelper).toHaveBeenCalledWith(user, runtime, expect.stringMatching(/imcodes-computer-use-/));
+      expect(launchHelper).toHaveBeenCalledWith(user, runtime, expect.stringMatching(/iccu-/));
     } finally {
       host.close();
     }
