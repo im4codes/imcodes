@@ -58,6 +58,7 @@ describe('macOS Computer Use runtime boundary', () => {
       join(runtimeRoot, 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse'),
     );
     expect(await readFile(runtime.helperExecutable, 'utf8')).toBe('node-v1');
+    expect(await readFile(join(runtimeRoot, 'open-computer-use.app.zip'), 'utf8')).toBe('archive-v1');
     expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('ocu-v1');
     expect(await readFile(
       join(runtimeRoot, 'Open Computer Use.app', 'Contents', '_CodeSignature', 'CodeResources'),
@@ -65,6 +66,7 @@ describe('macOS Computer Use runtime boundary', () => {
     )).toBe('developer-id-seal');
     expect((await lstat(runtimeRoot)).mode & 0o777).toBe(0o755);
     expect((await lstat(runtime.helperExecutable)).mode & 0o777).toBe(0o755);
+    expect((await lstat(join(runtimeRoot, 'open-computer-use.app.zip'))).mode & 0o777).toBe(0o644);
     expect((await lstat(runtime.openComputerUseExecutable)).mode & 0o777).toBe(0o755);
     expect(extractAppArchive).toHaveBeenCalledWith(sourceArchive, expect.stringContaining('.open-computer-use-extract-'));
     expect(verifyCodeSignature).toHaveBeenCalledWith(runtime.helperExecutable, false);

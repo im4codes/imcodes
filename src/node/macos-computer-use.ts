@@ -13,6 +13,10 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import {
+  controlledNodeComputerUseHelperFilename,
+  CONTROLLED_NODE_OS_MAC,
+} from '../../shared/controlled-node-artifacts.js';
 
 export const MACOS_COMPUTER_USE_RUNTIME_ROOT = '/Library/Application Support/imcodes-node-computer-use';
 export const MACOS_COMPUTER_USE_APP_NAME = 'Open Computer Use.app';
@@ -129,13 +133,14 @@ async function defaultExtractAppArchive(archivePath: string, destinationRoot: st
   await execFileText('/usr/bin/ditto', ['-x', '-k', archivePath, destinationRoot]);
 }
 
-async function publishExecutable(source: string, destination: string): Promise<void> {
+async function publishFile(source: string, destination: string, mode: number): Promise<void> {
   if (!await isRegularFile(source)) throw new Error('computer_use_runtime_source_not_regular');
+  if (source === destination) return;
   const existing = await isRegularFile(destination);
   if (existing && await sha256File(source) === await sha256File(destination)) return;
   const temp = `${destination}.${process.pid}.${randomUUID()}.tmp`;
   await copyFile(source, temp);
-  await chmod(temp, 0o755);
+  await chmod(temp, mode);
   await rename(temp, destination);
 }
 
@@ -224,11 +229,16 @@ export async function prepareMacosComputerUseRuntime(
     throw new Error('computer_use_runtime_root_not_directory');
   }
   await chmod(runtimeRoot, 0o755);
-  await publishExecutable(sourceNodeExecutable, helperExecutable);
+  await publishFile(sourceNodeExecutable, helperExecutable, 0o755);
   await verifyCodeSignature(helperExecutable, false);
 
   if (sourceOpenComputerUseArchive) {
     await publishAppBundle(sourceOpenComputerUseArchive, appPath, { verifyAppBundle, extractAppArchive });
+    await publishFile(
+      sourceOpenComputerUseArchive,
+      join(runtimeRoot, controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC)),
+      0o644,
+    );
   } else if (!await isRegularFile(openComputerUseExecutable)) {
     throw new Error('computer_use_helper_not_installed');
   } else {

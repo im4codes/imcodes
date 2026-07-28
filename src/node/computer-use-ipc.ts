@@ -13,6 +13,7 @@ import {
   prepareMacosComputerUseRuntime,
   resolveMacosConsoleUser,
   runMacosComputerUseDoctor,
+  MACOS_COMPUTER_USE_RUNTIME_ROOT,
   type MacosComputerUseRuntime,
   type MacosConsoleUser,
 } from './macos-computer-use.js';
@@ -355,6 +356,7 @@ export class ComputerUseIpcHost {
     await authorizeSocket(this.path, user);
     const archiveName = controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC);
     const candidates = [
+      join(MACOS_COMPUTER_USE_RUNTIME_ROOT, archiveName),
       join(dirname(execPath), 'computer-use-helper', archiveName),
       join(dirname(execPath), 'computer-use-helper', 'darwin-arm64', archiveName),
     ];
