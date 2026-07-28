@@ -149,22 +149,23 @@ describe('memory MCP shared contracts', () => {
     expect(getSources.description).toMatch(/not.*no memory/i);
   });
 
-  it('documents when search_memory results should be expanded through get_memory_sources', () => {
+  it('documents source expansion without assuming host-exposed tool names', () => {
     const search = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY];
     const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
     const projectionId = getSources.inputSchema.properties?.projectionId as { description?: string } | undefined;
     const observationId = getSources.inputSchema.properties?.observationId as { description?: string } | undefined;
     const ref = getSources.inputSchema.properties?.ref as { description?: string } | undefined;
 
-    expect(search.description).toContain('call get_memory_sources');
+    expect(search.description).toContain('use those fields for source expansion');
+    expect(search.description).not.toContain('call get_memory_sources');
     expect(search.description).toContain('sourceLookup');
     expect(search.description).toMatch(/typed sourceLookup/i);
-    expect(getSources.description).toContain('Use it after search_memory');
+    expect(getSources.description).toContain('after a memory-search result');
     expect(getSources.description).toContain('observation id');
     expect(getSources.description).toContain('compact ref');
     expect(getSources.description).toContain('provenance-sensitive answers');
-    expect(projectionId?.description).toContain('search_memory');
-    expect(observationId?.description).toContain('search_memory');
+    expect(projectionId?.description).toContain('memory-search result');
+    expect(observationId?.description).toContain('memory-search result');
     expect(ref?.description).toContain('startup memory');
   });
 

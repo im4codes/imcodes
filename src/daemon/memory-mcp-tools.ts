@@ -1630,8 +1630,8 @@ const schemas = {
     limit: z.number().int().min(1).max(100).optional().describe('Maximum summaries.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
-    projectionId: z.string().optional().describe('Projection hit id from search_memory.'),
-    observationId: z.string().optional().describe('Observation hit id from search_memory.'),
+    projectionId: z.string().optional().describe('Projection hit id from memory search.'),
+    observationId: z.string().optional().describe('Observation hit id from memory search.'),
     ref: z.string().optional().describe('Compact search/startup ref (obs:… or proj:…).'),
     kind: z.enum(['projection', 'observation']).optional().describe('Kind from sourceLookup.'),
   }),
