@@ -1,11 +1,26 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { runComputerUseTool, WINDOWS_DEFAULT_OCU_DIR } from './computer-use-runner.js';
 import { applyWindowsAclCommands, windowsComputerUseHelperAclCommands } from './installer.js';
+import {
+  authorizeMacosComputerUseSocket,
+  launchMacosUserSessionHelper,
+  prepareMacosComputerUseRuntime,
+  resolveMacosConsoleUser,
+  runMacosComputerUseDoctor,
+  type MacosComputerUseRuntime,
+  type MacosConsoleUser,
+} from './macos-computer-use.js';
+import {
+  controlledNodeArtifactTarget,
+  downloadControlledNodeComputerUseHelper,
+} from './self-upgrade.js';
+import type { ControlledNodeCredential } from './enrollment.js';
 import {
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
   computerUseMaxTimeoutMs,
@@ -13,14 +28,15 @@ import {
   validateComputerUseResultFrame,
   type ComputerUseFrame,
   type ComputerUseResultFrame,
+  type ComputerUseToolName,
 } from '../../shared/computer-use.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 
 interface IpcRequestWire { id: string; request: ComputerUseFrame }
 interface IpcResultWire { id: string; result?: ComputerUseResultFrame; error?: string }
-interface IpcHelloWire { hello: typeof IPC_HELPER_HELLO }
+interface IpcHelloWire { hello: typeof COMPUTER_USE_IPC_HELPER_HELLO }
 
-const IPC_HELPER_HELLO = 'imcodes-computer-use-helper-v1' as const;
+export const COMPUTER_USE_IPC_HELPER_HELLO = 'imcodes-computer-use-helper-v1' as const;
 
 export function computerUseIpcDeadlineMs(frame: Pick<ComputerUseFrame, 'tool' | 'timeoutMs'>): number {
   return Math.min(
@@ -198,6 +214,27 @@ function launchSameSessionHelper(exe: string, pipe: string): void {
   child.unref();
 }
 
+export interface ComputerUseIpcHostOptions {
+  credential?: ControlledNodeCredential;
+  platform?: NodeJS.Platform;
+  arch?: NodeJS.Architecture;
+  execPath?: string;
+  fetchImpl?: typeof fetch;
+  downloadMacosComputerUseHelper?: typeof downloadControlledNodeComputerUseHelper;
+  resolveMacosConsoleUser?: () => Promise<MacosConsoleUser>;
+  prepareMacosComputerUseRuntime?: (
+    sourceNodeExecutable: string,
+    sourceOpenComputerUseExecutable: string | undefined,
+  ) => Promise<MacosComputerUseRuntime>;
+  authorizeMacosComputerUseSocket?: (path: string, user: MacosConsoleUser) => Promise<void>;
+  runMacosComputerUseDoctor?: (user: MacosConsoleUser, runtime: MacosComputerUseRuntime) => Promise<void>;
+  launchMacosUserSessionHelper?: (
+    user: MacosConsoleUser,
+    runtime: MacosComputerUseRuntime,
+    pipe: string,
+  ) => void;
+}
+
 export class ComputerUseIpcHost {
   private server: net.Server | null = null;
   private socket: net.Socket | null = null;
@@ -206,8 +243,10 @@ export class ComputerUseIpcHost {
   private readyPromise: Promise<void> | null = null;
   private readonly path = pipePath();
 
+  constructor(private readonly options: ComputerUseIpcHostOptions = {}) {}
+
   async call(frame: ComputerUseFrame): Promise<ComputerUseResultFrame> {
-    await this.ensureStarted();
+    await this.ensureStarted(frame.tool);
     const socket = this.socket;
     if (!socket || socket.destroyed) throw new Error('computer_use_helper_not_connected');
     const id = randomBytes(12).toString('hex');
@@ -241,48 +280,112 @@ export class ComputerUseIpcHost {
     this.readyPromise = null;
   }
 
-  private ensureStarted(): Promise<void> {
-    if (this.socket && !this.socket.destroyed) return Promise.resolve();
-    if (this.readyPromise) return this.readyPromise;
+  private async ensureStarted(tool: ComputerUseToolName): Promise<void> {
+    if (this.socket && !this.socket.destroyed) return;
+    if (this.readyPromise) {
+      await this.readyPromise;
+      if (this.socket && !this.socket.destroyed) return;
+      return await this.ensureStarted(tool);
+    }
     this.readyPromise = new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout>;
       const server = net.createServer((socket) => {
-        this.acceptConnection(socket, resolve);
+        this.acceptConnection(socket, () => {
+          clearTimeout(timer);
+          resolve();
+        });
       });
       this.server = server;
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         server.close();
+        if (this.server === server) this.server = null;
         this.readyPromise = null;
         reject(new Error('computer_use_helper_connect_timeout'));
       }, 15_000);
       timer.unref?.();
       server.once('error', (err) => {
         clearTimeout(timer);
+        if (this.server === server) this.server = null;
         this.readyPromise = null;
         reject(err);
       });
       server.listen(this.path, () => {
         void (async () => {
           try {
-            if (process.platform === 'win32') {
+            const platform = this.options.platform ?? process.platform;
+            if (platform === 'win32') {
               allowWindowsComputerUseHelperFiles();
               allowWindowsPipeClients(this.path);
               await delay(750);
               launchWindowsUserSessionHelper(process.execPath, this.path);
+            } else if (platform === 'darwin') {
+              // The socket is visible in /tmp before runtime preparation and
+              // artifact download finish. Seal it root-only immediately, then
+              // transfer it to the exact console user once resolved.
+              await chmod(this.path, 0o600);
+              await this.launchMacosHelper(tool);
             } else {
               launchSameSessionHelper(process.execPath, this.path);
             }
           } catch (err) {
             clearTimeout(timer);
             server.close();
+            if (this.server === server) this.server = null;
             this.readyPromise = null;
             reject(err instanceof Error ? err : new Error(String(err)));
           }
         })();
       });
-      const done = () => clearTimeout(timer);
-      this.readyPromise?.then(done, done);
     });
-    return this.readyPromise;
+    await this.readyPromise;
+  }
+
+  private async launchMacosHelper(tool: ComputerUseToolName): Promise<void> {
+    const execPath = this.options.execPath ?? process.execPath;
+    const resolveConsoleUser = this.options.resolveMacosConsoleUser ?? resolveMacosConsoleUser;
+    const authorizeSocket = this.options.authorizeMacosComputerUseSocket ?? authorizeMacosComputerUseSocket;
+    const prepareRuntime = this.options.prepareMacosComputerUseRuntime ?? prepareMacosComputerUseRuntime;
+    const runDoctor = this.options.runMacosComputerUseDoctor ?? runMacosComputerUseDoctor;
+    const launchHelper = this.options.launchMacosUserSessionHelper ?? launchMacosUserSessionHelper;
+    const user = await resolveConsoleUser();
+    await authorizeSocket(this.path, user);
+    const candidates = [
+      join(dirname(execPath), 'computer-use-helper', 'open-computer-use'),
+      join(dirname(execPath), 'computer-use-helper', 'darwin-arm64', 'open-computer-use'),
+    ];
+    let sourceOpenComputerUseExecutable = candidates.find((candidate) => existsSync(candidate));
+    let downloadDir: string | undefined;
+    try {
+      if (!sourceOpenComputerUseExecutable) {
+        const credential = this.options.credential;
+        const target = controlledNodeArtifactTarget(
+          'darwin',
+          this.options.arch ?? process.arch,
+        );
+        if (!credential || !target) throw new Error('computer_use_helper_not_installed');
+        downloadDir = await mkdtemp(join(tmpdir(), 'imcodes-computer-use-download-'));
+        const downloadHelper = this.options.downloadMacosComputerUseHelper
+          ?? downloadControlledNodeComputerUseHelper;
+        const downloaded = await downloadHelper({
+          credential,
+          target,
+          dir: downloadDir,
+          fetchImpl: this.options.fetchImpl ?? fetch,
+        });
+        sourceOpenComputerUseExecutable = downloaded?.artifactPath;
+      }
+      const runtime = await prepareRuntime(execPath, sourceOpenComputerUseExecutable);
+      if (tool !== 'shell_session1' && !tool.startsWith('browser_')) {
+        // `doctor` opens the one-time TCC onboarding UI when permissions are
+        // absent. It is advisory: a stale LaunchServices registration must not
+        // prevent the real MCP helper from starting and returning its own
+        // actionable permission error.
+        await runDoctor(user, runtime).catch(() => {});
+      }
+      launchHelper(user, runtime, this.path);
+    } finally {
+      if (downloadDir) await rm(downloadDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
 
@@ -305,6 +408,7 @@ export class ComputerUseIpcHost {
       accepted = true;
       socket.setTimeout(0);
       this.socket = socket;
+      this.buffer = '';
       socket.removeAllListeners('data');
       socket.on('data', (chunk) => this.onData(String(chunk)));
       if (remaining) this.onData(remaining);
@@ -313,12 +417,14 @@ export class ComputerUseIpcHost {
     socket.on('error', (err) => {
       if (accepted && this.socket === socket) {
         this.socket = null;
+        this.retireServer();
         rejectPending(err instanceof Error ? err : new Error(String(err)));
       }
     });
     socket.on('close', () => {
       if (!accepted || this.socket !== socket) return;
       this.socket = null;
+      this.retireServer();
       rejectPending(new Error('computer_use_helper_disconnected'));
     });
     socket.on('data', (chunk) => {
@@ -337,7 +443,7 @@ export class ComputerUseIpcHost {
           socket.destroy();
           return;
         }
-        if (!parsed || parsed.hello !== IPC_HELPER_HELLO) {
+        if (!parsed || parsed.hello !== COMPUTER_USE_IPC_HELPER_HELLO) {
           socket.destroy();
           return;
         }
@@ -345,6 +451,21 @@ export class ComputerUseIpcHost {
         accept(remaining);
         return;
       }
+    });
+  }
+
+  private retireServer(): void {
+    this.buffer = '';
+    const server = this.server;
+    this.server = null;
+    if (!server) {
+      this.readyPromise = null;
+      return;
+    }
+    const closing = new Promise<void>((resolve) => server.close(() => resolve()));
+    this.readyPromise = closing;
+    void closing.finally(() => {
+      if (this.readyPromise === closing) this.readyPromise = null;
     });
   }
 
@@ -380,7 +501,7 @@ export async function runComputerUseIpcHelper(pipe: string): Promise<void> {
     socket.once('connect', resolve);
     socket.once('error', reject);
   });
-  socket.write(`${JSON.stringify({ hello: IPC_HELPER_HELLO } satisfies IpcHelloWire)}\n`);
+  socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO } satisfies IpcHelloWire)}\n`);
   socket.setEncoding('utf8');
   let buffer = '';
   socket.on('data', (chunk) => {

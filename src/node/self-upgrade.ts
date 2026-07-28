@@ -162,12 +162,12 @@ function controlledNodeComputerUseHelperFilename(target: ControlledNodeArtifactT
   return target.os === CONTROLLED_NODE_OS_WIN ? 'open-computer-use.exe' : 'open-computer-use';
 }
 
-async function downloadComputerUseHelper(input: {
+export async function downloadControlledNodeComputerUseHelper(input: {
   credential: ControlledNodeCredential;
   target: ControlledNodeArtifactTarget;
   dir: string;
   fetchImpl: typeof fetch;
-}): Promise<{ helperDir: string; sha256: string; sizeBytes: number } | undefined> {
+}): Promise<{ helperDir: string; artifactPath: string; sha256: string; sizeBytes: number } | undefined> {
   const helperDir = join(input.dir, 'computer-use-helper', controlledNodePlatformArchKey(input.target));
   await mkdir(helperDir, { recursive: true });
   try {
@@ -179,7 +179,12 @@ async function downloadComputerUseHelper(input: {
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER,
       expectedFileName: controlledNodeComputerUseHelperFilename(input.target),
     });
-    return { helperDir, sha256: downloaded.sha256, sizeBytes: downloaded.sizeBytes };
+    return {
+      helperDir,
+      artifactPath: downloaded.artifactPath,
+      sha256: downloaded.sha256,
+      sizeBytes: downloaded.sizeBytes,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/^download_failed_(404|503)$/.test(message) || message === 'artifact_filename_mismatch') return undefined;
@@ -438,7 +443,7 @@ export async function startControlledNodeSelfUpgrade(
     fetchImpl,
     ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
   });
-  const helper = await downloadComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
+  const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
   const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
   const destinationManifestPath = `${destinationPath}.manifest.json`;
   const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');

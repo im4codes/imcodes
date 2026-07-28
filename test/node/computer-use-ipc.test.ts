@@ -1,5 +1,26 @@
-import { describe, expect, it } from 'vitest';
-import { computerUseIpcDeadlineMs, quoteWinArg, windowsPipeClientAclCommand } from '../../src/node/computer-use-ipc.js';
+import net from 'node:net';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  COMPUTER_USE_IPC_HELPER_HELLO,
+  ComputerUseIpcHost,
+  computerUseIpcDeadlineMs,
+  quoteWinArg,
+  windowsPipeClientAclCommand,
+} from '../../src/node/computer-use-ipc.js';
+import type { MacosComputerUseRuntime, MacosConsoleUser } from '../../src/node/macos-computer-use.js';
+import { downloadControlledNodeComputerUseHelper } from '../../src/node/self-upgrade.js';
+
+const dirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
 
 describe('computer use IPC Windows argv quoting', () => {
   it('preserves named pipe backslashes for CreateProcessAsUser command lines', () => {
@@ -29,5 +50,250 @@ describe('computer use IPC deadline', () => {
   it('keeps the full 900 second shell timeout plus transport cleanup buffer', () => {
     expect(computerUseIpcDeadlineMs({ tool: 'shell_session1', timeoutMs: 900_000 })).toBe(905_000);
     expect(computerUseIpcDeadlineMs({ tool: 'list_apps', timeoutMs: 120_000 })).toBe(125_000);
+  });
+});
+
+describe('computer use IPC macOS GUI-session boundary', () => {
+  it('authorizes the socket, prompts for desktop permissions, and executes through the user helper', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    const sourceOcu = join(dir, 'computer-use-helper', 'open-computer-use');
+    await mkdir(join(dir, 'computer-use-helper'));
+    await writeFile(execPath, 'node');
+    await writeFile(sourceOcu, 'ocu');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+      tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    const authorizeSocket = vi.fn(async () => {});
+    const runDoctor = vi.fn(async () => {});
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += String(chunk);
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as {
+          id: string;
+          request: { correlationId: string; tool: 'list_apps' };
+        };
+        socket.write(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: 'Safari' }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: async () => runtime,
+      authorizeMacosComputerUseSocket: authorizeSocket,
+      runMacosComputerUseDoctor: runDoctor,
+      launchMacosUserSessionHelper: launchHelper,
+    });
+
+    try {
+      const result = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-macos-1',
+        tool: 'list_apps',
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        tool: 'list_apps',
+        content: [{ type: 'text', text: 'Safari' }],
+      });
+      expect(authorizeSocket).toHaveBeenCalledOnce();
+      expect(runDoctor).toHaveBeenCalledWith(user, runtime);
+      expect(launchHelper).toHaveBeenCalledWith(user, runtime, expect.stringMatching(/imcodes-computer-use-/));
+    } finally {
+      host.close();
+    }
+  });
+
+  it('restarts a disconnected helper instead of reusing a resolved readiness promise', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-reconnect-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    await mkdir(join(dir, 'computer-use-helper'));
+    await writeFile(execPath, 'node');
+    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use'), 'ocu');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+      tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    let responseCount = 0;
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += String(chunk);
+        const newline = buffer.indexOf('\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline)) as {
+          id: string;
+          request: { correlationId: string; tool: 'browser_close' };
+        };
+        responseCount++;
+        socket.end(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: `closed-${responseCount}` }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: async () => runtime,
+      authorizeMacosComputerUseSocket: async () => {},
+      runMacosComputerUseDoctor: async () => {},
+      launchMacosUserSessionHelper: launchHelper,
+    });
+
+    try {
+      const first = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-reconnect-1',
+        tool: 'browser_close',
+      });
+      expect(first.content[0]?.text).toBe('closed-1');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const second = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-reconnect-2',
+        tool: 'browser_close',
+      });
+      expect(second.content[0]?.text).toBe('closed-2');
+      expect(launchHelper).toHaveBeenCalledTimes(2);
+    } finally {
+      host.close();
+    }
+  });
+
+  it('downloads the OCU sidecar on a fresh macOS installation before launching the user helper', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-download-test-'));
+    dirs.push(dir);
+    const execPath = join(dir, 'imcodes-node');
+    await writeFile(execPath, 'node');
+    const user: MacosConsoleUser = {
+      name: 'desktop-user',
+      uid: 501,
+      gid: 20,
+      home: '/Users/desktop-user',
+      tempDir: '/private/tmp/user/',
+    };
+    const runtime: MacosComputerUseRuntime = {
+      helperExecutable: '/public/imcodes-helper',
+      openComputerUseExecutable: '/public/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    };
+    const downloadHelper = vi.fn(async (input: { dir: string }) => {
+      const helperDir = join(input.dir, 'computer-use-helper', 'darwin-arm64');
+      const artifactPath = join(helperDir, 'open-computer-use');
+      await mkdir(helperDir, { recursive: true });
+      await writeFile(artifactPath, 'downloaded-ocu');
+      return { helperDir, artifactPath, sha256: 'a'.repeat(64), sizeBytes: 14 };
+    });
+    const prepareRuntime = vi.fn(async (
+      _sourceNodeExecutable: string,
+      sourceOpenComputerUseExecutable: string | undefined,
+    ) => {
+      expect(sourceOpenComputerUseExecutable).toBeTruthy();
+      expect(await readFile(sourceOpenComputerUseExecutable!, 'utf8')).toBe('downloaded-ocu');
+      return runtime;
+    });
+    const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {
+      const socket = net.createConnection(pipe, () => {
+        socket.write(`${JSON.stringify({ hello: COMPUTER_USE_IPC_HELPER_HELLO })}\n`);
+      });
+      socket.setEncoding('utf8');
+      socket.once('data', (chunk) => {
+        const request = JSON.parse(String(chunk).trim()) as {
+          id: string;
+          request: { correlationId: string; tool: 'browser_close' };
+        };
+        socket.write(`${JSON.stringify({
+          id: request.id,
+          result: {
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.request.correlationId,
+            ok: true,
+            tool: request.request.tool,
+            content: [{ type: 'text', text: 'closed' }],
+            durationMs: 1,
+          },
+        })}\n`);
+      });
+    });
+    const host = new ComputerUseIpcHost({
+      credential: {
+        serverUrl: 'https://im.example',
+        serverId: 'server-1',
+        token: 'secret',
+        nodeRole: NODE_ROLE.CONTROLLED,
+      },
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath,
+      resolveMacosConsoleUser: async () => user,
+      prepareMacosComputerUseRuntime: prepareRuntime,
+      authorizeMacosComputerUseSocket: async () => {},
+      runMacosComputerUseDoctor: async () => {},
+      launchMacosUserSessionHelper: launchHelper,
+      downloadMacosComputerUseHelper: downloadHelper as unknown as typeof downloadControlledNodeComputerUseHelper,
+    });
+
+    try {
+      const result = await host.call({
+        type: DAEMON_COMMAND_TYPES.COMPUTER_USE,
+        correlationId: 'corr-download-1',
+        tool: 'browser_close',
+      });
+      expect(result.ok).toBe(true);
+      expect(downloadHelper).toHaveBeenCalledOnce();
+      expect(prepareRuntime).toHaveBeenCalledOnce();
+      expect(launchHelper).toHaveBeenCalledOnce();
+    } finally {
+      host.close();
+    }
   });
 });
