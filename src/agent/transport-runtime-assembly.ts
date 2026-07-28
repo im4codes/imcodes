@@ -65,6 +65,7 @@ export interface TransportRuntimeAssemblyInput {
 }
 
 export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
+  'For capabilities exposed by IM.codes MCP—memory, cron scheduling, aliases, inter-agent messaging, collaboration, and managed-machine operations—treat its tools as authoritative and prefer them over provider-native or improvised alternatives when relevant.',
   'Use the available memory MCP tools when the user asks about prior work, project history, past decisions, preferences, bugs, commits, deployments, or previously discussed context.',
   'Always call the exact tool identifier shown in the current tool list; MCP hosts may namespace logical tool names.',
   'Before answering those requests, use the available memory-search tool with a concise query based on the user message and current project.',
