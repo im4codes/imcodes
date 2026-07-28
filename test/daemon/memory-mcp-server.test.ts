@@ -191,8 +191,9 @@ describe('memory MCP stdio server', () => {
       // size here. This keeps the fixed tools/list prompt near 5k tokens while
       // allowing a small margin for intentional schema additions.
       // Explicit-path machine file-transfer tools plus the strict structured
-      // peer-audit reply envelope add safety contracts to the fixed surface.
-      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(27_000);
+      // peer-audit reply envelope and recurring-cron completion policy add
+      // safety contracts to the fixed surface.
+      expect(JSON.stringify(listed.tools).length).toBeLessThanOrEqual(29_000);
       expect(JSON.stringify(listed)).not.toContain('server-secret');
       expect(JSON.stringify(listed)).not.toContain('api-secret');
     } finally {
