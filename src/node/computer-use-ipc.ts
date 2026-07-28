@@ -511,6 +511,7 @@ export async function runComputerUseIpcHelper(
   closeRuntime: () => Promise<void> = closeComputerUseRuntimeForProcessExit,
 ): Promise<void> {
   const socket = net.createConnection(pipe);
+  const closed = new Promise<void>((resolve) => socket.once('close', resolve));
   try {
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
@@ -548,7 +549,7 @@ export async function runComputerUseIpcHelper(
         }
       });
     });
-    await new Promise<void>((resolve) => socket.once('close', resolve));
+    await closed;
   } finally {
     socket.destroy();
     await closeRuntime();
