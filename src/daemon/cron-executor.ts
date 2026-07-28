@@ -64,7 +64,7 @@ export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: st
   const completionPolicy = normalizeCronCompletionPolicy(msg.completionPolicy);
   const lifecycleInstruction = completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
     ? 'This schedule repeats until its overall goal is complete. Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.'
-    : 'This is one occurrence of a recurring schedule. Complete only this occurrence and keep the schedule active. Do not call cron_cancel_self after a successful run. Cancel it only when the user explicitly asks, using this id with force=true.';
+    : 'Recurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.';
   return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\n</imcodes-cron-control>`;
 }
 

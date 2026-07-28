@@ -128,7 +128,7 @@ describe('executeCronJob', () => {
     }), mockServerLink);
 
     const prompt = cronProcessSendMock.mock.calls[0][1] as string;
-    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1" completion-policy="recurring">\nUse cron_update_self to change this task only when the user explicitly asks.\nThis is one occurrence of a recurring schedule. Complete only this occurrence and keep the schedule active. Do not call cron_cancel_self after a successful run. Cancel it only when the user explicitly asks, using this id with force=true.\n</imcodes-cron-control>');
+    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1" completion-policy="recurring">\nUse cron_update_self to change this task only when the user explicitly asks.\nRecurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.\n</imcodes-cron-control>');
   });
 
   it('allows an until-complete schedule to self-cancel only after its overall goal completes', async () => {
