@@ -7,17 +7,20 @@ import {
   lstat,
   mkdir,
   readFile,
+  readdir,
   rename,
   rm,
   writeFile,
 } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export const MACOS_COMPUTER_USE_RUNTIME_ROOT = '/Library/Application Support/imcodes-node-computer-use';
 export const MACOS_COMPUTER_USE_APP_NAME = 'Open Computer Use.app';
 
 const MACOS_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
 const MACOS_COMPUTER_USE_BUNDLE_ID = 'com.ifuryst.opencomputeruse';
+const MACOS_COMPUTER_USE_TEAM_ID = 'J9P29FA5BX';
+const MACOS_COMPUTER_USE_SOURCE_DIGEST = '.open-computer-use-source.sha256';
 
 export interface MacosConsoleUser {
   name: string;
@@ -35,7 +38,8 @@ export interface MacosComputerUseRuntime {
 interface MacosComputerUseRuntimeOptions {
   runtimeRoot?: string;
   verifyCodeSignature?: (path: string, deep: boolean) => Promise<void>;
-  signAppBundle?: (path: string) => Promise<void>;
+  verifyAppBundle?: (path: string) => Promise<void>;
+  extractAppArchive?: (archivePath: string, destinationRoot: string) => Promise<void>;
 }
 
 function execFileText(file: string, args: readonly string[], timeoutMs = 15_000): Promise<string> {
@@ -72,32 +76,57 @@ async function defaultVerifyCodeSignature(path: string, deep: boolean): Promise<
   ]);
 }
 
-async function defaultSignAppBundle(path: string): Promise<void> {
-  await execFileText('/usr/bin/codesign', ['--force', '--sign', '-', '--deep', path]);
+async function defaultVerifyAppBundle(path: string): Promise<void> {
+  await defaultVerifyCodeSignature(path, true);
+  const details = await new Promise<string>((resolve, reject) => {
+    execFile('/usr/bin/codesign', ['-dv', '--verbose=4', path], { encoding: 'utf8', timeout: 15_000 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(String(stderr || error.message).trim()));
+        return;
+      }
+      resolve(`${stdout}\n${stderr}`);
+    });
+  });
+  if (!details.includes(`Identifier=${MACOS_COMPUTER_USE_BUNDLE_ID}`)
+    || !details.includes(`TeamIdentifier=${MACOS_COMPUTER_USE_TEAM_ID}`)
+    || !details.includes('Authority=Developer ID Application:')) {
+    throw new Error('computer_use_app_untrusted_signature');
+  }
 }
 
-export function macosComputerUseInfoPlist(): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleExecutable</key><string>${MACOS_COMPUTER_USE_EXECUTABLE}</string>
-  <key>CFBundleIdentifier</key><string>${MACOS_COMPUTER_USE_BUNDLE_ID}</string>
-  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleName</key><string>Open Computer Use</string>
-  <key>CFBundleDisplayName</key><string>Open Computer Use</string>
-  <key>OpenComputerUseAppVariant</key><string>release</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
-  <key>LSUIElement</key><true/>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>NSPrincipalClass</key><string>NSApplication</string>
-</dict>
-</plist>
-`;
+export function validateMacosComputerUseArchiveEntries(entries: readonly string[]): void {
+  if (entries.length === 0) throw new Error('computer_use_app_archive_empty');
+  for (const rawEntry of entries) {
+    const entry = rawEntry.endsWith('/') ? rawEntry.slice(0, -1) : rawEntry;
+    const components = entry.split('/');
+    if (!entry
+      || entry.startsWith('/')
+      || entry.includes('\\')
+      || components[0] !== MACOS_COMPUTER_USE_APP_NAME
+      || components.some((component) => component === '' || component === '.' || component === '..')) {
+      throw new Error('computer_use_app_archive_unsafe');
+    }
+  }
+}
+
+async function validateExtractedAppTree(path: string): Promise<void> {
+  const stat = await lstat(path);
+  if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) {
+    throw new Error('computer_use_app_archive_unsafe');
+  }
+  if (!stat.isDirectory()) return;
+  for (const name of await readdir(path)) {
+    await validateExtractedAppTree(join(path, name));
+  }
+}
+
+async function defaultExtractAppArchive(archivePath: string, destinationRoot: string): Promise<void> {
+  const entries = (await execFileText('/usr/bin/unzip', ['-Z1', archivePath]))
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  validateMacosComputerUseArchiveEntries(entries);
+  await execFileText('/usr/bin/ditto', ['-x', '-k', archivePath, destinationRoot]);
 }
 
 async function publishExecutable(source: string, destination: string): Promise<void> {
@@ -110,56 +139,81 @@ async function publishExecutable(source: string, destination: string): Promise<v
   await rename(temp, destination);
 }
 
-async function appBundleMatchesSource(appExecutable: string, source: string): Promise<boolean> {
-  if (!await isRegularFile(appExecutable)) return false;
-  return await sha256File(appExecutable) === await sha256File(source);
+async function readSourceDigest(path: string): Promise<string | null> {
+  if (!await isRegularFile(path)) return null;
+  const value = (await readFile(path, 'utf8')).trim();
+  return /^[a-f0-9]{64}$/.test(value) ? value : null;
 }
 
 async function publishAppBundle(
-  sourceExecutable: string,
+  sourceArchive: string,
   appPath: string,
-  options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyCodeSignature' | 'signAppBundle'>>,
+  options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'>>,
 ): Promise<void> {
+  if (!await isRegularFile(sourceArchive)) throw new Error('computer_use_helper_not_installed');
+  const sourceDigest = await sha256File(sourceArchive);
+  const digestPath = join(dirname(appPath), MACOS_COMPUTER_USE_SOURCE_DIGEST);
   const appExecutable = join(appPath, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE);
-  if (await appBundleMatchesSource(appExecutable, sourceExecutable)) {
-    await options.verifyCodeSignature(appPath, true);
-    return;
+  if (await readSourceDigest(digestPath) === sourceDigest && await isRegularFile(appExecutable)) {
+    try {
+      await options.verifyAppBundle(appPath);
+      return;
+    } catch {
+      // A matching archive digest never authorizes an invalid or replaced app.
+    }
   }
 
-  const tempApp = `${appPath}.${process.pid}.${randomUUID()}.tmp`;
+  const extractionRoot = join(dirname(appPath), `.open-computer-use-extract-${process.pid}-${randomUUID()}`);
+  const extractedApp = join(extractionRoot, MACOS_COMPUTER_USE_APP_NAME);
   const backupApp = `${appPath}.${process.pid}.${randomUUID()}.old`;
-  await rm(tempApp, { recursive: true, force: true });
-  await mkdir(join(tempApp, 'Contents', 'MacOS'), { recursive: true, mode: 0o755 });
-  await writeFile(join(tempApp, 'Contents', 'Info.plist'), macosComputerUseInfoPlist(), { mode: 0o644 });
-  await copyFile(sourceExecutable, join(tempApp, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE));
-  await chmod(join(tempApp, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE), 0o755);
-  await options.signAppBundle(tempApp);
-  await options.verifyCodeSignature(tempApp, true);
-
-  let movedExisting = false;
+  await rm(extractionRoot, { recursive: true, force: true });
+  await mkdir(extractionRoot, { recursive: true, mode: 0o755 });
   try {
-    if (await lstat(appPath).then(() => true, () => false)) {
-      await rename(appPath, backupApp);
-      movedExisting = true;
+    await options.extractAppArchive(sourceArchive, extractionRoot);
+    await validateExtractedAppTree(extractedApp);
+    if (!await isRegularFile(join(extractedApp, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE))) {
+      throw new Error('computer_use_helper_not_installed');
     }
-    await rename(tempApp, appPath);
-    await rm(backupApp, { recursive: true, force: true });
-  } catch (error) {
-    if (movedExisting) await rename(backupApp, appPath).catch(() => {});
-    throw error;
+    await options.verifyAppBundle(extractedApp);
+
+    let movedExisting = false;
+    let publishedNew = false;
+    try {
+      await rm(digestPath, { force: true });
+      if (await lstat(appPath).then(() => true, () => false)) {
+        await rename(appPath, backupApp);
+        movedExisting = true;
+      }
+      await rename(extractedApp, appPath);
+      publishedNew = true;
+      await options.verifyAppBundle(appPath);
+      await rm(backupApp, { recursive: true, force: true });
+    } catch (error) {
+      if (publishedNew) await rm(appPath, { recursive: true, force: true }).catch(() => {});
+      if (movedExisting) await rename(backupApp, appPath).catch(() => {});
+      throw error;
+    }
+    const tempDigest = `${digestPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tempDigest, `${sourceDigest}\n`, { mode: 0o644 });
+      await rename(tempDigest, digestPath);
+    } finally {
+      await rm(tempDigest, { force: true }).catch(() => {});
+    }
   } finally {
-    await rm(tempApp, { recursive: true, force: true }).catch(() => {});
+    await rm(extractionRoot, { recursive: true, force: true }).catch(() => {});
   }
 }
 
 export async function prepareMacosComputerUseRuntime(
   sourceNodeExecutable: string,
-  sourceOpenComputerUseExecutable: string | undefined,
+  sourceOpenComputerUseArchive: string | undefined,
   options: MacosComputerUseRuntimeOptions = {},
 ): Promise<MacosComputerUseRuntime> {
   const runtimeRoot = options.runtimeRoot ?? MACOS_COMPUTER_USE_RUNTIME_ROOT;
   const verifyCodeSignature = options.verifyCodeSignature ?? defaultVerifyCodeSignature;
-  const signAppBundle = options.signAppBundle ?? defaultSignAppBundle;
+  const verifyAppBundle = options.verifyAppBundle ?? defaultVerifyAppBundle;
+  const extractAppArchive = options.extractAppArchive ?? defaultExtractAppArchive;
   const helperExecutable = join(runtimeRoot, 'imcodes-computer-use-helper');
   const appPath = join(runtimeRoot, MACOS_COMPUTER_USE_APP_NAME);
   const openComputerUseExecutable = join(appPath, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE);
@@ -173,13 +227,12 @@ export async function prepareMacosComputerUseRuntime(
   await publishExecutable(sourceNodeExecutable, helperExecutable);
   await verifyCodeSignature(helperExecutable, false);
 
-  if (sourceOpenComputerUseExecutable) {
-    if (!await isRegularFile(sourceOpenComputerUseExecutable)) throw new Error('computer_use_helper_not_installed');
-    await publishAppBundle(sourceOpenComputerUseExecutable, appPath, { verifyCodeSignature, signAppBundle });
+  if (sourceOpenComputerUseArchive) {
+    await publishAppBundle(sourceOpenComputerUseArchive, appPath, { verifyAppBundle, extractAppArchive });
   } else if (!await isRegularFile(openComputerUseExecutable)) {
     throw new Error('computer_use_helper_not_installed');
   } else {
-    await verifyCodeSignature(appPath, true);
+    await verifyAppBundle(appPath);
   }
 
   return { helperExecutable, openComputerUseExecutable };

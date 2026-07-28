@@ -9,6 +9,7 @@ import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH,
+  controlledNodeComputerUseHelperFilename,
   CONTROLLED_NODE_OS_LINUX,
   CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
@@ -94,6 +95,7 @@ async function downloadArtifact(input: {
   asset?: typeof CONTROLLED_NODE_ARTIFACT_ASSETS[keyof typeof CONTROLLED_NODE_ARTIFACT_ASSETS];
   expectedFileName?: string;
   expectedVersion?: string;
+  fileMode?: number;
 }): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
   const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
@@ -117,8 +119,9 @@ async function downloadArtifact(input: {
   if (input.expectedVersion && versionHeader !== input.expectedVersion) throw new Error('artifact_version_mismatch');
   const artifactPath = join(input.dir, basename(filename));
   const manifestPath = `${artifactPath}.manifest.json`;
-  await writeFile(artifactPath, bytes, { mode: 0o755 });
-  if (process.platform !== 'win32') await chmod(artifactPath, 0o755).catch(() => {});
+  const fileMode = input.fileMode ?? 0o755;
+  await writeFile(artifactPath, bytes, { mode: fileMode });
+  if (process.platform !== 'win32') await chmod(artifactPath, fileMode).catch(() => {});
   // Re-read what actually LANDED. The check above proves the download was
   // intact in memory, not that those bytes survived the write — and the manifest
   // below records `actualSha` as fact, so an unverified write lets a corrupted
@@ -158,10 +161,6 @@ function controlledNodePlatformArchKey(target: ControlledNodeArtifactTarget): st
   return `${platform}-${target.arch}`;
 }
 
-function controlledNodeComputerUseHelperFilename(target: ControlledNodeArtifactTarget): string {
-  return target.os === CONTROLLED_NODE_OS_WIN ? 'open-computer-use.exe' : 'open-computer-use';
-}
-
 export async function downloadControlledNodeComputerUseHelper(input: {
   credential: ControlledNodeCredential;
   target: ControlledNodeArtifactTarget;
@@ -177,7 +176,8 @@ export async function downloadControlledNodeComputerUseHelper(input: {
       dir: helperDir,
       fetchImpl: input.fetchImpl,
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER,
-      expectedFileName: controlledNodeComputerUseHelperFilename(input.target),
+      expectedFileName: controlledNodeComputerUseHelperFilename(input.target.os),
+      fileMode: input.target.os === CONTROLLED_NODE_OS_MAC ? 0o644 : 0o755,
     });
     return {
       helperDir,
@@ -286,8 +286,11 @@ export function buildPosixControlledNodeUpgradeScript(input: {
     ? `cp -f ${shQuote(input.stagedJournalPath)} ${shQuote(input.destinationJournalPath)} 2>/dev/null || true\n`
     : '';
   const helperDir = join(dirname(input.destinationPath), 'computer-use-helper');
+  const helperPermissions = input.platform === 'darwin'
+    ? `find ${shQuote(helperDir)} -type f -name 'open-computer-use.app.zip' -exec chmod 644 {} \\; 2>/dev/null || true\n`
+    : `find ${shQuote(helperDir)} -type f -name 'open-computer-use' -exec chmod 755 {} \\; 2>/dev/null || true\n`;
   const helperCopy = input.stagedComputerUseHelperDir
-    ? `rm -rf ${shQuote(helperDir)}\nmkdir -p ${shQuote(helperDir)}\ncp -R ${shQuote(`${input.stagedComputerUseHelperDir}/.`)} ${shQuote(helperDir)}/ 2>/dev/null || true\nfind ${shQuote(helperDir)} -type f -name 'open-computer-use*' -exec chmod 755 {} \\; 2>/dev/null || true\n`
+    ? `rm -rf ${shQuote(helperDir)}\nmkdir -p ${shQuote(helperDir)}\ncp -R ${shQuote(`${input.stagedComputerUseHelperDir}/.`)} ${shQuote(helperDir)}/ 2>/dev/null || true\n${helperPermissions}`
     : '';
   // Publish the new executable through a temp file + rename(2), NEVER `cp -f`
   // straight onto the destination.

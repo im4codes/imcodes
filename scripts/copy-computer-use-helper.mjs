@@ -11,9 +11,10 @@
  * mutable PATH install. Missing helper is a warning for local dev unless
  * IMCODES_REQUIRE_COMPUTER_USE_HELPER=1.
  */
-import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +25,10 @@ const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
 const platformKey = `${process.platform}-${arch}`;
 const isWin = process.platform === 'win32';
 const helperBinaryName = isWin ? 'open-computer-use.exe' : 'open-computer-use';
+const macosAppName = 'Open Computer Use.app';
+const macosArchiveName = 'open-computer-use.app.zip';
+const macosBundleId = 'com.ifuryst.opencomputeruse';
+const macosTeamId = 'J9P29FA5BX';
 const args = new Set(process.argv.slice(2));
 const copyDist = args.size === 0 || args.has('--dist');
 const copyNodeExe = args.size === 0 || args.has('--node-exe');
@@ -40,7 +45,7 @@ function sourceCandidates() {
   })();
   const npmPackagedBinary = npmPackageRoot
     ? process.platform === 'darwin'
-      ? join(npmPackageRoot, 'dist', 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse')
+      ? join(npmPackageRoot, 'dist', macosAppName)
       : join(npmPackageRoot, 'dist', process.platform === 'win32' ? 'windows' : 'linux', arch === 'x64' ? 'amd64' : 'arm64', helperBinaryName)
     : null;
   return [
@@ -53,53 +58,70 @@ function sourceCandidates() {
 function findSource() {
   for (const candidate of sourceCandidates()) {
     const full = resolve(candidate);
-    if (existsSync(full)) return full;
+    if (!existsSync(full)) continue;
+    if (process.platform !== 'darwin') return full;
+    const app = basename(full) === macosAppName ? full : join(full, macosAppName);
+    if (existsSync(app) && lstatSync(app).isDirectory() && !lstatSync(app).isSymbolicLink()) return app;
   }
   return null;
 }
 
-/**
- * macOS: re-sign the copied helper ad-hoc.
- *
- * Upstream ships the darwin helper INSIDE a `Open Computer Use.app` bundle
- * signed with a Developer ID + hardened runtime. That signature covers the
- * bundle's `Info.plist` and `_CodeSignature/CodeResources`, so lifting the bare
- * Mach-O out of the bundle (which is what we want — a flat helper dir) leaves
- * those siblings behind and the signature no longer validates. With the
- * hardened-runtime flag set, the kernel then SIGKILLs the process on exec:
- * exit 137, no stdout, no stderr — the helper was simply DEAD on macOS.
- *
- * Replacing the now-invalid signature ad-hoc costs nothing: the upstream binary
- * carries NO entitlements, and the bundle is not notarized (`spctl` rejects it
- * as "Unnotarized Developer ID"), so there is no entitlement or Gatekeeper
- * benefit to preserve — only a broken signature to drop. Ad-hoc CDHash is
- * content-derived, so identical bytes keep a stable identity across rebuilds.
- */
-function adhocResignDarwinBinary(binaryPath) {
-  if (process.platform !== 'darwin') return;
+function verifyMacosAppBundle(appPath) {
   try {
-    execFileSync('codesign', ['--force', '--sign', '-', binaryPath], { stdio: 'pipe' });
+    execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath], { stdio: 'pipe' });
+    const inspected = spawnSync('/usr/bin/codesign', ['-dv', '--verbose=4', appPath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (inspected.error || inspected.status !== 0) {
+      throw inspected.error ?? new Error(String(inspected.stderr || 'codesign inspection failed').trim());
+    }
+    const details = `${inspected.stdout ?? ''}\n${inspected.stderr ?? ''}`;
+    if (!details.includes(`Identifier=${macosBundleId}`)
+      || !details.includes(`TeamIdentifier=${macosTeamId}`)
+      || !details.includes('Authority=Developer ID Application:')) {
+      throw new Error('unexpected Developer ID identity');
+    }
   } catch (error) {
-    throw new Error(`copy-computer-use-helper: ad-hoc codesign failed for ${binaryPath}: ${error.message}`);
+    throw new Error(`copy-computer-use-helper: invalid signed macOS app ${appPath}: ${error.message}`);
   }
 }
 
-function copySourceToDest(source, dest) {
+function archiveMacosAppBundle(source, archivePath) {
+  execFileSync('/usr/bin/ditto', ['-c', '-k', '--keepParent', source, archivePath], { stdio: 'pipe' });
+  const verificationRoot = mkdtempSync(join(tmpdir(), 'imcodes-ocu-archive-verify-'));
+  try {
+    execFileSync('/usr/bin/ditto', ['-x', '-k', archivePath, verificationRoot], { stdio: 'pipe' });
+    verifyMacosAppBundle(join(verificationRoot, macosAppName));
+  } finally {
+    rmSync(verificationRoot, { recursive: true, force: true });
+  }
+}
+
+function copySourceToDest(source, dest, includeMacosAppBundle) {
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
+  if (process.platform === 'darwin') {
+    verifyMacosAppBundle(source);
+    if (includeMacosAppBundle) {
+      const copiedApp = join(dest, macosAppName);
+      cpSync(source, copiedApp, { recursive: true });
+      verifyMacosAppBundle(copiedApp);
+    }
+    archiveMacosAppBundle(source, join(dest, macosArchiveName));
+    return;
+  }
   const stat = statSync(source);
   if (stat.isDirectory()) {
     const rootBinary = join(source, helperBinaryName);
     if (existsSync(rootBinary) && statSync(rootBinary).isFile()) {
       cpSync(rootBinary, join(dest, helperBinaryName));
-      adhocResignDarwinBinary(join(dest, helperBinaryName));
       return;
     }
     cpSync(source, dest, { recursive: true });
     return;
   }
   cpSync(source, join(dest, helperBinaryName));
-  adhocResignDarwinBinary(join(dest, helperBinaryName));
 }
 
 const source = findSource();
@@ -111,8 +133,16 @@ if (!source) {
 }
 
 const destinations = [];
-if (copyDist) destinations.push(join(root, 'dist', 'computer-use-helper', platformKey));
-if (copyNodeExe) destinations.push(join(root, 'dist-node-exe', 'computer-use-helper', platformKey));
+if (copyDist) destinations.push({
+  path: join(root, 'dist', 'computer-use-helper', platformKey),
+  includeMacosAppBundle: true,
+});
+if (copyNodeExe) destinations.push({
+  path: join(root, 'dist-node-exe', 'computer-use-helper', platformKey),
+  includeMacosAppBundle: false,
+});
 
-for (const dest of destinations) copySourceToDest(source, dest);
-console.log(`copy-computer-use-helper: copied ${source} -> ${destinations.join(', ')}`);
+for (const destination of destinations) {
+  copySourceToDest(source, destination.path, destination.includeMacosAppBundle);
+}
+console.log(`copy-computer-use-helper: copied ${source} -> ${destinations.map(({ path }) => path).join(', ')}`);

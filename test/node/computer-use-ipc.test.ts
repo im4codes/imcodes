@@ -58,7 +58,7 @@ describe('computer use IPC macOS GUI-session boundary', () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-ipc-macos-test-'));
     dirs.push(dir);
     const execPath = join(dir, 'imcodes-node');
-    const sourceOcu = join(dir, 'computer-use-helper', 'open-computer-use');
+    const sourceOcu = join(dir, 'computer-use-helper', 'open-computer-use.app.zip');
     await mkdir(join(dir, 'computer-use-helper'));
     await writeFile(execPath, 'node');
     await writeFile(sourceOcu, 'ocu');
@@ -138,7 +138,7 @@ describe('computer use IPC macOS GUI-session boundary', () => {
     const execPath = join(dir, 'imcodes-node');
     await mkdir(join(dir, 'computer-use-helper'));
     await writeFile(execPath, 'node');
-    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use'), 'ocu');
+    await writeFile(join(dir, 'computer-use-helper', 'open-computer-use.app.zip'), 'ocu-archive');
     const user: MacosConsoleUser = {
       name: 'desktop-user',
       uid: 501,
@@ -228,17 +228,17 @@ describe('computer use IPC macOS GUI-session boundary', () => {
     };
     const downloadHelper = vi.fn(async (input: { dir: string }) => {
       const helperDir = join(input.dir, 'computer-use-helper', 'darwin-arm64');
-      const artifactPath = join(helperDir, 'open-computer-use');
+      const artifactPath = join(helperDir, 'open-computer-use.app.zip');
       await mkdir(helperDir, { recursive: true });
       await writeFile(artifactPath, 'downloaded-ocu');
       return { helperDir, artifactPath, sha256: 'a'.repeat(64), sizeBytes: 14 };
     });
     const prepareRuntime = vi.fn(async (
       _sourceNodeExecutable: string,
-      sourceOpenComputerUseExecutable: string | undefined,
+      sourceOpenComputerUseArchive: string | undefined,
     ) => {
-      expect(sourceOpenComputerUseExecutable).toBeTruthy();
-      expect(await readFile(sourceOpenComputerUseExecutable!, 'utf8')).toBe('downloaded-ocu');
+      expect(sourceOpenComputerUseArchive).toBeTruthy();
+      expect(await readFile(sourceOpenComputerUseArchive!, 'utf8')).toBe('downloaded-ocu');
       return runtime;
     });
     const launchHelper = vi.fn((_user: MacosConsoleUser, _runtime: MacosComputerUseRuntime, pipe: string) => {

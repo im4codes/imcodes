@@ -15,6 +15,7 @@ import {
   isCanonicalControlledNodePair,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  controlledNodeComputerUseHelperFilename,
   isControlledNodeArch,
   isControlledNodeOs,
   type ControlledNodeArch,
@@ -586,10 +587,6 @@ function controlledNodeRuntimePlatform(os: ControlledNodeOs): 'win32' | 'darwin'
   if (os === 'win') return 'win32';
   if (os === 'mac') return 'darwin';
   return 'linux';
-}
-
-function controlledNodeComputerUseHelperFilename(os: ControlledNodeOs): string {
-  return os === 'win' ? 'open-computer-use.exe' : 'open-computer-use';
 }
 
 async function openComputerUseHelperArtifact(

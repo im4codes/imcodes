@@ -26,6 +26,12 @@ const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.e
 const SHELL_SESSION1_OUTPUT_MAX_BYTES = 96 * 1024;
 const OPEN_COMPUTER_USE_STDOUT_MAX_BYTES = 24 * 1024 * 1024;
 const OPEN_COMPUTER_USE_BINARY = process.platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
+const MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE = join(
+  'Open Computer Use.app',
+  'Contents',
+  'MacOS',
+  'OpenComputerUse',
+);
 
 function platformArchKey(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
   return `${platform}-${arch === 'arm64' ? 'arm64' : 'x64'}`;
@@ -56,13 +62,21 @@ export function openComputerUseCandidateBinariesForTest(moduleFilePath?: string,
 }
 
 function pushPackagedHelperCandidates(candidates: Array<string | undefined>, baseDir: string, key: string): void {
+  const helperRoots = [
+    resolve(baseDir, '..', 'computer-use-helper', key),
+    resolve(baseDir, '..', '..', 'computer-use-helper', key),
+    resolve(baseDir, '..', '..', 'dist', 'computer-use-helper', key),
+  ];
+  if (process.platform === 'darwin') {
+    candidates.push(...helperRoots.map((root) => join(root, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE)));
+  }
   candidates.push(
     // npm package layout: dist/src/index.js -> dist/computer-use-helper/<platform-arch>/...
-    resolve(baseDir, '..', 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[0]!, OPEN_COMPUTER_USE_BINARY),
     // module layout: dist/src/node/computer-use-runner.js -> dist/computer-use-helper/<platform-arch>/...
-    resolve(baseDir, '..', '..', 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[1]!, OPEN_COMPUTER_USE_BINARY),
     // source/dev checkout layout: src/... -> dist/computer-use-helper/<platform-arch>/...
-    resolve(baseDir, '..', '..', 'dist', 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[2]!, OPEN_COMPUTER_USE_BINARY),
   );
 }
 

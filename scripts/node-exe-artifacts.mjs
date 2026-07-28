@@ -20,7 +20,7 @@ const EXPECTED_OS_BY_ARTIFACT = new Map([
 ]);
 const EXPECTED_HELPER_BY_ARTIFACT = new Map([
   ['imcodes-node-linux', ['computer-use-helper', 'linux-x64', 'open-computer-use']],
-  ['imcodes-node-macos', ['computer-use-helper', 'darwin-arm64', 'open-computer-use']],
+  ['imcodes-node-macos', ['computer-use-helper', 'darwin-arm64', 'open-computer-use.app.zip']],
   ['imcodes-node.exe', ['computer-use-helper', 'win32-x64', 'open-computer-use.exe']],
 ]);
 const BUILD_VERSION_RE = /^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/;

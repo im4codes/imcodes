@@ -65,6 +65,9 @@ describe('controlled-node executable release wiring', () => {
     expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.2.0');
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
     expect(copyScript).toContain('Open Computer Use.app');
+    expect(copyScript).toContain('open-computer-use.app.zip');
+    expect(copyScript).toContain("['--verify', '--deep', '--strict', appPath]");
+    expect(copyScript).not.toContain("'--force', '--sign', '-'");
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"');
   });

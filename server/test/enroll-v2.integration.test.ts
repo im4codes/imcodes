@@ -1412,6 +1412,28 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     expect(helperResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('open-computer-use.exe');
     expect(helperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(helperBytes));
     expect(Buffer.from(await helperResponse.arrayBuffer())).toEqual(helperBytes);
+
+    const macToken = hex(16);
+    const macServerId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
+       VALUES ($1, $2, 'controlled-mac', $3, 'online', $4, $5, TRUE, 'mac', 'arm64')`,
+      [macServerId, userId, sha256(macToken), Date.now(), NODE_ROLE.CONTROLLED],
+    );
+    const macArchiveBytes = Buffer.from('SIGNED_OPEN_COMPUTER_USE_APP_ARCHIVE');
+    await mkdir(join(exeDir, 'computer-use-helper', 'darwin-arm64'), { recursive: true });
+    await writeFile(
+      join(exeDir, 'computer-use-helper', 'darwin-arm64', 'open-computer-use.app.zip'),
+      macArchiveBytes,
+    );
+    const macHelperResponse = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${macServerId}&os=mac&arch=arm64&asset=computer-use-helper`,
+      { headers: { authorization: `Bearer ${macToken}` } },
+    );
+    expect(macHelperResponse.status).toBe(200);
+    expect(macHelperResponse.headers.get('x-imcodes-node-artifact-filename')).toBe('open-computer-use.app.zip');
+    expect(macHelperResponse.headers.get('x-imcodes-node-artifact-sha256')).toBe(sha256(macArchiveBytes));
+    expect(Buffer.from(await macHelperResponse.arrayBuffer())).toEqual(macArchiveBytes);
   });
 
   it('rejects full daemon tokens and platform mismatches', async () => {

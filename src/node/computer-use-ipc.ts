@@ -30,6 +30,10 @@ import {
   type ComputerUseResultFrame,
   type ComputerUseToolName,
 } from '../../shared/computer-use.js';
+import {
+  controlledNodeComputerUseHelperFilename,
+  CONTROLLED_NODE_OS_MAC,
+} from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 
 interface IpcRequestWire { id: string; request: ComputerUseFrame }
@@ -224,7 +228,7 @@ export interface ComputerUseIpcHostOptions {
   resolveMacosConsoleUser?: () => Promise<MacosConsoleUser>;
   prepareMacosComputerUseRuntime?: (
     sourceNodeExecutable: string,
-    sourceOpenComputerUseExecutable: string | undefined,
+    sourceOpenComputerUseArchive: string | undefined,
   ) => Promise<MacosComputerUseRuntime>;
   authorizeMacosComputerUseSocket?: (path: string, user: MacosConsoleUser) => Promise<void>;
   runMacosComputerUseDoctor?: (user: MacosConsoleUser, runtime: MacosComputerUseRuntime) => Promise<void>;
@@ -349,14 +353,15 @@ export class ComputerUseIpcHost {
     const launchHelper = this.options.launchMacosUserSessionHelper ?? launchMacosUserSessionHelper;
     const user = await resolveConsoleUser();
     await authorizeSocket(this.path, user);
+    const archiveName = controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC);
     const candidates = [
-      join(dirname(execPath), 'computer-use-helper', 'open-computer-use'),
-      join(dirname(execPath), 'computer-use-helper', 'darwin-arm64', 'open-computer-use'),
+      join(dirname(execPath), 'computer-use-helper', archiveName),
+      join(dirname(execPath), 'computer-use-helper', 'darwin-arm64', archiveName),
     ];
-    let sourceOpenComputerUseExecutable = candidates.find((candidate) => existsSync(candidate));
+    let sourceOpenComputerUseArchive = candidates.find((candidate) => existsSync(candidate));
     let downloadDir: string | undefined;
     try {
-      if (!sourceOpenComputerUseExecutable) {
+      if (!sourceOpenComputerUseArchive) {
         const credential = this.options.credential;
         const target = controlledNodeArtifactTarget(
           'darwin',
@@ -372,9 +377,9 @@ export class ComputerUseIpcHost {
           dir: downloadDir,
           fetchImpl: this.options.fetchImpl ?? fetch,
         });
-        sourceOpenComputerUseExecutable = downloaded?.artifactPath;
+        sourceOpenComputerUseArchive = downloaded?.artifactPath;
       }
-      const runtime = await prepareRuntime(execPath, sourceOpenComputerUseExecutable);
+      const runtime = await prepareRuntime(execPath, sourceOpenComputerUseArchive);
       if (tool !== 'shell_session1' && !tool.startsWith('browser_')) {
         // `doctor` opens the one-time TCC onboarding UI when permissions are
         // absent. It is advisory: a stale LaunchServices registration must not

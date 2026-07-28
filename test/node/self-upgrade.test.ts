@@ -6,7 +6,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
-import { CONTROLLED_NODE_ARTIFACT_ASSETS, CONTROLLED_NODE_ARTIFACT_HEADERS, CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from '../../shared/controlled-node-artifacts.js';
+import {
+  CONTROLLED_NODE_ARTIFACT_ASSETS,
+  CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH,
+  controlledNodeComputerUseHelperFilename,
+} from '../../shared/controlled-node-artifacts.js';
 import {
   buildPosixControlledNodeUpgradeScript,
   buildWindowsControlledNodeUpgradeScript,
@@ -37,6 +42,9 @@ describe('controlled-node self-upgrade', () => {
     expect(controlledNodeArtifactTarget('darwin', 'arm64')).toEqual({ os: 'mac', arch: 'arm64' });
     expect(controlledNodeArtifactTarget('linux', 'x64')).toEqual({ os: 'linux', arch: 'x64' });
     expect(controlledNodeArtifactTarget('win32', 'arm64')).toBeNull();
+    expect(controlledNodeComputerUseHelperFilename('win')).toBe('open-computer-use.exe');
+    expect(controlledNodeComputerUseHelperFilename('mac')).toBe('open-computer-use.app.zip');
+    expect(controlledNodeComputerUseHelperFilename('linux')).toBe('open-computer-use');
   });
 
   it('builds the node-token artifact URL with serverId, os, and arch', () => {

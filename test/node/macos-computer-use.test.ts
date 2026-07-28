@@ -4,9 +4,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   macosComputerUseDoctorArgs,
-  macosComputerUseInfoPlist,
   macosUserSessionHelperArgs,
   prepareMacosComputerUseRuntime,
+  validateMacosComputerUseArchiveEntries,
   type MacosComputerUseRuntime,
   type MacosConsoleUser,
 } from '../../src/node/macos-computer-use.js';
@@ -19,25 +19,38 @@ async function tempDir(): Promise<string> {
   return dir;
 }
 
+async function writeExtractedApp(destinationRoot: string, executableBytes: string): Promise<void> {
+  const app = join(destinationRoot, 'Open Computer Use.app');
+  await mkdir(join(app, 'Contents', 'MacOS'), { recursive: true });
+  await mkdir(join(app, 'Contents', '_CodeSignature'), { recursive: true });
+  await writeFile(join(app, 'Contents', 'Info.plist'), '<plist>upstream-signed</plist>');
+  await writeFile(join(app, 'Contents', '_CodeSignature', 'CodeResources'), 'developer-id-seal');
+  await writeFile(join(app, 'Contents', 'MacOS', 'OpenComputerUse'), executableBytes, { mode: 0o755 });
+}
+
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 describe('macOS Computer Use runtime boundary', () => {
-  it('keeps the GUI runtime separate from protected credentials and publishes executable-only files', async () => {
+  it('publishes the complete upstream-signed app without rebuilding or re-signing it', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
-    const sourceOcu = join(dir, 'source-ocu');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
     const runtimeRoot = join(dir, 'runtime');
     await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
-    await writeFile(sourceOcu, 'ocu-v1', { mode: 0o755 });
-    const signAppBundle = vi.fn(async () => {});
+    await writeFile(sourceArchive, 'archive-v1', { mode: 0o644 });
+    const extractAppArchive = vi.fn(async (_archive: string, destination: string) => {
+      await writeExtractedApp(destination, 'ocu-v1');
+    });
     const verifyCodeSignature = vi.fn(async () => {});
+    const verifyAppBundle = vi.fn(async () => {});
 
-    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceOcu, {
+    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
       runtimeRoot,
-      signAppBundle,
+      extractAppArchive,
       verifyCodeSignature,
+      verifyAppBundle,
     });
 
     expect(runtime.helperExecutable).toBe(join(runtimeRoot, 'imcodes-computer-use-helper'));
@@ -46,69 +59,102 @@ describe('macOS Computer Use runtime boundary', () => {
     );
     expect(await readFile(runtime.helperExecutable, 'utf8')).toBe('node-v1');
     expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('ocu-v1');
+    expect(await readFile(
+      join(runtimeRoot, 'Open Computer Use.app', 'Contents', '_CodeSignature', 'CodeResources'),
+      'utf8',
+    )).toBe('developer-id-seal');
     expect((await lstat(runtimeRoot)).mode & 0o777).toBe(0o755);
     expect((await lstat(runtime.helperExecutable)).mode & 0o777).toBe(0o755);
     expect((await lstat(runtime.openComputerUseExecutable)).mode & 0o777).toBe(0o755);
-    expect(signAppBundle).toHaveBeenCalledOnce();
+    expect(extractAppArchive).toHaveBeenCalledWith(sourceArchive, expect.stringContaining('.open-computer-use-extract-'));
     expect(verifyCodeSignature).toHaveBeenCalledWith(runtime.helperExecutable, false);
-    expect(verifyCodeSignature).toHaveBeenCalledWith(
-      expect.stringMatching(/Open Computer Use\.app\..+\.tmp$/),
-      true,
-    );
+    expect(verifyAppBundle).toHaveBeenCalledWith(expect.stringMatching(/\.open-computer-use-extract-.+Open Computer Use\.app$/));
+    expect(verifyAppBundle).toHaveBeenLastCalledWith(join(runtimeRoot, 'Open Computer Use.app'));
   });
 
-  it('replaces changed helper bytes but reuses an unchanged signed app bundle', async () => {
+  it('replaces changed node bytes but reuses an unchanged verified app archive', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
-    const sourceOcu = join(dir, 'source-ocu');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
     const runtimeRoot = join(dir, 'runtime');
     await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
-    await writeFile(sourceOcu, 'ocu-v1', { mode: 0o755 });
-    const signAppBundle = vi.fn(async () => {});
-    const verifyCodeSignature = vi.fn(async () => {});
-    await prepareMacosComputerUseRuntime(sourceNode, sourceOcu, {
-      runtimeRoot,
-      signAppBundle,
-      verifyCodeSignature,
+    await writeFile(sourceArchive, 'archive-v1');
+    const extractAppArchive = vi.fn(async (_archive: string, destination: string) => {
+      await writeExtractedApp(destination, 'ocu-v1');
     });
+    const verifyAppBundle = vi.fn(async () => {});
+    const options = {
+      runtimeRoot,
+      extractAppArchive,
+      verifyCodeSignature: async () => {},
+      verifyAppBundle,
+    };
+    await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, options);
 
     await writeFile(sourceNode, 'node-v2', { mode: 0o755 });
-    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceOcu, {
-      runtimeRoot,
-      signAppBundle,
-      verifyCodeSignature,
-    });
+    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, options);
 
     expect(await readFile(runtime.helperExecutable, 'utf8')).toBe('node-v2');
     expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('ocu-v1');
-    expect(signAppBundle).toHaveBeenCalledOnce();
-    expect(verifyCodeSignature).toHaveBeenLastCalledWith(join(runtimeRoot, 'Open Computer Use.app'), true);
+    expect(extractAppArchive).toHaveBeenCalledOnce();
+    expect(verifyAppBundle).toHaveBeenLastCalledWith(join(runtimeRoot, 'Open Computer Use.app'));
   });
 
-  it('rebuilds the app bundle when the OCU helper changes', async () => {
+  it('replaces the app when the signed archive changes', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
-    const sourceOcu = join(dir, 'source-ocu');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
     const runtimeRoot = join(dir, 'runtime');
     await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
-    await writeFile(sourceOcu, 'ocu-v1', { mode: 0o755 });
-    const signAppBundle = vi.fn(async () => {});
-    const verifyCodeSignature = vi.fn(async () => {});
-    await prepareMacosComputerUseRuntime(sourceNode, sourceOcu, {
-      runtimeRoot,
-      signAppBundle,
-      verifyCodeSignature,
+    await writeFile(sourceArchive, 'archive-v1');
+    const extractAppArchive = vi.fn(async (archive: string, destination: string) => {
+      const version = await readFile(archive, 'utf8');
+      await writeExtractedApp(destination, version === 'archive-v1' ? 'ocu-v1' : 'ocu-v2');
     });
+    const options = {
+      runtimeRoot,
+      extractAppArchive,
+      verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
+    };
+    await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, options);
 
-    await writeFile(sourceOcu, 'ocu-v2', { mode: 0o755 });
-    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceOcu, {
-      runtimeRoot,
-      signAppBundle,
-      verifyCodeSignature,
-    });
+    await writeFile(sourceArchive, 'archive-v2');
+    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, options);
 
     expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('ocu-v2');
-    expect(signAppBundle).toHaveBeenCalledTimes(2);
+    expect(extractAppArchive).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects archive traversal and extra roots before extraction', () => {
+    expect(() => validateMacosComputerUseArchiveEntries([
+      'Open Computer Use.app/',
+      'Open Computer Use.app/Contents/MacOS/OpenComputerUse',
+    ])).not.toThrow();
+    expect(() => validateMacosComputerUseArchiveEntries([
+      'Open Computer Use.app/../outside',
+    ])).toThrow('computer_use_app_archive_unsafe');
+    expect(() => validateMacosComputerUseArchiveEntries([
+      'another-root/payload',
+    ])).toThrow('computer_use_app_archive_unsafe');
+  });
+
+  it('rejects symlinks injected into an extracted app tree', async () => {
+    const dir = await tempDir();
+    const sourceNode = join(dir, 'source-node');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
+    await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
+    await writeFile(sourceArchive, 'archive-v1');
+
+    await expect(prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
+      runtimeRoot: join(dir, 'runtime'),
+      extractAppArchive: async (_archive, destination) => {
+        await writeExtractedApp(destination, 'ocu-v1');
+        await symlink('/tmp', join(destination, 'Open Computer Use.app', 'Contents', 'Resources'));
+      },
+      verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
+    })).rejects.toThrow('computer_use_app_archive_unsafe');
   });
 
   it('uses the login GUI bootstrap namespace and drops privileges without exposing credentials', () => {
@@ -155,13 +201,6 @@ describe('macOS Computer Use runtime boundary', () => {
     ]);
   });
 
-  it('builds the app-scoped permission bundle identity expected by Open Computer Use', () => {
-    const plist = macosComputerUseInfoPlist();
-    expect(plist).toContain('<string>com.ifuryst.opencomputeruse</string>');
-    expect(plist).toContain('<string>OpenComputerUse</string>');
-    expect(plist).toContain('<key>LSUIElement</key><true/>');
-  });
-
   it('refuses to reuse a runtime whose app executable is absent', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
@@ -170,26 +209,27 @@ describe('macOS Computer Use runtime boundary', () => {
 
     await expect(prepareMacosComputerUseRuntime(sourceNode, undefined, {
       runtimeRoot: join(dir, 'runtime'),
-      signAppBundle: async () => {},
       verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
     })).rejects.toThrow('computer_use_helper_not_installed');
   });
 
   it('rejects a symlinked public runtime root', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
-    const sourceOcu = join(dir, 'source-ocu');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
     const target = join(dir, 'target');
     const runtimeRoot = join(dir, 'runtime-link');
     await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
-    await writeFile(sourceOcu, 'ocu-v1', { mode: 0o755 });
+    await writeFile(sourceArchive, 'archive-v1');
     await mkdir(target);
     await symlink(target, runtimeRoot);
 
-    await expect(prepareMacosComputerUseRuntime(sourceNode, sourceOcu, {
+    await expect(prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
       runtimeRoot,
-      signAppBundle: async () => {},
+      extractAppArchive: async (_archive, destination) => writeExtractedApp(destination, 'ocu-v1'),
       verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
     })).rejects.toThrow('computer_use_runtime_root_not_directory');
   });
 });
