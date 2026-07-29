@@ -14,6 +14,7 @@ vi.mock('react-i18next', () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'chat.tool_group_more') return `${String(vars?.count ?? '')} more`;
       if (key === 'chat.tool_detail_toggle') return 'details';
+      if (key === 'chat.tool_fold_collapse') return 'collapse';
       if (key === 'chat.tool_detail_input') return 'input';
       if (key === 'chat.tool_detail_output') return 'output';
       if (key === 'chat.tool_detail_meta') return 'meta';
@@ -165,6 +166,56 @@ describe('ChatView tool payload formatting', () => {
     fireEvent.click(screen.getByText('details'));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
+  });
+
+  it('preserves complete commands and outputs in the one-line preview and bounded expansion', () => {
+    const command = `printf '${'command-segment-'.repeat(24)}COMMAND_TAIL_9f6e'`;
+    const output = `${'output-segment-'.repeat(360)}OUTPUT_TAIL_4c21`;
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:full-fidelity:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'Bash',
+          input: { command },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:full-fidelity:result',
+        type: 'tool.result',
+        payload: { output },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const fold = container.querySelector('.chat-tool-block-fold');
+    const commandPreview = container.querySelector('.chat-tool-input');
+    const outputPreview = container.querySelector('.chat-tool-output');
+
+    expect(command.length).toBeGreaterThan(240);
+    expect(output.length).toBeGreaterThan(4_096);
+    expect(commandPreview?.textContent).toBe(` ${command}`);
+    expect(outputPreview?.textContent).toBe(output);
+    expect(commandPreview?.textContent).toContain('COMMAND_TAIL_9f6e');
+    expect(outputPreview?.textContent).toContain('OUTPUT_TAIL_4c21');
+    expect(container.textContent).not.toContain('…');
+
+    const toggle = screen.getByRole('button', { name: 'details' });
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(toggle);
+
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.chat-tool-detail')).not.toBeNull();
+    const detailText = Array.from(container.querySelectorAll('.chat-tool-detail-pre'))
+      .map((node) => node.textContent)
+      .join('\n');
+    expect(detailText).toContain(command);
+    expect(detailText).toContain(output);
+    expect(detailText).toContain('COMMAND_TAIL_9f6e');
+    expect(detailText).toContain('OUTPUT_TAIL_4c21');
   });
 
   it('prefers the completed WebSearch query over a generic started-state fallback label', () => {
