@@ -42,16 +42,22 @@ describe('styles.css regression contracts', () => {
   });
 
   it('keeps the expanded tool fold header visible while its details scroll', () => {
+    const foldRule = css.match(/\.chat-tool-block-fold\s*\{[^}]*\}/);
+    expect(foldRule).not.toBeNull();
+    expect(foldRule![0]).toMatch(/width:\s*100%/);
+    expect(foldRule![0]).not.toMatch(/900px/);
+
     const expandedHeaderRule = css.match(/\.chat-tool-block-fold\.is-expanded \.chat-tool-fold-header\s*\{[^}]*\}/);
     expect(expandedHeaderRule).not.toBeNull();
     expect(expandedHeaderRule![0]).toMatch(/position:\s*sticky/);
     expect(expandedHeaderRule![0]).toMatch(/top:\s*0/);
     expect(expandedHeaderRule![0]).toMatch(/z-index:\s*3/);
-    expect(expandedHeaderRule![0]).toMatch(/max-height:\s*32px/);
-    expect(expandedHeaderRule![0]).toMatch(/overflow-x:\s*auto/);
-    expect(expandedHeaderRule![0]).toMatch(/overflow-y:\s*hidden/);
-    expect(expandedHeaderRule![0]).toMatch(/white-space:\s*nowrap/);
-    expect(expandedHeaderRule![0]).toMatch(/word-break:\s*normal/);
+    expect(expandedHeaderRule![0]).not.toMatch(/white-space:\s*nowrap/);
+
+    const continuationRule = css.match(/\.chat-tool-fold-continuation\s*\{[^}]*\}/);
+    expect(continuationRule).not.toBeNull();
+    expect(continuationRule![0]).toMatch(/white-space:\s*pre-wrap/);
+    expect(continuationRule![0]).toMatch(/word-break:\s*break-word/);
   });
 
   it('fits portrait videos by available preview height without stretching them to full width', () => {

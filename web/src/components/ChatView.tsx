@@ -503,6 +503,19 @@ function formatToolOutputPreview(value: unknown): string | null {
   }
 }
 
+function splitToolFoldPreview(text: string | null | undefined): {
+  firstLine: string;
+  remainingLines: string | null;
+} {
+  if (!text) return { firstLine: text ?? '', remainingLines: null };
+  const newlineIndex = text.indexOf('\n');
+  if (newlineIndex < 0) return { firstLine: text, remainingLines: null };
+  return {
+    firstLine: text.slice(0, newlineIndex),
+    remainingLines: text.slice(newlineIndex + 1),
+  };
+}
+
 function ToolDetailSection({
   label,
   value,
@@ -3523,6 +3536,10 @@ const ChatEvent = memo(function ChatEvent({
       const callInput = summarizeToolInput(callPayloadInput, callDetail);
       const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
       const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
+      const {
+        firstLine: toolInputFirstLine,
+        remainingLines: toolInputRemainingLines,
+      } = splitToolFoldPreview(toolInput);
       const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       const isMerged = event.payload._merged === true;
       const toolFailed = event.payload._toolFailed === true;
@@ -3545,10 +3562,15 @@ const ChatEvent = memo(function ChatEvent({
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
                 <span class="chat-tool-name">{toolName}</span>
-                {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
+                {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
                 {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
                 {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
               </div>
+              {toolInputRemainingLines !== null && (
+                <div class="chat-event chat-tool chat-tool-fold-continuation">
+                  <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                </div>
+              )}
               {toolOutput && (
                 <div class="chat-event chat-tool chat-tool-result-preview">
                   <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
@@ -3574,6 +3596,12 @@ const ChatEvent = memo(function ChatEvent({
       const error = event.payload.error;
       const output = formatToolOutputPreview(event.payload.output) ?? '';
       const detail = event.payload.detail;
+      const resultText = error ? `error: ${String(error)}` : output || 'done';
+      const {
+        firstLine: resultFirstLine,
+        remainingLines: resultRemainingLines,
+      } = splitToolFoldPreview(resultText);
+      const resultClass = error ? 'chat-tool-error' : 'chat-tool-output';
       return (
         <ToolBlockFold>
           {(expanded, toggleExpanded, action) => (
@@ -3592,15 +3620,14 @@ const ChatEvent = memo(function ChatEvent({
                 >
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
-                {error ? (
-                  <span class="chat-tool-error">{`error: ${String(error)}`}</span>
-                ) : output ? (
-                  <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
-                ) : (
-                  <span class="chat-tool-output">done</span>
-                )}
+                <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
                 {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
               </div>
+              {resultRemainingLines !== null && (
+                <div class="chat-event chat-tool chat-tool-fold-continuation">
+                  <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                </div>
+              )}
               {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
             </>
           )}

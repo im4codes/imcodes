@@ -3187,7 +3187,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .chat-tool-block-fold {
   position: relative;
-  width: min(100%, 900px);
+  width: 100%;
   min-width: 0;
   overflow: hidden;
   border: 1px solid rgba(56, 189, 248, 0.19);
@@ -3237,17 +3237,17 @@ html.native-ios-mac .chat-dl-btn {
   position: sticky;
   z-index: 3;
   top: 0;
-  max-height: 32px;
   margin: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  white-space: nowrap;
-  word-break: normal;
   border-bottom: 1px solid rgba(34, 211, 238, 0.24);
   background: linear-gradient(90deg, rgba(8, 47, 73, 0.98), rgba(15, 23, 42, 0.98));
   box-shadow: 0 5px 12px rgba(2, 6, 23, 0.46);
 }
 .chat-tool-fold-header { cursor: pointer; }
+.chat-tool-fold-continuation {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .chat-tool-block-fold-content::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar { width: 5px; height: 3px; }
 .chat-tool-block-fold-content::-webkit-scrollbar-track,

@@ -240,6 +240,63 @@ describe('ChatView tool payload formatting', () => {
     expect(detailText).toContain('OUTPUT_TAIL_4c21');
   });
 
+  it('keeps only the first Bash command line in the sticky header', () => {
+    const command = 'printf first\nprintf second\nprintf third';
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:multiline-command:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'Bash',
+          input: { command },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:multiline-command:result',
+        type: 'tool.result',
+        payload: { output: 'done' },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+    const headerInput = container.querySelector('.chat-tool-fold-header .chat-tool-input');
+    const continuationInput = container.querySelector('.chat-tool-fold-continuation .chat-tool-input');
+
+    expect(headerInput?.textContent).toBe(' printf first');
+    expect(continuationInput?.textContent).toBe('printf second\nprintf third');
+    expect(headerInput?.textContent).not.toContain('printf second');
+
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    const detailText = Array.from(container.querySelectorAll('.chat-tool-detail-pre'))
+      .map((node) => node.textContent)
+      .join('\n');
+    expect(detailText).toContain('printf first');
+    expect(detailText).toContain('printf second');
+    expect(detailText).toContain('printf third');
+  });
+
+  it('keeps only the first standalone result line in the sticky header', () => {
+    const output = 'first result\nsecond result\nthird result';
+    const events = [
+      makeEvent({
+        eventId: 'tool-result:test:multiline',
+        type: 'tool.result',
+        payload: { output },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+    const headerOutput = container.querySelector('.chat-tool-fold-header .chat-tool-output');
+    const continuationOutput = container.querySelector('.chat-tool-fold-continuation .chat-tool-output');
+
+    expect(headerOutput?.textContent).toBe('first result');
+    expect(continuationOutput?.textContent).toBe('second result\nthird result');
+    expect(headerOutput?.textContent).not.toContain('second result');
+
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    expect(container.querySelector('.chat-tool-detail-pre')?.textContent).toBe(output);
+  });
+
   it('prefers the completed WebSearch query over a generic started-state fallback label', () => {
     const events = [
       makeEvent({
