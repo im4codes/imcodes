@@ -41,6 +41,14 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('keeps the expanded tool fold header visible while its details scroll', () => {
+    const expandedHeaderRule = css.match(/\.chat-tool-block-fold\.is-expanded \.chat-tool-fold-header\s*\{[^}]*\}/);
+    expect(expandedHeaderRule).not.toBeNull();
+    expect(expandedHeaderRule![0]).toMatch(/position:\s*sticky/);
+    expect(expandedHeaderRule![0]).toMatch(/top:\s*0/);
+    expect(expandedHeaderRule![0]).toMatch(/z-index:\s*3/);
+  });
+
   it('fits portrait videos by available preview height without stretching them to full width', () => {
     const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
     expect(videoContainerRule).not.toBeNull();

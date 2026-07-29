@@ -94,10 +94,17 @@ describe('ChatView tool payload formatting', () => {
       }),
     ];
 
-    render(<ChatView events={events} loading={false} />);
+    const { container } = render(<ChatView events={events} loading={false} />);
 
-    expect(screen.getByText('/tmp/readme.md')).toBeDefined();
+    const output = screen.getByText('/tmp/readme.md');
+    const fold = container.querySelector('.chat-tool-block-fold');
+    expect(output).toBeDefined();
     expect(screen.queryByText('[object Object]')).toBeNull();
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    fireEvent.click(output);
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    fireEvent.click(output);
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
   });
 
   it('hides meaningless empty object tool inputs', () => {
@@ -208,6 +215,14 @@ describe('ChatView tool payload formatting', () => {
     expect(toggle.textContent).not.toContain('details');
     expect(fold?.classList.contains('is-collapsed')).toBe(true);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(toolName);
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(toolName);
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
     fireEvent.click(toggle);
 
     expect(fold?.classList.contains('is-expanded')).toBe(true);

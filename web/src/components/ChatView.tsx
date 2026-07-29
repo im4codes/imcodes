@@ -3109,6 +3109,20 @@ function ToolBlockFold({
   );
 }
 
+function toggleToolFoldFromHeader(
+  event: MouseEvent,
+  toggleExpanded: () => void,
+) {
+  const target = event.target;
+  if (
+    target instanceof Element
+    && target.closest('button, a, input, select, textarea, .chat-path-link, [role="button"], [role="link"]')
+  ) {
+    return;
+  }
+  toggleExpanded();
+}
+
 function getToolActivityCounts(events: TimelineEvent[]) {
   let terminal = 0;
   let failed = 0;
@@ -3516,7 +3530,10 @@ const ChatEvent = memo(function ChatEvent({
         <ToolBlockFold>
           {(expanded, toggleExpanded, action) => (
             <>
-              <div class="chat-event chat-tool chat-tool-command-row">
+              <div
+                class="chat-event chat-tool chat-tool-command-row chat-tool-fold-header"
+                onClick={(event) => toggleToolFoldFromHeader(event, toggleExpanded)}
+              >
                 <button
                   type="button"
                   class="chat-tool-block-toggle"
@@ -3561,7 +3578,10 @@ const ChatEvent = memo(function ChatEvent({
         <ToolBlockFold>
           {(expanded, toggleExpanded, action) => (
             <>
-              <div class="chat-event chat-tool chat-tool-result-row">
+              <div
+                class="chat-event chat-tool chat-tool-result-row chat-tool-fold-header"
+                onClick={(event) => toggleToolFoldFromHeader(event, toggleExpanded)}
+              >
                 <button
                   type="button"
                   class="chat-tool-block-toggle"
