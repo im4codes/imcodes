@@ -141,4 +141,54 @@ describe('ChatView compact tool activity', () => {
     expect(container.querySelector('.chat-tool-activity-segment.is-failed')).not.toBeNull();
     expect(container.querySelector('.chat-tool')).toBeNull();
   });
+
+  it('does not reveal or count hidden tool events in Simple view', () => {
+    const visibleCall = makeEvent('visible-call', 'tool.call', {
+      tool: 'Read',
+      input: { file_path: 'visible.txt' },
+    }, 1);
+    const visibleResult = makeEvent('visible-result', 'tool.result', {
+      output: 'visible contents',
+    }, 2);
+    const hiddenCall = {
+      ...makeEvent('hidden-call', 'tool.call', {
+        tool: 'Edit',
+        input: { file_path: 'hidden.ts' },
+      }, 3),
+      hidden: true,
+    } as TimelineEvent;
+    const hiddenResult = {
+      ...makeEvent('hidden-result', 'tool.result', {
+        output: 'hidden result',
+      }, 4),
+      hidden: true,
+    } as TimelineEvent;
+
+    const { container, rerender } = render(
+      <ChatView events={[hiddenCall, hiddenResult]} loading={false} />,
+    );
+
+    expect(container.querySelector('.chat-tool-activity')).toBeNull();
+    expect(container.textContent).not.toContain('Edit');
+    expect(container.textContent).not.toContain('hidden.ts');
+
+    rerender(
+      <ChatView
+        events={[visibleCall, visibleResult, hiddenCall, hiddenResult]}
+        loading={false}
+      />,
+    );
+
+    const activity = container.querySelector('.chat-tool-activity') as HTMLButtonElement | null;
+    expect(activity).not.toBeNull();
+    expect(container.querySelector('.chat-tool-activity-total')?.textContent).toBe('1');
+    expect(activity?.getAttribute('aria-label')).toContain('1 tools: 1 completed, 0 running, 0 failed');
+
+    fireEvent.click(activity!);
+    expect(container.textContent).toContain('Read');
+    expect(container.textContent).toContain('visible.txt');
+    expect(container.textContent).not.toContain('Edit');
+    expect(container.textContent).not.toContain('hidden.ts');
+    expect(container.textContent).not.toContain('hidden result');
+  });
 });

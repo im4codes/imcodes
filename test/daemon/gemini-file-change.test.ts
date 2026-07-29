@@ -163,8 +163,10 @@ describe('Gemini watcher — file.change emission', () => {
   });
 
   it('does not emit file.change for shell-only Gemini tools', async () => {
+    const command = `printf 'FIRST_LINE'\n${'printf command-segment\n'.repeat(20)}printf 'COMMAND_TAIL_9f6e'`;
+    const output = `${'output-segment-'.repeat(40)}OUTPUT_TAIL_4c21`;
     vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: 1000, size: 500, ino: 1 } as any);
-    vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify({
+    vi.mocked(fs.readFile).mockReset().mockResolvedValue(JSON.stringify({
       lastUpdated: 'ts-1',
       messages: [
         {
@@ -176,11 +178,11 @@ describe('Gemini watcher — file.change emission', () => {
               id: 'gm-2',
               name: 'run_shell_command',
               status: 'success',
-              args: { command: 'sed -i ...' },
+              args: { command },
               result: [
                 {
                   functionResponse: {
-                    response: { output: 'done' },
+                    response: { output },
                   },
                 },
               ],
@@ -191,10 +193,20 @@ describe('Gemini watcher — file.change emission', () => {
     }));
 
     const state = makeState();
-    await pollTick('gemini-session', state);
+    await pollTick('gemini-shell-session', state);
 
     expect(mocks.emitMock.mock.calls.some((call) => call[1] === 'file.change')).toBe(false);
-    expect(mocks.emitMock.mock.calls.find((call) => call[1] === 'tool.call')?.[3]?.hidden).not.toBe(true);
-    expect(mocks.emitMock.mock.calls.find((call) => call[1] === 'tool.result')?.[3]?.hidden).not.toBe(true);
+    const toolCall = mocks.emitMock.mock.calls.find((call) => (
+      call[1] === 'tool.call' && call[2]?.tool === 'run_shell_command'
+    ));
+    const toolResult = mocks.emitMock.mock.calls.find((call) => (
+      call[1] === 'tool.result' && call[2]?.output === output
+    ));
+    expect(command.length).toBeGreaterThan(240);
+    expect(output.length).toBeGreaterThan(200);
+    expect(toolCall?.[2].input).toBe(command);
+    expect(toolResult?.[2].output).toBe(output);
+    expect(toolCall?.[3]?.hidden).not.toBe(true);
+    expect(toolResult?.[3]?.hidden).not.toBe(true);
   });
 });

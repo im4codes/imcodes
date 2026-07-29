@@ -361,13 +361,13 @@ export function buildTimelineEventsFromOpenCodeExport(
         if (batch) {
           push('tool.call', callPayload, startTs, `${messageId}:${partId}:tool.call`, true);
           if (state.status === 'completed' || state.status === 'error') {
-            const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
-            const truncOut = state.status !== 'error' && rawOut
-              ? (rawOut.length > 200 ? rawOut.slice(0, 197) + '...' : rawOut)
+            const rawOut = typeof state.output === 'string' ? state.output : '';
+            const output = state.status !== 'error' && rawOut.trim()
+              ? rawOut
               : undefined;
             push('tool.result', {
               ...(state.status === 'error' && state.error ? { error: state.error } : {}),
-              ...(truncOut ? { output: truncOut } : {}),
+              ...(output ? { output } : {}),
             }, endTs, `${messageId}:${partId}:tool.result`, true);
           }
           push(TIMELINE_EVENT_FILE_CHANGE, { batch }, endTs, `${messageId}:${partId}:file.change`);
@@ -375,13 +375,13 @@ export function buildTimelineEventsFromOpenCodeExport(
         }
         push('tool.call', callPayload, startTs, `${messageId}:${partId}:tool.call`);
         if (state.status === 'completed' || state.status === 'error') {
-          const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
-          const truncOut = state.status !== 'error' && rawOut
-            ? (rawOut.length > 200 ? rawOut.slice(0, 197) + '...' : rawOut)
+          const rawOut = typeof state.output === 'string' ? state.output : '';
+          const output = state.status !== 'error' && rawOut.trim()
+            ? rawOut
             : undefined;
           push('tool.result', {
             ...(state.status === 'error' && state.error ? { error: state.error } : {}),
-            ...(truncOut ? { output: truncOut } : {}),
+            ...(output ? { output } : {}),
           }, endTs, `${messageId}:${partId}:tool.result`);
         }
       }

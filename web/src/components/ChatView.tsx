@@ -646,7 +646,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   // activity rail. Other developer details remain fully filtered.
   const visible = events.filter((event) => (
     isVisibleChatTimelineEvent(event, showToolCalls)
-    || (!showToolCalls && (event.type === 'tool.call' || event.type === 'tool.result'))
+    || (!showToolCalls
+      && !event.hidden
+      && (event.type === 'tool.call' || event.type === 'tool.result'))
   ));
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,

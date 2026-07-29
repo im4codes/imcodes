@@ -425,7 +425,7 @@ describe('extractToolInput — tool-specific input extraction', () => {
 
     const calls = emittedEvents.filter((e) => e.type === 'tool.call' && e.payload.tool === 'Bash');
     expect(calls.length).toBeGreaterThanOrEqual(1);
-    expect(calls[calls.length - 1].payload.input).toBe('git status');
+    expect(calls[calls.length - 1].payload.input).toBe('git status\ngit diff');
   });
 
   it('extracts file_path from Read tool', async () => {
