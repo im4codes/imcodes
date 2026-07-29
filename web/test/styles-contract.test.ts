@@ -47,6 +47,11 @@ describe('styles.css regression contracts', () => {
     expect(expandedHeaderRule![0]).toMatch(/position:\s*sticky/);
     expect(expandedHeaderRule![0]).toMatch(/top:\s*0/);
     expect(expandedHeaderRule![0]).toMatch(/z-index:\s*3/);
+    expect(expandedHeaderRule![0]).toMatch(/max-height:\s*32px/);
+    expect(expandedHeaderRule![0]).toMatch(/overflow-x:\s*auto/);
+    expect(expandedHeaderRule![0]).toMatch(/overflow-y:\s*hidden/);
+    expect(expandedHeaderRule![0]).toMatch(/white-space:\s*nowrap/);
+    expect(expandedHeaderRule![0]).toMatch(/word-break:\s*normal/);
   });
 
   it('fits portrait videos by available preview height without stretching them to full width', () => {
