@@ -163,7 +163,7 @@ describe('ChatView tool payload formatting', () => {
 
     expect(screen.getByText('Read')).toBeDefined();
     expect(screen.getAllByText(/package\.json/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByText('details'));
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
   });
@@ -192,6 +192,7 @@ describe('ChatView tool payload formatting', () => {
     const fold = container.querySelector('.chat-tool-block-fold');
     const commandPreview = container.querySelector('.chat-tool-input');
     const outputPreview = container.querySelector('.chat-tool-output');
+    const toolName = screen.getByText('Bash');
 
     expect(command.length).toBeGreaterThan(240);
     expect(output.length).toBeGreaterThan(4_096);
@@ -202,12 +203,18 @@ describe('ChatView tool payload formatting', () => {
     expect(container.textContent).not.toContain('…');
 
     const toggle = screen.getByRole('button', { name: 'details' });
+    expect(toggle.textContent).toBe('▸');
+    expect(toggle.nextElementSibling).toBe(toolName);
+    expect(toggle.textContent).not.toContain('details');
     expect(fold?.classList.contains('is-collapsed')).toBe(true);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     fireEvent.click(toggle);
 
     expect(fold?.classList.contains('is-expanded')).toBe(true);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toBe('collapse');
+    expect(toggle.textContent).toBe('▾');
+    expect(toggle.textContent).not.toContain('collapse');
     expect(container.querySelector('.chat-tool-detail')).not.toBeNull();
     const detailText = Array.from(container.querySelectorAll('.chat-tool-detail-pre'))
       .map((node) => node.textContent)
@@ -252,7 +259,7 @@ describe('ChatView tool payload formatting', () => {
 
     expect(screen.getByText('WebSearch')).toBeDefined();
     expect(screen.getAllByText(/apple stock today/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByText('details'));
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.queryByText(/\(other\)/)).toBeNull();
   });
@@ -575,7 +582,7 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getAllByText(/agent:emma:main/).length).toBeGreaterThan(0);
     expect(screen.queryByText('[object Object]')).toBeNull();
 
-    fireEvent.click(screen.getByText('details'));
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
     expect(screen.getAllByText(/delivered/).length).toBeGreaterThan(0);

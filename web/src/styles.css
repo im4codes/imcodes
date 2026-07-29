@@ -3233,8 +3233,6 @@ html.native-ios-mac .chat-dl-btn {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.chat-tool-block-fold .chat-tool-command-row:first-child,
-.chat-tool-block-fold .chat-tool-result-row:first-child { padding-right: 82px; }
 .chat-tool-block-fold-content::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar { width: 5px; height: 3px; }
 .chat-tool-block-fold-content::-webkit-scrollbar-track,
@@ -3242,36 +3240,30 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-block-fold-content::-webkit-scrollbar-thumb,
 .chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar-thumb { border-radius: 999px; background: rgba(34, 211, 238, 0.35); }
 .chat-tool-block-toggle {
-  position: absolute;
-  z-index: 4;
-  top: 4px;
-  right: 5px;
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
-  gap: 4px;
-  max-width: 74px;
-  height: 19px;
-  padding: 0 6px;
-  overflow: hidden;
-  border: 1px solid rgba(34, 211, 238, 0.2);
-  border-radius: 4px;
-  background: rgba(8, 47, 73, 0.78);
-  color: #7dd3fc;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -2px 5px -2px -2px;
+  padding: 0;
+  border: 1px solid rgba(34, 211, 238, 0.42);
+  border-radius: 5px;
+  background: rgba(8, 47, 73, 0.72);
+  color: #67e8f9;
   font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
-  font-size: 8px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 800;
   line-height: 1;
-  letter-spacing: 0.05em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   cursor: pointer;
-  text-transform: uppercase;
+  box-shadow: inset 0 1px 0 rgba(165, 243, 252, 0.12), 0 0 8px rgba(34, 211, 238, 0.12);
+  text-shadow: 0 0 7px rgba(34, 211, 238, 0.72);
   -webkit-tap-highlight-color: transparent;
 }
-.chat-tool-block-toggle:hover { border-color: rgba(103, 232, 249, 0.52); color: #cffafe; background: rgba(14, 116, 144, 0.38); }
+.chat-tool-block-toggle:hover { border-color: rgba(103, 232, 249, 0.78); color: #ecfeff; background: rgba(14, 116, 144, 0.72); box-shadow: inset 0 1px 0 rgba(207, 250, 254, 0.18), 0 0 10px rgba(34, 211, 238, 0.28); }
 .chat-tool-block-toggle:focus-visible { outline: 1px solid #67e8f9; outline-offset: 1px; }
-.chat-tool-block-toggle-signal { flex: 0 0 auto; width: 4px; height: 4px; border-radius: 50%; background: #22d3ee; box-shadow: 0 0 6px rgba(34, 211, 238, 0.85); }
-.chat-tool-block-fold.is-expanded .chat-tool-block-toggle-signal { background: #34d399; box-shadow: 0 0 6px rgba(52, 211, 153, 0.78); }
+.chat-tool-block-fold.is-expanded .chat-tool-block-toggle { border-color: rgba(52, 211, 153, 0.48); background: rgba(6, 78, 59, 0.62); color: #6ee7b7; box-shadow: inset 0 1px 0 rgba(167, 243, 208, 0.1), 0 0 8px rgba(52, 211, 153, 0.14); text-shadow: 0 0 7px rgba(52, 211, 153, 0.62); }
 .chat-tool-fold-btn { background: none; border: 1px dashed #334155; color: #64748b; font-size: 11px; padding: 2px 10px; cursor: pointer; border-radius: 4px; text-align: center; }
 .chat-tool-fold-btn:hover { color: #94a3b8; border-color: #475569; }
 .chat-tool-fold-inline { background: none; border: none; color: #64748b; font-size: 11px; cursor: pointer; padding: 0 2px; }

@@ -3086,27 +3086,25 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 }
 
 /** Full-fidelity tool shell: one-line preview, bounded scrollable expansion. */
-function ToolBlockFold({ children }: { children: (expanded: boolean) => preact.ComponentChildren }) {
+function ToolBlockFold({
+  children,
+}: {
+  children: (
+    expanded: boolean,
+    toggleExpanded: () => void,
+    action: string,
+  ) => preact.ComponentChildren;
+}) {
   const [expanded, setExpanded] = useState(false);
   const { t } = useTranslation();
   const action = expanded ? t('chat.tool_fold_collapse') : t('chat.tool_detail_toggle');
+  const toggleExpanded = () => setExpanded((value) => !value);
 
   return (
     <div class={`chat-tool-block-fold${expanded ? ' is-expanded' : ' is-collapsed'}`}>
       <div class="chat-tool-block-fold-content">
-        {children(expanded)}
+        {children(expanded, toggleExpanded, action)}
       </div>
-      <button
-        type="button"
-        class="chat-tool-block-toggle"
-        aria-expanded={expanded}
-        aria-label={action}
-        title={action}
-        onClick={() => setExpanded((value) => !value)}
-      >
-        <span class="chat-tool-block-toggle-signal" aria-hidden="true" />
-        <span>{action}</span>
-      </button>
     </div>
   );
 }
@@ -3516,10 +3514,19 @@ const ChatEvent = memo(function ChatEvent({
       const toolFailed = event.payload._toolFailed === true;
       return (
         <ToolBlockFold>
-          {(expanded) => (
+          {(expanded, toggleExpanded, action) => (
             <>
               <div class="chat-event chat-tool chat-tool-command-row">
-                <span class="chat-tool-icon">{'>'}</span>
+                <button
+                  type="button"
+                  class="chat-tool-block-toggle"
+                  aria-expanded={expanded}
+                  aria-label={action}
+                  title={action}
+                  onClick={toggleExpanded}
+                >
+                  <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                </button>
                 <span class="chat-tool-name">{toolName}</span>
                 {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
                 {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
@@ -3552,10 +3559,19 @@ const ChatEvent = memo(function ChatEvent({
       const detail = event.payload.detail;
       return (
         <ToolBlockFold>
-          {(expanded) => (
+          {(expanded, toggleExpanded, action) => (
             <>
               <div class="chat-event chat-tool chat-tool-result-row">
-                <span class="chat-tool-icon">{'<'}</span>
+                <button
+                  type="button"
+                  class="chat-tool-block-toggle"
+                  aria-expanded={expanded}
+                  aria-label={action}
+                  title={action}
+                  onClick={toggleExpanded}
+                >
+                  <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                </button>
                 {error ? (
                   <span class="chat-tool-error">{`error: ${String(error)}`}</span>
                 ) : output ? (
