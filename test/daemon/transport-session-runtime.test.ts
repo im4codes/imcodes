@@ -28,6 +28,7 @@ import {
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 import { MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE } from '../../src/agent/transport-runtime-assembly.js';
@@ -252,6 +253,7 @@ describe('TransportSessionRuntime', () => {
 
   beforeEach(async () => {
     resetTransportQueueStoreForTests();
+    resetContextStoreClientForTests();
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
@@ -266,6 +268,7 @@ describe('TransportSessionRuntime', () => {
 
   afterEach(() => {
     resetTransportQueueStoreForTests();
+    resetContextStoreClientForTests();
     vi.unstubAllEnvs();
   });
 
@@ -2880,7 +2883,7 @@ ${PREFERENCE_CONTEXT_END}`;
     timelineEmitterEmitMock.mockClear();
 
     r.send('Please recall recent transport memory around recall runtime', 'client-turn-2');
-    await flushDispatch();
+    await waitForProviderSendCount(localMock.provider, 1);
 
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
       memoryRecall: expect.anything(),

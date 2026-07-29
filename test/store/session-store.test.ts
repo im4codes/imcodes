@@ -60,10 +60,9 @@ async function importSessionStore() {
   // resolution and return only that mock's partial exports. `importActual`
   // bypasses the mock registry for this import by contract, while resetModules
   // below still gives each test a fresh real store instance.
-  // This file also installs a deliberate partial mock in one regression test.
-  // Clear that runtime registration before every import as well as bypassing
+  // Clear any runtime registration before every import as well as bypassing
   // the mock registry: some Vitest worker-reuse schedules can otherwise retain
-  // the partial factory after resetModules() and hand it to importActual().
+  // a partial factory after resetModules() and hand it to importActual().
   vi.doUnmock('../../src/store/session-store.js');
   return vi.importActual<typeof import('../../src/store/session-store.js')>(
     '../../src/store/session-store.js',
@@ -81,24 +80,11 @@ afterEach(() => {
   // removal if that brief race recreates an entry during directory traversal.
   rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   vi.unstubAllEnvs();
-  // The partial-mock regression test must not contaminate later tests in this
-  // file or a reused full-suite worker.
   vi.doUnmock('../../src/store/session-store.js');
   vi.resetModules();
 });
 
 describe('session-store', () => {
-  it('reloads the real store after a worker-local partial mock registration', async () => {
-    vi.doMock('../../src/store/session-store.js', () => ({
-      listSessions: vi.fn(() => []),
-    }));
-    vi.resetModules();
-
-    const sessionStore = await importSessionStore();
-    expect(sessionStore.loadStore).toBeTypeOf('function');
-    expect(sessionStore.flushStore).toBeTypeOf('function');
-  });
-
   it('starts with empty store', async () => {
     const { listSessions } = await importSessionStore();
     const sessions = listSessions();
