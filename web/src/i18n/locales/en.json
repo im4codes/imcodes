@@ -1814,7 +1814,22 @@
     "apply": "Apply",
     "reset": "Reset",
     "empty_prefix": "No sub-sessions — click",
-    "empty_suffix": "to add one"
+    "empty_suffix": "to add one",
+    "daemon_details_open": "Show daemon details",
+    "daemon_details_kicker": "SYSTEM // DAEMON",
+    "daemon_details_title": "Daemon status",
+    "daemon_details_close": "Close daemon details",
+    "daemon_details_version": "Full version",
+    "daemon_details_cpu": "CPU",
+    "daemon_details_memory": "Memory",
+    "daemon_details_load": "Load 1 / 5 / 15",
+    "daemon_details_uptime": "Uptime",
+    "daemon_details_disks": "Disk capacity",
+    "daemon_details_embedding": "Embedding",
+    "daemon_details_memory_handles": "Memory handles",
+    "daemon_details_memory_handles_ok": "Healthy · no persistence failures reported",
+    "daemon_details_local_time": "Local time",
+    "daemon_details_no_data": "No data reported"
   },
   "localWebPreview": {
     "title": "Local Web Preview",

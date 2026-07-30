@@ -1814,7 +1814,22 @@
     "apply": "应用",
     "reset": "重置",
     "empty_prefix": "还没有子会话，点击",
-    "empty_suffix": "添加一个"
+    "empty_suffix": "添加一个",
+    "daemon_details_open": "查看 daemon 完整信息",
+    "daemon_details_kicker": "系统 // DAEMON",
+    "daemon_details_title": "Daemon 运行状态",
+    "daemon_details_close": "关闭 daemon 详情",
+    "daemon_details_version": "完整版本",
+    "daemon_details_cpu": "CPU",
+    "daemon_details_memory": "内存",
+    "daemon_details_load": "负载 1 / 5 / 15",
+    "daemon_details_uptime": "运行时间",
+    "daemon_details_disks": "磁盘容量",
+    "daemon_details_embedding": "向量服务",
+    "daemon_details_memory_handles": "记忆句柄",
+    "daemon_details_memory_handles_ok": "健康 · 未报告持久化故障",
+    "daemon_details_local_time": "本地时间",
+    "daemon_details_no_data": "暂无上报数据"
   },
   "localWebPreview": {
     "title": "本地网页预览",

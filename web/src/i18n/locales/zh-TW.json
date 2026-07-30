@@ -1814,7 +1814,22 @@
     "apply": "套用",
     "reset": "重設",
     "empty_prefix": "目前沒有子會話，點擊",
-    "empty_suffix": "新增一個"
+    "empty_suffix": "新增一個",
+    "daemon_details_open": "檢視 daemon 完整資訊",
+    "daemon_details_kicker": "系統 // DAEMON",
+    "daemon_details_title": "Daemon 執行狀態",
+    "daemon_details_close": "關閉 daemon 詳情",
+    "daemon_details_version": "完整版本",
+    "daemon_details_cpu": "CPU",
+    "daemon_details_memory": "記憶體",
+    "daemon_details_load": "負載 1 / 5 / 15",
+    "daemon_details_uptime": "執行時間",
+    "daemon_details_disks": "磁碟容量",
+    "daemon_details_embedding": "向量服務",
+    "daemon_details_memory_handles": "記憶句柄",
+    "daemon_details_memory_handles_ok": "健康 · 未回報持久化故障",
+    "daemon_details_local_time": "本地時間",
+    "daemon_details_no_data": "暫無回報資料"
   },
   "localWebPreview": {
     "title": "本機網頁預覽",

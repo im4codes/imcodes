@@ -1813,7 +1813,22 @@
     "apply": "적용",
     "reset": "재설정",
     "empty_prefix": "하위 세션이 없습니다. ",
-    "empty_suffix": "를 눌러 추가하세요"
+    "empty_suffix": "를 눌러 추가하세요",
+    "daemon_details_open": "daemon 상세 정보 보기",
+    "daemon_details_kicker": "시스템 // DAEMON",
+    "daemon_details_title": "Daemon 상태",
+    "daemon_details_close": "daemon 상세 정보 닫기",
+    "daemon_details_version": "전체 버전",
+    "daemon_details_cpu": "CPU",
+    "daemon_details_memory": "메모리",
+    "daemon_details_load": "부하 1 / 5 / 15",
+    "daemon_details_uptime": "가동 시간",
+    "daemon_details_disks": "디스크 용량",
+    "daemon_details_embedding": "임베딩",
+    "daemon_details_memory_handles": "메모리 참조",
+    "daemon_details_memory_handles_ok": "정상 · 영속화 실패 없음",
+    "daemon_details_local_time": "현지 시간",
+    "daemon_details_no_data": "보고된 데이터 없음"
   },
   "localWebPreview": {
     "title": "로컬 웹 미리보기",

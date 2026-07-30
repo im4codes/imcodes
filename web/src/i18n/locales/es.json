@@ -1814,7 +1814,22 @@
     "apply": "Aplicar",
     "reset": "Restablecer",
     "empty_prefix": "No hay sub-sesiones; haz clic en",
-    "empty_suffix": "para agregar una"
+    "empty_suffix": "para agregar una",
+    "daemon_details_open": "Mostrar detalles del daemon",
+    "daemon_details_kicker": "SISTEMA // DAEMON",
+    "daemon_details_title": "Estado del daemon",
+    "daemon_details_close": "Cerrar detalles del daemon",
+    "daemon_details_version": "Versión completa",
+    "daemon_details_cpu": "CPU",
+    "daemon_details_memory": "Memoria",
+    "daemon_details_load": "Carga 1 / 5 / 15",
+    "daemon_details_uptime": "Tiempo activo",
+    "daemon_details_disks": "Capacidad de disco",
+    "daemon_details_embedding": "Embeddings",
+    "daemon_details_memory_handles": "Referencias de memoria",
+    "daemon_details_memory_handles_ok": "Correcto · sin fallos de persistencia",
+    "daemon_details_local_time": "Hora local",
+    "daemon_details_no_data": "Sin datos"
   },
   "localWebPreview": {
     "title": "Vista previa web local",

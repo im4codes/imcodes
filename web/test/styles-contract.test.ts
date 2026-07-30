@@ -289,6 +289,19 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@keyframes daemon-clock-tick/);
   });
 
+  it('keeps the mobile daemon details as a fixed dismissible overlay', () => {
+    const backdropRule = css.match(/\.daemon-details-backdrop\s*\{[^}]*\}/);
+    expect(backdropRule).not.toBeNull();
+    expect(backdropRule![0]).toMatch(/position:\s*fixed/);
+    expect(backdropRule![0]).toMatch(/inset:\s*0/);
+    expect(backdropRule![0]).toMatch(/z-index:\s*13000/);
+
+    const panelRule = css.match(/\.daemon-details-panel\s*\{[^}]*\}/);
+    expect(panelRule).not.toBeNull();
+    expect(panelRule![0]).toMatch(/max-height:\s*min\(82dvh,\s*680px\)/);
+    expect(panelRule![0]).toMatch(/overflow:\s*auto/);
+  });
+
   it('sub-session close-all control stays a narrow strip at the left of the row', () => {
     const rowRule = css.match(/\.subsession-row-with-close\s*\{[^}]*\}/);
     expect(rowRule).not.toBeNull();

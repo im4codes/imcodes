@@ -1813,7 +1813,22 @@
     "apply": "適用",
     "reset": "リセット",
     "empty_prefix": "サブセッションはまだありません。",
-    "empty_suffix": "をクリックして追加"
+    "empty_suffix": "をクリックして追加",
+    "daemon_details_open": "daemon の詳細を表示",
+    "daemon_details_kicker": "システム // DAEMON",
+    "daemon_details_title": "Daemon ステータス",
+    "daemon_details_close": "daemon の詳細を閉じる",
+    "daemon_details_version": "完全なバージョン",
+    "daemon_details_cpu": "CPU",
+    "daemon_details_memory": "メモリ",
+    "daemon_details_load": "負荷 1 / 5 / 15",
+    "daemon_details_uptime": "稼働時間",
+    "daemon_details_disks": "ディスク容量",
+    "daemon_details_embedding": "埋め込み",
+    "daemon_details_memory_handles": "メモリ参照",
+    "daemon_details_memory_handles_ok": "正常 · 永続化エラーなし",
+    "daemon_details_local_time": "現地時刻",
+    "daemon_details_no_data": "データなし"
   },
   "localWebPreview": {
     "title": "ローカルWebプレビュー",
