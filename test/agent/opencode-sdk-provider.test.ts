@@ -92,6 +92,9 @@ function createHarness() {
       })),
     },
     event: { subscribe: vi.fn(() => Promise.resolve({ stream: queue.stream })) },
+    permission: {
+      reply: vi.fn(() => result(true)),
+    },
     postSessionIdPermissionsPermissionId: vi.fn(() => result(true)),
   };
   const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
@@ -130,6 +133,105 @@ describe('OpenCodeSdkProvider', () => {
     });
     await provider.disconnect();
     expect(harness.server.close).toHaveBeenCalledOnce();
+  });
+
+  it('detaches a stale route without unmapping or aborting its replacement conversation', async () => {
+    const harness = createHarness();
+    const eventQueues: Array<ReturnType<typeof createAsyncQueue<Record<string, unknown>>>> = [];
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      const eventQueue = createAsyncQueue<Record<string, unknown>>();
+      eventQueues.push(eventQueue);
+      options.signal.addEventListener('abort', eventQueue.close, { once: true });
+      return {
+        client: {
+          ...harness.client,
+          event: {
+            subscribe: vi.fn(async () => ({ stream: eventQueue.stream })),
+          },
+        } as any,
+        server: { url: harness.server.url, close: vi.fn() },
+      };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const deltas: Array<{ sessionId: string; text: string }> = [];
+    provider.onDelta((sessionId, delta) => deltas.push({ sessionId, text: delta.delta }));
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'route-seed',
+      sessionName: 'Seed route',
+      cwd: '/tmp/project',
+    });
+    const durableSessionId = 'oc-session-1';
+    await provider.detachSession('route-seed');
+    await provider.createSession({
+      sessionKey: 'route-replacement-old',
+      bindExistingKey: 'route-replacement-old',
+      sessionName: 'Old replacement route',
+      cwd: '/tmp/project',
+      resumeId: durableSessionId,
+      skipCreate: true,
+    });
+    await provider.createSession({
+      sessionKey: 'route-replacement-new',
+      bindExistingKey: 'route-replacement-new',
+      sessionName: 'New replacement route',
+      cwd: '/tmp/project',
+      resumeId: durableSessionId,
+      skipCreate: true,
+    });
+    await provider.createSession({
+      sessionKey: 'route-stale-last',
+      bindExistingKey: 'route-stale-last',
+      sessionName: 'Stale route finishing last',
+      cwd: '/tmp/project',
+      resumeId: durableSessionId,
+      skipCreate: true,
+    });
+
+    const sessions = (provider as any).sessions as Map<string, any>;
+    const providerToRoute = (provider as any).providerToRoute as Map<string, string>;
+    const staleState = sessions.get('route-stale-last');
+    const replacementState = sessions.get('route-replacement-new');
+    staleState.busy = true;
+    expect(providerToRoute.get(durableSessionId)).toBe(staleState.routeId);
+
+    await provider.detachSession(staleState.routeId);
+
+    expect(sessions.has(staleState.routeId)).toBe(false);
+    expect(sessions.get('route-replacement-new')).toBe(replacementState);
+    expect(providerToRoute.get(durableSessionId)).toBe('route-replacement-new');
+    expect(harness.client.session.abort).not.toHaveBeenCalled();
+
+    replacementState.busy = true;
+    eventQueues[3]?.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'replacement-message',
+          sessionID: durableSessionId,
+          role: 'assistant',
+        },
+      },
+    });
+    eventQueues[3]?.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'replacement-part',
+          sessionID: durableSessionId,
+          messageID: 'replacement-message',
+          type: 'text',
+          text: 'replacement still streams',
+        },
+      },
+    });
+    await vi.waitFor(() => {
+      expect(deltas).toEqual([{
+        sessionId: 'route-replacement-new',
+        text: 'replacement still streams',
+      }]);
+    });
+    await provider.disconnect();
   });
 
   it('maps streaming text, tools, permissions, usage and duplicate terminals exactly once', async () => {
@@ -262,6 +364,80 @@ describe('OpenCodeSdkProvider', () => {
     });
     await Promise.resolve();
     expect(completions).toHaveLength(1);
+    await provider.disconnect();
+  });
+
+  it('handles current OpenCode permission events without duplicating approval requests', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const approvals: any[] = [];
+    provider.onApprovalRequest((sessionId, approval) => approvals.push({ sessionId, ...approval }));
+    await provider.connect({});
+    const routeId = await provider.createSession({ sessionKey: 'route-modern-permissions', cwd: '/tmp/project' });
+
+    const asked = {
+      type: 'permission.asked',
+      properties: {
+        id: 'perm-asked',
+        sessionID: 'oc-session-1',
+        permission: 'external_directory',
+        patterns: ['/tmp/*'],
+        metadata: {},
+        always: [],
+        tool: { messageID: 'msg-asked', callID: 'call-asked' },
+      },
+    };
+    harness.queue.push(asked);
+    harness.queue.push(asked);
+    harness.queue.push({
+      type: 'permission.v2.asked',
+      properties: {
+        id: 'perm-v2',
+        sessionID: 'oc-session-1',
+        action: 'external_directory',
+        resources: ['/var/tmp/*'],
+        metadata: {},
+        source: { type: 'tool', messageID: 'msg-v2', callID: 'call-v2' },
+      },
+    });
+
+    await vi.waitFor(() => expect(approvals).toHaveLength(2));
+    expect(approvals).toEqual([
+      expect.objectContaining({
+        sessionId: routeId,
+        id: 'perm-asked',
+        tool: 'external_directory',
+        providerToolUseId: 'call-asked',
+        inputPreview: '/tmp/*',
+        description: 'Allow OpenCode external_directory: /tmp/*',
+      }),
+      expect.objectContaining({
+        sessionId: routeId,
+        id: 'perm-v2',
+        tool: 'external_directory',
+        providerToolUseId: 'call-v2',
+        inputPreview: '/var/tmp/*',
+        description: 'Allow OpenCode external_directory: /var/tmp/*',
+      }),
+    ]);
+
+    await provider.respondApproval(routeId, 'perm-asked', true);
+    await provider.respondApproval(routeId, 'perm-v2', false);
+    expect(harness.client.permission.reply).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      path: { requestID: 'perm-asked' },
+      query: { directory: '/tmp/project' },
+      body: { reply: 'once' },
+    }));
+    expect(harness.client.permission.reply).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      path: { requestID: 'perm-v2' },
+      query: { directory: '/tmp/project' },
+      body: { reply: 'reject' },
+    }));
+    expect(harness.client.postSessionIdPermissionsPermissionId).not.toHaveBeenCalled();
     await provider.disconnect();
   });
 
@@ -727,8 +903,12 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
-  it('reports an explicit failure when OpenCode becomes idle without a final response', async () => {
+  it('recovers once when OpenCode becomes idle after tools without a final response', async () => {
     const harness = createHarness();
+    const recoveryPrompt = deferred<{ data: Record<string, unknown> }>();
+    harness.client.session.prompt
+      .mockImplementationOnce(() => harness.prompt.promise)
+      .mockImplementationOnce(() => recoveryPrompt.promise);
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
       return { client: harness.client as any, server: harness.server };
@@ -792,6 +972,186 @@ describe('OpenCodeSdkProvider', () => {
     expect(errors).toHaveLength(0);
 
     harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(2));
+    expect(completions).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+    expect(harness.client.session.prompt.mock.calls[1]?.[0]).toMatchObject({
+      path: { id: 'oc-session-1' },
+      query: { directory: '/tmp/project' },
+      body: {
+        model: { providerID: 'opencode', modelID: 'deepseek-v4-flash-free' },
+        parts: [{
+          type: 'text',
+          text: expect.stringContaining("answer the user's original request now"),
+        }],
+      },
+      throwOnError: true,
+    });
+    harness.queue.push({
+      type: 'session.status',
+      properties: { sessionID: 'oc-session-1', status: { type: 'idle' } },
+    });
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(2);
+
+    recoveryPrompt.resolve({
+      data: {
+        info: {
+          id: 'msg-recovered-final',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'stop',
+          time: { completed: 300 },
+          tokens: { input: 25, output: 12, cache: { read: 4, write: 0 } },
+        },
+        parts: [{
+          id: 'part-recovered-final',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-recovered-final',
+          type: 'text',
+          text: 'The project contains 42 TypeScript lines.',
+        }],
+      },
+    });
+
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(completions[0]).toMatchObject({
+      sessionId: routeId,
+      id: 'msg-recovered-final',
+      content: '\n\nThe project contains 42 TypeScript lines.',
+      status: 'complete',
+    });
+    expect(errors).toHaveLength(0);
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(2);
+    await provider.disconnect();
+  });
+
+  it('waits for a late text part instead of recovering on message.updated alone', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const completions: any[] = [];
+    const errors: any[] = [];
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+    provider.onError((sessionId, error) => errors.push({ sessionId, ...error }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-late-final-part',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'inspect presets');
+
+    harness.queue.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'msg-late-final',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'stop',
+          time: { completed: 100 },
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(1);
+    expect(completions).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+
+    harness.queue.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'part-late-final',
+          sessionID: 'oc-session-1',
+          messageID: 'msg-late-final',
+          type: 'text',
+          text: 'Late but valid final response.',
+        },
+      },
+    });
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+
+    await vi.waitFor(() => expect(completions).toHaveLength(1));
+    expect(completions[0]).toMatchObject({
+      sessionId: routeId,
+      id: 'msg-late-final',
+      content: 'Late but valid final response.',
+      status: 'complete',
+    });
+    expect(errors).toHaveLength(0);
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(1);
+    await provider.disconnect();
+  });
+
+  it('reports an explicit failure when the one-shot missing-final recovery is also empty', async () => {
+    const harness = createHarness();
+    const recoveryPrompt = deferred<{ data: Record<string, unknown> }>();
+    harness.client.session.prompt
+      .mockImplementationOnce(() => harness.prompt.promise)
+      .mockImplementationOnce(() => recoveryPrompt.promise);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const completions: any[] = [];
+    const errors: any[] = [];
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, ...message }));
+    provider.onError((sessionId, error) => errors.push({ sessionId, ...error }));
+
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-empty-recovery',
+      cwd: '/tmp/project',
+      agentId: 'opencode/deepseek-v4-flash-free',
+    });
+    await provider.send(routeId, 'inspect presets');
+
+    harness.prompt.resolve({
+      data: {
+        info: {
+          id: 'msg-tool-step',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'tool-calls',
+          time: { completed: 100 },
+        },
+        parts: [],
+      },
+    });
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(2));
+
+    recoveryPrompt.resolve({
+      data: {
+        info: {
+          id: 'msg-empty-recovery',
+          sessionID: 'oc-session-1',
+          role: 'assistant',
+          providerID: 'opencode',
+          modelID: 'deepseek-v4-flash-free',
+          finish: 'unknown',
+          time: { completed: 200 },
+        },
+        parts: [],
+      },
+    });
+    await vi.waitFor(() => expect(harness.client.session.prompt).toHaveBeenCalledTimes(2));
+    harness.queue.push({ type: 'session.idle', properties: { sessionID: 'oc-session-1' } });
+
     await vi.waitFor(() => expect(errors).toHaveLength(1));
     expect(completions).toHaveLength(0);
     expect(errors[0]).toMatchObject({
@@ -801,12 +1161,18 @@ describe('OpenCodeSdkProvider', () => {
       recoverable: false,
       details: { source: 'session.idle' },
     });
+    expect(harness.client.session.prompt).toHaveBeenCalledTimes(2);
     await provider.disconnect();
   });
 
   it('restores provider sessions, discovers connected models and cancels active work', async () => {
     const harness = createHarness();
-    harness.sessions.set('resume-1', { id: 'resume-1', title: 'Restored', time: { updated: 12 } });
+    harness.sessions.set('resume-1', {
+      id: 'resume-1',
+      title: 'Restored',
+      directory: '/tmp/project',
+      time: { updated: 12 },
+    });
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
       return { client: harness.client as any, server: harness.server };
@@ -820,7 +1186,15 @@ describe('OpenCodeSdkProvider', () => {
     });
     expect(routeId).toBe('ephemeral-route');
     expect(await provider.restoreSession('resume-1')).toBe(true);
-    expect((await provider.listSessions())[0]).toMatchObject({ key: 'resume-1', displayName: 'Restored' });
+    expect((await provider.listSessions({ directory: '/tmp/project' }))[0]).toMatchObject({
+      key: 'resume-1',
+      displayName: 'Restored',
+      directory: '/tmp/project',
+    });
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: '/tmp/project' },
+      throwOnError: true,
+    });
     expect(await provider.listModels()).toMatchObject({
       defaultModel: 'anthropic/claude-sonnet-4-5',
       isAuthenticated: true,
@@ -877,7 +1251,7 @@ describe('OpenCodeSdkProvider', () => {
     expect(sessionServer.close).toHaveBeenCalledOnce();
   });
 
-  it('fails closed by rejecting permission requests when no approval listener exists', async () => {
+  it('fails closed by rejecting current permission requests when no approval listener exists', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
@@ -888,14 +1262,22 @@ describe('OpenCodeSdkProvider', () => {
     await provider.createSession({ sessionKey: 'route-no-ui', cwd: '/tmp/project' });
 
     harness.queue.push({
-      type: 'permission.updated',
-      properties: { id: 'perm-deny', sessionID: 'oc-session-1', messageID: 'msg-1', type: 'bash', title: 'Danger', metadata: {} },
+      type: 'permission.asked',
+      properties: {
+        id: 'perm-deny',
+        sessionID: 'oc-session-1',
+        permission: 'bash',
+        patterns: ['rm -rf /tmp/project'],
+        metadata: {},
+        always: [],
+      },
     });
 
-    await vi.waitFor(() => expect(harness.client.postSessionIdPermissionsPermissionId).toHaveBeenCalledWith(expect.objectContaining({
-      path: { id: 'oc-session-1', permissionID: 'perm-deny' },
-      body: { response: 'reject' },
+    await vi.waitFor(() => expect(harness.client.permission.reply).toHaveBeenCalledWith(expect.objectContaining({
+      path: { requestID: 'perm-deny' },
+      body: { reply: 'reject' },
     })));
+    expect(harness.client.postSessionIdPermissionsPermissionId).not.toHaveBeenCalled();
     await provider.disconnect();
   });
 

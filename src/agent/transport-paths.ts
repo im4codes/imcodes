@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import type { ChildProcess } from 'node:child_process';
 
@@ -10,6 +10,20 @@ export function normalizeTransportCwd(cwd?: string): string | undefined {
     return absolute.replace(/\\/g, '/');
   }
   return path.resolve(cwd);
+}
+
+/** Canonical directory identity used when matching provider-owned sessions. */
+export function canonicalizeTransportCwd(cwd?: string): string | undefined {
+  const normalized = normalizeTransportCwd(cwd);
+  if (!normalized) return undefined;
+  let canonical = normalized;
+  try {
+    canonical = normalizeTransportCwd(realpathSync.native(normalized)) ?? normalized;
+  } catch {
+    // The project may be temporarily unavailable; the absolute normalized
+    // path is still the safest fail-closed identity available.
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
 }
 
 /** Resolve a CLI binary name to an absolute path on Windows.

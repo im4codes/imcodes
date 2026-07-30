@@ -9,6 +9,7 @@ import {
 } from '../../src/daemon/cron-mcp-client.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
+import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 
 const endpoint = {
   serverId: 'srv-bound',
@@ -125,6 +126,7 @@ describe('cron MCP client', () => {
       targetSessionName: 'deck_sub_scheduler',
       action: { type: 'command', command: 'Review the latest status', selfManaged: true },
       timezone: 'Asia/Shanghai',
+      completionPolicy: CRON_COMPLETION_POLICY.RECURRING,
     });
   });
 
@@ -234,6 +236,33 @@ describe('cron MCP client', () => {
     expect(updateBody.userId).toBeUndefined();
     expect(updateBody.token).toBeUndefined();
     expect(updateBody.actorId).toBeUndefined();
+  });
+
+  it('propagates lifecycle updates and force only on explicit deletion', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdateSelf({
+      id: 'job-self',
+      projectName: 'proj',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      force: true,
+    }, { ...boundIdentity, fetchImpl });
+    await cronMcpDelete('job-self', { ...boundIdentity, fetchImpl });
+    await cronMcpDelete('job-self', { ...boundIdentity, fetchImpl }, true);
+
+    expect(JSON.parse(String((fetchImpl.mock.calls[0] as [string, RequestInit])[1].body))).toEqual({
+      projectName: 'proj',
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    });
+    expect((fetchImpl.mock.calls[0] as [string, RequestInit])[0]).toBe(
+      'https://worker.test/api/server/srv-bound/cron/job-self?force=true',
+    );
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[0]).toBe(
+      'https://worker.test/api/server/srv-bound/cron/job-self',
+    );
+    expect((fetchImpl.mock.calls[2] as [string, RequestInit])[0]).toBe(
+      'https://worker.test/api/server/srv-bound/cron/job-self?force=true',
+    );
   });
 
   it('attaches runtime-derived source provenance to update actions', async () => {

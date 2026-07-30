@@ -5616,7 +5616,7 @@ describe('CodexSdkProvider', () => {
       provider.onComplete((_sid, message) => completed.push(message));
       const sendPromise = provider.send('route-pending-start-rollout-settle', 'finish despite the missing start response');
       const child = childProcessMock.children[0];
-      await advanceFakeTimersUntil(() => child.requests.some((req) => req.method === 'turn/start'));
+      await advanceFakeTimersWithRealIoUntil(() => child.requests.some((req) => req.method === 'turn/start'));
 
       // The app-server accepted the turn and streamed its final item, but lost
       // both the turn/start response and turn/completed notification. Codex

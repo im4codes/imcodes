@@ -248,7 +248,7 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
           const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
           timelineEmitter.emit(sessionName, 'tool.result', {
             ...(tc.status === 'error' ? { error: rawOutput ?? 'error' } : {}),
-            ...(typeof rawOutput === 'string' && rawOutput.trim() ? { output: rawOutput.length > 200 ? rawOutput.slice(0, 197) + '...' : rawOutput } : {}),
+            ...(typeof rawOutput === 'string' && rawOutput.trim() ? { output: rawOutput } : {}),
           }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs, hidden: true });
           timelineEmitter.emit(sessionName, TIMELINE_EVENT_FILE_CHANGE, { batch: normalized }, { source: 'daemon', confidence: 'high', eventId: stableId('fc'), ts: stableTs });
           continue;
@@ -264,19 +264,19 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
         if (shouldEmitDeferredCall && (tc.status === 'complete' || tc.status === 'success' || tc.status === 'error')) {
           const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
           const isErr = tc.status === 'error';
-          const truncOutput = !isErr && typeof rawOutput === 'string' && rawOutput.trim()
-            ? (rawOutput.length > 200 ? rawOutput.slice(0, 197) + '...' : rawOutput)
+          const output = !isErr && typeof rawOutput === 'string' && rawOutput.trim()
+            ? rawOutput
             : undefined;
-          timelineEmitter.emit(sessionName, 'tool.result', { ...(isErr ? { error: rawOutput ?? 'error' } : {}), ...(truncOutput ? { output: truncOutput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
+          timelineEmitter.emit(sessionName, 'tool.result', { ...(isErr ? { error: rawOutput ?? 'error' } : {}), ...(output ? { output } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
           continue;
         }
         timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: stableTs });
         const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
         const isErr = tc.status === 'error';
-        const truncOutput = !isErr && typeof rawOutput === 'string' && rawOutput.trim()
-          ? (rawOutput.length > 200 ? rawOutput.slice(0, 197) + '...' : rawOutput)
+        const output = !isErr && typeof rawOutput === 'string' && rawOutput.trim()
+          ? rawOutput
           : undefined;
-        timelineEmitter.emit(sessionName, 'tool.result', { ...(isErr ? { error: rawOutput ?? 'error' } : {}), ...(truncOutput ? { output: truncOutput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
+        timelineEmitter.emit(sessionName, 'tool.result', { ...(isErr ? { error: rawOutput ?? 'error' } : {}), ...(output ? { output } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
       }
     }
     if (typeof msg.content === 'string' && msg.content.trim()) {
@@ -301,7 +301,7 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
 function extractToolInput(name: string, args?: any): string {
   if (!args) return '';
   const val = args.command ?? args.path ?? args.file_path ?? args.query ?? args.objective ?? '';
-  return String(val).split('\n')[0] ?? '';
+  return String(val);
 }
 
 // ── Per-session watcher state ──────────────────────────────────────────────────

@@ -15,6 +15,22 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.p2p_discussions') return 'Team discussions';
       if (key === 'repo.info_title') return 'Repository information';
       if (key === 'subsessionBar.scheduled_tasks') return 'Scheduled Tasks';
+      if (key === 'subsessionBar.daemon_details_open') return 'Show daemon details';
+      if (key === 'subsessionBar.daemon_details_kicker') return 'SYSTEM // DAEMON';
+      if (key === 'subsessionBar.daemon_details_title') return 'Daemon status';
+      if (key === 'subsessionBar.daemon_details_close') return 'Close daemon details';
+      if (key === 'subsessionBar.daemon_details_version') return 'Full version';
+      if (key === 'subsessionBar.daemon_details_cpu') return 'CPU';
+      if (key === 'subsessionBar.daemon_details_memory') return 'Memory';
+      if (key === 'subsessionBar.daemon_details_load') return 'Load 1 / 5 / 15';
+      if (key === 'subsessionBar.daemon_details_uptime') return 'Uptime';
+      if (key === 'subsessionBar.daemon_details_disks') return 'Disk capacity';
+      if (key === 'subsessionBar.daemon_details_embedding') return 'Embedding';
+      if (key === 'subsessionBar.daemon_details_memory_handles') return 'Memory handles';
+      if (key === 'subsessionBar.daemon_details_memory_handles_ok') return 'Healthy';
+      if (key === 'subsessionBar.daemon_details_local_time') return 'Local time';
+      if (key === 'subsessionBar.daemon_details_no_data') return 'No data reported';
+      if (key === 'embedding.status_ready') return 'Embedding ready';
       if (key === 'memory.short_ref_failure_short') return 'memory handles failing';
       if (key === 'memory.short_ref_failure_detail') {
         return `stage=${vars?.stage} failures=${vars?.failures} at=${vars?.when} error=${vars?.error}`;
@@ -237,6 +253,58 @@ describe('SubSessionBar', () => {
     expect(statsText).not.toContain('v2026.');
     expect(statsText).not.toMatch(/07:08:\d{2}/);
     expect(view.container.querySelector('.daemon-local-clock')).toBeNull();
+  });
+
+  it('opens the complete daemon status from the mobile version and closes from the backdrop', async () => {
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit({
+        ...daemonStatsMessage,
+        disks: [
+          { mount: '/', usedBytes: 440 * 1024 ** 3, totalBytes: 460 * 1024 ** 3, usedPercent: 96 },
+          { mount: '/data', usedBytes: 120 * 1024 ** 3, totalBytes: 500 * 1024 ** 3, usedPercent: 24 },
+        ],
+        embedding: { state: 'ready', reason: null },
+      });
+    });
+
+    fireEvent.click(view.getByRole('button', { name: 'Show daemon details' }));
+
+    const dialog = view.getByRole('dialog', { name: 'Daemon status' });
+    expect(dialog.textContent).toContain('v2026.5.2161-dev.7');
+    expect(dialog.textContent).toContain('2%');
+    expect(dialog.textContent).toContain('9.9 / 41.2 GB');
+    expect(dialog.textContent).toContain('0.8 / 0.7 / 0.6');
+    expect(dialog.textContent).toContain('1h');
+    expect(dialog.textContent).toContain('440/460GB');
+    expect(dialog.textContent).toContain('120/500GB');
+    expect(dialog.textContent).toContain('Embedding ready');
+    expect(dialog.textContent).toContain('Healthy');
+    expect(dialog.textContent).toContain('Local time');
+
+    fireEvent.click(dialog);
+    expect(view.queryByRole('dialog', { name: 'Daemon status' })).not.toBeNull();
+
+    fireEvent.click(view.getByTestId('daemon-details-backdrop'));
+    expect(view.queryByRole('dialog', { name: 'Daemon status' })).toBeNull();
   });
 
   it('shows the Auto Deliver entry in the desktop sub-session toolbar', () => {
@@ -1162,6 +1230,32 @@ describe('SubSessionBar', () => {
       expect(detail, `${locale}: memory.short_ref_failure_detail`).toBeTruthy();
       for (const placeholder of ['stage', 'failures', 'when', 'error']) {
         expect(detail, `${locale}: {{${placeholder}}}`).toContain(`{{${placeholder}}}`);
+      }
+    }
+  });
+
+  it('ships every mobile daemon detail label in all locales', () => {
+    const keys = [
+      'daemon_details_open',
+      'daemon_details_kicker',
+      'daemon_details_title',
+      'daemon_details_close',
+      'daemon_details_version',
+      'daemon_details_cpu',
+      'daemon_details_memory',
+      'daemon_details_load',
+      'daemon_details_uptime',
+      'daemon_details_disks',
+      'daemon_details_embedding',
+      'daemon_details_memory_handles',
+      'daemon_details_memory_handles_ok',
+      'daemon_details_local_time',
+      'daemon_details_no_data',
+    ];
+    for (const locale of SUPPORTED_LOCALES) {
+      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
+      for (const key of keys) {
+        expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
     }
   });

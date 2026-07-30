@@ -3,10 +3,18 @@
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
-import { CRON_MSG } from '../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_MSG,
+  normalizeCronCompletionPolicy,
+} from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
 import { getSession } from '../store/session-store.js';
-import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
+import {
+  ensureTransportRuntimeAvailable,
+  getTransportRuntime,
+  sessionName,
+} from '../agent/session-manager.js';
 import { detectStatusAsync, type AgentType } from '../agent/detect.js';
 import { startP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { prepareAdvancedWorkflowLaunch, sendProcessSessionMessageForAutomation } from './command-handler.js';
@@ -57,7 +65,11 @@ export function __setCronProcessCommandSenderForTests(
 }
 
 export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: string): string {
-  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)}>\nUse cron_update_self to change this task. When complete, call cron_cancel_self with this id; otherwise keep it scheduled.\n</imcodes-cron-control>`;
+  const completionPolicy = normalizeCronCompletionPolicy(msg.completionPolicy);
+  const lifecycleInstruction = completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? 'This schedule repeats until its overall goal is complete. Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.'
+    : 'Recurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.';
+  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\n</imcodes-cron-control>`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
@@ -150,7 +162,23 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       : action.command;
 
     if (session.runtimeType === 'transport') {
-      const runtime = getTransportRuntime(name);
+      let runtime = getTransportRuntime(name);
+      if (!runtime?.providerSessionId) {
+        logger.info({ jobId, sessionName: name }, 'Cron: transport runtime missing or unbound, restoring on demand');
+        try {
+          runtime = await ensureTransportRuntimeAvailable(name);
+        } catch (err) {
+          logger.error({ jobId, sessionName: name, err }, 'Cron: transport runtime restore failed');
+          sendCommandResult(serverLink, {
+            type: CRON_MSG.COMMAND_RESULT,
+            jobId,
+            executionId,
+            status: 'error',
+            detail: `Cron transport runtime restore failed for ${name}: ${formatErr(err)}`,
+          });
+          return;
+        }
+      }
       if (runtime) {
         try {
           const result = await runtime.send(command);
@@ -166,16 +194,18 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
             status: 'error',
             detail: `Cron transport send failed for ${name}: ${formatErr(err)}`,
           });
+          return;
         }
       } else {
-        logger.warn({ jobId, sessionName: name }, 'Cron: transport provider not connected');
+        logger.warn({ jobId, sessionName: name }, 'Cron: transport runtime unavailable after restore');
         sendCommandResult(serverLink, {
           type: CRON_MSG.COMMAND_RESULT,
           jobId,
           executionId,
           status: 'error',
-          detail: `Cron transport provider not connected for ${name}`,
+          detail: `Cron transport runtime unavailable after restore for ${name}`,
         });
+        return;
       }
     } else {
       await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command);

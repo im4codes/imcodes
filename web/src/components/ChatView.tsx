@@ -109,10 +109,10 @@ interface Props {
   onResendFailed?: (commandId: string, text: string) => void;
 }
 
-/** A merged view item — either a single event, merged assistant text, or collapsed tool group. */
+/** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
   key: string;
-  type: 'event' | 'assistant-block' | 'tool-group';
+  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity';
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
@@ -206,12 +206,21 @@ function formatMemoryContextScore(score: number | undefined): string | null {
   return score >= 1 ? score.toFixed(2) : score.toFixed(3);
 }
 
-function formatMemoryContextTimestamp(ts: number | undefined): string | null {
-  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
-  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+type I18nLocaleSource = {
+  resolvedLanguage?: string;
+  language?: string;
+};
+
+function resolveI18nLocale(i18n: I18nLocaleSource | undefined): string | undefined {
+  return i18n?.resolvedLanguage || i18n?.language || undefined;
 }
 
-export function formatChatDateTime(ts: number, now = Date.now()): string {
+function formatMemoryContextTimestamp(ts: number | undefined, locale?: string): string | null {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
+  return new Date(ts).toLocaleString(locale, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+export function formatChatDateTime(ts: number, now = Date.now(), locale?: string): string {
   const date = new Date(ts);
   const today = new Date(now);
   const timeOptions: Intl.DateTimeFormatOptions = {
@@ -223,8 +232,8 @@ export function formatChatDateTime(ts: number, now = Date.now()): string {
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
   return isToday
-    ? date.toLocaleTimeString([], timeOptions)
-    : date.toLocaleString([], { month: 'short', day: 'numeric', ...timeOptions });
+    ? date.toLocaleTimeString(locale, timeOptions)
+    : date.toLocaleString(locale, { month: 'short', day: 'numeric', ...timeOptions });
 }
 
 type MemoryContextSection =
@@ -351,9 +360,6 @@ const TOOL_INPUT_SUMMARY_KEYS = [
   'description',
   'name',
 ] as const;
-const TOOL_SUMMARY_MAX_CHARS = 240;
-const TOOL_SUMMARY_SCAN_CHARS = 4_096;
-const TOOL_SUMMARY_ARRAY_ITEMS = 8;
 
 type GroupedFileChange = {
   filePath: string;
@@ -373,52 +379,15 @@ function getFileChangeBatch(event: TimelineEvent): FileChangeBatch | null {
   return payload;
 }
 
-function truncateToolText(text: string, max = TOOL_SUMMARY_MAX_CHARS): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
-}
-
-function normalizeToolSummaryText(text: string, max = TOOL_SUMMARY_MAX_CHARS): string {
-  let out = '';
-  let pendingSpace = false;
-  let sawText = false;
-  const scanLength = Math.min(text.length, TOOL_SUMMARY_SCAN_CHARS);
-  for (let i = 0; i < scanLength; i += 1) {
-    const ch = text[i]!;
-    if (/\s/.test(ch)) {
-      if (sawText) pendingSpace = true;
-      continue;
-    }
-    if (pendingSpace && out.length > 0) {
-      out += ' ';
-      pendingSpace = false;
-    }
-    out += ch;
-    sawText = true;
-    if (out.length >= max) return truncateToolText(out, max);
-  }
-  return truncateToolText(out.trim(), max);
-}
-
-function formatToolObjectSummary(record: Record<string, unknown>): string {
-  const entries = Object.entries(record);
-  if (entries.length === 0) return '';
-  const parts = entries.slice(0, 4).map(([key, value]) => {
-    const formatted = formatToolPayloadValue(value);
-    return formatted ? `${key}: ${formatted}` : key;
-  });
-  if (entries.length > 4) parts.push('…');
-  return truncateToolText(`{${parts.join(', ')}}`);
-}
-
+/** Full-fidelity value for the tool card's single-line horizontal scroller. */
 function formatToolPayloadValue(value: unknown): string {
   if (value == null) return '';
-  if (typeof value === 'string') return normalizeToolSummaryText(value);
+  if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
-    const parts = value.slice(0, TOOL_SUMMARY_ARRAY_ITEMS).map((item) => formatToolPayloadValue(item)).filter(Boolean);
-    if (value.length > TOOL_SUMMARY_ARRAY_ITEMS) parts.push('…');
+    const parts = value.map((item) => formatToolPayloadValue(item)).filter(Boolean);
     if (parts.length === 0) return '';
-    return truncateToolText(parts.join(', '));
+    return parts.join(', ');
   }
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
@@ -433,9 +402,13 @@ function formatToolPayloadValue(value: unknown): string {
     if (entries.length === 1) {
       return formatToolPayloadValue(entries[0][1]);
     }
-    return formatToolObjectSummary(record);
+    try {
+      return JSON.stringify(record);
+    } catch {
+      return String(value);
+    }
   }
-  return truncateToolText(String(value));
+  return String(value);
 }
 
 function summarizeToolInput(
@@ -454,6 +427,58 @@ function summarizeToolInput(
   const fromRawArgs = formatToolPayloadValue(rawRecord.args);
   if (fromRawArgs) return fromRawArgs;
   return formatToolPayloadValue(rawRecord.input);
+}
+
+function summarizeToolCommand(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): string {
+  if (!value || depth > 5 || typeof value !== 'object') return '';
+  if (seen.has(value)) return '';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const command = summarizeToolCommand(item, depth + 1, seen);
+      if (command) return command;
+    }
+    return '';
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ['command', 'cmd'] as const) {
+    const command = formatToolCommandValue(record[key]);
+    if (command) return command;
+  }
+  for (const key of ['input', 'args', 'raw', 'detail', '_callDetail', '_resultDetail'] as const) {
+    const command = summarizeToolCommand(record[key], depth + 1, seen);
+    if (command) return command;
+  }
+  return '';
+}
+
+function formatToolCommandArgument(value: string | number): string {
+  const argument = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(argument)) return argument;
+  return `'${argument.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function formatToolCommandValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (!Array.isArray(value) || value.length === 0) return '';
+  const argumentsList: Array<string | number> = [];
+  for (const argument of value) {
+    if (typeof argument === 'string') {
+      argumentsList.push(argument);
+      continue;
+    }
+    if (typeof argument === 'number' && Number.isFinite(argument)) {
+      argumentsList.push(argument);
+      continue;
+    }
+    return '';
+  }
+  return argumentsList.map(formatToolCommandArgument).join(' ');
 }
 
 function isGenericWebSearchLabel(value: string | undefined): boolean {
@@ -516,6 +541,42 @@ function formatToolDetailJson(value: unknown): string | null {
   }
 }
 
+/**
+ * Full-fidelity single-line output preview.
+ *
+ * Keep a one-field object readable (and preserve path-link detection), while
+ * serializing every field for compound values. Expanded details use the
+ * pretty-printed formatter above.
+ */
+function formatToolOutputPreview(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 1) {
+      return formatToolPayloadValue(entries[0][1]) || formatToolDetailJson(value);
+    }
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function splitToolFoldPreview(text: string | null | undefined): {
+  firstLine: string;
+  remainingLines: string | null;
+} {
+  if (!text) return { firstLine: text ?? '', remainingLines: null };
+  const newlineIndex = text.indexOf('\n');
+  if (newlineIndex < 0) return { firstLine: text, remainingLines: null };
+  return {
+    firstLine: text.slice(0, newlineIndex),
+    remainingLines: text.slice(newlineIndex + 1),
+  };
+}
+
 function ToolDetailSection({
   label,
   value,
@@ -537,57 +598,38 @@ function MergedToolDetailPanel({
   toolName,
   callDetail,
   resultDetail,
+  callPayloadInput,
+  resultPayloadOutput,
 }: {
   toolName: string;
   callDetail: unknown;
   resultDetail: unknown;
+  callPayloadInput: unknown;
+  resultPayloadOutput: unknown;
 }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  if (!callDetail && !resultDetail) return null;
-  const detailInput = useMemo(() => (
-    open ? pickMergedToolDetailInput(toolName, callDetail, resultDetail) : undefined
-  ), [callDetail, open, resultDetail, toolName]);
-  const detailMeta = useMemo(() => (
-    open ? pickMergedToolDetailMeta(toolName, callDetail, resultDetail) : undefined
-  ), [callDetail, open, resultDetail, toolName]);
-  const rawDetail = open ? (callDetail as any)?.raw ?? (resultDetail as any)?.raw : undefined;
+  const detailInput = pickMergedToolDetailInput(toolName, callDetail, resultDetail) ?? callPayloadInput;
+  const detailOutput = (resultDetail as any)?.output ?? resultPayloadOutput;
+  const detailMeta = pickMergedToolDetailMeta(toolName, callDetail, resultDetail);
+  const rawDetail = (callDetail as any)?.raw ?? (resultDetail as any)?.raw;
   return (
-    <details
-      class="chat-tool-detail"
-      onToggle={(event: Event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
-    >
-      <summary class="chat-tool-detail-summary" onClick={() => setOpen(true)}>{t('chat.tool_detail_toggle')}</summary>
-      {open && (
-        <>
-          <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
-          <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
-          <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
-          <ToolDetailSection label={t('chat.tool_detail_raw')} value={rawDetail} />
-        </>
-      )}
-    </details>
+    <div class="chat-tool-detail">
+      <ToolDetailSection label={t('chat.tool_detail_input')} value={detailInput} />
+      <ToolDetailSection label={t('chat.tool_detail_output')} value={detailOutput} />
+      <ToolDetailSection label={t('chat.tool_detail_meta')} value={detailMeta} />
+      <ToolDetailSection label={t('chat.tool_detail_raw')} value={rawDetail} />
+    </div>
   );
 }
 
-function ToolResultDetailPanel({ detail }: { detail: unknown }) {
+function ToolResultDetailPanel({ detail, payloadOutput }: { detail: unknown; payloadOutput: unknown }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  if (!detail) return null;
   return (
-    <details
-      class="chat-tool-detail"
-      onToggle={(event: Event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}
-    >
-      <summary class="chat-tool-detail-summary" onClick={() => setOpen(true)}>{t('chat.tool_detail_toggle')}</summary>
-      {open && (
-        <>
-          <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
-          <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
-          <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any).raw} />
-        </>
-      )}
-    </details>
+    <div class="chat-tool-detail">
+      <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any)?.output ?? payloadOutput} />
+      <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any)?.meta} />
+      <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any)?.raw} />
+    </div>
   );
 }
 
@@ -599,14 +641,13 @@ function ToolResultDetailPanel({ detail }: { detail: unknown }) {
 /**
  * Event types that the show_tool_calls preference governs.
  *
- * When the preference is off (Simple view), the chat shows only natural-
- * language turn content — `user.message`, `assistant.text`, plus errors and
- * `ask.question` events that require user response. Everything in this set
- * is debug/work-in-progress detail that a non-dev user does not want to
- * see by default:
+ * When the preference is off (Simple view), the chat keeps natural-language
+ * turn content plus a one-line aggregate for tool activity. Detailed entries
+ * in this set are debug/work-in-progress content that a non-dev user does not
+ * want to see by default:
  *
- *   - `tool.call` / `tool.result` — every Bash/Read/etc. invocation the
- *     agent makes (also implicitly hides the `tool-group` collapse UI).
+ *   - `tool.call` / `tool.result` — detailed Bash/Read/etc. rows become one
+ *                                  compact activity rail per user turn.
  *   - `file.change`              — the file-diff cards rendered for
  *                                  apply_patch / file_change events.
  *   - `memory.context`           — "Related history" recall results that
@@ -631,9 +672,10 @@ function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean
   // - mode.state: shown elsewhere (tabs/header)
   // - command.ack, terminal.snapshot: internal plumbing
   // - session.state running/idle/queued: live status belongs in footer/header/queue UI, not chat history
-  // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden only when
-  //   the user has explicitly turned the wrench preference off. Undecided
-  //   users default to ON and see the first-run prompt.
+  // - TOOL_LIKE_EVENT_TYPES: optional developer details — hidden when the user
+  //   explicitly turns the wrench preference off. buildViewItems retains only
+  //   tool.call/result long enough to replace their detail rows with a compact
+  //   activity rail. Undecided users default to ON and see the chooser.
   return (
     !event.hidden &&
     event.type !== 'agent.status' &&
@@ -674,7 +716,14 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
 }
 
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
-  const visible = events.filter((event) => isVisibleChatTimelineEvent(event, showToolCalls));
+  // Simple view still needs tool call/result events to build its compact live
+  // activity rail. Other developer details remain fully filtered.
+  const visible = events.filter((event) => (
+    isVisibleChatTimelineEvent(event, showToolCalls)
+    || (!showToolCalls
+      && !event.hidden
+      && (event.type === 'tool.call' || event.type === 'tool.result'))
+  ));
 
   // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
   // and dedup stable-eventId streaming events (keep last occurrence only)
@@ -717,7 +766,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         const inputText = pickMergedToolInput(toolName, callInput, resultInput);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
-        const output = !next.payload.error ? formatToolPayloadValue(next.payload.output) : undefined;
+        const output = !next.payload.error ? formatToolOutputPreview(next.payload.output) ?? undefined : undefined;
         consolidated.push({
           ...ev,
           type: 'tool.call',
@@ -726,6 +775,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
             tool: toolName,
             input: `${input} ${status}`.trim(),
             _merged: true,
+            _toolFailed: Boolean(next.payload.error),
+            _callPayloadInput: ev.payload.input,
+            _resultPayloadOutput: next.payload.output,
             ...(output ? { _output: output } : {}),
             ...(ev.payload.detail ? { _callDetail: ev.payload.detail } : {}),
             ...(next.payload.detail ? { _resultDetail: next.payload.detail } : {}),
@@ -791,7 +843,13 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
 
   const flushTools = () => {
     if (pendingTools.length === 0) return;
-    if (pendingTools.length === 1) {
+    if (!showToolCalls) {
+      items.push({
+        key: `ta_${pendingTools[0].eventId}`,
+        type: 'tool-activity',
+        toolEvents: [...pendingTools],
+      });
+    } else if (pendingTools.length === 1) {
       items.push({ key: pendingTools[0].eventId, type: 'event', event: pendingTools[0] });
     } else {
       // 2+ consecutive tool events → collapsible group
@@ -809,7 +867,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
 
   for (const event of renderable) {
     if (event.type === 'assistant.text') {
-      flushTools();
+      // Developer view preserves exact chronology. Simple view holds tool
+      // events until the next user turn (or the tail) so one turn produces a
+      // single live activity rail instead of many tiny rows.
+      if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
       const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
       if (!text) continue;
@@ -836,7 +897,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       deferredEvents.push(event);
     } else {
       flushPending();
-      flushTools();
+      if (showToolCalls || event.type === 'user.message') flushTools();
       items.push({
         key: event.eventId,
         type: 'event',
@@ -887,6 +948,9 @@ function viewItemRevision(item: ViewItem): string {
   }
   if (item.type === 'tool-group') {
     return `${item.key}:tool-group:${(item.toolEvents ?? []).map(eventRevision).join('|')}`;
+  }
+  if (item.type === 'tool-activity') {
+    return `${item.key}:tool-activity:${(item.toolEvents ?? []).map(eventRevision).join('|')}`;
   }
   const linked = item.linkedEvents?.map(eventRevision).join('|') ?? '';
   return `${item.key}:event:${item.event ? eventRevision(item.event) : ''}:${linked}`;
@@ -1340,7 +1404,8 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
 }
 
 export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -1732,7 +1797,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
 
   // Tool-call/detail visibility preference (shared cache via usePref). Tri-state:
   //   value === true  → developer view, show tool/file/thinking rows
-  //   value === false → simple chat, hide them
+  //   value === false → simple chat, summarize tools and hide other details
   //   value === null  → undecided (first run); show by default and surface a
   //                     one-time chooser banner above the timeline if the
   //                     user has actually generated developer-detail events.
@@ -2740,7 +2805,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
-              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts)}</span>
+              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
@@ -2869,6 +2934,9 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
             }
             if (item.type === 'tool-group') {
               return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
+            }
+            if (item.type === 'tool-activity') {
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
@@ -3092,32 +3160,137 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
   );
 }
 
-/** Unified tool block fold — collapses any tool content exceeding ~3 lines (54px). */
-function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [overflows, setOverflows] = useState(false);
+/** Full-fidelity tool shell: one-line preview, bounded scrollable expansion. */
+function ToolBlockFold({
+  children,
+}: {
+  children: (
+    expanded: boolean,
+    toggleExpanded: () => void,
+    action: string,
+  ) => preact.ComponentChildren;
+}) {
   const [expanded, setExpanded] = useState(false);
   const { t } = useTranslation();
-
-  useEffect(() => {
-    if (!ref.current) return;
-    setOverflows(ref.current.scrollHeight > 60);
-  }, [children]);
+  const action = expanded ? t('chat.tool_fold_collapse') : t('chat.tool_detail_toggle');
+  const toggleExpanded = () => setExpanded((value) => !value);
 
   return (
-    <div class={`chat-tool-block-fold${!expanded && overflows ? ' collapsed' : ''}`}>
-      <div ref={ref} class="chat-tool-block-fold-content" style={!expanded && overflows ? { maxHeight: 54, overflow: 'hidden' } : undefined}>
-        {children}
+    <div class={`chat-tool-block-fold${expanded ? ' is-expanded' : ' is-collapsed'}`}>
+      <div class="chat-tool-block-fold-content">
+        {children(expanded, toggleExpanded, action)}
       </div>
-      {overflows && !expanded && (
-        <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
-          {'··· more'}
-        </button>
-      )}
-      {overflows && expanded && (
-        <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
-          {t('chat.tool_fold_collapse')}
-        </button>
+    </div>
+  );
+}
+
+function toggleToolFoldFromHeader(
+  event: MouseEvent,
+  toggleExpanded: () => void,
+) {
+  const target = event.target;
+  if (
+    target instanceof Element
+    && target.closest('button, a, input, select, textarea, .chat-path-link, [role="button"], [role="link"]')
+  ) {
+    return;
+  }
+  toggleExpanded();
+}
+
+function getToolActivityCounts(events: TimelineEvent[]) {
+  let terminal = 0;
+  let failed = 0;
+  for (const event of events) {
+    const isCompleted = event.type === 'tool.result' || event.payload._merged === true;
+    if (!isCompleted) continue;
+    terminal++;
+    if (event.payload.error || event.payload._toolFailed === true) failed++;
+  }
+  return {
+    total: events.length,
+    completed: Math.max(0, terminal - failed),
+    failed,
+    running: Math.max(0, events.length - terminal),
+  };
+}
+
+/** One-line live tool telemetry for Simple view; expands details on demand. */
+function ToolActivitySummary({
+  events,
+  onPathClick,
+  onUrlClick,
+  onDownload,
+  onHtmlPreview,
+  onImagePreview,
+  serverId,
+}: {
+  events: TimelineEvent[];
+  onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: ChatPathDownloadHandler;
+  onHtmlPreview?: (path: string) => void;
+  onImagePreview?: ChatLocalImagePreviewLoader;
+  serverId?: string;
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const counts = getToolActivityCounts(events);
+  const summary = t('chat.tool_activity_summary', counts);
+  const action = expanded
+    ? t('chat.tool_activity_collapse')
+    : t('chat.tool_activity_expand');
+
+  if (counts.total === 0) return null;
+
+  return (
+    <div class={`chat-tool-activity-wrap${expanded ? ' is-expanded' : ''}`}>
+      <button
+        type="button"
+        class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
+        aria-expanded={expanded}
+        aria-label={`${summary}. ${action}`}
+        title={summary}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span class="chat-tool-activity-core" aria-hidden="true" />
+        <span class="chat-tool-activity-label">{t('chat.tool_activity_label')}</span>
+        <span class="chat-tool-activity-total" aria-hidden="true">{counts.total}</span>
+        <span class="chat-tool-activity-stats" aria-hidden="true">
+          <span class="chat-tool-activity-stat is-complete">✓{counts.completed}</span>
+          {counts.running > 0 && <span class="chat-tool-activity-stat is-running">●{counts.running}</span>}
+          {counts.failed > 0 && <span class="chat-tool-activity-stat is-failed">×{counts.failed}</span>}
+        </span>
+        <span class="chat-tool-activity-rail" aria-hidden="true">
+          {counts.completed > 0 && (
+            <span class="chat-tool-activity-segment is-complete" style={{ flexGrow: counts.completed }} />
+          )}
+          {counts.running > 0 && (
+            <span class="chat-tool-activity-segment is-running" style={{ flexGrow: counts.running }} />
+          )}
+          {counts.failed > 0 && (
+            <span class="chat-tool-activity-segment is-failed" style={{ flexGrow: counts.failed }} />
+          )}
+        </span>
+        <span class="chat-tool-activity-chevron" aria-hidden="true">⌄</span>
+      </button>
+      <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
+      {expanded && (
+        <div class="chat-tool-activity-details">
+          {events.map((event) => (
+            <ChatEvent
+              key={event.eventId}
+              event={event}
+              onPathClick={onPathClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
+              serverId={serverId}
+              showTime
+            />
+          ))}
+        </div>
       )}
     </div>
   );
@@ -3175,7 +3348,8 @@ function ToolCallGroup({
   );
 }
 
-// ToolInputFold removed — replaced by unified ToolBlockFold (CSS max-height based)
+// ToolBlockFold keeps the complete payload in the DOM: a horizontally
+// scrollable one-line preview expands into a bounded, scrollable detail view.
 
 const AssistantBlock = memo(function AssistantBlock({
   text,
@@ -3298,7 +3472,8 @@ const ChatEvent = memo(function ChatEvent({
   onResendFailed?: (commandId: string, text: string) => void;
   showTime?: boolean;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
@@ -3415,26 +3590,66 @@ const ChatEvent = memo(function ChatEvent({
       const toolName = String(event.payload.tool ?? 'tool');
       const callDetail = event.payload._callDetail ?? event.payload.detail;
       const resultDetail = event.payload._resultDetail;
+      const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
+        ? event.payload._callPayloadInput
+        : event.payload.input;
+      const resultPayloadOutput = event.payload._resultPayloadOutput;
       const shouldShowTime = showTime || event.payload._merged === true;
       // Fall back to result detail for input — transport SDK tool.call may arrive without input
-      const callInput = summarizeToolInput(event.payload.input, callDetail);
+      const callInput = summarizeToolInput(callPayloadInput, callDetail);
       const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
       const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
+      const {
+        firstLine: toolInputFirstLine,
+        remainingLines: toolInputRemainingLines,
+      } = splitToolFoldPreview(toolInput);
       const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
+      const isMerged = event.payload._merged === true;
+      const toolFailed = event.payload._toolFailed === true;
       return (
         <ToolBlockFold>
-          <div class="chat-event chat-tool">
-            <span class="chat-tool-icon">{'>'}</span>
-            <span class="chat-tool-name">{toolName}</span>
-            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
-            {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
-          </div>
-          {toolOutput && (
-            <div class="chat-event chat-tool chat-tool-result-preview">
-              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
-            </div>
+          {(expanded, toggleExpanded, action) => (
+            <>
+              <div
+                class="chat-event chat-tool chat-tool-command-row chat-tool-fold-header"
+                onClick={(event) => toggleToolFoldFromHeader(event, toggleExpanded)}
+              >
+                <button
+                  type="button"
+                  class="chat-tool-block-toggle"
+                  aria-expanded={expanded}
+                  aria-label={action}
+                  title={action}
+                  onClick={toggleExpanded}
+                >
+                  <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                </button>
+                <span class="chat-tool-name">{toolName}</span>
+                {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
+                {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
+                {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
+              </div>
+              {toolInputRemainingLines !== null && (
+                <div class="chat-event chat-tool chat-tool-fold-continuation">
+                  <span class="chat-tool-input">{splitPathsAndUrls(toolInputRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                </div>
+              )}
+              {toolOutput && (
+                <div class="chat-event chat-tool chat-tool-result-preview">
+                  <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                </div>
+              )}
+              {expanded && (
+                <MergedToolDetailPanel
+                  toolName={toolName}
+                  callDetail={callDetail}
+                  resultDetail={resultDetail}
+                  callPayloadInput={callPayloadInput}
+                  resultPayloadOutput={resultPayloadOutput}
+                />
+              )}
+            </>
           )}
-          <MergedToolDetailPanel toolName={toolName} callDetail={callDetail} resultDetail={resultDetail} />
         </ToolBlockFold>
       );
     }
@@ -3442,22 +3657,47 @@ const ChatEvent = memo(function ChatEvent({
     case 'tool.result': {
       // Standalone tool.result (not merged) — still rendered for cases without a preceding call
       const error = event.payload.error;
-      const output = formatToolPayloadValue(event.payload.output);
+      const output = formatToolOutputPreview(event.payload.output) ?? '';
       const detail = event.payload.detail;
+      const command = summarizeToolCommand(event.payload);
+      const completedText = command
+        ? t('chat.tool_result_done_with_command', { command })
+        : t('chat.tool_result_done');
+      const resultText = error ? `error: ${String(error)}` : output || completedText;
+      const {
+        firstLine: resultFirstLine,
+        remainingLines: resultRemainingLines,
+      } = splitToolFoldPreview(resultText);
+      const resultClass = error ? 'chat-tool-error' : 'chat-tool-output';
       return (
         <ToolBlockFold>
-          <div class="chat-event chat-tool">
-            <span class="chat-tool-icon">{'<'}</span>
-            {error ? (
-            <span class="chat-tool-error">{`error: ${String(error)}`}</span>
-          ) : output ? (
-              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
-            ) : (
-              <span class="chat-tool-output">done</span>
-            )}
-            {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
-          </div>
-          <ToolResultDetailPanel detail={detail} />
+          {(expanded, toggleExpanded, action) => (
+            <>
+              <div
+                class="chat-event chat-tool chat-tool-result-row chat-tool-fold-header"
+                onClick={(event) => toggleToolFoldFromHeader(event, toggleExpanded)}
+              >
+                <button
+                  type="button"
+                  class="chat-tool-block-toggle"
+                  aria-expanded={expanded}
+                  aria-label={action}
+                  title={action}
+                  onClick={toggleExpanded}
+                >
+                  <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+                </button>
+                <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
+              </div>
+              {resultRemainingLines !== null && (
+                <div class="chat-event chat-tool chat-tool-fold-continuation">
+                  <span class={resultClass}>{splitPathsAndUrls(resultRemainingLines, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
+                </div>
+              )}
+              {expanded && <ToolResultDetailPanel detail={detail} payloadOutput={event.payload.output} />}
+            </>
+          )}
         </ToolBlockFold>
       );
     }
@@ -3502,7 +3742,7 @@ const ChatEvent = memo(function ChatEvent({
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
           <span>{displayLabel}</span>
           {inline
-            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>
+            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>
             : <ChatTime ts={event.ts} />}
         </div>
       );
@@ -3750,7 +3990,8 @@ function CoarseFilePatch({ patch }: { patch: FileChangePatch }) {
 }
 
 const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: TimelineEvent }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [expanded, setExpanded] = useState(false);
   const payload = event.payload as unknown as MemoryContextTimelinePayload;
   const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
@@ -3838,7 +4079,7 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
                   </div>
                 )) : section.items.map((item) => {
                   const score = formatMemoryContextScore(item.relevanceScore);
-                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt);
+                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt, locale);
                   return (
                     <div key={item.id} class="chat-memory-context-item">
                       <div class="chat-memory-context-item-summary">{item.summary}</div>
@@ -3939,9 +4180,10 @@ function UserMessageText({
 }
 
 const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
+  const { i18n } = useTranslation();
   return (
     <div class="chat-bubble-time">
-      {formatChatDateTime(ts)}
+      {formatChatDateTime(ts, Date.now(), resolveI18nLocale(i18n))}
     </div>
   );
 });

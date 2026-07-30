@@ -28,6 +28,7 @@ import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { buildExecutionTemplateLabel } from '../execution-template-label.js';
+import { formatLabel, formatSessionTabLabel } from '../format-label.js';
 import {
   OpenSpecAutoDeliverCurrentRunEntry,
   OpenSpecAutoDeliverDetailsPanel,
@@ -941,6 +942,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
@@ -3998,9 +4000,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // On mobile, focusing contenteditable can scroll the document body — force it back
   const handleFocus = () => {
+    setComposerFocused(true);
     if (window.scrollY !== 0) window.scrollTo(0, 0);
     if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
     if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
+  };
+
+  const handleBlur = () => {
+    setComposerFocused(false);
   };
 
   const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
@@ -4281,6 +4288,33 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
   const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
+  const composerSubSession = subSessionId
+    ? subSessions?.find((session) => session.sessionName === activeSession?.name)
+    : undefined;
+  const composerTargetName = sessionDisplayName?.trim()
+    || (composerSubSession?.label ? formatLabel(composerSubSession.label) : composerSubSession?.type?.trim())
+    || activeSession?.label?.trim()
+    || activeSession?.project?.trim()
+    || activeSession?.name?.trim()
+    || '';
+  const composerParentSession = composerSubSession?.parentSession
+    ? sessions?.find((session) => session.name === composerSubSession.parentSession)
+    : undefined;
+  const composerParentName = composerParentSession
+    ? formatSessionTabLabel(composerParentSession)
+    : composerSubSession?.parentSession?.trim() || '';
+  const composerTargetPath = composerParentName && composerParentName !== composerTargetName
+    ? `${composerParentName} → ${composerTargetName}`
+    : composerTargetName;
+  const showComposerTarget = !isMobileLayout
+    && composerFocused
+    && !!activeSession
+    && !!composerTargetName
+    && !atPickerOpen
+    && !aliasPickerOpen
+    && !machinePickerOpen
+    && !p2pOpen
+    && !quickOpen;
   const basePlaceholder = !hasSession
     ? t('session.no_session')
     : !connected
@@ -5691,6 +5725,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+          {showComposerTarget && (
+            <div
+              class="controls-target-bubble"
+              role="status"
+              aria-live="polite"
+              aria-label={t('session.composer_target_aria', { name: composerTargetPath })}
+            >
+              <span class="controls-target-pulse" aria-hidden="true" />
+              <span class="controls-target-label">{t('session.composer_target_label')}</span>
+              <span class="controls-target-name" title={composerTargetPath}>
+                {composerParentName && composerParentName !== composerTargetName && (
+                  <>
+                    <span class="controls-target-parent">{composerParentName}</span>
+                    <span class="controls-target-arrow" aria-hidden="true">→</span>
+                  </>
+                )}
+                <span class="controls-target-child">{composerTargetName}</span>
+              </span>
+            </div>
+          )}
           <div
             ref={divRef}
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
@@ -5704,6 +5758,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             enterkeyhint={isMobileLayout ? 'send' : undefined}
             style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
             onFocus={handleFocus}
+            onBlur={handleBlur}
             onInput={() => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());

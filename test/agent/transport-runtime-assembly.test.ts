@@ -73,8 +73,10 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('Be concise');
     expect(payload.systemText).toContain('Never edit generated files');
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
-    expect(payload.systemText).toContain('get_memory_sources');
-    expect(payload.systemText).toContain('sourceLookup fields');
+    expect(payload.systemText).toContain('exact tool identifier shown in the current tool list');
+    expect(payload.systemText).toContain('available memory source-expansion tool');
+    expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
+    expect(payload.systemText).toContain('sourceLookup object');
     expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
     expect(payload.systemText).toContain('At key boundaries only');
     expect(payload.systemText).toContain('full absolute filesystem path');
@@ -89,6 +91,7 @@ describe('buildProviderContextPayload', () => {
       'copilot-sdk',
       'codex-sdk',
       'cursor-headless',
+      'opencode-sdk',
       'qwen',
     ];
 
@@ -99,8 +102,12 @@ describe('buildProviderContextPayload', () => {
       });
 
       expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+      expect(payload.systemText).toContain('treat its tools as authoritative');
+      expect(payload.systemText).toContain('prefer them over provider-native or improvised alternatives when relevant');
       expect(payload.systemText).toContain('Do not call memory for bare control messages');
-      expect(payload.systemText).toContain('call get_memory_sources with the returned sourceLookup fields');
+      expect(payload.systemText).toContain('exact tool identifier shown in the current tool list');
+      expect(payload.systemText).toContain('available memory source-expansion tool with the returned fields');
+      expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
       expect(payload.systemText).toContain('do not invent details from summaries alone');
       expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
@@ -623,7 +630,7 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
-      const memoryIdx = systemText.indexOf('Use memory MCP search');
+      const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
       expect(descIdx).toBeGreaterThanOrEqual(0);
       expect(spIdx).toBeGreaterThan(descIdx);

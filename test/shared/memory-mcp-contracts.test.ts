@@ -149,22 +149,23 @@ describe('memory MCP shared contracts', () => {
     expect(getSources.description).toMatch(/not.*no memory/i);
   });
 
-  it('documents when search_memory results should be expanded through get_memory_sources', () => {
+  it('documents source expansion without assuming host-exposed tool names', () => {
     const search = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY];
     const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
     const projectionId = getSources.inputSchema.properties?.projectionId as { description?: string } | undefined;
     const observationId = getSources.inputSchema.properties?.observationId as { description?: string } | undefined;
     const ref = getSources.inputSchema.properties?.ref as { description?: string } | undefined;
 
-    expect(search.description).toContain('call get_memory_sources');
+    expect(search.description).toContain('use those fields for source expansion');
+    expect(search.description).not.toContain('call get_memory_sources');
     expect(search.description).toContain('sourceLookup');
     expect(search.description).toMatch(/typed sourceLookup/i);
-    expect(getSources.description).toContain('Use it after search_memory');
+    expect(getSources.description).toContain('after a memory-search result');
     expect(getSources.description).toContain('observation id');
     expect(getSources.description).toContain('compact ref');
     expect(getSources.description).toContain('provenance-sensitive answers');
-    expect(projectionId?.description).toContain('search_memory');
-    expect(observationId?.description).toContain('search_memory');
+    expect(projectionId?.description).toContain('memory-search result');
+    expect(observationId?.description).toContain('memory-search result');
     expect(ref?.description).toContain('startup memory');
   });
 
@@ -222,6 +223,7 @@ describe('memory MCP shared contracts', () => {
       'name',
       'timezone',
       'expiresAt',
+      'completionPolicy',
     ]);
     expect(cronCreateSelf.required).toEqual(['cronExpr', 'message']);
     expect(cronCreateSelf.properties ?? {}).not.toHaveProperty('sessionName');
@@ -234,12 +236,14 @@ describe('memory MCP shared contracts', () => {
       'name',
       'timezone',
       'expiresAt',
+      'completionPolicy',
+      'force',
     ]);
     expect(cronUpdateSelf.required).toEqual(['id']);
     expect(cronUpdateSelf.properties ?? {}).not.toHaveProperty('sessionName');
 
     const cronCancelSelf = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF].inputSchema;
-    expect(Object.keys(cronCancelSelf.properties ?? {})).toEqual(['id', 'name', 'all']);
+    expect(Object.keys(cronCancelSelf.properties ?? {})).toEqual(['id', 'name', 'all', 'force']);
     expect(cronCancelSelf.properties ?? {}).not.toHaveProperty('sessionName');
 
     const cronCreate = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_CREATE].inputSchema;
@@ -252,6 +256,7 @@ describe('memory MCP shared contracts', () => {
       'action',
       'timezone',
       'expiresAt',
+      'completionPolicy',
     ]);
     expect(cronCreate.required).toEqual(['name', 'cronExpr', 'action']);
     expect(cronCreate.properties ?? {}).not.toHaveProperty('schedule');
@@ -274,9 +279,15 @@ describe('memory MCP shared contracts', () => {
       'action',
       'timezone',
       'expiresAt',
+      'completionPolicy',
+      'force',
     ]);
     expect(cronUpdate.required).toEqual(['id']);
     expect(cronUpdate.properties ?? {}).not.toHaveProperty('schedule');
+
+    const cronDelete = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CRON_DELETE].inputSchema;
+    expect(Object.keys(cronDelete.properties ?? {})).toEqual(['id', 'force']);
+    expect(cronDelete.required).toEqual(['id']);
   });
 
   it('documents cron scheduling limits and structured send source-target resolution', () => {
@@ -292,7 +303,9 @@ describe('memory MCP shared contracts', () => {
     expect(cronCreateSelf.description).toContain('current session');
     expect(cronCreateSelf.description).toContain('Identity is automatic');
     expect(cronUpdateSelf.description).toContain('self-wakeup');
-    expect(cronCancelSelf.description).toContain('when complete');
+    expect(cronCancelSelf.description).toContain('force=true');
+    expect(cronCancelSelf.description).toContain('until_complete');
+    expect((cronCancelSelf.inputSchema.properties?.force as { description?: string }).description).toContain('Required');
     expect(cronCreate.description).toContain('cron_create_self');
     expect(cronCreate.description).toContain('5 minutes');
     expect((createProps.cronExpr as { description?: string }).description).toContain('5 minutes');

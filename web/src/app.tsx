@@ -155,6 +155,7 @@ import {
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingVersion,
@@ -2687,6 +2688,27 @@ export function App() {
       return changed ? next : prev;
     });
   }, [sessions, subSessions]);
+
+  // An idle completion alert belongs to the completed turn, not to the tab
+  // forever. If that session starts working again before the alert is
+  // dismissed, retaining the old token makes the CSS animation restart when
+  // the tab changes between active/inactive variants.
+  useEffect(() => {
+    const workingSessionNames = new Set(
+      sessions
+        .filter((session) => isWorkingSessionState(session.state))
+        .map((session) => session.name),
+    );
+    if (workingSessionNames.size === 0) return;
+    setIdleAlerts((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const sessionName of workingSessionNames) {
+        if (next.delete(sessionName)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [sessions]);
 
   // When sub-sessions load from API (after session_list already fired), sync them to Watch projection
   useEffect(() => {

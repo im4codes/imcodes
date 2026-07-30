@@ -28,8 +28,10 @@ import {
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
+import { MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE } from '../../src/agent/transport-runtime-assembly.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -251,6 +253,7 @@ describe('TransportSessionRuntime', () => {
 
   beforeEach(async () => {
     resetTransportQueueStoreForTests();
+    resetContextStoreClientForTests();
     timelineEmitterEmitMock.mockReset();
     searchLocalMemoryMock.mockReset();
     searchLocalMemorySemanticMock.mockReset();
@@ -265,6 +268,7 @@ describe('TransportSessionRuntime', () => {
 
   afterEach(() => {
     resetTransportQueueStoreForTests();
+    resetContextStoreClientForTests();
     vi.unstubAllEnvs();
   });
 
@@ -334,13 +338,7 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       userMessage: 'hi',
       assembledMessage: 'hi',
-      systemText: expect.stringContaining('Use memory MCP search'),
-    }));
-    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
-      systemText: expect.stringContaining('get_memory_sources'),
-    }));
-    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
-      systemText: expect.stringContaining('sourceLookup fields'),
+      systemText: expect.stringContaining(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE),
     }));
   });
 
@@ -1877,7 +1875,7 @@ describe('TransportSessionRuntime', () => {
       systemText: expect.stringContaining('expert\n\nruntime only'),
     }));
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
-      systemText: expect.stringContaining('Use memory MCP search'),
+      systemText: expect.stringContaining(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE),
     }));
     expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
       systemText: expect.stringContaining('do not invent details from summaries alone'),
@@ -2885,7 +2883,7 @@ ${PREFERENCE_CONTEXT_END}`;
     timelineEmitterEmitMock.mockClear();
 
     r.send('Please recall recent transport memory around recall runtime', 'client-turn-2');
-    await flushDispatch();
+    await waitForProviderSendCount(localMock.provider, 1);
 
     expect(localMock.provider.send).toHaveBeenCalledWith('sess-1', expect.not.objectContaining({
       memoryRecall: expect.anything(),

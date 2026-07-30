@@ -6,6 +6,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ZoomedTextDialog } from '../../src/components/ZoomedTextDialog.js';
 
+const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+const originalExecCommandDescriptor = Object.getOwnPropertyDescriptor(document, 'execCommand');
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string) => key,
@@ -14,6 +17,10 @@ vi.mock('react-i18next', () => ({
 
 afterEach(() => {
   window.getSelection()?.removeAllRanges();
+  if (originalClipboardDescriptor) Object.defineProperty(navigator, 'clipboard', originalClipboardDescriptor);
+  else delete (navigator as unknown as { clipboard?: Clipboard }).clipboard;
+  if (originalExecCommandDescriptor) Object.defineProperty(document, 'execCommand', originalExecCommandDescriptor);
+  else delete (document as unknown as { execCommand?: (commandId: string) => boolean }).execCommand;
   cleanup();
 });
 
@@ -28,6 +35,42 @@ function selectText(node: Node, start: number, end: number) {
 }
 
 describe('ZoomedTextDialog', () => {
+  it('copies only the zoomed message when Safari falls back from the Clipboard API', async () => {
+    const setData = vi.fn();
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error('NotAllowedError')) },
+    });
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: vi.fn(() => {
+        const event = new Event('copy', { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'clipboardData', { value: { setData } });
+        document.dispatchEvent(event);
+        return true;
+      }),
+    });
+
+    const { container } = render(
+      <>
+        <div>attachment and sidebar chrome</div>
+        <ZoomedTextDialog text={'Only this message\nwith two lines'} onClose={vi.fn()} />
+      </>,
+    );
+    const ambientRange = document.createRange();
+    ambientRange.selectNodeContents(document.body);
+    window.getSelection()?.addRange(ambientRange);
+
+    fireEvent.click(screen.getByText('chat.zoom_copy_all'));
+
+    await waitFor(() => {
+      expect(setData).toHaveBeenCalledWith('text/plain', 'Only this message\nwith two lines');
+      expect(screen.getByText('common.copied')).toBeTruthy();
+    });
+    expect(document.execCommand).toHaveBeenCalledWith('copy');
+    expect(container.querySelector('textarea')).toBeNull();
+  });
+
   it('shows Copy and Quote actions for selected text', async () => {
     const onQuote = vi.fn();
     const onClose = vi.fn();

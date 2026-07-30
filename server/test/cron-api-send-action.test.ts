@@ -73,8 +73,9 @@ function makeMockDb() {
           status: params[10],
           next_run_at: params[11],
           expires_at: params[12],
-          created_at: params[13],
-          updated_at: params[13],
+          completion_policy: params[13],
+          created_at: params[14],
+          updated_at: params[14],
         });
       }
       return { changes: 1 };

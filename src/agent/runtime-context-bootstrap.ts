@@ -324,7 +324,7 @@ function renderStartupObservationIndexText(items: readonly MemorySearchResultIte
   return [
     '# Persistent memory index (reference only)',
     '<persistent-memory-index advisory="true">',
-    'These are trusted saved observations or preferences. The ref is a compact handle; call get_memory_sources with { "ref": "obs:..." } for exact wording, or use search_memory to get full sourceLookup.',
+    'These are trusted saved observations or preferences. The ref is a compact handle; use the available memory source-expansion tool with { "ref": "obs:..." } for exact wording, or the available memory-search tool for a full sourceLookup. Use exact callable names from the current tool list.',
     ...items.map((item) => {
       const label = item.observationClass === 'preference' ? 'preference' : 'observation';
       const namespace: ContextNamespace = {

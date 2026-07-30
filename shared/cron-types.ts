@@ -4,6 +4,22 @@ import type { MemoryMcpSourceProvenance } from './memory-mcp-provenance.js';
 
 export type CronActionType = 'command' | 'p2p' | 'send';
 
+export const CRON_COMPLETION_POLICY = {
+  /** Each dispatch completes one occurrence; the schedule remains active. */
+  RECURRING: 'recurring',
+  /** The schedule may cancel itself once its overall goal is complete. */
+  UNTIL_COMPLETE: 'until_complete',
+} as const;
+
+export type CronCompletionPolicy = (typeof CRON_COMPLETION_POLICY)[keyof typeof CRON_COMPLETION_POLICY];
+
+/** Legacy and malformed values fail safe to recurring so a run cannot silently delete its schedule. */
+export function normalizeCronCompletionPolicy(value: unknown): CronCompletionPolicy {
+  return value === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    : CRON_COMPLETION_POLICY.RECURRING;
+}
+
 export interface CronCommandAction {
   type: 'command';
   command: string;
@@ -75,6 +91,8 @@ export interface CronDispatchMessage {
   cronExpr?: string;
   timezone?: string | null;
   expiresAt?: number | null;
+  /** Missing in older server dispatches; daemon treats it as recurring. */
+  completionPolicy?: CronCompletionPolicy;
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
   action: CronAction;

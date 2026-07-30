@@ -455,7 +455,10 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         const isActive = s.name === activeSession;
         const isBrain = s.role === 'brain';
         const isPinned = pinned.has(s.name);
-        const hasAlert = idleAlerts?.has(s.name) ?? false;
+        // A completion pulse is meaningful only while the session is still
+        // idle. This also prevents a stale alert class from switching animation
+        // names (active → inactive) and replaying red when the user changes tabs.
+        const hasAlert = s.state === 'idle' && (idleAlerts?.has(s.name) ?? false);
         const stateClass = isWorkingSessionState(s.state) ? 'busy' : s.state === 'idle' ? 'idle' : '';
         const classes = ['tab', isBrain ? 'brain' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;

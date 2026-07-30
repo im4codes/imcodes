@@ -20,7 +20,8 @@ const mocks = vi.hoisted(() => {
     prompt: string;
     attachments?: Array<Record<string, unknown>>;
   }> = [];
-  return { store, cursorSpawns, copilotRuns };
+  const copilotListFilters: Array<Record<string, unknown> | undefined> = [];
+  return { store, cursorSpawns, copilotRuns, copilotListFilters };
 });
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -134,10 +135,15 @@ vi.mock("@github/copilot-sdk", () => {
     async resumeSession(sessionId: string): Promise<FakeSession> {
       return new FakeSession(sessionId);
     }
-    async listSessions(): Promise<
-      Array<{ sessionId: string; summary?: string }>
+    async listSessions(filter?: Record<string, unknown>): Promise<
+      Array<{ sessionId: string; summary?: string; context?: { cwd: string } }>
     > {
-      return [{ sessionId: "copilot-session-restore", summary: "restored" }];
+      mocks.copilotListFilters.push(filter);
+      return [{
+        sessionId: "copilot-session-restore",
+        summary: "restored",
+        context: { cwd: "/tmp/copilot-restore" },
+      }];
     }
     async deleteSession(_sessionId: string): Promise<void> {}
   }
@@ -279,6 +285,7 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     mocks.store.clear();
     mocks.cursorSpawns.length = 0;
     mocks.copilotRuns.length = 0;
+    mocks.copilotListFilters.length = 0;
   });
 
   afterEach(async () => {
@@ -355,6 +362,38 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
         prompt: expect.stringContaining("Verify copilot restore"),
       }),
     );
+  }, 10_000);
+
+  it("recovers one legacy Copilot conversation only from the session project directory", async () => {
+    mocks.store.set("deck_copilot_legacy_brain", {
+      name: "deck_copilot_legacy_brain",
+      label: "restored",
+      projectName: "copilotrestore",
+      role: "brain",
+      agentType: "copilot-sdk",
+      projectDir: "/tmp/copilot-restore",
+      state: "idle",
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: "transport",
+      providerId: "copilot-sdk",
+      providerSessionId: "route-copilot-legacy",
+      requestedModel: "gpt-5.4",
+      activeModel: "gpt-5.4",
+    });
+
+    await connectProvider("copilot-sdk", {});
+    await restoreTransportSessions("copilot-sdk");
+
+    expect(mocks.copilotListFilters).toEqual([{ cwd: "/tmp/copilot-restore" }]);
+    expect(
+      mocks.store.get("deck_copilot_legacy_brain")?.providerResumeId,
+    ).toBe("copilot-session-restore");
+    expect(
+      getTransportRuntime("deck_copilot_legacy_brain")?.providerSessionId,
+    ).toBe("route-copilot-legacy");
   }, 10_000);
 
   it("skips unavailable provider restores without throwing and leaves the persisted session inspectable", async () => {

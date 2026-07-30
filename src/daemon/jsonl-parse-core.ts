@@ -110,7 +110,7 @@ function extractToolInput(name: string, input?: Record<string, unknown>): string
   if (name === 'Grep') {
     const pattern = input.pattern ?? input.query ?? input.text;
     const path = input.path ?? input.file_path ?? input.filePath;
-    if (pattern && path) return `${String(pattern).split('\n')[0]} in ${String(path).split('\n')[0]}`;
+    if (pattern && path) return `${String(pattern)} in ${String(path)}`;
   }
   const val = input.command
     ?? input.path
@@ -122,7 +122,7 @@ function extractToolInput(name: string, input?: Record<string, unknown>): string
     ?? input.text
     ?? '';
   const text = String(val);
-  return text.split('\n')[0] ?? '';
+  return text;
 }
 
 function extractToolResultOutput(block: ContentBlock): string | undefined {
@@ -136,9 +136,8 @@ function extractToolResultOutput(block: ContentBlock): string | undefined {
   } else {
     return undefined;
   }
-  text = text.trim();
-  if (!text) return undefined;
-  return text.length > 200 ? text.slice(0, 197) + '...' : text;
+  if (!text.trim()) return undefined;
+  return text;
 }
 
 function isClaudeFileChangeTool(name?: string): boolean {

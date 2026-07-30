@@ -39,6 +39,11 @@ interface Props {
 
 const MIN_W = 360;
 const MIN_H = 280;
+// Mobile global layer order:
+// sub-session windows (6000) < server switcher (6500) < modal panels (7000+)
+// < system dialogs (9999+). Desktop stacking remains controlled by callers.
+const MOBILE_FLOATING_PANEL_Z_MIN = 7000;
+const MOBILE_FLOATING_PANEL_Z_OFFSET = 2000;
 
 function currentViewportBounds(): WorkspaceBounds {
   return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
@@ -204,8 +209,12 @@ export function FloatingPanel({
 
   // Mobile: fullscreen with title bar
   if (isMobile) {
+    const mobileZIndex = Math.max(
+      MOBILE_FLOATING_PANEL_Z_MIN,
+      zIndex + MOBILE_FLOATING_PANEL_Z_OFFSET,
+    );
     return (
-      <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, zIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
+      <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, zIndex: mobileZIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
         <div className="floating-panel-safe-area" style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
         <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
           <span

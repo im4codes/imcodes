@@ -104,6 +104,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
       }
+      if (key === 'session.composer_target_label') return 'Sending to';
+      if (key === 'session.composer_target_aria') {
+        return `Message target: ${String(opts?.name ?? '')}`;
+      }
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
       }
@@ -710,6 +714,107 @@ afterEach(() => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+  });
+
+  it('shows the current desktop target on focus and tracks session switches', () => {
+    const firstSession = makeSession({ name: 'deck_project_brain', project: 'project-a', label: 'Main workspace' });
+    const secondSession = makeSession({ name: 'deck_sub_monitor', project: 'project-a', label: 'Monitor' });
+    const view = render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={firstSession}
+        sessionDisplayName="Main workspace"
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    expect(screen.queryByRole('status', { name: 'Message target: Main workspace' })).toBeNull();
+    act(() => input.focus());
+
+    const firstTarget = screen.getByRole('status', { name: 'Message target: Main workspace' });
+    expect(firstTarget.querySelector('.controls-target-label')?.textContent).toBe('Sending to');
+    expect(firstTarget.querySelector('.controls-target-name')?.textContent).toBe('Main workspace');
+    expect(firstTarget.querySelector('.controls-target-name')?.getAttribute('title')).toBe('Main workspace');
+
+    input.textContent = 'check production';
+    fireEvent.input(input);
+
+    view.rerender(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={secondSession}
+        subSessionId="monitor"
+        sessionDisplayName="Production monitor with a deliberately long tab name"
+        quickData={makeQuickData() as any}
+        sessions={[firstSession]}
+        subSessions={[{
+          sessionName: secondSession.name,
+          type: secondSession.agentType,
+          label: secondSession.label,
+          state: secondSession.state,
+          parentSession: firstSession.name,
+        }]}
+      />,
+    );
+    const switchedTarget = screen.getByRole('status', {
+      name: 'Message target: Main workspace → Production monitor with a deliberately long tab name',
+    });
+    expect(switchedTarget.querySelector('.controls-target-parent')?.textContent).toBe('Main workspace');
+    expect(switchedTarget.querySelector('.controls-target-arrow')?.textContent).toBe('→');
+    expect(switchedTarget.querySelector('.controls-target-child')?.textContent)
+      .toBe('Production monitor with a deliberately long tab name');
+    expect(switchedTarget.querySelector('.controls-target-name')?.getAttribute('title'))
+      .toBe('Main workspace → Production monitor with a deliberately long tab name');
+
+    const switchedInput = screen.getByRole('textbox') as HTMLDivElement;
+    switchedInput.textContent = '@';
+    fireEvent.input(switchedInput);
+    expect(document.querySelector('.controls-target-bubble')).toBeNull();
+    expect(screen.getByRole('button', { name: 'files' })).toBeDefined();
+
+    switchedInput.textContent = '';
+    fireEvent.input(switchedInput);
+    expect(screen.getByRole('status', {
+      name: 'Message target: Main workspace → Production monitor with a deliberately long tab name',
+    })).toBeDefined();
+    act(() => switchedInput.blur());
+    expect(document.querySelector('.controls-target-bubble')).toBeNull();
+  });
+
+  it('keeps the target bubble while focused after sending and never shows it on mobile', () => {
+    const ws = makeWs();
+    const desktop = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_sub_monitor', label: 'Monitor' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    act(() => input.focus());
+    expect(document.querySelector('.controls-target-bubble')).toBeTruthy();
+    input.textContent = 'status';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(document.querySelector('.controls-target-bubble')).toBeTruthy();
+    act(() => input.blur());
+    expect(document.querySelector('.controls-target-bubble')).toBeNull();
+    desktop.unmount();
+
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'deck_sub_monitor', label: 'Monitor' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const mobileInput = screen.getByRole('textbox') as HTMLDivElement;
+    act(() => mobileInput.focus());
+    mobileInput.textContent = 'status';
+    fireEvent.input(mobileInput);
+    expect(document.querySelector('.controls-target-bubble')).toBeNull();
   });
 
 
@@ -6066,7 +6171,7 @@ afterEach(() => {
 
     expect(screen.getByText('brain')).toBeDefined();
     expect(screen.getByText('w1')).toBeDefined();
-    expect(screen.getByText('w2')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'w2' })).toBeDefined();
     expect(screen.queryByText('other')).toBeNull();
 
     getSelectionSpy.mockRestore();

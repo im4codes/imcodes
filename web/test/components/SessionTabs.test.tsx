@@ -437,6 +437,55 @@ describe('SessionTabs', () => {
     expect(screen.getByRole('tablist')).toBeDefined();
   });
 
+  it('does not replay a stale idle alert when a running tab becomes inactive', () => {
+    const sessions = makeSessions([
+      { name: 'session_running', label: 'Running', state: 'running' },
+      { name: 'session_other', label: 'Other', state: 'idle' },
+    ]);
+    const idleAlerts = new Set(['session_running']);
+    const view = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="session_running"
+        idleAlerts={idleAlerts}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+
+    const runningTab = screen.getByRole('tab', { name: /running/i });
+    expect(runningTab.classList.contains('alert')).toBe(false);
+
+    view.rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="session_other"
+        idleAlerts={idleAlerts}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    expect(screen.getByRole('tab', { name: /running/i }).classList.contains('alert')).toBe(false);
+  });
+
+  it('keeps a fresh completion alert visible while the session is idle', () => {
+    const sessions = makeSessions([{ name: 'session_idle', label: 'Idle', state: 'idle' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        idleAlerts={new Set(['session_idle'])}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+
+    expect(screen.getByRole('tab', { name: /idle/i }).classList.contains('alert')).toBe(true);
+  });
+
   it('persists a pinned tab drag immediately and restores the order after remount', async () => {
     localStorage.removeItem('rcc_sync_tab_order');
     const sessions = makeSessions([

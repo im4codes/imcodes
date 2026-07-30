@@ -1,6 +1,8 @@
 import type { LaunchOpts } from './session-manager.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
+import type { RemoteSessionInfo } from './transport-provider.js';
+import { canonicalizeTransportCwd } from './transport-paths.js';
 
 /** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
 export function usesProviderResumeId(agentType: string | undefined): boolean {
@@ -9,6 +11,55 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'kimi-sdk'
     || agentType === 'grok-sdk'
     || agentType === 'opencode-sdk';
+}
+
+/** Providers whose remote session namespace is partitioned by working directory. */
+export function usesDirectoryScopedSessionListing(agentType: string | undefined): boolean {
+  return agentType === 'opencode-sdk'
+    || agentType === 'copilot-sdk'
+    || agentType === 'kimi-sdk'
+    || agentType === 'grok-sdk';
+}
+
+/**
+ * Recover a durable provider id for records created before providerResumeId
+ * was persisted reliably. Prefer an exact legacy id match; otherwise accept
+ * only one uniquely named remote conversation. Ambiguity fails closed so a
+ * daemon restart can never attach the cron/send path to the wrong history.
+ * Directory-scoped providers must also return the exact requested directory;
+ * missing or mismatched directory metadata fails closed.
+ */
+export function findLegacyProviderResumeId(
+  record: Pick<SessionRecord, 'name' | 'label' | 'providerSessionId'>,
+  remoteSessions: readonly RemoteSessionInfo[],
+  expectedDirectory?: string,
+): string | undefined {
+  const directoryScopeRequested = expectedDirectory !== undefined;
+  const normalizedExpectedDirectory = canonicalizeTransportCwd(expectedDirectory) ?? '';
+  if (directoryScopeRequested && !normalizedExpectedDirectory) return undefined;
+  const scopedSessions = normalizedExpectedDirectory
+    ? remoteSessions.filter((session) => (
+      !!session.directory
+      && canonicalizeTransportCwd(session.directory) === normalizedExpectedDirectory
+    ))
+    : remoteSessions;
+
+  const legacyId = record.providerSessionId?.trim();
+  if (legacyId && scopedSessions.some((session) => session.key === legacyId)) {
+    return legacyId;
+  }
+
+  const preferredName = record.label?.trim() || record.name?.trim();
+  if (!preferredName) return undefined;
+  const matches = new Set(
+    scopedSessions
+      .filter((session) => {
+        const displayName = session.displayName?.trim();
+        return !!displayName && displayName === preferredName;
+      })
+      .map((session) => session.key),
+  );
+  return matches.size === 1 ? [...matches][0] : undefined;
 }
 
 /**

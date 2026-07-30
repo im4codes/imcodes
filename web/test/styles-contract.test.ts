@@ -41,6 +41,60 @@ describe('styles.css regression contracts', () => {
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
   });
 
+  it('keeps the expanded tool fold header visible while its details scroll', () => {
+    const foldRule = css.match(/\.chat-tool-block-fold\s*\{[^}]*\}/);
+    expect(foldRule).not.toBeNull();
+    expect(foldRule![0]).toMatch(/width:\s*100%/);
+    expect(foldRule![0]).not.toMatch(/900px/);
+
+    const expandedHeaderRule = css.match(/\.chat-tool-block-fold\.is-expanded \.chat-tool-fold-header\s*\{[^}]*\}/);
+    expect(expandedHeaderRule).not.toBeNull();
+    expect(expandedHeaderRule![0]).toMatch(/position:\s*sticky/);
+    expect(expandedHeaderRule![0]).toMatch(/top:\s*0/);
+    expect(expandedHeaderRule![0]).toMatch(/z-index:\s*3/);
+    expect(expandedHeaderRule![0]).not.toMatch(/white-space:\s*nowrap/);
+
+    const continuationRule = css.match(/\.chat-tool-fold-continuation\s*\{[^}]*\}/);
+    expect(continuationRule).not.toBeNull();
+    expect(continuationRule![0]).toMatch(/white-space:\s*pre-wrap/);
+    expect(continuationRule![0]).toMatch(/word-break:\s*break-word/);
+
+    const collapsedContinuationRule = css.match(/\.chat-tool-block-fold\.is-collapsed \.chat-tool-fold-continuation\s*\{[^}]*\}/);
+    expect(collapsedContinuationRule).not.toBeNull();
+    expect(collapsedContinuationRule![0]).toMatch(/display:\s*none/);
+  });
+
+  it('keeps collapsed tool rows horizontally scrollable without a visible scrollbar', () => {
+    const collapsedRowsRule = css.match(
+      /\.chat-tool-block-fold\.is-collapsed \.chat-tool-command-row,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-row,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-preview\s*\{[^}]*\}/,
+    );
+    expect(collapsedRowsRule).not.toBeNull();
+    expect(collapsedRowsRule![0]).toMatch(/overflow-x:\s*auto/);
+    expect(collapsedRowsRule![0]).toMatch(/scrollbar-width:\s*none/);
+
+    const webkitScrollbarRule = css.match(
+      /\.chat-tool-block-fold\.is-collapsed \.chat-tool-command-row::\-webkit-scrollbar,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-row::\-webkit-scrollbar,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-preview::\-webkit-scrollbar\s*\{[^}]*\}/,
+    );
+    expect(webkitScrollbarRule).not.toBeNull();
+    expect(webkitScrollbarRule![0]).toMatch(/display:\s*none/);
+    expect(webkitScrollbarRule![0]).toMatch(/height:\s*0/);
+  });
+
+  it('keeps the desktop composer target compact and truncates long session names', () => {
+    const bubbleRule = css.match(/\.controls-target-bubble\s*\{[^}]*\}/);
+    expect(bubbleRule).not.toBeNull();
+    expect(bubbleRule![0]).toMatch(/position:\s*absolute/);
+    expect(bubbleRule![0]).toMatch(/bottom:\s*calc\(100%\s*\+\s*5px\)/);
+    expect(bubbleRule![0]).toMatch(/max-width:\s*calc\(100%\s*-\s*8px\)/);
+    expect(bubbleRule![0]).toMatch(/overflow:\s*hidden/);
+
+    const nameRule = css.match(/\.controls-target-name\s*\{[^}]*\}/);
+    expect(nameRule).not.toBeNull();
+    expect(nameRule![0]).toMatch(/min-width:\s*0/);
+    expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
+    expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
+  });
+
   it('fits portrait videos by available preview height without stretching them to full width', () => {
     const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
     expect(videoContainerRule).not.toBeNull();
@@ -235,6 +289,19 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@keyframes daemon-clock-tick/);
   });
 
+  it('keeps the mobile daemon details as a fixed dismissible overlay', () => {
+    const backdropRule = css.match(/\.daemon-details-backdrop\s*\{[^}]*\}/);
+    expect(backdropRule).not.toBeNull();
+    expect(backdropRule![0]).toMatch(/position:\s*fixed/);
+    expect(backdropRule![0]).toMatch(/inset:\s*0/);
+    expect(backdropRule![0]).toMatch(/z-index:\s*13000/);
+
+    const panelRule = css.match(/\.daemon-details-panel\s*\{[^}]*\}/);
+    expect(panelRule).not.toBeNull();
+    expect(panelRule![0]).toMatch(/max-height:\s*min\(82dvh,\s*680px\)/);
+    expect(panelRule![0]).toMatch(/overflow:\s*auto/);
+  });
+
   it('sub-session close-all control stays a narrow strip at the left of the row', () => {
     const rowRule = css.match(/\.subsession-row-with-close\s*\{[^}]*\}/);
     expect(rowRule).not.toBeNull();
@@ -380,6 +447,11 @@ describe('styles.css regression contracts', () => {
       .find((rule) => /gap:\s*8px/.test(rule));
     expect(barRule).not.toBeNull();
     expect(barRule!).toMatch(/gap:\s*8px/);
+    expect(barRule!).toMatch(/z-index:\s*6500/);
+
+    const backdropRule = css.match(/\.mobile-server-backdrop\s*\{[^}]*\}/);
+    expect(backdropRule).not.toBeNull();
+    expect(backdropRule![0]).toMatch(/z-index:\s*6499/);
 
     const wrapRule = css.match(/\.mobile-server-switcher-wrap\s*\{[^}]*\}/);
     expect(wrapRule).not.toBeNull();

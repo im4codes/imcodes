@@ -657,7 +657,9 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.injectedText).not.toContain(active.id);
     expect(startup?.injectedText).not.toContain(promoted.id);
     expect(startup?.injectedText).not.toContain('Candidate saved observation');
-    expect(startup?.injectedText).toContain('call get_memory_sources with { "ref": "obs:..." }');
+    expect(startup?.injectedText).toContain('available memory source-expansion tool with { "ref": "obs:..." }');
+    expect(startup?.injectedText).toContain('exact callable names from the current tool list');
+    expect(startup?.injectedText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
     expect(resolveMemoryShortRef(activeRef, {
       scope: 'user_private',
       projectId: 'github.com/acme/repo',

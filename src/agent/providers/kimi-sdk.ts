@@ -81,6 +81,7 @@ import type {
   ApprovalRequest,
   ProviderCompactCapability,
   RemoteSessionInfo,
+  RemoteSessionListOptions,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -97,7 +98,11 @@ import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import {
+  canonicalizeTransportCwd,
+  normalizeTransportCwd,
+  resolveExecutableForSpawn,
+} from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 import {
   buildGenericRuntimeSubagentTool,
@@ -216,6 +221,7 @@ export class KimiSdkProvider implements TransportProvider {
   /** Reverse lookup so `sessionUpdate` notifications can find the right state
    *  by ACP sessionId (which we only learn after newSession/loadSession). */
   private acpToRoute = new Map<string, string>();
+  private acpRouteOrder = new Map<string, string[]>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -238,6 +244,8 @@ export class KimiSdkProvider implements TransportProvider {
    *  lifetime of this provider connection. Populated on first session create. */
   private cachedModels: Array<{ id: string; name?: string }> | null = null;
   private cachedDefaultModel: string | null = null;
+  /** Negotiated ACP support for durable `session/list` discovery. */
+  private sessionListSupported = false;
 
   constructor(profile: AcpCliProviderProfile = KIMI_PROFILE) {
     this.profile = profile;
@@ -327,11 +335,13 @@ export class KimiSdkProvider implements TransportProvider {
     this.cancelPendingApprovals();
     this.teardownChild();
     this.acpToRoute.clear();
+    this.acpRouteOrder.clear();
     this.sessions.clear();
     this.config = null;
     this.initPromise = null;
     this.cachedModels = null;
     this.cachedDefaultModel = null;
+    this.sessionListSupported = false;
   }
 
   async createSession(config: SessionConfig): Promise<string> {
@@ -361,9 +371,12 @@ export class KimiSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
     };
+    if (existing?.acpSessionId && existing.acpSessionId !== state.acpSessionId) {
+      this.releaseAcpRoute(existing.acpSessionId, routeId);
+    }
     this.sessions.set(routeId, state);
     if (state.acpSessionId) {
-      this.acpToRoute.set(state.acpSessionId, routeId);
+      this.registerAcpRoute(state.acpSessionId, routeId);
       this.emitSessionInfo(routeId, { resumeId: state.acpSessionId });
     }
     return routeId;
@@ -373,18 +386,28 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
+    this.sessions.delete(state.routeId);
+    const removedSoleAcpRoute = state.acpSessionId
+      ? this.releaseAcpRoute(state.acpSessionId, state.routeId)
+      : false;
     // ACP has a session/close RPC (optional capability). We call it best-effort
     // so the agent can free state; if it fails, the session is still gone on
     // our side. closeSession is optional on the Agent interface so we have to
     // feature-detect.
-    if (state.acpSessionId && state.loaded && this.connection) {
+    if (state.acpSessionId && state.loaded && this.connection && removedSoleAcpRoute) {
       const closer = (this.connection as AcpAgent).closeSession;
       if (typeof closer === 'function') {
         await closer.call(this.connection, { sessionId: state.acpSessionId }).catch(() => {});
       }
-      this.acpToRoute.delete(state.acpSessionId);
     }
-    this.sessions.delete(sessionId);
+  }
+
+  async detachSession(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    this.cancelPendingApprovals(sessionId);
+    this.sessions.delete(state.routeId);
+    if (state.acpSessionId) this.releaseAcpRoute(state.acpSessionId, state.routeId);
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -400,14 +423,45 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  async listSessions(): Promise<RemoteSessionInfo[]> {
-    return [...this.sessions.values()]
-      .filter((state) => typeof state.acpSessionId === 'string')
-      .map((state) => ({
-        key: state.acpSessionId!,
-        displayName: state.sessionName ?? state.routeId,
-        ...(state.model ? { agentId: state.model } : {}),
-      }));
+  async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
+    const directoryRequested = options.directory !== undefined;
+    const queryDirectory = normalizeTransportCwd(options.directory);
+    const expectedDirectory = canonicalizeTransportCwd(options.directory);
+    if (
+      (directoryRequested && (!queryDirectory || !expectedDirectory))
+      || !this.connection
+      || !this.sessionListSupported
+    ) {
+      return [];
+    }
+
+    const sessions: RemoteSessionInfo[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const result = await this.connection.listSessions({
+        ...(queryDirectory ? { cwd: queryDirectory } : {}),
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const session of result.sessions) {
+        const directory = canonicalizeTransportCwd(session.cwd);
+        if (!directory || (expectedDirectory && directory !== expectedDirectory)) continue;
+        const updatedAt = session.updatedAt ? Date.parse(session.updatedAt) : Number.NaN;
+        sessions.push({
+          key: session.sessionId,
+          ...(session.title ? { displayName: session.title } : {}),
+          directory: session.cwd.trim(),
+          ...(Number.isFinite(updatedAt) ? { updatedAt } : {}),
+        });
+      }
+      const nextCursor = typeof result.nextCursor === 'string' && result.nextCursor
+        ? result.nextCursor
+        : undefined;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    return sessions;
   }
 
   onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
@@ -563,6 +617,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.child = null;
       this.connection = null;
       this.initPromise = null;
+      this.sessionListSupported = false;
     });
     child.on('error', (err) => {
       logger.error(
@@ -579,6 +634,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.child = null;
       this.connection = null;
       this.initPromise = null;
+      this.sessionListSupported = false;
     });
 
     // `ndJsonStream` wants Web streams; convert the Node stdio streams. Filter
@@ -623,6 +679,7 @@ export class KimiSdkProvider implements TransportProvider {
         { provider: this.id, agentInfo: result.agentInfo, caps: result.agentCapabilities },
         `${this.profile.displayName} ACP initialized`,
       );
+      this.sessionListSupported = result.agentCapabilities.sessionCapabilities?.list != null;
       await this.validateConnectedAgent(result as unknown as Record<string, unknown>, config);
     })().catch((err: unknown) => {
       logger.error(
@@ -795,7 +852,7 @@ export class KimiSdkProvider implements TransportProvider {
             { provider: this.id, sessionId, acpSessionId: state.acpSessionId, err },
             `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
           );
-          this.acpToRoute.delete(state.acpSessionId);
+          this.releaseAcpRoute(state.acpSessionId, state.routeId);
           state.acpSessionId = undefined;
           await this.createFreshAcpSession(sessionId, state);
         }
@@ -842,10 +899,36 @@ export class KimiSdkProvider implements TransportProvider {
     state.loaded = true;
     state.modeApplied = false;
     state.sessionSystemTextInjected = undefined;
-    this.acpToRoute.set(state.acpSessionId, sessionId);
+    this.registerAcpRoute(state.acpSessionId, sessionId);
     this.cacheModelsFromSessionResponse(result);
     this.applySessionMetadata(sessionId, state, result);
     this.emitSessionInfo(sessionId, { resumeId: state.acpSessionId });
+  }
+
+  private registerAcpRoute(acpSessionId: string, routeId: string): void {
+    const routes = (this.acpRouteOrder.get(acpSessionId) ?? [])
+      .filter((candidate) => candidate !== routeId && this.sessions.has(candidate));
+    routes.push(routeId);
+    this.acpRouteOrder.set(acpSessionId, routes);
+    this.acpToRoute.set(acpSessionId, routeId);
+  }
+
+  private releaseAcpRoute(acpSessionId: string, routeId: string): boolean {
+    const ownsCurrentRoute = this.acpToRoute.get(acpSessionId) === routeId;
+    const remainingRoutes = (this.acpRouteOrder.get(acpSessionId) ?? [])
+      .filter((candidate) => (
+        candidate !== routeId
+        && this.sessions.get(candidate)?.acpSessionId === acpSessionId
+      ));
+    if (remainingRoutes.length > 0) this.acpRouteOrder.set(acpSessionId, remainingRoutes);
+    else this.acpRouteOrder.delete(acpSessionId);
+    if (!ownsCurrentRoute) return false;
+    if (remainingRoutes.length > 0) {
+      this.acpToRoute.set(acpSessionId, remainingRoutes[remainingRoutes.length - 1]!);
+      return false;
+    }
+    this.acpToRoute.delete(acpSessionId);
+    return true;
   }
 
   private cacheModelsFromSessionResponse(result: NewSessionResponse | import('@agentclientprotocol/sdk').LoadSessionResponse | undefined): void {
@@ -1249,6 +1332,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
     this.child = null;
     this.connection = null;
+    this.sessionListSupported = false;
   }
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {

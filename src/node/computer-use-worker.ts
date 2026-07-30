@@ -1,4 +1,3 @@
-import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   validateComputerUseFrame,
   COMPUTER_USE_DEFAULT_TIMEOUT_MS,
@@ -6,10 +5,15 @@ import {
   type ComputerUseResult,
 } from '../../shared/computer-use.js';
 import { ComputerUseIpcHost } from './computer-use-ipc.js';
+import type { ControlledNodeCredential } from './enrollment.js';
 
 export class ComputerUseWorker {
-  private readonly host = new ComputerUseIpcHost();
+  private readonly host: ComputerUseIpcHost;
   private busy = false;
+
+  constructor(credential?: ControlledNodeCredential) {
+    this.host = new ComputerUseIpcHost({ credential });
+  }
 
   async handle(raw: unknown): Promise<ComputerUseResult | null> {
     const validation = validateComputerUseFrame(raw);
@@ -18,7 +22,8 @@ export class ComputerUseWorker {
     this.busy = true;
     try {
       const result = await this.host.call(validation.value);
-      const { type: _type, ...payload } = result;
+      const { type, ...payload } = result;
+      void type;
       return payload;
     } catch (error) {
       return this.failure(validation.value, error instanceof Error ? error.message : String(error));

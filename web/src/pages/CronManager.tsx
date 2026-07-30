@@ -2,8 +2,12 @@ import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { marked } from 'marked';
 import { apiFetch } from '../api.js';
-import type { CronAction, CronJobStatus } from '@shared/cron-types';
-import { CRON_STATUS } from '@shared/cron-types';
+import type { CronAction, CronCompletionPolicy, CronJobStatus } from '@shared/cron-types';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_STATUS,
+  normalizeCronCompletionPolicy,
+} from '@shared/cron-types';
 import { BUILT_IN_MODES } from '@shared/p2p-modes';
 import type { SessionInfo } from '../types.js';
 import { formatLabel } from '../format-label.js';
@@ -28,6 +32,7 @@ interface CronJob {
   last_run_at: number | null;
   next_run_at: number | null;
   expires_at: number | null;
+  completion_policy?: string | null;
   created_at: number;
 }
 
@@ -426,6 +431,9 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             <div style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', flexWrap: 'wrap' }}>
               <span style={{ fontFamily: 'monospace', color: '#cbd5e1' }}>{job.cron_expr}</span>
               <span>→ {displayTarget(job)}</span>
+              <span style={{ opacity: 0.6 }}>
+                {t(`cron.completion_${normalizeCronCompletionPolicy(job.completion_policy)}`)}
+              </span>
               {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>Team {action.mode}</span>}
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
               {action?.type === 'send' && <span title={sendActionSummary(action, t)} style={{ opacity: 0.6, maxWidth: '260px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sendActionSummary(action, t)}</span>}
@@ -918,6 +926,9 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
   const [sendReply, setSendReply] = useState(existingAction?.type === 'send' ? existingAction.reply === true : false);
   const [sendBroadcast, setSendBroadcast] = useState(existingAction?.type === 'send' ? existingAction.broadcast === true : false);
   const [expiresAt, setExpiresAt] = useState(formatDateTimeLocalInput(job?.expires_at));
+  const [completionPolicy, setCompletionPolicy] = useState<CronCompletionPolicy>(
+    normalizeCronCompletionPolicy(job?.completion_policy),
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const commandCharCount = Array.from(command).length;
@@ -956,7 +967,16 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
     const hasSessionEntries = entries.some(e => e.type === 'session');
 
     const action: CronAction = actionType === 'command'
-      ? { type: 'command', command }
+      ? {
+        type: 'command',
+        command,
+        ...(
+          completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+          || (existingAction?.type === 'command' && existingAction.selfManaged)
+            ? { selfManaged: true }
+            : {}
+        ),
+      }
       : actionType === 'send'
         ? {
           type: 'send',
@@ -988,6 +1008,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
       action,
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       expiresAt: expiresAt ? new Date(expiresAt).getTime() : null,
+      completionPolicy,
     };
 
     try {
@@ -1048,6 +1069,19 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], activeSes
             </option>
           ))}
         </select>
+
+        <label style={labelStyle}>{t('cron.completion_policy')}</label>
+        <select
+          style={{ ...inputStyle, appearance: 'auto' as string }}
+          value={completionPolicy}
+          onInput={e => setCompletionPolicy((e.target as HTMLSelectElement).value as CronCompletionPolicy)}
+        >
+          <option value={CRON_COMPLETION_POLICY.RECURRING}>{t('cron.completion_recurring')}</option>
+          <option value={CRON_COMPLETION_POLICY.UNTIL_COMPLETE}>{t('cron.completion_until_complete')}</option>
+        </select>
+        <div style={{ color: '#64748b', fontSize: '11px', marginTop: '-6px', marginBottom: '10px' }}>
+          {t(`cron.completion_${completionPolicy}_help`)}
+        </div>
 
         {(hasExistingP2pAction || existingAction?.type === 'send') && (
           <div style={{ marginBottom: '12px' }}>

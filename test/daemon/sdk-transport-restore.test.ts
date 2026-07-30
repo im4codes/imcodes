@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdir, symlink } from 'node:fs/promises';
+import path from 'node:path';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { isAuthoritativeCleanIdlePayload } from '../../shared/session-activity-types.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../src/shared/models/options.js';
+import { canonicalizeTransportCwd, normalizeTransportCwd } from '../../src/agent/transport-paths.js';
 
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
@@ -14,6 +17,16 @@ const mocks = vi.hoisted(() => {
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -164,7 +177,16 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
-import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
+import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
+import {
+  ensureTransportRuntimeAvailable,
+  getTransportRuntime,
+  launchTransportSession,
+  relaunchSessionWithSettings,
+  restoreTransportSessions,
+  setSessionEventCallback,
+  setSessionPersistCallback,
+} from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
@@ -184,6 +206,76 @@ import {
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 };
+
+const originalOpenCodeStart = openCodeSdkRuntimeHooks.start;
+
+function createOpenCodeRestoreHarness() {
+  const remoteSessions = new Map<string, Record<string, any>>();
+  let signal: AbortSignal | undefined;
+  const stream = {
+    async *[Symbol.asyncIterator]() {
+      if (signal?.aborted) return;
+      await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+    },
+  };
+  const client = {
+    session: {
+      create: vi.fn(async (options: any) => {
+        const session = {
+          id: 'unexpected-new-session',
+          title: options.body?.title ?? 'unexpected',
+          directory: options.query?.directory,
+        };
+        remoteSessions.set(session.id, session);
+        return { data: session };
+      }),
+      get: vi.fn(async (options: any) => {
+        const session = remoteSessions.get(String(options.path?.id));
+        if (!session) throw new Error('404 session not found');
+        return { data: session };
+      }),
+      list: vi.fn(async (options: any) => ({
+        data: [...remoteSessions.values()].filter((session) => (
+          !options.query?.directory || session.directory === options.query.directory
+        )),
+      })),
+      abort: vi.fn(async () => ({ data: true })),
+      prompt: vi.fn(),
+    },
+    provider: {
+      list: vi.fn(async () => ({
+        data: {
+          connected: ['opencode'],
+          default: { opencode: 'deepseek-v4-flash-free' },
+          all: [{
+            id: 'opencode',
+            name: 'OpenCode',
+            models: {
+              'deepseek-v4-flash-free': {
+                id: 'deepseek-v4-flash-free',
+                name: 'DeepSeek V4 Flash Free',
+                limit: { context: 128_000 },
+              },
+            },
+          }],
+        },
+      })),
+    },
+    event: {
+      subscribe: vi.fn(async () => ({ stream })),
+    },
+    permission: {
+      reply: vi.fn(async () => ({ data: true })),
+    },
+    postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+  };
+  const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
+  openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+    signal = options.signal;
+    return { client: client as any, server };
+  });
+  return { client, remoteSessions };
+}
 
 function claudeRunForSession(sessionName: string, prompt?: string) {
   return mocks.claudeRuns.find((run) => {
@@ -284,6 +376,7 @@ describe('sdk transport session restore', () => {
 
   afterEach(async () => {
     await disconnectAll();
+    openCodeSdkRuntimeHooks.start = originalOpenCodeStart;
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -334,6 +427,642 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('restores only the requested persisted transport session on demand', async () => {
+    const now = Date.now();
+    const makeStoredSession = (name: string, providerSessionId: string, ccSessionId: string) => ({
+      name,
+      projectName: 'sdkexactrestore',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: `/tmp/${name}`,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId,
+      ccSessionId,
+    });
+    mocks.store.set(
+      'deck_sdk_exact_target_brain',
+      makeStoredSession('deck_sdk_exact_target_brain', 'route-exact-target', 'cc-exact-target'),
+    );
+    mocks.store.set(
+      'deck_sdk_exact_other_brain',
+      makeStoredSession('deck_sdk_exact_other_brain', 'route-exact-other', 'cc-exact-other'),
+    );
+
+    await connectProvider('claude-code-sdk', {});
+    const [runtime, concurrentRuntime] = await Promise.all([
+      ensureTransportRuntimeAvailable('deck_sdk_exact_target_brain'),
+      ensureTransportRuntimeAvailable('deck_sdk_exact_target_brain'),
+    ]);
+
+    expect(runtime).toBeDefined();
+    expect(concurrentRuntime).toBe(runtime);
+    expect(runtime?.providerSessionId).toBe('route-exact-target');
+    expect(getTransportRuntime('deck_sdk_exact_target_brain')).toBe(runtime);
+    expect(getTransportRuntime('deck_sdk_exact_other_brain')).toBeUndefined();
+  });
+
+  it('recovers a legacy OpenCode conversation by one unique remote title instead of creating a new one', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor/../service-monitor',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-local-route');
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'remote-monitor-session' },
+      query: { directory: '/tmp/service-monitor' },
+    }));
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: '/tmp/service-monitor' },
+      throwOnError: true,
+    });
+    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBe('remote-monitor-session');
+  });
+
+  it('queries canonical and symlink directory spellings and resumes with the provider spelling', async () => {
+    const realDirectory = path.join(tempDir, 'service-monitor-real');
+    const aliasDirectory = path.join(tempDir, 'service-monitor-alias');
+    await mkdir(realDirectory);
+    await symlink(
+      realDirectory,
+      aliasDirectory,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    const canonicalDirectory = canonicalizeTransportCwd(realDirectory)!;
+    const normalizedAlias = normalizeTransportCwd(aliasDirectory)!;
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-symlink-monitor', {
+      id: 'remote-symlink-monitor',
+      title: '监控',
+      directory: normalizedAlias,
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_symlink_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: normalizedAlias,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-symlink-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-symlink-route');
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: canonicalDirectory },
+      throwOnError: true,
+    });
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: normalizedAlias },
+      throwOnError: true,
+    });
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'remote-symlink-monitor' },
+      query: { directory: normalizedAlias },
+    }));
+    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBe('remote-symlink-monitor');
+  });
+
+  it('refuses legacy provider discovery when a directory-scoped record has no project directory', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_missing_directory_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '   ',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await expect(ensureTransportRuntimeAvailable(name)).resolves.toBeUndefined();
+
+    expect(harness.client.session.list).not.toHaveBeenCalled();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
+  });
+
+  it('does not attach an old recovery to a same-name session recreated while listing is pending', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    const listingStarted = deferred<void>();
+    const listingResult = deferred<{ data: Array<Record<string, any>> }>();
+    harness.client.session.list.mockImplementationOnce(async () => {
+      listingStarted.resolve();
+      return listingResult.promise;
+    });
+    const name = 'deck_service_recreated_monitor';
+    const oldRecord = {
+      name,
+      sessionInstanceId: 'instance-old',
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-old-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set(name, oldRecord);
+
+    await connectProvider('opencode-sdk', {});
+    const restore = restoreTransportSessions('opencode-sdk', {
+      sessionName: name,
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+    await listingStarted.promise;
+
+    mocks.store.delete(name);
+    mocks.store.set(name, {
+      ...oldRecord,
+      sessionInstanceId: 'instance-new',
+      providerSessionId: 'new-route',
+      createdAt: oldRecord.createdAt + 1,
+      updatedAt: Date.now(),
+    });
+    listingResult.resolve({
+      data: [{
+        id: 'remote-monitor-session',
+        title: '监控',
+        directory: '/tmp/service-monitor',
+        time: { updated: Date.now() },
+      }],
+    });
+    await restore;
+
+    expect(mocks.store.get(name)?.sessionInstanceId).toBe('instance-new');
+    expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+  });
+
+  it('does not let SessionInfo from an initializing restore pollute a same-name replacement', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    const getStarted = deferred<void>();
+    const getResult = deferred<{ data: Record<string, any> }>();
+    harness.client.session.get.mockImplementationOnce(async () => {
+      getStarted.resolve();
+      return getResult.promise;
+    });
+    const name = 'deck_service_recreated_during_initialize';
+    const oldRecord = {
+      name,
+      sessionInstanceId: 'instance-old',
+      runtimeEpoch: 'epoch-old',
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-old-route',
+      providerResumeId: 'remote-monitor-session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set(name, oldRecord);
+    enqueueResend(name, {
+      text: 'must remain queued until restore authority commits',
+      commandId: 'cmd-stale-initialize',
+      queuedAt: Date.now(),
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const restore = restoreTransportSessions('opencode-sdk', {
+      sessionName: name,
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+    await getStarted.promise;
+
+    mocks.store.delete(name);
+    mocks.store.set(name, {
+      ...oldRecord,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      providerSessionId: 'new-route',
+      providerResumeId: undefined,
+      createdAt: oldRecord.createdAt + 1,
+      updatedAt: Date.now(),
+    });
+    getResult.resolve({
+      data: {
+        id: 'remote-monitor-session',
+        title: '监控',
+        directory: '/tmp/service-monitor',
+      },
+    });
+    await restore;
+
+    expect(mocks.store.get(name)).toMatchObject({
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      providerSessionId: 'new-route',
+    });
+    expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
+    expect(mocks.store.get(name)?.activeModel).toBeUndefined();
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(getResendCount(name)).toBe(1);
+    expect(harness.client.session.prompt).not.toHaveBeenCalled();
+  });
+
+  it('abandons an initializing restore when the same session changes runtime authority', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    const getStarted = deferred<void>();
+    const getResult = deferred<{ data: Record<string, any> }>();
+    harness.client.session.get.mockImplementationOnce(async () => {
+      getStarted.resolve();
+      return getResult.promise;
+    });
+    const name = 'deck_service_reconfigured_during_initialize';
+    const oldRecord = {
+      name,
+      sessionInstanceId: 'instance-stable',
+      runtimeEpoch: 'epoch-old',
+      label: '旧监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-route',
+      providerResumeId: 'remote-monitor-session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set(name, oldRecord);
+
+    await connectProvider('opencode-sdk', {});
+    const restore = restoreTransportSessions('opencode-sdk', {
+      sessionName: name,
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+    await getStarted.promise;
+
+    mocks.store.set(name, {
+      ...oldRecord,
+      runtimeEpoch: 'epoch-new',
+      label: '新监控',
+      requestedModel: 'opencode/new-model',
+      transportConfig: { provider: { mode: 'changed' } },
+      updatedAt: Date.now(),
+    });
+    getResult.resolve({
+      data: {
+        id: 'remote-monitor-session',
+        title: '旧监控',
+        directory: '/tmp/service-monitor',
+      },
+    });
+    await restore;
+
+    expect(mocks.store.get(name)).toMatchObject({
+      sessionInstanceId: 'instance-stable',
+      runtimeEpoch: 'epoch-new',
+      label: '新监控',
+      requestedModel: 'opencode/new-model',
+      transportConfig: { provider: { mode: 'changed' } },
+      providerResumeId: 'remote-monitor-session',
+    });
+    expect(mocks.store.get(name)?.activeModel).toBeUndefined();
+    expect(getTransportRuntime(name)).toBeUndefined();
+  });
+
+  it('refuses to let two same-name legacy records claim one provider conversation', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const baseRecord = {
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_monitor_a', {
+      ...baseRecord,
+      name: 'deck_service_monitor_a',
+      providerSessionId: 'legacy-route-a',
+    });
+    mocks.store.set('deck_service_monitor_b', {
+      ...baseRecord,
+      name: 'deck_service_monitor_b',
+      providerSessionId: 'legacy-route-b',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 2,
+      interSessionDelayMs: 0,
+    });
+
+    expect(getTransportRuntime('deck_service_monitor_a')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_monitor_b')).toBeUndefined();
+    expect(mocks.store.get('deck_service_monitor_a')?.providerResumeId).toBeUndefined();
+    expect(mocks.store.get('deck_service_monitor_b')?.providerResumeId).toBeUndefined();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+  });
+
+  it('refuses a legacy claim when another local record already owns the provider conversation', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const baseRecord = {
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_owned_monitor', {
+      ...baseRecord,
+      name: 'deck_service_owned_monitor',
+      providerSessionId: 'owned-route',
+      providerResumeId: 'remote-monitor-session',
+    });
+    mocks.store.set('deck_service_legacy_monitor', {
+      ...baseRecord,
+      name: 'deck_service_legacy_monitor',
+      providerSessionId: 'legacy-route',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 2,
+      interSessionDelayMs: 0,
+    });
+
+    expect(getTransportRuntime('deck_service_owned_monitor')?.providerSessionId).toBe('owned-route');
+    expect(getTransportRuntime('deck_service_legacy_monitor')).toBeUndefined();
+    expect(mocks.store.get('deck_service_legacy_monitor')?.providerResumeId).toBeUndefined();
+  });
+
+  it('fails all restores when one provider resume id is already persisted on multiple records', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const baseRecord = {
+      label: '监控',
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      providerResumeId: 'remote-monitor-session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_duplicate_a', {
+      ...baseRecord,
+      name: 'deck_service_duplicate_a',
+      providerSessionId: 'duplicate-route-a',
+    });
+    mocks.store.set('deck_service_duplicate_b', {
+      ...baseRecord,
+      name: 'deck_service_duplicate_b',
+      providerSessionId: 'duplicate-route-b',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 2,
+      interSessionDelayMs: 0,
+    });
+
+    expect(getTransportRuntime('deck_service_duplicate_a')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_duplicate_b')).toBeUndefined();
+    expect(harness.client.session.get).not.toHaveBeenCalled();
+  });
+
+  it('scopes legacy OpenCode title recovery to the stored project directory', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('other-project-monitor', {
+      id: 'other-project-monitor',
+      title: '监控',
+      directory: '/tmp/other-project',
+      time: { updated: Date.now() + 1 },
+    });
+    harness.remoteSessions.set('service-project-monitor', {
+      id: 'service-project-monitor',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_scoped_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route-scoped',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-local-route-scoped');
+    expect(mocks.store.get(name)?.providerResumeId).toBe('service-project-monitor');
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'service-project-monitor' },
+      query: { directory: '/tmp/service-monitor' },
+    }));
+    expect(harness.client.session.get).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'other-project-monitor' },
+    }));
+  });
+
+  it('retries one transient directory-list failure and reuses the recovered listing', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('second-monitor', {
+      id: 'second-monitor',
+      title: 'Second monitor',
+      directory: '/tmp/shared-monitor',
+      time: { updated: Date.now() },
+    });
+    harness.client.session.list.mockRejectedValueOnce(new Error('temporary list failure'));
+    const baseRecord = {
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/shared-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_first_monitor', {
+      ...baseRecord,
+      name: 'deck_service_first_monitor',
+      label: 'First monitor',
+      providerSessionId: 'legacy-first-route',
+    });
+    mocks.store.set('deck_service_second_monitor', {
+      ...baseRecord,
+      name: 'deck_service_second_monitor',
+      label: 'Second monitor',
+      providerSessionId: 'legacy-second-route',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+
+    expect(harness.client.session.list).toHaveBeenCalledTimes(2);
+    expect(getTransportRuntime('deck_service_first_monitor')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_second_monitor')?.providerSessionId)
+      .toBe('legacy-second-route');
+    expect(mocks.store.get('deck_service_second_monitor')?.providerResumeId)
+      .toBe('second-monitor');
+  });
+
+  it('persists the provider-native OpenCode resume id on the first launch', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    await connectProvider('opencode-sdk', {});
+
+    await launchTransportSession({
+      name: 'deck_opencode_new_brain',
+      projectName: 'opencodenew',
+      role: 'brain',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/opencode-new',
+      label: 'New OpenCode session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    expect(harness.client.session.create).toHaveBeenCalledOnce();
+    expect(mocks.store.get('deck_opencode_new_brain')).toMatchObject({
+      providerSessionId: expect.any(String),
+      providerResumeId: 'unexpected-new-session',
+    });
   });
 
   it('persists transport runtime running status so session snapshots do not stay idle while tools run', async () => {
@@ -1088,6 +1817,10 @@ describe('sdk transport session restore', () => {
       { source: 'daemon', confidence: 'high' },
     );
 
+    mocks.store.set('deck_sub_sdk_stale_running', {
+      ...mocks.store.get('deck_sub_sdk_stale_running'),
+      label: 'Renamed while restored runtime stays attached',
+    });
     runtime!.send('continue after daemon restart');
     await settleCodexRun('deck_sub_sdk_stale_running', 'start');
 
@@ -1097,6 +1830,7 @@ describe('sdk transport session restore', () => {
       input: 'continue after daemon restart',
     });
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('thread-restored');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.label).toBe('Renamed while restored runtime stays attached');
   });
 
   it('emits started idle when launching a new transport session', async () => {

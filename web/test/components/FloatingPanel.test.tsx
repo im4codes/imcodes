@@ -16,6 +16,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   document.querySelectorAll('.tab-bar').forEach((node) => node.remove());
+  vi.restoreAllMocks();
 });
 
 function rectWithBottom(bottom: number): DOMRect {
@@ -41,6 +42,17 @@ describe('FloatingPanel', () => {
     );
     const panel = screen.getByTestId('floating-panel-zindex-prop') as HTMLElement;
     expect(panel.style.zIndex).toBe('5050');
+  });
+
+  it('keeps mobile panels above the server switcher layer', () => {
+    vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue('iPhone');
+    const view = render(
+      <FloatingPanel id="mobile-zindex" title="Cron manager" onClose={() => {}} zIndex={5070}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+    const panel = view.container.querySelector('.floating-panel') as HTMLElement;
+    expect(panel.style.zIndex).toBe('7070');
   });
 
   it('fires onFocus on root pointer-down', () => {

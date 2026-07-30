@@ -4,7 +4,14 @@
  * Tests for cron shared types imported via @shared alias in web.
  */
 import { describe, it, expect } from 'vitest';
-import { CRON_STATUS, CRON_MSG, type CronAction, type CronJobStatus } from '@shared/cron-types';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_STATUS,
+  CRON_MSG,
+  normalizeCronCompletionPolicy,
+  type CronAction,
+  type CronJobStatus,
+} from '@shared/cron-types';
 
 describe('Cron shared types — web import', () => {
   it('CRON_STATUS has all expected statuses', () => {
@@ -16,6 +23,12 @@ describe('Cron shared types — web import', () => {
 
   it('CRON_MSG has dispatch type', () => {
     expect(CRON_MSG.DISPATCH).toBe('cron.dispatch');
+  });
+
+  it('defaults legacy and malformed completion policies to recurring', () => {
+    expect(normalizeCronCompletionPolicy(undefined)).toBe(CRON_COMPLETION_POLICY.RECURRING);
+    expect(normalizeCronCompletionPolicy('permanent')).toBe(CRON_COMPLETION_POLICY.RECURRING);
+    expect(normalizeCronCompletionPolicy('until_complete')).toBe(CRON_COMPLETION_POLICY.UNTIL_COMPLETE);
   });
 
   it('CronAction discriminated union accepts command type', () => {

@@ -47,7 +47,7 @@ export function createControlledNodeRuntime(
   options: ControlledNodeRuntimeOptions = {},
 ): AuthenticatedWebSocketClient {
   const worker = new MachineExecWorker();
-  const computerUseWorker = new ComputerUseWorker();
+  const computerUseWorker = new ComputerUseWorker(credential);
   let upgradeInFlight = false;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;

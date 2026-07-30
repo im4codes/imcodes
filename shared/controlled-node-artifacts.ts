@@ -84,6 +84,16 @@ export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   COMPUTER_USE_HELPER: 'computer-use-helper',
 } as const;
 
+export const CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES = {
+  [CONTROLLED_NODE_OS_WIN]: 'open-computer-use.exe',
+  [CONTROLLED_NODE_OS_MAC]: 'open-computer-use.app.zip',
+  [CONTROLLED_NODE_OS_LINUX]: 'open-computer-use',
+} as const satisfies Record<ControlledNodeOs, string>;
+
+export function controlledNodeComputerUseHelperFilename(os: ControlledNodeOs): string {
+  return CONTROLLED_NODE_COMPUTER_USE_HELPER_FILENAMES[os];
+}
+
 export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   SHA256: 'x-imcodes-node-artifact-sha256',
   SIZE_BYTES: 'x-imcodes-node-artifact-size-bytes',

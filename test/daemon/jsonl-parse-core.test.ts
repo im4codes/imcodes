@@ -162,6 +162,42 @@ describe('jsonl-parse-core', () => {
     expect(ctx.pendingToolCalls.get('s1')?.has('tu_1') ?? false).toBe(false);
   });
 
+  it('preserves complete multiline commands and long tool output', () => {
+    const ctx = createParseContext();
+    const command = `printf 'FIRST_LINE'\n${'printf command-segment\n'.repeat(20)}printf 'COMMAND_TAIL_9f6e'`;
+    const output = `${'output-segment-'.repeat(40)}OUTPUT_TAIL_4c21`;
+    const useLine = jsonlLine({
+      type: 'assistant',
+      timestamp: '2026-04-24T00:00:00.000Z',
+      message: {
+        content: [{ type: 'tool_use', id: 'tu_long', name: 'Bash', input: { command } }],
+      },
+    });
+    const resultLine = jsonlLine({
+      type: 'user',
+      timestamp: '2026-04-24T00:00:01.000Z',
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'tu_long', content: output }],
+      },
+    });
+
+    const { emits: callEmits } = parseLines(ctx, {
+      sessionName: 's1',
+      items: [{ line: useLine, lineByteOffset: 0 }],
+    });
+    const { emits: resultEmits } = parseLines(ctx, {
+      sessionName: 's1',
+      items: [{ line: resultLine, lineByteOffset: 1 }],
+    });
+
+    expect(command.length).toBeGreaterThan(240);
+    expect(output.length).toBeGreaterThan(200);
+    expect(callEmits[0].payload.input).toBe(command);
+    expect(resultEmits[0].payload.output).toBe(output);
+    expect(String(callEmits[0].payload.input)).toContain('COMMAND_TAIL_9f6e');
+    expect(String(resultEmits[0].payload.output)).toContain('OUTPUT_TAIL_4c21');
+  });
+
   it('emits file.change + hidden tool rows for Edit tool once the result arrives', () => {
     const ctx = createParseContext();
     const editUse = jsonlLine({

@@ -178,6 +178,14 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
+function formatMemoryPair(usedBytes: number, totalBytes: number): string {
+  const totalGb = totalBytes / (1024 ** 3);
+  if (totalGb >= 1) {
+    return `${(usedBytes / (1024 ** 3)).toFixed(1)} / ${totalGb.toFixed(1)} GB`;
+  }
+  return `${(usedBytes / (1024 ** 2)).toFixed(0)} / ${(totalBytes / (1024 ** 2)).toFixed(0)} MB`;
+}
+
 /** Format a used/total byte pair in a shared GB or TB unit — never smaller
  *  units, so disk sizes always read as e.g. "440/460GB" or "1.2/2.0TB". */
 function formatDiskPair(usedBytes: number, totalBytes: number): string {
@@ -358,6 +366,134 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState
   );
 }
 
+function DaemonStatsModal({
+  stats,
+  localClockText,
+  onClose,
+  t,
+}: {
+  stats: DaemonStats;
+  localClockText: string;
+  onClose: () => void;
+  t: (key: string, vars?: Record<string, unknown>) => string;
+}) {
+  const embeddingKey = stats.embedding?.state
+    ? `embedding.status_${stats.embedding.state}`
+    : 'embedding.status_unknown';
+  const shortRefHealth = stats.shortRefHealth;
+
+  return (
+    <div
+      class="daemon-details-backdrop"
+      data-testid="daemon-details-backdrop"
+      onClick={onClose}
+    >
+      <section
+        class="daemon-details-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="daemon-details-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div class="daemon-details-scanline" aria-hidden="true" />
+        <header class="daemon-details-header">
+          <div>
+            <div class="daemon-details-kicker">{t('subsessionBar.daemon_details_kicker')}</div>
+            <h2 id="daemon-details-title">{t('subsessionBar.daemon_details_title')}</h2>
+          </div>
+          <button
+            type="button"
+            class="daemon-details-close"
+            onClick={onClose}
+            aria-label={t('subsessionBar.daemon_details_close')}
+          >
+            ×
+          </button>
+        </header>
+
+        <div class="daemon-details-version">
+          <span>{t('subsessionBar.daemon_details_version')}</span>
+          <code>{stats.daemonVersion ? `v${stats.daemonVersion}` : '—'}</code>
+        </div>
+
+        <div class="daemon-details-grid">
+          <div class="daemon-details-card daemon-details-card-cpu">
+            <span>{t('subsessionBar.daemon_details_cpu')}</span>
+            <strong>{stats.cpu}%</strong>
+          </div>
+          <div class="daemon-details-card daemon-details-card-memory">
+            <span>{t('subsessionBar.daemon_details_memory')}</span>
+            <strong>{formatMemoryPair(stats.memUsed, stats.memTotal)}</strong>
+          </div>
+          <div class="daemon-details-card daemon-details-card-load">
+            <span>{t('subsessionBar.daemon_details_load')}</span>
+            <strong>{stats.load1} / {stats.load5} / {stats.load15}</strong>
+          </div>
+          <div class="daemon-details-card daemon-details-card-uptime">
+            <span>{t('subsessionBar.daemon_details_uptime')}</span>
+            <strong>{formatUptime(stats.uptime)}</strong>
+          </div>
+        </div>
+
+        <div class="daemon-details-section">
+          <div class="daemon-details-section-label">{t('subsessionBar.daemon_details_disks')}</div>
+          {stats.disks && stats.disks.length > 0 ? (
+            <div class="daemon-details-disks">
+              {stats.disks.map((disk) => (
+                <div class="daemon-details-disk" key={disk.mount}>
+                  <div>
+                    <strong>{shortMountLabel(disk.mount)}</strong>
+                    <span>{formatDiskPair(disk.usedBytes, disk.totalBytes)}</span>
+                  </div>
+                  <div class="daemon-details-disk-track" aria-hidden="true">
+                    <span
+                      style={{
+                        width: `${Math.max(0, Math.min(100, disk.usedPercent))}%`,
+                        background: diskUsageColor(disk.usedPercent),
+                      }}
+                    />
+                  </div>
+                  <b style={{ color: diskUsageColor(disk.usedPercent) }}>{disk.usedPercent}%</b>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div class="daemon-details-empty">{t('subsessionBar.daemon_details_no_data')}</div>
+          )}
+        </div>
+
+        <div class="daemon-details-health">
+          <div class="daemon-details-health-row">
+            <span>{t('subsessionBar.daemon_details_embedding')}</span>
+            <span>
+              <EmbeddingStatusIcon status={stats.embedding} />
+              {t(embeddingKey)}
+              {stats.embedding?.reason ? ` · ${stats.embedding.reason}` : ''}
+            </span>
+          </div>
+          <div class={`daemon-details-health-row${shortRefHealth ? ' is-danger' : ''}`}>
+            <span>{t('subsessionBar.daemon_details_memory_handles')}</span>
+            <span>
+              {shortRefHealth
+                ? t('memory.short_ref_failure_detail', {
+                  stage: shortRefHealth.stage,
+                  failures: shortRefHealth.failures,
+                  when: new Date(shortRefHealth.lastFailureAt).toLocaleString(),
+                  error: shortRefHealth.lastError,
+                })
+                : t('subsessionBar.daemon_details_memory_handles_ok')}
+            </span>
+          </div>
+          <div class="daemon-details-health-row">
+            <span>{t('subsessionBar.daemon_details_local_time')}</span>
+            <span class="daemon-details-clock">{localClockText}</span>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
@@ -371,7 +507,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
-  const localClockNow = useNowTicker(desktopLayoutCapable && !!stats);
+  const [showDaemonDetails, setShowDaemonDetails] = useState(false);
+  const localClockNow = useNowTicker(!!stats && (desktopLayoutCapable || showDaemonDetails));
   const localClockText = useMemo(() => formatLocalDateTime(localClockNow), [localClockNow]);
   const [quickClosedIds, setQuickClosedIds] = useState<string[]>([]);
   // DB sort_order is the authority — subSessions arrive pre-sorted from server.
@@ -404,6 +541,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   desktopLayoutCapableRef.current = desktopLayoutCapable;
   const focusedSubIdRef = useRef(focusedSubId);
   focusedSubIdRef.current = focusedSubId;
+
+  useEffect(() => {
+    if (!showDaemonDetails) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowDaemonDetails(false);
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [showDaemonDetails]);
+
+  useEffect(() => {
+    if (desktopLayoutCapable) setShowDaemonDetails(false);
+  }, [desktopLayoutCapable]);
   const gestureCallbacksRef = useRef({
     onOpen,
     onFocus,
@@ -962,7 +1112,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
                         full version stays available in the title tooltip above. */}
-                    <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)}</span>
+                    {desktopLayoutCapable ? (
+                      <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)}</span>
+                    ) : (
+                      <button
+                        type="button"
+                        class="daemon-stat-version daemon-stat-version-button"
+                        onClick={() => setShowDaemonDetails(true)}
+                        aria-haspopup="dialog"
+                        aria-label={t('subsessionBar.daemon_details_open')}
+                      >
+                        {formatDaemonVersionMobile(stats.daemonVersion)}
+                      </button>
+                    )}
                     <span class="daemon-stat-sep"> · </span>
                   </>
                 )}
@@ -1017,7 +1179,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           return (
             <span class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`} title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
-              {stats.daemonVersion && <span class="daemon-stat-version">{desktopLayoutCapable ? `v${formatDaemonVersionShort(stats.daemonVersion)}` : formatDaemonVersionMobile(stats.daemonVersion)} </span>}
+              {stats.daemonVersion && (desktopLayoutCapable ? (
+                <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)} </span>
+              ) : (
+                <button
+                  type="button"
+                  class="daemon-stat-version daemon-stat-version-button"
+                  onClick={() => setShowDaemonDetails(true)}
+                  aria-haspopup="dialog"
+                  aria-label={t('subsessionBar.daemon_details_open')}
+                >
+                  {formatDaemonVersionMobile(stats.daemonVersion)}
+                </button>
+              ))}
               <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
               <span class="daemon-stat-mem"><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
@@ -1367,6 +1541,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             ))}
           </div>
         </div>
+      )}
+      {showDaemonDetails && isMobile && stats && (
+        <DaemonStatsModal
+          stats={stats}
+          localClockText={localClockText}
+          onClose={() => setShowDaemonDetails(false)}
+          t={t}
+        />
       )}
     </div>
   );

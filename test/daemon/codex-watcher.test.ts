@@ -585,15 +585,39 @@ describe('parseLine — function_call (Codex tool calls)', () => {
     expect(typeof (call[2] as { input: string }).input).toBe('string');
   });
 
-  it('emits tool.result for function_call_output with truncated output', () => {
-    parseLine('session-f', functionCallOutputLine('Process exited with code 0\nOutput:\nhello world'));
+  it('preserves complete function_call_output text', () => {
+    const output = `${'output-segment-'.repeat(40)}OUTPUT_TAIL_4c21`;
+    parseLine('session-f', functionCallOutputLine(output));
     expect(timelineEmitter.emit).toHaveBeenCalledOnce();
     expect(timelineEmitter.emit).toHaveBeenCalledWith(
       'session-f',
       'tool.result',
-      { output: 'Process exited with code 0\nOutput:\nhello world' },
+      { output },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
+    expect(output.length).toBeGreaterThan(200);
+  });
+
+  it('preserves complete custom tool input and output text', () => {
+    const input = `${'command-segment-'.repeat(20)}COMMAND_TAIL_9f6e`;
+    const output = `${'output-segment-'.repeat(40)}OUTPUT_TAIL_4c21`;
+    parseLine('session-f', JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'custom_tool_call', name: 'apply_patch', input },
+    }));
+    parseLine('session-f', JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call_output',
+        output: JSON.stringify({ output, metadata: { exit_code: 0 } }),
+      },
+    }));
+
+    const calls = vi.mocked(timelineEmitter.emit).mock.calls;
+    expect(input.length).toBeGreaterThan(200);
+    expect(output.length).toBeGreaterThan(200);
+    expect(calls[1][2]).toMatchObject({ tool: 'apply_patch', input });
+    expect(calls[2][2]).toEqual({ output });
   });
 
   it('tool.call and tool.result use standard payloads without callId', () => {

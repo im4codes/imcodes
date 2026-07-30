@@ -74,6 +74,11 @@ import {
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
+import {
+  CRON_COMPLETION_POLICY,
+  normalizeCronCompletionPolicy,
+  type CronCompletionPolicy,
+} from '../../shared/cron-types.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionCloneParentStage } from '../../shared/execution-clone.js';
 import {
   PEER_AUDIT_VALIDATION_KINDS,
@@ -693,6 +698,7 @@ interface CronListJob {
   projectName: string;
   targetRole: string;
   targetSessionName: string | null;
+  completionPolicy: CronCompletionPolicy;
 }
 
 function cronJobsFromListBody(body: unknown): CronListJob[] {
@@ -710,7 +716,8 @@ function cronJobsFromListBody(body: unknown): CronListJob[] {
       : typeof row.targetRole === 'string' ? row.targetRole : '';
     const rawTargetSessionName = row.target_session_name ?? row.targetSessionName;
     const targetSessionName = typeof rawTargetSessionName === 'string' && rawTargetSessionName ? rawTargetSessionName : null;
-    return id && name ? [{ id, name, projectName, targetRole, targetSessionName }] : [];
+    const completionPolicy = normalizeCronCompletionPolicy(row.completion_policy ?? row.completionPolicy);
+    return id && name ? [{ id, name, projectName, targetRole, targetSessionName, completionPolicy }] : [];
   });
 }
 
@@ -731,16 +738,30 @@ function defaultSelfCronName(message: string): string {
   return name;
 }
 
-function selfCronControlMetadata(jobId: string): Record<string, unknown> {
+function selfCronControlMetadata(jobId: string, completionPolicy: CronCompletionPolicy): Record<string, unknown> {
+  const recurring = completionPolicy === CRON_COMPLETION_POLICY.RECURRING;
   return {
     preferredCronInterface: true,
     jobId,
+    completionPolicy,
     controls: {
       update: { tool: MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF, args: { id: jobId } },
-      cancel: { tool: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF, args: { id: jobId } },
+      cancel: {
+        tool: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
+        args: { id: jobId },
+        ...(recurring ? { forceRequired: true } : {}),
+      },
     },
-    lifecycleInstruction: `When the scheduled work is complete, call ${MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF} with this jobId.`,
+    lifecycleInstruction: recurring
+      ? `This recurring job remains scheduled after each occurrence. Do not call ${MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF} after a successful run. Only an explicit user request may remove it, using force=true.`
+      : `When the overall scheduled goal—not merely one occurrence—is complete, call ${MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF} with this jobId.`,
   };
+}
+
+function cronCompletionPolicyArg(value: unknown): CronCompletionPolicy | undefined | 'invalid' {
+  if (value === undefined) return undefined;
+  if (value === CRON_COMPLETION_POLICY.RECURRING || value === CRON_COMPLETION_POLICY.UNTIL_COMPLETE) return value;
+  return 'invalid';
 }
 
 function cronResultJobId(result: { body?: unknown }, fallback?: string): string | undefined {
@@ -1197,13 +1218,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['cronExpr', 'message', 'name', 'timezone', 'expiresAt']);
+      const args = pickAllowedMcpArgs(input, ['cronExpr', 'message', 'name', 'timezone', 'expiresAt', 'completionPolicy']);
       const cronExpr = stringArg(args, 'cronExpr');
       const message = stringArg(args, 'message');
       if (!cronExpr) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'cronExpr is required');
       if (!message) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message is required');
       const expiresAt = parseExpiresAt(args.expiresAt);
       if (Number.isNaN(expiresAt)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expiresAt must be a timestamp or ISO string');
+      const completionPolicy = cronCompletionPolicyArg(args.completionPolicy);
+      if (completionPolicy === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'completionPolicy must be recurring or until_complete');
+      const effectiveCompletionPolicy = completionPolicy ?? CRON_COMPLETION_POLICY.RECURRING;
       const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF);
       if (!isCronSelfBinding(binding)) return binding;
       const cronOptions = cronOptionsForCaller(binding.scopedCaller, deps);
@@ -1217,26 +1241,30 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         message,
         timezone: stringArg(args, 'timezone'),
         expiresAt,
+        completionPolicy: effectiveCompletionPolicy,
       }, cronOptions);
       if (result.status !== 'ok') return result as unknown as ToolResult;
       const jobId = cronResultJobId(result);
       return {
         ...result,
-        ...(jobId ? selfCronControlMetadata(jobId) : {}),
+        ...(jobId ? selfCronControlMetadata(jobId, effectiveCompletionPolicy) : {}),
       } as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['id', 'cronExpr', 'message', 'name', 'timezone', 'expiresAt']);
+      const args = pickAllowedMcpArgs(input, ['id', 'cronExpr', 'message', 'name', 'timezone', 'expiresAt', 'completionPolicy', 'force']);
       const id = stringArg(args, 'id');
       if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
       const hasUpdate = ['cronExpr', 'message', 'name', 'timezone'].some((key) => stringArg(args, key) !== undefined)
-        || args.expiresAt !== undefined;
+        || args.expiresAt !== undefined
+        || args.completionPolicy !== undefined;
       if (!hasUpdate) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'at least one update field is required');
       if (args.message !== undefined && !stringArg(args, 'message')) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'message must not be empty');
       }
       const expiresAt = parseExpiresAt(args.expiresAt);
       if (Number.isNaN(expiresAt)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expiresAt must be a timestamp or ISO string');
+      const completionPolicy = cronCompletionPolicyArg(args.completionPolicy);
+      if (completionPolicy === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'completionPolicy must be recurring or until_complete');
       const binding = resolveCronSelfBinding(caller, deps, MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF);
       if (!isCronSelfBinding(binding)) return binding;
       const cronOptions = cronOptionsForCaller(binding.scopedCaller, deps);
@@ -1253,15 +1281,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         message: stringArg(args, 'message'),
         timezone: stringArg(args, 'timezone'),
         expiresAt,
+        completionPolicy,
+        force: boolArg(args, 'force') === true,
       }, cronOptions);
       if (result.status !== 'ok') return result as unknown as ToolResult;
-      return { ...result, ...selfCronControlMetadata(id) } as unknown as ToolResult;
+      return {
+        ...result,
+        ...selfCronControlMetadata(id, completionPolicy ?? job.completionPolicy),
+      } as unknown as ToolResult;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['id', 'name', 'all']);
+      const args = pickAllowedMcpArgs(input, ['id', 'name', 'all', 'force']);
       const id = stringArg(args, 'id');
       const name = stringArg(args, 'name');
       const all = boolArg(args, 'all') === true;
+      const force = boolArg(args, 'force') === true;
       if (Number(Boolean(id)) + Number(Boolean(name)) + Number(all) !== 1) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'provide exactly one of id, name, or all=true');
       }
@@ -1282,9 +1316,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           matches: matches.map((job) => ({ id: job.id, name: job.name })),
         };
       }
+      const protectedRecurring = matches.filter((job) => job.completionPolicy === CRON_COMPLETION_POLICY.RECURRING);
+      if (protectedRecurring.length > 0 && !force) {
+        return {
+          ...error(
+            MCP_ERROR_REASONS.VALIDATION_FAILED,
+            'recurring jobs require force=true and may be removed only after an explicit user request',
+          ),
+          protected: protectedRecurring.map((job) => ({ id: job.id, name: job.name })),
+        };
+      }
       const deleted: Array<{ id: string; name: string }> = [];
       for (const job of matches) {
-        const result = await cronDelete(job.id, cronOptions);
+        const result = await cronDelete(job.id, cronOptions, force);
         if (result.status !== 'ok') {
           return { ...result, deleted } as unknown as ToolResult;
         }
@@ -1293,9 +1337,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return { status: 'ok', count: deleted.length, deleted };
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
+      const args = pickAllowedMcpArgs(input, ['name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt', 'completionPolicy']);
       const expiresAt = parseExpiresAt(args.expiresAt);
       if (Number.isNaN(expiresAt)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expiresAt must be a timestamp or ISO string');
+      const completionPolicy = cronCompletionPolicyArg(args.completionPolicy);
+      if (completionPolicy === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'completionPolicy must be recurring or until_complete');
       const scopedCaller = scopedCallerForDeps(caller, deps);
       const projectName = resolveCronProjectName(caller, deps, args, MEMORY_MCP_TOOL_NAMES.CRON_CREATE);
       if (typeof projectName !== 'string') return projectName;
@@ -1313,6 +1359,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         sourceServerId: scopedCaller.serverId ?? undefined,
         timezone: stringArg(args, 'timezone'),
         expiresAt,
+        completionPolicy,
       }, cronOptions) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: async (input) => {
@@ -1327,11 +1374,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, cronOptions) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['id', 'name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt']);
+      const args = pickAllowedMcpArgs(input, ['id', 'name', 'cronExpr', 'projectName', 'targetRole', 'targetSessionName', 'action', 'timezone', 'expiresAt', 'completionPolicy', 'force']);
       const id = stringArg(args, 'id');
       if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
       const expiresAt = parseExpiresAt(args.expiresAt);
       if (Number.isNaN(expiresAt)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expiresAt must be a timestamp or ISO string');
+      const completionPolicy = cronCompletionPolicyArg(args.completionPolicy);
+      if (completionPolicy === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'completionPolicy must be recurring or until_complete');
       const scopedCaller = scopedCallerForDeps(caller, deps);
       const projectName = resolveCronProjectName(caller, deps, args, MEMORY_MCP_TOOL_NAMES.CRON_UPDATE);
       if (typeof projectName !== 'string') return projectName;
@@ -1350,15 +1399,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         sourceServerId: scopedCaller.serverId ?? undefined,
         timezone: stringArg(args, 'timezone'),
         expiresAt,
+        completionPolicy,
+        force: boolArg(args, 'force') === true,
       }, cronOptions) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['id']);
+      const args = pickAllowedMcpArgs(input, ['id', 'force']);
       const id = stringArg(args, 'id');
       if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
       const cronOptions = cronOptionsForCaller(caller, deps);
       if ('status' in cronOptions) return cronOptions;
-      return cronDelete(id, cronOptions) as unknown as Promise<ToolResult>;
+      return cronDelete(id, cronOptions, boolArg(args, 'force') === true) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: async (input) => {
       if (!deps.machineDeps) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine control is not available on this node');
@@ -1579,8 +1630,8 @@ const schemas = {
     limit: z.number().int().min(1).max(100).optional().describe('Maximum summaries.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: z.object({
-    projectionId: z.string().optional().describe('Projection hit id from search_memory.'),
-    observationId: z.string().optional().describe('Observation hit id from search_memory.'),
+    projectionId: z.string().optional().describe('Projection hit id from memory search.'),
+    observationId: z.string().optional().describe('Observation hit id from memory search.'),
     ref: z.string().optional().describe('Compact search/startup ref (obs:… or proj:…).'),
     kind: z.enum(['projection', 'observation']).optional().describe('Kind from sourceLookup.'),
   }),
@@ -1662,6 +1713,10 @@ const schemas = {
     name: z.string().optional().describe('Job name; derived from message by default.'),
     timezone: z.string().optional().describe('Schedule timezone.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms or explicit-offset ISO expiration.'),
+    completionPolicy: z.enum([
+      CRON_COMPLETION_POLICY.RECURRING,
+      CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    ]).optional().describe('Defaults to recurring; use until_complete only for a bounded overall goal.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: z.object({
     id: z.string().describe('Current-session job id.'),
@@ -1670,11 +1725,17 @@ const schemas = {
     name: z.string().optional().describe('Replacement name.'),
     timezone: z.string().optional().describe('Replacement timezone.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO expiration.'),
+    completionPolicy: z.enum([
+      CRON_COMPLETION_POLICY.RECURRING,
+      CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    ]).optional().describe('Replacement lifecycle policy.'),
+    force: z.boolean().optional().describe('Required to change recurring to until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: z.object({
     id: z.string().optional().describe('Exact current-session job id.'),
     name: z.string().optional().describe('Exact unique current-session job name.'),
     all: z.boolean().optional().describe('Cancel every current-session job.'),
+    force: z.boolean().optional().describe('Required for recurring jobs; use only after an explicit user request.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
     name: z.string().describe('Job name.'),
@@ -1685,6 +1746,10 @@ const schemas = {
     action: z.record(z.string(), z.unknown()).describe('Send action: {type:"send", target, message, reply?, broadcast?, idempotencyKey?}.'),
     timezone: z.string().optional().describe('Schedule timezone only.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/offset-ISO, ≤90 days; affects future sends only.'),
+    completionPolicy: z.enum([
+      CRON_COMPLETION_POLICY.RECURRING,
+      CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    ]).optional().describe('Lifecycle policy; defaults to recurring.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_LIST]: z.object({
     projectName: z.string().optional().describe('Project filter.'),
@@ -1700,9 +1765,15 @@ const schemas = {
     action: z.record(z.string(), z.unknown()).optional().describe('Replacement send action; other action types are rejected.'),
     timezone: z.string().optional().describe('Replacement schedule timezone only.'),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO; affects future sends only.'),
+    completionPolicy: z.enum([
+      CRON_COMPLETION_POLICY.RECURRING,
+      CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    ]).optional().describe('Replacement lifecycle policy.'),
+    force: z.boolean().optional().describe('Required to change recurring to until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
     id: z.string().describe('Job id.'),
+    force: z.boolean().optional().describe('Required for agent deletion of recurring jobs.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
     includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),

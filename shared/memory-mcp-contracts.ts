@@ -41,6 +41,7 @@ import {
   PEER_AUDIT_VALIDATION_KINDS,
   PEER_AUDIT_VALIDATION_OUTCOMES,
 } from './peer-audit.js';
+import { CRON_COMPLETION_POLICY } from './cron-types.js';
 
 export const MEMORY_MCP_TOOL_NAMES = {
   SEARCH_MEMORY: 'search_memory',
@@ -246,7 +247,7 @@ const statusSchema = objectSchema({
 export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, MemoryMcpToolContract>> = {
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: {
     name: MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,
-    description: 'Search caller-bound memory when prior project or user context may matter. Returns compact hits with a typed sourceLookup; call get_memory_sources with those fields when a relevant summary is insufficient. The query is text; vectorization is internal.',
+    description: 'Search caller-bound memory when prior project or user context may matter. Returns compact hits with a typed sourceLookup; use those fields for source expansion when a relevant summary is insufficient. The query is text; vectorization is internal.',
     inputSchema: objectSchema({
       query: stringSchema('Required text query to search for. Do not send embeddings, vectors, identity, or namespace fields.'),
       limit: numberSchema(`Optional maximum hit count; defaults to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.SEARCH_MEMORY_MAX_LIMIT }),
@@ -254,12 +255,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
       reason: stringSchema('Optional machine-readable reason when an empty result is caused by project scoping, policy, or feature availability.'),
-      items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind, projectionId | observationId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
+      items: { type: 'array', description: 'Compact same-namespace memory hits. Each item includes ref plus sourceLookup with a logical tool name, kind, and projectionId or observationId for exact source expansion; use the exact callable identifier from the current tool list.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]: {
     name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
-    description: 'List recent caller-project memory summaries without a query. Each item includes a compact ref and sourceLookup for optional get_memory_sources expansion.',
+    description: 'List recent caller-project memory summaries without a query. Each item includes a compact ref and sourceLookup for optional source expansion.',
     inputSchema: objectSchema({
       projectionClass: { type: 'string', enum: ['recent_summary', 'durable_memory_candidate'], description: 'Optional processed memory class to list. Defaults to recent_summary for the newest task summaries; durable_memory_candidate lists promoted durable facts.' },
       limit: numberSchema(`Optional maximum summary count; defaults to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_DEFAULT_LIMIT} and is clamped to ${MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT}.`, { minimum: 1, maximum: MEMORY_MCP_CAPS.LIST_MEMORY_SUMMARIES_MAX_LIMIT }),
@@ -267,16 +268,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     outputSchema: objectSchema({
       status: stringSchema('ok, disabled, or error.'),
       reason: stringSchema('Optional machine-readable reason when an empty result is caused by project scoping, policy, or feature availability.'),
-      items: { type: 'array', description: 'Newest compact processed memory summaries. Each item includes ref plus sourceLookup: { tool: "get_memory_sources", kind: "projection", projectionId } for exact source expansion.', items: { type: 'object', additionalProperties: true } },
+      items: { type: 'array', description: 'Newest compact processed memory summaries. Each item includes ref plus sourceLookup with a logical tool name, projection kind, and projectionId for exact source expansion; use the exact callable identifier from the current tool list.', items: { type: 'object', additionalProperties: true } },
     }),
   },
   [MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES]: {
     name: MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES,
-    description: 'Fetch source snippets by projection id, observation id, or compact ref. Use it after search_memory or startup memory for exact prior facts and provenance-sensitive answers. Missing and cross-namespace ids return the same empty list. Rarely a ref denotes more than one record; the reply then sets ambiguousRef with `sources` empty and up to four expanded matches under `candidates` (each with its own projectionId / observationId and sources). candidateCount is how many records the ref actually covers and truncated says whether some were omitted, so do not assume `candidates` is exhaustive. Do NOT read that empty `sources` as "no memory" — decide which candidate answers the question and cite it by its own id, never by the ambiguous ref.',
+    description: 'Fetch source snippets by projection id, observation id, or compact ref. Use it after a memory-search result or startup memory for exact prior facts and provenance-sensitive answers. Missing and cross-namespace ids return the same empty list. Rarely a ref denotes more than one record; the reply then sets ambiguousRef with `sources` empty and up to four expanded matches under `candidates` (each with its own projectionId / observationId and sources). candidateCount is how many records the ref actually covers and truncated says whether some were omitted, so do not assume `candidates` is exhaustive. Do NOT read that empty `sources` as "no memory" — decide which candidate answers the question and cite it by its own id, never by the ambiguous ref.',
     inputSchema: objectSchema({
-      projectionId: stringSchema('Projection id from search_memory.sourceLookup for projection hits. Caller identity and namespace are runtime-bound.'),
-      observationId: stringSchema('Observation id from search_memory.sourceLookup for observation hits. Caller identity and namespace are runtime-bound.'),
-      ref: stringSchema('Compact ref shown in search_memory results or startup memory, such as obs:abc123 or proj:abc123. It resolves after the ref was observed by this daemon and is cached locally across daemon restarts.'),
+      projectionId: stringSchema('Projection id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
+      observationId: stringSchema('Observation id from a memory-search result sourceLookup. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Compact ref shown in memory-search results or startup memory, such as obs:abc123 or proj:abc123. It resolves after the ref was observed by this daemon and is cached locally across daemon restarts.'),
       kind: { type: 'string', enum: ['projection', 'observation'], description: 'Optional lookup kind copied from sourceLookup; provide exactly one matching id.' },
     }),
     outputSchema: objectSchema({
@@ -299,8 +300,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     name: MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
     description: 'Archive a caller-project projection so search, recall, and startup context omit it. Identity and scope are runtime-bound; pass its projectionId or proj: ref.',
     inputSchema: objectSchema({
-      projectionId: stringSchema('Projection id from search_memory/list_memory_summaries for the memory to archive. Caller identity and namespace are runtime-bound.'),
-      ref: stringSchema('Optional compact projection ref such as proj:abc123 returned by search_memory/list_memory_summaries. Do not combine with projectionId.'),
+      projectionId: stringSchema('Projection id from memory search or recent-summary listing for the memory to archive. Caller identity and namespace are runtime-bound.'),
+      ref: stringSchema('Optional compact projection ref such as proj:abc123 returned by memory search or recent-summary listing. Do not combine with projectionId.'),
     }),
     outputSchema: statusSchema,
   },
@@ -442,13 +443,16 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
-    description: `Preferred self-wakeup method: schedule a message for the current session. Identity is automatic; runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`,
+    description: `Preferred self-wakeup method: schedule a message for the current session. New jobs default to recurring and stay scheduled after each run; choose until_complete only for a bounded goal. Identity is automatic; runs must be at least ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes apart.`,
     inputSchema: objectSchema({
       cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
       message: stringSchema('Message delivered to the current session.'),
       name: stringSchema('Optional job name; derived from message when omitted.'),
       timezone: stringSchema('Optional cron timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead.`),
+      completionPolicy: stringSchema('Lifecycle policy. recurring keeps the schedule after each occurrence; until_complete permits self-cancel only after the overall goal is complete.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
     }, ['cronExpr', 'message']),
     outputSchema: statusSchema,
   },
@@ -462,16 +466,21 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       name: stringSchema('Optional replacement name.'),
       timezone: stringSchema('Optional replacement timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead.`),
+      completionPolicy: stringSchema('Optional lifecycle policy.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+      force: booleanSchema('Required when an agent changes a recurring job to until_complete.'),
     }, ['id']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
-    description: 'Cancel a current-session self-wakeup job when complete, by id or unique name; use all=true to cancel all.',
+    description: 'Cancel a current-session self-wakeup job by id or unique name; use all=true to cancel all. Recurring jobs require force=true and should be force-cancelled only after an explicit user request. until_complete jobs may self-cancel when their overall goal is complete.',
     inputSchema: objectSchema({
       id: stringSchema('Exact job id; exclusive with name and all.'),
       name: stringSchema('Unique exact job name; exclusive with id and all.'),
       all: booleanSchema('Cancel all current-session jobs; exclusive with id and name.'),
+      force: booleanSchema('Required to delete recurring jobs. Use only when the user explicitly asked to remove the schedule.'),
     }),
     outputSchema: statusSchema,
   },
@@ -487,6 +496,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       action: { type: 'object', description: 'Send action: { type: "send", target, message, reply?, broadcast?, idempotencyKey? }.', additionalProperties: true },
       timezone: stringSchema('Optional cron timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
+      completionPolicy: stringSchema('Optional lifecycle policy; defaults to recurring.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
     }, ['name', 'cronExpr', 'action']),
     outputSchema: statusSchema,
   },
@@ -512,14 +524,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       action: { type: 'object', description: 'Optional replacement send action.', additionalProperties: true },
       timezone: stringSchema('Optional replacement timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
+      completionPolicy: stringSchema('Optional lifecycle policy.', {
+        enum: [CRON_COMPLETION_POLICY.RECURRING, CRON_COMPLETION_POLICY.UNTIL_COMPLETE],
+      }),
+      force: booleanSchema('Required when an agent changes a recurring job to until_complete.'),
     }, ['id']),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_DELETE,
-    description: 'Delete a cron job by id. Use cron_cancel_self for current-session jobs.',
+    description: 'Delete a cron job by id. Agent deletion of recurring jobs requires force=true. Use cron_cancel_self for current-session jobs.',
     inputSchema: objectSchema({
       id: stringSchema('Job id.'),
+      force: booleanSchema('Required for agent deletion of a recurring job.'),
     }, ['id']),
     outputSchema: statusSchema,
   },

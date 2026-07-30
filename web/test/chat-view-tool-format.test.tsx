@@ -14,10 +14,13 @@ vi.mock('react-i18next', () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'chat.tool_group_more') return `${String(vars?.count ?? '')} more`;
       if (key === 'chat.tool_detail_toggle') return 'details';
+      if (key === 'chat.tool_fold_collapse') return 'collapse';
       if (key === 'chat.tool_detail_input') return 'input';
       if (key === 'chat.tool_detail_output') return 'output';
       if (key === 'chat.tool_detail_meta') return 'meta';
       if (key === 'chat.tool_detail_raw') return 'raw';
+      if (key === 'chat.tool_result_done') return 'done';
+      if (key === 'chat.tool_result_done_with_command') return `done · ${String(vars?.command ?? '')}`;
       return key.split('.').pop() ?? key;
     },
   }),
@@ -93,10 +96,101 @@ describe('ChatView tool payload formatting', () => {
       }),
     ];
 
-    render(<ChatView events={events} loading={false} />);
+    const { container } = render(<ChatView events={events} loading={false} />);
 
-    expect(screen.getByText('/tmp/readme.md')).toBeDefined();
+    const output = screen.getByText('/tmp/readme.md');
+    const fold = container.querySelector('.chat-tool-block-fold');
+    expect(output).toBeDefined();
     expect(screen.queryByText('[object Object]')).toBeNull();
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    fireEvent.click(output);
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    fireEvent.click(output);
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+  });
+
+  it('shows the completed command when a standalone result has no output', () => {
+    const command = '/bin/zsh -lc "ssh root@example.test docker logs app | tail -n 120"';
+    const events = [
+      makeEvent({
+        type: 'tool.result',
+        payload: {
+          detail: {
+            meta: {
+              status: 'completed',
+              exitCode: 0,
+              durationMs: 564,
+            },
+            raw: {
+              type: 'commandExecution',
+              id: 'exec-command-done',
+              command,
+              cwd: '/tmp/project',
+              processId: '50746',
+            },
+          },
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const header = container.querySelector('.chat-tool-result-row .chat-tool-output');
+    expect(header?.textContent).toBe(`done · ${command}`);
+    expect(header?.textContent).not.toBe('done');
+  });
+
+  it('formats argv commands without exposing object payloads as commands', () => {
+    const renderCommand = (command: unknown): string | null | undefined => {
+      const { container, unmount } = render(
+        <ChatView
+          events={[
+            makeEvent({
+              type: 'tool.result',
+              payload: { detail: { raw: { command } } },
+            }),
+          ]}
+          loading={false}
+        />,
+      );
+      const output = container.querySelector('.chat-tool-result-row .chat-tool-output')?.textContent;
+      unmount();
+      return output;
+    };
+
+    expect(renderCommand(['/bin/sh', '-lc', 'echo hi && ls']))
+      .toBe("done · /bin/sh -lc 'echo hi && ls'");
+    expect(renderCommand({ name: 'Bash', id: 3 })).toBe('done');
+    expect(renderCommand({ alpha: 1, beta: 2 })).toBe('done');
+  });
+
+  it('keeps errors and real output ahead of completed command summaries', () => {
+    const events = [
+      makeEvent({
+        eventId: 'evt-command-error',
+        type: 'tool.result',
+        payload: {
+          error: 'permission denied',
+          detail: { raw: { command: 'SHOULD_NOT_SHOW_ERROR' } },
+        },
+      }),
+      makeEvent({
+        eventId: 'evt-command-output',
+        type: 'tool.result',
+        payload: {
+          output: 'REAL_OUTPUT_TEXT',
+          detail: { raw: { command: 'SHOULD_NOT_SHOW_OUTPUT' } },
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const outputs = Array.from(container.querySelectorAll(
+      '.chat-tool-result-row .chat-tool-error, .chat-tool-result-row .chat-tool-output',
+    )).map((element) => element.textContent);
+    expect(outputs).toEqual(['error: permission denied', 'REAL_OUTPUT_TEXT']);
+    expect(container.textContent).not.toContain('SHOULD_NOT_SHOW');
   });
 
   it('hides meaningless empty object tool inputs', () => {
@@ -162,9 +256,131 @@ describe('ChatView tool payload formatting', () => {
 
     expect(screen.getByText('Read')).toBeDefined();
     expect(screen.getAllByText(/package\.json/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByText('details'));
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
+  });
+
+  it('preserves complete commands and outputs in the one-line preview and bounded expansion', () => {
+    const command = `printf '${'command-segment-'.repeat(24)}COMMAND_TAIL_9f6e'`;
+    const output = `${'output-segment-'.repeat(360)}OUTPUT_TAIL_4c21`;
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:full-fidelity:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'Bash',
+          input: { command },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:full-fidelity:result',
+        type: 'tool.result',
+        payload: { output },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const fold = container.querySelector('.chat-tool-block-fold');
+    const commandPreview = container.querySelector('.chat-tool-input');
+    const outputPreview = container.querySelector('.chat-tool-output');
+    const toolName = screen.getByText('Bash');
+
+    expect(command.length).toBeGreaterThan(240);
+    expect(output.length).toBeGreaterThan(4_096);
+    expect(commandPreview?.textContent).toBe(` ${command}`);
+    expect(outputPreview?.textContent).toBe(output);
+    expect(commandPreview?.textContent).toContain('COMMAND_TAIL_9f6e');
+    expect(outputPreview?.textContent).toContain('OUTPUT_TAIL_4c21');
+    expect(container.textContent).not.toContain('…');
+
+    const toggle = screen.getByRole('button', { name: 'details' });
+    expect(toggle.textContent).toBe('▸');
+    expect(toggle.nextElementSibling).toBe(toolName);
+    expect(toggle.textContent).not.toContain('details');
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(toolName);
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(toolName);
+    expect(fold?.classList.contains('is-collapsed')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(toggle);
+
+    expect(fold?.classList.contains('is-expanded')).toBe(true);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toBe('collapse');
+    expect(toggle.textContent).toBe('▾');
+    expect(toggle.textContent).not.toContain('collapse');
+    expect(container.querySelector('.chat-tool-detail')).not.toBeNull();
+    const detailText = Array.from(container.querySelectorAll('.chat-tool-detail-pre'))
+      .map((node) => node.textContent)
+      .join('\n');
+    expect(detailText).toContain(command);
+    expect(detailText).toContain(output);
+    expect(detailText).toContain('COMMAND_TAIL_9f6e');
+    expect(detailText).toContain('OUTPUT_TAIL_4c21');
+  });
+
+  it('keeps only the first Bash command line in the sticky header', () => {
+    const command = 'printf first\nprintf second\nprintf third';
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:multiline-command:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'Bash',
+          input: { command },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:multiline-command:result',
+        type: 'tool.result',
+        payload: { output: 'done' },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+    const headerInput = container.querySelector('.chat-tool-fold-header .chat-tool-input');
+    const continuationInput = container.querySelector('.chat-tool-fold-continuation .chat-tool-input');
+
+    expect(headerInput?.textContent).toBe(' printf first');
+    expect(continuationInput?.textContent).toBe('printf second\nprintf third');
+    expect(headerInput?.textContent).not.toContain('printf second');
+
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    const detailText = Array.from(container.querySelectorAll('.chat-tool-detail-pre'))
+      .map((node) => node.textContent)
+      .join('\n');
+    expect(detailText).toContain('printf first');
+    expect(detailText).toContain('printf second');
+    expect(detailText).toContain('printf third');
+  });
+
+  it('keeps only the first standalone result line in the sticky header', () => {
+    const output = 'first result\nsecond result\nthird result';
+    const events = [
+      makeEvent({
+        eventId: 'tool-result:test:multiline',
+        type: 'tool.result',
+        payload: { output },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+    const headerOutput = container.querySelector('.chat-tool-fold-header .chat-tool-output');
+    const continuationOutput = container.querySelector('.chat-tool-fold-continuation .chat-tool-output');
+
+    expect(headerOutput?.textContent).toBe('first result');
+    expect(continuationOutput?.textContent).toBe('second result\nthird result');
+    expect(headerOutput?.textContent).not.toContain('second result');
+
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    expect(container.querySelector('.chat-tool-detail-pre')?.textContent).toBe(output);
   });
 
   it('prefers the completed WebSearch query over a generic started-state fallback label', () => {
@@ -201,7 +417,7 @@ describe('ChatView tool payload formatting', () => {
 
     expect(screen.getByText('WebSearch')).toBeDefined();
     expect(screen.getAllByText(/apple stock today/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByText('details'));
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.queryByText(/\(other\)/)).toBeNull();
   });
@@ -524,7 +740,7 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getAllByText(/agent:emma:main/).length).toBeGreaterThan(0);
     expect(screen.queryByText('[object Object]')).toBeNull();
 
-    fireEvent.click(screen.getByText('details'));
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
     expect(screen.getAllByText(/delivered/).length).toBeGreaterThan(0);
