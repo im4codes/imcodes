@@ -782,16 +782,17 @@ html.native-ios-mac .chat-dl-btn {
 .quote-badge { border-color: rgba(167,139,250,0.42); background: rgba(76,29,149,0.28); }
 .quote-badge .attachment-badge-icon { color: #a78bfa; }
 .controls-target-bubble {
-  position: relative;
-  z-index: 2;
-  align-self: flex-start;
+  position: absolute;
+  left: 4px;
+  bottom: calc(100% + 5px);
+  z-index: 3;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  max-width: calc(100% - 60px);
+  max-width: calc(100% - 8px);
   height: 23px;
-  margin: 1px 8px 2px 44px;
+  margin: 0;
   padding: 0 10px 0 8px;
   overflow: hidden;
   border: 1px solid rgba(34, 211, 238, 0.38);
@@ -850,6 +851,13 @@ html.native-ios-mac .chat-dl-btn {
   text-shadow: 0 0 9px rgba(125, 211, 252, 0.34);
   white-space: nowrap;
 }
+.controls-target-parent { color: #bae6fd; }
+.controls-target-arrow {
+  margin: 0 5px;
+  color: #a78bfa;
+  text-shadow: 0 0 8px rgba(167, 139, 250, 0.72);
+}
+.controls-target-child { color: #ffffff; }
 @keyframes controls-target-scan {
   0%, 55% { transform: translateX(-130%); opacity: 0; }
   68% { opacity: 1; }

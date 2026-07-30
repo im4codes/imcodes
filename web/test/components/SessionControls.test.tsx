@@ -717,7 +717,7 @@ afterEach(() => {
   });
 
   it('shows the current desktop target while composing and tracks session switches', () => {
-    const firstSession = makeSession({ name: 'deck_project_brain', project: 'project-a', label: 'Brain' });
+    const firstSession = makeSession({ name: 'deck_project_brain', project: 'project-a', label: 'Main workspace' });
     const secondSession = makeSession({ name: 'deck_sub_monitor', project: 'project-a', label: 'Monitor' });
     const view = render(
       <SessionControls
@@ -742,19 +742,35 @@ afterEach(() => {
       <SessionControls
         ws={makeWs() as any}
         activeSession={secondSession}
+        subSessionId="monitor"
         sessionDisplayName="Production monitor with a deliberately long tab name"
         quickData={makeQuickData() as any}
+        sessions={[firstSession]}
+        subSessions={[{
+          sessionName: secondSession.name,
+          type: secondSession.agentType,
+          label: secondSession.label,
+          state: secondSession.state,
+          parentSession: firstSession.name,
+        }]}
       />,
     );
     const switchedTarget = screen.getByRole('status', {
-      name: 'Message target: Production monitor with a deliberately long tab name',
+      name: 'Message target: Main workspace → Production monitor with a deliberately long tab name',
     });
-    expect(switchedTarget.querySelector('.controls-target-name')?.textContent)
+    expect(switchedTarget.querySelector('.controls-target-parent')?.textContent).toBe('Main workspace');
+    expect(switchedTarget.querySelector('.controls-target-arrow')?.textContent).toBe('→');
+    expect(switchedTarget.querySelector('.controls-target-child')?.textContent)
       .toBe('Production monitor with a deliberately long tab name');
     expect(switchedTarget.querySelector('.controls-target-name')?.getAttribute('title'))
-      .toBe('Production monitor with a deliberately long tab name');
+      .toBe('Main workspace → Production monitor with a deliberately long tab name');
 
     const switchedInput = screen.getByRole('textbox') as HTMLDivElement;
+    switchedInput.textContent = '@';
+    fireEvent.input(switchedInput);
+    expect(document.querySelector('.controls-target-bubble')).toBeNull();
+    expect(screen.getByRole('button', { name: 'files' })).toBeDefined();
+
     switchedInput.textContent = '';
     fireEvent.input(switchedInput);
     expect(document.querySelector('.controls-target-bubble')).toBeNull();

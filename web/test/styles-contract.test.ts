@@ -83,7 +83,9 @@ describe('styles.css regression contracts', () => {
   it('keeps the desktop composer target compact and truncates long session names', () => {
     const bubbleRule = css.match(/\.controls-target-bubble\s*\{[^}]*\}/);
     expect(bubbleRule).not.toBeNull();
-    expect(bubbleRule![0]).toMatch(/max-width:\s*calc\(100%\s*-\s*60px\)/);
+    expect(bubbleRule![0]).toMatch(/position:\s*absolute/);
+    expect(bubbleRule![0]).toMatch(/bottom:\s*calc\(100%\s*\+\s*5px\)/);
+    expect(bubbleRule![0]).toMatch(/max-width:\s*calc\(100%\s*-\s*8px\)/);
     expect(bubbleRule![0]).toMatch(/overflow:\s*hidden/);
 
     const nameRule = css.match(/\.controls-target-name\s*\{[^}]*\}/);
