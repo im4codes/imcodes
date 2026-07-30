@@ -379,6 +379,8 @@
     "tool_detail_output": "출력",
     "tool_detail_meta": "메타",
     "tool_detail_raw": "원본",
+    "tool_result_done": "완료",
+    "tool_result_done_with_command": "완료 · {{command}}",
     "pinned_last_sent_label": "마지막 전송",
     "pinned_last_sent_aria": "마지막으로 보낸 메시지로 이동",
     "memory_context_title": "관련 기록",

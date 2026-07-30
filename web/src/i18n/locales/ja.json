@@ -379,6 +379,8 @@
     "tool_detail_output": "出力",
     "tool_detail_meta": "メタ",
     "tool_detail_raw": "生データ",
+    "tool_result_done": "完了",
+    "tool_result_done_with_command": "完了 · {{command}}",
     "pinned_last_sent_label": "直近の送信",
     "pinned_last_sent_aria": "直近に送信したメッセージへ移動",
     "memory_context_title": "関連履歴",

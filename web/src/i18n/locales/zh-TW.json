@@ -379,6 +379,8 @@
     "tool_detail_output": "輸出",
     "tool_detail_meta": "中繼資訊",
     "tool_detail_raw": "原始資料",
+    "tool_result_done": "完成",
+    "tool_result_done_with_command": "完成 · {{command}}",
     "pinned_last_sent_label": "最近發送",
     "pinned_last_sent_aria": "跳轉到你最近發送的訊息",
     "memory_context_title": "相關歷史",

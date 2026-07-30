@@ -19,6 +19,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'chat.tool_detail_output') return 'output';
       if (key === 'chat.tool_detail_meta') return 'meta';
       if (key === 'chat.tool_detail_raw') return 'raw';
+      if (key === 'chat.tool_result_done') return 'done';
+      if (key === 'chat.tool_result_done_with_command') return `done · ${String(vars?.command ?? '')}`;
       return key.split('.').pop() ?? key;
     },
   }),
@@ -136,6 +138,59 @@ describe('ChatView tool payload formatting', () => {
     const header = container.querySelector('.chat-tool-result-row .chat-tool-output');
     expect(header?.textContent).toBe(`done · ${command}`);
     expect(header?.textContent).not.toBe('done');
+  });
+
+  it('formats argv commands without exposing object payloads as commands', () => {
+    const renderCommand = (command: unknown): string | null | undefined => {
+      const { container, unmount } = render(
+        <ChatView
+          events={[
+            makeEvent({
+              type: 'tool.result',
+              payload: { detail: { raw: { command } } },
+            }),
+          ]}
+          loading={false}
+        />,
+      );
+      const output = container.querySelector('.chat-tool-result-row .chat-tool-output')?.textContent;
+      unmount();
+      return output;
+    };
+
+    expect(renderCommand(['/bin/sh', '-lc', 'echo hi && ls']))
+      .toBe("done · /bin/sh -lc 'echo hi && ls'");
+    expect(renderCommand({ name: 'Bash', id: 3 })).toBe('done');
+    expect(renderCommand({ alpha: 1, beta: 2 })).toBe('done');
+  });
+
+  it('keeps errors and real output ahead of completed command summaries', () => {
+    const events = [
+      makeEvent({
+        eventId: 'evt-command-error',
+        type: 'tool.result',
+        payload: {
+          error: 'permission denied',
+          detail: { raw: { command: 'SHOULD_NOT_SHOW_ERROR' } },
+        },
+      }),
+      makeEvent({
+        eventId: 'evt-command-output',
+        type: 'tool.result',
+        payload: {
+          output: 'REAL_OUTPUT_TEXT',
+          detail: { raw: { command: 'SHOULD_NOT_SHOW_OUTPUT' } },
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const outputs = Array.from(container.querySelectorAll(
+      '.chat-tool-result-row .chat-tool-error, .chat-tool-result-row .chat-tool-output',
+    )).map((element) => element.textContent);
+    expect(outputs).toEqual(['error: permission denied', 'REAL_OUTPUT_TEXT']);
+    expect(container.textContent).not.toContain('SHOULD_NOT_SHOW');
   });
 
   it('hides meaningless empty object tool inputs', () => {

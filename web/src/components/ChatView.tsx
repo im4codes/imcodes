@@ -446,7 +446,7 @@ function summarizeToolCommand(
   }
   const record = value as Record<string, unknown>;
   for (const key of ['command', 'cmd'] as const) {
-    const command = formatToolPayloadValue(record[key]);
+    const command = formatToolCommandValue(record[key]);
     if (command) return command;
   }
   for (const key of ['input', 'args', 'raw', 'detail', '_callDetail', '_resultDetail'] as const) {
@@ -454,6 +454,31 @@ function summarizeToolCommand(
     if (command) return command;
   }
   return '';
+}
+
+function formatToolCommandArgument(value: string | number): string {
+  const argument = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(argument)) return argument;
+  return `'${argument.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function formatToolCommandValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (!Array.isArray(value) || value.length === 0) return '';
+  const argumentsList: Array<string | number> = [];
+  for (const argument of value) {
+    if (typeof argument === 'string') {
+      argumentsList.push(argument);
+      continue;
+    }
+    if (typeof argument === 'number' && Number.isFinite(argument)) {
+      argumentsList.push(argument);
+      continue;
+    }
+    return '';
+  }
+  return argumentsList.map(formatToolCommandArgument).join(' ');
 }
 
 function isGenericWebSearchLabel(value: string | undefined): boolean {
@@ -3635,7 +3660,9 @@ const ChatEvent = memo(function ChatEvent({
       const output = formatToolOutputPreview(event.payload.output) ?? '';
       const detail = event.payload.detail;
       const command = summarizeToolCommand(event.payload);
-      const completedText = command ? `done · ${command}` : 'done';
+      const completedText = command
+        ? t('chat.tool_result_done_with_command', { command })
+        : t('chat.tool_result_done');
       const resultText = error ? `error: ${String(error)}` : output || completedText;
       const {
         firstLine: resultFirstLine,
