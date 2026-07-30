@@ -836,6 +836,57 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 
+  it('on mobile keeps the main session tabs above the sub-session window', () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const viewportHeight = window.innerHeight;
+    const tabBottom = 94;
+
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(tabBottom);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+
+    const subCardBar = document.createElement('div');
+    subCardBar.className = 'subcard-bar';
+    Object.defineProperty(subCardBar, 'offsetHeight', { configurable: true, value: 88 });
+    setElementRect(subCardBar, viewportHeight - 88, 88);
+    document.body.appendChild(subCardBar);
+
+    const sub = makeSubSession();
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    try {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.top).toBe('94px');
+      expect(panel?.style.bottom).toBe('88px');
+      expect(panel?.style.height).toBe(`calc(${viewportHeight - 94 - 88}px)`);
+    } finally {
+      unmount();
+      subCardBar.remove();
+      tabBar.remove();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  });
+
   it('on mobile ignores both main and sub-window composer controls when reserving bottom space', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });

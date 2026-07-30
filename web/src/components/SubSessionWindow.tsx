@@ -39,6 +39,7 @@ import {
   clampGeometryToWorkspace,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
+  resolveSessionTabsBottom,
   shouldPersistGeometry,
   viewportWorkspaceBelowSessionTabs,
   type WindowGeometry,
@@ -740,6 +741,9 @@ export function SubSessionWindow({
   }, [isMobile]);
 
   const [subSessionBarHeight, setSubSessionBarHeight] = useState(() => getInitialMobileSubSessionBarHeight(isMobile));
+  const [sessionTabsBottom, setSessionTabsBottom] = useState(() => (
+    isMobile && typeof document !== 'undefined' ? resolveSessionTabsBottom(document) : 0
+  ));
   useLayoutEffect(() => {
     if (!isMobile) return;
     let raf = 0;
@@ -747,6 +751,9 @@ export function SubSessionWindow({
     const vv = window.visualViewport;
 
     const update = () => {
+      const measuredTabsBottom = resolveSessionTabsBottom(document);
+      setSessionTabsBottom((prev) => (prev === measuredTabsBottom ? prev : measuredTabsBottom));
+
       const measured = measureMobileSubSessionBarHeight();
       if (measured <= 0) {
         if (isMobileSubSessionBarSuppressed()) {
@@ -770,6 +777,8 @@ export function SubSessionWindow({
       for (const el of getExternalMobileSubSessionBarElements()) {
         ro.observe(el);
       }
+      const tabBar = document.querySelector<HTMLElement>('.tab-bar');
+      if (tabBar) ro.observe(tabBar);
     };
 
     observeTargets();
@@ -816,13 +825,20 @@ export function SubSessionWindow({
   }, [geom, getMaximizeBounds, isMobile, isDesktopMaximized, maximizeBoundsVersion]);
 
   const mobileSubSessionBarHeight = Math.max(0, Math.min(subSessionBarHeight, Math.max(0, vvh - 120)));
-  const mobileWindowHeight = `calc(${vvh}px - var(--sat, 0px) - ${mobileSubSessionBarHeight}px)`;
+  const measuredMobileWindowTop = Math.max(
+    0,
+    Math.min(sessionTabsBottom, Math.max(0, vvh - mobileSubSessionBarHeight)),
+  );
+  const mobileWindowTop = measuredMobileWindowTop > 0
+    ? `${measuredMobileWindowTop}px`
+    : 'var(--sat, 0px)';
+  const mobileWindowHeight = `calc(${vvh}px - ${mobileWindowTop} - ${mobileSubSessionBarHeight}px)`;
 
   const style: Record<string, string | number> = isMobile
     ? {
         '--subsession-accent-color': accentColor,
         position: 'fixed',
-        top: 'var(--sat, 0px)',
+        top: mobileWindowTop,
         left: 0,
         right: 0,
         bottom: `${mobileSubSessionBarHeight}px`,
