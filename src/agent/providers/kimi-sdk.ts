@@ -81,6 +81,7 @@ import type {
   ApprovalRequest,
   ProviderCompactCapability,
   RemoteSessionInfo,
+  RemoteSessionListOptions,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -97,7 +98,11 @@ import logger from '../../util/logger.js';
 import type { TransportEffortLevel } from '../../../shared/effort-levels.js';
 import type { ProviderActiveWorkSnapshot } from '../../../shared/session-activity-types.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import {
+  canonicalizeTransportCwd,
+  normalizeTransportCwd,
+  resolveExecutableForSpawn,
+} from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 import {
   buildGenericRuntimeSubagentTool,
@@ -400,12 +405,18 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  async listSessions(): Promise<RemoteSessionInfo[]> {
+  async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
+    const expectedDirectory = canonicalizeTransportCwd(options.directory);
     return [...this.sessions.values()]
       .filter((state) => typeof state.acpSessionId === 'string')
+      .filter((state) => (
+        !expectedDirectory
+        || canonicalizeTransportCwd(state.cwd) === expectedDirectory
+      ))
       .map((state) => ({
         key: state.acpSessionId!,
         displayName: state.sessionName ?? state.routeId,
+        directory: state.cwd,
         ...(state.model ? { agentId: state.model } : {}),
       }));
   }

@@ -174,9 +174,11 @@ describe('findLegacyProviderResumeId', () => {
 });
 
 describe('usesDirectoryScopedSessionListing', () => {
-  it('scopes only OpenCode SDK listings by working directory', () => {
+  it('scopes every provider listing that exposes directory-aware sessions', () => {
     expect(usesDirectoryScopedSessionListing('opencode-sdk')).toBe(true);
-    expect(usesDirectoryScopedSessionListing('copilot-sdk')).toBe(false);
-    expect(usesDirectoryScopedSessionListing('kimi-sdk')).toBe(false);
+    expect(usesDirectoryScopedSessionListing('copilot-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('kimi-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('grok-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('cursor-headless')).toBe(false);
   });
 });

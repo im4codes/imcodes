@@ -1,9 +1,8 @@
-import { realpathSync } from 'node:fs';
-import { resolve } from 'node:path';
 import type { LaunchOpts } from './session-manager.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
 import type { RemoteSessionInfo } from './transport-provider.js';
+import { canonicalizeTransportCwd } from './transport-paths.js';
 
 /** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
 export function usesProviderResumeId(agentType: string | undefined): boolean {
@@ -16,19 +15,10 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
 
 /** Providers whose remote session namespace is partitioned by working directory. */
 export function usesDirectoryScopedSessionListing(agentType: string | undefined): boolean {
-  return agentType === 'opencode-sdk';
-}
-
-function normalizeDirectory(directory: string): string {
-  const trimmed = directory.trim();
-  if (!trimmed) return '';
-  let normalized: string;
-  try {
-    normalized = realpathSync.native(trimmed);
-  } catch {
-    normalized = resolve(trimmed);
-  }
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  return agentType === 'opencode-sdk'
+    || agentType === 'copilot-sdk'
+    || agentType === 'kimi-sdk'
+    || agentType === 'grok-sdk';
 }
 
 /**
@@ -44,13 +34,11 @@ export function findLegacyProviderResumeId(
   remoteSessions: readonly RemoteSessionInfo[],
   expectedDirectory?: string,
 ): string | undefined {
-  const normalizedExpectedDirectory = expectedDirectory
-    ? normalizeDirectory(expectedDirectory)
-    : '';
+  const normalizedExpectedDirectory = canonicalizeTransportCwd(expectedDirectory) ?? '';
   const scopedSessions = normalizedExpectedDirectory
     ? remoteSessions.filter((session) => (
       !!session.directory
-      && normalizeDirectory(session.directory) === normalizedExpectedDirectory
+      && canonicalizeTransportCwd(session.directory) === normalizedExpectedDirectory
     ))
     : remoteSessions;
 

@@ -72,4 +72,28 @@ describe('KimiSdkProvider cross-message streaming', () => {
     // Guard: no delta should ever contain both messages concatenated (the bleed).
     expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
   });
+
+  it('lists only resumable sessions from the requested directory', async () => {
+    const provider = new KimiSdkProvider();
+    await provider.createSession({
+      sessionKey: 'route-a',
+      sessionName: 'Project A',
+      cwd: '/tmp/project-a',
+      resumeId: 'acp-project-a',
+    });
+    await provider.createSession({
+      sessionKey: 'route-b',
+      sessionName: 'Project B',
+      cwd: '/tmp/project-b',
+      resumeId: 'acp-project-b',
+    });
+
+    await expect(provider.listSessions({ directory: '/tmp/project-b' })).resolves.toEqual([
+      expect.objectContaining({
+        key: 'acp-project-b',
+        displayName: 'Project B',
+        directory: '/tmp/project-b',
+      }),
+    ]);
+  });
 });

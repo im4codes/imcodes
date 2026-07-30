@@ -13,6 +13,7 @@ import type {
   ToolCallEvent,
   ApprovalRequest,
   RemoteSessionInfo,
+  RemoteSessionListOptions,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -68,7 +69,12 @@ type CopilotClientLike = {
   getAuthStatus(): Promise<{ isAuthenticated: boolean; statusMessage?: string }>;
   createSession(config: Record<string, unknown>): Promise<CopilotSessionLike>;
   resumeSession(sessionId: string, config: Record<string, unknown>): Promise<CopilotSessionLike>;
-  listSessions(filter?: Record<string, unknown>): Promise<Array<{ sessionId: string; summary?: string; modifiedTime?: Date | string | number }>>;
+  listSessions(filter?: Record<string, unknown>): Promise<Array<{
+    sessionId: string;
+    summary?: string;
+    modifiedTime?: Date | string | number;
+    context?: { cwd?: string };
+  }>>;
   deleteSession(sessionId: string): Promise<void>;
   listModels(): Promise<Array<{ id: string; capabilities?: { supports?: { reasoningEffort?: boolean } } }>>;
 };
@@ -801,14 +807,18 @@ export class CopilotSdkProvider implements TransportProvider {
     }
   }
 
-  async listSessions(): Promise<RemoteSessionInfo[]> {
+  async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
     const client = this.assertConnected();
-    const sessions = await client.listSessions();
+    const directory = typeof options.directory === 'string' ? options.directory.trim() : '';
+    const sessions = await client.listSessions(directory ? { cwd: directory } : undefined);
     return sessions
       .filter((session) => !this.poisonedSessionIds.has(session.sessionId))
       .map((session) => ({
         key: session.sessionId,
         ...(session.summary ? { displayName: session.summary } : {}),
+        ...(typeof session.context?.cwd === 'string' && session.context.cwd.trim()
+          ? { directory: session.context.cwd.trim() }
+          : {}),
         ...(session.modifiedTime ? { updatedAt: new Date(session.modifiedTime).getTime() } : {}),
       }));
   }
