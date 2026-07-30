@@ -38,6 +38,15 @@ const MODEL_CACHE_TTL_MS = 30_000;
 // window we force one throttled catalog refetch so the next frame self-heals.
 const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
+const OPENCODE_PERMISSION_EVENT = {
+  LEGACY_UPDATED: 'permission.updated',
+  ASKED: 'permission.asked',
+  V2_ASKED: 'permission.v2.asked',
+} as const;
+const OPENCODE_PERMISSION_REPLY_MODE = {
+  LEGACY: 'legacy',
+  REQUEST: 'request',
+} as const;
 const MISSING_FINAL_RECOVERY_PROMPT = [
   'The previous tool step finished, but you returned no final response.',
   "Continue from the existing results and answer the user's original request now.",
@@ -60,6 +69,9 @@ interface OpenCodeClientLike {
   event: {
     subscribe(options?: Record<string, unknown>): Promise<{ stream: AsyncIterable<Record<string, any>> }>;
   };
+  permission?: {
+    reply(options: Record<string, unknown>): SdkResult<boolean>;
+  };
   postSessionIdPermissionsPermissionId(options: Record<string, unknown>): SdkResult<boolean>;
 }
 
@@ -77,13 +89,35 @@ export interface OpenCodeSdkRuntimeHooks {
 
 export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
   async start(options) {
-    const sdk = await import('@opencode-ai/sdk');
-    return sdk.createOpencode(options) as unknown as Promise<{
+    const [sdk, v2Sdk] = await Promise.all([
+      import('@opencode-ai/sdk'),
+      import('@opencode-ai/sdk/v2/client'),
+    ]);
+    const started = await sdk.createOpencode(options);
+    const v2Client = v2Sdk.createOpencodeClient({ baseUrl: started.server.url });
+    Object.assign(started.client, { permission: v2Client.permission });
+    return started as unknown as {
       client: OpenCodeClientLike;
       server: OpenCodeServerLike;
-    }>;
+    };
   },
 };
+
+type OpenCodePermissionReplyMode = typeof OPENCODE_PERMISSION_REPLY_MODE[keyof typeof OPENCODE_PERMISSION_REPLY_MODE];
+
+interface NormalizedOpenCodePermission {
+  id: string;
+  operation?: string;
+  title?: string;
+  pattern?: string;
+  callId?: string;
+  replyMode: OpenCodePermissionReplyMode;
+}
+
+interface PendingOpenCodePermission {
+  timer: ReturnType<typeof setTimeout>;
+  replyMode: OpenCodePermissionReplyMode;
+}
 
 interface OpenCodeSessionState {
   routeId: string;
@@ -109,7 +143,7 @@ interface OpenCodeSessionState {
   server: OpenCodeServerLike;
   abort: AbortController;
   eventLoop: Promise<void>;
-  pendingPermissions: Map<string, ReturnType<typeof setTimeout>>;
+  pendingPermissions: Map<string, PendingOpenCodePermission>;
 }
 
 function errorMessage(error: unknown): string {
@@ -143,6 +177,49 @@ function sessionIdFromEvent(event: Record<string, any>): string | undefined {
   return safeString(properties?.sessionID)
     ?? safeString(properties?.part?.sessionID)
     ?? safeString(properties?.info?.sessionID);
+}
+
+function permissionPattern(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return safeString(value);
+  const items = value.map(safeString).filter((item): item is string => item !== undefined);
+  return items.length > 0 ? items.join(', ') : undefined;
+}
+
+function normalizePermissionEvent(
+  eventType: unknown,
+  properties: Record<string, any> | undefined,
+): NormalizedOpenCodePermission | undefined {
+  const id = safeString(properties?.id);
+  if (!id) return undefined;
+  if (eventType === OPENCODE_PERMISSION_EVENT.LEGACY_UPDATED) {
+    return {
+      id,
+      operation: safeString(properties?.type),
+      title: safeString(properties?.title),
+      pattern: permissionPattern(properties?.pattern),
+      callId: safeString(properties?.callID),
+      replyMode: OPENCODE_PERMISSION_REPLY_MODE.LEGACY,
+    };
+  }
+  if (eventType === OPENCODE_PERMISSION_EVENT.ASKED) {
+    return {
+      id,
+      operation: safeString(properties?.permission),
+      pattern: permissionPattern(properties?.patterns),
+      callId: safeString(properties?.tool?.callID),
+      replyMode: OPENCODE_PERMISSION_REPLY_MODE.REQUEST,
+    };
+  }
+  if (eventType === OPENCODE_PERMISSION_EVENT.V2_ASKED) {
+    return {
+      id,
+      operation: safeString(properties?.action),
+      pattern: permissionPattern(properties?.resources),
+      callId: safeString(properties?.source?.callID),
+      replyMode: OPENCODE_PERMISSION_REPLY_MODE.REQUEST,
+    };
+  }
+  return undefined;
 }
 
 function parseModelIdentity(value: string | undefined): { providerID: string; modelID: string } | undefined {
@@ -572,10 +649,33 @@ export class OpenCodeSdkProvider implements TransportProvider {
   async respondApproval(sessionId: string, requestId: string, approved: boolean): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) throw providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown OpenCode SDK session: ${sessionId}`, false);
-    const timer = state.pendingPermissions.get(requestId);
-    if (timer) clearTimeout(timer);
+    const pending = state.pendingPermissions.get(requestId);
+    if (pending) clearTimeout(pending.timer);
     state.pendingPermissions.delete(requestId);
+    await this.replyPermission(
+      state,
+      requestId,
+      approved,
+      pending?.replyMode ?? OPENCODE_PERMISSION_REPLY_MODE.LEGACY,
+    );
+  }
+
+  private async replyPermission(
+    state: OpenCodeSessionState,
+    requestId: string,
+    approved: boolean,
+    replyMode: OpenCodePermissionReplyMode,
+  ): Promise<void> {
     try {
+      if (replyMode === OPENCODE_PERMISSION_REPLY_MODE.REQUEST && state.client.permission) {
+        await state.client.permission.reply({
+          path: { requestID: requestId },
+          query: { directory: state.cwd },
+          body: { reply: approved ? 'once' : 'reject' },
+          throwOnError: true,
+        });
+        return;
+      }
       await state.client.postSessionIdPermissionsPermissionId({
         path: { id: state.providerSessionId, permissionID: requestId },
         query: { directory: state.cwd },
@@ -653,7 +753,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
   }
 
   private async closeSessionState(state: OpenCodeSessionState): Promise<void> {
-    for (const timer of state.pendingPermissions.values()) clearTimeout(timer);
+    for (const pending of state.pendingPermissions.values()) clearTimeout(pending.timer);
     state.pendingPermissions.clear();
     state.abort.abort();
     state.server.close();
@@ -675,8 +775,10 @@ export class OpenCodeSdkProvider implements TransportProvider {
           this.completeOnce(state, 'message.updated');
         }
         return;
-      case 'permission.updated':
-        this.processPermission(state, event.properties);
+      case OPENCODE_PERMISSION_EVENT.LEGACY_UPDATED:
+      case OPENCODE_PERMISSION_EVENT.ASKED:
+      case OPENCODE_PERMISSION_EVENT.V2_ASKED:
+        this.processPermission(state, normalizePermissionEvent(event.type, event.properties));
         return;
       case 'session.status': {
         const status = event.properties?.status;
@@ -827,35 +929,42 @@ export class OpenCodeSdkProvider implements TransportProvider {
     for (const callback of this.toolCallbacks) callback(state.routeId, event);
   }
 
-  private processPermission(state: OpenCodeSessionState, permission: Record<string, any>): void {
-    const id = safeString(permission?.id);
-    if (!id) return;
-    const pattern = Array.isArray(permission.pattern) ? permission.pattern.join(', ') : safeString(permission.pattern);
+  private processPermission(state: OpenCodeSessionState, permission: NormalizedOpenCodePermission | undefined): void {
+    if (!permission) return;
+    const { id, operation, title, pattern, callId, replyMode } = permission;
     const request: ApprovalRequest = {
       id,
-      description: safeString(permission.title) ?? `Allow OpenCode ${safeString(permission.type) ?? 'operation'}${pattern ? `: ${pattern}` : ''}`,
-      ...(safeString(permission.type) ? { tool: permission.type } : {}),
+      description: title ?? `Allow OpenCode ${operation ?? 'operation'}${pattern ? `: ${pattern}` : ''}`,
+      ...(operation ? { tool: operation } : {}),
       provider: this.id,
       providerGeneration: state.generation,
-      ...(safeString(permission.callID) ? { providerToolUseId: permission.callID } : {}),
+      ...(callId ? { providerToolUseId: callId } : {}),
       ...(pattern ? { inputPreview: pattern.slice(0, 300) } : {}),
     };
     if (this.approvalCallbacks.length === 0) {
-      void this.respondApproval(state.routeId, id, false).catch((error) => {
+      void this.replyPermission(state, id, false, replyMode).catch((error) => {
         this.emitError(state.routeId, this.normalizeError(error, 'permission rejection'));
       });
       return;
     }
     const prior = state.pendingPermissions.get(id);
-    if (prior) clearTimeout(prior);
+    if (prior) {
+      if (replyMode === OPENCODE_PERMISSION_REPLY_MODE.REQUEST
+        && prior.replyMode !== OPENCODE_PERMISSION_REPLY_MODE.REQUEST) {
+        state.pendingPermissions.set(id, { ...prior, replyMode });
+      }
+      return;
+    }
     const timer = setTimeout(() => {
+      const pending = state.pendingPermissions.get(id);
+      if (!pending) return;
       state.pendingPermissions.delete(id);
-      void this.respondApproval(state.routeId, id, false).catch((error) => {
+      void this.replyPermission(state, id, false, pending.replyMode).catch((error) => {
         this.emitError(state.routeId, this.normalizeError(error, 'permission timeout'));
       });
     }, this.approvalTimeoutMs);
     timer.unref?.();
-    state.pendingPermissions.set(id, timer);
+    state.pendingPermissions.set(id, { timer, replyMode });
     for (const callback of this.approvalCallbacks) callback(state.routeId, request);
   }
 

@@ -92,6 +92,9 @@ function createHarness() {
       })),
     },
     event: { subscribe: vi.fn(() => Promise.resolve({ stream: queue.stream })) },
+    permission: {
+      reply: vi.fn(() => result(true)),
+    },
     postSessionIdPermissionsPermissionId: vi.fn(() => result(true)),
   };
   const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
@@ -262,6 +265,80 @@ describe('OpenCodeSdkProvider', () => {
     });
     await Promise.resolve();
     expect(completions).toHaveLength(1);
+    await provider.disconnect();
+  });
+
+  it('handles current OpenCode permission events without duplicating approval requests', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const approvals: any[] = [];
+    provider.onApprovalRequest((sessionId, approval) => approvals.push({ sessionId, ...approval }));
+    await provider.connect({});
+    const routeId = await provider.createSession({ sessionKey: 'route-modern-permissions', cwd: '/tmp/project' });
+
+    const asked = {
+      type: 'permission.asked',
+      properties: {
+        id: 'perm-asked',
+        sessionID: 'oc-session-1',
+        permission: 'external_directory',
+        patterns: ['/tmp/*'],
+        metadata: {},
+        always: [],
+        tool: { messageID: 'msg-asked', callID: 'call-asked' },
+      },
+    };
+    harness.queue.push(asked);
+    harness.queue.push(asked);
+    harness.queue.push({
+      type: 'permission.v2.asked',
+      properties: {
+        id: 'perm-v2',
+        sessionID: 'oc-session-1',
+        action: 'external_directory',
+        resources: ['/var/tmp/*'],
+        metadata: {},
+        source: { type: 'tool', messageID: 'msg-v2', callID: 'call-v2' },
+      },
+    });
+
+    await vi.waitFor(() => expect(approvals).toHaveLength(2));
+    expect(approvals).toEqual([
+      expect.objectContaining({
+        sessionId: routeId,
+        id: 'perm-asked',
+        tool: 'external_directory',
+        providerToolUseId: 'call-asked',
+        inputPreview: '/tmp/*',
+        description: 'Allow OpenCode external_directory: /tmp/*',
+      }),
+      expect.objectContaining({
+        sessionId: routeId,
+        id: 'perm-v2',
+        tool: 'external_directory',
+        providerToolUseId: 'call-v2',
+        inputPreview: '/var/tmp/*',
+        description: 'Allow OpenCode external_directory: /var/tmp/*',
+      }),
+    ]);
+
+    await provider.respondApproval(routeId, 'perm-asked', true);
+    await provider.respondApproval(routeId, 'perm-v2', false);
+    expect(harness.client.permission.reply).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      path: { requestID: 'perm-asked' },
+      query: { directory: '/tmp/project' },
+      body: { reply: 'once' },
+    }));
+    expect(harness.client.permission.reply).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      path: { requestID: 'perm-v2' },
+      query: { directory: '/tmp/project' },
+      body: { reply: 'reject' },
+    }));
+    expect(harness.client.postSessionIdPermissionsPermissionId).not.toHaveBeenCalled();
     await provider.disconnect();
   });
 
@@ -1062,7 +1139,7 @@ describe('OpenCodeSdkProvider', () => {
     expect(sessionServer.close).toHaveBeenCalledOnce();
   });
 
-  it('fails closed by rejecting permission requests when no approval listener exists', async () => {
+  it('fails closed by rejecting current permission requests when no approval listener exists', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
@@ -1073,14 +1150,22 @@ describe('OpenCodeSdkProvider', () => {
     await provider.createSession({ sessionKey: 'route-no-ui', cwd: '/tmp/project' });
 
     harness.queue.push({
-      type: 'permission.updated',
-      properties: { id: 'perm-deny', sessionID: 'oc-session-1', messageID: 'msg-1', type: 'bash', title: 'Danger', metadata: {} },
+      type: 'permission.asked',
+      properties: {
+        id: 'perm-deny',
+        sessionID: 'oc-session-1',
+        permission: 'bash',
+        patterns: ['rm -rf /tmp/project'],
+        metadata: {},
+        always: [],
+      },
     });
 
-    await vi.waitFor(() => expect(harness.client.postSessionIdPermissionsPermissionId).toHaveBeenCalledWith(expect.objectContaining({
-      path: { id: 'oc-session-1', permissionID: 'perm-deny' },
-      body: { response: 'reject' },
+    await vi.waitFor(() => expect(harness.client.permission.reply).toHaveBeenCalledWith(expect.objectContaining({
+      path: { requestID: 'perm-deny' },
+      body: { reply: 'reject' },
     })));
+    expect(harness.client.postSessionIdPermissionsPermissionId).not.toHaveBeenCalled();
     await provider.disconnect();
   });
 
