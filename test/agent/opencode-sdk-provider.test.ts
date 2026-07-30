@@ -1068,7 +1068,12 @@ describe('OpenCodeSdkProvider', () => {
 
   it('restores provider sessions, discovers connected models and cancels active work', async () => {
     const harness = createHarness();
-    harness.sessions.set('resume-1', { id: 'resume-1', title: 'Restored', time: { updated: 12 } });
+    harness.sessions.set('resume-1', {
+      id: 'resume-1',
+      title: 'Restored',
+      directory: '/tmp/project',
+      time: { updated: 12 },
+    });
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
       return { client: harness.client as any, server: harness.server };
@@ -1082,7 +1087,15 @@ describe('OpenCodeSdkProvider', () => {
     });
     expect(routeId).toBe('ephemeral-route');
     expect(await provider.restoreSession('resume-1')).toBe(true);
-    expect((await provider.listSessions())[0]).toMatchObject({ key: 'resume-1', displayName: 'Restored' });
+    expect((await provider.listSessions({ directory: '/tmp/project' }))[0]).toMatchObject({
+      key: 'resume-1',
+      displayName: 'Restored',
+      directory: '/tmp/project',
+    });
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: '/tmp/project' },
+      throwOnError: true,
+    });
     expect(await provider.listModels()).toMatchObject({
       defaultModel: 'anthropic/claude-sonnet-4-5',
       isAuthenticated: true,

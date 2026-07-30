@@ -328,12 +328,19 @@ export interface RemoteSessionInfo {
   key: string;
   /** Human-readable session name. */
   displayName?: string;
+  /** Provider-side working directory when session identity is directory-scoped. */
+  directory?: string;
   /** Agent/model the session is associated with. */
   agentId?: string;
   /** Unix epoch milliseconds of the last update. */
   updatedAt?: number;
   /** Context window usage as a percentage (0–100), if available. */
   percentUsed?: number;
+}
+
+export interface RemoteSessionListOptions {
+  /** Restrict results to one working directory when the provider supports it. */
+  directory?: string;
 }
 
 /** Approval request emitted when the agent needs human permission to proceed. */
@@ -595,7 +602,7 @@ export interface TransportProvider {
    * Useful for session-picker UIs and resuming orphaned sessions.
    * Only call when capabilities.sessionRestore is true.
    */
-  listSessions?(): Promise<RemoteSessionInfo[]>;
+  listSessions?(options?: RemoteSessionListOptions): Promise<RemoteSessionInfo[]>;
 
   /**
    * Return the list of models available for this provider.

@@ -1,7 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildTransportResumeLaunchOpts,
   findLegacyProviderResumeId,
+  usesDirectoryScopedSessionListing,
   usesProviderResumeId,
 } from '../../src/agent/transport-resume-opts.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -106,5 +110,73 @@ describe('findLegacyProviderResumeId', () => {
         { key: 'remote-monitor-2', displayName: 'Monitor' },
       ],
     )).toBeUndefined();
+  });
+
+  it('accepts only sessions from the exact expected directory', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [
+        { key: 'project-a-monitor', displayName: 'Monitor', directory: '/srv/project-a' },
+        { key: 'project-b-monitor', displayName: 'Monitor', directory: '/srv/project-b' },
+      ],
+      '/srv/project-a/',
+    )).toBe('project-a-monitor');
+  });
+
+  it('treats symlinked and canonical forms of the same directory as identical', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-transport-resume-'));
+    const canonical = join(root, 'canonical');
+    const alias = join(root, 'alias');
+    try {
+      mkdirSync(canonical);
+      symlinkSync(canonical, alias, 'dir');
+      expect(findLegacyProviderResumeId(
+        rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+        [{ key: 'remote-monitor', displayName: 'Monitor', directory: realpathSync(canonical) }],
+        alias,
+      )).toBe('remote-monitor');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an exact legacy id when it belongs to another directory', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'remote-exact' }),
+      [
+        { key: 'remote-exact', displayName: 'Monitor', directory: '/srv/other' },
+      ],
+      '/srv/expected',
+    )).toBeUndefined();
+  });
+
+  it('fails closed when directory-scoped results omit directory metadata', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [{ key: 'remote-monitor', displayName: 'Monitor' }],
+      '/srv/expected',
+    )).toBeUndefined();
+  });
+
+  it('does not fall back to the store name when a user label exists', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ name: 'deck_service_monitor', label: 'Renamed monitor', providerSessionId: 'local-route' }),
+      [{ key: 'stranger', displayName: 'deck_service_monitor' }],
+    )).toBeUndefined();
+  });
+
+  it('still uses the store name when no user label exists', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ name: 'deck_service_monitor', label: undefined, providerSessionId: 'local-route' }),
+      [{ key: 'legacy', displayName: 'deck_service_monitor' }],
+    )).toBe('legacy');
+  });
+});
+
+describe('usesDirectoryScopedSessionListing', () => {
+  it('scopes only OpenCode SDK listings by working directory', () => {
+    expect(usesDirectoryScopedSessionListing('opencode-sdk')).toBe(true);
+    expect(usesDirectoryScopedSessionListing('copilot-sdk')).toBe(false);
+    expect(usesDirectoryScopedSessionListing('kimi-sdk')).toBe(false);
   });
 });

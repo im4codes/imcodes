@@ -11,6 +11,7 @@ import { isTransportAgent } from './detect.js';
 import {
   buildTransportResumeLaunchOpts,
   findLegacyProviderResumeId,
+  usesDirectoryScopedSessionListing,
   usesProviderResumeId,
 } from './transport-resume-opts.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
@@ -2120,7 +2121,7 @@ export async function restoreTransportSessions(
 ): Promise<void> {
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
-  let remoteSessionsPromise: Promise<RemoteSessionInfo[]> | undefined;
+  const remoteSessionsByDirectory = new Map<string, Promise<RemoteSessionInfo[]>>();
   const restoreConcurrency = Number.isFinite(options.concurrency) && (options.concurrency ?? 0) >= 1
     ? Math.trunc(options.concurrency!)
     : TRANSPORT_RESTORE_CONCURRENCY;
@@ -2169,9 +2170,35 @@ export async function restoreTransportSessions(
           }, 'Transport restore requires a durable provider id but the provider cannot list sessions');
           return;
         }
-        remoteSessionsPromise ??= provider.listSessions();
-        const remoteSessions = await remoteSessionsPromise;
-        const recoveredResumeId = findLegacyProviderResumeId(s, remoteSessions);
+        const expectedDirectory = usesDirectoryScopedSessionListing(s.providerId)
+          ? s.projectDir
+          : undefined;
+        const cacheKey = expectedDirectory ?? '';
+        let remoteSessions: RemoteSessionInfo[] | undefined;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          let remoteSessionsPromise = remoteSessionsByDirectory.get(cacheKey);
+          if (!remoteSessionsPromise) {
+            remoteSessionsPromise = provider.listSessions(
+              expectedDirectory ? { directory: expectedDirectory } : undefined,
+            );
+            remoteSessionsByDirectory.set(cacheKey, remoteSessionsPromise);
+          }
+          try {
+            remoteSessions = await remoteSessionsPromise;
+            break;
+          } catch (error) {
+            if (remoteSessionsByDirectory.get(cacheKey) === remoteSessionsPromise) {
+              remoteSessionsByDirectory.delete(cacheKey);
+            }
+            if (attempt === 1) throw error;
+          }
+        }
+        if (!remoteSessions) return;
+        const recoveredResumeId = findLegacyProviderResumeId(
+          s,
+          remoteSessions,
+          expectedDirectory,
+        );
         if (!recoveredResumeId) {
           logger.warn({
             session: s.name,

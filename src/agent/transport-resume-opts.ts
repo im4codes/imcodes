@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { LaunchOpts } from './session-manager.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
@@ -12,32 +14,58 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'opencode-sdk';
 }
 
+/** Providers whose remote session namespace is partitioned by working directory. */
+export function usesDirectoryScopedSessionListing(agentType: string | undefined): boolean {
+  return agentType === 'opencode-sdk';
+}
+
+function normalizeDirectory(directory: string): string {
+  const trimmed = directory.trim();
+  if (!trimmed) return '';
+  let normalized: string;
+  try {
+    normalized = realpathSync.native(trimmed);
+  } catch {
+    normalized = resolve(trimmed);
+  }
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
 /**
  * Recover a durable provider id for records created before providerResumeId
  * was persisted reliably. Prefer an exact legacy id match; otherwise accept
  * only one uniquely named remote conversation. Ambiguity fails closed so a
  * daemon restart can never attach the cron/send path to the wrong history.
+ * Directory-scoped providers must also return the exact requested directory;
+ * missing or mismatched directory metadata fails closed.
  */
 export function findLegacyProviderResumeId(
   record: Pick<SessionRecord, 'name' | 'label' | 'providerSessionId'>,
   remoteSessions: readonly RemoteSessionInfo[],
+  expectedDirectory?: string,
 ): string | undefined {
+  const normalizedExpectedDirectory = expectedDirectory
+    ? normalizeDirectory(expectedDirectory)
+    : '';
+  const scopedSessions = normalizedExpectedDirectory
+    ? remoteSessions.filter((session) => (
+      !!session.directory
+      && normalizeDirectory(session.directory) === normalizedExpectedDirectory
+    ))
+    : remoteSessions;
+
   const legacyId = record.providerSessionId?.trim();
-  if (legacyId && remoteSessions.some((session) => session.key === legacyId)) {
+  if (legacyId && scopedSessions.some((session) => session.key === legacyId)) {
     return legacyId;
   }
 
-  const names = new Set(
-    [record.label, record.name]
-      .map((value) => value?.trim())
-      .filter((value): value is string => !!value),
-  );
-  if (names.size === 0) return undefined;
+  const preferredName = record.label?.trim() || record.name?.trim();
+  if (!preferredName) return undefined;
   const matches = new Set(
-    remoteSessions
+    scopedSessions
       .filter((session) => {
         const displayName = session.displayName?.trim();
-        return !!displayName && names.has(displayName);
+        return !!displayName && displayName === preferredName;
       })
       .map((session) => session.key),
   );

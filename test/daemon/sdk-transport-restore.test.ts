@@ -211,6 +211,7 @@ function createOpenCodeRestoreHarness() {
         const session = {
           id: 'unexpected-new-session',
           title: options.body?.title ?? 'unexpected',
+          directory: options.query?.directory,
         };
         remoteSessions.set(session.id, session);
         return { data: session };
@@ -220,7 +221,11 @@ function createOpenCodeRestoreHarness() {
         if (!session) throw new Error('404 session not found');
         return { data: session };
       }),
-      list: vi.fn(async () => ({ data: [...remoteSessions.values()] })),
+      list: vi.fn(async (options: any) => ({
+        data: [...remoteSessions.values()].filter((session) => (
+          !options.query?.directory || session.directory === options.query.directory
+        )),
+      })),
       abort: vi.fn(async () => ({ data: true })),
       prompt: vi.fn(),
     },
@@ -456,6 +461,7 @@ describe('sdk transport session restore', () => {
     harness.remoteSessions.set('remote-monitor-session', {
       id: 'remote-monitor-session',
       title: '监控',
+      directory: '/tmp/service-monitor',
       time: { updated: Date.now() },
     });
     const name = 'deck_service_monitor';
@@ -483,9 +489,111 @@ describe('sdk transport session restore', () => {
     expect(runtime?.providerSessionId).toBe('legacy-local-route');
     expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
       path: { id: 'remote-monitor-session' },
+      query: { directory: '/tmp/service-monitor' },
     }));
+    expect(harness.client.session.list).toHaveBeenCalledWith({
+      query: { directory: '/tmp/service-monitor' },
+      throwOnError: true,
+    });
     expect(harness.client.session.create).not.toHaveBeenCalled();
     expect(mocks.store.get(name)?.providerResumeId).toBe('remote-monitor-session');
+  });
+
+  it('scopes legacy OpenCode title recovery to the stored project directory', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('other-project-monitor', {
+      id: 'other-project-monitor',
+      title: '监控',
+      directory: '/tmp/other-project',
+      time: { updated: Date.now() + 1 },
+    });
+    harness.remoteSessions.set('service-project-monitor', {
+      id: 'service-project-monitor',
+      title: '监控',
+      directory: '/tmp/service-monitor',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_scoped_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route-scoped',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-local-route-scoped');
+    expect(mocks.store.get(name)?.providerResumeId).toBe('service-project-monitor');
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'service-project-monitor' },
+      query: { directory: '/tmp/service-monitor' },
+    }));
+    expect(harness.client.session.get).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'other-project-monitor' },
+    }));
+  });
+
+  it('retries one transient directory-list failure and reuses the recovered listing', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('second-monitor', {
+      id: 'second-monitor',
+      title: 'Second monitor',
+      directory: '/tmp/shared-monitor',
+      time: { updated: Date.now() },
+    });
+    harness.client.session.list.mockRejectedValueOnce(new Error('temporary list failure'));
+    const baseRecord = {
+      projectName: 'service',
+      role: 'w1' as const,
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/shared-monitor',
+      state: 'idle' as const,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport' as const,
+      providerId: 'opencode-sdk',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    };
+    mocks.store.set('deck_service_first_monitor', {
+      ...baseRecord,
+      name: 'deck_service_first_monitor',
+      label: 'First monitor',
+      providerSessionId: 'legacy-first-route',
+    });
+    mocks.store.set('deck_service_second_monitor', {
+      ...baseRecord,
+      name: 'deck_service_second_monitor',
+      label: 'Second monitor',
+      providerSessionId: 'legacy-second-route',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    await restoreTransportSessions('opencode-sdk', {
+      concurrency: 1,
+      interSessionDelayMs: 0,
+    });
+
+    expect(harness.client.session.list).toHaveBeenCalledTimes(2);
+    expect(getTransportRuntime('deck_service_first_monitor')).toBeUndefined();
+    expect(getTransportRuntime('deck_service_second_monitor')?.providerSessionId)
+      .toBe('legacy-second-route');
+    expect(mocks.store.get('deck_service_second_monitor')?.providerResumeId)
+      .toBe('second-monitor');
   });
 
   it('persists the provider-native OpenCode resume id on the first launch', async () => {

@@ -10,6 +10,7 @@ import type {
   ProviderStatusUpdate,
   ProviderUsageUpdate,
   RemoteSessionInfo,
+  RemoteSessionListOptions,
   SessionConfig,
   SessionInfoUpdate,
   TransportProvider,
@@ -452,12 +453,17 @@ export class OpenCodeSdkProvider implements TransportProvider {
     }
   }
 
-  async listSessions(): Promise<RemoteSessionInfo[]> {
+  async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
     const client = this.assertConnected();
-    const result = await client.session.list({ throwOnError: true });
+    const directory = safeString(options.directory);
+    const result = await client.session.list({
+      ...(directory ? { query: { directory } } : {}),
+      throwOnError: true,
+    });
     return result.data.map((session) => ({
       key: String(session.id),
       ...(safeString(session.title) ? { displayName: session.title.trim() } : {}),
+      ...(safeString(session.directory) ? { directory: session.directory.trim() } : {}),
       ...(positiveNumber(session.time?.updated) !== undefined ? { updatedAt: session.time.updated } : {}),
     }));
   }
