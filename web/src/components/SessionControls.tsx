@@ -942,6 +942,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
@@ -3999,9 +4000,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // On mobile, focusing contenteditable can scroll the document body — force it back
   const handleFocus = () => {
+    setComposerFocused(true);
     if (window.scrollY !== 0) window.scrollTo(0, 0);
     if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
     if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
+  };
+
+  const handleBlur = () => {
+    setComposerFocused(false);
   };
 
   const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
@@ -4301,7 +4307,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ? `${composerParentName} → ${composerTargetName}`
     : composerTargetName;
   const showComposerTarget = !isMobileLayout
-    && hasText
+    && composerFocused
     && !!activeSession
     && !!composerTargetName
     && !atPickerOpen
@@ -5752,6 +5758,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             enterkeyhint={isMobileLayout ? 'send' : undefined}
             style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
             onFocus={handleFocus}
+            onBlur={handleBlur}
             onInput={() => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());

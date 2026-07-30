@@ -716,7 +716,7 @@ afterEach(() => {
     expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
   });
 
-  it('shows the current desktop target while composing and tracks session switches', () => {
+  it('shows the current desktop target on focus and tracks session switches', () => {
     const firstSession = makeSession({ name: 'deck_project_brain', project: 'project-a', label: 'Main workspace' });
     const secondSession = makeSession({ name: 'deck_sub_monitor', project: 'project-a', label: 'Monitor' });
     const view = render(
@@ -730,13 +730,15 @@ afterEach(() => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
 
     expect(screen.queryByRole('status', { name: 'Message target: Main workspace' })).toBeNull();
-    input.textContent = 'check production';
-    fireEvent.input(input);
+    act(() => input.focus());
 
     const firstTarget = screen.getByRole('status', { name: 'Message target: Main workspace' });
     expect(firstTarget.querySelector('.controls-target-label')?.textContent).toBe('Sending to');
     expect(firstTarget.querySelector('.controls-target-name')?.textContent).toBe('Main workspace');
     expect(firstTarget.querySelector('.controls-target-name')?.getAttribute('title')).toBe('Main workspace');
+
+    input.textContent = 'check production';
+    fireEvent.input(input);
 
     view.rerender(
       <SessionControls
@@ -773,10 +775,14 @@ afterEach(() => {
 
     switchedInput.textContent = '';
     fireEvent.input(switchedInput);
+    expect(screen.getByRole('status', {
+      name: 'Message target: Main workspace → Production monitor with a deliberately long tab name',
+    })).toBeDefined();
+    act(() => switchedInput.blur());
     expect(document.querySelector('.controls-target-bubble')).toBeNull();
   });
 
-  it('hides the target bubble after sending and never shows it on mobile', () => {
+  it('keeps the target bubble while focused after sending and never shows it on mobile', () => {
     const ws = makeWs();
     const desktop = render(
       <SessionControls
@@ -786,10 +792,13 @@ afterEach(() => {
       />,
     );
     const input = screen.getByRole('textbox') as HTMLDivElement;
+    act(() => input.focus());
+    expect(document.querySelector('.controls-target-bubble')).toBeTruthy();
     input.textContent = 'status';
     fireEvent.input(input);
-    expect(document.querySelector('.controls-target-bubble')).toBeTruthy();
     fireEvent.keyDown(input, { key: 'Enter' });
+    expect(document.querySelector('.controls-target-bubble')).toBeTruthy();
+    act(() => input.blur());
     expect(document.querySelector('.controls-target-bubble')).toBeNull();
     desktop.unmount();
 
@@ -802,6 +811,7 @@ afterEach(() => {
       />,
     );
     const mobileInput = screen.getByRole('textbox') as HTMLDivElement;
+    act(() => mobileInput.focus());
     mobileInput.textContent = 'status';
     fireEvent.input(mobileInput);
     expect(document.querySelector('.controls-target-bubble')).toBeNull();
