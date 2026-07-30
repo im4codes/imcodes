@@ -159,6 +159,48 @@ describe('CopilotSdkProvider', () => {
     });
   });
 
+  it('detaches a stale route without disconnecting or silencing its replacement attachment', async () => {
+    const harness = createCopilotHarness();
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as typeof import('@github/copilot-sdk');
+    const deltas: Array<{ sessionId: string; text: string }> = [];
+    provider.onDelta((sessionId, delta) => deltas.push({ sessionId, text: delta.delta }));
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({
+      sessionKey: 'route-stale',
+      sessionName: 'Stale route',
+      cwd: '/tmp/project',
+    });
+    await provider.createSession({
+      sessionKey: 'route-replacement',
+      sessionName: 'Replacement route',
+      cwd: '/tmp/project',
+      resumeId: 'session-1',
+      skipCreate: true,
+    });
+    const sharedSession = harness.sessions.get('session-1');
+
+    await provider.detachSession('route-stale');
+
+    expect(sharedSession?.disconnect).not.toHaveBeenCalled();
+    expect((provider as any).sessions.has('route-stale')).toBe(false);
+    expect((provider as any).sessions.has('route-replacement')).toBe(true);
+    sharedSession?.emit({
+      type: 'assistant.message_delta',
+      data: {
+        messageId: 'replacement-message',
+        deltaContent: 'replacement still streams',
+      },
+    });
+    expect(deltas).toEqual([{
+      sessionId: 'route-replacement',
+      text: 'replacement still streams',
+    }]);
+    await provider.disconnect();
+  });
+
   it('bridges SDK permission requests into approval callbacks and resolves responses', async () => {
     const harness = createCopilotHarness();
     const provider = new CopilotSdkProvider();

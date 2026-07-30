@@ -491,6 +491,17 @@ export class CopilotSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.getSessionState(sessionId);
     if (!state) return;
+    this.detachSessionState(state);
+    try { await state.session.disconnect?.(); } catch {}
+  }
+
+  async detachSession(sessionId: string): Promise<void> {
+    const state = this.getSessionState(sessionId);
+    if (!state) return;
+    this.detachSessionState(state);
+  }
+
+  private detachSessionState(state: CopilotSessionState): void {
     state.unsubscribes.forEach((fn) => fn());
     state.unsubscribes = [];
     for (const pending of state.pendingApprovals.values()) {
@@ -498,7 +509,6 @@ export class CopilotSdkProvider implements TransportProvider {
       pending.resolve({ kind: 'denied-no-approval-rule-and-could-not-request-from-user' });
     }
     state.pendingApprovals.clear();
-    try { await state.session.disconnect?.(); } catch {}
     this.sessions.delete(state.routeId);
   }
 

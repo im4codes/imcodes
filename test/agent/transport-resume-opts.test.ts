@@ -158,6 +158,14 @@ describe('findLegacyProviderResumeId', () => {
     )).toBeUndefined();
   });
 
+  it('fails closed when a directory-scoped lookup has only a blank directory', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [{ key: 'remote-monitor', displayName: 'Monitor' }],
+      '   ',
+    )).toBeUndefined();
+  });
+
   it('does not fall back to the store name when a user label exists', () => {
     expect(findLegacyProviderResumeId(
       rec({ name: 'deck_service_monitor', label: 'Renamed monitor', providerSessionId: 'local-route' }),

@@ -135,6 +135,105 @@ describe('OpenCodeSdkProvider', () => {
     expect(harness.server.close).toHaveBeenCalledOnce();
   });
 
+  it('detaches a stale route without unmapping or aborting its replacement conversation', async () => {
+    const harness = createHarness();
+    const eventQueues: Array<ReturnType<typeof createAsyncQueue<Record<string, unknown>>>> = [];
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      const eventQueue = createAsyncQueue<Record<string, unknown>>();
+      eventQueues.push(eventQueue);
+      options.signal.addEventListener('abort', eventQueue.close, { once: true });
+      return {
+        client: {
+          ...harness.client,
+          event: {
+            subscribe: vi.fn(async () => ({ stream: eventQueue.stream })),
+          },
+        } as any,
+        server: { url: harness.server.url, close: vi.fn() },
+      };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const deltas: Array<{ sessionId: string; text: string }> = [];
+    provider.onDelta((sessionId, delta) => deltas.push({ sessionId, text: delta.delta }));
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'route-seed',
+      sessionName: 'Seed route',
+      cwd: '/tmp/project',
+    });
+    const durableSessionId = 'oc-session-1';
+    await provider.detachSession('route-seed');
+    await provider.createSession({
+      sessionKey: 'route-replacement-old',
+      bindExistingKey: 'route-replacement-old',
+      sessionName: 'Old replacement route',
+      cwd: '/tmp/project',
+      resumeId: durableSessionId,
+      skipCreate: true,
+    });
+    await provider.createSession({
+      sessionKey: 'route-replacement-new',
+      bindExistingKey: 'route-replacement-new',
+      sessionName: 'New replacement route',
+      cwd: '/tmp/project',
+      resumeId: durableSessionId,
+      skipCreate: true,
+    });
+    await provider.createSession({
+      sessionKey: 'route-stale-last',
+      bindExistingKey: 'route-stale-last',
+      sessionName: 'Stale route finishing last',
+      cwd: '/tmp/project',
+      resumeId: durableSessionId,
+      skipCreate: true,
+    });
+
+    const sessions = (provider as any).sessions as Map<string, any>;
+    const providerToRoute = (provider as any).providerToRoute as Map<string, string>;
+    const staleState = sessions.get('route-stale-last');
+    const replacementState = sessions.get('route-replacement-new');
+    staleState.busy = true;
+    expect(providerToRoute.get(durableSessionId)).toBe(staleState.routeId);
+
+    await provider.detachSession(staleState.routeId);
+
+    expect(sessions.has(staleState.routeId)).toBe(false);
+    expect(sessions.get('route-replacement-new')).toBe(replacementState);
+    expect(providerToRoute.get(durableSessionId)).toBe('route-replacement-new');
+    expect(harness.client.session.abort).not.toHaveBeenCalled();
+
+    replacementState.busy = true;
+    eventQueues[3]?.push({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'replacement-message',
+          sessionID: durableSessionId,
+          role: 'assistant',
+        },
+      },
+    });
+    eventQueues[3]?.push({
+      type: 'message.part.updated',
+      properties: {
+        part: {
+          id: 'replacement-part',
+          sessionID: durableSessionId,
+          messageID: 'replacement-message',
+          type: 'text',
+          text: 'replacement still streams',
+        },
+      },
+    });
+    await vi.waitFor(() => {
+      expect(deltas).toEqual([{
+        sessionId: 'route-replacement-new',
+        text: 'replacement still streams',
+      }]);
+    });
+    await provider.disconnect();
+  });
+
   it('maps streaming text, tools, permissions, usage and duplicate terminals exactly once', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

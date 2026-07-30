@@ -338,13 +338,26 @@ describe('GrokSdkProvider contract', () => {
     expect(connection.newSession).not.toHaveBeenCalled();
   });
 
-  it('lists and restores only locally bound provider sessions', async () => {
+  it('lists remote provider sessions and restores locally bound sessions', async () => {
     const provider = new GrokSdkProvider();
     attachRoute(provider, 'route-listed');
-    await expect(provider.listSessions!()).resolves.toEqual([expect.objectContaining({
+    const listSessions = vi.fn().mockResolvedValue({
+      sessions: [{
+        sessionId: 'acp-route-listed',
+        title: 'route-listed',
+        cwd: '/tmp/project',
+      }],
+      nextCursor: null,
+    });
+    (provider as any).connection = { listSessions };
+    (provider as any).sessionListSupported = true;
+
+    await expect(provider.listSessions!({ directory: '/tmp/project' })).resolves.toEqual([expect.objectContaining({
       key: 'acp-route-listed',
       displayName: 'route-listed',
+      directory: '/tmp/project',
     })]);
+    expect(listSessions).toHaveBeenCalledWith({ cwd: '/tmp/project' });
     await expect(provider.restoreSession!('acp-route-listed')).resolves.toBe(true);
     await expect(provider.restoreSession!('missing')).resolves.toBe(false);
   });

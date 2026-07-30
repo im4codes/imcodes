@@ -2008,7 +2008,10 @@ export class TransportSessionRuntime implements SessionRuntime {
    *  turn (wedged provider) and avoid blocking upgrades forever. */
   get lastActivityAt(): number { return this._lastActivityAt; }
 
-  async kill(options: { preserveTransportQueue?: boolean } = {}): Promise<void> {
+  async kill(options: {
+    preserveTransportQueue?: boolean;
+    detachProviderSession?: boolean;
+  } = {}): Promise<void> {
     this.stopCodexRolloutBackstop();
     if (this._backgroundSubagentWakeTimer) clearTimeout(this._backgroundSubagentWakeTimer);
     this._backgroundSubagentWakeTimer = null;
@@ -2018,7 +2021,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unsubscribes = [];
 
     if (this._providerSessionId) {
-      await this.provider.endSession(this._providerSessionId);
+      if (options.detachProviderSession && this.provider.detachSession) {
+        await this.provider.detachSession(this._providerSessionId);
+      } else {
+        await this.provider.endSession(this._providerSessionId);
+      }
       this._providerSessionId = null;
     }
     if (this._activeTurn) {

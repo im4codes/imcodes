@@ -276,6 +276,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
   private lifecycleAbort: AbortController | null = null;
   private sessions = new Map<string, OpenCodeSessionState>();
   private providerToRoute = new Map<string, string>();
+  private providerRouteOrder = new Map<string, string[]>();
   private modelCache: { at: number; value: ProviderModelList } | null = null;
   private modelContextWindows = new Map<string, number>();
   private lastContextWindowRefreshAt = 0;
@@ -326,6 +327,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     const states = [...this.sessions.values()];
     this.sessions.clear();
     this.providerToRoute.clear();
+    this.providerRouteOrder.clear();
     for (const state of states) await this.closeSessionState(state);
     this.lifecycleAbort?.abort();
     this.lifecycleAbort = null;
@@ -422,7 +424,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
       pendingPermissions: new Map(),
     };
     this.sessions.set(routeId, state);
-    this.providerToRoute.set(providerSessionId, routeId);
+    this.registerProviderRoute(providerSessionId, routeId);
     state.eventLoop = this.consumeEvents(sessionRuntime.stream, sessionRuntime.abort.signal);
     this.emitSessionInfo(state);
     return routeId;
@@ -432,14 +434,22 @@ export class OpenCodeSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.sessions.delete(state.routeId);
-    this.providerToRoute.delete(state.providerSessionId);
-    if (state.busy) {
+    const removedSoleProviderRoute = this.releaseProviderRoute(state);
+    if (state.busy && removedSoleProviderRoute) {
       await state.client.session.abort({
         path: { id: state.providerSessionId },
         query: { directory: state.cwd },
         throwOnError: true,
       }).catch(() => {});
     }
+    await this.closeSessionState(state);
+  }
+
+  async detachSession(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    this.sessions.delete(state.routeId);
+    this.releaseProviderRoute(state);
     await this.closeSessionState(state);
   }
 
@@ -764,6 +774,32 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.abort.abort();
     state.server.close();
     await state.eventLoop.catch(() => {});
+  }
+
+  private releaseProviderRoute(state: OpenCodeSessionState): boolean {
+    const ownsCurrentRoute = this.providerToRoute.get(state.providerSessionId) === state.routeId;
+    const remainingRoutes = (this.providerRouteOrder.get(state.providerSessionId) ?? [])
+      .filter((routeId) => (
+        routeId !== state.routeId
+        && this.sessions.get(routeId)?.providerSessionId === state.providerSessionId
+      ));
+    if (remainingRoutes.length > 0) this.providerRouteOrder.set(state.providerSessionId, remainingRoutes);
+    else this.providerRouteOrder.delete(state.providerSessionId);
+    if (!ownsCurrentRoute) return false;
+    if (remainingRoutes.length > 0) {
+      this.providerToRoute.set(state.providerSessionId, remainingRoutes[remainingRoutes.length - 1]!);
+      return false;
+    }
+    this.providerToRoute.delete(state.providerSessionId);
+    return true;
+  }
+
+  private registerProviderRoute(providerSessionId: string, routeId: string): void {
+    const routes = (this.providerRouteOrder.get(providerSessionId) ?? [])
+      .filter((candidate) => candidate !== routeId && this.sessions.has(candidate));
+    routes.push(routeId);
+    this.providerRouteOrder.set(providerSessionId, routes);
+    this.providerToRoute.set(providerSessionId, routeId);
   }
 
   private handleEvent(event: Record<string, any>): void {

@@ -538,6 +538,13 @@ export interface TransportProvider {
   // ── Optional methods — gated by capabilities ─────────────────────────────
 
   /**
+   * Detach local routing/resources without closing the provider-owned durable
+   * conversation. Used when a stale initialization loses authority while a
+   * replacement runtime may already be attached to the same conversation.
+   */
+  detachSession?(sessionId: string): Promise<void>;
+
+  /**
    * Register a callback for discrete tool-call events.
    * Only call when capabilities.toolCalling is true.
    */

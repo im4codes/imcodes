@@ -34,7 +34,9 @@ export function findLegacyProviderResumeId(
   remoteSessions: readonly RemoteSessionInfo[],
   expectedDirectory?: string,
 ): string | undefined {
+  const directoryScopeRequested = expectedDirectory !== undefined;
   const normalizedExpectedDirectory = canonicalizeTransportCwd(expectedDirectory) ?? '';
+  if (directoryScopeRequested && !normalizedExpectedDirectory) return undefined;
   const scopedSessions = normalizedExpectedDirectory
     ? remoteSessions.filter((session) => (
       !!session.directory
