@@ -523,6 +523,8 @@
     "transport_send_queued_count": "{{count}} 件キュー中",
     "send_placeholder": "{{name}} へ送信…",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
+    "composer_target_label": "送信先",
+    "composer_target_aria": "メッセージの送信先: {{name}}",
     "actions": "セッション操作",
     "new_btn": "新規セッション",
     "clone": {

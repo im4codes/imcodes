@@ -353,6 +353,10 @@ const TOOL_RESULT_STATUS_KEYS = [
   'chat.tool_result_done',
   'chat.tool_result_done_with_command',
 ] as const;
+const COMPOSER_TARGET_KEYS = [
+  'session.composer_target_label',
+  'session.composer_target_aria',
+] as const;
 
 function readPath(value: unknown, path: string): unknown {
   return path.split('.').reduce<unknown>((current, key) => (
@@ -361,6 +365,23 @@ function readPath(value: unknown, path: string): unknown {
 }
 
 describe('generic i18n coverage guard', () => {
+  it('keeps composer target labels localized in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(
+        readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+      ) as unknown;
+      for (const key of COMPOSER_TARGET_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+      expect(
+        readPath(messages, 'session.composer_target_aria'),
+        `${locale}:session.composer_target_aria`,
+      ).toContain('{{name}}');
+    }
+  });
+
   it('keeps completed tool result labels localized in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(

@@ -4281,6 +4281,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
   const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
+  const composerTargetName = sessionDisplayName?.trim()
+    || activeSession?.label?.trim()
+    || activeSession?.project?.trim()
+    || activeSession?.name?.trim()
+    || '';
+  const showComposerTarget = !isMobileLayout && hasText && !!activeSession && !!composerTargetName;
   const basePlaceholder = !hasSession
     ? t('session.no_session')
     : !connected
@@ -5328,6 +5334,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               >×</button>
             </span>
           ))}
+        </div>
+      )}
+
+      {showComposerTarget && (
+        <div
+          class="controls-target-bubble"
+          role="status"
+          aria-live="polite"
+          aria-label={t('session.composer_target_aria', { name: composerTargetName })}
+        >
+          <span class="controls-target-pulse" aria-hidden="true" />
+          <span class="controls-target-label">{t('session.composer_target_label')}</span>
+          <span class="controls-target-name" title={composerTargetName}>{composerTargetName}</span>
         </div>
       )}
 

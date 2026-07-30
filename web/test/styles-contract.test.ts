@@ -80,6 +80,19 @@ describe('styles.css regression contracts', () => {
     expect(webkitScrollbarRule![0]).toMatch(/height:\s*0/);
   });
 
+  it('keeps the desktop composer target compact and truncates long session names', () => {
+    const bubbleRule = css.match(/\.controls-target-bubble\s*\{[^}]*\}/);
+    expect(bubbleRule).not.toBeNull();
+    expect(bubbleRule![0]).toMatch(/max-width:\s*calc\(100%\s*-\s*60px\)/);
+    expect(bubbleRule![0]).toMatch(/overflow:\s*hidden/);
+
+    const nameRule = css.match(/\.controls-target-name\s*\{[^}]*\}/);
+    expect(nameRule).not.toBeNull();
+    expect(nameRule![0]).toMatch(/min-width:\s*0/);
+    expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
+    expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
+  });
+
   it('fits portrait videos by available preview height without stretching them to full width', () => {
     const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
     expect(videoContainerRule).not.toBeNull();

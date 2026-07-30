@@ -523,6 +523,8 @@
     "transport_send_queued_count": "{{count}} 条队列",
     "send_placeholder": "发送到 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴或拖拽快速上传",
+    "composer_target_label": "发送至",
+    "composer_target_aria": "消息将发送至 {{name}}",
     "actions": "会话操作",
     "new_btn": "新建会话",
     "clone": {

@@ -523,6 +523,8 @@
     "transport_send_queued_count": "В очереди: {{count}}",
     "send_placeholder": "Отправить в {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка нескольких файлов вставкой или перетаскиванием",
+    "composer_target_label": "Отправка в",
+    "composer_target_aria": "Получатель сообщения: {{name}}",
     "actions": "Действия с сессией",
     "new_btn": "Новая сессия",
     "clone": {

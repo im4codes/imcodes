@@ -523,6 +523,8 @@
     "transport_send_queued_count": "{{count}} 則佇列",
     "send_placeholder": "傳送給 {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上或拖曳快速上傳",
+    "composer_target_label": "傳送至",
+    "composer_target_aria": "訊息將傳送至 {{name}}",
     "actions": "Session 操作",
     "new_btn": "新建 Session",
     "clone": {

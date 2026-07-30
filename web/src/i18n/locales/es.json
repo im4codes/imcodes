@@ -523,6 +523,8 @@
     "transport_send_queued_count": "{{count}} en cola",
     "send_placeholder": "Enviar a {{name}}…",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
+    "composer_target_label": "Enviando a",
+    "composer_target_aria": "Destino del mensaje: {{name}}",
     "actions": "Acciones de sesión",
     "new_btn": "Nueva sesión",
     "clone": {
