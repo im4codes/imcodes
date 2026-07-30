@@ -64,6 +64,22 @@ describe('styles.css regression contracts', () => {
     expect(collapsedContinuationRule![0]).toMatch(/display:\s*none/);
   });
 
+  it('keeps collapsed tool rows horizontally scrollable without a visible scrollbar', () => {
+    const collapsedRowsRule = css.match(
+      /\.chat-tool-block-fold\.is-collapsed \.chat-tool-command-row,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-row,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-preview\s*\{[^}]*\}/,
+    );
+    expect(collapsedRowsRule).not.toBeNull();
+    expect(collapsedRowsRule![0]).toMatch(/overflow-x:\s*auto/);
+    expect(collapsedRowsRule![0]).toMatch(/scrollbar-width:\s*none/);
+
+    const webkitScrollbarRule = css.match(
+      /\.chat-tool-block-fold\.is-collapsed \.chat-tool-command-row::\-webkit-scrollbar,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-row::\-webkit-scrollbar,\s*\.chat-tool-block-fold\.is-collapsed \.chat-tool-result-preview::\-webkit-scrollbar\s*\{[^}]*\}/,
+    );
+    expect(webkitScrollbarRule).not.toBeNull();
+    expect(webkitScrollbarRule![0]).toMatch(/display:\s*none/);
+    expect(webkitScrollbarRule![0]).toMatch(/height:\s*0/);
+  });
+
   it('fits portrait videos by available preview height without stretching them to full width', () => {
     const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
     expect(videoContainerRule).not.toBeNull();

@@ -3223,8 +3223,7 @@ html.native-ios-mac .chat-dl-btn {
   overflow-y: hidden;
   white-space: nowrap;
   word-break: normal;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(34, 211, 238, 0.32) transparent;
+  scrollbar-width: none;
 }
 .chat-tool-block-fold.is-expanded .chat-tool-command-row,
 .chat-tool-block-fold.is-expanded .chat-tool-result-row,
@@ -3251,12 +3250,16 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-block-fold.is-collapsed .chat-tool-fold-continuation {
   display: none;
 }
-.chat-tool-block-fold-content::-webkit-scrollbar,
-.chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar { width: 5px; height: 3px; }
-.chat-tool-block-fold-content::-webkit-scrollbar-track,
-.chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.25); }
-.chat-tool-block-fold-content::-webkit-scrollbar-thumb,
-.chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar-thumb { border-radius: 999px; background: rgba(34, 211, 238, 0.35); }
+.chat-tool-block-fold-content::-webkit-scrollbar { width: 5px; height: 3px; }
+.chat-tool-block-fold-content::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.25); }
+.chat-tool-block-fold-content::-webkit-scrollbar-thumb { border-radius: 999px; background: rgba(34, 211, 238, 0.35); }
+.chat-tool-block-fold.is-collapsed .chat-tool-command-row::-webkit-scrollbar,
+.chat-tool-block-fold.is-collapsed .chat-tool-result-row::-webkit-scrollbar,
+.chat-tool-block-fold.is-collapsed .chat-tool-result-preview::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
 .chat-tool-block-toggle {
   display: inline-flex;
   flex: 0 0 auto;
