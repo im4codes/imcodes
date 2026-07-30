@@ -447,6 +447,11 @@ describe('styles.css regression contracts', () => {
       .find((rule) => /gap:\s*8px/.test(rule));
     expect(barRule).not.toBeNull();
     expect(barRule!).toMatch(/gap:\s*8px/);
+    expect(barRule!).toMatch(/z-index:\s*6500/);
+
+    const backdropRule = css.match(/\.mobile-server-backdrop\s*\{[^}]*\}/);
+    expect(backdropRule).not.toBeNull();
+    expect(backdropRule![0]).toMatch(/z-index:\s*6499/);
 
     const wrapRule = css.match(/\.mobile-server-switcher-wrap\s*\{[^}]*\}/);
     expect(wrapRule).not.toBeNull();
