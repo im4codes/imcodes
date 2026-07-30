@@ -383,6 +383,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _status: AgentStatus = 'idle';
   private _history: AgentMessage[] = [];
   private _providerSessionId: string | null = null;
+  /** Route id expected while provider.createSession() is still resolving.
+   *  Some providers synchronously publish the durable resume id before that
+   *  promise returns; retain those exact-session updates instead of dropping
+   *  them because `_providerSessionId` is not assigned yet. */
+  private _initializingProviderSessionId: string | null = null;
   private _sending = false;
   private _lastProviderError: ProviderError | null = null;
   private _lastProviderErrorAt = 0;
@@ -760,7 +765,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         }
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
-        if (sid !== this._providerSessionId) return;
+        if (sid !== (this._providerSessionId ?? this._initializingProviderSessionId)) return;
         this._lastActivityAt = Date.now();
         this._onSessionInfoChange?.(info);
       })] : []),
@@ -1686,7 +1691,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._startupMemory = null;
     }
 
-    this._providerSessionId = await this.provider.createSession(config);
+    this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
+    try {
+      this._providerSessionId = await this.provider.createSession(config);
+    } finally {
+      this._initializingProviderSessionId = null;
+    }
     // Cap user-authored text so a single oversized paste can't bloat every
     // subsequent turn — these get re-injected into the system prompt on
     // every model call. See `shared/user-session-text-caps.ts`.

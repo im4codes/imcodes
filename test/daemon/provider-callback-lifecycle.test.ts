@@ -2,7 +2,14 @@
  * Tests for provider callback lifecycle (unsubscribe) and key sanitization defense.
  */
 import { describe, it, expect, vi } from 'vitest';
-import type { TransportProvider, ProviderCapabilities, ProviderConfig, SessionConfig, ProviderError } from '../../src/agent/transport-provider.js';
+import type {
+  ProviderCapabilities,
+  ProviderConfig,
+  ProviderError,
+  SessionConfig,
+  SessionInfoUpdate,
+  TransportProvider,
+} from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 
 // ── Minimal mock provider implementing the new unsubscribe interface ────────
@@ -19,11 +26,18 @@ class MockProvider implements TransportProvider {
   deltaCallbacks: Array<(sid: string, d: MessageDelta) => void> = [];
   completeCallbacks: Array<(sid: string, m: AgentMessage) => void> = [];
   errorCallbacks: Array<(sid: string, e: ProviderError) => void> = [];
+  sessionInfoCallbacks: Array<(sid: string, info: SessionInfoUpdate) => void> = [];
 
   async connect(_config: ProviderConfig) {}
   async disconnect() {}
   async send(_sid: string, _msg: string) {}
-  async createSession(config: SessionConfig) { return config.sessionKey; }
+  async createSession(config: SessionConfig) {
+    const routeId = config.bindExistingKey ?? config.sessionKey;
+    for (const callback of this.sessionInfoCallbacks) {
+      callback(routeId, { resumeId: 'provider-native-session' });
+    }
+    return routeId;
+  }
   async endSession(_sid: string) {}
 
   onDelta(cb: (sid: string, d: MessageDelta) => void): () => void {
@@ -37,6 +51,13 @@ class MockProvider implements TransportProvider {
   onError(cb: (sid: string, e: ProviderError) => void): () => void {
     this.errorCallbacks.push(cb);
     return () => { const i = this.errorCallbacks.indexOf(cb); if (i >= 0) this.errorCallbacks.splice(i, 1); };
+  }
+  onSessionInfo(cb: (sid: string, info: SessionInfoUpdate) => void): () => void {
+    this.sessionInfoCallbacks.push(cb);
+    return () => {
+      const i = this.sessionInfoCallbacks.indexOf(cb);
+      if (i >= 0) this.sessionInfoCallbacks.splice(i, 1);
+    };
   }
 }
 
@@ -92,7 +113,24 @@ describe('Provider callback unsubscribe', () => {
 });
 
 describe('TransportSessionRuntime callback cleanup', () => {
-  it('kill() removes all 3 provider callbacks', async () => {
+  it('keeps session info emitted synchronously while createSession is resolving', async () => {
+    const provider = new MockProvider();
+    const { TransportSessionRuntime } = await import('../../src/agent/transport-session-runtime.js');
+    const runtime = new TransportSessionRuntime(provider, 'deck_test_brain');
+    const onSessionInfo = vi.fn();
+    runtime.onSessionInfoChange = onSessionInfo;
+
+    await runtime.initialize({
+      sessionKey: 'ephemeral-route',
+      bindExistingKey: 'persisted-route',
+    });
+
+    expect(runtime.providerSessionId).toBe('persisted-route');
+    expect(onSessionInfo).toHaveBeenCalledWith({ resumeId: 'provider-native-session' });
+    await runtime.kill();
+  });
+
+  it('kill() removes all provider callbacks', async () => {
     const provider = new MockProvider();
     const { TransportSessionRuntime } = await import('../../src/agent/transport-session-runtime.js');
     const runtime = new TransportSessionRuntime(provider, 'test-session');
@@ -100,12 +138,14 @@ describe('TransportSessionRuntime callback cleanup', () => {
     expect(provider.deltaCallbacks).toHaveLength(1);
     expect(provider.completeCallbacks).toHaveLength(1);
     expect(provider.errorCallbacks).toHaveLength(1);
+    expect(provider.sessionInfoCallbacks).toHaveLength(1);
 
     await runtime.kill();
 
     expect(provider.deltaCallbacks).toHaveLength(0);
     expect(provider.completeCallbacks).toHaveLength(0);
     expect(provider.errorCallbacks).toHaveLength(0);
+    expect(provider.sessionInfoCallbacks).toHaveLength(0);
   });
 
   it('creating and killing multiple runtimes cleans up correctly', async () => {

@@ -164,7 +164,16 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
-import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback, setSessionPersistCallback } from '../../src/agent/session-manager.js';
+import { openCodeSdkRuntimeHooks } from '../../src/agent/providers/opencode-sdk.js';
+import {
+  ensureTransportRuntimeAvailable,
+  getTransportRuntime,
+  launchTransportSession,
+  relaunchSessionWithSettings,
+  restoreTransportSessions,
+  setSessionEventCallback,
+  setSessionPersistCallback,
+} from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
@@ -184,6 +193,71 @@ import {
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 };
+
+const originalOpenCodeStart = openCodeSdkRuntimeHooks.start;
+
+function createOpenCodeRestoreHarness() {
+  const remoteSessions = new Map<string, Record<string, any>>();
+  let signal: AbortSignal | undefined;
+  const stream = {
+    async *[Symbol.asyncIterator]() {
+      if (signal?.aborted) return;
+      await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+    },
+  };
+  const client = {
+    session: {
+      create: vi.fn(async (options: any) => {
+        const session = {
+          id: 'unexpected-new-session',
+          title: options.body?.title ?? 'unexpected',
+        };
+        remoteSessions.set(session.id, session);
+        return { data: session };
+      }),
+      get: vi.fn(async (options: any) => {
+        const session = remoteSessions.get(String(options.path?.id));
+        if (!session) throw new Error('404 session not found');
+        return { data: session };
+      }),
+      list: vi.fn(async () => ({ data: [...remoteSessions.values()] })),
+      abort: vi.fn(async () => ({ data: true })),
+      prompt: vi.fn(),
+    },
+    provider: {
+      list: vi.fn(async () => ({
+        data: {
+          connected: ['opencode'],
+          default: { opencode: 'deepseek-v4-flash-free' },
+          all: [{
+            id: 'opencode',
+            name: 'OpenCode',
+            models: {
+              'deepseek-v4-flash-free': {
+                id: 'deepseek-v4-flash-free',
+                name: 'DeepSeek V4 Flash Free',
+                limit: { context: 128_000 },
+              },
+            },
+          }],
+        },
+      })),
+    },
+    event: {
+      subscribe: vi.fn(async () => ({ stream })),
+    },
+    permission: {
+      reply: vi.fn(async () => ({ data: true })),
+    },
+    postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+  };
+  const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
+  openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+    signal = options.signal;
+    return { client: client as any, server };
+  });
+  return { client, remoteSessions };
+}
 
 function claudeRunForSession(sessionName: string, prompt?: string) {
   return mocks.claudeRuns.find((run) => {
@@ -284,6 +358,7 @@ describe('sdk transport session restore', () => {
 
   afterEach(async () => {
     await disconnectAll();
+    openCodeSdkRuntimeHooks.start = originalOpenCodeStart;
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -334,6 +409,104 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('restores only the requested persisted transport session on demand', async () => {
+    const now = Date.now();
+    const makeStoredSession = (name: string, providerSessionId: string, ccSessionId: string) => ({
+      name,
+      projectName: 'sdkexactrestore',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: `/tmp/${name}`,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId,
+      ccSessionId,
+    });
+    mocks.store.set(
+      'deck_sdk_exact_target_brain',
+      makeStoredSession('deck_sdk_exact_target_brain', 'route-exact-target', 'cc-exact-target'),
+    );
+    mocks.store.set(
+      'deck_sdk_exact_other_brain',
+      makeStoredSession('deck_sdk_exact_other_brain', 'route-exact-other', 'cc-exact-other'),
+    );
+
+    await connectProvider('claude-code-sdk', {});
+    const [runtime, concurrentRuntime] = await Promise.all([
+      ensureTransportRuntimeAvailable('deck_sdk_exact_target_brain'),
+      ensureTransportRuntimeAvailable('deck_sdk_exact_target_brain'),
+    ]);
+
+    expect(runtime).toBeDefined();
+    expect(concurrentRuntime).toBe(runtime);
+    expect(runtime?.providerSessionId).toBe('route-exact-target');
+    expect(getTransportRuntime('deck_sdk_exact_target_brain')).toBe(runtime);
+    expect(getTransportRuntime('deck_sdk_exact_other_brain')).toBeUndefined();
+  });
+
+  it('recovers a legacy OpenCode conversation by one unique remote title instead of creating a new one', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    harness.remoteSessions.set('remote-monitor-session', {
+      id: 'remote-monitor-session',
+      title: '监控',
+      time: { updated: Date.now() },
+    });
+    const name = 'deck_service_monitor';
+    mocks.store.set(name, {
+      name,
+      label: '监控',
+      projectName: 'service',
+      role: 'w1',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/service-monitor',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'opencode-sdk',
+      providerSessionId: 'legacy-local-route',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    await connectProvider('opencode-sdk', {});
+    const runtime = await ensureTransportRuntimeAvailable(name);
+
+    expect(runtime?.providerSessionId).toBe('legacy-local-route');
+    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { id: 'remote-monitor-session' },
+    }));
+    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(mocks.store.get(name)?.providerResumeId).toBe('remote-monitor-session');
+  });
+
+  it('persists the provider-native OpenCode resume id on the first launch', async () => {
+    const harness = createOpenCodeRestoreHarness();
+    await connectProvider('opencode-sdk', {});
+
+    await launchTransportSession({
+      name: 'deck_opencode_new_brain',
+      projectName: 'opencodenew',
+      role: 'brain',
+      agentType: 'opencode-sdk',
+      projectDir: '/tmp/opencode-new',
+      label: 'New OpenCode session',
+      requestedModel: 'opencode/deepseek-v4-flash-free',
+    });
+
+    expect(harness.client.session.create).toHaveBeenCalledOnce();
+    expect(mocks.store.get('deck_opencode_new_brain')).toMatchObject({
+      providerSessionId: expect.any(String),
+      providerResumeId: 'unexpected-new-session',
+    });
   });
 
   it('persists transport runtime running status so session snapshots do not stay idle while tools run', async () => {

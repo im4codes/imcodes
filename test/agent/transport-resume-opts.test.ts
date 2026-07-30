@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { buildTransportResumeLaunchOpts, usesProviderResumeId } from '../../src/agent/transport-resume-opts.js';
+import {
+  buildTransportResumeLaunchOpts,
+  findLegacyProviderResumeId,
+  usesProviderResumeId,
+} from '../../src/agent/transport-resume-opts.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 function rec(overrides: Partial<SessionRecord>): SessionRecord {
@@ -70,5 +74,37 @@ describe('buildTransportResumeLaunchOpts', () => {
   it('preserves parentSession so a sub-session resumes attached to its parent', () => {
     expect(buildTransportResumeLaunchOpts(rec({ name: 'deck_sub_x', parentSession: 'deck_demo_brain' })))
       .toMatchObject({ parentSession: 'deck_demo_brain' });
+  });
+});
+
+describe('findLegacyProviderResumeId', () => {
+  it('prefers an exact persisted legacy id when it still exists remotely', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ providerSessionId: 'remote-exact', label: 'Monitor' }),
+      [
+        { key: 'remote-exact', displayName: 'Different title' },
+        { key: 'remote-other', displayName: 'Monitor' },
+      ],
+    )).toBe('remote-exact');
+  });
+
+  it('recovers one uniquely named legacy conversation', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ name: 'deck_service_monitor', label: 'Monitor', providerSessionId: 'local-route' }),
+      [
+        { key: 'remote-monitor', displayName: 'Monitor' },
+        { key: 'remote-worker', displayName: 'Worker' },
+      ],
+    )).toBe('remote-monitor');
+  });
+
+  it('fails closed when multiple remote conversations share the legacy label', () => {
+    expect(findLegacyProviderResumeId(
+      rec({ label: 'Monitor', providerSessionId: 'local-route' }),
+      [
+        { key: 'remote-monitor-1', displayName: 'Monitor' },
+        { key: 'remote-monitor-2', displayName: 'Monitor' },
+      ],
+    )).toBeUndefined();
   });
 });

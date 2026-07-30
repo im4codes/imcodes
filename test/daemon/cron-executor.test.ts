@@ -9,6 +9,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 vi.mock('../../src/agent/session-manager.js', () => ({
   sessionName: vi.fn((project: string, role: string) => `deck_${project}_${role}`),
   getTransportRuntime: vi.fn(),
+  ensureTransportRuntimeAvailable: vi.fn(),
 }));
 
 vi.mock('../../src/agent/detect.js', () => ({
@@ -48,7 +49,11 @@ vi.mock('../../src/util/logger.js', () => ({
 
 import { __setCronProcessCommandSenderForTests, executeCronJob } from '../../src/daemon/cron-executor.js';
 import { getSession } from '../../src/store/session-store.js';
-import { sessionName, getTransportRuntime } from '../../src/agent/session-manager.js';
+import {
+  ensureTransportRuntimeAvailable,
+  getTransportRuntime,
+  sessionName,
+} from '../../src/agent/session-manager.js';
 import { detectStatusAsync } from '../../src/agent/detect.js';
 import { sendKeys } from '../../src/agent/tmux.js';
 import { startP2pRun } from '../../src/daemon/p2p-orchestrator.js';
@@ -96,6 +101,7 @@ describe('executeCronJob', () => {
       (project: string, role: string) => `deck_${project}_${role}`,
     );
     timelineOn.mockReturnValue(() => {});
+    (ensureTransportRuntimeAvailable as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue(undefined);
     __setCronProcessCommandSenderForTests(cronProcessSendMock);
   });
 
@@ -263,7 +269,10 @@ describe('executeCronJob', () => {
 
   // 10. Transport session — skips busy check, calls runtime.send()
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {
-    const mockRuntime = { send: vi.fn().mockReturnValue('sent') };
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      send: vi.fn().mockReturnValue('sent'),
+    };
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
       makeSession({ runtimeType: 'transport' }),
     );
@@ -283,7 +292,10 @@ describe('executeCronJob', () => {
   });
 
   it('does not emit a user.message when a transport cron command is only queued', async () => {
-    const mockRuntime = { send: vi.fn().mockReturnValue('queued') };
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      send: vi.fn().mockReturnValue('queued'),
+    };
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
       makeSession({ runtimeType: 'transport' }),
     );
@@ -299,26 +311,79 @@ describe('executeCronJob', () => {
     );
   });
 
-  // 11. Transport session with disconnected provider — skips, logs warning
-  it('skips when transport provider is not connected', async () => {
+  // 11. Missing transport runtime — restores exact session before sending
+  it('restores a missing transport runtime before sending the cron command', async () => {
+    const mockRuntime = {
+      providerSessionId: 'restored-provider-session',
+      send: vi.fn().mockReturnValue('sent'),
+    };
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
-      makeSession({ runtimeType: 'transport' }),
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
     );
     (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
+    (ensureTransportRuntimeAvailable as ReturnType<typeof vi.fn>).mockResolvedValue(mockRuntime);
 
     await executeCronJob(makeMsg(), mockServerLink);
 
+    expect(ensureTransportRuntimeAvailable).toHaveBeenCalledOnce();
+    expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
+    expect(mockRuntime.send).toHaveBeenCalledOnce();
+    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
     expect(sendKeys).not.toHaveBeenCalled();
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ sessionName: 'deck_myapp_brain' }),
-      expect.stringContaining('not connected'),
+    expect(mockServerLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      status: 'error',
+    }));
+  });
+
+  it('replaces an unbound transport runtime before sending the cron command', async () => {
+    const unboundRuntime = { send: vi.fn().mockReturnValue('sent') };
+    const restoredRuntime = {
+      providerSessionId: 'restored-provider-session',
+      send: vi.fn().mockReturnValue('sent'),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
     );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(unboundRuntime);
+    (ensureTransportRuntimeAvailable as ReturnType<typeof vi.fn>).mockResolvedValue(restoredRuntime);
+
+    await executeCronJob(makeMsg(), mockServerLink);
+
+    expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
+    expect(unboundRuntime.send).not.toHaveBeenCalled();
+    expect(restoredRuntime.send).toHaveBeenCalledOnce();
+    expect(restoredRuntime.send).toHaveBeenCalledWith('review the codebase');
+  });
+
+  it('reports an error only after on-demand transport recovery fails', async () => {
+    const restoreError = new Error('provider restart failed');
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
+    (ensureTransportRuntimeAvailable as ReturnType<typeof vi.fn>).mockRejectedValue(restoreError);
+
+    await executeCronJob(makeMsg(), mockServerLink);
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionName: 'deck_myapp_brain', err: restoreError }),
+      expect.stringContaining('runtime restore failed'),
+    );
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      status: 'error',
+      detail: expect.stringContaining('provider restart failed'),
+    }));
   });
 
   // 12. Transport session send throws — logs error, doesn't crash
   it('logs error when transport send throws but does not crash', async () => {
     const sendError = new Error('provider timeout');
-    const mockRuntime = { send: vi.fn().mockRejectedValue(sendError) };
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      send: vi.fn().mockRejectedValue(sendError),
+    };
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
       makeSession({ runtimeType: 'transport' }),
     );

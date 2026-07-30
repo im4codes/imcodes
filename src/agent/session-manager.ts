@@ -8,11 +8,19 @@ import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
 import { isTransportAgent } from './detect.js';
-import { buildTransportResumeLaunchOpts, usesProviderResumeId } from './transport-resume-opts.js';
+import {
+  buildTransportResumeLaunchOpts,
+  findLegacyProviderResumeId,
+  usesProviderResumeId,
+} from './transport-resume-opts.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
-import { PROVIDER_ERROR_CODES, type SessionInfoUpdate } from './transport-provider.js';
+import {
+  PROVIDER_ERROR_CODES,
+  type RemoteSessionInfo,
+  type SessionInfoUpdate,
+} from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
@@ -1748,8 +1756,14 @@ function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpda
   return changed;
 }
 
-function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName: string, agentType: string): void {
+function wireTransportSessionInfo(
+  runtime: TransportSessionRuntime,
+  sessionName: string,
+  agentType: string,
+): () => SessionInfoUpdate | undefined {
+  let latestInfo: SessionInfoUpdate | undefined;
   runtime.onSessionInfoChange = (info) => {
+    latestInfo = { ...(latestInfo ?? {}), ...info };
     const existing = getSession(sessionName);
     if (!existing) return;
     const next: SessionRecord = { ...existing };
@@ -1838,6 +1852,7 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
     upsertSession(next);
     emitSessionPersist(next, sessionName);
   };
+  return () => latestInfo ? { ...latestInfo } : undefined;
 }
 
 /** providerSessionId → IM.codes sessionName routing map */
@@ -2092,12 +2107,20 @@ async function reconcileTimelineRestoreOrphanSdkSubagents(sessionName: string, r
  * Called after provider auto-reconnect succeeds (restoreFromStore runs before provider connects).
  * Skips sessions that already have a runtime (rebuilt by oc-session-sync).
  */
+const transportSessionRestoreInFlight = new Map<string, Promise<void>>();
+
 export async function restoreTransportSessions(
   providerId: string,
-  options: { onlyWithPendingResend?: boolean; concurrency?: number; interSessionDelayMs?: number } = {},
+  options: {
+    onlyWithPendingResend?: boolean;
+    sessionName?: string;
+    concurrency?: number;
+    interSessionDelayMs?: number;
+  } = {},
 ): Promise<void> {
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
+  let remoteSessionsPromise: Promise<RemoteSessionInfo[]> | undefined;
   const restoreConcurrency = Number.isFinite(options.concurrency) && (options.concurrency ?? 0) >= 1
     ? Math.trunc(options.concurrency!)
     : TRANSPORT_RESTORE_CONCURRENCY;
@@ -2119,6 +2142,7 @@ export async function restoreTransportSessions(
     isStoredTransportSession(s)
     && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
+    && (!options.sessionName || s.name === options.sessionName)
     && (!options.onlyWithPendingResend || getResendCount(s.name) > 0),
   ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
   const restoreOne = async (s: Restorable, index: number): Promise<void> => {
@@ -2137,6 +2161,37 @@ export async function restoreTransportSessions(
     try {
       const provider = getProvider(s.providerId);
       if (!provider) return;
+      if (usesProviderResumeId(s.providerId) && !s.providerResumeId) {
+        if (!provider.listSessions) {
+          logger.warn({
+            session: s.name,
+            providerId: s.providerId,
+          }, 'Transport restore requires a durable provider id but the provider cannot list sessions');
+          return;
+        }
+        remoteSessionsPromise ??= provider.listSessions();
+        const remoteSessions = await remoteSessionsPromise;
+        const recoveredResumeId = findLegacyProviderResumeId(s, remoteSessions);
+        if (!recoveredResumeId) {
+          logger.warn({
+            session: s.name,
+            providerId: s.providerId,
+            label: s.label,
+          }, 'Transport restore could not identify one exact legacy provider session; refusing to start a fresh conversation');
+          return;
+        }
+        s.providerResumeId = recoveredResumeId;
+        const current = getSession(s.name);
+        if (current) {
+          const recoveredRecord = {
+            ...current,
+            providerResumeId: recoveredResumeId,
+            updatedAt: Date.now(),
+          };
+          upsertSession(recoveredRecord);
+          emitSessionPersist(recoveredRecord, s.name);
+        }
+      }
       let availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
@@ -2152,7 +2207,7 @@ export async function restoreTransportSessions(
       }
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
-      wireTransportSessionInfo(runtime, s.name, s.agentType);
+      const getLatestSessionInfo = wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const freshAfterInterruptedCodexRestore = shouldStartFreshCodexThreadAfterInterruptedRestore(s);
@@ -2271,6 +2326,7 @@ export async function restoreTransportSessions(
         // conversation already has its history preamble and we must not repeat it.
         startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
       });
+      const latestSessionInfo = getLatestSessionInfo();
       if (s.description) runtime.setDescription(s.description);
       if (systemPrompt) runtime.setSystemPrompt(systemPrompt);
       runtime.setSessionIdentity(s.name, s.label);
@@ -2294,6 +2350,9 @@ export async function restoreTransportSessions(
         ...(freshOnRestore ? { summarySyncFingerprints: undefined } : {}),
         ...(freshQoderRestore
           ? { providerResumeId: undefined }
+          : {}),
+        ...(!freshQoderRestore && usesProviderResumeId(s.providerId) && latestSessionInfo?.resumeId
+          ? { providerResumeId: latestSessionInfo.resumeId }
           : {}),
         ...((freshOnRestore || s.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
@@ -2410,7 +2469,23 @@ export async function restoreTransportSessions(
     concurrency: restoreConcurrency,
     interSessionDelayMs: restoreInterSessionDelayMs,
   }, 'Restoring transport session runtimes');
-  await mapWithConcurrency(pending, restoreConcurrency, restoreOne);
+  const restoreOneCoalesced = async (session: Restorable, index: number): Promise<void> => {
+    const existing = transportSessionRestoreInFlight.get(session.name);
+    if (existing) {
+      await existing;
+      return;
+    }
+    const restore = restoreOne(session, index);
+    transportSessionRestoreInFlight.set(session.name, restore);
+    try {
+      await restore;
+    } finally {
+      if (transportSessionRestoreInFlight.get(session.name) === restore) {
+        transportSessionRestoreInFlight.delete(session.name);
+      }
+    }
+  };
+  await mapWithConcurrency(pending, restoreConcurrency, restoreOneCoalesced);
   logger.info({ providerId, count: pending.length }, 'Transport session runtime restore completed');
 }
 
@@ -2478,7 +2553,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
 
   const runtime = new TransportSessionRuntime(provider, name);
   wireTransportCallbacks(runtime, name);
-  wireTransportSessionInfo(runtime, name, agentType);
+  const getLatestSessionInfo = wireTransportSessionInfo(runtime, name, agentType);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
@@ -2671,6 +2746,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         effort: opts.effort,
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
       });
+  const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
   transportRuntimes.set(name, runtime);
@@ -2692,8 +2768,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...(usesProviderResumeId(agentType) && transportResumeId
-          ? { providerResumeId: transportResumeId }
+        ...(usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
+          ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
@@ -2769,7 +2845,65 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   await drainTransportResendQueueIntoRuntime(runtime, name, 'launch');
 }
 
-const pendingResendRelaunches = new Set<string>();
+const transportRuntimeRecoveries = new Map<string, Promise<void>>();
+
+/**
+ * Ensure one persisted transport session has a live provider-bound runtime.
+ *
+ * Unlike the bulk startup warm restore, this is an on-demand, session-scoped
+ * recovery path for work that cannot wait for every provider/session ahead of
+ * it in the startup queue. Concurrent callers await the same recovery instead
+ * of observing the missing runtime and failing or launching duplicates.
+ */
+export async function ensureTransportRuntimeAvailable(
+  sessionName: string,
+): Promise<TransportSessionRuntime | undefined> {
+  const existing = getTransportRuntime(sessionName);
+  if (existing?.providerSessionId) return existing;
+
+  let recovery = transportRuntimeRecoveries.get(sessionName);
+  if (!recovery) {
+    recovery = (async () => {
+      const record = getSession(sessionName);
+      if (!record || !isTransportAgent(record.agentType as AgentType)) return;
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime?.providerSessionId) return;
+      if (runtime) {
+        // Registered but unbound (half-dead — e.g. post-cancel / mid-init
+        // error): preserve queued work before replacing it.
+        const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
+        if (preservation.preservedCount > 0) {
+          logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before on-demand recovery');
+        }
+        await stopTransportRuntimeSession(sessionName, {
+          preserveTransportQueue: preservation.preservedCount > 0,
+        }).catch(() => {});
+      }
+      const providerId = record.providerId ?? record.agentType;
+      await ensureProviderConnected(providerId, {});
+      if (record.providerSessionId) {
+        await restoreTransportSessions(providerId, {
+          sessionName,
+          concurrency: 1,
+          interSessionDelayMs: 0,
+        });
+      } else {
+        await launchTransportSession(buildTransportResumeLaunchOpts(record));
+      }
+    })();
+    transportRuntimeRecoveries.set(sessionName, recovery);
+  }
+
+  try {
+    await recovery;
+  } finally {
+    if (transportRuntimeRecoveries.get(sessionName) === recovery) {
+      transportRuntimeRecoveries.delete(sessionName);
+    }
+  }
+  const restored = getTransportRuntime(sessionName);
+  return restored?.providerSessionId ? restored : undefined;
+}
 
 /**
  * Ensure a transport session that has NO live, provider-bound runtime gets
@@ -2790,27 +2924,10 @@ const pendingResendRelaunches = new Set<string>();
  * success) is the final concurrency guard.
  */
 export async function ensureTransportRuntimeForPendingResend(sessionName: string): Promise<void> {
-  if (pendingResendRelaunches.has(sessionName)) return;
-  const record = getSession(sessionName);
-  if (!record || !isTransportAgent(record.agentType as AgentType)) return;
-  const runtime = getTransportRuntime(sessionName);
-  if (runtime && runtime.providerSessionId) return; // already bound — nothing to recover
-  pendingResendRelaunches.add(sessionName);
   try {
-    if (runtime) {
-      // Registered but unbound (half-dead — e.g. post-cancel / mid-init error):
-      // preserve its queued work into resend and stop it before relaunch.
-      const preservation = preserveTransportRuntimeQueuesToResend(sessionName, runtime);
-      if (preservation.preservedCount > 0) {
-        logger.info({ sessionName, ...preservation }, 'preserved transport runtime queues before pending-resend relaunch');
-      }
-      await stopTransportRuntimeSession(sessionName, { preserveTransportQueue: preservation.preservedCount > 0 }).catch(() => {});
-    }
-    await launchTransportSession(buildTransportResumeLaunchOpts(record));
+    await ensureTransportRuntimeAvailable(sessionName);
   } catch (err) {
     logger.error({ err, sessionName }, 'ensureTransportRuntimeForPendingResend failed');
-  } finally {
-    pendingResendRelaunches.delete(sessionName);
   }
 }
 

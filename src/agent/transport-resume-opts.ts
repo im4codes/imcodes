@@ -1,6 +1,7 @@
 import type { LaunchOpts } from './session-manager.js';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AgentType } from './detect.js';
+import type { RemoteSessionInfo } from './transport-provider.js';
 
 /** Providers whose durable conversation id is stored in SessionRecord.providerResumeId. */
 export function usesProviderResumeId(agentType: string | undefined): boolean {
@@ -9,6 +10,38 @@ export function usesProviderResumeId(agentType: string | undefined): boolean {
     || agentType === 'kimi-sdk'
     || agentType === 'grok-sdk'
     || agentType === 'opencode-sdk';
+}
+
+/**
+ * Recover a durable provider id for records created before providerResumeId
+ * was persisted reliably. Prefer an exact legacy id match; otherwise accept
+ * only one uniquely named remote conversation. Ambiguity fails closed so a
+ * daemon restart can never attach the cron/send path to the wrong history.
+ */
+export function findLegacyProviderResumeId(
+  record: Pick<SessionRecord, 'name' | 'label' | 'providerSessionId'>,
+  remoteSessions: readonly RemoteSessionInfo[],
+): string | undefined {
+  const legacyId = record.providerSessionId?.trim();
+  if (legacyId && remoteSessions.some((session) => session.key === legacyId)) {
+    return legacyId;
+  }
+
+  const names = new Set(
+    [record.label, record.name]
+      .map((value) => value?.trim())
+      .filter((value): value is string => !!value),
+  );
+  if (names.size === 0) return undefined;
+  const matches = new Set(
+    remoteSessions
+      .filter((session) => {
+        const displayName = session.displayName?.trim();
+        return !!displayName && names.has(displayName);
+      })
+      .map((session) => session.key),
+  );
+  return matches.size === 1 ? [...matches][0] : undefined;
 }
 
 /**
