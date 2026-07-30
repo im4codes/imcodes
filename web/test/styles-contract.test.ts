@@ -58,6 +58,10 @@ describe('styles.css regression contracts', () => {
     expect(continuationRule).not.toBeNull();
     expect(continuationRule![0]).toMatch(/white-space:\s*pre-wrap/);
     expect(continuationRule![0]).toMatch(/word-break:\s*break-word/);
+
+    const collapsedContinuationRule = css.match(/\.chat-tool-block-fold\.is-collapsed \.chat-tool-fold-continuation\s*\{[^}]*\}/);
+    expect(collapsedContinuationRule).not.toBeNull();
+    expect(collapsedContinuationRule![0]).toMatch(/display:\s*none/);
   });
 
   it('fits portrait videos by available preview height without stretching them to full width', () => {

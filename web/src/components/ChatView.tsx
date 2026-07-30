@@ -206,12 +206,21 @@ function formatMemoryContextScore(score: number | undefined): string | null {
   return score >= 1 ? score.toFixed(2) : score.toFixed(3);
 }
 
-function formatMemoryContextTimestamp(ts: number | undefined): string | null {
-  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
-  return new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+type I18nLocaleSource = {
+  resolvedLanguage?: string;
+  language?: string;
+};
+
+function resolveI18nLocale(i18n: I18nLocaleSource | undefined): string | undefined {
+  return i18n?.resolvedLanguage || i18n?.language || undefined;
 }
 
-export function formatChatDateTime(ts: number, now = Date.now()): string {
+function formatMemoryContextTimestamp(ts: number | undefined, locale?: string): string | null {
+  if (typeof ts !== 'number' || !Number.isFinite(ts)) return null;
+  return new Date(ts).toLocaleString(locale, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+export function formatChatDateTime(ts: number, now = Date.now(), locale?: string): string {
   const date = new Date(ts);
   const today = new Date(now);
   const timeOptions: Intl.DateTimeFormatOptions = {
@@ -223,8 +232,8 @@ export function formatChatDateTime(ts: number, now = Date.now()): string {
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
   return isToday
-    ? date.toLocaleTimeString([], timeOptions)
-    : date.toLocaleString([], { month: 'short', day: 'numeric', ...timeOptions });
+    ? date.toLocaleTimeString(locale, timeOptions)
+    : date.toLocaleString(locale, { month: 'short', day: 'numeric', ...timeOptions });
 }
 
 type MemoryContextSection =
@@ -1343,7 +1352,8 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
 }
 
 export function ChatView({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onQuote, agentType: _agentType, onResendFailed, onForceSync }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -2743,7 +2753,7 @@ export function ChatView({ events, loading, refreshing = false, historyStatus, l
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
-              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts)}</span>
+              <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
             <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
           </div>
@@ -3410,7 +3420,8 @@ const ChatEvent = memo(function ChatEvent({
   onResendFailed?: (commandId: string, text: string) => void;
   showTime?: boolean;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
@@ -3564,7 +3575,7 @@ const ChatEvent = memo(function ChatEvent({
                 <span class="chat-tool-name">{toolName}</span>
                 {toolInputFirstLine && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInputFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>}
                 {isMerged && <span class={`chat-tool-state${toolFailed ? ' is-failed' : ' is-complete'}`} aria-hidden="true">{toolFailed ? '×' : '✓'}</span>}
-                {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
+                {shouldShowTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
               </div>
               {toolInputRemainingLines !== null && (
                 <div class="chat-event chat-tool chat-tool-fold-continuation">
@@ -3621,7 +3632,7 @@ const ChatEvent = memo(function ChatEvent({
                   <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
                 </button>
                 <span class={resultClass}>{splitPathsAndUrls(resultFirstLine, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'))}</span>
-                {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>}
+                {showTime && <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>}
               </div>
               {resultRemainingLines !== null && (
                 <div class="chat-event chat-tool chat-tool-fold-continuation">
@@ -3675,7 +3686,7 @@ const ChatEvent = memo(function ChatEvent({
         <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
           <span>{displayLabel}</span>
           {inline
-            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts)}</span>
+            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{formatChatDateTime(event.ts, Date.now(), locale)}</span>
             : <ChatTime ts={event.ts} />}
         </div>
       );
@@ -3923,7 +3934,8 @@ function CoarseFilePatch({ patch }: { patch: FileChangePatch }) {
 }
 
 const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: TimelineEvent }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [expanded, setExpanded] = useState(false);
   const payload = event.payload as unknown as MemoryContextTimelinePayload;
   const items = Array.isArray(payload.items) ? payload.items as MemoryContextTimelineItem[] : [];
@@ -4011,7 +4023,7 @@ const MemoryContextEvent = memo(function MemoryContextEvent({ event }: { event: 
                   </div>
                 )) : section.items.map((item) => {
                   const score = formatMemoryContextScore(item.relevanceScore);
-                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt);
+                  const recalledAt = formatMemoryContextTimestamp(item.lastUsedAt, locale);
                   return (
                     <div key={item.id} class="chat-memory-context-item">
                       <div class="chat-memory-context-item-summary">{item.summary}</div>
@@ -4112,9 +4124,10 @@ function UserMessageText({
 }
 
 const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
+  const { i18n } = useTranslation();
   return (
     <div class="chat-bubble-time">
-      {formatChatDateTime(ts)}
+      {formatChatDateTime(ts, Date.now(), resolveI18nLocale(i18n))}
     </div>
   );
 });

@@ -85,6 +85,19 @@ describe('formatChatDateTime', () => {
       second: '2-digit',
     }));
   });
+
+  it('formats dates with the active i18n locale instead of the system locale', () => {
+    const ts = new Date(2026, 6, 10, 17, 50, 9).getTime();
+    const formatted = formatChatDateTime(ts, now, 'zh-CN');
+    expect(formatted).toBe(new Date(ts).toLocaleString('zh-CN', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }));
+    expect(formatted).not.toMatch(/\bJul\b/i);
+  });
 });
 
 vi.mock('react-i18next', () => ({

@@ -3248,6 +3248,9 @@ html.native-ios-mac .chat-dl-btn {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.chat-tool-block-fold.is-collapsed .chat-tool-fold-continuation {
+  display: none;
+}
 .chat-tool-block-fold-content::-webkit-scrollbar,
 .chat-tool-block-fold.is-collapsed .chat-tool::-webkit-scrollbar { width: 5px; height: 3px; }
 .chat-tool-block-fold-content::-webkit-scrollbar-track,
