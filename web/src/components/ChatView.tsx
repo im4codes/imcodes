@@ -429,6 +429,33 @@ function summarizeToolInput(
   return formatToolPayloadValue(rawRecord.input);
 }
 
+function summarizeToolCommand(
+  value: unknown,
+  depth = 0,
+  seen = new WeakSet<object>(),
+): string {
+  if (!value || depth > 5 || typeof value !== 'object') return '';
+  if (seen.has(value)) return '';
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const command = summarizeToolCommand(item, depth + 1, seen);
+      if (command) return command;
+    }
+    return '';
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ['command', 'cmd'] as const) {
+    const command = formatToolPayloadValue(record[key]);
+    if (command) return command;
+  }
+  for (const key of ['input', 'args', 'raw', 'detail', '_callDetail', '_resultDetail'] as const) {
+    const command = summarizeToolCommand(record[key], depth + 1, seen);
+    if (command) return command;
+  }
+  return '';
+}
+
 function isGenericWebSearchLabel(value: string | undefined): boolean {
   if (!value) return false;
   return /^\((?:other|open_page|find_in_page|search|web_search)\)$/i.test(value.trim());
@@ -3607,7 +3634,9 @@ const ChatEvent = memo(function ChatEvent({
       const error = event.payload.error;
       const output = formatToolOutputPreview(event.payload.output) ?? '';
       const detail = event.payload.detail;
-      const resultText = error ? `error: ${String(error)}` : output || 'done';
+      const command = summarizeToolCommand(event.payload);
+      const completedText = command ? `done · ${command}` : 'done';
+      const resultText = error ? `error: ${String(error)}` : output || completedText;
       const {
         firstLine: resultFirstLine,
         remainingLines: resultRemainingLines,

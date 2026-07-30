@@ -107,6 +107,37 @@ describe('ChatView tool payload formatting', () => {
     expect(fold?.classList.contains('is-collapsed')).toBe(true);
   });
 
+  it('shows the completed command when a standalone result has no output', () => {
+    const command = '/bin/zsh -lc "ssh root@example.test docker logs app | tail -n 120"';
+    const events = [
+      makeEvent({
+        type: 'tool.result',
+        payload: {
+          detail: {
+            meta: {
+              status: 'completed',
+              exitCode: 0,
+              durationMs: 564,
+            },
+            raw: {
+              type: 'commandExecution',
+              id: 'exec-command-done',
+              command,
+              cwd: '/tmp/project',
+              processId: '50746',
+            },
+          },
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const header = container.querySelector('.chat-tool-result-row .chat-tool-output');
+    expect(header?.textContent).toBe(`done · ${command}`);
+    expect(header?.textContent).not.toBe('done');
+  });
+
   it('hides meaningless empty object tool inputs', () => {
     const events = [
       makeEvent({
