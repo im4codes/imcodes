@@ -311,6 +311,30 @@ describe('styles.css regression contracts', () => {
     expect(panelRule![0]).toMatch(/overflow:\s*auto/);
   });
 
+  it('keeps full-screen mobile work surfaces above the persistent server bar', () => {
+    const rootRule = css.match(/:root\s*\{[^}]*\}/);
+    expect(rootRule).not.toBeNull();
+    expect(rootRule![0]).toMatch(/--mobile-server-bar-z:\s*6500/);
+    expect(rootRule![0]).toMatch(/--mobile-fullscreen-window-z:\s*7000/);
+    expect(rootRule![0]).toMatch(/--mobile-fullscreen-preview-z:\s*7001/);
+
+    const sidebarRule = css.match(/\.mobile-sidebar-overlay\s*\{[^}]*\}/);
+    expect(sidebarRule).not.toBeNull();
+    expect(sidebarRule![0]).toMatch(/z-index:\s*var\(--mobile-fullscreen-window-z\)/);
+
+    const fileOverlayRule = Array.from(css.matchAll(/\.mobile-fb-overlay\s*\{[^}]*\}/g))
+      .map((match) => match[0])
+      .find((rule) => /position:\s*fixed/.test(rule));
+    expect(fileOverlayRule).toBeDefined();
+    expect(fileOverlayRule).toMatch(/z-index:\s*var\(--mobile-fullscreen-window-z\)/);
+
+    const previewRule = Array.from(css.matchAll(/\.fb-body-split \.fb-preview\s*\{[^}]*\}/g))
+      .map((match) => match[0])
+      .find((rule) => /position:\s*fixed/.test(rule));
+    expect(previewRule).toBeDefined();
+    expect(previewRule).toMatch(/z-index:\s*var\(--mobile-fullscreen-preview-z\)/);
+  });
+
   it('sub-session close-all control stays a narrow strip at the left of the row', () => {
     const rowRule = css.match(/\.subsession-row-with-close\s*\{[^}]*\}/);
     expect(rowRule).not.toBeNull();
@@ -456,7 +480,7 @@ describe('styles.css regression contracts', () => {
       .find((rule) => /gap:\s*8px/.test(rule));
     expect(barRule).not.toBeNull();
     expect(barRule!).toMatch(/gap:\s*8px/);
-    expect(barRule!).toMatch(/z-index:\s*6500/);
+    expect(barRule!).toMatch(/z-index:\s*var\(--mobile-server-bar-z\)/);
 
     const backdropRule = css.match(/\.mobile-server-backdrop\s*\{[^}]*\}/);
     expect(backdropRule).not.toBeNull();

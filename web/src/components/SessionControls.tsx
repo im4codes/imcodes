@@ -4350,7 +4350,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   return (
     <>
-    {mobileFileBrowserOpen && ws && activeSession && (
+    {mobileFileBrowserOpen && ws && activeSession && createPortal(
       <div class="mobile-fb-overlay" ref={swipeBackRef}>
         <div class="mobile-fb-header">
           <span style={{ fontSize: 13, fontWeight: 600 }}>📁 Files</span>
@@ -4375,7 +4375,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           }}
           onClose={onMobileFileBrowserClose}
         />
-      </div>
+      </div>,
+      document.body,
     )}
     {openSpecFolderPath && ws && activeSession && (
       <div class="fb-overlay openspec-folder-overlay" onClick={() => setOpenSpecFolderPath(null)}>

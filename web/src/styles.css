@@ -15,6 +15,12 @@ html { position: fixed; }
   --chrome-accent-2: #34d399;
   --chrome-accent-3: #a78bfa;
   --chrome-warm: #f59e0b;
+  /* Mobile layer contract: persistent navigation stays above session windows,
+     while full-screen work surfaces must cover the navigation instead of
+     rendering their headers underneath it. */
+  --mobile-server-bar-z: 6500;
+  --mobile-fullscreen-window-z: 7000;
+  --mobile-fullscreen-preview-z: 7001;
   --imcodes-app-font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
   --imcodes-app-cjk-font-family: 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
 }
@@ -2971,7 +2977,7 @@ html.native-ios-mac .chat-dl-btn {
      here. */
   /* Keep server selection above sub-session windows (6000), but below
      full-screen mobile panels (7000+) and system dialogs (9999+). */
-  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: 6500; }
+  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: var(--mobile-server-bar-z); }
   .mobile-server-bar::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.72), rgba(52,211,153,0.55), transparent); pointer-events: none; }
   .mobile-sidebar-toggle { display: block; width: 36px; height: 36px; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 10px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
@@ -3000,7 +3006,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 
 /* Mobile sidebar overlay — always mounted, shown/hidden via .open class */
-.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0); pointer-events: none; transition: background 0.25s ease; }
+.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-window-z); background: rgba(0,0,0,0); pointer-events: none; transition: background 0.25s ease; }
 .mobile-sidebar-overlay.open { pointer-events: auto; background: rgba(0,0,0,0.5); }
 .mobile-sidebar-panel { position: absolute; top: 0; left: 0; width: 88%; max-width: 360px; height: var(--vvh, 100%); background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.024) 22px 23px), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-right: 1px solid rgba(34,211,238,0.18); display: flex; flex-direction: column; box-shadow: 8px 0 28px rgba(0,0,0,0.48); transform: translateX(-100%); transition: transform 0.25s cubic-bezier(0.4,0,0.2,1); }
 .mobile-sidebar-overlay.open .mobile-sidebar-panel { transform: translateX(0); }
@@ -5383,15 +5389,16 @@ html.native-ios-mac .chat-dl-btn {
 }
 .html-fullscreen-preview-error { color: #dc2626; }
 .fb-modal-wide { width: min(92vw, 900px) !important; }
-.mobile-fb-overlay { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; }
+.mobile-fb-overlay { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-window-z); background: #0f172a; display: flex; flex-direction: column; }
 .mobile-fb-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .fb-preview-back { display: none; background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 16px; padding: 2px 6px 2px 0; line-height: 1; }
 .fb-preview-back:hover { color: #e2e8f0; }
 @media (max-width: 640px) {
+  .fb-overlay { z-index: var(--mobile-fullscreen-window-z); }
   .fb-breadcrumb-seg { max-width: 11ch; }
   .fb-breadcrumb-seg.active { max-width: 16ch; }
   .fb-body-split > .fb-tree { display: none; }
-  .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; width: 100%; height: 100%; }
+  .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-preview-z); background: #0f172a; display: flex; flex-direction: column; width: 100%; height: 100%; }
   .fb-preview-back { display: block; }
   .fb-modal-wide { width: min(96vw, 900px) !important; }
 }
