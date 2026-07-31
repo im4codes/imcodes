@@ -298,7 +298,7 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@keyframes daemon-clock-tick/);
   });
 
-  it('keeps the mobile daemon details as a fixed dismissible overlay', () => {
+  it('keeps daemon details as a fixed dismissible overlay on every layout', () => {
     const backdropRule = css.match(/\.daemon-details-backdrop\s*\{[^}]*\}/);
     expect(backdropRule).not.toBeNull();
     expect(backdropRule![0]).toMatch(/position:\s*fixed/);
@@ -309,6 +309,11 @@ describe('styles.css regression contracts', () => {
     expect(panelRule).not.toBeNull();
     expect(panelRule![0]).toMatch(/max-height:\s*min\(82dvh,\s*680px\)/);
     expect(panelRule![0]).toMatch(/overflow:\s*auto/);
+
+    const triggerRule = css.match(/\.daemon-stats-trigger\s*\{[^}]*\}/);
+    expect(triggerRule).not.toBeNull();
+    expect(triggerRule![0]).toMatch(/appearance:\s*none/);
+    expect(triggerRule![0]).toMatch(/cursor:\s*pointer/);
   });
 
   it('keeps full-screen mobile work surfaces above the persistent server bar', () => {

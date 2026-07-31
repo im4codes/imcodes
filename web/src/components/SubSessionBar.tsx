@@ -551,9 +551,6 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     return () => document.removeEventListener('keydown', closeOnEscape);
   }, [showDaemonDetails]);
 
-  useEffect(() => {
-    if (desktopLayoutCapable) setShowDaemonDetails(false);
-  }, [desktopLayoutCapable]);
   const gestureCallbacksRef = useRef({
     onOpen,
     onFocus,
@@ -1107,7 +1104,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
-              <span class="daemon-stats-inline daemon-stats-inline-tech" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
+              <button
+                type="button"
+                class="daemon-stats-inline daemon-stats-inline-tech daemon-stats-trigger"
+                title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+                onClick={() => setShowDaemonDetails(true)}
+                aria-haspopup="dialog"
+                aria-label={t('subsessionBar.daemon_details_open')}
+              >
                 {stats.daemonVersion && (
                   <>
                     {/* Display the short form (strips trailing -dev.NNN counter); the
@@ -1115,15 +1119,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     {desktopLayoutCapable ? (
                       <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)}</span>
                     ) : (
-                      <button
-                        type="button"
-                        class="daemon-stat-version daemon-stat-version-button"
-                        onClick={() => setShowDaemonDetails(true)}
-                        aria-haspopup="dialog"
-                        aria-label={t('subsessionBar.daemon_details_open')}
-                      >
+                      <span class="daemon-stat-version daemon-stat-version-chip">
                         {formatDaemonVersionMobile(stats.daemonVersion)}
-                      </button>
+                      </span>
                     )}
                     <span class="daemon-stat-sep"> · </span>
                   </>
@@ -1163,7 +1161,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
                   </>
                 )}
-              </span>
+              </button>
             )}
           </>
         )}
@@ -1177,20 +1175,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
-            <span class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`} title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}>
+            <button
+              type="button"
+              class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact daemon-stats-trigger${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`}
+              title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+              onClick={() => setShowDaemonDetails(true)}
+              aria-haspopup="dialog"
+              aria-label={t('subsessionBar.daemon_details_open')}
+            >
               {/* Mobile-narrow stat strip — show short version; full string in title above. */}
               {stats.daemonVersion && (desktopLayoutCapable ? (
                 <span class="daemon-stat-version">v{formatDaemonVersionShort(stats.daemonVersion)} </span>
               ) : (
-                <button
-                  type="button"
-                  class="daemon-stat-version daemon-stat-version-button"
-                  onClick={() => setShowDaemonDetails(true)}
-                  aria-haspopup="dialog"
-                  aria-label={t('subsessionBar.daemon_details_open')}
-                >
+                <span class="daemon-stat-version daemon-stat-version-chip">
                   {formatDaemonVersionMobile(stats.daemonVersion)}
-                </button>
+                </span>
               ))}
               <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
@@ -1209,7 +1208,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   <span class="daemon-local-clock">{renderTechClock(localClockText)}</span>
                 </>
               )}
-            </span>
+            </button>
           );
         })()}
         {onNew && (
@@ -1542,7 +1541,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           </div>
         </div>
       )}
-      {showDaemonDetails && isMobile && stats && (
+      {showDaemonDetails && stats && (
         <DaemonStatsModal
           stats={stats}
           localClockText={localClockText}

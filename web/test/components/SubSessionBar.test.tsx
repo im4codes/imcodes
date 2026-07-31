@@ -255,7 +255,7 @@ describe('SubSessionBar', () => {
     expect(view.container.querySelector('.daemon-local-clock')).toBeNull();
   });
 
-  it('opens the complete daemon status from the mobile version and closes from the backdrop', async () => {
+  it('opens the complete daemon status from the whole mobile status region and closes from the backdrop', async () => {
     const statsWs = makeStatsWs();
     const view = render(
       <SubSessionBar
@@ -286,7 +286,11 @@ describe('SubSessionBar', () => {
       });
     });
 
-    fireEvent.click(view.getByRole('button', { name: 'Show daemon details' }));
+    const trigger = view.getByRole('button', { name: 'Show daemon details' });
+    expect(trigger.classList.contains('daemon-stats-inline')).toBe(true);
+    expect(trigger.textContent).toContain('2%');
+    expect(trigger.querySelector('button')).toBeNull();
+    fireEvent.click(trigger);
 
     const dialog = view.getByRole('dialog', { name: 'Daemon status' });
     expect(dialog.textContent).toContain('v2026.5.2161-dev.7');
@@ -305,6 +309,39 @@ describe('SubSessionBar', () => {
 
     fireEvent.click(view.getByTestId('daemon-details-backdrop'));
     expect(view.queryByRole('dialog', { name: 'Daemon status' })).toBeNull();
+  });
+
+  it.each([true, false])('opens daemon details from the entire desktop status region when collapsed=%s', async (collapsed) => {
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={collapsed}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit(daemonStatsMessage);
+    });
+
+    const trigger = view.getByRole('button', { name: 'Show daemon details' });
+    expect(trigger.classList.contains('daemon-stats-inline')).toBe(true);
+    expect(trigger.textContent).toContain(collapsed ? '2%' : 'CPU');
+    expect(trigger.querySelector('.daemon-local-clock')).not.toBeNull();
+    fireEvent.click(trigger);
+
+    expect(view.getByRole('dialog', { name: 'Daemon status' }).textContent).toContain('v2026.5.2161-dev.7');
   });
 
   it('shows the Auto Deliver entry in the desktop sub-session toolbar', () => {
