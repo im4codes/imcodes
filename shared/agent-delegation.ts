@@ -30,6 +30,79 @@ export const DELEGATION_EMPTY_TASK = AGENT_DELEGATION_ERROR_CODES.DELEGATION_EMP
 export const DELEGATION_UNSUPPORTED_INPUT = AGENT_DELEGATION_ERROR_CODES.DELEGATION_UNSUPPORTED_INPUT;
 
 export const AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER = '<imcodes-agent-delegation-reply-instruction-v1>' as const;
+export const AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER = '<imcodes-agent-delegation-reply-instruction-v2>' as const;
+export const AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER = '<imcodes-delegation-completed-v1>' as const;
+export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as const;
+export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
+export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
+export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
+export const AGENT_DELEGATION_CAPABILITY_MIN_CHARS = 32;
+export const AGENT_DELEGATION_CAPABILITY_MAX_CHARS = 512;
+export const AGENT_DELEGATION_ID_MAX_BYTES = 256;
+export const AGENT_DELEGATION_REPLY_ERRORS = {
+  OVERSIZE: 'oversize',
+  MALFORMED: 'malformed',
+  INVALID_VERSION: 'invalid_version',
+  UNKNOWN_FIELD: 'unknown_field',
+  INVALID_DELEGATION_ID: 'invalid_delegation_id',
+  INVALID_CAPABILITY: 'invalid_capability',
+  INVALID_RESULT: 'invalid_result',
+  IDENTITY_MISMATCH: 'identity_mismatch',
+  EXPIRED: 'expired',
+  ALREADY_REPLIED: 'already_replied',
+  NOTIFICATION_UNSUPPORTED: 'notification_unsupported',
+  DELIVERY_PENDING: 'delivery_pending',
+  RATE_LIMITED: 'rate_limited',
+} as const;
+export type AgentDelegationReplyError =
+  (typeof AGENT_DELEGATION_REPLY_ERRORS)[keyof typeof AGENT_DELEGATION_REPLY_ERRORS];
+
+export interface AgentDelegationReplyEnvelope {
+  version: typeof AGENT_DELEGATION_REPLY_VERSION;
+  delegationId: string;
+  replyCapability: string;
+  result: string;
+}
+
+export interface AgentDelegationReplyAuthority {
+  delegationId: string;
+  replyCapability: string;
+}
+
+export const AGENT_DELEGATION_PURPOSES = {
+  SUPERVISION_AUDIT: 'supervision_audit',
+} as const;
+export type AgentDelegationPurpose =
+  (typeof AGENT_DELEGATION_PURPOSES)[keyof typeof AGENT_DELEGATION_PURPOSES];
+
+export interface AgentDelegationAuditRequest {
+  kind: typeof AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT;
+  attemptId: string;
+}
+
+export const AGENT_DELEGATION_REPLY_STATUSES = {
+  PENDING: 'pending',
+  RECEIVED: 'received',
+  DELIVERED: 'delivered',
+  EXPIRED: 'expired',
+} as const;
+export type AgentDelegationReplyStatus =
+  (typeof AGENT_DELEGATION_REPLY_STATUSES)[keyof typeof AGENT_DELEGATION_REPLY_STATUSES];
+
+export const AGENT_DELEGATION_NOTIFICATION_RESULTS = {
+  DELIVERED: 'delivered',
+  STALE: 'stale',
+  UNSUPPORTED: 'unsupported',
+} as const;
+export type AgentDelegationNotificationResult =
+  (typeof AGENT_DELEGATION_NOTIFICATION_RESULTS)[keyof typeof AGENT_DELEGATION_NOTIFICATION_RESULTS];
+
+export const AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES = {
+  NATIVE: 'native',
+  UNSUPPORTED: 'unsupported',
+} as const;
+export type AgentDelegationActiveNotificationMode =
+  (typeof AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES)[keyof typeof AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES];
 export const AGENT_DELEGATION_CONTEXT_HEADER = 'Recent context from the origin session (sanitized, bounded):' as const;
 export const AGENT_DELEGATION_CONTEXT_OMITTED_MARKER = '[delegation-context-omitted]' as const;
 export const AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER = '[delegation-context-truncated]' as const;
@@ -115,7 +188,10 @@ export type AgentDelegationMixedP2pField = typeof AGENT_DELEGATION_MIXED_P2P_FIE
 const P2P_CONTROL_TOKEN_RE = /@@(?:discuss|all|p2p-config)\([^\n\r]*\)/gi;
 const IMCODES_NO_REPLY_LINE_RE = /^.*\bimcodes\s+send\s+--no-reply\b.*$/gim;
 const REPLY_INSTRUCTION_LINE_RE = /^.*After completing the above task, send your response using:.*$/gim;
-const MARKED_REPLY_BLOCK_RE = new RegExp(`^.*${escapeRegExp(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)}.*$`, 'gim');
+const MARKED_REPLY_BLOCK_RE = new RegExp(
+  `^.*(?:${escapeRegExp(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)}|${escapeRegExp(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER)}).*(?:\\r?\\n[^\\r\\n]*)?`,
+  'gim',
+);
 const DELEGATION_CONTROL_LINE_RE = /^.*\b(?:delegateTarget|delegationId|delegationContext|contextTail)\b\s*[:=].*$/gim;
 const UNSUPPORTED_CONTROL_TEXT_RE = /^\s*\/(?:stop\b|model\s+\S+|(?:thinking|effort)\s+\S+|clear\b|compact\b|resume\b|restart\b)/i;
 
@@ -177,9 +253,105 @@ export function isDelegationUnsupportedControlText(text: string): boolean {
   return UNSUPPORTED_CONTROL_TEXT_RE.test(text);
 }
 
-export function buildAgentDelegationReplyInstruction(replyToSession: string): string {
+export function buildAgentDelegationReplyInstruction(
+  replyToSession: string,
+  authority?: AgentDelegationReplyAuthority,
+): string {
   if (!isCanonicalAgentDelegationSessionName(replyToSession)) return '';
+  if (authority) {
+    if (!isAgentDelegationOpaqueId(authority.delegationId)
+      || !isAgentDelegationReplyCapability(authority.replyCapability)) return '';
+    return [
+      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify(authority)}`,
+      `After completing the above task, reply exactly once with the delegation_reply tool using the delegationId and replyCapability above plus result: "<your complete response>". This structured reply is routed directly to ${JSON.stringify(replyToSession)}; do not use send_message or imcodes send for this reply.`,
+    ].join('\n');
+  }
   return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
+}
+
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+function agentDelegationByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+export function isAgentDelegationOpaqueId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && agentDelegationByteLength(value) <= AGENT_DELEGATION_ID_MAX_BYTES
+    && BASE64URL_RE.test(value);
+}
+
+export function isAgentDelegationReplyCapability(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length >= AGENT_DELEGATION_CAPABILITY_MIN_CHARS
+    && value.length <= AGENT_DELEGATION_CAPABILITY_MAX_CHARS
+    && BASE64URL_RE.test(value);
+}
+
+export function extractAgentDelegationReplyAuthorityFromInstruction(
+  text: string,
+): AgentDelegationReplyAuthority | undefined {
+  for (const line of text.split(/\r?\n/)) {
+    const markerIndex = line.indexOf(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
+    if (markerIndex < 0) continue;
+    const raw = line.slice(markerIndex + AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER.length).trim();
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+      const record = parsed as Record<string, unknown>;
+      if (Object.keys(record).length !== 2
+        || !Object.prototype.hasOwnProperty.call(record, 'delegationId')
+        || !Object.prototype.hasOwnProperty.call(record, 'replyCapability')
+        || !isAgentDelegationOpaqueId(record.delegationId)
+        || !isAgentDelegationReplyCapability(record.replyCapability)) return undefined;
+      return {
+        delegationId: record.delegationId,
+        replyCapability: record.replyCapability,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+export function decodeAgentDelegationReplyEnvelope(
+  raw: unknown,
+): { ok: true; value: AgentDelegationReplyEnvelope } | { ok: false; error: AgentDelegationReplyError } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.MALFORMED };
+  }
+  const record = raw as Record<string, unknown>;
+  const allowed = new Set(['version', 'delegationId', 'replyCapability', 'result']);
+  if (Object.keys(record).some((key) => !allowed.has(key))) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.UNKNOWN_FIELD };
+  }
+  if (record.version !== AGENT_DELEGATION_REPLY_VERSION) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_VERSION };
+  }
+  if (!isAgentDelegationOpaqueId(record.delegationId)) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID };
+  }
+  if (!isAgentDelegationReplyCapability(record.replyCapability)) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_CAPABILITY };
+  }
+  if (typeof record.result !== 'string'
+    || !record.result.trim()
+    || agentDelegationByteLength(record.result) > AGENT_DELEGATION_REPLY_RESULT_BYTES) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_RESULT };
+  }
+  const value: AgentDelegationReplyEnvelope = {
+    version: AGENT_DELEGATION_REPLY_VERSION,
+    delegationId: record.delegationId,
+    replyCapability: record.replyCapability,
+    result: record.result,
+  };
+  if (agentDelegationByteLength(JSON.stringify(value)) > AGENT_DELEGATION_REPLY_TOTAL_BYTES) {
+    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.OVERSIZE };
+  }
+  return { ok: true, value };
 }
 
 export interface AgentDelegationOrchestrationPromptInput {
@@ -237,7 +409,7 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
     '',
     'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above, and require a reply. Prefer the available send_message tool with reply enabled when present; otherwise use:',
     `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
-    'A reply-enabled send already routes the delegate response back into this session as a normal incoming message. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for the reply to arrive.',
+    'A reply-enabled send gives the delegate a one-time structured reply capability and routes that result back through this session provider’s notification path. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for the reply notification to arrive.',
     '',
     'If the user selected or mentioned multiple @ delegates, split the work into separate per-delegate briefs, dispatch each one independently with reply required, and track/report each delegate result separately.',
     '',
@@ -247,6 +419,7 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
 
 export function isAgentDelegationForwardedPayloadText(text: string): boolean {
   return text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
+    || text.includes(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER)
     || text.includes(AGENT_DELEGATION_CONTEXT_HEADER)
     || text.includes(AGENT_DELEGATION_CONTEXT_OMITTED_MARKER)
     || text.includes(AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER);

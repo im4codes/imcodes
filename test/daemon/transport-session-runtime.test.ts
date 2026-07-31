@@ -32,6 +32,10 @@ import { resetContextStoreClientForTests } from '../../src/store/context-store-w
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
 import { MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE } from '../../src/agent/transport-runtime-assembly.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
@@ -353,6 +357,73 @@ describe('TransportSessionRuntime', () => {
     ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers a delegation reply into an active provider turn without joining the ordinary queue', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-1');
+    await flushDispatch();
+
+    const result = await runtime.deliverDelegationNotification({
+      notificationId: 'notify-1',
+      delegationId: 'delegation-1',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'notify-1',
+      delegationId: 'delegation-1',
+      text: 'audit complete',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('fails closed instead of queueing when a busy provider has no native delegation notification', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-2');
+    await flushDispatch();
+
+    const result = await runtime.deliverDelegationNotification({
+      notificationId: 'notify-2',
+      delegationId: 'delegation-2',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a private continuation immediately when the origin runtime is idle', async () => {
+    const mock = makeMockProvider();
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+
+    const result = await runtime.deliverDelegationNotification({
+      notificationId: 'notify-idle',
+      delegationId: 'delegation-idle',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete while idle',
+    });
+    await flushDispatch();
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(mock.provider.send).toHaveBeenCalledWith(
+      'sess-1',
+      expect.objectContaining({ userMessage: 'audit complete while idle' }),
+    );
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   // Stability: the transport queue is persisted to transport-queue.sqlite, but a

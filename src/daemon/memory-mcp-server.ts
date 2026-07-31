@@ -88,6 +88,12 @@ export function mergeDefaultToolDeps(caller: McpRuntimeCaller, toolDeps: MemoryM
       if (!caller.sessionName) throw new Error('peer_audit_reply requires a scoped caller');
       return postHookSend(port, envelope as unknown as Record<string, unknown>, '/audit-reply', caller.sessionName);
     }),
+    delegationReply: toolDeps.delegationReply ?? (async (envelope) => {
+      const port = await resolveLiveHookPort();
+      if (!port) throw new Error('daemon delegation reply ingress is unavailable');
+      if (!caller.sessionName) throw new Error('delegation_reply requires a scoped caller');
+      return postHookSend(port, envelope as unknown as Record<string, unknown>, '/delegation-reply', caller.sessionName);
+    }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.
     // This stdio MCP server only runs on FULL nodes, so the tools are advertised

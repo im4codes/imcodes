@@ -1176,6 +1176,14 @@ export async function startup(): Promise<DaemonContext> {
     slowWarmRestoreTransportProviders,
     startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_SLOW_RESTORE_DELAY_MS,
   );
+  scheduleDaemonStartupBackgroundTask(
+    'delegation reply outbox resume',
+    async () => {
+      const { resumePendingDelegationReplies } = await import('./delegation-reply-ingress.js');
+      resumePendingDelegationReplies();
+    },
+    startupBackgroundBaseDelayMs + STARTUP_TRANSPORT_RESTORE_DELAY_MS + 1_000,
+  );
   if (creds && startupWorkerSessionSyncOutcome && startupWorkerSessionSyncOutcome.retryable) {
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = createWorkerSessionSyncRetrier({

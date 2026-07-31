@@ -30,10 +30,12 @@ import {
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
 import {
+  AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
   buildAgentDelegationReplyInstruction,
   buildAgentDelegationOrchestrationPrompt,
   buildQuickAgentDelegationTask,
+  extractAgentDelegationReplyAuthorityFromInstruction,
 } from '../../shared/agent-delegation.js';
 import {
   PEER_AUDIT_DEADLINE_MS,
@@ -46,6 +48,12 @@ import { peerAuditService } from './peer-audit-service.js';
 import { emitPeerAuditResult } from './peer-audit-result.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import {
+  getDelegationReplyStore,
+  type DelegationReplyBoundIdentity,
+  type DelegationReplyRecord,
+} from './delegation-reply-store.js';
+import { onDelegationReplyDelivered } from './delegation-reply-events.js';
 
 /**
  * Merge the daemon-cached global custom instructions into a session snapshot
@@ -105,6 +113,7 @@ interface ActiveTaskRunState {
   lastAssistantText?: string;
   terminalState?: TaskRunTerminalState;
   auditAttemptId?: string;
+  auditDelegationId?: string;
   auditStartedAt?: number;
   auditReplyObserved: boolean;
   auditDeadlineTimer?: NodeJS.Timeout;
@@ -163,8 +172,31 @@ function isReplyEnabledPeerAuditDelegationText(text: string | undefined, replyTo
   if (!text) return false;
   const hasExactReplyRoute = text.includes(AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER)
     && text.includes(buildAgentDelegationReplyInstruction(replyToSession));
-  const asksForAudit = /(?:\b(?:independent(?:ly)?\s+)?(?:peer\s+)?audit\b|独立(?:只读)?(?:审计|审核|复审)|(?:审计|审核|复审)(?:当前|本次|这次|最近))/iu.test(text);
+  const asksForAudit = /(?:\b(?:independent(?:ly)?\s+)?(?:peer\s+)?audit\b|独立(?:只读)?(?:审计|审核|复审|终审)|(?:审计|审核|复审|终审)(?:当前|本次|这次|最近))/iu.test(text);
   return hasExactReplyRoute && asksForAudit;
+}
+
+const POST_AUDIT_DEFERRED_WORK_RE = /(?:\b(?:after|once|when)\b[\s\S]{0,40}\b(?:audit|review)\b[\s\S]{0,120}\b(?:test|verify|validate|commit|push|merge|release|deploy)\b|(?:审计|审核|复审|终审)(?:[\s\S]{0,20}PASS)?\s*(?:通过)?\s*后[\s\S]{0,120}(?:测试|验证|检查|提交|推送|合并|发布|部署)|PASS\s*(?:通过)?\s*后[\s\S]{0,120}(?:测试|验证|检查|提交|推送|合并|发布|部署))/iu;
+const POST_AUDIT_DEFERRED_NEXT_ACTION = 'Peer audit passed. Resume only the validation and repository or delivery finalization explicitly deferred until PASS in the original task. Run the requested post-audit tests before any commit or push. Do not repeat implementation and do not request or start another audit.';
+
+function boundDelegationIdentity(record: ReturnType<typeof getSession>): DelegationReplyBoundIdentity | null {
+  const sessionInstanceId = record?.sessionInstanceId?.trim();
+  const runtimeEpoch = record?.runtimeEpoch?.trim();
+  if (!record || !sessionInstanceId || !runtimeEpoch) return null;
+  return {
+    sessionName: record.name,
+    sessionInstanceId,
+    runtimeEpoch,
+  };
+}
+
+function delegationIdentityMatches(
+  expected: DelegationReplyBoundIdentity,
+  actual: DelegationReplyBoundIdentity | null,
+): boolean {
+  return actual?.sessionName === expected.sessionName
+    && actual.sessionInstanceId === expected.sessionInstanceId
+    && actual.runtimeEpoch === expected.runtimeEpoch;
 }
 
 interface AuditBaseline {
@@ -592,6 +624,9 @@ class SupervisionAutomation {
     timelineEmitter.on((event) => {
       this.handleTimelineEvent(event);
     });
+    onDelegationReplyDelivered((record) => {
+      this.handleStructuredDelegationReplyDelivered(record);
+    });
   }
 
   setServerLink(_serverLink: ServerLink | null): void {
@@ -783,12 +818,100 @@ class SupervisionAutomation {
     run.auditTargetDispatchObservedAt = undefined;
   }
 
+  private deferExplicitPostAuditWork(run: ActiveTaskRunState): void {
+    if (run.deferredFinalization || !POST_AUDIT_DEFERRED_WORK_RE.test(run.userText)) return;
+    run.deferredFinalization = {
+      reason: 'The original task explicitly defers validation or repository finalization until peer-audit PASS.',
+      nextAction: POST_AUDIT_DEFERRED_NEXT_ACTION,
+    };
+  }
+
+  private beginObservedAudit(
+    run: ActiveTaskRunState,
+    target: NonNullable<ReturnType<typeof getSession>>,
+    options: {
+      auditAttemptId: string;
+      delegationId?: string;
+    },
+  ): void {
+    if (run.phase !== 'execution' && run.phase !== 'auditing') return;
+    if (run.phase === 'auditing' && run.auditDelegationId && run.auditDelegationId !== options.delegationId) return;
+    if (run.phase === 'execution') this.deferExplicitPostAuditWork(run);
+    run.phase = 'auditing';
+    run.requiresAudit = false;
+    run.evaluating = false;
+    run.terminalState = 'complete';
+    run.auditReplyObserved = false;
+    run.auditAttemptId = options.auditAttemptId;
+    run.auditDelegationId = options.delegationId;
+    run.auditStartedAt = Date.now();
+    run.auditTargetSessionInstanceId = target.sessionInstanceId;
+    run.auditTargetDispatchObservedAt = Date.now();
+    run.auditTargetObservedActive = true;
+    run.auditTargetRecoveryAttempts = 0;
+    run.auditTargetRecoveryLimitNotified = false;
+    run.sawAssistantOutput = false;
+    run.lastAssistantText = undefined;
+    this.clearAuditTargetRecoveryTimer(run);
+    this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
+    this.emitAutomationNote(
+      run.sessionName,
+      'Auto: observed the existing reply-enabled peer-audit delegation; waiting for its PASS/REWORK receipt without sending another request.',
+      'supervision-audit-delegated',
+    );
+    this.armAuditDeadline(run);
+  }
+
+  private structuredAuditRecord(
+    run: ActiveTaskRunState,
+    eventSessionId: string,
+    text: string | undefined,
+  ): DelegationReplyRecord | undefined {
+    if (!text || run.snapshot.auditTargetSessionName !== eventSessionId) return undefined;
+    const authority = extractAgentDelegationReplyAuthorityFromInstruction(text);
+    if (!authority) return undefined;
+    const record = getDelegationReplyStore().matchPendingAuthority(authority);
+    if (!record
+      || record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+      || !record.auditAttemptId
+      || record.origin.sessionName !== run.sessionName
+      || record.target.sessionName !== eventSessionId
+      || (run.phase === 'auditing' && run.auditAttemptId && run.auditAttemptId !== record.auditAttemptId)
+      || !delegationIdentityMatches(record.origin, boundDelegationIdentity(getSession(run.sessionName)))
+      || !delegationIdentityMatches(record.target, boundDelegationIdentity(getSession(eventSessionId)))) return undefined;
+    return record;
+  }
+
+  private handleStructuredDelegationReplyDelivered(record: DelegationReplyRecord): void {
+    if (record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) return;
+    const run = this.activeRuns.get(record.origin.sessionName);
+    if (!run
+      || run.phase !== 'auditing'
+      || run.auditDelegationId !== record.delegationId
+      || run.snapshot.auditTargetSessionName !== record.target.sessionName
+      || !delegationIdentityMatches(record.origin, boundDelegationIdentity(getSession(record.origin.sessionName)))
+      || !delegationIdentityMatches(record.target, boundDelegationIdentity(getSession(record.target.sessionName)))) return;
+    this.clearAuditTargetRecovery(run);
+    run.auditReplyObserved = true;
+    run.sawAssistantOutput = false;
+    run.lastAssistantText = undefined;
+    this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
+    this.emitAutomationNote(
+      run.sessionName,
+      'Auto: the structured delegated audit reply arrived; waiting for this session to produce the final PASS/REWORK judgment.',
+      'supervision-audit-reply-received',
+    );
+  }
+
   private isCorrelatedAuditTargetDispatch(
     run: ActiveTaskRunState,
     payload: Record<string, unknown>,
   ): boolean {
     const text = trimString(payload.text);
     if (!text || !run.auditAttemptId || payload.automation === true) return false;
+    if (run.auditDelegationId) {
+      return extractAgentDelegationReplyAuthorityFromInstruction(text)?.delegationId === run.auditDelegationId;
+    }
     const sharedActor = payload.sharedActor && typeof payload.sharedActor === 'object'
       ? payload.sharedActor as Record<string, unknown>
       : undefined;
@@ -824,33 +947,30 @@ class SupervisionAutomation {
         && run.snapshot.auditTargetSessionName === event.sessionId;
       if (
         targetsConfiguredAuditor
-        && run.phase === 'execution'
+        && (run.phase === 'execution' || (run.phase === 'auditing' && !run.auditDelegationId))
         && event.type === 'user.message'
-        && isReplyEnabledPeerAuditDelegationText(trimString(event.payload.text), run.sessionName)
       ) {
         const target = getSession(event.sessionId);
         if (!target) continue;
-        run.phase = 'auditing';
-        run.requiresAudit = false;
-        run.evaluating = false;
-        run.terminalState = 'complete';
-        run.auditReplyObserved = false;
-        run.auditAttemptId = randomUUID();
-        run.auditStartedAt = Date.now();
-        run.auditTargetSessionInstanceId = target.sessionInstanceId;
-        run.auditTargetDispatchObservedAt = Date.now();
-        run.auditTargetObservedActive = false;
-        run.auditTargetRecoveryAttempts = 0;
-        run.auditTargetRecoveryLimitNotified = false;
-        run.sawAssistantOutput = false;
-        run.lastAssistantText = undefined;
-        this.emitStatus(run.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
-        this.emitAutomationNote(
-          run.sessionName,
-          'Auto: observed the existing reply-enabled peer-audit delegation; waiting for its PASS/REWORK receipt without sending another request.',
-          'supervision-audit-delegated',
-        );
-        this.armAuditDeadline(run);
+        const text = trimString(event.payload.text);
+        const structured = this.structuredAuditRecord(run, event.sessionId, text);
+        if (structured) {
+          this.beginObservedAudit(run, target, {
+            auditAttemptId: structured.auditAttemptId!,
+            delegationId: structured.delegationId,
+          });
+        } else if (run.phase === 'execution') {
+          const sharedActor = event.payload.sharedActor && typeof event.payload.sharedActor === 'object'
+            ? event.payload.sharedActor as Record<string, unknown>
+            : undefined;
+          const exactOriginActor = trimString(sharedActor?.actorUserId) === run.sessionName;
+          if (exactOriginActor && isReplyEnabledPeerAuditDelegationText(text, run.sessionName)) {
+            const legacyAttempt = text?.match(/Automatic audit attempt ID:\s*([A-Za-z0-9_-]+)/iu)?.[1];
+            this.beginObservedAudit(run, target, {
+              auditAttemptId: legacyAttempt ?? randomUUID(),
+            });
+          }
+        }
       }
 
       if (
@@ -1013,6 +1133,7 @@ class SupervisionAutomation {
       const delegatedReply = Boolean(
         !automation
         && activeRun?.phase === 'auditing'
+        && !activeRun.auditDelegationId
         && isDelegatedAuditReplyText(text),
       );
       if (delegatedReply && activeRun) {
@@ -1273,6 +1394,7 @@ class SupervisionAutomation {
     current.evaluating = false;
     current.auditReplyObserved = false;
     current.auditAttemptId = randomUUID();
+    current.auditDelegationId = undefined;
     current.auditStartedAt = Date.now();
     current.auditTargetSessionInstanceId = undefined;
     current.auditTargetDispatchObservedAt = undefined;
@@ -1322,6 +1444,10 @@ class SupervisionAutomation {
       buildQuickAgentDelegationTask('audit'),
       'This is the configured automatic supervision audit. You—not the daemon—must prepare the audit background from your real current-session context and send it to the selected delegate with reply enabled.',
       `Automatic audit attempt ID: ${current.auditAttemptId}. Include this exact attempt ID in the delegated audit brief. The route is fixed: send exactly one reply-enabled audit request to ${targetName}. Do not choose another session or send a second audit while this attempt is pending.`,
+      `When send_message is available, set reply=true and audit=${JSON.stringify({
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: current.auditAttemptId,
+      })}. This structured metadata is required so supervision can register the pending audit without parsing natural-language task text.`,
       'Do not commit, push, deploy, or modify the implementation while waiting for the audit.',
       baseline.changeDir ? `Relevant OpenSpec change: ${baseline.changeDir}` : '',
       baseline.fileContents.length > 0
@@ -1418,6 +1544,7 @@ class SupervisionAutomation {
     if (verdict === 'PASS') {
       this.emitOrchestratedAuditResult(current, 'pass', undefined, findings);
       current.auditAttemptId = undefined;
+      current.auditDelegationId = undefined;
       current.freshAuditRequiredAfterRework = false;
       if (current.deferredFinalization) {
         current.phase = 'finalizing';
@@ -1433,6 +1560,7 @@ class SupervisionAutomation {
     }
     this.emitOrchestratedAuditResult(current, 'rework', undefined, findings);
     current.auditAttemptId = undefined;
+    current.auditDelegationId = undefined;
     if (current.reworkDispatches >= current.snapshot.maxAuditLoops) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
       this.activeRuns.delete(current.sessionName);

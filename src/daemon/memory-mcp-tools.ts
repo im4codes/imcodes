@@ -85,6 +85,14 @@ import {
   PEER_AUDIT_VALIDATION_OUTCOMES,
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_VERSION,
+  decodeAgentDelegationReplyEnvelope,
+  isAgentDelegationOpaqueId,
+  type AgentDelegationAuditRequest,
+  type AgentDelegationReplyEnvelope,
+} from '../../shared/agent-delegation.js';
 import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
@@ -162,6 +170,7 @@ export interface MemoryMcpToolDeps {
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  delegationReply?: (envelope: AgentDelegationReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
   archiveMemory?: (id: string) => Promise<boolean> | boolean;
   restoreArchivedMemory?: (id: string) => Promise<boolean> | boolean;
@@ -469,6 +478,21 @@ function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'i
     ephemeral: true,
     parentRunId: record.parentRunId,
     parentStage: record.parentStage,
+  };
+}
+
+const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId']);
+
+function parseAuditArg(value: unknown): AgentDelegationAuditRequest | undefined | 'invalid' {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !AUDIT_ARG_ALLOWED_KEYS.has(key))
+    || record.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+    || !isAgentDelegationOpaqueId(record.attemptId)) return 'invalid';
+  return {
+    kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+    attemptId: record.attemptId,
   };
 }
 
@@ -1167,6 +1191,26 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'peer audit reply rejected'))
         : { status: 'ok', accepted: true };
     },
+    [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: async (input) => {
+      if (!deps.delegationReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'delegation reply ingress is unavailable');
+      const record = input && typeof input === 'object' && !Array.isArray(input)
+        ? input as Record<string, unknown>
+        : {};
+      const decoded = decodeAgentDelegationReplyEnvelope({
+        ...record,
+        version: AGENT_DELEGATION_REPLY_VERSION,
+      });
+      if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
+      const result = await deps.delegationReply(decoded.value);
+      return result.ok === false
+        ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'delegation reply rejected'))
+        : {
+            status: 'ok',
+            accepted: true,
+            delivered: result.delivered === true,
+            ...(result.pending === true ? { pending: true } : {}),
+          };
+    },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
       const sessions = await sendSessions();
       const args = pickAllowedMcpArgs(input, ['query', 'limit']);
@@ -1179,14 +1223,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'broadcast', 'idempotencyKey', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'broadcast', 'idempotencyKey', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
+      const audit = parseAuditArg(args.audit);
+      if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
       return dispatchSendMessage(caller, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
+        ...(audit ? { audit } : {}),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(clone ? { clone } : {}),
@@ -1680,6 +1727,11 @@ const schemas = {
       summary: z.string(),
     }).strict()),
   }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: z.object({
+    delegationId: z.string(),
+    replyCapability: z.string(),
+    result: z.string(),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
     query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
@@ -1689,6 +1741,10 @@ const schemas = {
     message: z.string().describe('Complete task/request and expected output.'),
     files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
     reply: z.boolean().optional().describe('Request a reply/report.'),
+    audit: z.object({
+      kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
+      attemptId: z.string().min(1),
+    }).strict().optional().describe('Automatic supervision audit metadata; requires reply=true and one exact target.'),
     broadcast: z.boolean().optional().describe('Only when the user asks every/all sessions.'),
     idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
     clone: z.object({

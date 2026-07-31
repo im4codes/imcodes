@@ -14,6 +14,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   TransportProvider,
+  ProviderDelegationNotification,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -29,6 +30,11 @@ import { isTransientRequestFailure } from '../../../shared/request-failure.js';
 import { composeProviderSystemText } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import logger from '../../util/logger.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 
 const LOOPBACK_HOST = '127.0.0.1';
 const MODEL_CACHE_TTL_MS = 30_000;
@@ -79,6 +85,9 @@ interface OpenCodeClientLike {
     reply(options: Record<string, unknown>): SdkResult<boolean>;
   };
   postSessionIdPermissionsPermissionId(options: Record<string, unknown>): SdkResult<boolean>;
+  notificationSession?: {
+    prompt(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<Record<string, any>>;
+  };
 }
 
 interface OpenCodeServerLike {
@@ -101,7 +110,10 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
     ]);
     const started = await sdk.createOpencode(options);
     const v2Client = v2Sdk.createOpencodeClient({ baseUrl: started.server.url });
-    Object.assign(started.client, { permission: v2Client.permission });
+    Object.assign(started.client, {
+      permission: v2Client.permission,
+      notificationSession: v2Client.session,
+    });
     return started as unknown as {
       client: OpenCodeClientLike;
       server: OpenCodeServerLike;
@@ -312,6 +324,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     multiTurn: true,
     attachments: true,
     contextSupport: 'full-normalized-context-injection',
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
   };
 
   private client: OpenCodeClientLike | null = null;
@@ -663,6 +676,27 @@ export class OpenCodeSdkProvider implements TransportProvider {
       this.emitStatus(state.routeId, { status: null, label: null });
       throw this.normalizeError(error, 'prompt submission');
     }
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.busy || state.cancelled) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    if (!state.client.notificationSession) return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
+    const generation = state.generation;
+    await state.client.notificationSession.prompt({
+      sessionID: state.providerSessionId,
+      id: notification.notificationId,
+      prompt: { text: notification.text },
+      delivery: 'steer',
+      resume: true,
+    }, { throwOnError: true });
+    if (!this.isCurrent(state, generation) || state.cancelled) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
   async cancel(sessionId: string): Promise<void> {

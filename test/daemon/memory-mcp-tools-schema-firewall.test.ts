@@ -116,6 +116,33 @@ describe('memory MCP tool schema firewall', () => {
     expect(peerAuditReply).toHaveBeenCalledTimes(1);
   });
 
+  it('submits delegation replies only through the strict structured dependency', async () => {
+    const delegationReply = vi.fn(async () => ({ ok: true, delivered: true }));
+    const handlers = createMemoryMcpToolHandlers(caller(), { delegationReply });
+    const valid = {
+      delegationId: 'delegation_identity_1234567890',
+      replyCapability: 'reply_capability_1234567890_ABCDEFG',
+      result: 'Completed with exact evidence.',
+    };
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY](valid)).resolves.toEqual({
+      status: 'ok',
+      accepted: true,
+      delivered: true,
+    });
+    expect(delegationReply).toHaveBeenCalledWith({
+      version: 'agent_delegation_reply_v1',
+      ...valid,
+    });
+
+    const forged = await handlers[MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]({
+      ...valid,
+      replyTo: 'deck_other_brain',
+    });
+    expect(forged).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(delegationReply).toHaveBeenCalledTimes(1);
+  });
+
   it('defers peer-audit PASS evidence policy until the sender-bound ingress', async () => {
     const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'invalid_capability' }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });

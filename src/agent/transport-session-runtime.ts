@@ -3,7 +3,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -91,6 +91,11 @@ import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../shared/agent-delegation.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -116,6 +121,10 @@ export interface PendingTransportMessage {
   peerAudit?: {
     contractVersion: string;
     attemptHash: string;
+  };
+  /** @internal: private completed-delegation notification; excluded from public snapshots and memory recall. */
+  delegationReply?: {
+    delegationId: string;
   };
 }
 
@@ -149,6 +158,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
   delete publicEntry.peerAudit;
+  delete publicEntry.delegationReply;
   return publicEntry;
 }
 
@@ -176,6 +186,10 @@ export interface TransportSendMetadata {
   peerAudit?: {
     contractVersion: string;
     attemptHash: string;
+  };
+  /** @internal: marks a provider/runtime-native delegation completion. */
+  delegationReply?: {
+    delegationId: string;
   };
 }
 
@@ -606,7 +620,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         const completedEntry = this._activeDispatchEntries.length === 1
           ? this._activeDispatchEntries[0]
           : undefined;
-        this._lastCompletedTurn = completedEntry && !completedEntry.peerAudit
+        this._lastCompletedTurn = completedEntry && !completedEntry.peerAudit && !completedEntry.delegationReply
           ? {
               taskCommandId: completedEntry.clientMessageId,
               assistantText: message.content,
@@ -1782,6 +1796,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
+      ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
     };
 
     if (this.hasActiveTurnWork()) {
@@ -1808,6 +1823,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
             ...(entry.historyCommitted ? { historyCommitted: true } : {}),
             ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
+            ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
           }),
         });
       } catch (err) {
@@ -1851,6 +1867,49 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw err;
     }
     return 'sent';
+  }
+
+  /**
+   * Deliver a completed delegation without cancelling or joining the ordinary
+   * FIFO. Busy sessions use the provider's active-turn notification primitive;
+   * idle sessions start one private continuation turn. A busy race is returned
+   * as stale so the durable delegation outbox can retry against fresh state.
+   */
+  async deliverDelegationNotification(
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    if (!this._providerSessionId) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+
+    if (this.hasActiveTurnWork()) {
+      if (this.provider.capabilities.activeDelegationNotification
+          !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+        || !this.provider.notifyActiveDelegation) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
+      }
+      const result = await this.provider.notifyActiveDelegation(this._providerSessionId, notification);
+      if (result !== AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE || this.hasActiveTurnWork()) {
+        return result;
+      }
+    }
+
+    const disposition = this.send(
+      notification.text,
+      notification.notificationId,
+      undefined,
+      undefined,
+      {
+        timelineCommitted: true,
+        historyCommitted: true,
+        delegationReply: { delegationId: notification.delegationId },
+      },
+    );
+    if (disposition === 'sent') return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+
+    // A provider callback may have made the runtime busy between the awaited
+    // native attempt and the idle fallback. Never leave this private reply in
+    // the ordinary user FIFO.
+    this.removePendingMessage(notification.notificationId);
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
   }
 
   editPendingMessage(clientMessageId: string, text: string): boolean {
@@ -2557,8 +2616,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       text: message,
       ...(attachments?.length ? { attachments } : {}),
     }]).map((entry) => ({ ...entry }));
-    const isPrivatePeerAuditDispatch = this._activeDispatchEntries.length > 0
-      && this._activeDispatchEntries.every((entry) => !!entry.peerAudit);
+    const isPrivateControlDispatch = this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => !!entry.peerAudit || !!entry.delegationReply);
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     // Alias expansion (A′): the provider (and runtime history) receive the
@@ -2625,13 +2684,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       // particular, do not consume first-turn startup memory or run semantic
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
-      const suppressMemoryContext = isSlashControl || isPrivatePeerAuditDispatch;
+      const suppressMemoryContext = isSlashControl || isPrivateControlDispatch;
       const startupMemory = suppressMemoryContext ? null : (this._startupMemory ?? (
         !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
           ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
           : null
       ));
-      const memoryRecallResult = isPrivatePeerAuditDispatch
+      const memoryRecallResult = isPrivateControlDispatch
         ? { artifact: null }
         : isSlashControl
         ? {

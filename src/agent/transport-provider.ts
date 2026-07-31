@@ -17,6 +17,10 @@ import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type {
+  AgentDelegationActiveNotificationMode,
+  AgentDelegationNotificationResult,
+} from '../../shared/agent-delegation.js';
+import type {
   ProviderContextPayload,
   ProviderSupportClass,
   SharedScopePolicyOverride,
@@ -198,6 +202,15 @@ export interface ProviderCapabilities {
   compact?: ProviderCompactCapability;
   /** How a completed background subagent re-enters an already-idle parent session. */
   backgroundSubagentWake?: BackgroundSubagentWakeMode;
+  /** Whether a delegation reply can enter the provider's currently active turn without cancellation or FIFO queueing. */
+  activeDelegationNotification?: AgentDelegationActiveNotificationMode;
+}
+
+export interface ProviderDelegationNotification {
+  notificationId: string;
+  delegationId: string;
+  sourceSessionName: string;
+  text: string;
 }
 
 /**
@@ -488,6 +501,16 @@ export interface TransportProvider {
    * @param attachments - Optional file/image attachments (only when capabilities.attachments is true).
    */
   send(sessionId: string, payload: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void>;
+
+  /**
+   * Deliver a completed delegation into the currently active provider turn.
+   * Implementations must never cancel the turn or enqueue an ordinary future
+   * user message. A stale result means the active turn ended before admission.
+   */
+  notifyActiveDelegation?(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult>;
 
   /**
    * Best-effort cancellation of the current in-flight turn for a session.

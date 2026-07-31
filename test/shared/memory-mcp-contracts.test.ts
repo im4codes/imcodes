@@ -34,6 +34,7 @@ describe('memory MCP shared contracts', () => {
       'save_observation',
       'save_preference',
       'peer_audit_reply',
+      'delegation_reply',
       'send_list_targets',
       'send_message',
       'send_stop',
@@ -111,12 +112,20 @@ describe('memory MCP shared contracts', () => {
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
     const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;
     const sendMessageReply = sendMessage.inputSchema.properties?.reply as { description?: string } | undefined;
+    const sendMessageAudit = sendMessage.inputSchema.properties?.audit as {
+      description?: string;
+      properties?: Record<string, { enum?: string[] }>;
+      required?: string[];
+    } | undefined;
     const sendMessageBroadcast = sendMessage.inputSchema.properties?.broadcast as { description?: string } | undefined;
     expect(sendListQuery?.description).toContain('cc');
     expect(sendListQuery?.description).toContain('display labels');
     expect(sendMessageText?.description).toContain('complete task/request text');
     expect(sendMessageReply?.description).toContain('Set true');
     expect(sendMessageReply?.description).toContain('discussion invites');
+    expect(sendMessageAudit?.description).toContain('automatic-supervision');
+    expect(sendMessageAudit?.properties?.kind?.enum).toEqual(['supervision_audit']);
+    expect(sendMessageAudit?.required).toEqual(['kind', 'attemptId']);
     expect(sendMessageBroadcast?.description).toContain('every/all available sessions');
   });
 

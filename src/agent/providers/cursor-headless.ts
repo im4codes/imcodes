@@ -40,6 +40,7 @@ import {
   type CursorMcpEnsureResult,
 } from '../../daemon/cursor-mcp-config.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../../shared/agent-delegation.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import {
   MEMORY_MCP_PROVIDER_STATUS_REASON,
@@ -136,6 +137,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: false,
     contextSupport: 'degraded-message-side-context-mapping',
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED,
     compact: {
       execution: 'unsupported',
       verified: true,

@@ -20,6 +20,7 @@ import type {
   ProviderUsageUpdate,
   ToolCallEvent,
   SdkTurnLostRecoveryMetadata,
+  ProviderDelegationNotification,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -62,6 +63,11 @@ import { composeProviderSystemText, getProviderSystemTextParts } from '../provid
 import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -2276,6 +2282,7 @@ export class CodexSdkProvider implements TransportProvider {
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
+    activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
@@ -2634,6 +2641,32 @@ export class CodexSdkProvider implements TransportProvider {
       turnDispatchGeneration,
       CODEX_AUTH_RECOVERY_RETRY_LIMIT,
     );
+  }
+
+  async notifyActiveDelegation(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    const turnId = state?.runningTurnId;
+    if (!state || !turnId || state.cancelled) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+    try {
+      await this.request('turn/steer', {
+        threadId: state.threadId,
+        expectedTurnId: turnId,
+        clientUserMessageId: notification.notificationId,
+        input: [{ type: 'text', text: notification.text }],
+      });
+    } catch (error) {
+      const latest = this.sessions.get(sessionId);
+      if (!latest || latest.runningTurnId !== turnId || latest.cancelled) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      throw error;
+    }
+    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
   private clearActiveItemEvidence(state: CodexSdkSessionState): void {

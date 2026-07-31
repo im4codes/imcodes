@@ -123,6 +123,9 @@ const childProcessMock = vi.hoisted(() => {
               emitTurnInterruptResult(childRecord, msg);
             }
           }
+          if (msg.method === 'turn/steer' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: { turnId: msg.params?.expectedTurnId } });
+          }
           if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: { status: 'unsubscribed' } });
           }
@@ -272,6 +275,7 @@ import {
 } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -445,6 +449,32 @@ describe('CodexSdkProvider', () => {
       connected: true,
       degradedReasons: [],
     });
+  });
+
+  it('steers a correlated delegation completion into the exact active Codex turn', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-delegation-notify', cwd: '/tmp/project' });
+    await provider.send('route-delegation-notify', 'foreground work');
+    const child = childProcessMock.children[0]!;
+
+    const result = await provider.notifyActiveDelegation?.('route-delegation-notify', {
+      notificationId: 'notification_identity',
+      delegationId: 'delegation_identity',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'delegated audit finished',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(child.requests.find((request) => request.method === 'turn/steer')).toMatchObject({
+      params: {
+        threadId: 'thread-1',
+        expectedTurnId: 'turn-1',
+        clientUserMessageId: 'notification_identity',
+        input: [{ type: 'text', text: 'delegated audit finished' }],
+      },
+    });
+    expect(child.requests.some((request) => request.method === 'turn/interrupt')).toBe(false);
   });
 
   it('restarts the app-server before creating a session when Codex auth changes', async () => {

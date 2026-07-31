@@ -409,6 +409,66 @@ describe('memory MCP stdio server', () => {
     }
   });
 
+  it('submits delegation_reply to dedicated ingress with the runtime-bound sender header', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-delegation-reply-'));
+    await writeSessionStore(home);
+    const received: Array<{ body: Record<string, unknown>; sender?: string }> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== '/delegation-reply') {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        received.push({
+          body: JSON.parse(raw) as Record<string, unknown>,
+          sender: typeof req.headers['x-imcodes-session'] === 'string' ? req.headers['x-imcodes-session'] : undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, delivered: true }));
+      });
+    });
+    await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+    const address = hookServer.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+    await writeFile(join(home, '.imcodes', 'hook-port'), String(address.port), 'utf8');
+    const client = new Client({ name: 'memory-mcp-delegation-reply-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: mcpEnv(home),
+      stderr: 'pipe',
+    });
+    try {
+      await client.connect(transport);
+      const result = await client.callTool({
+        name: 'delegation_reply',
+        arguments: {
+          delegationId: 'delegation_identity_1234567890',
+          replyCapability: 'reply_capability_1234567890_ABCDEFG',
+          result: 'Completed with exact evidence.',
+        },
+      });
+      expect(result.structuredContent).toEqual({ status: 'ok', accepted: true, delivered: true });
+      expect(received).toEqual([{
+        sender: 'deck_sub_worker',
+        body: {
+          version: 'agent_delegation_reply_v1',
+          delegationId: 'delegation_identity_1234567890',
+          replyCapability: 'reply_capability_1234567890_ABCDEFG',
+          result: 'Completed with exact evidence.',
+        },
+      }]);
+    } finally {
+      await client.close();
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
   it('keeps listed send targets usable across a transient empty session-store refresh', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-send-stable-'));
     await writeSessionStore(home);

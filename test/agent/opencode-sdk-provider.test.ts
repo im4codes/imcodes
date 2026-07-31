@@ -6,6 +6,7 @@ import {
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 
 vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -104,6 +105,9 @@ function createHarness() {
       })),
     },
     event: { subscribe: vi.fn(() => Promise.resolve({ stream: queue.stream })) },
+    notificationSession: {
+      prompt: vi.fn(() => result({ accepted: true })),
+    },
     permission: {
       reply: vi.fn(() => result(true)),
     },
@@ -123,6 +127,40 @@ describe('OpenCodeSdkProvider', () => {
   afterEach(() => {
     vi.useRealTimers();
     openCodeSdkRuntimeHooks.start = originalStart;
+  });
+
+  it('steers a correlated delegation completion through the OpenCode v2 session client', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-delegation-notify',
+      sessionName: 'deck_project_brain',
+      cwd: '/tmp/project',
+    });
+    await provider.send(routeId, 'foreground work');
+
+    const result = await provider.notifyActiveDelegation?.(routeId, {
+      notificationId: 'notification_identity',
+      delegationId: 'delegation_identity',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'delegated audit finished',
+    });
+
+    expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(harness.client.notificationSession.prompt).toHaveBeenCalledWith({
+      sessionID: 'oc-session-1',
+      id: 'notification_identity',
+      prompt: { text: 'delegated audit finished' },
+      delivery: 'steer',
+      resume: true,
+    }, { throwOnError: true });
+    expect(harness.client.session.abort).not.toHaveBeenCalled();
+    await provider.disconnect();
   });
 
   it('starts the official server on loopback and exposes connected status', async () => {

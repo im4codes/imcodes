@@ -72,7 +72,6 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, readFileSync
 import { resolve, join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
-import { buildAgentDelegationReplyInstruction } from '../shared/agent-delegation.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
 import { runAuditReplyCommand } from './cli/audit-reply.js';
 import { resolveLiveHookPort } from './daemon/hook-port.js';
@@ -725,13 +724,11 @@ program
         const detectedFrom = await detectSenderSession().catch(() => '');
         const from = detectedFrom || IMCODES_EXTERNAL_CLI_SENDER;
 
-        // --reply: append callback instruction so the target knows to reply
         if (opts.reply) {
           if (!detectedFrom) {
             console.error('Error: --reply requires a managed sender session. Set IMCODES_SESSION to the session that should receive the reply, or omit --reply.');
             process.exit(1);
           }
-          message += `\n\n${buildAgentDelegationReplyInstruction(detectedFrom)}`;
         }
 
         if (opts.all) {
@@ -741,6 +738,7 @@ program
             to: '*',
             message,
             ...(files ? { files } : {}),
+            ...(opts.reply ? { reply: true } : {}),
             depth: 0,
           });
           printSendResult(res);
@@ -754,6 +752,7 @@ program
             to: opts.type,
             message,
             ...(files ? { files } : {}),
+            ...(opts.reply ? { reply: true } : {}),
             depth: 0,
           });
           printSendResult(res);
@@ -766,6 +765,7 @@ program
           to: resolvedTarget!,
           message,
           ...(files ? { files } : {}),
+          ...(opts.reply ? { reply: true } : {}),
           depth: 0,
         });
         printSendResult(res);
@@ -778,6 +778,10 @@ program
 
     // Fallback: direct tmux sendKeys (original behavior for backward compat)
     console.warn('Warning: hook server unavailable — using direct send (no --files, --all, --type, queue, or label resolution).');
+    if (opts.reply) {
+      console.error('Error: --reply requires the daemon hook server; refusing an uncorrelated direct send.');
+      process.exit(1);
+    }
     if (!resolvedTarget) {
       console.error('Error: target is required for direct send (hook server not available).');
       process.exit(1);

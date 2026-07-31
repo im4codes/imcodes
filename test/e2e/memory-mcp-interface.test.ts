@@ -700,6 +700,8 @@ function sessionRecord(
 ) {
   return {
     name,
+    sessionInstanceId: `instance_${name}`,
+    runtimeEpoch: `epoch_${name}`,
     projectName,
     role,
     agentType: 'codex-sdk',

@@ -7,6 +7,11 @@ import { MEMORY_MCP_CAPS } from '../../shared/memory-mcp-contracts.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import {
+  AGENT_DELEGATION_PURPOSES,
+  isAgentDelegationOpaqueId,
+  type AgentDelegationAuditRequest,
+} from '../../shared/agent-delegation.js';
+import {
   EXECUTION_CLONE_KIND,
   EXECUTION_CLONE_ERROR_CODES,
   EXECUTION_CLONE_TERMINAL_REASONS,
@@ -29,6 +34,10 @@ const EXECUTION_CLONE_TERMINAL_REASON_DESTROYED: ExecutionCloneTerminalReason =
 import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { isExecutionClone } from './execution-clone.js';
+import {
+  createDelegationReplyAuthority,
+  expireDelegationReplyAuthority,
+} from './delegation-reply-authority.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 
@@ -115,6 +124,8 @@ export interface SendMessageInput {
   reply?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
+  /** Strict supervision-only metadata. Never infer this purpose from message text. */
+  audit?: AgentDelegationAuditRequest;
   /** Optional execution-clone request — see {@link SendMessageCloneRequest}. */
   clone?: SendMessageCloneRequest;
 }
@@ -122,6 +133,7 @@ export interface SendMessageInput {
 export interface SendMessageDelivery {
   target: string;
   messageId?: SendMessageId;
+  delegationId?: string;
   status: 'delivered' | 'failed';
   error?: string;
 }
@@ -146,6 +158,7 @@ export interface HookSendDispatchInput {
   message: string;
   files?: string[];
   projectRoot?: string | null;
+  reply?: boolean;
 }
 
 export interface HookSendDispatchResult {
@@ -387,6 +400,19 @@ export async function dispatchSendMessage(
   if (Buffer.byteLength(input.message, 'utf8') > MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES) {
     return { status: 'error', reason: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, error: `message exceeds ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} bytes` };
   }
+  if (input.audit && (
+    input.audit.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+    || !isAgentDelegationOpaqueId(input.audit.attemptId)
+    || input.reply !== true
+    || input.broadcast === true
+    || Boolean(input.clone)
+  )) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'audit metadata requires one exact reply-enabled non-clone target and a valid attemptId',
+    };
+  }
 
   // ── Execution-clone branch ──────────────────────────────────────────────
   // STRUCTURAL LIVENESS: only this branch references the execution-clone create
@@ -421,24 +447,49 @@ export async function dispatchSendMessage(
   if (!fileRefs.ok) return { status: 'error', reason: fileRefs.reason, error: fileRefs.error };
 
   const dispatchId = createSendDispatchId();
-  const message = buildSessionDispatchMessage({
-    message: input.message,
-    files: fileRefs.files,
-    replyTo: input.reply ? caller.sessionName : null,
-  });
   const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
   const deliveries: SendMessageDelivery[] = [];
 
   for (const target of targets.targets) {
     const messageId = createSendMessageId();
+    const replyAuthority = input.reply
+      ? createDelegationReplyAuthority({
+          origin: callerRecord,
+          target,
+          dispatchId,
+          messageId,
+          ...(input.audit ? { audit: input.audit } : {}),
+          now,
+        })
+      : null;
+    if (input.reply && !replyAuthority) {
+      deliveries.push({
+        target: target.name,
+        status: 'failed',
+        error: 'reply-capable session identity is unavailable',
+      });
+      continue;
+    }
+    const message = buildSessionDispatchMessage({
+      message: input.message,
+      files: fileRefs.files,
+      replyTo: input.reply ? caller.sessionName : null,
+      ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
+    });
     try {
       await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
         ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
       });
-      deliveries.push({ target: target.name, messageId, status: 'delivered' });
+      deliveries.push({
+        target: target.name,
+        messageId,
+        ...(replyAuthority ? { delegationId: replyAuthority.record.delegationId } : {}),
+        status: 'delivered',
+      });
     } catch (err) {
+      if (replyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
       deliveries.push({ target: target.name, status: 'failed', error: sanitizeMcpErrorMessage(err) });
     }
   }
@@ -592,11 +643,6 @@ async function dispatchExecutionCloneSend(
   const dispatchId = createSendDispatchId();
   const messageId = createSendMessageId();
   const now = d.now();
-  const message = buildSessionDispatchMessage({
-    message: input.message!,
-    files: fileRefs.files,
-    replyTo: caller.sessionName, // force reply: true
-  });
   const cloneRecord = d.getSession(created.target) ?? ({
     name: created.target,
     projectName: caller.projectName,
@@ -609,6 +655,27 @@ async function dispatchExecutionCloneSend(
     createdAt: now,
     updatedAt: now,
   } as SessionRecord);
+  const replyAuthority = createDelegationReplyAuthority({
+    origin: callerRecord,
+    target: cloneRecord,
+    dispatchId,
+    messageId,
+    now,
+  });
+  if (!replyAuthority) {
+    await destroyClone({ target: created.target, reason: EXECUTION_CLONE_TERMINAL_REASON_DESTROYED, bypassAuth: true }).catch(() => {});
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      error: 'reply-capable clone identity is unavailable',
+    };
+  }
+  const message = buildSessionDispatchMessage({
+    message: input.message!,
+    files: fileRefs.files,
+    replyTo: caller.sessionName,
+    replyAuthority: replyAuthority.authority,
+  });
 
   try {
     await d.dispatchMessage(cloneRecord, message, {
@@ -617,6 +684,7 @@ async function dispatchExecutionCloneSend(
       ...buildSharedServerMemberSharedActorOption(caller, callerRecord, cloneRecord, messageId, now),
     });
   } catch (err) {
+    expireDelegationReplyAuthority(replyAuthority.record.delegationId);
     // Rollback — destroy the just-created clone before surfacing the error.
     await destroyClone({ target: created.target, reason: EXECUTION_CLONE_TERMINAL_REASON_DESTROYED, bypassAuth: true }).catch(() => {});
     return { status: 'error', reason: MCP_ERROR_REASONS.INTERNAL_ERROR, error: sanitizeMcpErrorMessage(err) };
@@ -626,7 +694,12 @@ async function dispatchExecutionCloneSend(
     status: 'accepted',
     dispatchId,
     messageId,
-    deliveries: [{ target: created.target, messageId, status: 'delivered' }],
+    deliveries: [{
+      target: created.target,
+      messageId,
+      delegationId: replyAuthority.record.delegationId,
+      status: 'delivered',
+    }],
     clone: {
       target: created.target,
       sessionName: created.sessionName,
@@ -795,12 +868,30 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   const queued: string[] = [];
   const errors: string[] = [];
   const messages: SendMessageDelivery[] = [];
-  const message = buildSessionDispatchMessage({ message: input.message, files: fileRefs.files, replyTo: null });
   const callerRecord = d.getSession(input.from) ?? undefined;
   const now = d.now();
 
   for (const target of input.targetRecords) {
     const messageId = createSendMessageId();
+    const replyAuthority = input.reply
+      ? createDelegationReplyAuthority({
+          origin: callerRecord,
+          target,
+          dispatchId,
+          messageId,
+          now,
+        })
+      : null;
+    if (input.reply && !replyAuthority) {
+      errors.push(`${target.name}: reply-capable session identity is unavailable`);
+      continue;
+    }
+    const message = buildSessionDispatchMessage({
+      message: input.message,
+      files: fileRefs.files,
+      replyTo: input.reply ? input.from : null,
+      ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
+    });
     try {
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
@@ -820,8 +911,14 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       });
       if (result === 'queued') queued.push(target.name);
       else delivered.push(target.name);
-      messages.push({ target: target.name, messageId, status: 'delivered' });
+      messages.push({
+        target: target.name,
+        messageId,
+        ...(replyAuthority ? { delegationId: replyAuthority.record.delegationId } : {}),
+        status: 'delivered',
+      });
     } catch (err) {
+      if (replyAuthority) expireDelegationReplyAuthority(replyAuthority.record.delegationId);
       errors.push(`${target.name}: ${(err as Error).message}`);
     }
   }

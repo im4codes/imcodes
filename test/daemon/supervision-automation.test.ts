@@ -13,7 +13,11 @@ import {
   PEER_AUDIT_DEADLINE_MS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
 } from '../../shared/peer-audit.js';
-import { buildAgentDelegationReplyInstruction } from '../../shared/agent-delegation.js';
+import {
+  AGENT_DELEGATION_PURPOSES,
+  buildAgentDelegationReplyInstruction,
+} from '../../shared/agent-delegation.js';
+import { createSendDispatchId, createSendMessageId } from '../../shared/send-message-id.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 
 const mockStartP2pRun = vi.fn();
@@ -84,6 +88,8 @@ vi.mock('../../src/daemon/peer-audit-service.js', () => ({
 const { supervisionAutomation } = await import('../../src/daemon/supervision-automation.js');
 const { timelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
 const { getSession, upsertSession, removeSession } = await import('../../src/store/session-store.js');
+const { createDelegationReplyAuthority } = await import('../../src/daemon/delegation-reply-authority.js');
+const { emitDelegationReplyDelivered } = await import('../../src/daemon/delegation-reply-events.js');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -389,6 +395,191 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
+  it('adopts the production v1 终审 wording once and keeps deferred 211 validation behind PASS', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-production-final-audit',
+      '开始实现审计后 在211 完整测试 全部通过后推送',
+      snapshot,
+    );
+    beginRun('cmd-production-final-audit', '开始实现审计后 在211 完整测试 全部通过后推送');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: 独立只读终审当前未提交实现，完成后回复 PASS 或 REWORK。',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain'),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain' },
+    });
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      requiresAudit: false,
+      auditReplyObserved: false,
+      deferredFinalization: {
+        nextAction: expect.stringContaining('post-audit tests'),
+      },
+    });
+
+    completeTurn('已发送终审，等待 CC1 回复。');
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditReplyObserved: false,
+    });
+
+    completeDelegatedAudit('PASS', 'Production wording audit passed.');
+    await sleep(10);
+    completeTurn('211 full validation and repository finalization completed.');
+    await waitForRunEnd();
+  });
+
+  it('does not misclassify an ordinary reply-enabled delegation to the configured auditor', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-ordinary-delegation',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-ordinary-delegation', 'implement the feature');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: brainstorm alternative names for this feature.',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain'),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain' },
+    });
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'execution',
+    });
+  });
+
+  it('does not misclassify an ordinary v2 delegation authority as a supervised audit', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-ordinary-structured-delegation',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-ordinary-structured-delegation', 'implement the feature');
+
+    const origin = getSession('deck_supervision_brain');
+    const target = getSession('deck_sub_reviewer');
+    if (!target) throw new Error('reviewer was not seeded');
+    const authority = createDelegationReplyAuthority({
+      origin,
+      target,
+      dispatchId: createSendDispatchId(),
+      messageId: createSendMessageId(),
+    });
+    if (!authority) throw new Error('ordinary delegation authority was not created');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: brainstorm alternative names for this feature.',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain', authority.authority),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain' },
+    });
+
+    const activeRun = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    expect(activeRun).toMatchObject({ phase: 'execution' });
+    expect(activeRun).not.toHaveProperty('auditDelegationId');
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+  });
+
+  it('registers a v2 audit by delegation authority and releases deferred validation only after its delivery', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-structured-audit',
+      '审计 PASS 后在 211 完整测试，全部通过后提交并推送',
+      snapshot,
+    );
+    beginRun('cmd-structured-audit', '审计 PASS 后在 211 完整测试，全部通过后提交并推送');
+
+    const origin = getSession('deck_supervision_brain');
+    const target = getSession('deck_sub_reviewer');
+    if (!target) throw new Error('reviewer was not seeded');
+    const authority = createDelegationReplyAuthority({
+      origin,
+      target,
+      dispatchId: createSendDispatchId(),
+      messageId: createSendMessageId(),
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'automatic_audit_attempt_structured_1',
+      },
+    });
+    if (!authority) throw new Error('structured audit authority was not created');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: this text intentionally contains no audit keyword.',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain', authority.authority),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain' },
+    });
+
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditAttemptId: 'automatic_audit_attempt_structured_1',
+      auditDelegationId: authority.record.delegationId,
+      auditReplyObserved: false,
+      deferredFinalization: expect.any(Object),
+    });
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(10);
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+
+    emitDelegationReplyDelivered({
+      ...authority.record,
+      status: 'delivered',
+      result: 'PASS with independent evidence.',
+      deliveredAt: Date.now(),
+    });
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'auditing',
+      auditDelegationId: authority.record.delegationId,
+      auditReplyObserved: true,
+    });
+
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `Structured audit passed.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+      streaming: false,
+    });
+    await sleep(10);
+
+    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('在 211 完整测试');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('post-audit tests');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).not.toContain('Exact delegate target session:');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'finalizing',
+    });
+  });
+
   it('asks the current session to prepare and delegate the audit, then clears only after the reply-backed PASS', async () => {
     const snapshot = await seedSession('supervised_audit');
 
@@ -409,6 +600,8 @@ describe('SupervisionAutomation', () => {
     expect(orchestrationPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
     expect(orchestrationPrompt).toContain('send exactly one reply-enabled audit request to deck_sub_reviewer');
     expect(orchestrationPrompt).toContain('Include this exact attempt ID in the delegated audit brief');
+    expect(orchestrationPrompt).toContain('"kind":"supervision_audit"');
+    expect(orchestrationPrompt).toContain('"attemptId":');
     expect(orchestrationPrompt).toContain('Do not choose another session or send a second audit');
     expect(orchestrationPrompt).toContain('You—not the daemon—must prepare the audit background');
     expect(orchestrationPrompt).toContain('Do not commit, push, deploy');
