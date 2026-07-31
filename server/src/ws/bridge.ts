@@ -45,6 +45,7 @@ import {
 } from '../../../shared/transport/file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
+import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
 import {
   MEMORY_WS,
   isMemoryManagementRequestType,
@@ -5025,6 +5026,10 @@ export class WsBridge {
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
+        // The bridge rebuilds daemon.stats from an explicit allowlist. Keep
+        // embedding health on that list so the UI does not permanently fall
+        // back to "unknown" even while a current daemon is connected.
+        ...(isEmbeddingStatus(msg.embedding) ? { embedding: msg.embedding } : {}),
         ...(Array.isArray(msg.disks) ? { disks: msg.disks } : {}),
         // Memory-handle persistence failures ride this frame because the
         // daemon's own counter and log cannot leave a machine whose disk is

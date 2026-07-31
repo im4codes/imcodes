@@ -1363,6 +1363,52 @@ describe('WsBridge', () => {
       expect(stats).not.toHaveProperty('disks');
     });
 
+    it('relays daemon embedding status to browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const embedding = { state: 'ready', reason: null };
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        embedding,
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toMatchObject({ type: 'daemon.stats', embedding });
+    });
+
+    it('drops malformed daemon embedding status instead of forwarding junk', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        embedding: { state: 'ready', reason: 42 },
+      }));
+      await flushAsync();
+
+      const stats = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .find((message) => message.type === 'daemon.stats');
+      expect(stats).toBeDefined();
+      expect(stats).not.toHaveProperty('embedding');
+    });
+
     it('translates session_event → session.event', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       daemonWs.emit('message', JSON.stringify({ type: 'session_event', session: 'x' }));

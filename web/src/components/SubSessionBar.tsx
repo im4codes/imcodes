@@ -1023,7 +1023,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           // Older daemons don't ship `embedding`; preserve null so the
           // icon falls through to its "unknown" rendering instead of
           // showing a misleading "ready".
-          embedding: (msg as { embedding?: EmbeddingStatus | null }).embedding ?? null,
+          embedding: msg.embedding ?? null,
           // Older daemons don't ship `disks`; null means "no data" so the
           // desktop strip simply hides the readout (and mobile never shows it).
           disks: msg.disks ?? null,
