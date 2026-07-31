@@ -4894,6 +4894,33 @@ afterEach(() => {
     }));
   });
 
+  it('keeps the mobile transport Stop outside the scrollable metadata controls', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const ws = makeWs();
+    const { container } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stopButton = screen.getByRole('button', { name: /^stop$/i });
+    const transportShortcuts = stopButton.closest('.shortcuts-transport');
+    const metadataScroller = container.querySelector('.shortcuts-meta-scroll');
+
+    expect(transportShortcuts).toBeTruthy();
+    expect(metadataScroller).toBeTruthy();
+    expect(transportShortcuts?.nextElementSibling).toBe(metadataScroller);
+    expect(metadataScroller?.contains(stopButton)).toBe(false);
+    expect(metadataScroller?.querySelector('.shortcuts-model')).toBeTruthy();
+  });
+
   it('shows a compact Auto dropdown for supported transport sessions and enables supervised mode from saved defaults', async () => {
     const ws = makeWs();
     fetchSupervisorDefaultsMock.mockResolvedValue({

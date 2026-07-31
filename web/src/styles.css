@@ -345,6 +345,7 @@ html.native-ios-mac .chat-dl-btn {
 .shortcuts { display: flex; gap: 4px; padding: 4px 8px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
 .shortcuts-transport { flex: 1 1 auto; min-width: 0; margin-left: 0; padding-left: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
+.shortcuts-meta-scroll { display: contents; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
 .shortcuts-model-supervision { display: inline-flex; align-items: center; gap: 4px; }
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
@@ -1582,7 +1583,20 @@ html.native-ios-mac .chat-dl-btn {
   .controls-composer { min-height: 32px; }
   .shortcuts-row { overflow: visible; }
   .shortcuts { gap: 3px; padding: 4px 4px 4px 6px; }
-  .shortcuts-transport { flex: 1 1 auto; min-width: 30px; max-width: none; overflow: visible; padding-left: 0; }
+  .shortcuts-transport { flex: 0 0 auto; min-width: 0; max-width: none; overflow: visible; padding-left: 0; }
+  .shortcuts-meta-scroll {
+    display: flex;
+    align-items: center;
+    flex: 1 1 0;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .shortcuts-meta-scroll::-webkit-scrollbar { display: none; }
+  .shortcuts-meta-scroll.has-open-menu { overflow: visible; }
   /* Bigger stop tap-target on mobile. Extra height comes from padding that is
      cancelled by equal negative vertical margins, so the button's margin-box
      (which drives the toolbar row height) is unchanged — the toolbar does not

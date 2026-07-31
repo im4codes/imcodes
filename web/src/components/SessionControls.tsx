@@ -4480,6 +4480,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           })}
         </div>}
 
+        <div class={`shortcuts-meta-scroll${autoOpen || modelOpen || thinkingOpen ? ' has-open-menu' : ''}`}>
         {/* Quick peer delegation reuses the ordinary @agent orchestration path.
             It stays separate from automatic supervision state and remains
             visible while Auto is off. */}
@@ -5169,6 +5170,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             </>
           )}
         </div>}
+        </div>
       </div>}
 
       {pendingTransportApproval && effectiveRuntimeType === 'transport' && (

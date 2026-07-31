@@ -251,9 +251,18 @@ describe('styles.css regression contracts', () => {
       .map((match) => match[0])
       .find((rule) => /max-width:\s*none/.test(rule));
     expect(mobileTransportShortcutRule).not.toBeNull();
-    expect(mobileTransportShortcutRule!).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(mobileTransportShortcutRule!).toMatch(/flex:\s*0\s+0\s+auto/);
+    expect(mobileTransportShortcutRule!).toMatch(/min-width:\s*0/);
     expect(mobileTransportShortcutRule!).toMatch(/max-width:\s*none/);
     expect(mobileTransportShortcutRule!).toMatch(/padding-left:\s*0/);
+
+    const mobileMetaScrollerRule = css.match(/\.shortcuts-meta-scroll\s*\{\s*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*\}/);
+    expect(mobileMetaScrollerRule).not.toBeNull();
+    expect(mobileMetaScrollerRule![0]).toMatch(/flex:\s*1\s+1\s+0/);
+    expect(mobileMetaScrollerRule![0]).toMatch(/min-width:\s*0/);
+    expect(mobileMetaScrollerRule![0]).toMatch(/overflow-y:\s*hidden/);
+    expect(mobileMetaScrollerRule![0]).toMatch(/scrollbar-width:\s*none/);
+    expect(css).toMatch(/\.shortcuts-meta-scroll::-webkit-scrollbar\s*\{\s*display:\s*none/);
 
     const subcardStopRule = css.match(/\.subcard-stop-btn\s*\{[^}]*\}/);
     expect(subcardStopRule).not.toBeNull();
