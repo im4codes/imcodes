@@ -541,6 +541,60 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('keeps an unobservable prompt_async delivery recoverable without calling it absent', async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    harness.client.session.message
+      .mockRejectedValueOnce(notFoundError())
+      .mockRejectedValue(new TypeError('fetch failed'));
+    harness.client.session.promptAsync.mockRejectedValueOnce(new TypeError('fetch failed'));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-prompt-unknown',
+      cwd: '/tmp/project',
+    });
+    const send = provider.send(routeId, {
+      userMessage: 'inspect the service',
+      assembledMessage: 'inspect the service',
+      deliveryId: 'cron-command-unknown',
+      context: {
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'p' },
+        authoritySource: 'none',
+        freshness: 'fresh',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    } satisfies ProviderContextPayload).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    );
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(send).resolves.toMatchObject({ error: {
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: true,
+      message: expect.stringContaining('fetch failed'),
+    } });
+    expect(harness.client.session.promptAsync).toHaveBeenCalledOnce();
+    expect(harness.client.session.message).toHaveBeenCalledTimes(6);
+    await provider.disconnect();
+  });
+
   it('handles current OpenCode permission events without duplicating approval requests', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

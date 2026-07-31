@@ -41,6 +41,7 @@ const MODEL_CACHE_TTL_MS = 30_000;
 const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
+type PromptAcceptance = 'accepted' | 'absent' | 'unknown';
 const OPENCODE_PERMISSION_EVENT = {
   LEGACY_UPDATED: 'permission.updated',
   ASKED: 'permission.asked',
@@ -644,8 +645,14 @@ export class OpenCodeSdkProvider implements TransportProvider {
       if (!this.isCurrent(state, generation) || state.cancelled) return;
       if (isTransientRequestFailure(error)) {
         try {
-          const accepted = await this.waitForPromptAcceptance(state, generation, messageId);
-          if (accepted || !this.isCurrent(state, generation) || state.cancelled) return;
+          const acceptance = await this.waitForPromptAcceptance(state, generation, messageId);
+          if (acceptance === 'accepted' || !this.isCurrent(state, generation) || state.cancelled) return;
+          if (acceptance === 'unknown') {
+            logger.warn(
+              { provider: this.id, sessionId: state.routeId, messageId },
+              'OpenCode prompt acceptance remained unknown after transient lookup failures; retrying with the same message ID',
+            );
+          }
         } catch (acceptanceError) {
           state.busy = false;
           this.emitStatus(state.routeId, { status: null, label: null });
@@ -772,23 +779,29 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state: OpenCodeSessionState,
     generation: number,
     messageId: string,
-  ): Promise<boolean> {
+  ): Promise<PromptAcceptance> {
+    let lastObservation: PromptAcceptance = 'unknown';
     for (const delayMs of PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS) {
       await sleep(delayMs);
-      if (!this.isCurrent(state, generation) || state.cancelled) return false;
+      if (!this.isCurrent(state, generation) || state.cancelled) return 'unknown';
       try {
         if (await this.hasAcceptedPrompt(state, messageId)) {
           logger.warn(
             { provider: this.id, sessionId: state.routeId, messageId },
             'OpenCode prompt submission response failed after the message was accepted; suppressing duplicate replay',
           );
-          return true;
+          return 'accepted';
         }
+        lastObservation = 'absent';
       } catch (error) {
         if (!isTransientRequestFailure(error)) throw error;
+        // A later failed lookup invalidates an earlier absence observation:
+        // the server may have accepted the message in between. Retry remains
+        // safe because every dispatch attempt reuses this exact message ID.
+        lastObservation = 'unknown';
       }
     }
-    return false;
+    return lastObservation;
   }
 
   private async consumeEvents(stream: AsyncIterable<Record<string, any>>, signal: AbortSignal): Promise<void> {

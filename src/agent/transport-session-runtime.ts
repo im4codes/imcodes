@@ -487,11 +487,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
   private _recoverableRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  // How many FRONT pending entries make up the turn currently being retried.
-  // STOP uses this to interrupt exactly that turn while keeping messages the
-  // user queued AFTER it. Overwritten on each re-queue; harmless when stale
-  // (only read while the retry timer is set, and re-queue always sets it first).
-  private _recoverableRetryEntryCount = 0;
+  // Stable identities of the logical turn currently being retried. The IDs
+  // preserve its batch boundary while backoff is active: messages queued later
+  // must remain a separate turn or they would change provider-level delivery
+  // identity and could replay already-accepted side effects.
+  private _recoverableRetryEntryIds: string[] = [];
   private _nextDispatchId = 0;
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
@@ -1914,15 +1914,17 @@ export class TransportSessionRuntime implements SessionRuntime {
     // not keep "working" with nothing scheduled.
     if (this._recoverableRetryTimer && !this._activeTurn && !this._sending) {
       // STOP during an auto-retry interrupts ONLY the turn being retried (the
-      // front entries). Messages the user queued AFTER it stay intact and drain,
-      // matching normal STOP semantics ("keep queued messages; interrupt the
-      // active turn"). Do NOT clear the whole queue.
-      const retriedEntryCount = this._recoverableRetryEntryCount;
+      // entries identified below). Messages the user queued AFTER it stay
+      // intact and drain, matching normal STOP semantics ("keep queued
+      // messages; interrupt the active turn"). Do NOT clear the whole queue.
+      const retriedEntryIds = new Set(this._recoverableRetryEntryIds);
       this.clearRecoverableRetryTimer();
       this._recoverableDispatchRetries = 0;
-      this._recoverableRetryEntryCount = 0;
-      if (retriedEntryCount > 0) {
-        this._pendingMessages.splice(0, retriedEntryCount);
+      this._recoverableRetryEntryIds = [];
+      if (retriedEntryIds.size > 0) {
+        this._pendingMessages = this._pendingMessages.filter(
+          (entry) => !retriedEntryIds.has(entry.clientMessageId),
+        );
         this._pendingVersion++;
       }
       this.markCurrentActivityGenerationLocallyCancelled();
@@ -2048,6 +2050,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
     this._recoverableDispatchRetries = 0;
+    this._recoverableRetryEntryIds = [];
     if (this._pendingMessages.length > 0) {
       if (options.preserveTransportQueue) {
         logger.info(
@@ -2444,8 +2447,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._activeDispatchEntries.length === 0) return false;
     if (this._recoverableDispatchRetries >= MAX_RECOVERABLE_DISPATCH_RETRIES) return false;
     this._recoverableDispatchRetries++;
-    // Record the size of THIS retried turn so STOP can drop exactly it.
-    this._recoverableRetryEntryCount = this._activeDispatchEntries.length;
+    // Preserve the exact logical turn boundary. New messages can queue during
+    // backoff, but must not be merged into this retry because provider-level
+    // idempotency keys are derived from these stable client message IDs.
+    this._recoverableRetryEntryIds = this._activeDispatchEntries.map(
+      (entry) => entry.clientMessageId,
+    );
     this._pendingMessages.unshift(...this._activeDispatchEntries);
     this._pendingVersion++;
     this._activeDispatchEntries = [];
@@ -2481,7 +2488,10 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private runRecoverableRetryTick(): void {
     this._recoverableRetryTimer = null;
-    if (!this._providerSessionId || this._pendingMessages.length === 0) return;
+    if (!this._providerSessionId || this._pendingMessages.length === 0) {
+      this._recoverableRetryEntryIds = [];
+      return;
+    }
     // A turn became active in the meantime (e.g. onComplete already drained the
     // queue) — its settlement owns the next drain.
     if (this._sending || this._activeTurn) return;
@@ -2892,7 +2902,29 @@ export class TransportSessionRuntime implements SessionRuntime {
     // Draining now supersedes any pending recoverable-retry backoff.
     this.clearRecoverableRetryTimer();
 
-    const messages = this._pendingMessages.splice(0);
+    const retryEntryIds = this._recoverableRetryEntryIds;
+    this._recoverableRetryEntryIds = [];
+    let messages: PendingTransportMessage[];
+    if (retryEntryIds.length > 0) {
+      const retryEntriesById = new Map(
+        this._pendingMessages.map((entry) => [entry.clientMessageId, entry]),
+      );
+      messages = retryEntryIds
+        .map((clientMessageId) => retryEntriesById.get(clientMessageId))
+        .filter((entry): entry is PendingTransportMessage => entry !== undefined);
+      if (messages.length > 0) {
+        const retryEntryIdSet = new Set(retryEntryIds);
+        this._pendingMessages = this._pendingMessages.filter(
+          (entry) => !retryEntryIdSet.has(entry.clientMessageId),
+        );
+      } else {
+        // The user removed the whole retried turn during backoff. Its timer no
+        // longer owns the queue; drain whatever remains as an ordinary turn.
+        messages = this._pendingMessages.splice(0);
+      }
+    } else {
+      messages = this._pendingMessages.splice(0);
+    }
     const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
     for (const entry of timelineMessages) entry.timelineCommitted = true;
     try {

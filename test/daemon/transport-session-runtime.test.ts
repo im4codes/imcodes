@@ -1377,6 +1377,43 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.sending).toBe(true);
   });
 
+  it('keeps a recoverable retry isolated from messages queued during backoff', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'fetch failed',
+      recoverable: true,
+    });
+
+    expect(runtime.send('first message', 'msg-A')).toBe('sent');
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-A', text: 'first message' },
+    ]);
+
+    expect(runtime.send('second message', 'msg-B')).toBe('queued');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(mock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+      userMessage: 'first message',
+      deliveryId: 'msg-A',
+    }));
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'first message',
+      deliveryId: 'msg-A',
+    }));
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-B', text: 'second message' },
+    ]);
+
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 3);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(3, 'sess-1', expect.objectContaining({
+      userMessage: 'second message',
+      deliveryId: 'msg-B',
+    }));
+  });
+
   it('auto-retry of a direct send does not duplicate timeline drain or runtime history', async () => {
     (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
