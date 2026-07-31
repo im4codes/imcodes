@@ -26,6 +26,8 @@ import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } fro
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
+  /** Stable logical delivery identity retained across recoverable dispatch retries. */
+  deliveryId?: string;
   description?: string;
   systemPrompt?: string;
   suppressMcpMemorySearchGuidance?: boolean;
@@ -234,6 +236,7 @@ export function buildProviderContextPayload(
   return {
     userMessage: input.userMessage,
     assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
+    ...(input.deliveryId?.trim() ? { deliveryId: input.deliveryId.trim() } : {}),
     ...(input.activityGeneration ? { activityGeneration: input.activityGeneration } : {}),
     sessionSystemText: compiledContext.sessionSystemText,
     turnSystemText: compiledContext.turnSystemText,

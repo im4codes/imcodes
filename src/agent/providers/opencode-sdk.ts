@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import type {
@@ -25,6 +25,7 @@ import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
+import { isTransientRequestFailure } from '../../../shared/request-failure.js';
 import { composeProviderSystemText } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import logger from '../../util/logger.js';
@@ -39,6 +40,7 @@ const MODEL_CACHE_TTL_MS = 30_000;
 // window we force one throttled catalog refetch so the next frame self-heals.
 const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
+const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
 const OPENCODE_PERMISSION_EVENT = {
   LEGACY_UPDATED: 'permission.updated',
   ASKED: 'permission.asked',
@@ -61,7 +63,9 @@ interface OpenCodeClientLike {
     create(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     get(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     list(options?: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
+    message(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     prompt(options: Record<string, unknown>): SdkResult<Record<string, any>>;
+    promptAsync(options: Record<string, unknown>): SdkResult<void>;
     abort(options: Record<string, unknown>): SdkResult<boolean>;
   };
   provider: {
@@ -159,6 +163,44 @@ function safeString(value: unknown): string | undefined {
 
 function positiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function errorHttpStatus(error: unknown): number | undefined {
+  const pending: unknown[] = [error];
+  const seen = new Set<object>();
+  for (let depth = 0; pending.length > 0 && depth < 8; depth++) {
+    const current = pending.shift();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    const record = current as Record<string, unknown>;
+    if (typeof record.status === 'number' && Number.isFinite(record.status)) return record.status;
+    if (record.cause !== undefined) pending.push(record.cause);
+  }
+  return undefined;
+}
+
+function isNotFoundError(error: unknown): boolean {
+  if (errorHttpStatus(error) === 404) return true;
+  return /\b404\b/.test(errorMessage(error));
+}
+
+function openCodePromptMessageId(providerSessionId: string, deliveryId: string | undefined): string {
+  const stableInput = deliveryId?.trim() || randomUUID();
+  const digest = createHash('sha256')
+    .update(providerSessionId)
+    .update('\0')
+    .update(stableInput)
+    .digest('hex')
+    .slice(0, 26);
+  return `msg_${digest}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
 }
 
 function isTerminalAssistantMessage(info: Record<string, any> | undefined): boolean {
@@ -581,12 +623,17 @@ export class OpenCodeSdkProvider implements TransportProvider {
       ...attachmentParts(payload.attachments),
     ];
     const system = composeProviderSystemText(payload);
-    let promptRequest: SdkResult<Record<string, any>>;
+    const messageId = openCodePromptMessageId(state.providerSessionId, payload.deliveryId);
     try {
-      promptRequest = state.client.session.prompt({
+      if (await this.hasAcceptedPrompt(state, messageId)) {
+        return;
+      }
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      await state.client.session.promptAsync({
         path: { id: state.providerSessionId },
         query: { directory: state.cwd },
         body: {
+          messageID: messageId,
           ...(model ? { model } : {}),
           ...(system ? { system } : {}),
           parts,
@@ -594,18 +641,21 @@ export class OpenCodeSdkProvider implements TransportProvider {
         throwOnError: true,
       });
     } catch (error) {
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      if (isTransientRequestFailure(error)) {
+        try {
+          const accepted = await this.waitForPromptAcceptance(state, generation, messageId);
+          if (accepted || !this.isCurrent(state, generation) || state.cancelled) return;
+        } catch (acceptanceError) {
+          state.busy = false;
+          this.emitStatus(state.routeId, { status: null, label: null });
+          throw this.normalizeError(acceptanceError, 'prompt acceptance check');
+        }
+      }
       state.busy = false;
       this.emitStatus(state.routeId, { status: null, label: null });
-      throw this.normalizeError(error, 'prompt');
+      throw this.normalizeError(error, 'prompt submission');
     }
-    void promptRequest.then((result) => {
-      if (!this.isCurrent(state, generation) || state.cancelled) return;
-      const terminal = this.processPromptResult(state, result.data);
-      if (terminal) this.completeOnce(state, 'prompt.result');
-    }).catch((error) => {
-      if (!this.isCurrent(state, generation) || state.cancelled) return;
-      this.failOnce(state, this.normalizeError(error, 'prompt'));
-    });
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -701,6 +751,44 @@ export class OpenCodeSdkProvider implements TransportProvider {
     } catch (error) {
       throw this.normalizeError(error, 'permission');
     }
+  }
+
+  private async hasAcceptedPrompt(state: OpenCodeSessionState, messageId: string): Promise<boolean> {
+    try {
+      const result = await state.client.session.message({
+        path: { id: state.providerSessionId, messageID: messageId },
+        query: { directory: state.cwd },
+        throwOnError: true,
+      });
+      return safeString(result.data?.info?.id) === messageId
+        && result.data?.info?.role === 'user';
+    } catch (error) {
+      if (isNotFoundError(error)) return false;
+      throw error;
+    }
+  }
+
+  private async waitForPromptAcceptance(
+    state: OpenCodeSessionState,
+    generation: number,
+    messageId: string,
+  ): Promise<boolean> {
+    for (const delayMs of PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS) {
+      await sleep(delayMs);
+      if (!this.isCurrent(state, generation) || state.cancelled) return false;
+      try {
+        if (await this.hasAcceptedPrompt(state, messageId)) {
+          logger.warn(
+            { provider: this.id, sessionId: state.routeId, messageId },
+            'OpenCode prompt submission response failed after the message was accepted; suppressing duplicate replay',
+          );
+          return true;
+        }
+      } catch (error) {
+        if (!isTransientRequestFailure(error)) throw error;
+      }
+    }
+    return false;
   }
 
   private async consumeEvents(stream: AsyncIterable<Record<string, any>>, signal: AbortSignal): Promise<void> {
@@ -1200,6 +1288,9 @@ export class OpenCodeSdkProvider implements TransportProvider {
     }
     if (lower.includes('404') || lower.includes('session') && lower.includes('not found')) {
       return providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `OpenCode session was not found during ${operation}`, false);
+    }
+    if (isTransientRequestFailure(error)) {
+      return providerError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `OpenCode ${operation} failed: ${message}`, true);
     }
     return providerError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `OpenCode ${operation} failed: ${message}`, true);
   }

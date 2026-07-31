@@ -1368,7 +1368,11 @@ describe('TransportSessionRuntime', () => {
     await waitForProviderSendCount(mock.provider, 2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       userMessage: 'deliver me',
+      deliveryId: 'msg-retry',
     }));
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toMatchObject({
+      deliveryId: 'msg-retry',
+    });
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
   });

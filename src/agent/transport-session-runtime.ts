@@ -2666,6 +2666,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       summarySyncReservation = undefined;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
+        deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
         activityGeneration: this.currentActivityGeneration(),
         messagePreamble,
         description: isSlashControl ? undefined : this._description,
