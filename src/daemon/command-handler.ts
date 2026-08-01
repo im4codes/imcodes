@@ -5605,13 +5605,15 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   }
 
   const record = await recoverOpenCodeSessionRecord(getSession(params.sessionName));
-  let opencodeInitialDeferred = false;
   let opencodeSynthesized = false;
   if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
     const initialHistoryRequest = params.afterTs === undefined && params.beforeTs === undefined;
-    if (initialHistoryRequest) {
-      opencodeInitialDeferred = !hasSubstantiveTimelineHistory(trimmed);
-    } else {
+    // An empty initial OpenCode projection must be recovered here. Returning a
+    // terminal `deferred` response without scheduling any work leaves manual
+    // refresh stuck forever; only a later live message would create a cursor
+    // that happens to enter the incremental synthesis path. Keep the common
+    // initial path cheap when SQLite already has substantive history.
+    if (!initialHistoryRequest || !hasSubstantiveTimelineHistory(trimmed)) {
       const tSyn0 = Date.now();
       try {
         const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
@@ -5642,9 +5644,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     maxResponseBytes: params.maxResponseBytes,
     detailSink: getDefaultTimelineDetailStore(),
   });
-  const status = opencodeInitialDeferred
-    ? TIMELINE_RESPONSE_STATUS.DEFERRED
-    : timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
+  const status = timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
   return {
     events: sanitized.events,
     eventsRead: events.length,
@@ -5655,13 +5655,10 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     readMs,
     synthesizeMs,
     sanitizeMs: Date.now() - tSanitize,
-    source: opencodeInitialDeferred
-      ? TIMELINE_RESPONSE_SOURCES.DEFERRED
-      : opencodeSynthesized
+    source: opencodeSynthesized
       ? TIMELINE_RESPONSE_SOURCES.OPENCODE_EXPORT
       : TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE,
     status,
-    errorReason: opencodeInitialDeferred ? TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE : undefined,
     detailRefs: sanitized.detailRefs,
   };
 }
