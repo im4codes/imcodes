@@ -3175,15 +3175,18 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-group { display: flex; flex-direction: column; gap: 2px; }
 .chat-tool-group .chat-event { margin: 0; }
 .chat-tool-group-indent { margin-left: 6px; display: flex; flex-direction: column; gap: 2px; }
-.chat-tool-activity-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin: 2px 0; min-width: 0; }
+.chat-tool-activity-wrap { display: flex; flex-direction: column; align-items: stretch; gap: 2px; margin: 2px 0; min-width: 0; }
 .chat-tool-activity {
   position: relative;
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
-  width: fit-content;
+  /* Full width on every client: the chip now carries a variable-length tool
+     descriptor, so sizing to content made it jump around as tools changed and
+     left no room to ellipse. */
+  width: 100%;
   max-width: 100%;
-  min-width: 218px;
+  min-width: 0;
   height: 26px;
   padding: 0 7px;
   overflow: hidden;
@@ -3278,9 +3281,20 @@ html.native-ios-mac .chat-dl-btn {
    from twitching as digit widths change. */
 .chat-tool-activity-time.is-running { color: #67e8f9; }
 
-/* What the newest tool is actually doing (command, search pattern, path).
-   Desktop only — see the width rules below. */
+/* A miniature tool call: which tool, and what it was called with. Kept on every
+   screen size — it is the whole point of the chip during a long wait — so it
+   takes the slack and ellipses instead of being dropped on narrow screens. */
 .chat-tool-activity-last {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.chat-tool-activity-last-name { flex: 0 0 auto; color: #cbd5e1; font-weight: 600; }
+.chat-tool-activity-last-input {
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -3288,16 +3302,6 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
   color: #94a3b8;
   opacity: 0.9;
-}
-/* Below the desktop breakpoint the chip has no width to spare, so the
-   descriptor is dropped and the elapsed time is kept. */
-@media (max-width: 768px) {
-  .chat-tool-activity-last { display: none; }
-}
-/* Desktop can afford a wider chip; without raising the ceiling the descriptor
-   would just squeeze the progress rail. */
-@media (min-width: 769px) {
-  .chat-tool-activity { min-width: 300px; max-width: min(100%, 560px); }
 }
 .chat-tool-activity-chevron { flex: 0 0 auto; color: #64748b; font-size: 13px; transform: translateY(-1px); transition: transform 0.15s, color 0.15s; }
 .chat-tool-activity-wrap.is-expanded .chat-tool-activity-chevron { color: #67e8f9; transform: rotate(180deg) translateY(1px); }

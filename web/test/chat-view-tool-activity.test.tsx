@@ -249,4 +249,73 @@ describe('ChatView compact tool activity', () => {
 
     expect(container.querySelector('.chat-tool-activity-last')?.textContent).not.toContain('✓');
   });
+  // Regressions from the first cut of this chip: the last event in a group is
+  // often a standalone tool.result (its call fell outside the merge window),
+  // and reading it directly produced a bare input dump with no name, no time.
+  it('names the tool, not just its arguments', () => {
+    const call = makeEvent('n1', 'tool.call', { tool: 'Grep', input: { pattern: 'needle' } }, 1);
+    const { container } = render(<ChatView events={[call]} loading={false} />);
+    expect(container.querySelector('.chat-tool-activity-last-name')?.textContent).toBe('Grep');
+  });
+
+  it('falls back past a standalone trailing result to the call that names the tool', () => {
+    // The merge window pairs a call with the FIRST result after it, so a second
+    // unpaired result stays in the group and lands last. Reading that directly
+    // is what produced a bare argument dump with no name and no duration.
+    const call = makeEvent('c3', 'tool.call', { tool: 'Bash', input: { command: 'npm ci' } }, 1);
+    (call as { ts: number }).ts = 10_000;
+    const pairedResult = makeEvent('r3', 'tool.result', { output: 'done' }, 2);
+    (pairedResult as { ts: number }).ts = 12_000;
+    const strayResult = makeEvent('r4', 'tool.result', { output: 'stray' }, 3);
+    (strayResult as { ts: number }).ts = 13_000;
+
+    const { container } = render(
+      <ChatView events={[call, pairedResult, strayResult]} loading={false} />,
+    );
+
+    expect(container.querySelector('.chat-tool-activity-last-name')?.textContent).toBe('Bash');
+    expect(container.querySelector('.chat-tool-activity-last-input')?.textContent).toContain('npm ci');
+    // Timed call → paired result (2.0s), not call → stray result (3.0s).
+    expect(container.querySelector('.chat-tool-activity-time')?.textContent).toBe('2.0s');
+  });
+
+  it('uses the result args when a streamed call arrived without input', () => {
+    // Transport SDKs emit tool.call before the arguments finish streaming; the
+    // full row recovers them from the result, and the chip must do the same or
+    // it shows a bare tool name.
+    const call = makeEvent('s1', 'tool.call', { tool: 'Grep' }, 1);
+    const result = makeEvent('s2', 'tool.result', {
+      output: 'hit',
+      detail: { input: { pattern: 'from-result' } },
+    }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+
+    expect(container.querySelector('.chat-tool-activity-last-input')?.textContent).toContain('from-result');
+  });
+
+  it('renders the descriptor on narrow screens too, not only desktop', () => {
+    // The chip goes full width and ellipses; dropping it on mobile would remove
+    // the only answer to "what is it doing".
+    const call = makeEvent('m1', 'tool.call', { tool: 'Bash', input: { command: 'npm run build' } }, 1);
+    const { container } = render(<ChatView events={[call]} loading={false} />);
+    const last = container.querySelector('.chat-tool-activity-last') as HTMLElement | null;
+    expect(last).not.toBeNull();
+    // No JS media gate: presence must not depend on viewport width.
+    expect(last?.style.display).not.toBe('none');
+  });
+  it('shows only the first line of a multi-line command', () => {
+    // The chip is one row tall; a heredoc or multi-line script must not drag
+    // the rest of its body into the status strip.
+    const call = makeEvent('ml1', 'tool.call', {
+      tool: 'Bash',
+      input: { command: 'set -e\nnpm ci\nnpm test' },
+    }, 1);
+
+    const { container } = render(<ChatView events={[call]} loading={false} />);
+
+    const input = container.querySelector('.chat-tool-activity-last-input')?.textContent ?? '';
+    expect(input).toContain('set -e');
+    expect(input).not.toContain('npm test');
+  });
 });

@@ -18,7 +18,7 @@ import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
-import { formatToolDuration, truncateToolLabel } from '../util/tool-duration.js';
+import { formatToolDuration } from '../util/tool-duration.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -3204,8 +3204,26 @@ function toggleToolFoldFromHeader(
   toggleExpanded();
 }
 
-/** Chip width budget for the desktop-only "what is it running" descriptor. */
-const TOOL_ACTIVITY_LABEL_MAX = 44;
+/**
+ * Name + input for a `tool.call`, exactly as the full tool row derives them.
+ *
+ * Shared so the Simple-view chip really is a miniature of the detailed row: it
+ * needs `pickMergedToolInput` (which prefers the result's complete args when a
+ * streamed call arrived without input) rather than the raw payload, or a tool
+ * like TodoWrite renders as a wall of JSON.
+ */
+function deriveToolCallDisplay(event: TimelineEvent): { toolName: string; toolInput: string } {
+  const toolName = String(event.payload.tool ?? 'tool');
+  const callDetail = event.payload._callDetail ?? event.payload.detail;
+  const resultDetail = event.payload._resultDetail;
+  const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
+    ? event.payload._callPayloadInput
+    : event.payload.input;
+  // Fall back to result detail for input — transport SDK tool.call may arrive without input.
+  const callInput = summarizeToolInput(callPayloadInput, callDetail);
+  const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
+  return { toolName, toolInput: pickMergedToolInput(toolName, callInput, resultInput) };
+}
 
 function getToolActivityCounts(events: TimelineEvent[]) {
   let terminal = 0;
@@ -3234,35 +3252,38 @@ function getToolActivityCounts(events: TimelineEvent[]) {
 function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
   running: boolean;
   durationMs: number | null;
-  label: string;
+  toolName: string;
+  toolInput: string;
 } | null {
-  const last = events[events.length - 1];
-  if (!last) return null;
+  // Walk back to the newest `tool.call`. The last event in a group is often a
+  // standalone `tool.result` (its call fell outside the merge window), and a
+  // result carries no tool name and no start time — reading it directly is why
+  // the chip showed a bare input dump with no name and no duration.
+  let index = events.length - 1;
+  while (index >= 0 && events[index].type !== 'tool.call') index -= 1;
+  if (index < 0) return null;
+  const call = events[index];
 
-  const startedAt = typeof last.ts === 'number' ? last.ts : null;
-  const finishedAt = typeof last.payload._resultTs === 'number' ? last.payload._resultTs : null;
-  const running = last.payload._merged !== true && last.type !== 'tool.result';
+  const { toolName, toolInput } = deriveToolCallDisplay(call);
+
+  const startedAt = typeof call.ts === 'number' ? call.ts : null;
+  // Merging is what pairs a call with its result, so a merged event is finished
+  // and carries the result's timestamp; anything unmerged is still in flight.
+  // (An explicit "look for a trailing result" branch was tried here and removed:
+  // the merge window scans forward by array position, so a result adjacent to
+  // its call always merges, and no test could reach the branch.)
+  const finishedAt = typeof call.payload._resultTs === 'number' ? call.payload._resultTs : null;
+  const running = call.payload._merged !== true;
 
   let durationMs: number | null = null;
   if (startedAt !== null) {
-    // A clock skew or a rehydrated event can put the start in the future;
-    // clamp rather than render a negative age.
+    // Clock skew or a rehydrated event can put the start in the future; clamp
+    // rather than render a negative age.
     if (running) durationMs = Math.max(0, nowMs - startedAt);
     else if (finishedAt !== null) durationMs = Math.max(0, finishedAt - startedAt);
   }
 
-  const tool = String(last.payload.tool ?? '').trim();
-  // Read the ORIGINAL call input: a merged event rewrites `payload.input` to
-  // append a ✓/✗ status, which the counters already show and which would only
-  // eat width here. `_callPayloadInput` is set on every merge and holds the
-  // pre-status value, so no stripping is needed.
-  const input = summarizeToolInput(
-    last.payload._callPayloadInput ?? last.payload.input,
-    last.payload._callDetail ?? last.payload.detail,
-  ).trim();
-  const label = [tool, input].filter(Boolean).join(' ');
-
-  return { running, durationMs, label };
+  return { running, durationMs, toolName, toolInput };
 }
 
 /** One-line live tool telemetry for Simple view; expands details on demand. */
@@ -3291,7 +3312,9 @@ function ToolActivitySummary({
   const nowMs = useNowTicker(counts.running > 0);
   const last = getLastToolActivity(events, nowMs);
   const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
-  const lastLabel = last?.label ? truncateToolLabel(last.label, TOOL_ACTIVITY_LABEL_MAX) : null;
+  // Same one-line preview the full row shows, so this reads as a miniature of it
+  // rather than a different rendering of the same data.
+  const lastInput = last ? splitToolFoldPreview(last.toolInput).firstLine : null;
   const summary = t('chat.tool_activity_summary', counts);
   const action = expanded
     ? t('chat.tool_activity_collapse')
@@ -3306,7 +3329,7 @@ function ToolActivitySummary({
         class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
         aria-expanded={expanded}
         aria-label={`${summary}. ${action}`}
-        title={[summary, last?.label, lastDuration].filter(Boolean).join(' · ')}
+        title={[summary, last && [last.toolName, last.toolInput].filter(Boolean).join(' '), lastDuration].filter(Boolean).join(' · ')}
         onClick={() => setExpanded((value) => !value)}
       >
         <span class="chat-tool-activity-core" aria-hidden="true" />
@@ -3317,11 +3340,15 @@ function ToolActivitySummary({
           {counts.running > 0 && <span class="chat-tool-activity-stat is-running">●{counts.running}</span>}
           {counts.failed > 0 && <span class="chat-tool-activity-stat is-failed">×{counts.failed}</span>}
         </span>
-        {/* Desktop only: the chip has room to say WHAT is running, not just how
-            many. Hidden below the desktop breakpoint in CSS rather than by a JS
-            media query, so it costs no re-render on resize. */}
-        {lastLabel && (
-          <span class="chat-tool-activity-last" aria-hidden="true" title={last?.label}>{lastLabel}</span>
+        {/* A miniature tool call: which tool, and what it was called with. Shown
+            on every client — "what is it doing" is the question during a wait
+            regardless of screen size; the chip goes full width and this ellipses
+            rather than being dropped. */}
+        {last && (
+          <span class="chat-tool-activity-last" aria-hidden="true" title={[last.toolName, last.toolInput].filter(Boolean).join(' ')}>
+            <span class="chat-tool-activity-last-name">{last.toolName}</span>
+            {lastInput && <span class="chat-tool-activity-last-input">{lastInput}</span>}
+          </span>
         )}
         {lastDuration && (
           <span
@@ -3655,18 +3682,14 @@ const ChatEvent = memo(function ChatEvent({
       return null;
 
     case 'tool.call': {
-      const toolName = String(event.payload.tool ?? 'tool');
-      const callDetail = event.payload._callDetail ?? event.payload.detail;
-      const resultDetail = event.payload._resultDetail;
+      const { toolName, toolInput } = deriveToolCallDisplay(event);
       const callPayloadInput = Object.prototype.hasOwnProperty.call(event.payload, '_callPayloadInput')
         ? event.payload._callPayloadInput
         : event.payload.input;
+      const callDetail = event.payload._callDetail ?? event.payload.detail;
+      const resultDetail = event.payload._resultDetail;
       const resultPayloadOutput = event.payload._resultPayloadOutput;
       const shouldShowTime = showTime || event.payload._merged === true;
-      // Fall back to result detail for input — transport SDK tool.call may arrive without input
-      const callInput = summarizeToolInput(callPayloadInput, callDetail);
-      const resultInput = summarizeToolInput((resultDetail as any)?.input, resultDetail);
-      const toolInput = pickMergedToolInput(toolName, callInput, resultInput);
       const {
         firstLine: toolInputFirstLine,
         remainingLines: toolInputRemainingLines,

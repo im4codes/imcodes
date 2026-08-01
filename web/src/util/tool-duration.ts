@@ -27,15 +27,3 @@ export function formatToolDuration(ms: number): string {
   const hours = Math.floor(minutes / 60);
   return `${hours}h${String(minutes % 60).padStart(2, '0')}m`;
 }
-
-/**
- * Trim a tool descriptor to fit the chip without cutting mid-character.
- *
- * Slices by code point so a surrogate pair (emoji, rare CJK) is never split
- * into a lone half, which renders as a replacement glyph.
- */
-export function truncateToolLabel(text: string, maxCodePoints: number): string {
-  const points = Array.from(text);
-  if (points.length <= maxCodePoints) return text;
-  return `${points.slice(0, maxCodePoints).join('')}…`;
-}
