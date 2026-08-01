@@ -5,6 +5,7 @@
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import {
   CRON_COMPLETION_POLICY,
+  CRON_CONTROL_PROTOCOL,
   CRON_MSG,
   normalizeCronCompletionPolicy,
 } from '../../shared/cron-types.js';
@@ -26,6 +27,9 @@ import logger from '../util/logger.js';
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
 const CRON_DAEMON_BUSY_DEFAULT_DELAY_MS = 5_000;
+const CRON_TRANSIENT_RETRY_DELAY_MS = 60_000;
+const CRON_TRANSIENT_MAX_ATTEMPTS = 3;
+const CRON_COMMAND_ATTEMPT_TIMEOUT_MS = 13 * 60_000;
 
 const BUSY_STATES = new Set(['streaming', 'thinking', 'tool_running', 'permission']);
 
@@ -69,7 +73,7 @@ export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: st
   const lifecycleInstruction = completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
     ? 'This schedule repeats until its overall goal is complete. Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.'
     : 'Recurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.';
-  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\n</imcodes-cron-control>`;
+  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\nExecute only the operations explicitly requested above. Do not add web fetches, curl requests, or other network checks unless the task explicitly requests them.\nIf an explicitly requested tool returns ${CRON_CONTROL_PROTOCOL.SILENT_RESULT} as its first non-empty line, stop immediately, call no more tools, and finish this occurrence with exactly ${CRON_CONTROL_PROTOCOL.SILENT_RESULT}.\nAlways produce one final response for this occurrence.\n</imcodes-cron-control>`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
@@ -180,12 +184,27 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         }
       }
       if (runtime) {
-        try {
-          const result = await runtime.send(command);
+        const transportRuntime = runtime;
+        const dispatchAttempt = async (attempt: number): Promise<void> => {
+          if (attempt > 1 && transportRuntime.getStatus() !== 'idle') {
+            await transportRuntime.cancel();
+          }
+          const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
+          const result = await transportRuntime.send(command, clientMessageId);
           if (result !== 'queued') {
             timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
           }
+        };
+        const collector = collectCommandResult(name, jobId, executionId, serverLink, {
+          retry: dispatchAttempt,
+          retryDelayMs: CRON_TRANSIENT_RETRY_DELAY_MS,
+          maxAttempts: CRON_TRANSIENT_MAX_ATTEMPTS,
+          maxWaitMs: CRON_COMMAND_ATTEMPT_TIMEOUT_MS,
+        });
+        try {
+          await dispatchAttempt(1);
         } catch (err) {
+          collector.cancel();
           logger.error({ jobId, sessionName: name, err }, 'Cron: transport send failed');
           sendCommandResult(serverLink, {
             type: CRON_MSG.COMMAND_RESULT,
@@ -208,11 +227,22 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         return;
       }
     } else {
-      await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command);
+      const collector = collectCommandResult(name, jobId, executionId, serverLink);
+      try {
+        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command);
+      } catch (error) {
+        collector.cancel();
+        logger.error({ jobId, sessionName: name, error }, 'Cron: process session send failed');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron process session send failed for ${name}: ${formatErr(error)}`,
+        });
+        return;
+      }
     }
-
-    // Capture agent response: collect assistant.text events until session goes idle
-    collectCommandResult(name, jobId, executionId, serverLink);
     return;
   }
 
@@ -425,49 +455,153 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   });
 }
 
+interface CronCommandResultCollectorOptions {
+  retry?: (attempt: number) => Promise<void>;
+  retryDelayMs?: number;
+  maxAttempts?: number;
+  maxWaitMs?: number;
+}
+
 /** Collect assistant output after a cron command until session goes idle, then send result to server. */
-function collectCommandResult(sessionId: string, jobId: string, executionId: string | undefined, serverLink: ServerLink): void {
-  const MAX_WAIT_MS = 10 * 60 * 1000; // 10 min max
+function collectCommandResult(
+  sessionId: string,
+  jobId: string,
+  executionId: string | undefined,
+  serverLink: ServerLink,
+  options: CronCommandResultCollectorOptions = {},
+): { cancel(): void } {
   const MAX_DETAIL_LEN = 4000;
   const collected: string[] = [];
-  const startTs = Date.now();
+  let attempt = 1;
+  let attemptStartTs = Date.now();
+  let toolObserved = false;
+  let successfulAssistantObserved = false;
+  let providerErrorObserved = false;
+  let recoverableProviderErrorObserved = false;
+  let retryScheduled = false;
+  let finished = false;
+  let attemptTimer: ReturnType<typeof setTimeout> | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let unsub = () => {};
+
+  const maxAttempts = Math.max(1, options.maxAttempts ?? 1);
+  const retryDelayMs = Math.max(0, options.retryDelayMs ?? 0);
+  const maxWaitMs = Math.max(1_000, options.maxWaitMs ?? CRON_COMMAND_ATTEMPT_TIMEOUT_MS);
+
+  const resetAttempt = () => {
+    collected.length = 0;
+    attemptStartTs = Date.now();
+    toolObserved = false;
+    successfulAssistantObserved = false;
+    providerErrorObserved = false;
+    recoverableProviderErrorObserved = false;
+    retryScheduled = false;
+  };
+
+  const cleanup = () => {
+    if (attemptTimer) clearTimeout(attemptTimer);
+    if (retryTimer) clearTimeout(retryTimer);
+    attemptTimer = null;
+    retryTimer = null;
+    unsub();
+  };
+
+  const finish = (status?: 'error', fallbackDetail?: string) => {
+    if (finished) return;
+    finished = true;
+    const detail = (collected.join('\n').trim() || fallbackDetail || `Cron command returned no response from ${sessionId}`)
+      .slice(0, MAX_DETAIL_LEN);
+    logger.info({ jobId, executionId, sessionId, detailLength: detail.length, status }, 'Cron: command result captured');
+    sendCommandResult(serverLink, {
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId,
+      executionId,
+      ...(status ? { status } : {}),
+      detail,
+    });
+    cleanup();
+  };
+
+  const canRetrySafely = () => (
+    !!options.retry
+    && attempt < maxAttempts
+    && !toolObserved
+    && !successfulAssistantObserved
+    && (!providerErrorObserved || recoverableProviderErrorObserved)
+  );
+
+  const scheduleRetry = (reason: 'recoverable_provider_error' | 'timeout') => {
+    if (finished || retryScheduled || !canRetrySafely() || !options.retry) return;
+    retryScheduled = true;
+    if (attemptTimer) {
+      clearTimeout(attemptTimer);
+      attemptTimer = null;
+    }
+    const nextAttempt = attempt + 1;
+    logger.warn(
+      { jobId, executionId, sessionId, attempt, nextAttempt, maxAttempts, retryDelayMs, reason },
+      'Cron: retrying a side-effect-free transient transport failure',
+    );
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      attempt = nextAttempt;
+      resetAttempt();
+      armAttemptTimeout();
+      void options.retry!(attempt).catch((error) => {
+        collected.push(`Cron transport retry failed for ${sessionId}: ${formatErr(error)}`);
+        providerErrorObserved = true;
+        finish('error');
+      });
+    }, retryDelayMs);
+    retryTimer.unref?.();
+  };
+
+  const armAttemptTimeout = () => {
+    if (attemptTimer) clearTimeout(attemptTimer);
+    attemptTimer = setTimeout(() => {
+      logger.warn({ jobId, executionId, sessionId, attempt }, 'Cron: command result timed out');
+      if (canRetrySafely()) {
+        scheduleRetry('timeout');
+        return;
+      }
+      finish('error', `Cron command timed out waiting for response from ${sessionId}`);
+    }, maxWaitMs);
+    attemptTimer.unref?.();
+  };
 
   const handler = (e: TimelineEvent) => {
-    if (e.sessionId !== sessionId) return;
-    // Skip events from before this cron dispatch (prevents capturing stale output)
-    if (e.ts < startTs) return;
-    if (Date.now() - startTs > MAX_WAIT_MS) {
-      logger.warn({ jobId, executionId, sessionId }, 'Cron: command result timed out');
-      sendCommandResult(serverLink, {
-        type: CRON_MSG.COMMAND_RESULT,
-        jobId,
-        executionId,
-        status: 'error',
-        detail: `Cron command timed out waiting for response from ${sessionId}`,
-      });
-      cleanup();
-      return;
-    }
+    if (finished || retryScheduled || e.sessionId !== sessionId) return;
+    if (typeof e.ts === 'number' && e.ts < attemptStartTs) return;
+    if (e.type === 'tool.call' || e.type === 'tool.result') toolObserved = true;
 
     if (e.type === 'assistant.text' && typeof e.payload.text === 'string') {
       collected.push(e.payload.text);
+      if (typeof e.payload.providerErrorCode === 'string') {
+        providerErrorObserved = true;
+        recoverableProviderErrorObserved = e.payload.providerErrorRecoverable === true;
+      } else {
+        successfulAssistantObserved = true;
+      }
     }
 
     if (e.type === 'session.state' && e.payload.state === 'idle' && collected.length > 0) {
-      const detail = collected.join('\n').slice(0, MAX_DETAIL_LEN);
-      logger.info({ jobId, executionId, sessionId, detailLength: detail.length }, 'Cron: command result captured');
-      sendCommandResult(serverLink, { type: CRON_MSG.COMMAND_RESULT, jobId, executionId, detail });
-      cleanup();
+      if (recoverableProviderErrorObserved && canRetrySafely()) {
+        scheduleRetry('recoverable_provider_error');
+        return;
+      }
+      finish(providerErrorObserved ? 'error' : undefined);
     }
   };
 
-  const unsub = timelineEmitter.on(handler);
-  const timer = setTimeout(cleanup, MAX_WAIT_MS);
-
-  function cleanup() {
-    clearTimeout(timer);
-    unsub();
-  }
+  unsub = timelineEmitter.on(handler);
+  armAttemptTimeout();
+  return {
+    cancel() {
+      if (finished) return;
+      finished = true;
+      cleanup();
+    },
+  };
 }
 
 function sendCommandResult(serverLink: ServerLink, msg: CronCommandResultMessage, attempt = 1): void {

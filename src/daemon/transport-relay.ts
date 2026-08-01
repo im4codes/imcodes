@@ -7,6 +7,7 @@
  */
 import {
   PROVIDER_ERROR_CODES,
+  PROVIDER_CANCEL_ORIGINS,
   SDK_TURN_LOST_RECOVERY_PHASES,
   SDK_TURN_LOST_RECOVERY_REASON,
   SDK_TURN_LOST_RECOVERY_STATUS,
@@ -508,6 +509,13 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     }
 
     if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
+      const errorDetails = error.details && typeof error.details === 'object' && !Array.isArray(error.details)
+        ? error.details as Record<string, unknown>
+        : null;
+      const staleWatchdogRecovery = errorDetails?.cancelOrigin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG;
+      const terminalNotice = staleWatchdogRecovery
+        ? '⚠️ OpenCode was unresponsive and was automatically recovered.'
+        : '⚠️ Turn cancelled';
       // Preserve the partial streamed content up to the stop point and persist it.
       // Previously this replaced the in-place streaming event (same eventId) with
       // ONLY the cancel notice, so pressing Esc/Stop mid-stream made the visible
@@ -515,20 +523,35 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       // Mirror the error branch below: keep `tracked.text` + a terminal marker, and
       // append the transport event so the partial survives refresh/reconnect (落盘).
       const cancelledText = tracked?.text
-        ? `${tracked.text}\n\n⚠️ Turn cancelled`
-        : `⚠️ Turn cancelled: ${error.message}`;
+        ? `${tracked.text}\n\n${terminalNotice}`
+        : staleWatchdogRecovery
+          ? terminalNotice
+          : `⚠️ Turn cancelled: ${error.message}`;
       timelineEmitter.emit(sessionName, 'assistant.text', {
         text: cancelledText,
         streaming: false,
         // Cancelled output is deliberately interrupted — keep it out of memory,
         // but still display + persist it. (Display/replay are unaffected by this flag.)
         memoryExcluded: true,
+        providerErrorCode: error.code,
+        providerErrorRecoverable: error.recoverable,
+        ...(staleWatchdogRecovery ? {
+          automation: true,
+          providerCancelOrigin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+        } : {}),
       }, {
         source: 'daemon',
         confidence: 'high',
         ...(tracked ? { eventId: tracked.eventId } : {}),
       });
       if (tracked?.text) {
+        void appendTransportEvent(sessionName, {
+          type: 'assistant.text',
+          sessionId: sessionName,
+          text: cancelledText,
+        });
+      }
+      if (staleWatchdogRecovery && !tracked?.text) {
         void appendTransportEvent(sessionName, {
           type: 'assistant.text',
           sessionId: sessionName,
@@ -547,6 +570,8 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: errorText,
       streaming: false,
+      providerErrorCode: error.code,
+      providerErrorRecoverable: error.recoverable,
       ...(!tracked?.text ? { memoryExcluded: true } : {}),
     }, {
       source: 'daemon',

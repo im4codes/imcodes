@@ -1502,7 +1502,7 @@ const HEALTH_POLL_MS = 30_000;
 // long-thinking latency, but not so high that a memory-compression/app-server
 // finalize miss leaves the UI "working" for a whole operator session. Active
 // tool calls still use the runtime's longer tool-aware floor.
-const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 5 * 60_000;
+const TRANSPORT_STALE_ACTIVE_TURN_RECOVERY_MS = 12 * 60_000;
 const MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS = 6 * 60_000;
 const CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS = 12 * 60_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;

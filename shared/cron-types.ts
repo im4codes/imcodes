@@ -11,6 +11,19 @@ export const CRON_COMPLETION_POLICY = {
   UNTIL_COMPLETE: 'until_complete',
 } as const;
 
+/** Protocol markers used by self-managed scheduled turns. Keep these shared. */
+export const CRON_CONTROL_PROTOCOL = {
+  OPEN_TAG: '<imcodes-cron-control ',
+  SILENT_RESULT: 'SILENT',
+} as const;
+
+/** True when a self-managed cron tool result explicitly declares a no-op run. */
+export function isCronSilentResult(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const firstNonEmptyLine = value.split(/\r?\n/u).find((line) => line.trim().length > 0);
+  return firstNonEmptyLine?.trim() === CRON_CONTROL_PROTOCOL.SILENT_RESULT;
+}
+
 export type CronCompletionPolicy = (typeof CRON_COMPLETION_POLICY)[keyof typeof CRON_COMPLETION_POLICY];
 
 /** Legacy and malformed values fail safe to recurring so a run cannot silently delete its schedule. */

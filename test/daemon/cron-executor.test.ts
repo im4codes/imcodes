@@ -120,6 +120,28 @@ describe('executeCronJob', () => {
     expect(sendKeys).not.toHaveBeenCalled();
   });
 
+  it('reports a process session send failure instead of leaving the cron execution unresolved', async () => {
+    const sendError = new Error('tmux write failed');
+    cronProcessSendMock.mockRejectedValueOnce(sendError);
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await expect(executeCronJob(makeMsg({ executionId: 'exec-process-failure' }), mockServerLink))
+      .resolves.toBeUndefined();
+
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-process-failure',
+      status: 'error',
+      detail: 'Cron process session send failed for deck_myapp_brain: tmux write failed',
+    });
+    expect(logger.error).toHaveBeenCalledWith(
+      { jobId: 'job-1', sessionName: 'deck_myapp_brain', error: sendError },
+      'Cron: process session send failed',
+    );
+  });
+
   it('injects only the self-management id and lifecycle rule into agent wake-up prompts', async () => {
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
     (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
@@ -134,7 +156,10 @@ describe('executeCronJob', () => {
     }), mockServerLink);
 
     const prompt = cronProcessSendMock.mock.calls[0][1] as string;
-    expect(prompt).toBe('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1" completion-policy="recurring">\nUse cron_update_self to change this task only when the user explicitly asks.\nRecurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.\n</imcodes-cron-control>');
+    expect(prompt).toContain('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1" completion-policy="recurring">');
+    expect(prompt).toContain('Do not add web fetches, curl requests, or other network checks unless the task explicitly requests them.');
+    expect(prompt).toContain('If an explicitly requested tool returns SILENT as its first non-empty line, stop immediately, call no more tools, and finish this occurrence with exactly SILENT.');
+    expect(prompt).toContain('Always produce one final response for this occurrence.');
   });
 
   it('allows an until-complete schedule to self-cancel only after its overall goal completes', async () => {
@@ -281,7 +306,7 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg(), mockServerLink);
 
     expect(detectStatusAsync).not.toHaveBeenCalled();
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
+    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
     expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
     expect(sendKeys).not.toHaveBeenCalled();
     expect(timelineEmit).toHaveBeenCalledWith(
@@ -303,12 +328,170 @@ describe('executeCronJob', () => {
 
     await executeCronJob(makeMsg(), mockServerLink);
 
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
+    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
     expect(timelineEmit).not.toHaveBeenCalledWith(
       'deck_myapp_brain',
       'user.message',
       expect.anything(),
     );
+  });
+
+  it('retries a recoverable transport failure after one minute only when no tool ran', async () => {
+    vi.useFakeTimers();
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      getStatus: vi.fn(() => 'idle'),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn().mockReturnValue('sent'),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    await executeCronJob(makeMsg({ executionId: 'exec-retry-safe' }), mockServerLink);
+    handler?.({
+      sessionId: 'deck_myapp_brain',
+      type: 'assistant.text',
+      payload: {
+        text: '⚠️ OpenCode was unresponsive and was automatically recovered.',
+        providerErrorCode: 'CANCELLED',
+        providerErrorRecoverable: true,
+      },
+    });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+
+    expect(mockServerLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+    }));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mockRuntime.send).toHaveBeenNthCalledWith(
+      2,
+      'review the codebase',
+      'cron:job-1:exec-retry-safe:attempt:2',
+    );
+    expect(mockRuntime.cancel).not.toHaveBeenCalled();
+
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'done after retry' } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-retry-safe',
+      detail: 'done after retry',
+    });
+    vi.useRealTimers();
+  });
+
+  it('does not replay a recoverable cron failure after tool side effects', async () => {
+    vi.useFakeTimers();
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      getStatus: vi.fn(() => 'idle'),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn().mockReturnValue('sent'),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    await executeCronJob(makeMsg({ executionId: 'exec-no-duplicate' }), mockServerLink);
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'tool.result', payload: { output: 'side effect complete' } });
+    handler?.({
+      sessionId: 'deck_myapp_brain',
+      type: 'assistant.text',
+      payload: {
+        text: '⚠️ Error: fetch failed',
+        providerErrorCode: 'CONNECTION_LOST',
+        providerErrorRecoverable: true,
+      },
+    });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-no-duplicate',
+      status: 'error',
+      detail: '⚠️ Error: fetch failed',
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mockRuntime.send).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it('subscribes before transport dispatch so an immediate result is not lost', async () => {
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      getStatus: vi.fn(() => 'idle'),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn(() => {
+        handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'immediate result' } });
+        handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+        return 'sent';
+      }),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    await executeCronJob(makeMsg({ executionId: 'exec-immediate' }), mockServerLink);
+
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-immediate',
+      detail: 'immediate result',
+    });
+  });
+
+  it('stops after three side-effect-free timed-out attempts and reports the timeout', async () => {
+    vi.useFakeTimers();
+    timelineOn.mockImplementation(() => () => {});
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      getStatus: vi.fn(() => 'idle'),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn().mockReturnValue('sent'),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'opencode-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    await executeCronJob(makeMsg({ executionId: 'exec-timeout-budget' }), mockServerLink);
+    await vi.advanceTimersByTimeAsync(13 * 60_000 + 60_000);
+    await vi.advanceTimersByTimeAsync(13 * 60_000 + 60_000);
+    await vi.advanceTimersByTimeAsync(13 * 60_000);
+
+    expect(mockRuntime.send).toHaveBeenCalledTimes(3);
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-timeout-budget',
+      status: 'error',
+      detail: 'Cron command timed out waiting for response from deck_myapp_brain',
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mockRuntime.send).toHaveBeenCalledTimes(3);
+    vi.useRealTimers();
   });
 
   // 11. Missing transport runtime — restores exact session before sending
@@ -328,7 +511,7 @@ describe('executeCronJob', () => {
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledOnce();
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
     expect(mockRuntime.send).toHaveBeenCalledOnce();
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
+    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
     expect(sendKeys).not.toHaveBeenCalled();
     expect(mockServerLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: CRON_MSG.COMMAND_RESULT,
@@ -353,7 +536,7 @@ describe('executeCronJob', () => {
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
     expect(unboundRuntime.send).not.toHaveBeenCalled();
     expect(restoredRuntime.send).toHaveBeenCalledOnce();
-    expect(restoredRuntime.send).toHaveBeenCalledWith('review the codebase');
+    expect(restoredRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
   });
 
   it('reports an error only after on-demand transport recovery fails', async () => {

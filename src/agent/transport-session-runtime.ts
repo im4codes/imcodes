@@ -4,7 +4,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
-import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -269,7 +269,7 @@ const TRANSPORT_STALE_ACTIVE_TURN_WITH_TOOL_MS = (() => {
 })();
 const TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS = (() => {
   const raw = Number.parseInt(process.env.IMCODES_TRANSPORT_STALE_SILENT_ACTIVE_TURN_MS ?? '', 10);
-  return Number.isFinite(raw) && raw >= 60_000 ? raw : 5 * 60_000;
+  return Number.isFinite(raw) && raw >= 60_000 ? raw : 12 * 60_000;
 })();
 
 function isRecoverableProviderBusyError(error: ProviderError): boolean {
@@ -1313,7 +1313,12 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (shouldCancelProvider) {
       try {
-        const cancelResult = this.provider.cancel!(providerSessionId);
+        const cancelResult = this.provider.cancel!(providerSessionId, {
+          origin: reason.includes('stale-active-turn')
+            ? PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
+            : PROVIDER_CANCEL_ORIGINS.EXTERNAL_COMPLETION,
+          reason,
+        });
         void Promise.resolve(cancelResult).catch((err) => {
           logger.warn(
             { err, sessionKey: this.sessionKey, providerSessionId, reason },

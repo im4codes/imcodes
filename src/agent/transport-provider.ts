@@ -70,6 +70,13 @@ export const PROVIDER_ERROR_CODES = {
   SDK_TURN_LOST:    'SDK_TURN_LOST',
 } as const;
 
+/** Why the runtime asked a provider to stop its active turn. */
+export const PROVIDER_CANCEL_ORIGINS = {
+  USER: 'user',
+  EXTERNAL_COMPLETION: 'external_completion',
+  STALE_WATCHDOG: 'stale_watchdog',
+} as const;
+
 // ── Derived types ───────────────────────────────────────────────────────────
 
 /** Connection mode determines how the transport manages the agent lifecycle. */
@@ -80,6 +87,13 @@ export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWN
 
 /** Error code from a provider operation. */
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
+export type ProviderCancelOrigin = typeof PROVIDER_CANCEL_ORIGINS[keyof typeof PROVIDER_CANCEL_ORIGINS];
+
+export interface ProviderCancelOptions {
+  origin: ProviderCancelOrigin;
+  /** Bounded machine-readable reason owned by the runtime, never raw provider output. */
+  reason?: string;
+}
 
 /** Machine-readable recovery reason for Codex SDK app-server lost foreground turns. */
 export const SDK_TURN_LOST_REASON = SHARED_SDK_TURN_LOST_RECOVERY_REASON;
@@ -516,7 +530,7 @@ export interface TransportProvider {
    * Best-effort cancellation of the current in-flight turn for a session.
    * Providers that support interruption should implement this.
    */
-  cancel?(sessionId: string): Promise<void>;
+  cancel?(sessionId: string, options?: ProviderCancelOptions): Promise<void>;
 
   /**
    * Register a callback to receive incremental output deltas while the agent is streaming.

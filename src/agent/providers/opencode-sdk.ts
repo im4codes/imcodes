@@ -15,10 +15,12 @@ import type {
   SessionInfoUpdate,
   TransportProvider,
   ProviderDelegationNotification,
+  ProviderCancelOptions,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
   normalizeProviderPayload,
+  PROVIDER_CANCEL_ORIGINS,
   PROVIDER_ERROR_CODES,
   SESSION_OWNERSHIP,
 } from '../transport-provider.js';
@@ -27,6 +29,10 @@ import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import { isTransientRequestFailure } from '../../../shared/request-failure.js';
+import {
+  CRON_CONTROL_PROTOCOL,
+  isCronSilentResult,
+} from '../../../shared/cron-types.js';
 import { composeProviderSystemText } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import logger from '../../util/logger.js';
@@ -47,6 +53,8 @@ const MODEL_CACHE_TTL_MS = 30_000;
 const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
+const MISSING_FINAL_RECOVERY_TIMEOUT_MS = 15_000;
+const MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS = [250, 1_000] as const;
 type PromptAcceptance = 'accepted' | 'absent' | 'unknown';
 const OPENCODE_PERMISSION_EVENT = {
   LEGACY_UPDATED: 'permission.updated',
@@ -71,6 +79,7 @@ interface OpenCodeClientLike {
     get(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     list(options?: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
     message(options: Record<string, unknown>): SdkResult<Record<string, any>>;
+    messages(options: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
     prompt(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     promptAsync(options: Record<string, unknown>): SdkResult<void>;
     abort(options: Record<string, unknown>): SdkResult<boolean>;
@@ -149,6 +158,9 @@ interface OpenCodeSessionState {
   terminalErrorEmitted: boolean;
   missingFinalRecoveryAttempted: boolean;
   missingFinalRecoveryInFlight: boolean;
+  cronControlActive: boolean;
+  silentToolResult: string | null;
+  deliveryMessageId: string | null;
   currentMessageId: string | null;
   messageRoles: Map<string, 'user' | 'assistant'>;
   pendingParts: Map<string, Array<{ part: Record<string, any>; delta?: string }>>;
@@ -162,6 +174,34 @@ interface OpenCodeSessionState {
   abort: AbortController;
   eventLoop: Promise<void>;
   pendingPermissions: Map<string, PendingOpenCodePermission>;
+  runtimeConfig: SessionConfig;
+}
+
+class OpenCodeRequestTimeoutError extends Error {
+  constructor(operation: string) {
+    super(`OpenCode ${operation} timed out after ${MISSING_FINAL_RECOVERY_TIMEOUT_MS}ms`);
+    this.name = 'OpenCodeRequestTimeoutError';
+  }
+}
+
+function withOpenCodeRequestTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new OpenCodeRequestTimeoutError(operation)),
+      MISSING_FINAL_RECOVERY_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function errorMessage(error: unknown): string {
@@ -206,6 +246,10 @@ function openCodePromptMessageId(providerSessionId: string, deliveryId: string |
     .digest('hex')
     .slice(0, 26);
   return `msg_${digest}`;
+}
+
+function openCodeRecoveryMessageId(providerSessionId: string, deliveryMessageId: string): string {
+  return openCodePromptMessageId(providerSessionId, `${deliveryMessageId}\0missing-final-recovery`);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -465,6 +509,9 @@ export class OpenCodeSdkProvider implements TransportProvider {
       terminalErrorEmitted: false,
       missingFinalRecoveryAttempted: false,
       missingFinalRecoveryInFlight: false,
+      cronControlActive: false,
+      silentToolResult: null,
+      deliveryMessageId: null,
       currentMessageId: null,
       messageRoles: new Map(),
       pendingParts: new Map(),
@@ -478,6 +525,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
       abort: sessionRuntime.abort,
       eventLoop: Promise.resolve(),
       pendingPermissions: new Map(),
+      runtimeConfig: { ...config },
     };
     this.sessions.set(routeId, state);
     this.registerProviderRoute(providerSessionId, routeId);
@@ -622,6 +670,9 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.terminalErrorEmitted = false;
     state.missingFinalRecoveryAttempted = false;
     state.missingFinalRecoveryInFlight = false;
+    state.cronControlActive = payload.assembledMessage.includes(CRON_CONTROL_PROTOCOL.OPEN_TAG);
+    state.silentToolResult = null;
+    state.deliveryMessageId = null;
     state.currentMessageId = null;
     state.messageRoles.clear();
     state.pendingParts.clear();
@@ -638,6 +689,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     ];
     const system = composeProviderSystemText(payload);
     const messageId = openCodePromptMessageId(state.providerSessionId, payload.deliveryId);
+    state.deliveryMessageId = messageId;
     try {
       if (await this.hasAcceptedPrompt(state, messageId)) {
         return;
@@ -699,7 +751,7 @@ export class OpenCodeSdkProvider implements TransportProvider {
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
   }
 
-  async cancel(sessionId: string): Promise<void> {
+  async cancel(sessionId: string, options?: ProviderCancelOptions): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state || !state.busy) return;
     state.cancelled = true;
@@ -711,7 +763,14 @@ export class OpenCodeSdkProvider implements TransportProvider {
         throwOnError: true,
       });
     } finally {
-      this.failOnce(state, providerError(PROVIDER_ERROR_CODES.CANCELLED, 'OpenCode turn cancelled', true));
+      this.failOnce(state, providerError(
+        PROVIDER_ERROR_CODES.CANCELLED,
+        options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
+          ? 'OpenCode was unresponsive and was automatically recovered.'
+          : 'OpenCode turn cancelled',
+        true,
+        options ? { cancelOrigin: options.origin, reason: options.reason } : undefined,
+      ));
     }
   }
 
@@ -1104,6 +1163,17 @@ export class OpenCodeSdkProvider implements TransportProvider {
       },
     };
     for (const callback of this.toolCallbacks) callback(state.routeId, event);
+    if (
+      status === 'complete'
+      && state.cronControlActive
+      && isCronSilentResult(toolState.output)
+    ) {
+      state.silentToolResult = CRON_CONTROL_PROTOCOL.SILENT_RESULT;
+      this.finishOnce(state, CRON_CONTROL_PROTOCOL.SILENT_RESULT, 'cron.tool.silent');
+      // Do not abort the provider turn here. An asynchronous abort can race
+      // with the next queued turn and cancel unrelated work. finishOnce makes
+      // SILENT terminal for IM.codes and generation guards ignore late events.
+    }
   }
 
   private processPermission(state: OpenCodeSessionState, permission: NormalizedOpenCodePermission | undefined): void {
@@ -1202,6 +1272,10 @@ export class OpenCodeSdkProvider implements TransportProvider {
     if (!state.busy || state.completionEmitted || state.terminalErrorEmitted || state.cancelled) return;
     const content = [...state.textParts.values()].join('');
     if (!content.trim()) {
+      if (state.cronControlActive && state.silentToolResult) {
+        this.finishOnce(state, state.silentToolResult, 'cron.tool.silent');
+        return;
+      }
       // A terminal message.updated frame can precede its text part. Wait for
       // prompt.result or an idle authority before deciding the turn is empty.
       if (source === 'message.updated' || state.missingFinalRecoveryInFlight) return;
@@ -1217,6 +1291,11 @@ export class OpenCodeSdkProvider implements TransportProvider {
       ));
       return;
     }
+    this.finishOnce(state, content, source);
+  }
+
+  private finishOnce(state: OpenCodeSessionState, content: string, source: string): void {
+    if (!state.busy || state.completionEmitted || state.terminalErrorEmitted || state.cancelled) return;
     state.completionEmitted = true;
     state.busy = false;
     this.emitStatus(state.routeId, { status: null, label: null });
@@ -1249,33 +1328,147 @@ export class OpenCodeSdkProvider implements TransportProvider {
     state.missingFinalRecoveryAttempted = true;
     state.missingFinalRecoveryInFlight = true;
     const generation = state.generation;
+    void this.runMissingFinalRecovery(state, generation);
+  }
+
+  private async runMissingFinalRecovery(state: OpenCodeSessionState, generation: number): Promise<void> {
+    const deliveryMessageId = state.deliveryMessageId
+      ?? openCodePromptMessageId(state.providerSessionId, `${state.routeId}:${generation}`);
+    const recoveryMessageId = openCodeRecoveryMessageId(state.providerSessionId, deliveryMessageId);
+    let lastError: unknown;
+
+    for (const delayMs of MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS) {
+      if (delayMs > 0) await sleep(delayMs);
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      try {
+        const recovered = await this.tryMissingFinalRecovery(state, recoveryMessageId);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
+        if (recovered) {
+          state.missingFinalRecoveryInFlight = false;
+          this.completeOnce(state, 'recovery.prompt.result');
+          return;
+        }
+        lastError = undefined;
+      } catch (error) {
+        lastError = error;
+        if (!isTransientRequestFailure(error) && !(error instanceof OpenCodeRequestTimeoutError)) break;
+      }
+    }
+
+    if (!this.isCurrent(state, generation) || state.cancelled) return;
+    if (lastError) {
+      try {
+        const restarted = await this.restartSessionRuntime(state, generation);
+        if (!restarted) return;
+        const recovered = await this.tryMissingFinalRecovery(state, recoveryMessageId);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
+        if (recovered) {
+          state.missingFinalRecoveryInFlight = false;
+          this.completeOnce(state, 'recovery.prompt.result.after-reconnect');
+          return;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (!this.isCurrent(state, generation) || state.cancelled) return;
+    state.missingFinalRecoveryInFlight = false;
+    const normalized = lastError
+      ? this.normalizeError(lastError, 'missing final response recovery')
+      : providerError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        'OpenCode ended the turn without a final response after bounded recovery.',
+        false,
+        { recoveryMessageId },
+      );
+    this.failOnce(state, normalized);
+  }
+
+  private async tryMissingFinalRecovery(
+    state: OpenCodeSessionState,
+    recoveryMessageId: string,
+  ): Promise<boolean> {
+    await withOpenCodeRequestTimeout(state.client.session.get({
+      path: { id: state.providerSessionId },
+      query: { directory: state.cwd },
+      throwOnError: true,
+    }), 'session health check');
+
+    const accepted = await withOpenCodeRequestTimeout(
+      this.hasAcceptedPrompt(state, recoveryMessageId),
+      'missing final acceptance check',
+    );
+    if (accepted) return this.loadAcceptedRecoveryResult(state, recoveryMessageId);
+
     const model = parseModelIdentity(state.model);
-    let recoveryRequest: SdkResult<Record<string, any>>;
+    const result = await withOpenCodeRequestTimeout(state.client.session.prompt({
+      path: { id: state.providerSessionId },
+      query: { directory: state.cwd },
+      body: {
+        messageID: recoveryMessageId,
+        ...(model ? { model } : {}),
+        parts: [{ type: 'text', text: MISSING_FINAL_RECOVERY_PROMPT }],
+      },
+      throwOnError: true,
+    }), 'missing final recovery prompt');
+    return this.processPromptResult(state, result.data);
+  }
+
+  private async loadAcceptedRecoveryResult(
+    state: OpenCodeSessionState,
+    recoveryMessageId: string,
+  ): Promise<boolean> {
+    const result = await withOpenCodeRequestTimeout(state.client.session.messages({
+      path: { id: state.providerSessionId },
+      query: { directory: state.cwd, limit: 100 },
+      throwOnError: true,
+    }), 'missing final recovery reconciliation');
+    const recovered = [...result.data].reverse().find((message) => (
+      message?.info?.role === 'assistant'
+      && safeString(message.info.parentID) === recoveryMessageId
+      && isTerminalAssistantMessage(message.info)
+    ));
+    return recovered ? this.processPromptResult(state, recovered) : false;
+  }
+
+  private async restartSessionRuntime(state: OpenCodeSessionState, generation: number): Promise<boolean> {
+    const replacement = await this.startSessionRuntime(state.runtimeConfig, state.cwd);
     try {
-      recoveryRequest = state.client.session.prompt({
+      await withOpenCodeRequestTimeout(replacement.client.session.get({
         path: { id: state.providerSessionId },
         query: { directory: state.cwd },
-        body: {
-          ...(model ? { model } : {}),
-          parts: [{ type: 'text', text: MISSING_FINAL_RECOVERY_PROMPT }],
-        },
         throwOnError: true,
-      });
+      }), 'session reconnect verification');
     } catch (error) {
-      state.missingFinalRecoveryInFlight = false;
-      this.failOnce(state, this.normalizeError(error, 'missing final response recovery'));
-      return;
+      await this.closeStartedRuntime(replacement);
+      throw error;
     }
-    void recoveryRequest.then((result) => {
-      if (!this.isCurrent(state, generation) || state.cancelled) return;
-      state.missingFinalRecoveryInFlight = false;
-      const terminal = this.processPromptResult(state, result.data);
-      if (terminal) this.completeOnce(state, 'recovery.prompt.result');
-    }).catch((error) => {
-      if (!this.isCurrent(state, generation) || state.cancelled) return;
-      state.missingFinalRecoveryInFlight = false;
-      this.failOnce(state, this.normalizeError(error, 'missing final response recovery'));
-    });
+
+    // Cancellation or a newer send may win while the replacement server is
+    // starting. Never attach that stale runtime after its owning turn ended.
+    if (!this.isCurrent(state, generation) || state.cancelled) {
+      await this.closeStartedRuntime(replacement);
+      return false;
+    }
+
+    const previous = {
+      abort: state.abort,
+      server: state.server,
+      eventLoop: state.eventLoop,
+    };
+    state.client = replacement.client;
+    state.server = replacement.server;
+    state.abort = replacement.abort;
+    state.eventLoop = this.consumeEvents(replacement.stream, replacement.abort.signal);
+    previous.abort.abort();
+    previous.server.close();
+    void previous.eventLoop.catch(() => {});
+    logger.warn(
+      { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId },
+      'OpenCode session server reconnected during missing-final recovery',
+    );
+    return true;
   }
 
   private failOnce(state: OpenCodeSessionState, error: ProviderError): void {

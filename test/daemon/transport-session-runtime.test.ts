@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
-import { PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
+import { PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -1934,7 +1934,10 @@ describe('TransportSessionRuntime', () => {
 
     expect(runtime.settleActiveDispatchFromExternalCompletion('marker-complete-but-provider-tool-stale')).toBe(true);
 
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.EXTERNAL_COMPLETION,
+      reason: 'marker-complete-but-provider-tool-stale',
+    });
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('provider_tool_item');
@@ -3592,7 +3595,10 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.settleActiveDispatchFromExternalCompletion('test-marker-completed')).toBe(true);
     await waitForProviderSendCount(mock.provider, 2);
 
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.EXTERNAL_COMPLETION,
+      reason: 'test-marker-completed',
+    });
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.sending).toBe(true);
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
@@ -3647,7 +3653,10 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
     await waitForProviderSendCount(mock.provider, 2);
 
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1', {
+      origin: PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG,
+      reason: 'health-poll-stale-active-turn',
+    });
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
       userMessage: 'queued after stuck compact',
@@ -4000,7 +4009,7 @@ ${PREFERENCE_CONTEXT_END}`;
     // Truly stale (provider silent past the last-resort no-tool threshold) +
     // empty queue → settle to idle. This covers memory-compression/finalize
     // misses where no queued prompt exists to trigger queue-visible recovery.
-    expect(runtime.recoverSilentActiveTurn({ nowMs: 1_000 + 5 * 60_000 + 1, staleMs: 10_000 })).toBe(true);
+    expect(runtime.recoverSilentActiveTurn({ nowMs: 1_000 + 12 * 60_000 + 1, staleMs: 10_000 })).toBe(true);
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
     expect(runtime.activeDispatchEntries).toEqual([]);
