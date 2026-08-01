@@ -95,6 +95,7 @@ import {
   type SupervisionMode,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_STATE } from '@shared/direct-file-transfer.js';
 import { shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
@@ -4031,7 +4032,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       name: file.name || 'file',
       progress: 0,
       status: 'uploading' as const,
-      transport: 'connecting' as const,
+      transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
     }));
     addComposerUploadItems(uploadKey, uploadItems);
 
@@ -4048,7 +4049,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           onMode: (transport) => {
             updateComposerUploadItem(uploadKey, uploadItem.id, {
               transport,
-              ...(transport === 'falling_back' ? { progress: 0 } : {}),
+              ...(transport === DIRECT_FILE_TRANSFER_STATE.FALLING_BACK ? { progress: 0 } : {}),
             });
           },
         });
@@ -4505,6 +4506,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </button>
             );
           })}
+          {showComposerTarget && (
+            <div
+              class="controls-target-bubble"
+              role="status"
+              aria-live="polite"
+              aria-label={t('session.composer_target_aria', { name: composerTargetPath })}
+            >
+              <span class="controls-target-pulse" aria-hidden="true" />
+              <span class="controls-target-label">{t('session.composer_target_label')}</span>
+              <span class="controls-target-name" title={composerTargetPath}>
+                {composerParentName && composerParentName !== composerTargetName && (
+                  <>
+                    <span class="controls-target-parent">{composerParentName}</span>
+                    <span class="controls-target-arrow" aria-hidden="true">→</span>
+                  </>
+                )}
+                <span class="controls-target-child">{composerTargetName}</span>
+              </span>
+            </div>
+          )}
         </div>}
 
         <div class={`shortcuts-meta-scroll${autoOpen || modelOpen || thinkingOpen ? ' has-open-menu' : ''}`}>
@@ -5283,44 +5304,47 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
       {/* Upload progress bars */}
       {uploadRows.length > 0 && (
-        <div style={{ margin: '0 8px 4px', display: 'grid', gap: 6 }}>
+        <div class="composer-upload-list">
           {uploadRows.map((item) => (
             <div
               key={item.id}
               data-testid="composer-upload-row"
-              style={{ minHeight: 24, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 38px', alignItems: 'center', columnGap: 8, rowGap: 4 }}
+              data-transport={item.transport}
+              class={`composer-upload-row composer-upload-row-${item.transport}`}
             >
               <span
                 title={item.name}
-                style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11, color: '#94a3b8' }}
+                class="composer-upload-name"
               >
                 {item.name}
               </span>
               <span
                 data-testid="composer-upload-transport"
-                style={{ fontSize: 10, color: item.transport === 'direct' ? '#22c55e' : '#94a3b8', textAlign: 'right', whiteSpace: 'nowrap' }}
+                data-transport={item.transport}
+                class={`composer-upload-transport composer-upload-transport-${item.transport}`}
+                title={t(`upload.transport.${item.transport}`)}
               >
+                <span class="composer-upload-transport-signal" aria-hidden="true" />
                 {t(`upload.transport.${item.transport}`)}
               </span>
               <div
                 role="progressbar"
-                aria-label={`${item.name} upload progress`}
+                aria-label={t('upload.progress_aria', {
+                  name: item.name,
+                  transport: t(`upload.transport.${item.transport}`),
+                  progress: item.progress,
+                })}
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={item.progress}
-                style={{ gridColumn: '1 / -1', height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}
+                class="composer-upload-progress-track"
               >
                 <div
-                  style={{
-                    width: `${item.progress}%`,
-                    height: '100%',
-                    background: item.status === 'error' ? '#ef4444' : '#3b82f6',
-                    borderRadius: 2,
-                    transition: 'width 0.2s ease',
-                  }}
+                  class={`composer-upload-progress-fill${item.status === 'error' ? ' composer-upload-progress-fill-error' : ''}`}
+                  style={{ width: `${item.progress}%` }}
                 />
               </div>
-              <span data-testid="composer-upload-progress" style={{ gridColumn: 2, fontSize: 11, color: '#94a3b8', textAlign: 'right' }}>{item.progress}%</span>
+              <span data-testid="composer-upload-progress" class="composer-upload-progress-value">{item.progress}%</span>
             </div>
           ))}
         </div>
@@ -5760,26 +5784,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
-          {showComposerTarget && (
-            <div
-              class="controls-target-bubble"
-              role="status"
-              aria-live="polite"
-              aria-label={t('session.composer_target_aria', { name: composerTargetPath })}
-            >
-              <span class="controls-target-pulse" aria-hidden="true" />
-              <span class="controls-target-label">{t('session.composer_target_label')}</span>
-              <span class="controls-target-name" title={composerTargetPath}>
-                {composerParentName && composerParentName !== composerTargetName && (
-                  <>
-                    <span class="controls-target-parent">{composerParentName}</span>
-                    <span class="controls-target-arrow" aria-hidden="true">→</span>
-                  </>
-                )}
-                <span class="controls-target-child">{composerTargetName}</span>
-              </span>
-            </div>
-          )}
           <div
             ref={divRef}
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}

@@ -817,6 +817,24 @@ afterEach(() => {
     expect(document.querySelector('.controls-target-bubble')).toBeNull();
   });
 
+  it('keeps the desktop target bubble in the Stop toolbar instead of over the upload list', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeTransportSession({ name: 'deck_project_brain', label: 'Main workspace' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    act(() => input.focus());
+
+    const target = screen.getByRole('status', { name: 'Message target: Main workspace' });
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    expect(target.parentElement).toBe(stop.parentElement);
+    expect(target.parentElement?.classList.contains('shortcuts')).toBe(true);
+    expect(target.closest('.controls-composer')).toBeNull();
+  });
+
 
   it('uses the parent connected prop instead of a stale ws.connected getter', () => {
     const ws = makeWs() as any;
@@ -6512,13 +6530,22 @@ afterEach(() => {
     expect(rows).toHaveLength(2);
     expect(within(rows[0]).getByText('alpha.txt')).toBeDefined();
     expect(within(rows[1]).getByText('beta.txt')).toBeDefined();
-    expect(screen.getAllByTestId('composer-upload-transport').map((node) => node.textContent)).toEqual([
+    const transportBadges = screen.getAllByTestId('composer-upload-transport');
+    expect(transportBadges.map((node) => node.textContent)).toEqual([
       'relay',
       'relay',
     ]);
+    expect(transportBadges.every((node) => (
+      node.getAttribute('data-transport') === 'relay'
+      && node.classList.contains('composer-upload-transport-relay')
+    ))).toBe(true);
+    expect(rows.every((row) => (
+      row.getAttribute('data-transport') === 'relay'
+      && row.classList.contains('composer-upload-row-relay')
+    ))).toBe(true);
     const progressBars = screen.getAllByRole('progressbar');
     expect(progressBars.map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
-    expect(progressBars.every((bar) => (bar as HTMLElement).style.gridColumn === '1 / -1')).toBe(true);
+    expect(progressBars.every((bar) => bar.classList.contains('composer-upload-progress-track'))).toBe(true);
 
     await act(async () => {
       pendingUploads[1].resolve({ attachment: { daemonPath: '/tmp/beta.txt' } });

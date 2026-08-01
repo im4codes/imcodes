@@ -39,6 +39,7 @@ import logger from '../util/logger.js';
 import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
 import { TIMELINE_HISTORY_ERROR_REASONS, type TimelineHistoryErrorReason } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
 
 export const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -55,6 +56,7 @@ const CONVERSATION_RETENTION_TYPES = new Set([
   'assistant.text',
   'ask.question',
   'peer_audit.result',
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   'memory.compression',
 ]);
 

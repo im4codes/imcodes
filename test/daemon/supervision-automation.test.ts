@@ -14,6 +14,7 @@ import {
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
 } from '../../shared/peer-audit.js';
 import {
+  AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_PURPOSES,
   buildAgentDelegationReplyInstruction,
 } from '../../shared/agent-delegation.js';
@@ -578,6 +579,77 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
       phase: 'finalizing',
     });
+  });
+
+  it('does not treat a structured audit completion notification as a new task after PASS', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-structured-audit-no-repeat',
+      'implement the feature',
+      snapshot,
+    );
+
+    const origin = getSession('deck_supervision_brain');
+    const target = getSession('deck_sub_reviewer');
+    if (!target) throw new Error('reviewer was not seeded');
+    const authority = createDelegationReplyAuthority({
+      origin,
+      target,
+      dispatchId: createSendDispatchId(),
+      messageId: createSendMessageId(),
+      audit: {
+        kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        attemptId: 'automatic_audit_attempt_no_repeat',
+      },
+    });
+    if (!authority) throw new Error('structured audit authority was not created');
+
+    timelineEmitter.emit('deck_sub_reviewer', 'user.message', {
+      text: [
+        'Task: independently audit this implementation.',
+        buildAgentDelegationReplyInstruction('deck_supervision_brain', authority.authority),
+      ].join('\n'),
+      allowDuplicate: true,
+      sharedActor: { actorUserId: 'deck_supervision_brain' },
+    });
+
+    // Runtime delivery sends the trusted completion notification into the
+    // origin timeline before the delivered event opens the verdict gate.
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: [
+        AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
+        'A delegated agent completed the requested work.',
+        `Delegation ID: ${authority.record.delegationId}`,
+        'From session: deck_sub_reviewer',
+        '',
+        'RECOMMENDATION: PASS',
+      ].join('\n'),
+      allowDuplicate: true,
+    });
+    emitDelegationReplyDelivered({
+      ...authority.record,
+      status: 'delivered',
+      result: 'RECOMMENDATION: PASS',
+      deliveredAt: Date.now(),
+    });
+
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `Structured audit passed.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+      streaming: false,
+    });
+    await sleep(10);
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+
+    mockSupervisionDecide.mockClear();
+    mockTransportRuntime.send.mockClear();
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await sleep(25);
+
+    expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
   });
 
   it('asks the current session to prepare and delegate the audit, then clears only after the reply-backed PASS', async () => {

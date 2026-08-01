@@ -1,6 +1,7 @@
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_STATUSES,
   decodeAgentDelegationReplyEnvelope,
@@ -17,6 +18,7 @@ import {
 } from './delegation-reply-store.js';
 import { PeerAuditReplyRateLimiter } from './peer-audit-reply-ingress.js';
 import { emitDelegationReplyDelivered } from './delegation-reply-events.js';
+import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -54,6 +56,25 @@ function notificationText(record: DelegationReplyRecord): string {
     '',
     record.result ?? '',
   ].join('\n');
+}
+
+function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
+  const targetSession = getSession(record.target.sessionName);
+  timelineEmitter.emit(
+    record.origin.sessionName,
+    AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+    {
+      memoryExcluded: true,
+      sourceSessionName: record.target.sessionName,
+      ...(targetSession?.label ? { sourceLabel: targetSession.label } : {}),
+      result: record.result ?? '',
+    },
+    {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `delegation-reply:${record.notificationId}`,
+    },
+  );
 }
 
 function scheduleRetry(delegationId: string, delayMs: number): void {
@@ -178,11 +199,16 @@ export async function submitDelegationReply(input: {
             : AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID;
     return { ok: false, error };
   }
+  // Timeline visibility is tied to authenticated reply receipt, not provider
+  // availability. Native notification delivery may need retries while the
+  // origin has an active turn, but the user should see the reply immediately.
+  emitDelegationReplyTimeline(received.record);
   return deliverRecord(received.record);
 }
 
 export function resumePendingDelegationReplies(): void {
   for (const record of getDelegationReplyStore().listReceived()) {
+    emitDelegationReplyTimeline(record);
     scheduleRetry(record.delegationId, 250);
   }
 }

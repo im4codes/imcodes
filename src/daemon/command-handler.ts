@@ -56,6 +56,7 @@ import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import {
   AGENT_DELEGATION_ERROR_CODES,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_TARGET_FIELD,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
@@ -5448,6 +5449,7 @@ export function hasSubstantiveTimelineHistory(events: Array<{ type: string }>): 
     || event.type === 'tool.call'
     || event.type === 'tool.result'
     || event.type === 'ask.question'
+    || event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
   ));
 }
 
@@ -5459,6 +5461,7 @@ export function countSubstantiveTimelineEvents(events: Array<{ type: string }>):
     || event.type === 'tool.call'
     || event.type === 'tool.result'
     || event.type === 'ask.question'
+    || event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
   )).length;
 }
 

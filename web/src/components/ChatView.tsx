@@ -61,6 +61,7 @@ import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
   deriveSdkSubagentStatusRows,
@@ -3680,6 +3681,30 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'peer_audit.status':
       return null;
+
+    case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
+      const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
+      const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      return (
+        <section class="chat-event chat-system delegation-reply-card" data-event-id={event.eventId}>
+          <div class="delegation-reply-card-head">
+            <strong>{t('delegation.reply_title')}</strong>
+            <span>{t('delegation.reply_from', { source })}</span>
+          </div>
+          {result && (
+            <ChatMarkdown
+              text={result}
+              onPathClick={onPathClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
+            />
+          )}
+          <ChatTime ts={event.ts} />
+        </section>
+      );
+    }
 
     case 'tool.call': {
       const { toolName, toolInput } = deriveToolCallDisplay(event);

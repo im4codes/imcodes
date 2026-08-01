@@ -32,6 +32,7 @@ export const DELEGATION_UNSUPPORTED_INPUT = AGENT_DELEGATION_ERROR_CODES.DELEGAT
 export const AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER = '<imcodes-agent-delegation-reply-instruction-v1>' as const;
 export const AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER = '<imcodes-agent-delegation-reply-instruction-v2>' as const;
 export const AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER = '<imcodes-delegation-completed-v1>' as const;
+export const AGENT_DELEGATION_REPLY_TIMELINE_EVENT = 'delegation.reply' as const;
 export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as const;
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;

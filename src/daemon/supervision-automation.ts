@@ -30,6 +30,7 @@ import {
   buildReworkBriefPrompt,
 } from './supervision-prompts.js';
 import {
+  AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
   buildAgentDelegationReplyInstruction,
@@ -166,6 +167,10 @@ function isDelegatedAuditReplyText(text: string | undefined): boolean {
   // this ordinary delegation path. Requiring both fields prevents unrelated
   // chat text from opening the automatic-audit verdict gate.
   return /^Task:\s*\S/im.test(text) && /^Result:\s*\S/im.test(text);
+}
+
+function isDelegationCompletionNotificationText(text: string | undefined): boolean {
+  return text?.trimStart().startsWith(AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER) === true;
 }
 
 function isReplyEnabledPeerAuditDelegationText(text: string | undefined, replyToSession: string): boolean {
@@ -1130,6 +1135,14 @@ class SupervisionAutomation {
       const automation = event.payload.automation === true;
       const text = trimString(event.payload.text);
       const activeRun = this.activeRuns.get(event.sessionId);
+      // Structured delegation replies are injected into the origin session as
+      // trusted runtime notifications before the delivery event opens the
+      // audit verdict gate. They are control-plane input, not a new user task.
+      // Caching one here makes the PASS/REWORK response look like its assistant
+      // answer, so the next idle starts a duplicate supervision/audit run.
+      const delegationCompletionNotification = Boolean(
+        !automation && isDelegationCompletionNotificationText(text),
+      );
       const delegatedReply = Boolean(
         !automation
         && activeRun?.phase === 'auditing'
@@ -1144,7 +1157,7 @@ class SupervisionAutomation {
         this.emitStatus(activeRun.sessionName, 'supervision_audit_waiting', SUPERVISION_AUDIT_WAITING_LABEL);
         this.emitAutomationNote(activeRun.sessionName, 'Auto: the delegated audit reply arrived; waiting for this session to produce the final PASS/REWORK judgment.', 'supervision-audit-reply-received');
       }
-      if (!automation && !delegatedReply && text && !text.startsWith('/')) {
+      if (!automation && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
         this.recentTaskCandidates.set(event.sessionId, {
           commandId: clientMessageId ?? `implicit:${Date.now()}`,
           text,

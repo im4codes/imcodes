@@ -12,7 +12,11 @@ import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { uploadFile, type AttachmentRefResponse } from './api.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
-export type FileUploadTransportMode = 'connecting' | 'direct' | 'falling_back' | 'relay';
+export type FileUploadTransportMode =
+  | typeof DIRECT_FILE_TRANSFER_STATE.CONNECTING
+  | typeof DIRECT_FILE_TRANSFER_STATE.DIRECT
+  | typeof DIRECT_FILE_TRANSFER_STATE.FALLING_BACK
+  | typeof DIRECT_FILE_TRANSFER_STATE.RELAY;
 
 export class DirectFileTransferFailure extends Error {
   constructor(
@@ -278,14 +282,14 @@ export async function uploadFileWithDirectFallback(options: {
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const clientUploadId = crypto.randomUUID();
   if (options.ws && supportsDirectUpload(options.ws)) {
-    options.onMode?.('connecting');
+    options.onMode?.(DIRECT_FILE_TRANSFER_STATE.CONNECTING);
     try {
       const result = await uploadFileDirect(
         options.ws,
         options.file,
         clientUploadId,
         options.onProgress,
-        () => options.onMode?.('direct'),
+        () => options.onMode?.(DIRECT_FILE_TRANSFER_STATE.DIRECT),
       );
       return result;
     } catch (error) {
@@ -296,11 +300,11 @@ export async function uploadFileWithDirectFallback(options: {
           error instanceof Error ? error.message : String(error),
         );
       }
-      options.onMode?.('falling_back');
+      options.onMode?.(DIRECT_FILE_TRANSFER_STATE.FALLING_BACK);
     }
   } else if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
     throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.RELAY_SIZE_LIMIT, false);
   }
-  options.onMode?.('relay');
+  options.onMode?.(DIRECT_FILE_TRANSFER_STATE.RELAY);
   return uploadFile(options.serverId, options.file, options.onProgress, clientUploadId);
 }

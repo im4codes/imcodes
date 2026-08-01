@@ -80,12 +80,13 @@ describe('styles.css regression contracts', () => {
     expect(webkitScrollbarRule![0]).toMatch(/height:\s*0/);
   });
 
-  it('keeps the desktop composer target compact and truncates long session names', () => {
+  it('keeps the desktop composer target compact in the Stop toolbar and truncates long session names', () => {
     const bubbleRule = css.match(/\.controls-target-bubble\s*\{[^}]*\}/);
     expect(bubbleRule).not.toBeNull();
-    expect(bubbleRule![0]).toMatch(/position:\s*absolute/);
-    expect(bubbleRule![0]).toMatch(/bottom:\s*calc\(100%\s*\+\s*5px\)/);
-    expect(bubbleRule![0]).toMatch(/max-width:\s*calc\(100%\s*-\s*8px\)/);
+    expect(bubbleRule![0]).toMatch(/position:\s*relative/);
+    expect(bubbleRule![0]).toMatch(/height:\s*28px/);
+    expect(bubbleRule![0]).toMatch(/box-sizing:\s*border-box/);
+    expect(bubbleRule![0]).not.toMatch(/bottom:/);
     expect(bubbleRule![0]).toMatch(/overflow:\s*hidden/);
 
     const nameRule = css.match(/\.controls-target-name\s*\{[^}]*\}/);
@@ -93,6 +94,30 @@ describe('styles.css regression contracts', () => {
     expect(nameRule![0]).toMatch(/min-width:\s*0/);
     expect(nameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(nameRule![0]).toMatch(/white-space:\s*nowrap/);
+  });
+
+  it('joins consecutive assistant text cards without blue separator lines', () => {
+    const assistantRule = css.match(/\.chat-assistant\s*\{[^}]*\}/);
+    const precedingRule = css.match(/\.chat-assistant:has\(\+ \.chat-assistant\)\s*\{[^}]*\}/);
+    const followingRule = css.match(/\.chat-assistant \+ \.chat-assistant\s*\{[^}]*\}/);
+
+    expect(assistantRule?.[0]).toMatch(/border:\s*0/);
+    expect(precedingRule?.[0]).toMatch(/margin-bottom:\s*0/);
+    expect(precedingRule?.[0]).toMatch(/border-bottom-left-radius:\s*0/);
+    expect(followingRule?.[0]).toMatch(/margin-top:\s*-2px/);
+    expect(followingRule?.[0]).toMatch(/border-top-left-radius:\s*0/);
+  });
+
+  it('visually distinguishes P2P direct uploads from relay uploads', () => {
+    const directBadgeRule = css.match(/\.composer-upload-transport-direct\s*\{[^}]*\}/);
+    const relayBadgeRule = css.match(/\.composer-upload-transport-falling_back,\s*\.composer-upload-transport-relay\s*\{[^}]*\}/);
+    const directProgressRule = css.match(/\.composer-upload-row-direct \.composer-upload-progress-fill\s*\{[^}]*\}/);
+    const relayProgressRule = css.match(/\.composer-upload-row-falling_back \.composer-upload-progress-fill,\s*\.composer-upload-row-relay \.composer-upload-progress-fill\s*\{[^}]*\}/);
+
+    expect(directBadgeRule?.[0]).toMatch(/color:\s*#86efac/);
+    expect(relayBadgeRule?.[0]).toMatch(/color:\s*#fcd34d/);
+    expect(directProgressRule?.[0]).toMatch(/#4ade80/);
+    expect(relayProgressRule?.[0]).toMatch(/#fbbf24/);
   });
 
   it('fits portrait videos by available preview height without stretching them to full width', () => {

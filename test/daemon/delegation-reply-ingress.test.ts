@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
 } from '../../shared/agent-delegation.js';
 
@@ -20,6 +21,7 @@ const mocks = vi.hoisted(() => ({
     get: vi.fn(),
     listReceived: vi.fn(() => []),
   },
+  timelineEmit: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -34,6 +36,10 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 vi.mock('../../src/daemon/delegation-reply-store.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/daemon/delegation-reply-store.js')>(),
   getDelegationReplyStore: () => mocks.store,
+}));
+
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: { emit: mocks.timelineEmit },
 }));
 
 import {
@@ -98,6 +104,7 @@ describe('delegation reply ingress', () => {
     mocks.store.expire.mockReset();
     mocks.store.get.mockReset();
     mocks.store.listReceived.mockReset().mockReturnValue([]);
+    mocks.timelineEmit.mockReset();
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
   });
 
@@ -128,6 +135,20 @@ describe('delegation reply ingress', () => {
       expect.objectContaining({ text: expect.stringContaining(record.result) }),
     );
     expect(mocks.store.markDelivered).toHaveBeenCalledWith(record.delegationId);
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      {
+        memoryExcluded: true,
+        sourceSessionName: target.sessionName,
+        result: record.result,
+      },
+      {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `delegation-reply:${record.notificationId}`,
+      },
+    );
     expect(delivered).toHaveBeenCalledWith(expect.objectContaining({
       delegationId: record.delegationId,
       result: record.result,
@@ -167,6 +188,12 @@ describe('delegation reply ingress', () => {
     });
 
     expect(mocks.store.markDelivered).not.toHaveBeenCalled();
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({ result: record.result }),
+      expect.objectContaining({ eventId: `delegation-reply:${record.notificationId}` }),
+    );
   });
 
   it('keeps the capability unconsumed when native notification admission throws', async () => {
