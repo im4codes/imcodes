@@ -14,6 +14,12 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps long delegation replies at content height inside the chat flex scroller', () => {
+    const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeTruthy();
+    expect(rule).toMatch(/flex:\s*0\s+0\s+auto/);
+  });
+
   it('.chat-view-preview must NOT be a scroll container', () => {
     // User reported: card chat history flickers / oscillates infinitely
     // near the bottom at certain heights — only resolves after manual

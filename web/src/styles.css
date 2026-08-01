@@ -3664,6 +3664,11 @@ html.native-ios-mac .chat-dl-btn {
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .delegation-reply-card {
+  /* This card can contain a full multi-page audit report. `.chat-view` is a
+     column flex scroller, so the default flex-shrink combined with this
+     card's overflow clipping can collapse it to the one-line header. Keep the
+     card at its content height and let the parent own vertical scrolling. */
+  flex: 0 0 auto;
   align-self: stretch;
   text-align: left;
   padding: 10px 12px;
