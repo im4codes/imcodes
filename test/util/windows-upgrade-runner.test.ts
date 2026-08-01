@@ -178,8 +178,8 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     const callIdx = src.indexOf('try { nodeDatachannelRepair(npmPrefix)', repairIdx + 1);
     const killIdx = src.indexOf("trace(6, 'pre-kill-watchdogs')");
     expect(repairIdx).toBeGreaterThan(-1);
-    expect(src.slice(repairIdx, callIdx)).toContain("import('node-datachannel')");
-    expect(src.slice(repairIdx, callIdx)).toContain("'rebuild', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(src.slice(repairIdx, callIdx)).toContain('node-datachannel-repair.mjs');
+    expect(src.slice(repairIdx, callIdx)).toContain('IMCODES_NPM_BIN: NPM_CMD');
     expect(callIdx).toBeGreaterThan(repairIdx);
     expect(killIdx).toBeGreaterThan(callIdx);
   });

@@ -373,38 +373,20 @@ function sharpRepair(npmPrefix) {
  */
 function nodeDatachannelRepair(npmPrefix) {
   const imcodesDir = join(npmPrefix, 'node_modules', 'imcodes');
-  const verify = () => {
-    if (!existsSync(imcodesDir)) return false;
-    const result = spawnSync(process.execPath, [
-      '-e',
-      "import('node-datachannel').then(() => process.exit(0)).catch(() => process.exit(1))",
-    ], {
-      cwd: imcodesDir,
-      stdio: 'ignore',
-      windowsHide: true,
-      timeout: FAST_CMD_TIMEOUT_MS,
-      killSignal: 'SIGKILL',
-    });
-    return result.status === 0;
-  };
-
-  if (verify()) return;
-  log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
-  const result = spawnNpm(NPM_CMD, [
-    'rebuild', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
-  ], {
-    cwd: imcodesDir,
+  const repairScript = join(imcodesDir, 'dist', 'src', 'util', 'node-datachannel-repair.mjs');
+  if (!existsSync(repairScript)) {
+    log('node-datachannel repair utility absent — relay remains enabled');
+    return;
+  }
+  const result = spawnSync(process.execPath, [repairScript, imcodesDir], {
+    env: { ...process.env, IMCODES_NPM_BIN: NPM_CMD },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    timeout: 5 * 60_000,
+    timeout: 6 * 60_000,
   });
-  if (result.status === 0 && verify()) {
-    log('node-datachannel repair succeeded');
-    return;
-  }
-  log(`node-datachannel repair FAILED [exit ${result.status} signal ${result.signal ?? 'none'}] — direct transfer unavailable; relay remains enabled`);
-  if (result.stderr) log(`node-datachannel repair stderr: ${result.stderr.toString().trim()}`);
+  if (result.stderr) log(result.stderr.toString().trim());
+  if (result.status !== 0) log('node-datachannel repair unavailable — relay remains enabled');
 }
 
 /** Schedule a deferred delete of the runner's tmp dir.

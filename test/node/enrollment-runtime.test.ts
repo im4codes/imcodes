@@ -17,6 +17,11 @@ import { encodeEnrollmentBlob, parseEnrollmentBlob } from '../../src/node/enroll
 import { loadInstallJournal } from '../../src/node/install-journal.js';
 import { createControlledNodeRuntime, isControlledNodeAuthAck } from '../../src/node/runtime.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_ERROR,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+} from '../../shared/machine-direct-file-transfer.js';
 
 class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
   readyState = 0;
@@ -60,6 +65,7 @@ describe('controlled node enrollment and runtime', () => {
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
       FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
     ]));
     expect(JSON.parse(socket.sent[1]!)).toMatchObject({ type: 'heartbeat', daemonVersion: expect.any(String) });
 
@@ -120,6 +126,40 @@ describe('controlled node enrollment and runtime', () => {
     });
     socket.emit('message', JSON.stringify({ type: 'fs.list', requestId: 'forbidden', path: dir }));
     expect(socket.sent.some((raw) => raw.includes('forbidden'))).toBe(false);
+    runtime.stop();
+  });
+
+  it('strictly validates machine-direct control and returns a bounded terminal error', async () => {
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket);
+    runtime.start();
+    socket.open();
+    const request = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId: 'r'.repeat(32),
+      clientUploadId: 'c'.repeat(32),
+      capability: 'A'.repeat(43),
+      candidates: [{ host: '192.168.2.145', port: 45123 }],
+      originalName: 'expired.txt',
+      size: 1,
+      expiresAt: Date.now() - 1,
+    };
+    const before = socket.sent.length;
+    socket.emit('message', JSON.stringify({ ...request, injected: true }));
+    await Promise.resolve();
+    expect(socket.sent).toHaveLength(before);
+
+    socket.emit('message', JSON.stringify(request));
+    await vi.waitFor(() => expect(socket.sent.slice(before).map((raw) => JSON.parse(raw))).toContainEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+      requestId: request.requestId,
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.EXPIRED,
+    }));
     runtime.stop();
   });
 

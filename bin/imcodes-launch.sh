@@ -176,6 +176,19 @@ if [ "$needs_repair" = "1" ]; then
   fi
 fi
 
+# The daemon upgrade intentionally installs with --ignore-scripts, which can
+# leave node-datachannel's JavaScript wrapper present without its native addon.
+# Run the newly installed package's built-in repair before the daemon starts.
+# This launch-time pass is essential for the first upgrade from an older daemon:
+# that old daemon's generated upgrade script cannot contain newer repair logic.
+NODE_DATACHANNEL_REPAIR="$PKG_ROOT/dist/src/util/node-datachannel-repair.mjs"
+if [ -f "$NODE_DATACHANNEL_REPAIR" ] && [ -n "$NPM" ]; then
+  mkdir -p "$(dirname "$REPAIR_LOG")"
+  if ! IMCODES_NPM_BIN="$NPM" "$NODE" "$NODE_DATACHANNEL_REPAIR" "$PKG_ROOT" >>"$REPAIR_LOG" 2>&1; then
+    log "node-datachannel launch repair unavailable — relay remains enabled; see $REPAIR_LOG"
+  fi
+fi
+
 # Hand off to the real daemon. `exec` replaces this shell so
 # systemd/launchctl tracks the node PID directly — no extra hop.
 exec "$NODE" "$ENTRY" "$@"

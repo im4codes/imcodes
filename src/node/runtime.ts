@@ -22,6 +22,14 @@ import {
   handleFileUploadFetch,
   type FileTransferSender,
 } from '../daemon/file-transfer-handler.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_ERROR,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectUploadRequest,
+} from '../../shared/machine-direct-file-transfer.js';
+import { receiveMachineDirectUpload } from '../daemon/machine-direct-transfer.js';
 
 /** Server → controlled node: auth succeeded; connection is live (bridge.ts heartbeat path). */
 const CONTROLLED_NODE_AUTH_ACK_TYPE = 'heartbeat_ack' as const;
@@ -51,6 +59,7 @@ export function createControlledNodeRuntime(
   let upgradeInFlight = false;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
+  const activeMachineDirectUploads = new Set<string>();
   const reportAuthenticationError = (error: unknown) => {
     try {
       options.onAuthenticationError?.(error);
@@ -104,6 +113,7 @@ export function createControlledNodeRuntime(
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
         FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
         FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+        MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
       ],
     },
     heartbeatMessage: { type: 'heartbeat', daemonVersion: DAEMON_VERSION },
@@ -154,6 +164,26 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) {
+        const parsed = validateMachineDirectUploadRequest(message);
+        if (!parsed.ok) return;
+        if (activeMachineDirectUploads.size >= MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONCURRENT_RECEIVERS
+          || activeMachineDirectUploads.has(parsed.value.requestId)) {
+          client.send({
+            type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+            requestId: parsed.value.requestId,
+            error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.TRANSFER_FAILED,
+          });
+          return;
+        }
+        activeMachineDirectUploads.add(parsed.value.requestId);
+        try {
+          client.send(await receiveMachineDirectUpload(parsed.value));
+        } finally {
+          activeMachineDirectUploads.delete(parsed.value.requestId);
+        }
         return;
       }
       if (message.type === 'file.upload_fetch'

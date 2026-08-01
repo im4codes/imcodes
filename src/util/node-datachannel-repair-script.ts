@@ -19,26 +19,17 @@
  * the `log()` shell helper.
  */
 export function buildBashNodeDatachannelRepair(): string {
-  return `# node-datachannel repair: the global install above uses
-# --ignore-scripts, so explicitly run this optional dependency's native
-# lifecycle when its addon cannot be imported. This is best effort: relay
-# remains available when a platform has no compatible binary/toolchain.
+  return `# node-datachannel repair: invoke the newly installed package's
+# pure-builtins repair utility. This is best effort: relay remains available
+# when a platform has no compatible binary/toolchain.
 GLOBAL_ROOT_CHECK=$(eval "$NPM_RUN root -g" 2>/dev/null)
 IMCODES_PACKAGE_DIR="$GLOBAL_ROOT_CHECK/imcodes"
-verify_node_datachannel() {
-  [ -d "$IMCODES_PACKAGE_DIR" ] || return 1
-  (cd "$IMCODES_PACKAGE_DIR" && "$NODE" -e "import('node-datachannel').then(() => process.exit(0)).catch(() => process.exit(1))") >/dev/null 2>&1
-}
-if ! verify_node_datachannel; then
-  log "[step 2.2] node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled"
-  if (cd "$IMCODES_PACKAGE_DIR" && eval "$NPM_RUN rebuild node-datachannel --ignore-scripts=false --foreground-scripts") >> "$LOG" 2>&1; then
-    if verify_node_datachannel; then
-      log "[step 2.2] node-datachannel repair succeeded"
-    else
-      log "[step 2.2] node-datachannel repair FAILED verification — direct transfer unavailable; relay remains enabled"
-    fi
-  else
-    log "[step 2.2] node-datachannel repair FAILED (exit $?) — direct transfer unavailable; relay remains enabled"
+NODE_DATACHANNEL_REPAIR="$IMCODES_PACKAGE_DIR/dist/src/util/node-datachannel-repair.mjs"
+if [ -f "$NODE_DATACHANNEL_REPAIR" ]; then
+  if ! IMCODES_NPM_BIN="npm" IMCODES_NPM_CLI="\${NPM_CLI:-}" "$NODE" "$NODE_DATACHANNEL_REPAIR" "$IMCODES_PACKAGE_DIR" >> "$LOG" 2>&1; then
+    log "[step 2.2] node-datachannel repair unavailable — direct transfer unavailable; relay remains enabled"
   fi
+else
+  log "[step 2.2] node-datachannel repair utility absent — relay remains enabled"
 fi`;
 }

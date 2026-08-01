@@ -9,6 +9,13 @@ import {
 } from '../../shared/transport/file-transfer.js';
 import { isFilePreviewPathAllowed } from './file-preview-path-policy.js';
 import { MachineControlPlaneError } from './machine-exec-client.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectUploadResponse,
+  type MachineDirectUploadRequest,
+} from '../../shared/machine-direct-file-transfer.js';
+import { startMachineDirectSender } from './machine-direct-transfer.js';
 
 const MAX_CONTROL_RESPONSE_BYTES = 64 * 1024;
 
@@ -89,9 +96,6 @@ async function resolveReadableRegularFile(sourcePath: string): Promise<{ path: s
   if (!canonical || !isFilePreviewPathAllowed(canonical)) {
     throw new MachineControlPlaneError('malformed', 'source path is forbidden');
   }
-  if (rawStat.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
-    throw new MachineControlPlaneError('malformed', 'source file is too large');
-  }
   return { path: canonical, size: rawStat.size };
 }
 
@@ -107,8 +111,62 @@ function parseAttachmentResponse(value: Record<string, unknown>): AttachmentRef 
 export async function sendFileToMachine(options: SendFileToMachineOptions): Promise<MachineFileTransferResult> {
   const source = await resolveReadableRegularFile(options.sourcePath);
   const doFetch = options.fetchImpl ?? fetch;
+  const clientUploadId = randomBytes(24).toString('base64url');
+  // The MCP process does not own the daemon's long-lived ServerLink, so the
+  // direct attempt uses a short authenticated HTTP control request while file
+  // bytes stay on the routed-LAN TCP socket.
+  {
+    const requestId = randomBytes(24).toString('base64url');
+    const capability = randomBytes(32).toString('base64url');
+    const requestBase: Omit<MachineDirectUploadRequest, 'candidates'> = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId,
+      clientUploadId,
+      capability,
+      originalName: basename(source.path),
+      size: source.size,
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    };
+    const sender = await startMachineDirectSender({ sourcePath: source.path, request: requestBase }).catch(() => null);
+    if (sender) {
+      try {
+        const response = await doFetch(
+          `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-upload`,
+          {
+            method: 'POST',
+            headers: { ...authHeaders(options.sourceServerId, options.sourceToken), 'content-type': 'application/json' },
+            body: JSON.stringify({ ...requestBase, candidates: sender.candidates }),
+            signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
+          },
+        );
+        const body = await readBoundedJson(response);
+        const parsed = validateMachineDirectUploadResponse(body, validateAttachmentRef);
+        if (response.ok
+          && parsed.ok
+          && parsed.value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE
+          && parsed.value.requestId === requestId) {
+          await sender.completion;
+          const attachment = parsed.value.attachment;
+          return {
+            size: attachment.size ?? source.size,
+            attachmentId: attachment.id,
+            remotePath: attachment.daemonPath,
+          };
+        }
+      } catch {
+        // Any direct-control, connect, authentication, or transfer failure falls
+        // through to the existing staged Server upload below.
+      } finally {
+        sender.close();
+      }
+    }
+  }
+  if (source.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+    throw new MachineControlPlaneError('malformed', 'source file is too large for Server relay fallback');
+  }
   const form = new FormData();
   form.append('file', await openAsBlob(source.path), basename(source.path));
+  form.append('clientUploadId', clientUploadId);
   let response: Response;
   try {
     response = await doFetch(

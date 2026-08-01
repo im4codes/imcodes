@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 const PREFLIGHT_SRC = join(process.cwd(), 'src', 'util', 'windows-launch-preflight.mjs');
+const NODE_DATACHANNEL_REPAIR_SRC = join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs');
 
 interface Sandbox {
   root: string;
@@ -39,6 +40,7 @@ function makeSandbox(opts: {
   halfInstalledDeps?: string[];
   npmExitCode?: number;
   pinnedVersion?: string;
+  brokenNodeDatachannel?: boolean;
 }): Sandbox {
   const root = mkdtempSync(join(tmpdir(), 'win-preflight-'));
   const pkgRoot = join(root, 'lib', 'node_modules', 'imcodes');
@@ -55,7 +57,11 @@ function makeSandbox(opts: {
   // package.json with pinned version (default 1.2.3, override per test).
   writeFileSync(
     join(pkgRoot, 'package.json'),
-    JSON.stringify({ name: 'imcodes', version: opts.pinnedVersion ?? '1.2.3' }),
+    JSON.stringify({
+      name: 'imcodes',
+      version: opts.pinnedVersion ?? '1.2.3',
+      ...(opts.brokenNodeDatachannel ? { optionalDependencies: { 'node-datachannel': '0.0.0-test' } } : {}),
+    }),
   );
 
   // dist/src/index.js (optional).
@@ -81,6 +87,15 @@ function makeSandbox(opts: {
   // resolution (`SELF → util/ → src/ → dist/ → PKG_ROOT`) lands here.
   const preflight = join(distSrcUtil, 'windows-launch-preflight.mjs');
   writeFileSync(preflight, readFileSync(PREFLIGHT_SRC, 'utf8'));
+  if (opts.brokenNodeDatachannel) {
+    const dependencyDir = join(pkgRoot, 'node_modules', 'node-datachannel');
+    writeFileSync(join(distSrcUtil, 'node-datachannel-repair.mjs'), readFileSync(NODE_DATACHANNEL_REPAIR_SRC, 'utf8'));
+    mkdirSync(dependencyDir, { recursive: true });
+    writeFileSync(join(dependencyDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: '0.0.0-test', type: 'module', main: 'index.js',
+    }));
+    writeFileSync(join(dependencyDir, 'index.js'), "throw new Error('native addon missing');\n");
+  }
 
   // npm shim — captures argv. Both `npm` and `npm.cmd` so the
   // platform-conditional in the preflight resolves to the right name.
@@ -124,6 +139,19 @@ describe('src/util/windows-launch-preflight.mjs', () => {
     }
   });
 
+  it('first fixed-version launch invokes optional-native repair before returning to watchdog', () => {
+    const sb = makeSandbox({ brokenNodeDatachannel: true });
+    try {
+      const r = runPreflight(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain('rebuild node-datachannel --ignore-scripts=false --foreground-scripts');
+      expect(npmLog).toContain('install --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
   it('half-installed deps: invokes npm install -g --ignore-scripts imcodes@<pinned>', () => {
     const sb = makeSandbox({ halfInstalledDeps: ['commander', 'hono'] });
     try {
@@ -138,6 +166,24 @@ describe('src/util/windows-launch-preflight.mjs', () => {
       expect(r.stderr).toMatch(/half-installed/);
       expect(r.stderr).toMatch(/commander/);
       expect(r.stderr).toMatch(/hono/);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('repairs the optional native addon again after a successful half-install reinstall', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['commander'], brokenNodeDatachannel: true });
+    try {
+      const r = runPreflight(sb);
+      expect(r.status).toBe(0);
+      const calls = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n');
+      const globalInstall = calls.findIndex((call) => call.includes('install -g'));
+      expect(globalInstall).toBeGreaterThan(0);
+      expect(calls.slice(0, globalInstall).some((call) => call.includes('rebuild node-datachannel'))).toBe(true);
+      expect(calls.slice(globalInstall + 1).some((call) => (
+        call.includes('rebuild node-datachannel')
+        || (call.includes('install --no-save') && call.includes('node-datachannel@0.0.0-test'))
+      ))).toBe(true);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }

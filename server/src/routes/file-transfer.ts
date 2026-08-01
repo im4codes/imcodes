@@ -18,6 +18,12 @@ import {
   validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
 import { DIRECT_FILE_TRANSFER_CAPABILITY, isDirectFileTransferClientUploadId } from '../../../shared/direct-file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectUploadRequest,
+} from '../../../shared/machine-direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
@@ -321,6 +327,7 @@ const authMiddleware = requireAuth();
 
 fileTransferRoutes.use('/:id/upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
+fileTransferRoutes.use('/:id/machine-direct-upload', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
   // Token-based auth bypass for native downloads (system browser has no app auth)
@@ -561,6 +568,38 @@ fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
   }
 });
 
+fileTransferRoutes.post('/:id/machine-direct-upload', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(c, serverId, MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY, true);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  const body = await readBoundedJsonObject(c.req.raw, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.MAX_CONTROL_BYTES);
+  if (!body.ok) return c.json({ error: body.tooLarge ? 'body_too_large' : 'invalid_body' }, body.tooLarge ? 413 : 400);
+  const parsed = validateMachineDirectUploadRequest(body.value);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const now = Date.now();
+  if (parsed.value.expiresAt <= now || parsed.value.expiresAt > now + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS) {
+    return c.json({ error: 'invalid_expiry' }, 400);
+  }
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      parsed.value.requestId,
+      parsed.value as unknown as Record<string, unknown>,
+      MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS,
+    );
+    if (result.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE) {
+      return c.json({ error: typeof result.error === 'string' ? result.error : 'direct_failed' }, 409);
+    }
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = serverId;
+    return c.json({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE, requestId: parsed.value.requestId, attachment });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'timeout') return c.json({ error: 'direct_timeout' }, 504);
+    if (message === 'request_id_conflict') return c.json({ error: message }, 409);
+    return c.json({ error: 'daemon_offline' }, 503);
+  }
+});
+
 fileTransferRoutes.post('/:id/upload', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
@@ -614,7 +653,10 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   }
   // Old controlled daemons use an exact-key request validator. Only include
   // the new dedupe field when this daemon explicitly advertised direct-v1.
-  const negotiatedClientUploadId = bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_CAPABILITY)
+  const negotiatedClientUploadId = (
+    bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_CAPABILITY)
+    || bridge.hasDaemonCapability(MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY)
+  )
     ? clientUploadId
     : undefined;
 

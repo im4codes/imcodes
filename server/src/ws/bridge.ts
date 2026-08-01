@@ -46,8 +46,14 @@ import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  validateAttachmentRef,
   validateControlledFileTransferResponse,
 } from '../../../shared/transport/file-transfer.js';
+import {
+  MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
+  MACHINE_DIRECT_FILE_TRANSFER_MSG,
+  validateMachineDirectUploadResponse,
+} from '../../../shared/machine-direct-file-transfer.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
@@ -2441,6 +2447,10 @@ export class WsBridge {
     this.db = db;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      // `ws.close()` completes asynchronously in production. Reject the old
+      // generation's request waiters before swapping `daemonWs`; otherwise the
+      // old socket's identity-guarded close handler cannot see or drain them.
+      this.rejectAllPendingFileTransfers('daemon_disconnected');
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
@@ -2598,7 +2608,8 @@ export class WsBridge {
                 .filter((capability): capability is string =>
                   capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
                   || capability === FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY
-                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY),
+                  || capability === FILE_TRANSFER_PATH_HANDLE_CAPABILITY
+                  || capability === MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY),
             )
           : new Set();
         this.authenticated = true;
@@ -2787,6 +2798,12 @@ export class WsBridge {
           if (!this.resolveValidatedComputerUseResult(msg)) {
             WsBridge.controlledInboundDropped++;
           }
+          return;
+        }
+        if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR) {
+          const direct = validateMachineDirectUploadResponse(msg, validateAttachmentRef);
+          const resolved = direct.ok ? this.resolveFileTransfer(direct.value.requestId, direct.value as unknown as Record<string, unknown>) : false;
+          if (!resolved) WsBridge.controlledInboundDropped++;
           return;
         }
         const fileTransfer = validateControlledFileTransferResponse(msg);
@@ -6310,6 +6327,9 @@ export class WsBridge {
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
+      // Production WebSocket close is asynchronous. Drain request waiters before
+      // clearing the socket identity, or the guarded close handler cannot do it.
+      this.rejectAllPendingFileTransfers('daemon_disconnected');
       try { this.daemonWs.close(4001, 'token_rotated'); } catch { /* ignore */ }
       this.daemonWs = null;
       this.authenticated = false;
@@ -6392,6 +6412,7 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
+      || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -6733,6 +6754,9 @@ export class WsBridge {
     const generation = this.daemonGeneration;
     if (!socket || !this.authenticated || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('daemon_offline'));
+    }
+    if (this.pendingFileTransfers.has(requestId)) {
+      return Promise.reject(new Error('request_id_conflict'));
     }
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
