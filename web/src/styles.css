@@ -3305,7 +3305,18 @@ html.native-ios-mac .chat-dl-btn {
 }
 .chat-tool-activity-chevron { flex: 0 0 auto; color: #64748b; font-size: 13px; transform: translateY(-1px); transition: transform 0.15s, color 0.15s; }
 .chat-tool-activity-wrap.is-expanded .chat-tool-activity-chevron { color: #67e8f9; transform: rotate(180deg) translateY(1px); }
-.chat-tool-activity-details { display: flex; flex-direction: column; gap: 2px; width: min(100%, 760px); margin-left: 6px; }
+/* Expanded rows match the collapsed chip's full width. The old `min(100%, 760px)`
+   capped them well short of it, and combined with the left margin the content
+   ran past the right edge instead of fitting. `min-width: 0` lets the rows
+   inside shrink rather than forcing an overflow. */
+.chat-tool-activity-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: auto;
+  min-width: 0;
+  margin-left: 6px;
+}
 .chat-tool-activity-details .chat-event { margin: 0; }
 .chat-tool-activity-live {
   position: absolute;

@@ -578,4 +578,27 @@ describe('styles.css regression contracts', () => {
       expect(source).toMatch(/type=['"]checkbox['"][\s\S]{0,600}?width:\s*['"]auto['"]/);
     }
   });
+  it('the expanded tool-activity details must not be narrower than the chip', () => {
+    // User reported the expanded rows running past the right edge instead of
+    // filling the width. Root cause: the details block was capped at
+    // `min(100%, 760px)` while the collapsed chip is full width, so the rows
+    // were laid out into a container narrower than the space available and the
+    // 6px left margin pushed the remainder out of view.
+    const rule = cssWithoutComments.match(/\.chat-tool-activity-details\s*\{[^}]*\}/)?.[0];
+    expect(rule, '.chat-tool-activity-details rule missing').toBeTruthy();
+    expect(rule).not.toMatch(/760px/);
+    expect(rule).not.toMatch(/max-width/);
+    // `min-width: 0` is what lets the horizontally-scrolling rows inside shrink
+    // to the container instead of forcing it wider.
+    expect(rule).toMatch(/min-width:\s*0/);
+  });
+
+  it('the collapsed tool-activity chip stays full width', () => {
+    // It carries a variable-length tool descriptor; sizing to content made it
+    // jump around as tools changed and left nothing to ellipse.
+    const rule = cssWithoutComments.match(/\.chat-tool-activity\s*\{[^}]*\}/)?.[0];
+    expect(rule, '.chat-tool-activity rule missing').toBeTruthy();
+    expect(rule).toMatch(/width:\s*100%/);
+    expect(rule).not.toMatch(/width:\s*fit-content/);
+  });
 });
