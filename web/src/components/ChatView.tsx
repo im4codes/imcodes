@@ -17,6 +17,8 @@ import type {
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
+import { formatToolDuration, truncateToolLabel } from '../util/tool-duration.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -776,6 +778,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
             input: `${input} ${status}`.trim(),
             _merged: true,
             _toolFailed: Boolean(next.payload.error),
+            // The merged event keeps the CALL's ts (so ordering is unchanged);
+            // the result's ts is the only record of when the tool finished, and
+            // without it a completed tool has no computable duration.
+            ...(typeof next.ts === 'number' ? { _resultTs: next.ts } : {}),
             _callPayloadInput: ev.payload.input,
             _resultPayloadOutput: next.payload.output,
             ...(output ? { _output: output } : {}),
@@ -3198,6 +3204,9 @@ function toggleToolFoldFromHeader(
   toggleExpanded();
 }
 
+/** Chip width budget for the desktop-only "what is it running" descriptor. */
+const TOOL_ACTIVITY_LABEL_MAX = 44;
+
 function getToolActivityCounts(events: TimelineEvent[]) {
   let terminal = 0;
   let failed = 0;
@@ -3213,6 +3222,47 @@ function getToolActivityCounts(events: TimelineEvent[]) {
     failed,
     running: Math.max(0, events.length - terminal),
   };
+}
+
+/**
+ * What the newest tool in the group is doing, for the Simple-view chip.
+ *
+ * The counters alone answer "how many", not "what is it stuck on" — which is
+ * the question during a long wait. A running tool reports live elapsed time; a
+ * finished one reports how long it took.
+ */
+function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
+  running: boolean;
+  durationMs: number | null;
+  label: string;
+} | null {
+  const last = events[events.length - 1];
+  if (!last) return null;
+
+  const startedAt = typeof last.ts === 'number' ? last.ts : null;
+  const finishedAt = typeof last.payload._resultTs === 'number' ? last.payload._resultTs : null;
+  const running = last.payload._merged !== true && last.type !== 'tool.result';
+
+  let durationMs: number | null = null;
+  if (startedAt !== null) {
+    // A clock skew or a rehydrated event can put the start in the future;
+    // clamp rather than render a negative age.
+    if (running) durationMs = Math.max(0, nowMs - startedAt);
+    else if (finishedAt !== null) durationMs = Math.max(0, finishedAt - startedAt);
+  }
+
+  const tool = String(last.payload.tool ?? '').trim();
+  // Read the ORIGINAL call input: a merged event rewrites `payload.input` to
+  // append a ✓/✗ status, which the counters already show and which would only
+  // eat width here. `_callPayloadInput` is set on every merge and holds the
+  // pre-status value, so no stripping is needed.
+  const input = summarizeToolInput(
+    last.payload._callPayloadInput ?? last.payload.input,
+    last.payload._callDetail ?? last.payload.detail,
+  ).trim();
+  const label = [tool, input].filter(Boolean).join(' ');
+
+  return { running, durationMs, label };
 }
 
 /** One-line live tool telemetry for Simple view; expands details on demand. */
@@ -3236,6 +3286,12 @@ function ToolActivitySummary({
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const counts = getToolActivityCounts(events);
+  // Tick only while something is actually running: a settled group must not keep
+  // a timer alive, and the shared ticker stops once its last listener leaves.
+  const nowMs = useNowTicker(counts.running > 0);
+  const last = getLastToolActivity(events, nowMs);
+  const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
+  const lastLabel = last?.label ? truncateToolLabel(last.label, TOOL_ACTIVITY_LABEL_MAX) : null;
   const summary = t('chat.tool_activity_summary', counts);
   const action = expanded
     ? t('chat.tool_activity_collapse')
@@ -3250,7 +3306,7 @@ function ToolActivitySummary({
         class={`chat-tool-activity${counts.running > 0 ? ' is-running' : ''}${counts.failed > 0 ? ' has-error' : ''}`}
         aria-expanded={expanded}
         aria-label={`${summary}. ${action}`}
-        title={summary}
+        title={[summary, last?.label, lastDuration].filter(Boolean).join(' · ')}
         onClick={() => setExpanded((value) => !value)}
       >
         <span class="chat-tool-activity-core" aria-hidden="true" />
@@ -3261,6 +3317,18 @@ function ToolActivitySummary({
           {counts.running > 0 && <span class="chat-tool-activity-stat is-running">●{counts.running}</span>}
           {counts.failed > 0 && <span class="chat-tool-activity-stat is-failed">×{counts.failed}</span>}
         </span>
+        {/* Desktop only: the chip has room to say WHAT is running, not just how
+            many. Hidden below the desktop breakpoint in CSS rather than by a JS
+            media query, so it costs no re-render on resize. */}
+        {lastLabel && (
+          <span class="chat-tool-activity-last" aria-hidden="true" title={last?.label}>{lastLabel}</span>
+        )}
+        {lastDuration && (
+          <span
+            class={`chat-tool-activity-time${last?.running ? ' is-running' : ''}`}
+            aria-hidden="true"
+          >{lastDuration}</span>
+        )}
         <span class="chat-tool-activity-rail" aria-hidden="true">
           {counts.completed > 0 && (
             <span class="chat-tool-activity-segment is-complete" style={{ flexGrow: counts.completed }} />

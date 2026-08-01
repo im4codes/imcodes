@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { cleanup, fireEvent, render } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 if (!HTMLElement.prototype.scrollIntoView) {
@@ -190,5 +190,63 @@ describe('ChatView compact tool activity', () => {
     expect(container.textContent).not.toContain('Edit');
     expect(container.textContent).not.toContain('hidden.ts');
     expect(container.textContent).not.toContain('hidden result');
+  });
+  // The counters answer "how many", not "what is it stuck on" — the question
+  // during a long wait. These cover the wiring, not just the formatter.
+  it('shows live elapsed time and what the running tool is doing', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const bashCall = makeEvent('bash-call', 'tool.call', {
+      tool: 'Bash',
+      input: { command: 'npm run build' },
+    }, 1);
+    // Started 42s before "now".
+    (bashCall as { ts: number }).ts = 1_000_000 - 42_000;
+
+    const { container } = render(<ChatView events={[bashCall]} loading={false} />);
+
+    expect(container.querySelector('.chat-tool-activity-time')?.textContent).toBe('42s');
+    expect(container.querySelector('.chat-tool-activity-time')?.className).toContain('is-running');
+    expect(container.querySelector('.chat-tool-activity-last')?.textContent).toContain('npm run build');
+
+    // Ticks while the tool keeps running, or a long wait would look frozen.
+    act(() => { vi.advanceTimersByTime(3_000); });
+    expect(container.querySelector('.chat-tool-activity-time')?.textContent).toBe('45s');
+
+    vi.useRealTimers();
+  });
+
+  it('reports how long a finished tool took, not how long ago it started', () => {
+    const call = makeEvent('c', 'tool.call', { tool: 'Read', input: { file_path: 'a.md' } }, 1);
+    (call as { ts: number }).ts = 5_000;
+    const result = makeEvent('r', 'tool.result', { output: 'ok' }, 2);
+    (result as { ts: number }).ts = 6_500;
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+
+    // 1.5s of actual work — not the age of the event.
+    expect(container.querySelector('.chat-tool-activity-time')?.textContent).toBe('1.5s');
+    expect(container.querySelector('.chat-tool-activity-time')?.className).not.toContain('is-running');
+  });
+
+  it('describes the newest tool, not the first one in the group', () => {
+    const readCall = makeEvent('rc', 'tool.call', { tool: 'Read', input: { file_path: 'old.md' } }, 1);
+    const readResult = makeEvent('rr', 'tool.result', { output: 'x' }, 2);
+    const grepCall = makeEvent('gc', 'tool.call', { tool: 'Grep', input: { pattern: 'needle' } }, 3);
+
+    const { container } = render(<ChatView events={[readCall, readResult, grepCall]} loading={false} />);
+
+    const label = container.querySelector('.chat-tool-activity-last')?.textContent ?? '';
+    expect(label).toContain('needle');
+    expect(label).not.toContain('old.md');
+  });
+
+  it('keeps the status glyph out of the descriptor, since the counters show it', () => {
+    const call = makeEvent('c2', 'tool.call', { tool: 'Bash', input: { command: 'ls' } }, 1);
+    const result = makeEvent('r2', 'tool.result', { output: 'ok' }, 2);
+
+    const { container } = render(<ChatView events={[call, result]} loading={false} />);
+
+    expect(container.querySelector('.chat-tool-activity-last')?.textContent).not.toContain('✓');
   });
 });

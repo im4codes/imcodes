@@ -3266,6 +3266,39 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-activity-segment.is-complete { background: linear-gradient(90deg, #0f766e, #34d399); }
 .chat-tool-activity-segment.is-running { background: linear-gradient(90deg, #0891b2, #67e8f9); box-shadow: 0 0 6px rgba(34, 211, 238, 0.7); }
 .chat-tool-activity-segment.is-failed { background: linear-gradient(90deg, #be123c, #fb7185); }
+/* Elapsed time of the newest tool. Shown on every client: during a long wait
+   "how long has this been going" is the question the counters cannot answer. */
+.chat-tool-activity-time {
+  flex: 0 0 auto;
+  color: #7dd3fc;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+/* A running timer changes every second; tabular figures above stop the chip
+   from twitching as digit widths change. */
+.chat-tool-activity-time.is-running { color: #67e8f9; }
+
+/* What the newest tool is actually doing (command, search pattern, path).
+   Desktop only — see the width rules below. */
+.chat-tool-activity-last {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #94a3b8;
+  opacity: 0.9;
+}
+/* Below the desktop breakpoint the chip has no width to spare, so the
+   descriptor is dropped and the elapsed time is kept. */
+@media (max-width: 768px) {
+  .chat-tool-activity-last { display: none; }
+}
+/* Desktop can afford a wider chip; without raising the ceiling the descriptor
+   would just squeeze the progress rail. */
+@media (min-width: 769px) {
+  .chat-tool-activity { min-width: 300px; max-width: min(100%, 560px); }
+}
 .chat-tool-activity-chevron { flex: 0 0 auto; color: #64748b; font-size: 13px; transform: translateY(-1px); transition: transform 0.15s, color 0.15s; }
 .chat-tool-activity-wrap.is-expanded .chat-tool-activity-chevron { color: #67e8f9; transform: rotate(180deg) translateY(1px); }
 .chat-tool-activity-details { display: flex; flex-direction: column; gap: 2px; width: min(100%, 760px); margin-left: 6px; }
