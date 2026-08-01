@@ -9,7 +9,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -18,7 +18,6 @@ const REPAIR_TIMEOUT_MS = 5 * 60_000;
 const VERIFY_TIMEOUT_MS = 60_000;
 
 function run(command, args, options = {}) {
-  const windowsCommandShim = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(command);
   return spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
@@ -26,8 +25,31 @@ function run(command, args, options = {}) {
     stdio: options.stdio ?? ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
     timeout: options.timeout,
-    shell: windowsCommandShim,
+    shell: false,
   });
+}
+
+export function resolveNpmCliJs(npmCommand, nodeExecPath = process.execPath, env = process.env) {
+  const candidates = [];
+  if (
+    typeof env.npm_execpath === 'string'
+    && isAbsolute(env.npm_execpath)
+    && basename(env.npm_execpath).toLowerCase() === 'npm-cli.js'
+  ) {
+    candidates.push(env.npm_execpath);
+  }
+  const roots = [dirname(nodeExecPath)];
+  if (npmCommand && isAbsolute(npmCommand)) roots.unshift(dirname(npmCommand));
+  for (const root of roots) {
+    candidates.push(
+      join(root, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      join(root, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    );
+  }
+  for (const candidate of new Set(candidates)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return '';
 }
 
 function verify(packageRoot) {
@@ -58,7 +80,10 @@ export function repairNodeDatachannel(options = {}) {
   const npmCommand = options.npmCommand
     ?? process.env.IMCODES_NPM_BIN
     ?? (process.platform === 'win32' ? 'npm.cmd' : 'npm');
-  const npmCli = options.npmCli ?? process.env.IMCODES_NPM_CLI ?? '';
+  const configuredNpmCli = options.npmCli ?? process.env.IMCODES_NPM_CLI ?? '';
+  const npmCli = configuredNpmCli || (
+    process.platform === 'win32' ? resolveNpmCliJs(npmCommand) : ''
+  );
   const log = options.log ?? (() => {});
   const runNpm = (args) => npmCli
     ? run(process.execPath, [npmCli, ...args], { cwd: packageRoot, timeout: REPAIR_TIMEOUT_MS })
@@ -73,7 +98,8 @@ export function repairNodeDatachannel(options = {}) {
     attempted = true;
     log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
     const rebuild = runNpm([
-      'rebuild', '--global=false', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
+      'rebuild', '--global=false', '--prefix', packageRoot,
+      'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
     ]);
     if (rebuild.status !== 0) {
       log(`node-datachannel rebuild returned non-zero [exit ${rebuild.status} signal ${rebuild.signal ?? 'none'}]; trying clean dependency reinstall`);
@@ -86,7 +112,8 @@ export function repairNodeDatachannel(options = {}) {
     attempted = true;
     try { rmSync(dependencyDir, { recursive: true, force: true }); } catch { /* npm reports the failure below */ }
     const reinstall = runNpm([
-      'install', '--global=false', '--no-save', '--ignore-scripts=false', '--foreground-scripts',
+      'install', '--global=false', '--prefix', packageRoot,
+      '--no-save', '--ignore-scripts=false', '--foreground-scripts',
       `node-datachannel@${dependencySpec}`,
     ]);
     if (reinstall.status !== 0) {

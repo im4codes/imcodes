@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { resolveNpmCliJs } from '../../src/util/node-datachannel-repair.mjs';
 import { buildBashNodeDatachannelRepair } from '../../src/util/node-datachannel-repair-script.js';
 
 const cleanup: string[] = [];
@@ -20,21 +21,57 @@ describe('buildBashNodeDatachannelRepair', () => {
 
   it('runs only the dependency lifecycle with scripts explicitly enabled', () => {
     const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
-    expect(implementation).toContain("'rebuild', '--global=false', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts'");
-    expect(implementation).toContain("'install', '--global=false', '--no-save', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(implementation).toContain("'rebuild', '--global=false', '--prefix', packageRoot");
+    expect(implementation).toContain("'node-datachannel', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(implementation).toContain("'install', '--global=false', '--prefix', packageRoot");
+    expect(implementation).toContain("'--no-save', '--ignore-scripts=false', '--foreground-scripts'");
     expect(block).not.toContain('install -g');
+  });
+
+  it('resolves npm-cli.js without routing dynamic paths through a command shell', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes npm & repair-'));
+    cleanup.push(root);
+    const nodeDir = join(root, 'Node Runtime & Tools');
+    const npmCommand = join(nodeDir, 'npm.cmd');
+    const npmCli = join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    const ambientNpmCli = join(root, 'Ambient npm & runtime', 'npm-cli.js');
+    const arbitraryExecutable = join(root, 'Ambient npm & runtime', 'not-npm.js');
+    mkdirSync(join(nodeDir, 'node_modules', 'npm', 'bin'), { recursive: true });
+    mkdirSync(join(root, 'Ambient npm & runtime'), { recursive: true });
+    writeFileSync(npmCommand, 'shim');
+    writeFileSync(npmCli, 'cli');
+    writeFileSync(ambientNpmCli, 'ambient cli');
+    writeFileSync(arbitraryExecutable, 'not npm');
+
+    expect(resolveNpmCliJs(npmCommand, join(nodeDir, 'node.exe'), {})).toBe(npmCli);
+    expect(resolveNpmCliJs(npmCommand, join(nodeDir, 'node.exe'), {
+      npm_execpath: ambientNpmCli,
+    })).toBe(ambientNpmCli);
+    for (const invalidNpmExecPath of [
+      npmCommand,
+      arbitraryExecutable,
+      'relative/npm-cli.js',
+      join(root, 'missing', 'npm-cli.js'),
+    ]) {
+      expect(resolveNpmCliJs(npmCommand, join(nodeDir, 'node.exe'), {
+        npm_execpath: invalidNpmExecPath,
+      })).toBe(npmCli);
+    }
+    const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
+    expect(implementation).toContain('shell: false');
+    expect(implementation).not.toContain('shell: windowsCommandShim');
   });
 
   it('verifies again after rebuild and degrades to relay on failure', () => {
     const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
-    const rebuildIndex = implementation.indexOf("'rebuild', '--global=false', 'node-datachannel'");
+    const rebuildIndex = implementation.indexOf("'rebuild', '--global=false', '--prefix', packageRoot");
     expect(implementation.indexOf('if (verify(packageRoot))', rebuildIndex)).toBeGreaterThan(rebuildIndex);
     expect(block).toContain('direct transfer unavailable; relay remains enabled');
     expect(block).not.toMatch(/\bexit\s+[1-9]/);
   });
 
   it('repairs a real script-suppressed dependency and verifies its native marker', () => {
-    const root = mkdtempSync(join(tmpdir(), 'imcodes-node-datachannel-repair-'));
+    const root = mkdtempSync(join(tmpdir(), 'imcodes node-datachannel & repair-'));
     cleanup.push(root);
     const prefix = join(root, 'prefix');
     const imcodesDir = join(prefix, 'lib', 'node_modules', 'imcodes');
