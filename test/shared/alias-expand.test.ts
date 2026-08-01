@@ -7,11 +7,14 @@ import {
   sanitizeResolvedAliasValue,
 } from '../../shared/alias-expand.js';
 import {
+  ALIAS_DESCRIPTION_MAX,
   ALIAS_LEGEND_DIRECTIVE,
   ALIAS_LEGEND_NOTE_INLINE_MAX,
   ALIAS_LEGEND_NOTE_TRUNCATED_HINT,
+  ALIAS_NOTE_HARD_MAX,
   ALIAS_REASONS,
   ALIAS_VALUE_MAX,
+  validateAliasDescription,
 } from '../../shared/alias-types.js';
 
 const ESC = '\x1b';
@@ -230,5 +233,29 @@ describe('alias notes in the legend', () => {
     const out = send(';;(known) ;;(missing)', { known: 'v' }, { missing: 'should not appear' });
     expect(out.text).not.toContain('should not appear');
     expect(out.unresolved).toEqual(['missing']);
+  });
+});
+
+describe('note budget invariants', () => {
+  it('keeps the three ceilings strictly ordered', () => {
+    // The whole "truncate + tell the agent where the rest is" behaviour depends
+    // on this ordering. If the save cap ever met the inline budget, every
+    // legitimately-saved note would fit and the hint would go dead; if the hard
+    // ceiling met the save cap, a legal note would be pre-trimmed to exactly the
+    // budget and the agent would never learn anything was withheld.
+    expect(ALIAS_LEGEND_NOTE_INLINE_MAX).toBeLessThan(ALIAS_DESCRIPTION_MAX);
+    expect(ALIAS_DESCRIPTION_MAX).toBeLessThan(ALIAS_NOTE_HARD_MAX);
+  });
+
+  it('truncates a note saved at the real save cap, which now exceeds the budget', () => {
+    // Previously the save cap equalled the budget, so this path was unreachable
+    // for anything saved through the normal UI. It is the common case now.
+    const atSaveCap = 'z'.repeat(ALIAS_DESCRIPTION_MAX);
+    expect(validateAliasDescription(atSaveCap)).toBeNull();
+
+    const out = expandForAgent(';;(k)', { k: 'v' }, 'legend', { k: atSaveCap });
+    const line = out.text.split('\n\n')[0].split('\n').find((l) => l.startsWith(';;(k):'))!;
+    expect(line).toContain(ALIAS_LEGEND_NOTE_TRUNCATED_HINT);
+    expect([...line].filter((c) => c === 'z')).toHaveLength(ALIAS_LEGEND_NOTE_INLINE_MAX);
   });
 });

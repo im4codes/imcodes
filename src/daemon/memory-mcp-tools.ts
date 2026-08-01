@@ -116,7 +116,7 @@ import {
 /** Upper bound on records expanded for one colliding handle. */
 const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
-import { ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
+import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -2034,7 +2034,7 @@ const aliasSchemas: Record<AliasMcpToolName, z.ZodTypeAny> = {
   [ALIAS_MCP_TOOLS.SAVE]: z.object({
     name: z.string().describe('NFC letters/digits/._-, ≤20 code points; overwrites existing.'),
     value: z.string().describe('Exact inserted value; nonempty, ≤500 code points, no NUL.'),
-    description: z.string().optional().describe('Description, ≤200 code points.'),
+    description: z.string().optional().describe(`Description, ≤${ALIAS_DESCRIPTION_MAX} code points.`),
     tags: z.array(z.string()).optional().describe('≤10 tags, each ≤30 chars, no controls.'),
   }),
   [ALIAS_MCP_TOOLS.DELETE]: z.object({

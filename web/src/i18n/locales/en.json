@@ -26,7 +26,7 @@
     "error": {
       "invalid_alias_name": "Invalid alias name. Use letters, numbers, dot, underscore, or hyphen (max 20 characters).",
       "alias_value_invalid": "Invalid value. It must not be empty and can be at most 500 characters.",
-      "alias_description_invalid": "Description is too long (max 200 characters).",
+      "alias_description_invalid": "Description is too long (max {{max}} characters).",
       "alias_not_found": "This alias no longer exists.",
       "alias_unresolved_failclosed": "This alias could not be resolved and was not sent.",
       "alias_tags_invalid": "Invalid tags. Use at most 10 tags, each up to 30 characters with no control characters.",

@@ -3,6 +3,7 @@ import {
   ALIAS_NAME_MAX,
   ALIAS_VALUE_MAX,
   ALIAS_REASONS,
+  ALIAS_DESCRIPTION_MAX,
   buildAliasMarker,
   buildAliasLegendLine,
   normalizeAliasValueForStorage,
@@ -59,8 +60,8 @@ describe('alias value validation', () => {
 describe('alias description validation', () => {
   it('is optional and length-bounded', () => {
     expect(validateAliasDescription(undefined)).toBeNull();
-    expect(validateAliasDescription('x'.repeat(200))).toBeNull();
-    expect(validateAliasDescription('x'.repeat(201))).toBe(ALIAS_REASONS.DESCRIPTION_INVALID);
+    expect(validateAliasDescription('x'.repeat(ALIAS_DESCRIPTION_MAX))).toBeNull();
+    expect(validateAliasDescription('x'.repeat(ALIAS_DESCRIPTION_MAX + 1))).toBe(ALIAS_REASONS.DESCRIPTION_INVALID);
   });
 });
 

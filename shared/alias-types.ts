@@ -7,7 +7,7 @@ export const ALIAS_NAME_MAX = 20;
 /** Max length of an alias value, counted in Unicode code points after NFC. */
 export const ALIAS_VALUE_MAX = 500;
 /** Max length of an optional description, counted in Unicode code points after NFC. */
-export const ALIAS_DESCRIPTION_MAX = 200;
+export const ALIAS_DESCRIPTION_MAX = 2000;
 
 /**
  * Hard ceiling applied to a client-supplied note before it is injected.
@@ -15,10 +15,10 @@ export const ALIAS_DESCRIPTION_MAX = 200;
  * Deliberately ABOVE {@link ALIAS_DESCRIPTION_MAX}: this bounds abuse from an
  * out-of-band map that never passed server validation, while still leaving the
  * visible budget cut (and its "fetch the rest" hint) to the legend builder. If
- * this were also 200, an oversized note would arrive pre-trimmed to exactly the
- * budget and the agent would never be told that anything was withheld.
+ * this equalled the inline budget, an oversized note would arrive pre-trimmed to
+ * exactly that budget and the agent would never be told anything was withheld.
  */
-export const ALIAS_NOTE_HARD_MAX = 4000;
+export const ALIAS_NOTE_HARD_MAX = 8000;
 
 /**
  * Allowlist for an alias name (NFC, case-sensitive). Excludes whitespace,
@@ -264,7 +264,7 @@ export const ALIAS_LEGEND_NOTE_SEPARATOR = ' — note: ';
  * save-time ceiling, so an oversized note can reach this line regardless of what
  * {@link ALIAS_DESCRIPTION_MAX} allows at save time.
  */
-export const ALIAS_LEGEND_NOTE_INLINE_MAX = 200;
+export const ALIAS_LEGEND_NOTE_INLINE_MAX = 300;
 
 /** Appended when a note was cut to the inline budget; names the tool that returns the rest. */
 export const ALIAS_LEGEND_NOTE_TRUNCATED_HINT = '… (note truncated — call list_aliases for the full text)';

@@ -7,6 +7,7 @@ import { FileBrowser } from './file-browser-lazy.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { AliasApiError } from '../api/aliases.js';
 import {
+  ALIAS_DESCRIPTION_MAX,
   validateAliasName,
   validateAliasValue,
   validateAliasDescription,
@@ -710,7 +711,12 @@ export function QuickInputPanel({
   };
 
   const aliasErrorText = aliasError
-    ? (aliasError === 'generic' ? t('alias.error.generic') : t(`alias.error.${aliasError}`))
+    // The limits are passed in rather than restated in each locale string, so a
+    // change to the shared constant cannot leave seven translations claiming a
+    // number the server no longer enforces.
+    ? (aliasError === 'generic'
+      ? t('alias.error.generic')
+      : t(`alias.error.${aliasError}`, { max: ALIAS_DESCRIPTION_MAX }))
     : null;
 
   const panel = (

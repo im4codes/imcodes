@@ -26,7 +26,7 @@
     "error": {
       "invalid_alias_name": "別名不合法。只能使用字母、數字、點、底線或連字號（最多 20 個字元）。",
       "alias_value_invalid": "內容不合法。不能為空，且最多 500 個字元。",
-      "alias_description_invalid": "說明過長（最多 200 個字元）。",
+      "alias_description_invalid": "說明過長（最多 {{max}} 個字元）。",
       "alias_not_found": "此別名已不存在。",
       "alias_unresolved_failclosed": "此別名無法解析，已阻止傳送。",
       "alias_tags_invalid": "標籤無效。最多 10 個標籤，每個不超過 30 個字元，且不能包含控制字元。",

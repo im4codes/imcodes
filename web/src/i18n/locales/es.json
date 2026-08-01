@@ -26,7 +26,7 @@
     "error": {
       "invalid_alias_name": "Nombre de alias no válido. Usa letras, números, punto, guion bajo o guion (máx. 20 caracteres).",
       "alias_value_invalid": "Valor no válido. No puede estar vacío y admite como máximo 500 caracteres.",
-      "alias_description_invalid": "La descripción es demasiado larga (máx. 200 caracteres).",
+      "alias_description_invalid": "La descripción es demasiado larga (máx. {{max}} caracteres).",
       "alias_not_found": "Este alias ya no existe.",
       "alias_unresolved_failclosed": "No se pudo resolver este alias y no se envió.",
       "alias_tags_invalid": "Etiquetas no válidas. Usa como máximo 10 etiquetas, cada una de hasta 30 caracteres y sin caracteres de control.",

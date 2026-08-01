@@ -26,7 +26,7 @@
     "error": {
       "invalid_alias_name": "エイリアス名が無効です。英字・数字・ピリオド・アンダースコア・ハイフンを使用してください（最大 20 文字）。",
       "alias_value_invalid": "内容が無効です。空にはできず、最大 500 文字です。",
-      "alias_description_invalid": "説明が長すぎます（最大 200 文字）。",
+      "alias_description_invalid": "説明が長すぎます（最大 {{max}} 文字）。",
       "alias_not_found": "このエイリアスは存在しません。",
       "alias_unresolved_failclosed": "このエイリアスを解決できなかったため、送信されませんでした。",
       "alias_tags_invalid": "タグが無効です。タグは最大10個、各30文字までで、制御文字は使用できません。",

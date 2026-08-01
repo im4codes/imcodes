@@ -26,7 +26,7 @@
     "error": {
       "invalid_alias_name": "别名不合法。只能使用字母、数字、点、下划线或连字符（最多 20 个字符）。",
       "alias_value_invalid": "内容不合法。不能为空，且最多 500 个字符。",
-      "alias_description_invalid": "说明过长（最多 200 个字符）。",
+      "alias_description_invalid": "说明过长（最多 {{max}} 个字符）。",
       "alias_not_found": "该别名已不存在。",
       "alias_unresolved_failclosed": "该别名无法解析，已阻止发送。",
       "alias_tags_invalid": "标签无效。最多 10 个标签，每个不超过 30 个字符，且不能包含控制字符。",
