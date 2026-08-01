@@ -1563,6 +1563,8 @@
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",
     "upload_failed": "上傳失敗",
+    "direct_required_large": "此檔案需要直連；伺服器中轉回退上限為 {{max}}MB",
+    "transport": { "connecting": "正在直連", "direct": "P2P 直連", "falling_back": "正在回退", "relay": "伺服器中轉" },
     "insufficient_capacity": "伺服器磁碟空間不足",
     "file_too_large": "檔案過大（最大 {{max}}MB）",
     "long_text_attached": "過長貼上內容已作為 {{name}} 附件加入",

@@ -17,6 +17,7 @@ import {
   FILE_TRANSFER_MSG,
   validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY, isDirectFileTransferClientUploadId } from '../../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
@@ -593,6 +594,10 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
   const file = formData.get('file');
   if (!file || !(file instanceof File)) return c.json({ error: 'missing_file' }, 400);
+  const rawClientUploadId = formData.get('clientUploadId');
+  const clientUploadId = typeof rawClientUploadId === 'string' && isDirectFileTransferClientUploadId(rawClientUploadId)
+    ? rawClientUploadId
+    : undefined;
 
   // Size check
   if (file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -607,6 +612,11 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
   }
+  // Old controlled daemons use an exact-key request validator. Only include
+  // the new dedupe field when this daemon explicitly advertised direct-v1.
+  const negotiatedClientUploadId = bridge.hasDaemonCapability(DIRECT_FILE_TRANSFER_CAPABILITY)
+    ? clientUploadId
+    : undefined;
 
   // Generate upload ID and sanitized filename
   const uploadId = randomHex(16);
@@ -663,6 +673,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       mime: file.type || undefined,
       size: file.size,
       downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
+      ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
     };
   } else {
     uploadMsg = {
@@ -673,6 +684,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       mime: file.type || undefined,
       size: file.size,
       content: (await readFile(stagedPath)).toString('base64'),
+      ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
     };
   }
 

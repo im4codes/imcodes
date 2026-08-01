@@ -35,6 +35,7 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY, DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
@@ -6897,6 +6898,55 @@ describe('WsBridge', () => {
 
       expect(browserWs.sentStrings.some((msg) => msg.includes('"type":"timeline.event"'))).toBe(true);
       expect(errorSpy).toHaveBeenCalled();
+    });
+
+    it('wires direct-file signaling through generation-bound daemon and browser unicast routes', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      const db = makeDb('valid-hash');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [DIRECT_FILE_TRANSFER_CAPABILITY],
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }));
+      await flushAsync();
+      bridge.handleBrowserConnection(browserA as never, 'user-a', db);
+      bridge.handleBrowserConnection(browserB as never, 'user-b', db);
+      browserA.sent.length = 0;
+      browserB.sent.length = 0;
+      daemonWs.sent.length = 0;
+
+      const requestId = '123e4567-e89b-12d3-a456-426614174000';
+      const clientUploadId = '123e4567-e89b-12d3-a456-426614174001';
+      browserA.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.INIT,
+        requestId,
+        clientUploadId,
+        filename: 'large.bin',
+        size: 5 * 1024 * 1024 * 1024,
+      }));
+      await flushAsync();
+      const prepare = daemonWs.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.PREPARE);
+      const authorized = browserA.sentStrings.map((row) => JSON.parse(row)).find((row) => row.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED);
+      expect(prepare).toMatchObject({ requestId, clientUploadId, size: 5 * 1024 * 1024 * 1024 });
+      expect(authorized).toMatchObject({ requestId, clientUploadId });
+
+      daemonWs.emit('message', JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+        requestId,
+        capability: authorized.capability,
+        sdp: 'daemon-answer',
+      }));
+      await flushAsync();
+      expect(browserA.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(true);
+      expect(browserB.sentStrings.some((row) => row.includes('daemon-answer'))).toBe(false);
     });
   });
 });

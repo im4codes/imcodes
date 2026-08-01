@@ -371,6 +371,46 @@ describe('file-transfer local handle hardening', () => {
     }));
   });
 
+  it('waits for an ambiguous direct attempt and reuses its committed attachment instead of uploading twice', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+    const clientUploadId = 'client_upload_ambiguous_1234';
+    const claim = transfer.tryClaimClientUpload(clientUploadId);
+    expect(claim).not.toBeNull();
+
+    const relay = transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch',
+      uploadId: 'upload-fallback',
+      clientUploadId,
+      filename: 'relay.txt',
+      originalName: 'source.txt',
+      size: 5,
+      downloadUrl: 'https://relay.example/upload-staged/upload-fallback?token=reusable',
+    }, done.serverLink as never);
+
+    await vi.waitFor(() => expect(transfer.waitForClientUploadClaim(clientUploadId)).not.toBeNull());
+    expect(fetchMock).not.toHaveBeenCalled();
+    const directPath = path.join(fakeHome, '.imcodes', 'uploads', 'direct.txt');
+    await transfer.finalizeDirectUploadedFile({
+      clientUploadId,
+      filename: 'direct.txt',
+      originalName: 'source.txt',
+      resolved: directPath,
+      size: 5,
+    });
+    transfer.releaseClientUploadClaim(clientUploadId, claim!);
+    await relay;
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(done.sent).toEqual([expect.objectContaining({
+      type: 'file.upload_done',
+      uploadId: 'upload-fallback',
+      attachment: expect.objectContaining({ id: 'direct.txt', size: 5 }),
+    })]);
+  });
+
   it('retries relay-staged upload downloads with the same URL before failing', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
     const fetchMock = vi.fn()

@@ -8,6 +8,7 @@ import {
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../shared/direct-file-transfer.js';
 
 const { sendFileTransferRequestMock, isDaemonConnectedMock, hasDaemonCapabilityMock, mockResolveServerMemberAccessOrShareDeny, queryOneMock } = vi.hoisted(() => ({
   sendFileTransferRequestMock: vi.fn(),
@@ -269,6 +270,7 @@ describe('file-transfer upload route', () => {
 
     const form = new FormData();
     form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+    form.append('clientUploadId', 'client_upload_1234');
 
     const res = await app.request('/api/server/srv-1/upload', {
       method: 'POST',
@@ -291,10 +293,34 @@ describe('file-transfer upload route', () => {
       mime: 'text/plain',
       size: 5,
       downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
+      clientUploadId: 'client_upload_1234',
     }));
     expect(sendFileTransferRequestMock.mock.calls[0]?.[2]).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
+  });
+
+  it('omits clientUploadId when relaying to an older daemon without direct-transfer capability', async () => {
+    hasDaemonCapabilityMock.mockImplementation((capability: string) => (
+      capability === FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY
+    ));
+
+    const form = new FormData();
+    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+    form.append('clientUploadId', 'client_upload_1234');
+
+    const res = await makeApp().request('/api/server/srv-1/upload', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test' },
+      body: form,
+    });
+
+    expect(res.status).toBe(200);
+    expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(DIRECT_FILE_TRANSFER_CAPABILITY);
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH,
+    }));
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('clientUploadId');
   });
 
   it('cleans relay-staged uploads after a successful daemon fetch grace window', async () => {

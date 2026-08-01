@@ -74,6 +74,7 @@ import type {
   FsDeleteResponse,
 } from '../../src/shared/transport/fs.js';
 import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
+import type { DirectFileTransferServerMessage } from '@shared/direct-file-transfer.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
 
@@ -132,6 +133,7 @@ export type SessionEventReason =
 
 export type ServerMessage =
   | ResourceChangedMessage
+  | DirectFileTransferServerMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
   | { type: 'terminal.stream_reset'; session: string; reason: string }

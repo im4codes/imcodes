@@ -1562,6 +1562,8 @@
     "upload_file": "ファイルをアップロード",
     "uploading": "アップロード中...",
     "upload_failed": "アップロード失敗",
+    "direct_required_large": "このファイルには直接接続が必要です。サーバー中継は最大 {{max}}MB です",
+    "transport": { "connecting": "直接接続中", "direct": "P2P 直接", "falling_back": "中継へ切替中", "relay": "サーバー中継" },
     "insufficient_capacity": "サーバーのディスク容量が不足しています",
     "file_too_large": "ファイルが大きすぎます（最大 {{max}}MB）",
     "long_text_attached": "長い貼り付けテキストを {{name}} として添付しました",

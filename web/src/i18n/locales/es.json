@@ -1563,6 +1563,8 @@
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",
     "upload_failed": "Error al subir",
+    "direct_required_large": "Este archivo requiere conexión directa; el relevo del servidor está limitado a {{max}}MB",
+    "transport": { "connecting": "Conectando", "direct": "P2P directo", "falling_back": "Cambiando a relevo", "relay": "Relevo del servidor" },
     "insufficient_capacity": "Espacio en disco insuficiente en el servidor",
     "file_too_large": "Archivo demasiado grande (máx. {{max}}MB)",
     "long_text_attached": "El texto pegado largo se adjuntó como {{name}}",

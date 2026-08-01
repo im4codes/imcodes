@@ -35,6 +35,8 @@ import { RESOURCE_EVENT_MSG, type ResourceTopic } from '../../../shared/resource
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/peer-audit.js';
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
+import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -1222,6 +1224,22 @@ export class WsBridge {
       logWarn: (scope, fields, message) => { logger.warn(fields as Record<string, unknown>, message); },
     },
   );
+
+  /** Capability-bound WebRTC signaling routes; direct frames are never broadcast. */
+  private readonly directFileTransferRouter = new DirectFileTransferRouter({
+    serverId: () => this.serverId,
+    daemonAvailable: () => Boolean(
+      this.authenticated
+      && this.daemonNodeRole === NODE_ROLE.FULL
+      && this.daemonWs?.readyState === WebSocket.OPEN,
+    ),
+    daemonSupportsDirect: () => this.daemonP2pWorkflowCapabilities?.capabilities.includes(
+      DIRECT_FILE_TRANSFER_CAPABILITY,
+    ) ?? false,
+    daemonGeneration: () => this.daemonGeneration,
+    sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
+    sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+  });
 
   /** Per-request memory management pending map — routes sensitive admin responses via requestId unicast. */
   private pendingMemoryManagementRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
@@ -2428,6 +2446,7 @@ export class WsBridge {
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
+    this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
     // Invalidate every pending peer-audit response route: the prior daemon
     // is gone, and any reply that arrives for it must not be delivered to a
@@ -2819,6 +2838,10 @@ export class WsBridge {
         return;
       }
 
+      if (this.directFileTransferRouter.handleDaemon(msg, connectionGeneration)) {
+        return;
+      }
+
       // A controlled node's exec result — deliver to the pending relay request,
       // bound to this connection's (serverId, generation). Unmatched/forged
       // correlationIds are dropped by the registry (10.6). FULL daemons can
@@ -3167,6 +3190,10 @@ export class WsBridge {
       }
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
+        return;
+      }
+
+      if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
         return;
       }
 
@@ -5575,6 +5602,7 @@ export class WsBridge {
     this.transportSubscriptions.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
     this.peerAuditRouter.dropSocket(ws);
+    this.directFileTransferRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
     for (const [reqId, pending] of this.pendingTimelineRequests) {
       if (pending.socket === ws) {
@@ -6317,6 +6345,19 @@ export class WsBridge {
     } catch (err) {
       logger.error({ serverId: this.serverId, err }, 'Failed to send COMPUTER_USE');
       return 'send_failed';
+    }
+  }
+
+  /** Direct-transfer signaling is connection-bound and must never enter the replay queue. */
+  private trySendDirectFileTransfer(message: Record<string, unknown>, expectedGeneration: number): boolean {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonGeneration !== expectedGeneration || this.daemonNodeRole !== NODE_ROLE.FULL) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(message));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId, type: message.type }, 'Direct file transfer signaling send failed');
+      return false;
     }
   }
 

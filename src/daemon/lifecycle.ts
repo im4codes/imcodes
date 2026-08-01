@@ -7,6 +7,7 @@ import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.j
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
+import { initializeDirectFileTransfer, shutdownDirectFileTransfers } from './direct-file-transfer.js';
 import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
@@ -540,6 +541,7 @@ export async function startup(): Promise<DaemonContext> {
   await initFileTransfer();
   startCleanupTimer();
   logger.info('File transfer initialized');
+  await initializeDirectFileTransfer();
 
   // Warm the memory short-ref index so handles injected before this restart
   // still resolve. Resolution is synchronous (it runs inside render paths), so
@@ -1364,6 +1366,10 @@ export async function shutdown(exitCode = 0): Promise<void> {
   // deadlines/queued dispatches and close the dedicated reply ingress before
   // timeline and queue stores are drained.
   peerAuditService.shutdown();
+
+  await shutdownDirectFileTransfers().catch((err) => {
+    logger.warn({ err }, 'Daemon shutdown direct file transfer cleanup failed');
+  });
 
   // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
   if ((BACKEND as string) === 'conpty') {

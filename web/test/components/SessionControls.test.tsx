@@ -6512,6 +6512,10 @@ afterEach(() => {
     expect(rows).toHaveLength(2);
     expect(within(rows[0]).getByText('alpha.txt')).toBeDefined();
     expect(within(rows[1]).getByText('beta.txt')).toBeDefined();
+    expect(screen.getAllByTestId('composer-upload-transport').map((node) => node.textContent)).toEqual([
+      'relay',
+      'relay',
+    ]);
     const progressBars = screen.getAllByRole('progressbar');
     expect(progressBars.map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
     expect(progressBars.every((bar) => (bar as HTMLElement).style.gridColumn === '1 / -1')).toBe(true);

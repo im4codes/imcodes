@@ -1394,9 +1394,11 @@ export async function uploadFile(
   serverId: string,
   file: File,
   onProgress?: (pct: number) => void,
+  clientUploadId?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
+  if (clientUploadId) form.append('clientUploadId', clientUploadId);
   const browserUploadWeight = 50;
   const daemonDownloadWeight = 50;
 

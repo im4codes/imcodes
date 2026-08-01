@@ -34,6 +34,8 @@ import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../shared/direct-file-transfer.js';
+import { isDirectFileTransferAvailable } from './direct-file-transfer.js';
 import {
   classifyServerSendPlane,
   recordServerLinkDataPlaneBackpressure,
@@ -824,6 +826,7 @@ export class ServerLink {
     return [...new Set([
       ...this.p2pWorkflowCapabilities,
       ...DAEMON_STATIC_CAPABILITIES,
+      ...(isDirectFileTransferAvailable() ? [DIRECT_FILE_TRANSFER_CAPABILITY] : []),
     ])];
   }
 

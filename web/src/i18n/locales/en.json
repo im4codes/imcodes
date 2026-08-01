@@ -1563,6 +1563,8 @@
     "upload_file": "Upload file",
     "uploading": "Uploading...",
     "upload_failed": "Upload failed",
+    "direct_required_large": "This file requires a direct connection; relay fallback is limited to {{max}}MB",
+    "transport": { "connecting": "Connecting", "direct": "P2P direct", "falling_back": "Falling back", "relay": "Server relay" },
     "insufficient_capacity": "Insufficient disk space on the server",
     "file_too_large": "File too large (max {{max}}MB)",
     "long_text_attached": "Large pasted text attached as {{name}}",

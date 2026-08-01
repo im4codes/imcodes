@@ -119,6 +119,8 @@ export interface FileUploadRequest {
   mime?: string;
   size: number;
   content: string; // base64
+  /** Stable browser-generated identity shared with an optional direct attempt. */
+  clientUploadId?: string;
 }
 
 export interface FileUploadFetchRequest {
@@ -129,6 +131,8 @@ export interface FileUploadFetchRequest {
   mime?: string;
   size: number;
   downloadUrl: string;
+  /** Stable browser-generated identity shared with an optional direct attempt. */
+  clientUploadId?: string;
 }
 
 export interface FileDownloadRequest {
@@ -275,14 +279,17 @@ function isBoundedString(value: unknown, maxBytes: number, allowEmpty = false): 
     && utf8Bytes(value) <= maxBytes;
 }
 
-function isSafeSize(value: unknown): value is number {
+function isSafeSize(value: unknown, maxSize = FILE_TRANSFER_LIMITS.MAX_FILE_SIZE): value is number {
   return typeof value === 'number'
     && Number.isSafeInteger(value)
     && value >= 0
-    && value <= FILE_TRANSFER_LIMITS.MAX_FILE_SIZE;
+    && value <= maxSize;
 }
 
-export function validateAttachmentRef(value: unknown): AttachmentRef | null {
+export function validateAttachmentRef(
+  value: unknown,
+  options?: { maxSize?: number },
+): AttachmentRef | null {
   if (!isObject(value) || !hasOnlyKeys(value, FILE_TRANSFER_ATTACHMENT_KEYS)) return null;
   if (!isTransferId(value.id)) return null;
   if (value.source !== 'upload' && value.source !== 'local') return null;
@@ -290,7 +297,7 @@ export function validateAttachmentRef(value: unknown): AttachmentRef | null {
   if (!isBoundedString(value.daemonPath, FILE_TRANSFER_PATH_MAX_BYTES)) return null;
   if (value.originalName !== undefined && !isBoundedString(value.originalName, 1024)) return null;
   if (value.mime !== undefined && !isBoundedString(value.mime, 256)) return null;
-  if (value.size !== undefined && !isSafeSize(value.size)) return null;
+  if (value.size !== undefined && !isSafeSize(value.size, options?.maxSize)) return null;
   if (!isBoundedString(value.createdAt, 64)) return null;
   if (value.expiresAt !== undefined && !isBoundedString(value.expiresAt, 64)) return null;
   if (typeof value.downloadable !== 'boolean') return null;
@@ -314,11 +321,12 @@ export function validateControlledFileTransferRequest(
   if (!isObject(value) || typeof value.type !== 'string') return { ok: false, error: 'invalid_object' };
   if (value.type === FILE_TRANSFER_MSG.PATH_HANDLE) return validateFilePathHandleRequest(value);
   if (value.type === 'file.upload_fetch') {
-    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl']))
+    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId']))
       || !isTransferId(value.uploadId)
       || typeof value.filename !== 'string' || !/^[a-f0-9]{16,128}(\.[A-Za-z0-9]{1,20})?$/.test(value.filename)
       || (value.originalName !== undefined && !isBoundedString(value.originalName, 1024))
       || (value.mime !== undefined && !isBoundedString(value.mime, 256))
+      || (value.clientUploadId !== undefined && !isTransferId(value.clientUploadId))
       || !isSafeSize(value.size)
       || !isBoundedString(value.downloadUrl, 8192)) {
       return { ok: false, error: 'invalid_upload_fetch' };
