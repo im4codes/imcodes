@@ -4439,6 +4439,70 @@ ${PREFERENCE_CONTEXT_END}`;
       }));
     });
 
+    it('queued entry carries its audit anchor to onDrain, so the deferred timeline emit can anchor it', async () => {
+      const AUDIT = { names: ['host'], resolvedHash: 'a'.repeat(64) };
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
+      expect(runtime.send(ORIGINAL, 'alias-audit-1', undefined, undefined, {
+        providerText: EXPANDED,
+        aliasAudit: AUDIT,
+      })).toBe('queued');
+
+      // Unlike providerText, the anchor SURVIVES the public projection: it holds
+      // only names + a hash, and onDrain is the consumer that needs it.
+      expect(runtime.pendingEntries[0]).not.toHaveProperty('providerText');
+      expect(runtime.pendingEntries[0].aliasAudit).toEqual(AUDIT);
+
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+
+      const drained = onDrainEntries.flat().find((e) => e.clientMessageId === 'alias-audit-1');
+      expect(drained?.aliasAudit).toEqual(AUDIT);
+    });
+
+    it('the audit anchor survives a daemon restart with the queued entry', async () => {
+      const AUDIT = { names: ['host'], resolvedHash: 'b'.repeat(64) };
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send(ORIGINAL, 'alias-audit-restart', undefined, undefined, {
+        providerText: EXPANDED,
+        aliasAudit: AUDIT,
+      })).toBe('queued');
+
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+      await restarted.initialize(defaultConfig);
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+
+      const rehydrated = restarted.pendingEntriesForResend.find((e) => e.clientMessageId === 'alias-audit-restart');
+      expect(rehydrated?.aliasAudit).toEqual(AUDIT);
+      // Still delivered privately, never on the public projection.
+      expect(rehydrated?.providerText).toBe(EXPANDED);
+    });
+
+    it('editing a queued message drops the anchor along with the stale expansion', async () => {
+      const AUDIT = { names: ['host'], resolvedHash: 'c'.repeat(64) };
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send(ORIGINAL, 'alias-audit-edit', undefined, undefined, {
+        providerText: EXPANDED,
+        aliasAudit: AUDIT,
+      })).toBe('queued');
+
+      runtime.editPendingMessage('alias-audit-edit', 'totally different text');
+
+      // The anchor attested to the OLD aliases; keeping it would claim a
+      // delivery that no longer happens.
+      const edited = runtime.pendingEntriesForResend.find((e) => e.clientMessageId === 'alias-audit-edit');
+      expect(edited?.text).toBe('totally different text');
+      expect(edited?.providerText).toBeUndefined();
+      expect(edited?.aliasAudit).toBeUndefined();
+    });
+
     it('SQLite rehydrate after restart: providerText survives; provider gets expanded, timeline entry stays the marker', async () => {
       runtime.send('first turn');
       await waitForProviderSendCount(mock.provider, 1);

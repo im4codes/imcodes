@@ -964,6 +964,8 @@ import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
 import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
+import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
@@ -1391,6 +1393,11 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   }
   const cmd = msg as Record<string, unknown>;
   traceWebCommandReceived(cmd);
+
+  if (isDirectFileTransferMessageType(cmd.type)) {
+    void handleDirectFileTransferCommand(cmd, serverLink);
+    return;
+  }
 
   // Top-level isolation: any synchronous throw inside a handler — e.g.
   // a TypeError from `cmd.foo.bar` when `foo` is undefined, or a
@@ -4234,10 +4241,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // (the expanded agent-bound copy) rides the send metadata and only exists
       // when alias expansion actually changed the text — otherwise the metadata
       // shape stays exactly as before (byte-identical no-alias path).
-      const sendMetadata = (sharedActor || aliasProviderText)
+      // `aliasAudit` must ride the metadata, not just the immediate emit: a
+      // queued/resent message emits its user.message later from session-manager,
+      // which can only anchor what the entry carries.
+      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
+            ...(aliasAudit ? { aliasAudit } : {}),
           }
         : undefined;
       const result = preferenceMessagePreamble
@@ -4611,7 +4622,26 @@ async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, se
   }
   const release = await getMutex(sessionName).acquire();
   try {
-    const edited = runtime.editPendingMessage(clientMessageId, text);
+    // Re-resolve aliases for the EDITED text. The edit may introduce or keep
+    // `;;(name)` markers; without this the provider receives the literal marker
+    // (legend agents) or the send fails closed (shell/script).
+    const editResolved: SendAliasResolution = cmd.resolvedAliases && typeof cmd.resolvedAliases === 'object' && !Array.isArray(cmd.resolvedAliases)
+      ? cmd.resolvedAliases as SendAliasResolution
+      : {};
+    const editNotes: SendAliasNotes = cmd.resolvedAliasNotes && typeof cmd.resolvedAliasNotes === 'object' && !Array.isArray(cmd.resolvedAliasNotes)
+      ? cmd.resolvedAliasNotes as SendAliasNotes
+      : {};
+    const editExpansion = expandForAgent(
+      text,
+      editResolved,
+      aliasExpansionModeFor(String(record?.agentType ?? '')),
+      editNotes,
+    );
+    const editAudit = buildAliasSendAudit(text, editResolved, editNotes);
+    const edited = runtime.editPendingMessage(clientMessageId, text, {
+      ...(editExpansion.deliver && editExpansion.text !== text ? { providerText: editExpansion.text } : {}),
+      ...(editAudit ? { aliasAudit: editAudit } : {}),
+    });
     if (!edited) {
       timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
       emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: 'Queued message not found' });

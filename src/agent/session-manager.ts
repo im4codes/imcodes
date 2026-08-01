@@ -1382,6 +1382,9 @@ async function drainTransportResendQueueIntoRuntime(
         const resendMetadata = {
           ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
           ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+          // Preserve the anchor across a reconnect resend for the same reason as
+          // providerText: the user.message is emitted after this hop.
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
           ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
           ...(entry.historyCommitted ? { historyCommitted: true } : {}),
         };
@@ -1703,6 +1706,7 @@ function wireTransportCallbacks(
           allowDuplicate: true,
           pendingMessageVersion: drainedVersion,
           ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
         },
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );

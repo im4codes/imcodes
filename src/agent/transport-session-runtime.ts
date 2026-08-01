@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { AliasSendAudit } from '../../shared/alias-types.js';
 import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
@@ -108,6 +109,13 @@ export interface PendingTransportMessage {
    * expansion happened and `text` is delivered verbatim.
    */
   providerText?: string;
+  /**
+   * Alias send audit anchor (names + SHA-256, never plaintext). Rides the queued
+   * entry so a message dispatched after a drain, a reconnect, or a daemon
+   * restart still projects the anchor onto its final timeline `user.message` —
+   * without it, only immediately-sent messages were auditable.
+   */
+  aliasAudit?: AliasSendAudit;
   /** Provider-visible per-turn context rendered through the shared context preamble path. */
   messagePreamble?: string;
   attachments?: TransportAttachment[];
@@ -157,6 +165,8 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // full material for internal resend preservation only.
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
+  // `aliasAudit` deliberately survives: it holds only referenced names and a
+  // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
   delete publicEntry.delegationReply;
   return publicEntry;
@@ -170,6 +180,8 @@ export interface TransportSendMetadata {
    * `message`. Absent ⇒ `message` is delivered verbatim.
    */
   providerText?: string;
+  /** Alias send audit anchor to project onto this message's timeline event. */
+  aliasAudit?: AliasSendAudit;
   /**
    * Where to place this message when a provider turn is already active.
    * `front` is reserved for out-of-band dialog answers (ask.answer):
@@ -1111,6 +1123,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           const material = JSON.parse(materialJson) as {
             text?: unknown;
             providerText?: unknown;
+            aliasAudit?: unknown;
             messagePreamble?: unknown;
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
@@ -1122,6 +1135,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               clientMessageId,
               text: material.text,
               ...(typeof material.providerText === 'string' ? { providerText: material.providerText } : {}),
+              ...(material.aliasAudit && typeof material.aliasAudit === 'object'
+                ? { aliasAudit: material.aliasAudit as AliasSendAudit }
+                : {}),
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
@@ -1795,6 +1811,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.providerText != null && metadata.providerText !== message
         ? { providerText: metadata.providerText }
         : {}),
+      ...(metadata?.aliasAudit ? { aliasAudit: metadata.aliasAudit } : {}),
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
@@ -1822,6 +1839,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             clientMessageId: entry.clientMessageId,
             text: entry.text,
             ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+            ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
             ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
             ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
             ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
@@ -1917,18 +1935,38 @@ export class TransportSessionRuntime implements SessionRuntime {
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
   }
 
-  editPendingMessage(clientMessageId: string, text: string): boolean {
+  /**
+   * Replace a queued message's text.
+   *
+   * `expansion` carries the re-resolved alias material for the NEW text. It is
+   * required for correctness, not an optimisation: the edited text may contain
+   * `;;(name)` markers, and without a fresh expansion the provider would receive
+   * the literal marker while the old (now wrong) expansion is discarded.
+   * Omitting it keeps the previous behaviour — drop everything and deliver
+   * verbatim — which is right for an edit that references no alias.
+   */
+  editPendingMessage(
+    clientMessageId: string,
+    text: string,
+    expansion?: { providerText?: string; aliasAudit?: AliasSendAudit },
+  ): boolean {
     const nextText = text;
     if (!clientMessageId || nextText.length === 0) return false;
     const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
     if (!entry) return false;
     entry.text = nextText;
-    // The edit is fresh user text with no attached alias resolution — drop any
-    // stale expansion so the edited text is delivered to the provider verbatim.
-    entry.providerText = undefined;
+    // Any expansion from the PREVIOUS text is stale; only a freshly computed one
+    // may survive this edit.
+    entry.providerText = expansion?.providerText != null && expansion.providerText !== nextText
+      ? expansion.providerText
+      : undefined;
+    entry.aliasAudit = expansion?.aliasAudit;
     entry.messagePreamble = undefined;
     try {
-      getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText);
+      getTransportQueueStore().edit(this.sessionKey, clientMessageId, nextText, undefined, {
+        ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      });
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite edit failed; preserving runtime-local edit');
     }

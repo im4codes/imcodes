@@ -49,7 +49,8 @@ import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
-import { uploadFile, sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
+import { sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
+import { DirectFileTransferFailure, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
@@ -566,6 +567,7 @@ type ComposerUploadItem = {
   name: string;
   progress: number;
   status: 'uploading' | 'done' | 'error';
+  transport: FileUploadTransportMode;
 };
 
 type ComposerUploadEntry = {
@@ -3505,6 +3507,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         mutationCommandId = sendQueuedMessageMutation('session.edit_queued_message', {
           clientMessageId: editingQueuedMessageId,
           text: payload.text,
+          // The daemon drops the previous expansion (it belongs to the old
+          // text) and re-expands from this; without it an edited message that
+          // still references an alias loses its value.
+          ...buildAliasSendExtra(payload.text, aliasAll),
         });
         if (!mutationCommandId) return 'rejected';
       } catch {
@@ -3628,7 +3634,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (entry.status !== 'failed') return;
     let commandId: string | null = null;
     try {
-      commandId = sendSessionMessage(entry.text);
+      // Re-resolve the markers in the retried text. The failed entry's text
+      // keeps its `;;(name)` markers (values never live on the timeline), so a
+      // bare resend would deliver the literal marker to a legend agent and
+      // fail closed on shell/script. Resolving here — instead of replaying a
+      // stored map — also keeps alias VALUES out of queue component state and
+      // picks up any edit made since the original send.
+      commandId = sendSessionMessage(entry.text, buildAliasSendExtra(entry.text, aliasAll));
     } catch {
       commandId = null;
     }
@@ -3645,7 +3657,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       });
       return next;
     });
-  }, [incomingQueuedTransportVersion, sendSessionMessage]);
+  }, [aliasAll, incomingQueuedTransportVersion, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -4019,14 +4031,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       name: file.name || 'file',
       progress: 0,
       status: 'uploading' as const,
+      transport: 'connecting' as const,
     }));
     addComposerUploadItems(uploadKey, uploadItems);
 
     const uploadedAttachments = await Promise.all(files.map(async (file, index) => {
       const uploadItem = uploadItems[index];
       try {
-        const result = await uploadFile(serverId, file, (pct) => {
-          updateComposerUploadItem(uploadKey, uploadItem.id, { progress: pct });
+        const result = await uploadFileWithDirectFallback({
+          ws,
+          serverId,
+          file,
+          onProgress: (pct) => {
+            updateComposerUploadItem(uploadKey, uploadItem.id, { progress: pct });
+          },
+          onMode: (transport) => {
+            updateComposerUploadItem(uploadKey, uploadItem.id, {
+              transport,
+              ...(transport === 'falling_back' ? { progress: 0 } : {}),
+            });
+          },
         });
         updateComposerUploadItem(uploadKey, uploadItem.id, { progress: 100, status: 'done' });
         if (result.attachment?.daemonPath) {
@@ -4037,7 +4061,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
         let errorMessage: string;
-        if (isInsufficientCapacityError(body)) {
+        if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
+          errorMessage = t('upload.direct_required_large', { max: MAX_UPLOAD_SIZE_MB });
+        } else if (isInsufficientCapacityError(body)) {
           errorMessage = t('upload.insufficient_capacity');
         } else if (body.includes('daemon_offline')) {
           errorMessage = t('upload.daemon_offline');
@@ -5270,6 +5296,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               >
                 {item.name}
               </span>
+              <span
+                data-testid="composer-upload-transport"
+                style={{ fontSize: 10, color: item.transport === 'direct' ? '#22c55e' : '#94a3b8', textAlign: 'right', whiteSpace: 'nowrap' }}
+              >
+                {t(`upload.transport.${item.transport}`)}
+              </span>
               <div
                 role="progressbar"
                 aria-label={`${item.name} upload progress`}
@@ -5288,7 +5320,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   }}
                 />
               </div>
-              <span data-testid="composer-upload-progress" style={{ fontSize: 11, color: '#94a3b8', textAlign: 'right' }}>{item.progress}%</span>
+              <span data-testid="composer-upload-progress" style={{ gridColumn: 2, fontSize: 11, color: '#94a3b8', textAlign: 'right' }}>{item.progress}%</span>
             </div>
           ))}
         </div>

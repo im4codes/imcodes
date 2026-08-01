@@ -20,6 +20,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { AliasSendAudit } from '../../shared/alias-types.js';
 import logger from '../util/logger.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
@@ -43,6 +44,8 @@ export interface ResendEntry {
    * provider (via runtime.send metadata) while `text` stays the timeline copy.
    */
   providerText?: string;
+  /** Alias send audit anchor (names + hash only) to project when this is finally delivered. */
+  aliasAudit?: AliasSendAudit;
   /** Provider-visible context to pass through TransportSessionRuntime messagePreamble. */
   messagePreamble?: string;
   /** Original clientMessageId so command.ack correlation survives the resend. */
@@ -100,6 +103,7 @@ export function enqueueResend(sessionName: string, entry: ResendEntry): {
         clientMessageId: normalizedEntry.clientMessageId,
         text: normalizedEntry.text,
         ...(normalizedEntry.providerText != null ? { providerText: normalizedEntry.providerText } : {}),
+        ...(normalizedEntry.aliasAudit ? { aliasAudit: normalizedEntry.aliasAudit } : {}),
         ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
         ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
         ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),
