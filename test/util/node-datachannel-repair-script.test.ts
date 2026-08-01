@@ -1,9 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { resolveNpmCliJs } from '../../src/util/node-datachannel-repair.mjs';
+import { isDirectInvocation, resolveNpmCliJs } from '../../src/util/node-datachannel-repair.mjs';
 import { buildBashNodeDatachannelRepair } from '../../src/util/node-datachannel-repair-script.js';
 
 const cleanup: string[] = [];
@@ -60,6 +62,20 @@ describe('buildBashNodeDatachannelRepair', () => {
     const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
     expect(implementation).toContain('shell: false');
     expect(implementation).not.toContain('shell: windowsCommandShim');
+  });
+
+  it.skipIf(process.platform === 'win32')('recognizes direct execution through a canonicalized path alias', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes repair entry-'));
+    cleanup.push(root);
+    const realDir = join(root, 'real');
+    const aliasDir = join(root, 'alias');
+    mkdirSync(realDir);
+    symlinkSync(realDir, aliasDir, 'dir');
+    const realEntry = join(realDir, 'repair.mjs');
+    const aliasEntry = join(aliasDir, 'repair.mjs');
+    writeFileSync(realEntry, 'fixture');
+
+    expect(isDirectInvocation(aliasEntry, realEntry)).toBe(true);
   });
 
   it('verifies again after rebuild and degrades to relay on failure', () => {
@@ -128,7 +144,9 @@ describe('buildBashNodeDatachannelRepair', () => {
 
     execFileSync('bash', [scriptPath], { stdio: 'pipe' });
 
+    const repairLog = readFileSync(logPath, 'utf8');
+    if (!existsSync(marker)) throw new Error(`native marker missing after repair:\n${repairLog}`);
     expect(readFileSync(marker, 'utf8')).toBe('fixture');
-    expect(readFileSync(logPath, 'utf8')).toContain('node-datachannel repair succeeded');
+    expect(repairLog).toContain('node-datachannel repair succeeded');
   });
 });

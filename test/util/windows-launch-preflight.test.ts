@@ -16,7 +16,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync,
+  mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, realpathSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -43,14 +43,16 @@ function makeSandbox(opts: {
   brokenNodeDatachannel?: boolean;
 }): Sandbox {
   const root = mkdtempSync(join(tmpdir(), 'win-preflight-'));
-  const pkgRoot = join(root, 'lib', 'node_modules', 'imcodes');
-  const distSrcUtil = join(pkgRoot, 'dist', 'src', 'util');
+  const pkgRootPath = join(root, 'lib', 'node_modules', 'imcodes');
+  const distSrcUtilPath = join(pkgRootPath, 'dist', 'src', 'util');
   const shimDir = join(root, 'shims');
   const homeDir = join(root, 'home');
   const npmCallLog = join(root, 'npm-calls.log');
   const repairLog = join(homeDir, '.imcodes', 'launch-repair.log');
 
-  mkdirSync(distSrcUtil, { recursive: true });
+  mkdirSync(distSrcUtilPath, { recursive: true });
+  const pkgRoot = realpathSync(pkgRootPath);
+  const distSrcUtil = join(pkgRoot, 'dist', 'src', 'util');
   mkdirSync(shimDir, { recursive: true });
   mkdirSync(join(homeDir, '.imcodes'), { recursive: true });
 

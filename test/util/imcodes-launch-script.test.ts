@@ -23,7 +23,9 @@
  * (windows-upgrade-script.ts) that solves the same problem differently.
  */
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import {
+  mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, realpathSync,
+} from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -67,11 +69,12 @@ function makeSandbox(opts: {
   brokenNodeDatachannel?: boolean;
 }): Sandbox {
   const root = mkdtempSync(join(tmpdir(), 'imcodes-launch-'));
-  const pkgRoot = join(root, 'lib', 'node_modules', 'imcodes');
+  const pkgRootPath = join(root, 'lib', 'node_modules', 'imcodes');
   const binDir = join(root, 'shims');
   const homeDir = join(root, 'home');
   const npmCallLog = join(root, 'npm-calls.log');
-  mkdirSync(pkgRoot, { recursive: true });
+  mkdirSync(pkgRootPath, { recursive: true });
+  const pkgRoot = realpathSync(pkgRootPath);
   mkdirSync(binDir, { recursive: true });
   mkdirSync(join(homeDir, '.imcodes'), { recursive: true });
 

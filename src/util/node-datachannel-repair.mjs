@@ -8,7 +8,7 @@
  * the newly installed daemon starts.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,6 +16,15 @@ const SELF = fileURLToPath(import.meta.url);
 const DEFAULT_PACKAGE_ROOT = resolve(dirname(SELF), '..', '..', '..');
 const REPAIR_TIMEOUT_MS = 5 * 60_000;
 const VERIFY_TIMEOUT_MS = 60_000;
+
+export function isDirectInvocation(entryPath, selfPath = SELF) {
+  if (!entryPath) return false;
+  try {
+    return realpathSync(entryPath) === realpathSync(selfPath);
+  } catch {
+    return resolve(entryPath) === resolve(selfPath);
+  }
+}
 
 function run(command, args, options = {}) {
   return spawnSync(command, args, {
@@ -129,7 +138,7 @@ export function repairNodeDatachannel(options = {}) {
   return { available: false, attempted, repaired: false, reason: 'verification_failed' };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === SELF) {
+if (isDirectInvocation(process.argv[1])) {
   const result = repairNodeDatachannel({
     packageRoot: process.argv[2] || DEFAULT_PACKAGE_ROOT,
     log: (line) => process.stderr.write(`[node-datachannel-repair] ${line}\n`),
