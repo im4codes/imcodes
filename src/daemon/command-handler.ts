@@ -7,7 +7,7 @@ import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.j
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
-import type { AliasSendAudit, SendAliasResolution } from '../../shared/alias-types.js';
+import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -3044,6 +3044,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const resolvedAliases: SendAliasResolution = cmd.resolvedAliases && typeof cmd.resolvedAliases === 'object' && !Array.isArray(cmd.resolvedAliases)
     ? cmd.resolvedAliases as SendAliasResolution
     : {};
+  // Sibling note map (optional). Older clients omit it entirely; the legend then
+  // renders exactly as before.
+  const resolvedAliasNotes: SendAliasNotes = cmd.resolvedAliasNotes && typeof cmd.resolvedAliasNotes === 'object' && !Array.isArray(cmd.resolvedAliasNotes)
+    ? cmd.resolvedAliasNotes as SendAliasNotes
+    : {};
 
   if (!sessionName || typeof text !== 'string') {
     logger.warn('session.send: missing sessionName or text');
@@ -3659,7 +3664,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // `aliasProviderText` is set only when the agent-bound text actually differs, so
   // the no-alias path stays byte-identical. Values are never logged.
   const aliasMode = aliasExpansionModeFor(record.agentType ?? '');
-  const aliasExpansion = expandForAgent(displayText, resolvedAliases, aliasMode);
+  const aliasExpansion = expandForAgent(displayText, resolvedAliases, aliasMode, resolvedAliasNotes);
   // ── Alias fail-closed guard (A′, CRITICAL) ─────────────────────────────────
   // `deliver === false` ONLY for a raw executor (inline mode: shell/script, or an
   // unknown agent type that defaults to inline) with an UNRESOLVED `;;(name)`
@@ -3716,7 +3721,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // plaintext) to the human-facing `user.message` so "what did `;;(name)`
   // actually deliver" is auditable. `undefined` when no marker resolved, so the
   // no-alias path stays byte-identical. Values are never logged or emitted.
-  const aliasAudit: AliasSendAudit | undefined = buildAliasSendAudit(displayText, resolvedAliases);
+  const aliasAudit: AliasSendAudit | undefined = buildAliasSendAudit(displayText, resolvedAliases, resolvedAliasNotes);
   const aliasAuditExtra: Record<string, unknown> = aliasAudit ? { aliasAudit } : {};
   const preferenceMessagePreamble = await loadPreferenceProviderContext({
     enabled: preferenceFeatureEnabled,

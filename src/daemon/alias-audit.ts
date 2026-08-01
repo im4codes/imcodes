@@ -14,9 +14,11 @@
 
 import { createHash } from 'node:crypto';
 import {
+  aliasNoteFor,
   nfc,
   parseAliasMarkers,
   type AliasSendAudit,
+  type SendAliasNotes,
   type SendAliasResolution,
 } from '../../shared/alias-types.js';
 
@@ -34,6 +36,7 @@ import {
 export function buildAliasSendAudit(
   text: string,
   resolvedAliases: SendAliasResolution,
+  resolvedAliasNotes?: SendAliasNotes,
 ): AliasSendAudit | undefined {
   // Distinct valid marker names in first-occurrence order (shared parser).
   const referenced = parseAliasMarkers(text);
@@ -49,9 +52,21 @@ export function buildAliasSendAudit(
   // keys sorted, mapped to their NFC-normalized values. Sorting + a purpose-built
   // object make the hash stable regardless of marker order or map key order, and
   // independent of any unrelated aliases the client happened to ship.
-  const canonical: Record<string, string> = {};
+  // The note is delivered to the agent alongside the value, so it is part of
+  // "what this marker actually delivered" and must be covered by the anchor —
+  // otherwise a silently edited note would leave no trace. Absent notes omit the
+  // key entirely, so an alias without one hashes unambiguously.
+  // A note is delivered to the agent alongside its value, so it is part of "what
+  // this marker actually delivered" and must be covered by the anchor —
+  // otherwise a silently edited note would leave no trace. Aliases with no note
+  // omit the key entirely and keep hashing exactly as before, so existing
+  // note-free sends produce unchanged anchors.
+  const canonical: Record<string, string | { value: string; description: string }> = {};
   for (const name of [...resolvedNames].sort()) {
-    canonical[name] = nfc(resolvedAliases[name]);
+    const note = aliasNoteFor(resolvedAliasNotes, name);
+    canonical[name] = note === undefined
+      ? nfc(resolvedAliases[name])
+      : { value: nfc(resolvedAliases[name]), description: nfc(note) };
   }
   const resolvedHash = createHash('sha256')
     .update(JSON.stringify(canonical), 'utf8')

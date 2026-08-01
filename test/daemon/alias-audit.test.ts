@@ -80,3 +80,31 @@ describe('buildAliasSendAudit (RV-C alias send audit anchor)', () => {
     expect(audit?.names).toEqual(['host']);
   });
 });
+
+describe('buildAliasSendAudit — notes are part of what was delivered', () => {
+  it('keeps the anchor byte-identical when no note is involved', () => {
+    // Existing note-free sends must hash exactly as before, or every historical
+    // anchor becomes incomparable.
+    const withoutArg = buildAliasSendAudit(';;(a)', { a: 'v' });
+    expect(buildAliasSendAudit(';;(a)', { a: 'v' }, {})).toEqual(withoutArg);
+    expect(buildAliasSendAudit(';;(a)', { a: 'v' }, { other: 'x' })).toEqual(withoutArg);
+  });
+
+  it('changes the hash when the note changes, since the agent saw it', () => {
+    const a = buildAliasSendAudit(';;(a)', { a: 'v' }, { a: 'read replica only' });
+    const b = buildAliasSendAudit(';;(a)', { a: 'v' }, { a: 'full write access' });
+    expect(a!.resolvedHash).not.toBe(b!.resolvedHash);
+    // A note is not silently equivalent to having none.
+    expect(a!.resolvedHash).not.toBe(buildAliasSendAudit(';;(a)', { a: 'v' })!.resolvedHash);
+  });
+
+  it('never puts the note plaintext on the anchor', () => {
+    const audit = buildAliasSendAudit(';;(a)', { a: 'sk-secret' }, { a: 'super secret context' });
+    expect(JSON.stringify(audit)).not.toContain('super secret context');
+    expect(JSON.stringify(audit)).not.toContain('sk-secret');
+  });
+
+  it('treats a blank note as absent rather than as a distinct value', () => {
+    expect(buildAliasSendAudit(';;(a)', { a: 'v' }, { a: '   ' })).toEqual(buildAliasSendAudit(';;(a)', { a: 'v' }));
+  });
+});

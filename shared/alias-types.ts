@@ -10,6 +10,17 @@ export const ALIAS_VALUE_MAX = 500;
 export const ALIAS_DESCRIPTION_MAX = 200;
 
 /**
+ * Hard ceiling applied to a client-supplied note before it is injected.
+ *
+ * Deliberately ABOVE {@link ALIAS_DESCRIPTION_MAX}: this bounds abuse from an
+ * out-of-band map that never passed server validation, while still leaving the
+ * visible budget cut (and its "fetch the rest" hint) to the legend builder. If
+ * this were also 200, an oversized note would arrive pre-trimmed to exactly the
+ * budget and the agent would never be told that anything was withheld.
+ */
+export const ALIAS_NOTE_HARD_MAX = 4000;
+
+/**
  * Allowlist for an alias name (NFC, case-sensitive). Excludes whitespace,
  * Unicode control/format (`\p{C}`) and bidi via the positive class, and the
  * marker/legend/URL-dangerous characters `; ( ) : / % #` by omission. CJK is
@@ -85,6 +96,30 @@ export function toAliasMetadata(entry: AliasEntry): AliasMetadata {
 
 /** Out-of-band map sent alongside a message: marker name -> resolved value (A′). */
 export type SendAliasResolution = Record<string, string>;
+
+/**
+ * Sibling map: marker name -> the author's note on that alias.
+ *
+ * The note used to be dropped at this boundary, so an agent saw
+ * `;;(deploy_key): sk-…` with none of the constraints the human wrote down
+ * ("read replica only", "revoke after use") — the part that makes a bare value
+ * safe to act on.
+ *
+ * Deliberately a SEPARATE field rather than widening {@link SendAliasResolution}
+ * into `string | {value, description}`: the daemon is a globally-installed CLI
+ * that users upgrade independently of the server-served web UI, so new-web +
+ * old-daemon is routine. An old daemon calls `nfc()` on each map entry, which
+ * throws `TypeError: i.normalize is not a function` on an object — every alias
+ * send would fail to deliver. An unknown sibling field is simply ignored.
+ */
+export type SendAliasNotes = Record<string, string>;
+
+/** Read a note for `name`, treating blank/non-string entries as absent. */
+export function aliasNoteFor(notes: SendAliasNotes | undefined, name: string): string | undefined {
+  if (!notes || typeof notes !== 'object') return undefined;
+  const note = (notes as Record<string, unknown>)[name];
+  return typeof note === 'string' && note.trim().length > 0 ? note : undefined;
+}
 
 /** NFC normalization used consistently on every layer before validation/storage/matching. */
 export function nfc(input: string): string {
@@ -208,14 +243,54 @@ export function parseAliasMarkers(text: string): string[] {
 
 /** Directive prepended to the legend block for NL/LLM agents. */
 export const ALIAS_LEGEND_DIRECTIVE =
-  'The ;;(name) markers in the message below expand to the following values; use the value wherever its marker appears:';
+  'The ;;(name) markers in the message below expand to the following values; use the value wherever its marker appears. '
+  + 'A line may carry a "— note:" written by the user about that alias: treat it as a constraint on how the value may be used, not as part of the value:';
+
+/** Separator between the value and the author's note on a legend line. */
+export const ALIAS_LEGEND_NOTE_SEPARATOR = ' — note: ';
+
+/**
+ * Longest note injected inline on a legend line.
+ *
+ * A note rides on EVERY send that references the alias, whether or not the agent
+ * ends up needing it, so a long one is a recurring token cost for information
+ * that is often irrelevant. Past this budget the line carries the leading slice
+ * plus a hint, and the agent fetches the rest on demand — `list_aliases` returns
+ * full alias metadata (including `description`) and never exposes values, so
+ * redeeming the hint costs nothing in value-secrecy terms.
+ *
+ * This is a real enforcement point, not a formality: the note map is supplied
+ * out-of-band by the client and is never re-validated against the server's
+ * save-time ceiling, so an oversized note can reach this line regardless of what
+ * {@link ALIAS_DESCRIPTION_MAX} allows at save time.
+ */
+export const ALIAS_LEGEND_NOTE_INLINE_MAX = 200;
+
+/** Appended when a note was cut to the inline budget; names the tool that returns the rest. */
+export const ALIAS_LEGEND_NOTE_TRUNCATED_HINT = '… (note truncated — call list_aliases for the full text)';
 
 /** Collapse internal whitespace runs (incl. newlines/tabs) so a legend line stays single-line. */
 export function legendValueSingleLine(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-/** Build one legend line `;;(name): value` (value single-lined). */
-export function buildAliasLegendLine(name: string, value: string): string {
-  return `${buildAliasMarker(name)}: ${legendValueSingleLine(value)}`;
+/**
+ * Build one legend line `;;(name): value` (value single-lined), appending
+ * `— note: <description>` when the alias carries one.
+ *
+ * The note is deliberately placed AFTER the value and behind a separator: the
+ * value stays the first thing following the marker, so a model copying "the
+ * thing after the colon" cannot pick up the note by accident.
+ */
+export function buildAliasLegendLine(name: string, value: string, description?: string): string {
+  const line = `${buildAliasMarker(name)}: ${legendValueSingleLine(value)}`;
+  const note = description ? legendValueSingleLine(description) : '';
+  if (!note) return line;
+  // Slice on code points, never UTF-16 units, so a surrogate pair (emoji, rare
+  // CJK) is not split into a lone half at the cut.
+  const points = Array.from(note);
+  const shown = points.length > ALIAS_LEGEND_NOTE_INLINE_MAX
+    ? points.slice(0, ALIAS_LEGEND_NOTE_INLINE_MAX).join('') + ALIAS_LEGEND_NOTE_TRUNCATED_HINT
+    : note;
+  return `${line}${ALIAS_LEGEND_NOTE_SEPARATOR}${shown}`;
 }

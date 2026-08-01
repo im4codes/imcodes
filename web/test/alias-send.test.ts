@@ -36,3 +36,41 @@ describe('buildAliasSendExtra', () => {
     expect(extra).toEqual({ resolvedAliases: { a: 'AAA' } });
   });
 });
+
+describe('buildAliasSendExtra — author notes', () => {
+  const withNote: AliasEntry = {
+    name: 'deploy', value: 'sk-live-1', description: 'prod — read replica only',
+    tags: [], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+  const noNote: AliasEntry = { ...withNote, name: 'plain', value: 'v2', description: undefined };
+
+  it('ships the note alongside the value', () => {
+    expect(buildAliasSendExtra('use ;;(deploy)', [withNote])).toEqual({
+      resolvedAliases: { deploy: 'sk-live-1' },
+      resolvedAliasNotes: { deploy: 'prod — read replica only' },
+    });
+  });
+
+  it('omits the notes field entirely when nothing has a note', () => {
+    // Keeps note-free sends byte-identical, so an older daemon sees no new field.
+    expect(buildAliasSendExtra('use ;;(plain)', [noNote])).toEqual({ resolvedAliases: { plain: 'v2' } });
+  });
+
+  it('keeps resolvedAliases a flat name→string map for older daemons', () => {
+    // An old daemon calls nfc() on each entry; an object there throws
+    // TypeError and the send never reaches the agent.
+    const extra = buildAliasSendExtra('use ;;(deploy)', [withNote]);
+    for (const v of Object.values(extra.resolvedAliases!)) expect(typeof v).toBe('string');
+  });
+
+  it('includes only the notes of aliases the body actually references', () => {
+    const extra = buildAliasSendExtra('use ;;(plain)', [withNote, noNote]);
+    expect(extra.resolvedAliasNotes).toBeUndefined();
+    expect(extra.resolvedAliases).toEqual({ plain: 'v2' });
+  });
+
+  it('drops a whitespace-only note instead of shipping an empty one', () => {
+    const blank: AliasEntry = { ...withNote, description: '   ' };
+    expect(buildAliasSendExtra('use ;;(deploy)', [blank]).resolvedAliasNotes).toBeUndefined();
+  });
+});
