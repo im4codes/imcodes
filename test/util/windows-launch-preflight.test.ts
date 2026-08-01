@@ -145,8 +145,8 @@ describe('src/util/windows-launch-preflight.mjs', () => {
       const r = runPreflight(sb);
       expect(r.status).toBe(0);
       const npmLog = readFileSync(sb.npmCallLog, 'utf8');
-      expect(npmLog).toContain('rebuild node-datachannel --ignore-scripts=false --foreground-scripts');
-      expect(npmLog).toContain('install --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
+      expect(npmLog).toContain('rebuild --global=false node-datachannel --ignore-scripts=false --foreground-scripts');
+      expect(npmLog).toContain('install --global=false --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -179,10 +179,10 @@ describe('src/util/windows-launch-preflight.mjs', () => {
       const calls = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n');
       const globalInstall = calls.findIndex((call) => call.includes('install -g'));
       expect(globalInstall).toBeGreaterThan(0);
-      expect(calls.slice(0, globalInstall).some((call) => call.includes('rebuild node-datachannel'))).toBe(true);
+      expect(calls.slice(0, globalInstall).some((call) => call.includes('rebuild --global=false node-datachannel'))).toBe(true);
       expect(calls.slice(globalInstall + 1).some((call) => (
-        call.includes('rebuild node-datachannel')
-        || (call.includes('install --no-save') && call.includes('node-datachannel@0.0.0-test'))
+        call.includes('rebuild --global=false node-datachannel')
+        || (call.includes('install --global=false --no-save') && call.includes('node-datachannel@0.0.0-test'))
       ))).toBe(true);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });

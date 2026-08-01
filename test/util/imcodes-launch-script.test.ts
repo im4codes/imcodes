@@ -204,8 +204,8 @@ describeUnix('bin/imcodes-launch.sh', () => {
       const r = runLauncher(sb);
       expect(r.status).toBe(0);
       const npmLog = readFileSync(sb.npmCallLog, 'utf8');
-      expect(npmLog).toContain('rebuild node-datachannel --ignore-scripts=false --foreground-scripts');
-      expect(npmLog).toContain('install --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
+      expect(npmLog).toContain('rebuild --global=false node-datachannel --ignore-scripts=false --foreground-scripts');
+      expect(npmLog).toContain('install --global=false --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
       const nodeLog = readFileSync(join(sb.root, 'node-calls.log'), 'utf8');
       expect(nodeLog).toContain('start');
     } finally {

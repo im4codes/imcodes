@@ -20,14 +20,14 @@ describe('buildBashNodeDatachannelRepair', () => {
 
   it('runs only the dependency lifecycle with scripts explicitly enabled', () => {
     const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
-    expect(implementation).toContain("'rebuild', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts'");
-    expect(implementation).toContain("'install', '--no-save', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(implementation).toContain("'rebuild', '--global=false', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(implementation).toContain("'install', '--global=false', '--no-save', '--ignore-scripts=false', '--foreground-scripts'");
     expect(block).not.toContain('install -g');
   });
 
   it('verifies again after rebuild and degrades to relay on failure', () => {
     const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
-    const rebuildIndex = implementation.indexOf("'rebuild', 'node-datachannel'");
+    const rebuildIndex = implementation.indexOf("'rebuild', '--global=false', 'node-datachannel'");
     expect(implementation.indexOf('if (verify(packageRoot))', rebuildIndex)).toBeGreaterThan(rebuildIndex);
     expect(block).toContain('direct transfer unavailable; relay remains enabled');
     expect(block).not.toMatch(/\bexit\s+[1-9]/);
@@ -78,6 +78,10 @@ describe('buildBashNodeDatachannelRepair', () => {
     writeFileSync(scriptPath, [
       'set -u',
       `export npm_config_prefix=${JSON.stringify(prefix)}`,
+      // A globally installed package can inherit global npm mode on some
+      // platforms/configurations. The repair must still target this package's
+      // own node_modules tree rather than the prefix-level global tree.
+      'export npm_config_global=true',
       'NPM_RUN=npm',
       `NODE=${JSON.stringify(process.execPath)}`,
       `LOG=${JSON.stringify(logPath)}`,

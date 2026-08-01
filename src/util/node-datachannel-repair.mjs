@@ -73,7 +73,7 @@ export function repairNodeDatachannel(options = {}) {
     attempted = true;
     log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
     const rebuild = runNpm([
-      'rebuild', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
+      'rebuild', '--global=false', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
     ]);
     if (rebuild.status !== 0) {
       log(`node-datachannel rebuild returned non-zero [exit ${rebuild.status} signal ${rebuild.signal ?? 'none'}]; trying clean dependency reinstall`);
@@ -86,7 +86,7 @@ export function repairNodeDatachannel(options = {}) {
     attempted = true;
     try { rmSync(dependencyDir, { recursive: true, force: true }); } catch { /* npm reports the failure below */ }
     const reinstall = runNpm([
-      'install', '--no-save', '--ignore-scripts=false', '--foreground-scripts',
+      'install', '--global=false', '--no-save', '--ignore-scripts=false', '--foreground-scripts',
       `node-datachannel@${dependencySpec}`,
     ]);
     if (reinstall.status !== 0) {
