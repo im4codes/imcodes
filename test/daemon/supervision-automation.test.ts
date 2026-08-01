@@ -1337,9 +1337,9 @@ describe('SupervisionAutomation', () => {
     );
     beginRun('cmd-completed-mixed-finalization', '修复解析错误');
     completeTurn('修复与验证已经完成并通过。当前未提交，等待本轮自动审计后再 commit/push。');
-    await sleep(25);
-
-    expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+    }, { timeout: 4_000 });
     const auditPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(auditPrompt).toContain('Exact delegate target session: deck_sub_reviewer');
     expect(auditPrompt).toContain('imcodes send --reply "deck_sub_reviewer"');
