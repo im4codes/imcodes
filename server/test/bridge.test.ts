@@ -1410,6 +1410,41 @@ describe('WsBridge', () => {
       expect(stats).not.toHaveProperty('embedding');
     });
 
+    it('relays validated direct-connectivity runtime diagnostics and drops malformed values', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        directConnectivity: { state: 'runtime_unavailable', error: 'native_module_missing' },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'daemon.stats',
+        cpu: 12,
+        memUsed: 1,
+        memTotal: 2,
+        load1: 0.1,
+        load5: 0.2,
+        load15: 0.3,
+        uptime: 100,
+        directConnectivity: { state: 'available', targetIp: '192.168.2.145' },
+      }));
+      await flushAsync();
+
+      const rows = browserWs.sentStrings
+        .map((message) => JSON.parse(message))
+        .filter((message) => message.type === 'daemon.stats');
+      expect(rows.at(-2)).toMatchObject({
+        directConnectivity: { state: 'runtime_unavailable', error: 'native_module_missing' },
+      });
+      expect(rows.at(-1)).not.toHaveProperty('directConnectivity');
+    });
+
     it('translates session_event → session.event', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       daemonWs.emit('message', JSON.stringify({ type: 'session_event', session: 'x' }));

@@ -4055,6 +4055,36 @@ html.native-ios-mac .chat-dl-btn {
 .daemon-details-health-row > span:first-child { color: #64748b; font-weight: 700; }
 .daemon-details-health-row > span:last-child { min-width: 0; overflow-wrap: anywhere; color: #cbd5e1; text-align: right; }
 .daemon-details-health-row.is-danger > span:last-child { color: #fca5a5; }
+.daemon-details-direct-row { align-items: flex-start; }
+.daemon-details-direct-result {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.daemon-details-direct-result > span { display: grid; gap: 2px; }
+.daemon-details-direct-result small {
+  color: #64748b;
+  font: 9px/1.2 'SF Mono', 'Cascadia Code', monospace;
+  text-transform: uppercase;
+}
+.daemon-details-direct-result .is-direct { color: #86efac; }
+.daemon-details-direct-result .is-warning { color: #fcd34d; }
+.daemon-details-direct-result .is-danger { color: #fca5a5; }
+.daemon-details-direct-result .is-probing { color: #67e8f9; }
+.daemon-details-direct-refresh {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  border-radius: 7px;
+  background: rgba(8, 47, 73, 0.45);
+  color: #67e8f9;
+  cursor: pointer;
+}
+.daemon-details-direct-refresh:disabled { opacity: 0.4; cursor: default; }
+.daemon-details-direct-refresh:not(:disabled):hover { border-color: #22d3ee; color: #ecfeff; }
 .daemon-details-clock {
   color: #67e8f9 !important;
   font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;

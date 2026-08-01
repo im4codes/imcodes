@@ -1,11 +1,16 @@
 import {
+  classifyDirectConnectivityRoute,
   DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+  DIRECT_FILE_TRANSFER_PURPOSE,
   DIRECT_FILE_TRANSFER_STATE,
   validateDirectFileTransferAuthorized,
+  validateDirectFileTransferDataMessage,
+  type DirectConnectivityProbeResult,
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
@@ -83,17 +88,31 @@ async function pumpFile(
   }));
 }
 
-export async function uploadFileDirect(
-  ws: WsClient,
-  file: File,
-  clientUploadId: string,
-  onProgress?: (pct: number) => void,
-  onConnected?: () => void,
-): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
+type DirectOperation = {
+  kind: 'upload';
+  file: File;
+  clientUploadId: string;
+  onProgress?: (pct: number) => void;
+  onConnected?: () => void;
+} | {
+  kind: 'probe';
+  nonce: string;
+};
+
+type DirectOperationResult =
+  | { kind: 'upload'; attachment: AttachmentRefResponse }
+  | { kind: 'probe'; result: DirectConnectivityProbeResult };
+
+async function runDirectOperation(ws: WsClient, operation: DirectOperation): Promise<DirectOperationResult> {
   if (!supportsDirectUpload(ws)) {
     throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE);
   }
   const requestId = crypto.randomUUID();
+  const probe = operation.kind === 'probe';
+  const clientUploadId = probe ? crypto.randomUUID() : operation.clientUploadId;
+  const filename = probe ? 'connectivity-probe' : (operation.file.name || 'file');
+  const mime = probe ? undefined : operation.file.type;
+  const size = probe ? 0 : operation.file.size;
   let peer: RTCPeerConnection | null = null;
   let channel: RTCDataChannel | null = null;
   let capability: string | null = null;
@@ -114,17 +133,14 @@ export async function uploadFileDirect(
       channel = null;
       peer = null;
     };
+    const cancel = (reason: typeof DIRECT_FILE_TRANSFER_ERROR[keyof typeof DIRECT_FILE_TRANSFER_ERROR]) => {
+      if (!capability) return;
+      ws.send({ type: DIRECT_FILE_TRANSFER_MSG.CANCEL, requestId, capability, reason });
+    };
     const finishError = (error: unknown) => {
       if (settled) return;
       settled = true;
-      if (capability) {
-        ws.send({
-          type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
-          requestId,
-          capability,
-          reason: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
-        });
-      }
+      cancel(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
       cleanup();
       reject(error instanceof DirectFileTransferFailure
         ? error
@@ -150,37 +166,66 @@ export async function uploadFileDirect(
     const handleAuthorized = async (message: ServerMessage) => {
       const parsed = validateDirectFileTransferAuthorized(message);
       if (!parsed.ok || parsed.value.requestId !== requestId || settled) return;
+      const authorizedProbe = parsed.value.purpose === DIRECT_FILE_TRANSFER_PURPOSE.PROBE;
+      if (authorizedProbe !== probe) {
+        finishError(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false));
+        return;
+      }
       capability = parsed.value.capability;
       peer = new RTCPeerConnection({
         iceServers: parsed.value.iceServers.map((urls) => ({ urls })),
       });
-      channel = peer.createDataChannel('imcodes-file-upload', { ordered: true });
+      channel = peer.createDataChannel(probe ? 'imcodes-connectivity-probe' : 'imcodes-file-upload', { ordered: true });
       channel.binaryType = 'arraybuffer';
       channel.addEventListener('open', () => {
         if (!channel || settled) return;
-        channel.send(JSON.stringify({
-          type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
-          protocolVersion: 1,
-          requestId,
-          clientUploadId,
-          filename: file.name || 'file',
-          ...(file.type ? { mime: file.type } : {}),
-          size: file.size,
-          capability: parsed.value.capability,
-        }));
-        armTimeout();
+        channel.send(JSON.stringify(probe
+          ? {
+              type: DIRECT_FILE_TRANSFER_DATA_MSG.PROBE,
+              protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+              requestId,
+              capability: parsed.value.capability,
+              nonce: operation.nonce,
+            }
+          : {
+              type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+              protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+              requestId,
+              clientUploadId,
+              filename,
+              ...(mime ? { mime } : {}),
+              size,
+              capability: parsed.value.capability,
+            }));
+        armTimeout(probe ? DIRECT_FILE_TRANSFER_LIMITS.PROBE_TIMEOUT_MS : DIRECT_FILE_TRANSFER_LIMITS.IDLE_TIMEOUT_MS);
       });
       channel.addEventListener('message', (event) => {
         if (typeof event.data !== 'string') return;
-        let payload: { type?: unknown; requestId?: unknown } | null = null;
-        try { payload = JSON.parse(event.data) as { type?: unknown; requestId?: unknown }; } catch { /* invalid control */ }
-        if (payload?.type !== DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED || payload.requestId !== requestId || !channel || pumping) return;
+        let raw: unknown;
+        try { raw = JSON.parse(event.data); } catch { raw = null; }
+        const parsedData = validateDirectFileTransferDataMessage(raw);
+        if (!parsedData.ok || parsedData.value.requestId !== requestId) return;
+        if (probe) {
+          if (parsedData.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.PONG || parsedData.value.nonce !== operation.nonce) return;
+          settled = true;
+          cancel(DIRECT_FILE_TRANSFER_ERROR.CANCELED);
+          const result: DirectConnectivityProbeResult = {
+            route: classifyDirectConnectivityRoute(parsedData.value.localCandidate, parsedData.value.remoteCandidate),
+            rttMs: parsedData.value.rttMs,
+            localCandidate: parsedData.value.localCandidate,
+            remoteCandidate: parsedData.value.remoteCandidate,
+          };
+          cleanup();
+          resolve({ kind: 'probe', result });
+          return;
+        }
+        if (parsedData.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED || !channel || pumping) return;
         pumping = true;
-        onConnected?.();
+        operation.onConnected?.();
         armTimeout();
-        void pumpFile(channel, file, requestId, (pct) => {
+        void pumpFile(channel, operation.file, requestId, (pct) => {
           armTimeout();
-          onProgress?.(pct);
+          operation.onProgress?.(pct);
         }).catch(finishError);
       });
       channel.addEventListener('error', () => finishError(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED)));
@@ -233,27 +278,30 @@ export async function uploadFileDirect(
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.PROGRESS && capability === message.capability) {
+        if (probe) return;
         armTimeout();
-        onProgress?.(message.total > 0 ? Math.round((message.loaded / message.total) * 100) : 100);
+        operation.onProgress?.(message.total > 0 ? Math.round((message.loaded / message.total) * 100) : 100);
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.DONE && (!capability || capability === message.capability)) {
+        if (probe) return;
         capability = message.capability;
         settled = true;
         cleanup();
-        onProgress?.(100);
-        resolve({ ok: true, attachment: message.attachment as AttachmentRefResponse });
+        operation.onProgress?.(100);
+        resolve({ kind: 'upload', attachment: message.attachment as AttachmentRefResponse });
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS
         && (!capability || capability === message.capability)
         && message.state === DIRECT_FILE_TRANSFER_STATE.COMMITTED
         && message.attachment) {
+        if (probe) return;
         capability = message.capability;
         settled = true;
         cleanup();
-        onProgress?.(100);
-        resolve({ ok: true, attachment: message.attachment as AttachmentRefResponse });
+        operation.onProgress?.(100);
+        resolve({ kind: 'upload', attachment: message.attachment as AttachmentRefResponse });
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
@@ -264,13 +312,32 @@ export async function uploadFileDirect(
     armTimeout(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
     ws.send({
       type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      ...(probe ? { purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE } : {}),
       requestId,
       clientUploadId,
-      filename: file.name || 'file',
-      ...(file.type ? { mime: file.type } : {}),
-      size: file.size,
+      filename,
+      ...(mime ? { mime } : {}),
+      size,
     });
   });
+}
+
+export async function uploadFileDirect(
+  ws: WsClient,
+  file: File,
+  clientUploadId: string,
+  onProgress?: (pct: number) => void,
+  onConnected?: () => void,
+): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
+  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, onProgress, onConnected });
+  if (result.kind !== 'upload') throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
+  return { ok: true, attachment: result.attachment };
+}
+
+export async function probeDirectConnectivity(ws: WsClient): Promise<DirectConnectivityProbeResult> {
+  const result = await runDirectOperation(ws, { kind: 'probe', nonce: crypto.randomUUID() });
+  if (result.kind !== 'probe') throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
+  return result.result;
 }
 
 export async function uploadFileWithDirectFallback(options: {

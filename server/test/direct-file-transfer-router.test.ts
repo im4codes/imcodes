@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import { DirectFileTransferRouter } from '../src/ws/direct-file-transfer-router.js';
-import { DIRECT_FILE_TRANSFER_CAPABILITY, DIRECT_FILE_TRANSFER_LIMITS, DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  DIRECT_FILE_TRANSFER_LIMITS,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PURPOSE,
+} from '../../shared/direct-file-transfer.js';
 
 const init = {
   type: DIRECT_FILE_TRANSFER_MSG.INIT,
@@ -113,6 +118,34 @@ describe('DirectFileTransferRouter', () => {
 
   it('advertises the negotiated capability constant without changing relay support', () => {
     expect(DIRECT_FILE_TRANSFER_CAPABILITY).toBe('file.transfer.direct.v1');
+  });
+
+  it('reuses the exact-socket authority path for probes and rejects arbitrary IP targets', () => {
+    const f = fixture();
+    const probe = {
+      ...init,
+      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
+      filename: 'connectivity-probe',
+      size: 0,
+    } as const;
+    expect(f.router.handleBrowser(f.browserA, 'user-a', probe)).toBe(true);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
+      size: 0,
+    });
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED,
+      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
+    });
+
+    const rejected = fixture();
+    expect(rejected.router.handleBrowser(rejected.browserA, 'user-a', {
+      ...probe,
+      targetIp: '192.168.2.145',
+    })).toBe(true);
+    expect(rejected.daemonMessages).toHaveLength(0);
+    expect(rejected.messages(rejected.browserA)[0]).toMatchObject({ error: 'invalid_request' });
   });
 
   it('expires authorities and enforces the global active-transfer cap', () => {

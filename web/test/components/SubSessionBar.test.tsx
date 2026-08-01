@@ -7,6 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
+const { probeDirectConnectivityMock } = vi.hoisted(() => ({
+  probeDirectConnectivityMock: vi.fn(),
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
@@ -28,6 +32,13 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.daemon_details_embedding') return 'Embedding';
       if (key === 'subsessionBar.daemon_details_memory_handles') return 'Memory handles';
       if (key === 'subsessionBar.daemon_details_memory_handles_ok') return 'Healthy';
+      if (key === 'subsessionBar.daemon_details_direct_connectivity') return 'Direct connectivity';
+      if (key === 'subsessionBar.daemon_details_direct_runtime_unavailable') return 'WebRTC runtime unavailable';
+      if (key === 'subsessionBar.daemon_details_direct_probing') return 'Testing direct path…';
+      if (key === 'subsessionBar.daemon_details_direct_lan') return 'LAN direct';
+      if (key === 'subsessionBar.daemon_details_direct_ip') return 'IP direct';
+      if (key === 'subsessionBar.daemon_details_direct_relay') return 'Relay path';
+      if (key === 'subsessionBar.daemon_details_direct_refresh') return 'Test direct connectivity';
       if (key === 'subsessionBar.daemon_details_local_time') return 'Local time';
       if (key === 'subsessionBar.daemon_details_no_data') return 'No data reported';
       if (key === 'embedding.status_ready') return 'Embedding ready';
@@ -67,6 +78,13 @@ vi.mock('../../src/api.js', () => ({
   reorderSubSessions: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../src/direct-file-transfer.js', () => ({
+  DirectFileTransferFailure: class DirectFileTransferFailure extends Error {
+    constructor(readonly code: string) { super(code); }
+  },
+  probeDirectConnectivity: probeDirectConnectivityMock,
+}));
+
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
 import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
@@ -93,9 +111,13 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   };
 }
 
-function makeStatsWs() {
+function makeStatsWs(capabilities: string[] = []) {
   let handler: ((msg: any) => void) | null = null;
   const ws = {
+    getDaemonCapabilitySnapshot: vi.fn(() => ({
+      daemonId: 'daemon-1', capabilities, helloEpoch: 1, sentAt: Date.now(), observedAt: Date.now(),
+    })),
+    send: vi.fn(),
     onMessage: vi.fn((next: (msg: any) => void) => {
       handler = next;
       return () => {
@@ -126,6 +148,12 @@ describe('SubSessionBar', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    probeDirectConnectivityMock.mockResolvedValue({
+      route: 'lan_direct',
+      rttMs: 1.4,
+      localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+      remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
+    });
   });
 
   afterEach(() => {
@@ -309,6 +337,39 @@ describe('SubSessionBar', () => {
 
     fireEvent.click(view.getByTestId('daemon-details-backdrop'));
     expect(view.queryByRole('dialog', { name: 'Daemon status' })).toBeNull();
+  });
+
+  it('auto-probes direct connectivity in daemon details and supports a manual refresh', async () => {
+    const statsWs = makeStatsWs(['file.transfer.direct.v1']);
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit({
+        ...daemonStatsMessage,
+        directConnectivity: { state: 'available' },
+      });
+    });
+    fireEvent.click(view.getByRole('button', { name: 'Show daemon details' }));
+
+    await waitFor(() => expect(probeDirectConnectivityMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(view.getByRole('dialog', { name: 'Daemon status' }).textContent).toContain('LAN direct · 1.4 ms'));
+    fireEvent.click(view.getByRole('button', { name: 'Test direct connectivity' }));
+    await waitFor(() => expect(probeDirectConnectivityMock).toHaveBeenCalledTimes(2));
   });
 
   it.each([true, false])('opens daemon details from the entire desktop status region when collapsed=%s', async (collapsed) => {
@@ -1286,6 +1347,17 @@ describe('SubSessionBar', () => {
       'daemon_details_embedding',
       'daemon_details_memory_handles',
       'daemon_details_memory_handles_ok',
+      'daemon_details_direct_connectivity',
+      'daemon_details_direct_runtime_unavailable',
+      'daemon_details_direct_probing',
+      'daemon_details_direct_lan',
+      'daemon_details_direct_ip',
+      'daemon_details_direct_relay',
+      'daemon_details_direct_timeout',
+      'daemon_details_direct_signaling_failed',
+      'daemon_details_direct_ice_failed',
+      'daemon_details_direct_not_tested',
+      'daemon_details_direct_refresh',
       'daemon_details_local_time',
       'daemon_details_no_data',
     ];

@@ -36,7 +36,10 @@ import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/peer-audit.js';
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
-import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../../shared/direct-file-transfer.js';
+import {
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  isDirectConnectivityRuntimeStatus,
+} from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -5058,6 +5061,9 @@ export class WsBridge {
         // back to "unknown" even while a current daemon is connected.
         ...(isEmbeddingStatus(msg.embedding) ? { embedding: msg.embedding } : {}),
         ...(Array.isArray(msg.disks) ? { disks: msg.disks } : {}),
+        ...(isDirectConnectivityRuntimeStatus(msg.directConnectivity)
+          ? { directConnectivity: msg.directConnectivity }
+          : {}),
         // Memory-handle persistence failures ride this frame because the
         // daemon's own counter and log cannot leave a machine whose disk is
         // full. Rebuilding the payload without them put the signal in a hole:

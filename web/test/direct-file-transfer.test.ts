@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DIRECT_FILE_TRANSFER_CAPABILITY, DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import {
+  DIRECT_CONNECTIVITY_ROUTE,
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  DIRECT_FILE_TRANSFER_DATA_MSG,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PURPOSE,
+} from '../../shared/direct-file-transfer.js';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
 
 const uploadFileMock = vi.fn();
@@ -97,6 +103,7 @@ function createWs(capabilities: string[]) {
 describe('direct file upload fallback', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    FakePeerConnection.latest = null;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     uploadFileMock.mockResolvedValue({
       ok: true,
@@ -216,5 +223,42 @@ describe('direct file upload fallback', () => {
     expect(progress).toContain(100);
     expect(uploadFileMock).not.toHaveBeenCalled();
     expect(peer.channel.sent.some((value) => typeof value !== 'string')).toBe(true);
+  });
+
+  it('probes a routed private path over the data channel without uploading a file', async () => {
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const pending = probeDirectConnectivity(ws);
+
+    await vi.waitFor(() => expect(FakePeerConnection.latest?.channel.sent.length).toBeGreaterThan(0));
+    const peer = FakePeerConnection.latest!;
+    const probeRaw = peer.channel.sent.find((value) => typeof value === 'string') as string;
+    const probe = JSON.parse(probeRaw) as { requestId: string; nonce: string };
+    peer.channel.dispatchEvent(new MessageEvent('message', {
+      data: JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.PONG,
+        requestId: probe.requestId,
+        nonce: probe.nonce,
+        rttMs: 1.4,
+        localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+        remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
+      }),
+    }));
+
+    await expect(pending).resolves.toMatchObject({
+      route: DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT,
+      rttMs: 1.4,
+    });
+    expect(sent[0]).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
+      filename: 'connectivity-probe',
+      size: 0,
+    });
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
+      reason: 'canceled',
+    }));
+    expect(uploadFileMock).not.toHaveBeenCalled();
   });
 });

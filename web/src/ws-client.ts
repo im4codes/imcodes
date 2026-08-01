@@ -203,7 +203,7 @@ export type ServerMessage =
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
-  | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth }
+  | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus }
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse

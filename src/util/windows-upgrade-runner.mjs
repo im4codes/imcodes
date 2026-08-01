@@ -364,6 +364,49 @@ function sharpRepair(npmPrefix) {
   }
 }
 
+/** Verify and repair node-datachannel's native addon after the global install.
+ *
+ * The top-level upgrade intentionally uses --ignore-scripts for sharp, which
+ * also skips node-datachannel's native install hook. Rebuild only this optional
+ * dependency with lifecycle scripts enabled, then verify it can actually be
+ * imported. Failure remains non-fatal because relay upload is still available.
+ */
+function nodeDatachannelRepair(npmPrefix) {
+  const imcodesDir = join(npmPrefix, 'node_modules', 'imcodes');
+  const verify = () => {
+    if (!existsSync(imcodesDir)) return false;
+    const result = spawnSync(process.execPath, [
+      '-e',
+      "import('node-datachannel').then(() => process.exit(0)).catch(() => process.exit(1))",
+    ], {
+      cwd: imcodesDir,
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: FAST_CMD_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    return result.status === 0;
+  };
+
+  if (verify()) return;
+  log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
+  const result = spawnNpm(NPM_CMD, [
+    'rebuild', 'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
+  ], {
+    cwd: imcodesDir,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    timeout: 5 * 60_000,
+  });
+  if (result.status === 0 && verify()) {
+    log('node-datachannel repair succeeded');
+    return;
+  }
+  log(`node-datachannel repair FAILED [exit ${result.status} signal ${result.signal ?? 'none'}] — direct transfer unavailable; relay remains enabled`);
+  if (result.stderr) log(`node-datachannel repair stderr: ${result.stderr.toString().trim()}`);
+}
+
 /** Schedule a deferred delete of the runner's tmp dir.
  *
  *  IMPORTANT: only call this on the SUCCESS path.  On failure paths we
@@ -512,6 +555,11 @@ async function main() {
   trace(5, 'pre-sharp-repair');
   try { sharpRepair(npmPrefix); } catch (e) { log(`sharp repair threw: ${e?.message ?? e}`); }
   trace(5, 'post-sharp-repair');
+
+  // Step 5.1: node-datachannel native addon repair (best effort).
+  trace(5, 'pre-node-datachannel-repair');
+  try { nodeDatachannelRepair(npmPrefix); } catch (e) { log(`node-datachannel repair threw: ${e?.message ?? e}`); }
+  trace(5, 'post-node-datachannel-repair');
 
   // Step 6: Kill stale watchdogs and the old daemon.
   trace(6, 'pre-kill-watchdogs');

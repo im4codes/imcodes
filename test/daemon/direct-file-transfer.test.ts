@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { DIRECT_FILE_TRANSFER_DATA_MSG, DIRECT_FILE_TRANSFER_MSG } from '../../shared/direct-file-transfer.js';
+import {
+  DIRECT_CONNECTIVITY_RUNTIME_STATE,
+  DIRECT_FILE_TRANSFER_DATA_MSG,
+  DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PURPOSE,
+} from '../../shared/direct-file-transfer.js';
 
 class FakeDataChannel {
   private messageHandler: ((message: string | Buffer | ArrayBuffer) => void) | null = null;
@@ -41,6 +46,11 @@ class FakePeerConnection {
     if (type === 'offer') this.localDescriptionHandler?.('daemon-answer', 'answer');
   });
   addRemoteCandidate = vi.fn();
+  rtt = vi.fn(() => 1.4);
+  getSelectedCandidatePair = vi.fn(() => ({
+    local: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+    remote: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
+  }));
   onDataChannel = (handler: (channel: FakeDataChannel) => void) => { this.dataChannelHandler = handler; };
   onLocalDescription = (handler: (sdp: string, type: string) => void) => { this.localDescriptionHandler = handler; };
   onLocalCandidate = (handler: (candidate: string, mid: string) => void) => { this.localCandidateHandler = handler; };
@@ -241,11 +251,55 @@ describe('daemon direct file transfer', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('answers an authenticated probe without creating a file or attachment', async () => {
+    const direct = await import('../../src/daemon/direct-file-transfer.js');
+    await direct.initializeDirectFileTransfer();
+    const sent: Array<Record<string, unknown>> = [];
+    const sender = { send: (message: unknown) => sent.push(message as Record<string, unknown>) };
+    const authority = {
+      type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
+      requestId: '123e4567-e89b-12d3-a456-426614174030',
+      clientUploadId: '123e4567-e89b-12d3-a456-426614174031',
+      filename: 'connectivity-probe',
+      size: 0,
+      capability: 'D'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      iceServers: [],
+    } as const;
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel();
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.PROBE,
+      protocolVersion: 1,
+      requestId: authority.requestId,
+      capability: authority.capability,
+      nonce: 'probe-nonce-12345678',
+    }));
+
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.PONG)));
+    const pong = JSON.parse(channel.sent.find((value) => typeof value === 'string') as string) as Record<string, unknown>;
+    expect(pong).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.PONG,
+      nonce: 'probe-nonce-12345678',
+      rttMs: 1.4,
+      localCandidate: { address: '192.168.2.145', type: 'host' },
+      remoteCandidate: { address: '192.168.2.59', type: 'prflx' },
+    });
+    expect(finalizeDirectUploadedFile).not.toHaveBeenCalled();
+    await expect(access(finalPath)).rejects.toThrow();
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('fails closed when the optional native dependency is unavailable', async () => {
     vi.resetModules();
     vi.doMock('node-datachannel', () => { throw new Error('native addon unavailable'); });
     const direct = await import('../../src/daemon/direct-file-transfer.js');
     await expect(direct.initializeDirectFileTransfer()).resolves.toBe(false);
     expect(direct.isDirectFileTransferAvailable()).toBe(false);
+    expect(direct.getDirectConnectivityRuntimeStatus()).toMatchObject({
+      state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE,
+    });
   });
 });

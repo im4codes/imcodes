@@ -130,6 +130,7 @@ import {
   resolveWindowsUpgradeRunnerPath,
 } from '../util/windows-upgrade-script.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
+import { buildBashNodeDatachannelRepair } from '../util/node-datachannel-repair-script.js';
 import {
   buildPosixUpgradeLayoutRecoveryScript,
   parsePosixUpgradeFailureStatus,
@@ -7781,6 +7782,8 @@ fi
 log "[step 2] install succeeded after $ATTEMPT attempt(s)"
 
 ${buildBashSharpRepair()}
+
+${buildBashNodeDatachannelRepair()}
 
 # Read installed version directly from package.json — bypasses the
 # freshly-installed imcodes shebang (which can fail under the same

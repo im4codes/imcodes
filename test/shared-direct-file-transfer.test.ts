@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  classifyDirectConnectivityRoute,
+  DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PURPOSE,
   validateDirectFileTransferBrowserMessage,
   validateDirectFileTransferDaemonCommand,
   validateDirectFileTransferDaemonMessage,
@@ -62,5 +65,52 @@ describe('direct file transfer protocol', () => {
     };
     expect(validateDirectFileTransferDataMessage(start)).toMatchObject({ ok: true });
     expect(validateDirectFileTransferDataMessage({ ...start, protocolVersion: 2 })).toMatchObject({ ok: false });
+  });
+
+  it('accepts authenticated zero-file probes and validates bounded pong diagnostics', () => {
+    expect(validateDirectFileTransferBrowserMessage({
+      type: DIRECT_FILE_TRANSFER_MSG.INIT,
+      purpose: DIRECT_FILE_TRANSFER_PURPOSE.PROBE,
+      requestId,
+      clientUploadId,
+      filename: 'connectivity-probe',
+      size: 0,
+    })).toMatchObject({ ok: true });
+
+    const probe = {
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.PROBE,
+      protocolVersion: 1,
+      requestId,
+      capability,
+      nonce: 'probe-nonce-12345678',
+    };
+    expect(validateDirectFileTransferDataMessage(probe)).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferDataMessage({ ...probe, targetIp: '192.168.2.145' })).toMatchObject({ ok: false });
+
+    const pong = {
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.PONG,
+      requestId,
+      nonce: probe.nonce,
+      rttMs: 1.4,
+      localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+      remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
+    };
+    expect(validateDirectFileTransferDataMessage(pong)).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferDataMessage({ ...pong, rttMs: Number.POSITIVE_INFINITY })).toMatchObject({ ok: false });
+  });
+
+  it('classifies routed private/SNAT candidates as LAN direct without requiring equal subnets', () => {
+    expect(classifyDirectConnectivityRoute(
+      { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+      { address: '172.16.253.211', port: 59074, type: 'prflx', transportType: 'udp' },
+    )).toBe(DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT);
+    expect(classifyDirectConnectivityRoute(
+      { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+      { address: '203.0.113.8', port: 59074, type: 'srflx', transportType: 'udp' },
+    )).toBe(DIRECT_CONNECTIVITY_ROUTE.DIRECT);
+    expect(classifyDirectConnectivityRoute(
+      { address: '192.168.2.145', port: 49153, type: 'relay', transportType: 'udp' },
+      { address: '172.16.253.211', port: 59074, type: 'host', transportType: 'udp' },
+    )).toBe(DIRECT_CONNECTIVITY_ROUTE.RELAY);
   });
 });

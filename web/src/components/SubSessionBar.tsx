@@ -39,6 +39,15 @@ import {
 } from '../subsession-accent-colors.js';
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
+import {
+  DIRECT_CONNECTIVITY_ROUTE,
+  DIRECT_CONNECTIVITY_RUNTIME_STATE,
+  DIRECT_FILE_TRANSFER_CAPABILITY,
+  DIRECT_FILE_TRANSFER_ERROR,
+  type DirectConnectivityProbeResult,
+  type DirectConnectivityRuntimeStatus,
+} from '@shared/direct-file-transfer.js';
+import { DirectFileTransferFailure, probeDirectConnectivity } from '../direct-file-transfer.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -52,6 +61,7 @@ interface DaemonStats {
   embedding?: EmbeddingStatus | null;
   disks?: DiskUsage[] | null;
   shortRefHealth?: MemoryShortRefHealth | null;
+  directConnectivity?: DirectConnectivityRuntimeStatus | null;
 }
 
 type DiscussionSummary = P2pProgressDiscussion & {
@@ -368,19 +378,68 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState
 
 function DaemonStatsModal({
   stats,
+  ws,
   localClockText,
   onClose,
   t,
 }: {
   stats: DaemonStats;
+  ws: WsClient | null;
   localClockText: string;
   onClose: () => void;
   t: (key: string, vars?: Record<string, unknown>) => string;
 }) {
+  const PROBE_VIEW_STATE = {
+    IDLE: 'idle',
+    PROBING: 'probing',
+    SUCCESS: 'success',
+    FAILED: 'failed',
+  } as const;
+  const [probeState, setProbeState] = useState<typeof PROBE_VIEW_STATE[keyof typeof PROBE_VIEW_STATE]>(PROBE_VIEW_STATE.IDLE);
+  const [probeResult, setProbeResult] = useState<DirectConnectivityProbeResult | null>(null);
+  const [probeErrorKey, setProbeErrorKey] = useState<string | null>(null);
+  const autoProbeStarted = useRef(false);
   const embeddingKey = stats.embedding?.state
     ? `embedding.status_${stats.embedding.state}`
     : 'embedding.status_unknown';
   const shortRefHealth = stats.shortRefHealth;
+  const capabilityReady = Boolean(ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(DIRECT_FILE_TRANSFER_CAPABILITY));
+  const runtimeUnavailable = stats.directConnectivity?.state === DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE;
+
+  const runProbe = useCallback(async () => {
+    if (!ws || runtimeUnavailable || !capabilityReady) return;
+    setProbeState(PROBE_VIEW_STATE.PROBING);
+    setProbeResult(null);
+    setProbeErrorKey(null);
+    try {
+      const result = await probeDirectConnectivity(ws);
+      setProbeResult(result);
+      setProbeState(PROBE_VIEW_STATE.SUCCESS);
+    } catch (error) {
+      const code = error instanceof DirectFileTransferFailure ? error.code : DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED;
+      const key = code === DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT
+        ? 'subsessionBar.daemon_details_direct_timeout'
+        : code === DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE
+          ? 'subsessionBar.daemon_details_direct_signaling_failed'
+          : code === DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE
+            ? 'subsessionBar.daemon_details_direct_runtime_unavailable'
+            : 'subsessionBar.daemon_details_direct_ice_failed';
+      setProbeErrorKey(key);
+      setProbeState(PROBE_VIEW_STATE.FAILED);
+    }
+  }, [capabilityReady, runtimeUnavailable, ws]);
+
+  useEffect(() => {
+    if (autoProbeStarted.current || !capabilityReady || runtimeUnavailable) return;
+    autoProbeStarted.current = true;
+    void runProbe();
+  }, [capabilityReady, runProbe, runtimeUnavailable]);
+
+  const routeKey = probeResult?.route === DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT
+    ? 'subsessionBar.daemon_details_direct_lan'
+    : probeResult?.route === DIRECT_CONNECTIVITY_ROUTE.RELAY
+      ? 'subsessionBar.daemon_details_direct_relay'
+      : 'subsessionBar.daemon_details_direct_ip';
 
   return (
     <div
@@ -463,6 +522,37 @@ function DaemonStatsModal({
         </div>
 
         <div class="daemon-details-health">
+          <div class="daemon-details-health-row daemon-details-direct-row">
+            <span>{t('subsessionBar.daemon_details_direct_connectivity')}</span>
+            <span class="daemon-details-direct-result">
+              {runtimeUnavailable || !capabilityReady ? (
+                <span class="is-danger">{t('subsessionBar.daemon_details_direct_runtime_unavailable')}</span>
+              ) : probeState === PROBE_VIEW_STATE.PROBING ? (
+                <span class="is-probing">{t('subsessionBar.daemon_details_direct_probing')}</span>
+              ) : probeState === PROBE_VIEW_STATE.SUCCESS && probeResult ? (
+                <span class={probeResult.route === DIRECT_CONNECTIVITY_ROUTE.RELAY ? 'is-warning' : 'is-direct'}>
+                  {t(routeKey)} · {probeResult.rttMs.toFixed(1)} ms
+                  <small title={`${probeResult.remoteCandidate.address}:${probeResult.remoteCandidate.port}`}>
+                    {probeResult.localCandidate.type}/{probeResult.remoteCandidate.type} · {probeResult.localCandidate.transportType.toUpperCase()}
+                  </small>
+                </span>
+              ) : probeState === PROBE_VIEW_STATE.FAILED && probeErrorKey ? (
+                <span class="is-danger">{t(probeErrorKey)}</span>
+              ) : (
+                <span>{t('subsessionBar.daemon_details_direct_not_tested')}</span>
+              )}
+              <button
+                type="button"
+                class="daemon-details-direct-refresh"
+                onClick={() => { void runProbe(); }}
+                disabled={!capabilityReady || runtimeUnavailable || probeState === PROBE_VIEW_STATE.PROBING}
+                aria-label={t('subsessionBar.daemon_details_direct_refresh')}
+                title={t('subsessionBar.daemon_details_direct_refresh')}
+              >
+                ↻
+              </button>
+            </span>
+          </div>
           <div class="daemon-details-health-row">
             <span>{t('subsessionBar.daemon_details_embedding')}</span>
             <span>
@@ -1025,6 +1115,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           // desktop strip simply hides the readout (and mobile never shows it).
           disks: msg.disks ?? null,
           shortRefHealth: msg.shortRefHealth ?? null,
+          directConnectivity: msg.directConnectivity ?? null,
         });
       }
     });
@@ -1544,6 +1635,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {showDaemonDetails && stats && (
         <DaemonStatsModal
           stats={stats}
+          ws={ws}
           localClockText={localClockText}
           onClose={() => setShowDaemonDetails(false)}
           t={t}

@@ -34,8 +34,8 @@ import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
-import { DIRECT_FILE_TRANSFER_CAPABILITY } from '../../shared/direct-file-transfer.js';
-import { isDirectFileTransferAvailable } from './direct-file-transfer.js';
+import { DIRECT_FILE_TRANSFER_CAPABILITY, type DirectConnectivityRuntimeStatus } from '../../shared/direct-file-transfer.js';
+import { getDirectConnectivityRuntimeStatus, isDirectFileTransferAvailable } from './direct-file-transfer.js';
 import {
   classifyServerSendPlane,
   recordServerLinkDataPlaneBackpressure,
@@ -69,6 +69,8 @@ interface SystemStats {
    *  heartbeat because the counter and the daemon log both stay on the machine
    *  whose disk is usually what failed. */
   shortRefHealth?: MemoryShortRefHealth;
+  /** Optional WebRTC addon state; distinct from ICE/network reachability. */
+  directConnectivity: DirectConnectivityRuntimeStatus;
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
@@ -90,6 +92,7 @@ function collectSystemStats(): SystemStats {
     uptime: os.uptime(),
     embedding: getEmbeddingStatus(),
     disks: getDiskUsage(),
+    directConnectivity: getDirectConnectivityRuntimeStatus(),
     ...(shortRefHealth ? { shortRefHealth } : {}),
   };
 }

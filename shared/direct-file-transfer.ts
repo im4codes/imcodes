@@ -4,6 +4,38 @@ import { validateAttachmentRef } from './transport/file-transfer.js';
 export const DIRECT_FILE_TRANSFER_CAPABILITY = 'file.transfer.direct.v1' as const;
 export const DIRECT_FILE_TRANSFER_PROTOCOL_VERSION = 1;
 
+export const DIRECT_FILE_TRANSFER_PURPOSE = {
+  UPLOAD: 'upload',
+  PROBE: 'probe',
+} as const;
+
+export type DirectFileTransferPurpose = typeof DIRECT_FILE_TRANSFER_PURPOSE[keyof typeof DIRECT_FILE_TRANSFER_PURPOSE];
+
+export const DIRECT_CONNECTIVITY_ROUTE = {
+  LAN_DIRECT: 'lan_direct',
+  DIRECT: 'direct',
+  RELAY: 'relay',
+} as const;
+
+export type DirectConnectivityRoute = typeof DIRECT_CONNECTIVITY_ROUTE[keyof typeof DIRECT_CONNECTIVITY_ROUTE];
+
+export const DIRECT_CONNECTIVITY_RUNTIME_STATE = {
+  AVAILABLE: 'available',
+  RUNTIME_UNAVAILABLE: 'runtime_unavailable',
+} as const;
+
+export const DIRECT_CONNECTIVITY_RUNTIME_ERROR = {
+  NATIVE_MODULE_MISSING: 'native_module_missing',
+  LOAD_FAILED: 'load_failed',
+} as const;
+
+export type DirectConnectivityRuntimeError = typeof DIRECT_CONNECTIVITY_RUNTIME_ERROR[keyof typeof DIRECT_CONNECTIVITY_RUNTIME_ERROR];
+
+export interface DirectConnectivityRuntimeStatus {
+  state: typeof DIRECT_CONNECTIVITY_RUNTIME_STATE[keyof typeof DIRECT_CONNECTIVITY_RUNTIME_STATE];
+  error?: DirectConnectivityRuntimeError;
+}
+
 export const DIRECT_FILE_TRANSFER_MSG = {
   INIT: 'direct_file.init',
   AUTHORIZED: 'direct_file.authorized',
@@ -23,6 +55,8 @@ export const DIRECT_FILE_TRANSFER_DATA_MSG = {
   START: 'direct_file.data.start',
   ACCEPTED: 'direct_file.data.accepted',
   FINISH: 'direct_file.data.finish',
+  PROBE: 'direct_file.data.probe',
+  PONG: 'direct_file.data.pong',
   ERROR: 'direct_file.data.error',
 } as const;
 
@@ -83,6 +117,10 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   RECENT_RESULT_CAPACITY: 256,
   RECENT_RESULT_TTL_MS: 30 * 60 * 1000,
   DISK_RESERVE_BYTES: 64 * 1024 * 1024,
+  PROBE_NONCE_BYTES: 128,
+  PROBE_CANDIDATE_ADDRESS_BYTES: 512,
+  PROBE_CANDIDATE_TYPE_BYTES: 64,
+  PROBE_TIMEOUT_MS: 8 * 1000,
 } as const;
 
 export const DIRECT_FILE_TRANSFER_ICE_SERVERS = [
@@ -91,6 +129,7 @@ export const DIRECT_FILE_TRANSFER_ICE_SERVERS = [
 
 export interface DirectFileTransferInit {
   type: typeof DIRECT_FILE_TRANSFER_MSG.INIT;
+  purpose?: DirectFileTransferPurpose;
   requestId: string;
   clientUploadId: string;
   filename: string;
@@ -200,6 +239,37 @@ export interface DirectFileTransferDataFinish {
   sha256?: string;
 }
 
+export interface DirectConnectivityCandidateInfo {
+  address: string;
+  port: number;
+  type: string;
+  transportType: string;
+}
+
+export interface DirectFileTransferDataProbe {
+  type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.PROBE;
+  protocolVersion: number;
+  requestId: string;
+  capability: string;
+  nonce: string;
+}
+
+export interface DirectFileTransferDataPong {
+  type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.PONG;
+  requestId: string;
+  nonce: string;
+  rttMs: number;
+  localCandidate: DirectConnectivityCandidateInfo;
+  remoteCandidate: DirectConnectivityCandidateInfo;
+}
+
+export interface DirectConnectivityProbeResult {
+  route: DirectConnectivityRoute;
+  rttMs: number;
+  localCandidate: DirectConnectivityCandidateInfo;
+  remoteCandidate: DirectConnectivityCandidateInfo;
+}
+
 export interface DirectFileTransferDataError {
   type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.ERROR;
   requestId: string;
@@ -241,6 +311,8 @@ export type DirectFileTransferDataMessage =
   | DirectFileTransferDataStart
   | DirectFileTransferDataAccepted
   | DirectFileTransferDataFinish
+  | DirectFileTransferDataProbe
+  | DirectFileTransferDataPong
   | DirectFileTransferDataError;
 
 type ValidationResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -250,9 +322,19 @@ const CAPABILITY_RE = /^[A-Za-z0-9_-]{32,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const DIRECT_STATES = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_STATE));
 const DIRECT_ERRORS = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_ERROR));
+const DIRECT_PURPOSES = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_PURPOSE));
+const DIRECT_RUNTIME_STATES = new Set<string>(Object.values(DIRECT_CONNECTIVITY_RUNTIME_STATE));
+const DIRECT_RUNTIME_ERRORS = new Set<string>(Object.values(DIRECT_CONNECTIVITY_RUNTIME_ERROR));
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isDirectConnectivityRuntimeStatus(value: unknown): value is DirectConnectivityRuntimeStatus {
+  if (!isRecord(value) || !hasExactKeys(value, ['state'], ['error'])) return false;
+  return typeof value.state === 'string'
+    && DIRECT_RUNTIME_STATES.has(value.state)
+    && (value.error === undefined || (typeof value.error === 'string' && DIRECT_RUNTIME_ERRORS.has(value.error)));
 }
 
 function utf8Bytes(value: string): number {
@@ -290,11 +372,54 @@ export function isDirectFileTransferSize(value: unknown): value is number {
 
 function validateMetadata(value: Record<string, unknown>): boolean {
   return isDirectFileTransferRequestId(value.requestId)
+    && (value.purpose === undefined || (typeof value.purpose === 'string' && DIRECT_PURPOSES.has(value.purpose)))
     && isDirectFileTransferClientUploadId(value.clientUploadId)
     && isBoundedString(value.filename, DIRECT_FILE_TRANSFER_LIMITS.FILENAME_BYTES)
     && (value.mime === undefined || isBoundedString(value.mime, DIRECT_FILE_TRANSFER_LIMITS.MIME_BYTES))
     && isDirectFileTransferSize(value.size)
     && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)));
+}
+
+function isDirectConnectivityCandidateInfo(value: unknown): value is DirectConnectivityCandidateInfo {
+  if (!isRecord(value) || !hasExactKeys(value, ['address', 'port', 'type', 'transportType'])) return false;
+  return isBoundedString(value.address, DIRECT_FILE_TRANSFER_LIMITS.PROBE_CANDIDATE_ADDRESS_BYTES)
+    && typeof value.port === 'number'
+    && Number.isInteger(value.port)
+    && value.port >= 0
+    && value.port <= 65_535
+    && isBoundedString(value.type, DIRECT_FILE_TRANSFER_LIMITS.PROBE_CANDIDATE_TYPE_BYTES)
+    && isBoundedString(value.transportType, DIRECT_FILE_TRANSFER_LIMITS.PROBE_CANDIDATE_TYPE_BYTES);
+}
+
+export function isPrivateNetworkAddress(address: string): boolean {
+  const normalized = address.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const ipv4 = normalized.split('.').map((part) => Number(part));
+  if (ipv4.length === 4 && ipv4.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
+    return ipv4[0] === 10
+      || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+      || (ipv4[0] === 192 && ipv4[1] === 168)
+      || ipv4[0] === 127
+      || (ipv4[0] === 169 && ipv4[1] === 254);
+  }
+  return normalized === '::1'
+    || normalized.startsWith('fc')
+    || normalized.startsWith('fd')
+    || normalized.startsWith('fe8')
+    || normalized.startsWith('fe9')
+    || normalized.startsWith('fea')
+    || normalized.startsWith('feb');
+}
+
+export function classifyDirectConnectivityRoute(
+  localCandidate: DirectConnectivityCandidateInfo,
+  remoteCandidate: DirectConnectivityCandidateInfo,
+): DirectConnectivityRoute {
+  if (localCandidate.type === DIRECT_CONNECTIVITY_ROUTE.RELAY || remoteCandidate.type === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
+    return DIRECT_CONNECTIVITY_ROUTE.RELAY;
+  }
+  return isPrivateNetworkAddress(localCandidate.address) && isPrivateNetworkAddress(remoteCandidate.address)
+    ? DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT
+    : DIRECT_CONNECTIVITY_ROUTE.DIRECT;
 }
 
 function validateAuthorityFields(value: Record<string, unknown>): boolean {
@@ -311,7 +436,7 @@ function validateAuthorityFields(value: Record<string, unknown>): boolean {
 export function validateDirectFileTransferBrowserMessage(value: unknown): ValidationResult<DirectFileTransferBrowserMessage> {
   if (!isRecord(value) || typeof value.type !== 'string') return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
   if (value.type === DIRECT_FILE_TRANSFER_MSG.INIT) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'clientUploadId', 'filename', 'size'], ['mime', 'sha256']) || !validateMetadata(value)) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'clientUploadId', 'filename', 'size'], ['purpose', 'mime', 'sha256']) || !validateMetadata(value)) {
       return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
     }
     return { ok: true, value: value as unknown as DirectFileTransferInit };
@@ -362,7 +487,7 @@ export function validateDirectFileTransferDaemonCommand(value: unknown): Validat
     if (!hasExactKeys(
       value,
       ['type', 'requestId', 'clientUploadId', 'filename', 'size', 'capability', 'expiresAt', 'iceServers'],
-      ['mime', 'sha256'],
+      ['purpose', 'mime', 'sha256'],
     ) || !validateAuthorityFields(value)) return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
     return { ok: true, value: value as unknown as DirectFileTransferPrepare };
   }
@@ -439,7 +564,7 @@ export function validateDirectFileTransferAuthorized(value: unknown): Validation
     || !hasExactKeys(
       value,
       ['type', 'requestId', 'clientUploadId', 'filename', 'size', 'capability', 'expiresAt', 'iceServers'],
-      ['mime', 'sha256'],
+      ['purpose', 'mime', 'sha256'],
     )
     || !validateAuthorityFields(value)) return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
   return { ok: true, value: value as unknown as DirectFileTransferAuthorized };
@@ -451,7 +576,7 @@ export function validateDirectFileTransferDataMessage(value: unknown): Validatio
     if (!hasExactKeys(
       value,
       ['type', 'protocolVersion', 'requestId', 'clientUploadId', 'filename', 'size', 'capability'],
-      ['mime', 'sha256'],
+      ['purpose', 'mime', 'sha256'],
     )
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
       || !validateMetadata(value)
@@ -472,6 +597,30 @@ export function validateDirectFileTransferDataMessage(value: unknown): Validatio
       return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
     }
     return { ok: true, value: value as unknown as DirectFileTransferDataFinish };
+  }
+  if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.PROBE) {
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'requestId', 'capability', 'nonce'])
+      || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
+      || !isDirectFileTransferRequestId(value.requestId)
+      || !isDirectFileTransferCapability(value.capability)
+      || !isBoundedString(value.nonce, DIRECT_FILE_TRANSFER_LIMITS.PROBE_NONCE_BYTES)) {
+      return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
+    }
+    return { ok: true, value: value as unknown as DirectFileTransferDataProbe };
+  }
+  if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.PONG) {
+    if (!hasExactKeys(value, ['type', 'requestId', 'nonce', 'rttMs', 'localCandidate', 'remoteCandidate'])
+      || !isDirectFileTransferRequestId(value.requestId)
+      || !isBoundedString(value.nonce, DIRECT_FILE_TRANSFER_LIMITS.PROBE_NONCE_BYTES)
+      || typeof value.rttMs !== 'number'
+      || !Number.isFinite(value.rttMs)
+      || value.rttMs < 0
+      || value.rttMs > 3_600_000
+      || !isDirectConnectivityCandidateInfo(value.localCandidate)
+      || !isDirectConnectivityCandidateInfo(value.remoteCandidate)) {
+      return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
+    }
+    return { ok: true, value: value as unknown as DirectFileTransferDataPong };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.ERROR) {
     if (!hasExactKeys(value, ['type', 'requestId', 'error'])

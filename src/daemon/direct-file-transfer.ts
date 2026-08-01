@@ -4,17 +4,22 @@ import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import logger from '../util/logger.js';
 import {
+  DIRECT_CONNECTIVITY_RUNTIME_ERROR,
+  DIRECT_CONNECTIVITY_RUNTIME_STATE,
   DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_PURPOSE,
   DIRECT_FILE_TRANSFER_STATE,
   validateDirectFileTransferDaemonCommand,
   validateDirectFileTransferDataMessage,
   type DirectFileTransferDaemonCommand,
   type DirectFileTransferError,
   type DirectFileTransferPrepare,
+  type DirectConnectivityRuntimeError,
+  type DirectConnectivityRuntimeStatus,
 } from '../../shared/direct-file-transfer.js';
 import type { AttachmentRef } from '../../shared/transport/file-transfer.js';
 import {
@@ -50,11 +55,12 @@ interface ActiveDirectTransfer {
   idleTimer: ReturnType<typeof setTimeout> | null;
   remoteDescriptionSet: boolean;
   pendingRemoteCandidates: Array<{ candidate: string; mid: string }>;
-  uploadClaim: symbol;
+  uploadClaim: symbol | null;
 }
 
 let rtc: NodeDataChannel | null = null;
 let loadAttempted = false;
+let rtcLoadError: DirectConnectivityRuntimeError | undefined;
 const active = new Map<string, ActiveDirectTransfer>();
 
 export async function initializeDirectFileTransfer(): Promise<boolean> {
@@ -63,9 +69,14 @@ export async function initializeDirectFileTransfer(): Promise<boolean> {
   try {
     rtc = await import('node-datachannel');
     rtc.initLogger('Warning', (_level, message) => logger.debug({ message }, 'node-datachannel'));
+    rtcLoadError = undefined;
     logger.info({ capability: DIRECT_FILE_TRANSFER_CAPABILITY }, 'Direct file transfer available');
   } catch (error) {
     rtc = null;
+    const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error);
+    rtcLoadError = detail.includes('node_datachannel.node') || detail.includes('MODULE_NOT_FOUND')
+      ? DIRECT_CONNECTIVITY_RUNTIME_ERROR.NATIVE_MODULE_MISSING
+      : DIRECT_CONNECTIVITY_RUNTIME_ERROR.LOAD_FAILED;
     logger.info({ error }, 'Direct file transfer unavailable; relay upload remains enabled');
   }
   return rtc !== null;
@@ -73,6 +84,15 @@ export async function initializeDirectFileTransfer(): Promise<boolean> {
 
 export function isDirectFileTransferAvailable(): boolean {
   return rtc !== null;
+}
+
+export function getDirectConnectivityRuntimeStatus(): DirectConnectivityRuntimeStatus {
+  return rtc
+    ? { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE }
+    : {
+        state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE,
+        ...(rtcLoadError ? { error: rtcLoadError } : {}),
+      };
 }
 
 function sendError(
@@ -123,7 +143,7 @@ async function closeTransferResources(transfer: ActiveDirectTransfer, removePart
   if (removePart && transfer.partPath) await unlink(transfer.partPath).catch(() => {});
   if (removePart && transfer.finalPath) await unlink(transfer.finalPath).catch(() => {});
   active.delete(transfer.authority.requestId);
-  releaseClientUploadClaim(transfer.authority.clientUploadId, transfer.uploadClaim);
+  if (transfer.uploadClaim) releaseClientUploadClaim(transfer.authority.clientUploadId, transfer.uploadClaim);
 }
 
 async function failTransfer(
@@ -296,6 +316,44 @@ function attachDataChannel(transfer: ActiveDirectTransfer, channel: DataChannel,
   transfer.channel = channel;
   channel.onMessage((message) => {
     if (typeof message === 'string') {
+      if (transfer.authority.purpose === DIRECT_FILE_TRANSFER_PURPOSE.PROBE) {
+        if (transfer.started || transfer.settled) return;
+        let raw: unknown;
+        try { raw = JSON.parse(message); } catch { raw = null; }
+        const parsed = validateDirectFileTransferDataMessage(raw);
+        if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.PROBE
+          || parsed.value.requestId !== transfer.authority.requestId
+          || parsed.value.capability !== transfer.authority.capability) {
+          void failTransfer(transfer, sender, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
+          return;
+        }
+        const selected = transfer.peer.getSelectedCandidatePair();
+        if (!selected) {
+          void failTransfer(transfer, sender, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, 'No selected ICE candidate pair');
+          return;
+        }
+        transfer.started = true;
+        resetIdleTimer(transfer, sender);
+        channel.sendMessage(JSON.stringify({
+          type: DIRECT_FILE_TRANSFER_DATA_MSG.PONG,
+          requestId: transfer.authority.requestId,
+          nonce: parsed.value.nonce,
+          rttMs: Math.max(0, transfer.peer.rtt()),
+          localCandidate: {
+            address: selected.local.address,
+            port: selected.local.port,
+            type: selected.local.type,
+            transportType: selected.local.transportType,
+          },
+          remoteCandidate: {
+            address: selected.remote.address,
+            port: selected.remote.port,
+            type: selected.remote.type,
+            transportType: selected.remote.transportType,
+          },
+        }));
+        return;
+      }
       if (!transfer.started) void startDataTransfer(transfer, channel, message, sender).catch((error) => {
         void failTransfer(transfer, sender, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, error instanceof Error ? error.message : String(error));
       });
@@ -334,13 +392,16 @@ async function prepareTransfer(authority: DirectFileTransferPrepare, sender: Fil
     sendError(sender, authority.requestId, authority.capability, DIRECT_FILE_TRANSFER_ERROR.TOO_MANY_TRANSFERS, true, 'Upload already active');
     return;
   }
-  const existing = lookupAttachmentByClientUploadId(authority.clientUploadId);
-  if (existing) {
-    sendStatus(sender, authority, DIRECT_FILE_TRANSFER_STATE.COMMITTED, existing);
-    return;
+  const probe = authority.purpose === DIRECT_FILE_TRANSFER_PURPOSE.PROBE;
+  if (!probe) {
+    const existing = lookupAttachmentByClientUploadId(authority.clientUploadId);
+    if (existing) {
+      sendStatus(sender, authority, DIRECT_FILE_TRANSFER_STATE.COMMITTED, existing);
+      return;
+    }
   }
-  const uploadClaim = tryClaimClientUpload(authority.clientUploadId);
-  if (!uploadClaim) {
+  const uploadClaim = probe ? null : tryClaimClientUpload(authority.clientUploadId);
+  if (!probe && !uploadClaim) {
     sendError(sender, authority.requestId, authority.capability, DIRECT_FILE_TRANSFER_ERROR.TOO_MANY_TRANSFERS, true, 'Upload already active');
     return;
   }
@@ -353,7 +414,7 @@ async function prepareTransfer(authority: DirectFileTransferPrepare, sender: Fil
       maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
     });
   } catch (error) {
-    releaseClientUploadClaim(authority.clientUploadId, uploadClaim);
+    if (uploadClaim) releaseClientUploadClaim(authority.clientUploadId, uploadClaim);
     sendError(
       sender,
       authority.requestId,
