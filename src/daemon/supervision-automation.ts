@@ -89,6 +89,16 @@ const SUPERVISION_AUDIT_PASS_LABEL = 'Supervised: audit passed.';
 const SUPERVISION_REWORK_LABEL = 'Supervised: audit requested rework; brief sent.';
 const SUPERVISION_BLOCKED_LABEL = 'Supervised: stopped because the session is blocked.';
 const AUDIT_TARGET_RECOVERY_DELAY_MS = 1_500;
+const SUPERVISION_PARKED_LABEL = 'Supervised: parked until the pending reply arrives.';
+/**
+ * How long a parked run may sit before automation hands control back.
+ *
+ * A parked run is woken by the session's NEXT turn (the reply lands, the agent
+ * responds, evaluation runs again), so no polling is needed. This bound exists
+ * only for the case where that reply never comes — without it, a lost audit
+ * would strand the run silently instead of surfacing to the human.
+ */
+const SUPERVISION_WAITING_TIMEOUT_MS = 30 * 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
 
 interface ActiveTaskRunState {
@@ -124,6 +134,8 @@ interface ActiveTaskRunState {
   auditTargetRecoveryAttempts: number;
   auditTargetRecoveryLimitNotified: boolean;
   auditTargetRecoveryTimer?: NodeJS.Timeout;
+  /** Safety net for a parked run whose awaited reply never arrives. */
+  waitingTimeoutTimer?: NodeJS.Timeout;
   // When a reply-backed audit settles from the assistant-text fallback (that
   // is, before the provider emits the trailing idle for the audit turn), the
   // deferred finalization/rework prompt may already be dispatched by the time
@@ -646,6 +658,9 @@ class SupervisionAutomation {
       this.clearAuditTargetRecovery(state);
       this.emitOrchestratedAuditResult(state, 'cancelled', 'session_supervision_cancelled');
     }
+    // A deleted run must not leave its park timer armed: generation is reused,
+    // so a survivor could later terminate an unrelated run.
+    if (state) this.clearWaitingTimeout(state);
     this.activeRuns.delete(sessionName);
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
@@ -810,6 +825,11 @@ class SupervisionAutomation {
 
   getActiveRun(sessionName: string): ActiveTaskRunState | undefined {
     return this.activeRuns.get(sessionName);
+  }
+
+  private clearWaitingTimeout(run: ActiveTaskRunState): void {
+    if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
+    run.waitingTimeoutTimer = undefined;
   }
 
   private clearAuditTargetRecoveryTimer(run: ActiveTaskRunState): void {
@@ -1063,6 +1083,40 @@ class SupervisionAutomation {
     run.auditTargetRecoveryTimer = timer;
   }
 
+  /**
+   * Bound how long a parked run may sit with no reply.
+   *
+   * Re-armed on every park, and cancelled implicitly by the generation/phase
+   * guard once the run moves on. This is a safety net, NOT the wake path — the
+   * awaited reply produces a new assistant turn, which re-enters evaluation on
+   * its own.
+   */
+  private armWaitingTimeout(run: ActiveTaskRunState): void {
+    if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
+    const generation = run.generation;
+    const phase = run.phase;
+    let timer: NodeJS.Timeout;
+    timer = setTimeout(() => {
+      const latest = this.activeRuns.get(run.sessionName);
+      // Identity is the timer handle. `generation` restarts at 1 whenever a run
+      // is cancelled rather than replaced, so gen+phase alone let a stale timer
+      // from a cancelled run terminate an unrelated later one.
+      if (!latest || latest.waitingTimeoutTimer !== timer) return;
+      if (latest.generation !== generation || latest.phase !== phase) return;
+      // An evaluation already in flight owns this run's fate; killing it here
+      // would drop the verdict the parked run was waiting for.
+      if (latest.evaluating) return;
+      latest.waitingTimeoutTimer = undefined;
+      this.emitWarning(
+        latest.sessionName,
+        'The awaited reply did not arrive within the parked-wait limit; handing control back to the human.',
+      );
+      this.finishRun(latest.sessionName, 'needs_input');
+    }, SUPERVISION_WAITING_TIMEOUT_MS);
+    timer.unref?.();
+    run.waitingTimeoutTimer = timer;
+  }
+
   private continueFailedAuditTarget(run: ActiveTaskRunState, failedState: string): void {
     const targetName = run.snapshot.auditTargetSessionName;
     const target = targetName ? getSession(targetName) : undefined;
@@ -1260,6 +1314,12 @@ class SupervisionAutomation {
     if (!current || current.generation !== run.generation || (current.phase !== 'execution' && current.phase !== 'finalizing')) return;
     const evaluatedPhase = current.phase;
 
+    // Disarm the park BEFORE awaiting the broker. The awaited reply has already
+    // produced this turn, so the run is no longer parked; leaving the timer
+    // armed across the await lets it fire mid-decision, finish the run, and
+    // silently discard the very verdict it was waiting for.
+    this.clearWaitingTimeout(current);
+
     const record = getSession(run.sessionName);
     let decision;
     try {
@@ -1277,6 +1337,9 @@ class SupervisionAutomation {
     const latest = this.activeRuns.get(run.sessionName);
     if (!latest || latest.generation !== run.generation || latest.phase !== evaluatedPhase) return;
     latest.evaluating = false;
+    // A new evaluation means the park (if any) is over; the branch below
+    // re-arms it when the decision is still `waiting`.
+    this.clearWaitingTimeout(latest);
     latest.requiresAudit = latest.freshAuditRequiredAfterRework || decision.requiresAudit !== false;
 
     switch (decision.decision) {
@@ -1367,6 +1430,20 @@ class SupervisionAutomation {
         });
         return;
       }
+      case 'waiting': {
+        // Park: no continue contract, no finishRun. The run stays alive so the
+        // next assistant turn — which happens when the awaited reply arrives —
+        // re-enters evaluation naturally. Re-prompting here is exactly the loop
+        // this decision exists to break.
+        this.emitStatus(latest.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
+        this.emitAutomationNote(
+          latest.sessionName,
+          `Auto: parked while waiting — ${decision.reason}`,
+          'supervision-parked',
+        );
+        this.armWaitingTimeout(latest);
+        return;
+      }
       case 'ask_human':
       default: {
         const unavailableText = formatUnavailableReason(
@@ -1391,6 +1468,7 @@ class SupervisionAutomation {
     if (!run) return;
     this.clearAuditDeadline(run);
     this.clearAuditTargetRecovery(run);
+    this.clearWaitingTimeout(run);
     run.terminalState = state;
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
@@ -1567,6 +1645,9 @@ class SupervisionAutomation {
         void this.dispatchContinue(current, current.deferredFinalization);
       } else {
         this.emitTerminalStatus(current.sessionName, 'supervision_audit_pass', SUPERVISION_AUDIT_PASS_LABEL);
+        // A deleted run must not leave its park timer armed: generation is reused,
+        // so a survivor could later terminate an unrelated run.
+        this.clearWaitingTimeout(current);
         this.activeRuns.delete(current.sessionName);
       }
       return;
@@ -1576,6 +1657,9 @@ class SupervisionAutomation {
     current.auditDelegationId = undefined;
     if (current.reworkDispatches >= current.snapshot.maxAuditLoops) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      // A deleted run must not leave its park timer armed: generation is reused,
+      // so a survivor could later terminate an unrelated run.
+      this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
       return;
     }
@@ -1583,6 +1667,9 @@ class SupervisionAutomation {
     const transportRuntime = getTransportRuntime(current.sessionName);
     if (!transportRuntime) {
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      // A deleted run must not leave its park timer armed: generation is reused,
+      // so a survivor could later terminate an unrelated run.
+      this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
       return;
     }
@@ -1608,6 +1695,9 @@ class SupervisionAutomation {
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Peer audit rework dispatch failed');
       this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      // A deleted run must not leave its park timer armed: generation is reused,
+      // so a survivor could later terminate an unrelated run.
+      this.clearWaitingTimeout(current);
       this.activeRuns.delete(current.sessionName);
     }
   }

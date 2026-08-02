@@ -2417,4 +2417,220 @@ describe('SupervisionAutomation', () => {
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('imcodes send --reply');
     expect(mockStartP2pRun).not.toHaveBeenCalled();
   });
+  // The loop this fixes: a session that dispatched a peer audit and is barred
+  // from touching the repo until it returns can only be classified `continue`
+  // out of the old three-value enum, so automation re-prompted it forever and
+  // it answered "still blocked" every time.
+  it('parks on a waiting decision instead of sending another continue contract', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'blocked awaiting the delegated audit verdict',
+      confidence: 0.9,
+    });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-parked',
+      'implement the feature',
+      snapshot,
+    );
+    beginRun('cmd-parked', 'implement the feature');
+    completeTurn('Still blocked on the audit reply; not touching the repository.');
+
+    await vi.waitFor(() => {
+      const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      expect(events.some((event) => event.type === 'agent.status'
+        && event.payload.status === 'supervision_parked')).toBe(true);
+    }, { timeout: 4_000 });
+
+    // No continue prompt was pushed at the session …
+    const prompts = mockTransportRuntime.send.mock.calls.map((call) => String(call[0]));
+    expect(prompts.some((prompt) => prompt.includes('[Contract: supervision_continue_v1]'))).toBe(false);
+    // … and the run is still alive, so the reply's turn can resume it.
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+  });
+
+  it('resumes the SAME parked run when the awaited reply produces the next turn', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'waiting',
+        reason: 'blocked awaiting the delegated audit verdict',
+        confidence: 0.9,
+      })
+      .mockResolvedValueOnce({
+        decision: 'complete',
+        reason: 'audit returned and the work is done',
+        confidence: 0.95,
+        requiresAudit: false,
+      });
+
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-resume', 'implement the feature', snapshot);
+    beginRun('cmd-park-resume', 'implement the feature');
+    completeTurn('Still blocked on the audit reply.');
+    await vi.waitFor(() => {
+      expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+    }, { timeout: 4_000 });
+
+    // Pin the run's identity BEFORE the wake. Asserting only "decide ran twice"
+    // is satisfiable by an implicit re-registration after the first run ended,
+    // which would prove nothing about resumption.
+    const parked = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    expect(parked).toMatchObject({ phase: 'execution', commandId: 'cmd-park-resume' });
+    const parkedGeneration = parked!.generation;
+
+    completeTurn('Audit returned PASS; everything is finished.');
+    await vi.waitFor(() => {
+      expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    }, { timeout: 4_000 });
+
+    // The second decision was applied to the same run, not a fresh one.
+    await vi.waitFor(() => {
+      const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      expect(events.some((event) => event.type === 'agent.status'
+        && event.payload.status === 'supervision_complete')).toBe(true);
+    }, { timeout: 4_000 });
+    const after = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    if (after) expect(after.generation).toBe(parkedGeneration);
+  });
+
+  it('does not let a cancelled run\'s park timer terminate a later run', async () => {
+    // `generation` restarts at 1 when a run is cancelled rather than replaced,
+    // so a surviving timer from run A matched run B on generation+phase and
+    // finished it 30 minutes later.
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'blocked awaiting the delegated audit verdict',
+      confidence: 0.9,
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-a', 'task A', snapshot);
+      beginRun('cmd-park-a', 'task A');
+      completeTurn('Blocked on the audit reply.');
+      await vi.waitFor(async () => {
+        expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+      }, { timeout: 4_000 });
+
+      supervisionAutomation.cancelSession('deck_supervision_brain');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+
+      // A brand-new run, which the stale timer must not touch.
+      mockSupervisionDecide.mockResolvedValue({
+        decision: 'continue',
+        reason: 'work remains',
+        confidence: 0.9,
+        nextAction: 'Run the test suite.',
+      });
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-b', 'task B', snapshot);
+      beginRun('cmd-park-b', 'task B');
+
+      await vi.advanceTimersByTimeAsync(30 * 60_000 + 1_000);
+
+      const survivor = supervisionAutomation.getActiveRun('deck_supervision_brain');
+      expect(survivor?.commandId).toBe('cmd-park-b');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not discard a verdict that lands while the deadline is expiring', async () => {
+    // The timer stayed armed across `await supervisionBroker.decide(...)`, so a
+    // reply arriving just before the deadline could be evaluated while the
+    // timer fired underneath, finishing the run and dropping the verdict.
+    const snapshot = await seedSession('supervised_audit');
+    let releaseSecondDecision: (() => void) | undefined;
+    mockSupervisionDecide
+      .mockResolvedValueOnce({
+        decision: 'waiting',
+        reason: 'blocked awaiting the delegated audit verdict',
+        confidence: 0.9,
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseSecondDecision = () => resolve({
+          decision: 'complete',
+          reason: 'audit returned and the work is done',
+          confidence: 0.95,
+          requiresAudit: false,
+        });
+      }));
+
+    // This file does not reset supervision state between tests, and a run left
+    // active by an earlier test changes which branch the second decision takes
+    // — enough to make this assertion pass while the defect is present.
+    supervisionAutomation.cancelSession('deck_supervision_brain');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-race', 'implement the feature', snapshot);
+      beginRun('cmd-park-race', 'implement the feature');
+      completeTurn('Blocked on the audit reply.');
+      await vi.waitFor(async () => {
+        expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
+      }, { timeout: 4_000 });
+
+      // The verdict lands; evaluation starts but the broker has not answered.
+      completeTurn('Audit returned PASS; everything is finished.');
+      await vi.waitFor(async () => {
+        expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+      }, { timeout: 4_000 });
+
+      // Baseline BEFORE advancing: the timeout warning would be emitted DURING
+      // the advance, so capturing after it would slice the very event under
+      // test out of the window. (The timeline is not reset between tests in
+      // this file, hence the slice rather than replaying from 0.)
+      const before = timelineEmitter.replay('deck_supervision_brain', 0).events.length;
+
+      // Push past the original deadline while that decision is still in flight.
+      await vi.advanceTimersByTimeAsync(30 * 60_000 + 1_000);
+      expect(releaseSecondDecision).toBeDefined();
+      releaseSecondDecision!();
+
+      // Let the released decision settle, then assert the park did NOT expire.
+      // (`complete` in supervised_audit mode starts an audit rather than
+      // emitting supervision_complete, so the timeout warning — not a
+      // completion status — is what distinguishes the two outcomes here.)
+      await vi.advanceTimersByTimeAsync(50);
+      const fresh = timelineEmitter.replay('deck_supervision_brain', 0).events.slice(before);
+      const expired = fresh.some((event) => typeof event.payload?.text === 'string'
+        && event.payload.text.includes('parked-wait limit'));
+      // (A `complete` decision legitimately ends the run, so the run's absence
+      // proves nothing here — the timeout warning is the only signal that
+      // separates "verdict applied" from "park expired and dropped it".)
+      expect(expired).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('hands a parked run back to the human when the reply never arrives', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'blocked awaiting the delegated audit verdict',
+      confidence: 0.9,
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-park-timeout', 'implement the feature', snapshot);
+      beginRun('cmd-park-timeout', 'implement the feature');
+      completeTurn('Still blocked on the audit reply.');
+
+      await vi.waitFor(async () => {
+        expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'execution' });
+      }, { timeout: 4_000 });
+
+      // Parking must not be permanent: a lost reply has to surface, not strand.
+      await vi.advanceTimersByTimeAsync(30 * 60_000 + 1_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

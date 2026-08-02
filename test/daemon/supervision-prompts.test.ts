@@ -216,4 +216,36 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('openspec status --change "<name>" --json');
     expect(prompt).toContain('requiresAudit is REQUIRED');
   });
+  it('turns a repeat audit into an incremental one by carrying the prior findings', () => {
+    // Without this, every re-audit restarts from zero: the auditor re-derives
+    // what the last round already cleared and tends to surface a fresh crop of
+    // incidental findings, so repeat rounds diverge instead of converging.
+    const prompt = buildPeerAuditBriefV1({
+      attemptId: 'attempt_rerun',
+      replyCapability: 'B'.repeat(32),
+      taskRequest: 'Implement the requested behavior',
+      completedResult: 'Fixed the three blocking findings',
+      acceptanceCriteria: ['Focused tests pass'],
+      priorReworkFindings: 'F1 timer leak on cancel. F2 verdict dropped mid-flight.',
+    });
+
+    expect(prompt).toContain('THIS IS A RE-AUDIT');
+    expect(prompt).toContain('F1 timer leak on cancel');
+    // The auditor is told to converge, not to re-open settled ground.
+    expect(prompt).toContain('converge');
+    expect(prompt).toContain('still open');
+  });
+
+  it('omits the re-audit section entirely on a first-round brief', () => {
+    const prompt = buildPeerAuditBriefV1({
+      attemptId: 'attempt_first',
+      replyCapability: 'C'.repeat(32),
+      taskRequest: 'Implement the requested behavior',
+      completedResult: 'Implementation complete',
+      acceptanceCriteria: ['Focused tests pass'],
+    });
+
+    expect(prompt).not.toContain('THIS IS A RE-AUDIT');
+    expect(prompt).not.toContain('Previous REWORK findings');
+  });
 });

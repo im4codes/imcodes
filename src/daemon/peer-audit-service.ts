@@ -42,6 +42,7 @@ import {
   registerPeerAuditReplyIngressHandler,
 } from './peer-audit-reply-ingress.js';
 import { emitPeerAuditResult, emitPeerAuditStatus, peerAuditResultEventId } from './peer-audit-result.js';
+import { PEER_AUDIT_TERMINAL_OUTCOMES } from '../../shared/peer-audit.js';
 import { buildPeerAuditBriefV1 } from './supervision-prompts.js';
 import { cancelQueuedPeerAuditMessage, dispatchPeerAuditMessage } from './session-dispatch.js';
 
@@ -685,6 +686,12 @@ export class PeerAuditService {
     return result.ok ? { ok: true } : { ok: false, error: result.error };
   }
 
+  /**
+   * Last REWORK findings per session, so a re-audit is incremental.
+   * Cleared on PASS: once the work is accepted there is nothing to carry.
+   */
+  #lastReworkFindings = new Map<string, string>();
+
   #buildBrief(
     baseline: CompletedAuditBaseline,
     attemptId: string,
@@ -711,6 +718,9 @@ export class PeerAuditService {
       changedPaths: context.changedPaths,
       validations: context.validations,
       supervisorRationale: baseline.supervisorRationale,
+      ...(this.#lastReworkFindings.get(record.name)
+        ? { priorReworkFindings: this.#lastReworkFindings.get(record.name) }
+        : {}),
     });
   }
 
@@ -836,6 +846,14 @@ export class PeerAuditService {
       findings: terminal.findings,
       reason: terminal.reason,
     });
+    // Carry REWORK findings into the next round's brief. Only PASS clears them:
+    // a timeout/cancellation decided nothing, so the previous round's open
+    // items are still open and must survive into the next attempt.
+    if (terminal.outcome === PEER_AUDIT_TERMINAL_OUTCOMES.REWORK && terminal.findings) {
+      this.#lastReworkFindings.set(sessionName, terminal.findings);
+    } else if (terminal.outcome === PEER_AUDIT_TERMINAL_OUTCOMES.PASS) {
+      this.#lastReworkFindings.delete(sessionName);
+    }
     context?.onAutomaticTerminal?.(terminal);
     void pending;
     this.#contexts.delete(terminal.attemptId);

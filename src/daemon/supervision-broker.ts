@@ -24,7 +24,17 @@ import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/s
 import logger from '../util/logger.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
-export type SupervisionDecisionKind = 'complete' | 'continue' | 'ask_human';
+/**
+ * `waiting` exists because the other three cannot express "correctly parked".
+ *
+ * A session that dispatched a peer audit and is forbidden from touching the
+ * repository until it returns is not `complete` (work remains), not
+ * `ask_human` (nobody needs to intervene), and emphatically not `continue` —
+ * yet `continue` was the only survivor, so automation re-prompted a session
+ * whose sole correct action was to wait, and it answered "still blocked" on
+ * every loop.
+ */
+export type SupervisionDecisionKind = 'complete' | 'continue' | 'waiting' | 'ask_human';
 
 /**
  * Structured supervisor verdict. The schema is intentionally action-oriented:
@@ -89,7 +99,7 @@ export interface SupervisionBrokerDeps {
   waitForRetry?: (delayMs: number) => Promise<void>;
 }
 
-const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'ask_human']);
+const DECISIONS = new Set<SupervisionDecisionKind>(['complete', 'continue', 'waiting', 'ask_human']);
 const MIN_SUPERVISION_EXECUTION_BUDGET_MS = 5;
 const MAX_RECOVERABLE_PROVIDER_RETRIES = 2;
 const PROVIDER_RETRY_DELAYS_MS = [250, 750] as const;
