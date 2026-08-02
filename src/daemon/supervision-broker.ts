@@ -114,11 +114,42 @@ function errorRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Placeholder JS produces for `String(plainObject)` — never useful to a human. */
+const USELESS_STRINGIFIED_OBJECT = '[object Object]';
+
+/**
+ * Recover a diagnosable message from whatever the provider surfaced.
+ *
+ * `ProviderError` (transport-provider.ts) is a PLAIN OBJECT
+ * `{ code, message, recoverable, details }` — NOT an `Error`. `String()` on it
+ * yields the literal `[object Object]`, which is what previously reached both
+ * the user-facing warning and the daemon log, destroying every root cause: the
+ * operator saw "after 3 attempts: [object Object]" and had nothing left to
+ * diagnose with. Read the object's own `message` before falling back.
+ *
+ * The last resort deliberately reports the error CODE rather than the useless
+ * placeholder, so a message-less provider failure is still actionable. `details`
+ * is only used when it is already human text — adapters are supposed to keep it
+ * privacy-whitelisted, but stringifying an arbitrary payload here could leak a
+ * raw provider response into logs.
+ */
+function extractProviderErrorMessage(error: unknown, record: Record<string, unknown> | null): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  const message = typeof record?.message === 'string' ? record.message.trim() : '';
+  if (message) return message;
+  const code = typeof record?.code === 'string' ? record.code.trim() : '';
+  const details = typeof record?.details === 'string' ? record.details.trim() : '';
+  if (code) return details ? `${code}: ${details}` : `provider error (${code})`;
+  if (details) return details;
+  const raw = String(error).trim();
+  return raw && raw !== USELESS_STRINGIFIED_OBJECT ? raw : 'unknown provider error';
+}
+
 function normalizeProviderExecutionError(error: unknown): SupervisionExecutionError {
   const record = errorRecord(error);
   if (record?.supervisionUnavailableReason) return error as SupervisionExecutionError;
 
-  const message = error instanceof Error ? error.message : String(error);
+  const message = extractProviderErrorMessage(error, record);
   const code = typeof record?.code === 'string' && record.code.trim()
     ? record.code.trim()
     : undefined;
@@ -405,7 +436,10 @@ export class SupervisionBroker {
       return await this.evaluateWithProvider(provider, request, remainingBudget, snapshot, request.cwd);
     } catch (error) {
       const normalized = error as SupervisionExecutionError;
-      const message = error instanceof Error ? error.message : String(error);
+      // Same reason as normalizeProviderExecutionError: a non-Error thrown from
+      // anywhere in this chain must not degrade into `[object Object]` — this
+      // message becomes `decision.reason`, i.e. the detail the operator reads.
+      const message = extractProviderErrorMessage(error, errorRecord(error));
       const unavailableReason = (error && typeof error === 'object' && 'supervisionUnavailableReason' in error
         ? normalized.supervisionUnavailableReason
         : undefined) ?? SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED;
@@ -455,7 +489,7 @@ export class SupervisionBroker {
         preset: snapshot.preset,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = extractProviderErrorMessage(error, errorRecord(error));
       throw Object.assign(new Error(message), {
         supervisionUnavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
         supervisionProviderCode: PROVIDER_ERROR_CODES.CONFIG_ERROR,

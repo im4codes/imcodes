@@ -865,6 +865,59 @@ describe('SupervisionBroker', () => {
     expect(provider.endSession).toHaveBeenCalledTimes(3);
   });
 
+  // Regression: `ProviderError` is a PLAIN OBJECT, not an `Error`, so the old
+  // `error instanceof Error ? error.message : String(error)` collapsed every
+  // provider failure to the literal `[object Object]` — in the user-facing
+  // warning AND in the daemon log, leaving no way to diagnose why supervision
+  // kept failing. Observed in production as:
+  //   "…after 3 attempts: [object Object]. Manual continuation is required."
+  it.each([
+    [
+      'a ProviderError carrying a message',
+      { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'upstream 529 overloaded', recoverable: false },
+      'upstream 529 overloaded',
+    ],
+    [
+      'a message-less ProviderError (falls back to the code, never the placeholder)',
+      { code: PROVIDER_ERROR_CODES.RATE_LIMITED, message: '', recoverable: true },
+      PROVIDER_ERROR_CODES.RATE_LIMITED,
+    ],
+  ])('surfaces the real provider failure detail for %s', async (_label, providerError, expected) => {
+    class MessageProvider extends FakeProvider {
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        queueMicrotask(() => {
+          for (const cb of this.errorHandlers) cb(sessionId, providerError as ProviderError);
+        });
+      });
+    }
+
+    const provider = new MessageProvider([]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      waitForRetry: async () => {},
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 2_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      auditMode: 'audit',
+      maxAuditLoops: 2,
+      taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Partial output',
+    });
+
+    expect(result.reason).toContain(expected);
+    expect(result.reason).not.toContain('[object Object]');
+  });
+
   it('recovers a transient supervisor provider failure in a fresh ephemeral session', async () => {
     class RecoveringProvider extends FakeProvider {
       private attempts = 0;
