@@ -10,6 +10,7 @@ import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
@@ -569,6 +570,12 @@ type ComposerUploadItem = {
   progress: number;
   status: 'uploading' | 'done' | 'error';
   transport: FileUploadTransportMode;
+  totalBytes: number;
+  startedAt: number;
+  lastSampleAt: number;
+  lastSampleBytes: number;
+  speedBps: number;
+  updatedAt: number;
 };
 
 type ComposerUploadEntry = {
@@ -628,6 +635,96 @@ function updateComposerUploadItem(key: string, id: string, patch: Partial<Compos
       item.id === id ? { ...item, ...patch } : item
     )),
   });
+}
+
+function updateComposerUploadProgress(key: string, id: string, rawProgress: number, now = Date.now()): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.map((item) => {
+      if (item.id !== id) return item;
+      const clamped = Math.max(0, Math.min(100, Math.round(rawProgress)));
+      const progress = Math.max(item.progress, clamped);
+      const transferredBytes = Math.round((item.totalBytes * progress) / 100);
+      const sampleElapsedMs = now - item.lastSampleAt;
+      let speedBps = item.speedBps;
+      let lastSampleAt = item.lastSampleAt;
+      let lastSampleBytes = item.lastSampleBytes;
+      if (transferredBytes > item.lastSampleBytes && sampleElapsedMs >= 250) {
+        const instantSpeed = ((transferredBytes - item.lastSampleBytes) * 1000) / sampleElapsedMs;
+        speedBps = item.speedBps > 0
+          ? (item.speedBps * 0.7) + (instantSpeed * 0.3)
+          : instantSpeed;
+        lastSampleAt = now;
+        lastSampleBytes = transferredBytes;
+      }
+      return {
+        ...item,
+        progress,
+        speedBps,
+        lastSampleAt,
+        lastSampleBytes,
+        updatedAt: now,
+      };
+    }),
+  });
+}
+
+function updateComposerUploadTransport(
+  key: string,
+  id: string,
+  transport: FileUploadTransportMode,
+  now = Date.now(),
+): void {
+  const entry = getComposerUploadEntry(key);
+  updateComposerUploadSnapshot(key, {
+    uploads: entry.snapshot.uploads.map((item) => {
+      if (item.id !== id || item.transport === transport) return item;
+      const enteringDirect = transport === DIRECT_FILE_TRANSFER_STATE.DIRECT;
+      const restartingForRelay = transport === DIRECT_FILE_TRANSFER_STATE.FALLING_BACK
+        || (transport === DIRECT_FILE_TRANSFER_STATE.RELAY
+          && item.transport !== DIRECT_FILE_TRANSFER_STATE.FALLING_BACK);
+      const resetPhase = enteringDirect || restartingForRelay;
+      return {
+        ...item,
+        transport,
+        ...(restartingForRelay ? { progress: 0 } : {}),
+        ...(resetPhase ? {
+          lastSampleAt: now,
+          lastSampleBytes: 0,
+          speedBps: 0,
+        } : {}),
+        updatedAt: now,
+      };
+    }),
+  });
+}
+
+function formatUploadBytes(bytes: number): string {
+  const safeBytes = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
+  const units: Array<{ size: number; unit: Intl.NumberFormatOptions['unit'] }> = [
+    { size: 1024 ** 4, unit: 'terabyte' },
+    { size: 1024 ** 3, unit: 'gigabyte' },
+    { size: 1024 ** 2, unit: 'megabyte' },
+    { size: 1024, unit: 'kilobyte' },
+    { size: 1, unit: 'byte' },
+  ];
+  const selected = units.find((entry) => safeBytes >= entry.size) ?? units[units.length - 1];
+  return new Intl.NumberFormat(undefined, {
+    style: 'unit',
+    unit: selected.unit,
+    unitDisplay: 'short',
+    maximumFractionDigits: selected.size === 1 ? 0 : 1,
+  }).format(safeBytes / selected.size);
+}
+
+function formatUploadDuration(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.round(Number.isFinite(seconds) ? seconds : 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainder = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+    : `${minutes}:${String(remainder).padStart(2, '0')}`;
 }
 
 function removeComposerUploadItems(key: string, ids: readonly string[]): void {
@@ -1251,6 +1348,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
   const uploadRows = uploadSnapshot.uploads;
   const uploading = uploadRows.some((item) => item.status === 'uploading');
+  const uploadNow = useNowTicker(uploading);
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
@@ -4027,13 +4125,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (files.length === 0 || !serverId) return false;
     const uploadKey = composerUploadKey;
     const uploadAttachmentDraftKey = attachmentDraftKey;
-    const uploadItems = files.map((file) => ({
-      id: createComposerUploadId(),
-      name: file.name || 'file',
-      progress: 0,
-      status: 'uploading' as const,
-      transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
-    }));
+    const uploadItems = files.map((file) => {
+      const now = Date.now();
+      return {
+        id: createComposerUploadId(),
+        name: file.name || 'file',
+        progress: 0,
+        status: 'uploading' as const,
+        transport: DIRECT_FILE_TRANSFER_STATE.CONNECTING,
+        totalBytes: file.size,
+        startedAt: now,
+        lastSampleAt: now,
+        lastSampleBytes: 0,
+        speedBps: 0,
+        updatedAt: now,
+      };
+    });
     addComposerUploadItems(uploadKey, uploadItems);
 
     const uploadedAttachments = await Promise.all(files.map(async (file, index) => {
@@ -4044,16 +4151,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           serverId,
           file,
           onProgress: (pct) => {
-            updateComposerUploadItem(uploadKey, uploadItem.id, { progress: pct });
+            updateComposerUploadProgress(uploadKey, uploadItem.id, pct);
           },
           onMode: (transport) => {
-            updateComposerUploadItem(uploadKey, uploadItem.id, {
-              transport,
-              ...(transport === DIRECT_FILE_TRANSFER_STATE.FALLING_BACK ? { progress: 0 } : {}),
-            });
+            updateComposerUploadTransport(uploadKey, uploadItem.id, transport);
           },
         });
-        updateComposerUploadItem(uploadKey, uploadItem.id, { progress: 100, status: 'done' });
+        updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
         if (result.attachment?.daemonPath) {
           return { path: result.attachment.daemonPath, name: file.name, seq: 0 };
         }
@@ -5305,48 +5410,69 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       {/* Upload progress bars */}
       {uploadRows.length > 0 && (
         <div class="composer-upload-list">
-          {uploadRows.map((item) => (
-            <div
-              key={item.id}
-              data-testid="composer-upload-row"
-              data-transport={item.transport}
-              class={`composer-upload-row composer-upload-row-${item.transport}`}
-            >
-              <span
-                title={item.name}
-                class="composer-upload-name"
-              >
-                {item.name}
-              </span>
-              <span
-                data-testid="composer-upload-transport"
-                data-transport={item.transport}
-                class={`composer-upload-transport composer-upload-transport-${item.transport}`}
-                title={t(`upload.transport.${item.transport}`)}
-              >
-                <span class="composer-upload-transport-signal" aria-hidden="true" />
-                {t(`upload.transport.${item.transport}`)}
-              </span>
+          {uploadRows.map((item) => {
+            const transferredBytes = Math.round((item.totalBytes * item.progress) / 100);
+            const elapsedSeconds = Math.max(0, (Math.max(uploadNow, item.updatedAt) - item.startedAt) / 1000);
+            const remainingBytes = Math.max(0, item.totalBytes - transferredBytes);
+            const etaSeconds = item.speedBps > 0 ? remainingBytes / item.speedBps : null;
+            return (
               <div
-                role="progressbar"
-                aria-label={t('upload.progress_aria', {
-                  name: item.name,
-                  transport: t(`upload.transport.${item.transport}`),
-                  progress: item.progress,
-                })}
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={item.progress}
-                class="composer-upload-progress-track"
+                key={item.id}
+                data-testid="composer-upload-row"
+                data-transport={item.transport}
+                class={`composer-upload-row composer-upload-row-${item.transport}`}
               >
                 <div
-                  class={`composer-upload-progress-fill${item.status === 'error' ? ' composer-upload-progress-fill-error' : ''}`}
-                  style={{ width: `${item.progress}%` }}
-                />
+                  title={item.name}
+                  class="composer-upload-name"
+                >
+                  {item.name}
+                </div>
+                <span
+                  data-testid="composer-upload-transport"
+                  data-transport={item.transport}
+                  class={`composer-upload-transport composer-upload-transport-${item.transport}`}
+                  title={t(`upload.transport.${item.transport}`)}
+                >
+                  <span class="composer-upload-transport-signal" aria-hidden="true" />
+                  {t(`upload.transport.${item.transport}`)}
+                </span>
+                <div
+                  role="progressbar"
+                  aria-label={t('upload.progress_aria', {
+                    name: item.name,
+                    transport: t(`upload.transport.${item.transport}`),
+                    progress: item.progress,
+                  })}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={item.progress}
+                  class="composer-upload-progress-track"
+                >
+                  <div
+                    class={`composer-upload-progress-fill${item.status === 'error' ? ' composer-upload-progress-fill-error' : ''}`}
+                    style={{ width: `${item.progress}%` }}
+                  />
+                </div>
+                <span data-testid="composer-upload-progress" class="composer-upload-progress-value">{item.progress}%</span>
+                <div data-testid="composer-upload-stats" class="composer-upload-stats">
+                  <span>{t('upload.transferred', {
+                    transferred: formatUploadBytes(transferredBytes),
+                    total: formatUploadBytes(item.totalBytes),
+                  })}</span>
+                  <span>{item.speedBps > 0
+                    ? t('upload.speed', { speed: formatUploadBytes(item.speedBps) })
+                    : t('upload.speed_calculating')}</span>
+                  <span>{t('upload.elapsed', { time: formatUploadDuration(elapsedSeconds) })}</span>
+                  <span>{etaSeconds !== null && item.progress < 100
+                    ? t('upload.eta', { time: formatUploadDuration(etaSeconds) })
+                    : item.progress >= 100
+                      ? t('upload.eta_done')
+                      : t('upload.eta_calculating')}</span>
+                </div>
               </div>
-              <span data-testid="composer-upload-progress" class="composer-upload-progress-value">{item.progress}%</span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

@@ -1572,6 +1572,13 @@
       "relay": "Relay upload"
     },
     "progress_aria": "{{name}}: {{transport}}, {{progress}}% complete",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "speed_calculating": "Measuring speed…",
+    "elapsed": "Elapsed {{time}}",
+    "eta": "ETA {{time}}",
+    "eta_calculating": "Calculating ETA…",
+    "eta_done": "Complete",
     "insufficient_capacity": "Insufficient disk space on the server",
     "file_too_large": "File too large (max {{max}}MB)",
     "long_text_attached": "Large pasted text attached as {{name}}",

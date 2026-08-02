@@ -1571,6 +1571,13 @@
       "relay": "中継アップロード中"
     },
     "progress_aria": "{{name}}：{{transport}}、進捗 {{progress}}%",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/秒",
+    "speed_calculating": "速度を測定中…",
+    "elapsed": "経過 {{time}}",
+    "eta": "残り約 {{time}}",
+    "eta_calculating": "残り時間を計算中…",
+    "eta_done": "完了",
     "insufficient_capacity": "サーバーのディスク容量が不足しています",
     "file_too_large": "ファイルが大きすぎます（最大 {{max}}MB）",
     "long_text_attached": "長い貼り付けテキストを {{name}} として添付しました",

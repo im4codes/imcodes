@@ -113,6 +113,13 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'upload.drop_overlay_title') return 'Drop files to upload';
       if (key === 'upload.drop_overlay_hint') return 'Release anywhere in this session window';
+      if (key === 'upload.transferred') return `${String(opts?.transferred ?? '')} / ${String(opts?.total ?? '')}`;
+      if (key === 'upload.speed') return `${String(opts?.speed ?? '')}/s`;
+      if (key === 'upload.speed_calculating') return 'Measuring speed';
+      if (key === 'upload.elapsed') return `Elapsed ${String(opts?.time ?? '')}`;
+      if (key === 'upload.eta') return `ETA ${String(opts?.time ?? '')}`;
+      if (key === 'upload.eta_calculating') return 'Calculating ETA';
+      if (key === 'upload.eta_done') return 'Complete';
       if (key === 'upload.file_too_large') {
         return `File too large (max ${String(opts?.max ?? '')}MB)`;
       }
@@ -6521,9 +6528,11 @@ afterEach(() => {
     await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
     expect(pendingUploads.map((entry) => entry.file.name)).toEqual(['alpha.txt', 'beta.txt']);
 
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await act(async () => {
       pendingUploads[0].onProgress?.(24);
       pendingUploads[1].onProgress?.(68);
+      pendingUploads[0].onProgress?.(12);
     });
 
     const rows = screen.getAllByTestId('composer-upload-row');
@@ -6546,6 +6555,11 @@ afterEach(() => {
     const progressBars = screen.getAllByRole('progressbar');
     expect(progressBars.map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '68']);
     expect(progressBars.every((bar) => bar.classList.contains('composer-upload-progress-track'))).toBe(true);
+    const stats = screen.getAllByTestId('composer-upload-stats');
+    expect(stats).toHaveLength(2);
+    expect(stats[0].textContent).toContain('/s');
+    expect(stats[0].textContent).toContain('Elapsed');
+    expect(stats[0].textContent).toContain('ETA');
 
     await act(async () => {
       pendingUploads[1].resolve({ attachment: { daemonPath: '/tmp/beta.txt' } });

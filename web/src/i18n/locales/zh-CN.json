@@ -1572,6 +1572,13 @@
       "relay": "中转上传中"
     },
     "progress_aria": "{{name}}：{{transport}}，进度 {{progress}}%",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/秒",
+    "speed_calculating": "测速中…",
+    "elapsed": "已用 {{time}}",
+    "eta": "预计剩余 {{time}}",
+    "eta_calculating": "预计时间计算中…",
+    "eta_done": "已完成",
     "insufficient_capacity": "服务器磁盘空间不足",
     "file_too_large": "文件过大（最大 {{max}}MB）",
     "long_text_attached": "超长粘贴内容已作为 {{name}} 附件添加",

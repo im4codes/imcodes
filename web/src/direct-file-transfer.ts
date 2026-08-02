@@ -289,9 +289,8 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         pumping = true;
         operation.onConnected?.();
         armTimeout();
-        void pumpFile(channel, operation.file, requestId, (pct) => {
+        void pumpFile(channel, operation.file, requestId, () => {
           armTimeout();
-          operation.onProgress?.(pct);
         }, () => {
           uploadFinalizing = true;
           armTimeout();

@@ -1571,6 +1571,13 @@
       "relay": "릴레이 업로드 중"
     },
     "progress_aria": "{{name}}: {{transport}}, 진행률 {{progress}}%",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/초",
+    "speed_calculating": "속도 측정 중…",
+    "elapsed": "경과 {{time}}",
+    "eta": "예상 남은 시간 {{time}}",
+    "eta_calculating": "남은 시간 계산 중…",
+    "eta_done": "완료",
     "insufficient_capacity": "서버의 디스크 공간이 부족합니다",
     "file_too_large": "파일이 너무 큽니다 (최대 {{max}}MB)",
     "long_text_attached": "긴 붙여넣기 텍스트가 {{name}} 첨부파일로 추가되었습니다",

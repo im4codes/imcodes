@@ -1571,6 +1571,13 @@
       "relay": "Загрузка через ретранслятор"
     },
     "progress_aria": "{{name}}: {{transport}}, выполнено {{progress}}%",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/с",
+    "speed_calculating": "Измерение скорости…",
+    "elapsed": "Прошло {{time}}",
+    "eta": "Осталось примерно {{time}}",
+    "eta_calculating": "Расчёт оставшегося времени…",
+    "eta_done": "Завершено",
     "insufficient_capacity": "Недостаточно места на диске сервера",
     "file_too_large": "Файл слишком большой (макс. {{max}}МБ)",
     "long_text_attached": "Большой вставленный текст прикреплен как {{name}}",

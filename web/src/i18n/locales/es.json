@@ -1572,6 +1572,13 @@
       "relay": "Subida por relevo"
     },
     "progress_aria": "{{name}}: {{transport}}, {{progress}}% completado",
+    "transferred": "{{transferred}} / {{total}}",
+    "speed": "{{speed}}/s",
+    "speed_calculating": "Midiendo velocidad…",
+    "elapsed": "Transcurrido {{time}}",
+    "eta": "Tiempo restante {{time}}",
+    "eta_calculating": "Calculando tiempo restante…",
+    "eta_done": "Completado",
     "insufficient_capacity": "Espacio en disco insuficiente en el servidor",
     "file_too_large": "Archivo demasiado grande (máx. {{max}}MB)",
     "long_text_attached": "El texto pegado largo se adjuntó como {{name}}",

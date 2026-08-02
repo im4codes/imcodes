@@ -896,6 +896,28 @@ html.native-ios-mac .chat-dl-btn {
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+.composer-upload-stats {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  min-width: 0;
+  color: #94a3b8;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+.composer-upload-stats span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .composer-upload-stats {
+    gap: 4px 8px;
+  }
+}
 @keyframes composer-upload-signal {
   0%, 100% { opacity: 0.45; transform: scale(0.82); }
   50% { opacity: 1; transform: scale(1); }

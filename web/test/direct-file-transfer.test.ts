@@ -199,6 +199,13 @@ describe('direct file upload fallback', () => {
         })));
       }
       if (payload.type === 'direct_file.data.finish') {
+        emit({
+          type: DIRECT_FILE_TRANSFER_MSG.PROGRESS,
+          requestId: payload.requestId,
+          capability,
+          loaded: Math.floor(file.size / 4),
+          total: file.size,
+        } as ServerMessage);
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.DONE,
           requestId: payload.requestId,
@@ -220,7 +227,9 @@ describe('direct file upload fallback', () => {
 
     await expect(pending).resolves.toMatchObject({ attachment: { id: 'direct' } });
     expect(modes).toContain('direct');
+    expect(progress).toContain(25);
     expect(progress).toContain(100);
+    expect(progress).toEqual([...progress].sort((a, b) => a - b));
     expect(uploadFileMock).not.toHaveBeenCalled();
     expect(peer.channel.sent.some((value) => typeof value !== 'string')).toBe(true);
   });
