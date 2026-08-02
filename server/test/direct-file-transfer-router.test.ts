@@ -226,6 +226,8 @@ describe('DirectFileTransferRouter', () => {
   it('expires authorities and enforces the global active-transfer cap', () => {
     vi.useFakeTimers();
     try {
+      expect(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS).toBe(2 * 60 * 60 * 1000);
+
       const f = fixture();
       f.router.handleBrowser(f.browserA, 'user-a', init);
       vi.advanceTimersByTime(DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS + 1);
