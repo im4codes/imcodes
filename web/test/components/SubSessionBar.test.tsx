@@ -43,6 +43,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.daemon_details_direct_browser_nat') return 'Browser network (inferred)';
       if (key === 'subsessionBar.daemon_details_direct_daemon_nat') return 'Daemon network (inferred)';
       if (key === 'subsessionBar.daemon_details_direct_nat_note') return 'Candidate inference only';
+      if (key === 'subsessionBar.daemon_details_direct_technical_details') return 'Technical details';
       if (key === 'subsessionBar.daemon_details_direct_no_candidates') return 'No ICE candidates observed';
       if (key === 'subsessionBar.daemon_details_direct_stage_authorizing') return 'Requesting signaling authority';
       if (key === 'subsessionBar.daemon_details_direct_stage_offer') return 'Creating browser offer';
@@ -389,11 +390,19 @@ describe('SubSessionBar', () => {
     await waitFor(() => {
       const text = view.getByRole('dialog', { name: 'Daemon status' }).textContent ?? '';
       expect(text).toContain('LAN direct · 1.4 ms');
-      expect(text).toContain('Current stepProbe complete');
-      expect(text).toContain('Browser network (inferred)Peer-reflexive mapping · PRFLX · 192.168.2.59:59074');
-      expect(text).toContain('Daemon network (inferred)Private / routed · HOST · 192.168.2.145:49153');
+      expect(text).toContain('Current step7/7 · Probe complete');
+      expect(text).toContain('Browser network (inferred)Peer-reflexive mapping');
+      expect(text).toContain('Daemon network (inferred)Private / routed');
+      expect(text).toContain('Technical details');
+      expect(text).toContain('PRFLX · 192.168.2.59:59074');
+      expect(text).toContain('HOST · 192.168.2.145:49153');
       expect(text).toContain('Candidate inference only');
     });
+    const technicalDetails = view.getByRole('dialog', { name: 'Daemon status' }).querySelector('details');
+    expect(technicalDetails).not.toBeNull();
+    expect(technicalDetails?.open).toBe(false);
+    fireEvent.click(view.getByText('Technical details'));
+    expect(technicalDetails?.open).toBe(true);
     fireEvent.click(view.getByRole('button', { name: 'Test direct connectivity' }));
     await waitFor(() => expect(probeDirectConnectivityMock).toHaveBeenCalledTimes(2));
   });
@@ -433,9 +442,12 @@ describe('SubSessionBar', () => {
 
     await waitFor(() => {
       const text = view.getByTestId('direct-connectivity-diagnostics').textContent ?? '';
-      expect(text).toContain('Current stepChecking ICE connectivity');
-      expect(text).toContain('Browser network (inferred)NAT mapped · SRFLX');
-      expect(text).toContain('Daemon network (inferred)Host candidates · HOST');
+      expect(text).toContain('Current step4/7 · Checking ICE connectivity');
+      expect(text).toContain('Browser network (inferred)NAT mapped');
+      expect(text).toContain('Daemon network (inferred)Host candidates');
+      expect(text).toContain('Technical details');
+      expect(text).toContain('SRFLX');
+      expect(text).toContain('HOST');
     });
 
     act(() => {

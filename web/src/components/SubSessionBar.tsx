@@ -478,23 +478,30 @@ function DaemonStatsModal({
     [DIRECT_CONNECTIVITY_ENDPOINT_KIND.HOST_CANDIDATE]: 'subsessionBar.daemon_details_direct_endpoint_host',
     [DIRECT_CONNECTIVITY_ENDPOINT_KIND.UNKNOWN]: 'subsessionBar.daemon_details_direct_endpoint_unknown',
   };
-  const formatEndpoint = (
+  const resolveEndpointKind = (
     candidate: DirectConnectivityCandidateInfo | null,
     candidateTypes: readonly DirectConnectivityCandidateType[],
-  ) => {
-    if (!candidate && candidateTypes.length === 0) {
-      return t('subsessionBar.daemon_details_direct_no_candidates');
-    }
-    const kind = candidate
+  ): DirectConnectivityEndpointKind => candidate
       ? inferDirectConnectivityEndpointKind(candidate)
       : inferDirectConnectivityEndpointKindFromTypes(candidateTypes);
-    const candidateDetail = candidate
+  const formatEndpointSummary = (
+    candidate: DirectConnectivityCandidateInfo | null,
+    candidateTypes: readonly DirectConnectivityCandidateType[],
+  ) => candidate || candidateTypes.length > 0
+    ? t(endpointKindKeys[resolveEndpointKind(candidate, candidateTypes)])
+    : t('subsessionBar.daemon_details_direct_no_candidates');
+  const formatEndpointTechnicalDetail = (
+    candidate: DirectConnectivityCandidateInfo | null,
+    candidateTypes: readonly DirectConnectivityCandidateType[],
+  ) => candidate
       ? `${candidate.type.toUpperCase()} · ${candidate.address.includes(':') ? `[${candidate.address}]` : candidate.address}:${candidate.port}`
-      : candidateTypes.map((type) => type.toUpperCase()).join('/');
-    return `${t(endpointKindKeys[kind])} · ${candidateDetail}`;
-  };
+      : candidateTypes.length > 0
+        ? candidateTypes.map((type) => type.toUpperCase()).join(' / ')
+        : t('subsessionBar.daemon_details_direct_no_candidates');
   const browserCandidateTypes = probeDiagnostics?.browserCandidateTypes ?? [];
   const daemonCandidateTypes = probeDiagnostics?.daemonCandidateTypes ?? [];
+  const probeStages = Object.values(DIRECT_CONNECTIVITY_PROBE_STAGE);
+  const probeStep = probeDiagnostics ? probeStages.indexOf(probeDiagnostics.stage) + 1 : 0;
 
   return (
     <div
@@ -612,17 +619,28 @@ function DaemonStatsModal({
                 <span class="daemon-details-direct-diagnostics" data-testid="direct-connectivity-diagnostics">
                   <span>
                     <b>{t('subsessionBar.daemon_details_direct_current_step')}</b>
-                    <em>{t(probeStageKeys[probeDiagnostics.stage])}</em>
+                    <em><strong>{probeStep}/{probeStages.length}</strong> · {t(probeStageKeys[probeDiagnostics.stage])}</em>
                   </span>
                   <span>
                     <b>{t('subsessionBar.daemon_details_direct_browser_nat')}</b>
-                    <em>{formatEndpoint(probeResult?.remoteCandidate ?? null, browserCandidateTypes)}</em>
+                    <em>{formatEndpointSummary(probeResult?.remoteCandidate ?? null, browserCandidateTypes)}</em>
                   </span>
                   <span>
                     <b>{t('subsessionBar.daemon_details_direct_daemon_nat')}</b>
-                    <em>{formatEndpoint(probeResult?.localCandidate ?? null, daemonCandidateTypes)}</em>
+                    <em>{formatEndpointSummary(probeResult?.localCandidate ?? null, daemonCandidateTypes)}</em>
                   </span>
-                  <small>{t('subsessionBar.daemon_details_direct_nat_note')}</small>
+                  <details>
+                    <summary>{t('subsessionBar.daemon_details_direct_technical_details')}</summary>
+                    <span>
+                      <b>{t('subsessionBar.daemon_details_direct_browser_nat')}</b>
+                      <code>{formatEndpointTechnicalDetail(probeResult?.remoteCandidate ?? null, browserCandidateTypes)}</code>
+                    </span>
+                    <span>
+                      <b>{t('subsessionBar.daemon_details_direct_daemon_nat')}</b>
+                      <code>{formatEndpointTechnicalDetail(probeResult?.localCandidate ?? null, daemonCandidateTypes)}</code>
+                    </span>
+                    <small>{t('subsessionBar.daemon_details_direct_nat_note')}</small>
+                  </details>
                 </span>
               )}
             </span>

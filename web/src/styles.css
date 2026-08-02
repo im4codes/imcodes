@@ -4113,7 +4113,35 @@ html.native-ios-mac .chat-dl-btn {
   overflow-wrap: anywhere;
   text-align: right;
 }
+.daemon-details-direct-diagnostics em strong { color: #67e8f9; }
+.daemon-details-direct-diagnostics details {
+  border-top: 1px solid rgba(34, 211, 238, 0.1);
+  padding-top: 4px;
+  color: #64748b;
+  font: 8px/1.35 'SF Mono', 'Cascadia Code', monospace;
+}
+.daemon-details-direct-diagnostics summary {
+  cursor: pointer;
+  list-style-position: inside;
+  text-align: right;
+  user-select: none;
+}
+.daemon-details-direct-diagnostics details > span {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) 1fr;
+  gap: 8px;
+  margin-top: 4px;
+  align-items: baseline;
+}
+.daemon-details-direct-diagnostics code {
+  color: #94a3b8;
+  font: inherit;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
 .daemon-details-direct-diagnostics small {
+  display: block;
+  margin-top: 4px;
   color: #475569;
   font: 8px/1.35 'SF Mono', 'Cascadia Code', monospace;
   text-align: right;
