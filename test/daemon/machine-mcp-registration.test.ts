@@ -6,6 +6,7 @@ import { registerMemoryMcpTools, type MachineToolDeps } from '../../src/daemon/m
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE, REMOTE_EXEC_MAX_COMMAND_BYTES } from '../../shared/remote-exec.js';
+import { FILE_TRANSFER_LIMITS } from '../../shared/transport/file-transfer.js';
 
 // Machine tool handlers never touch the runtime caller; a bare stub is enough.
 const stubCaller = {} as unknown as McpRuntimeCaller;
@@ -22,8 +23,8 @@ async function connect(machineDeps: MachineToolDeps): Promise<Client> {
 const okDeps: MachineToolDeps = {
   listMachines: () => [{ name: 'win-1', displayName: 'Win Box', os: 'win', online: true, execEnabled: true, role: NODE_ROLE.CONTROLLED }],
   execRemote: () => ({ outcome: 'completed', ok: true, exitCode: 7, stdout: 'ok', stderr: '', timedOut: false, truncated: false, durationMs: 3 }),
-  sendFileToMachine: () => ({ ok: true, remotePath: '/var/lib/imcodes/uploads/a.txt', attachmentId: 'a'.repeat(32), size: 5 }),
-  fetchFileFromMachine: ({ destinationPath }) => ({ ok: true, destinationPath, attachmentId: 'b'.repeat(32), size: 7 }),
+  sendFileToMachine: () => ({ ok: true, remotePath: '/var/lib/imcodes/uploads/a.txt', attachmentId: 'a'.repeat(32), size: 5, transport: 'direct' }),
+  fetchFileFromMachine: ({ destinationPath }) => ({ ok: true, destinationPath, attachmentId: 'b'.repeat(32), size: 7, transport: 'relay' }),
   computerUseCall: ({ tool }) => ({
     outcome: 'completed',
     result: {
@@ -117,6 +118,9 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     expect(optionalKeys(publishedItems)).toEqual(optionalKeys(sharedItems));
     expect(publishedList.properties!.machines!.maxItems).toBe(MACHINE_LIST_MAX_ITEMS);
     expect(publishedList.properties!.machines!.maxItems).toBe(sharedList.properties!.machines!.maxItems);
+    const publishedSend = byName.get(MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE)!.outputSchema as PublishedSchema;
+    expect(publishedSend.properties!.size!.maximum).toBe(Number.MAX_SAFE_INTEGER);
+    expect(requiredKeys(publishedSend)).toContain('transport');
     await client.close();
   });
 
@@ -211,7 +215,7 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
       arguments: { machine: '^^(win-1)', sourcePath: '/tmp/a.txt' },
     });
     expect(sent.isError).toBeFalsy();
-    expect(sent.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 5, remotePath: '/var/lib/imcodes/uploads/a.txt' });
+    expect(sent.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 5, transport: 'direct', remotePath: '/var/lib/imcodes/uploads/a.txt' });
 
     const fetched = await client.callTool({
       name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
@@ -219,6 +223,32 @@ describe('machine MCP tools — in-process discovery + call parity', () => {
     });
     expect(fetched.isError).toBeFalsy();
     expect(fetched.structuredContent).toMatchObject({ status: 'ok', machine: 'win-1', size: 7, destinationPath: '/tmp/a.txt' });
+    await client.close();
+  });
+
+  it('accepts and reports a direct controlled-node transfer above the relay ceiling', async () => {
+    const size = FILE_TRANSFER_LIMITS.MAX_FILE_SIZE + 1;
+    const client = await connect({
+      ...okDeps,
+      sendFileToMachine: () => ({
+        ok: true,
+        remotePath: '/var/lib/imcodes/uploads/large.bin',
+        attachmentId: 'c'.repeat(32),
+        size,
+        transport: 'direct',
+      }),
+    });
+    const sent = await client.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+      arguments: { machine: 'win-1', sourcePath: '/tmp/large.bin' },
+    });
+    expect(sent.isError).toBeFalsy();
+    expect(sent.structuredContent).toMatchObject({
+      status: 'ok',
+      machine: 'win-1',
+      size,
+      transport: 'direct',
+    });
     await client.close();
   });
 

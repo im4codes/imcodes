@@ -3,6 +3,13 @@ import type { AttachmentRef, FileTransferValidationResult } from './transport/fi
 
 export const MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY = 'file.transfer.machine_direct.v1' as const;
 
+export const MACHINE_FILE_TRANSFER_TRANSPORT = {
+  DIRECT: 'direct',
+  RELAY: 'relay',
+} as const;
+
+export type MachineFileTransferTransport = typeof MACHINE_FILE_TRANSFER_TRANSPORT[keyof typeof MACHINE_FILE_TRANSFER_TRANSPORT];
+
 export const MACHINE_DIRECT_FILE_TRANSFER_MSG = {
   REQUEST: 'file.machine_direct.request',
   DONE: 'file.machine_direct.done',

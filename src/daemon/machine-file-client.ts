@@ -10,9 +10,11 @@ import {
 import { isFilePreviewPathAllowed } from './file-preview-path-policy.js';
 import { MachineControlPlaneError } from './machine-exec-client.js';
 import {
+  MACHINE_FILE_TRANSFER_TRANSPORT,
   MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
   MACHINE_DIRECT_FILE_TRANSFER_MSG,
   validateMachineDirectUploadResponse,
+  type MachineFileTransferTransport,
   type MachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
 import { startMachineDirectSender } from './machine-direct-transfer.js';
@@ -41,6 +43,7 @@ export interface FetchFileFromMachineOptions extends MachineFileBaseOptions {
 export interface MachineFileTransferResult {
   size: number;
   attachmentId: string;
+  transport: MachineFileTransferTransport;
   remotePath?: string;
   destinationPath?: string;
 }
@@ -150,6 +153,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
           return {
             size: attachment.size ?? source.size,
             attachmentId: attachment.id,
+            transport: MACHINE_FILE_TRANSFER_TRANSPORT.DIRECT,
             remotePath: attachment.daemonPath,
           };
         }
@@ -187,6 +191,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
   return {
     size: attachment.size ?? source.size,
     attachmentId: attachment.id,
+    transport: MACHINE_FILE_TRANSFER_TRANSPORT.RELAY,
     remotePath: attachment.daemonPath,
   };
 }
@@ -276,7 +281,12 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
     await file.close();
     file = undefined;
     await commitDownloadedFile(prepared.temp, prepared.destination, options.overwrite === true);
-    return { size, attachmentId: attachment.id, destinationPath: prepared.destination };
+    return {
+      size,
+      attachmentId: attachment.id,
+      transport: MACHINE_FILE_TRANSFER_TRANSPORT.RELAY,
+      destinationPath: prepared.destination,
+    };
   } catch (error) {
     await file?.close().catch(() => {});
     await unlink(prepared.temp).catch(() => {});

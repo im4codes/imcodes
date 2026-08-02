@@ -171,8 +171,8 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
   });
 
   it('resolves file-transfer targets fail-closed and forwards explicit paths', async () => {
-    const sendFile = vi.fn(async () => ({ size: 5, attachmentId: 'a'.repeat(32), remotePath: '/staging/a.txt' }));
-    const fetchFile = vi.fn(async (input: { destinationPath: string }) => ({ size: 7, attachmentId: 'b'.repeat(32), destinationPath: input.destinationPath }));
+    const sendFile = vi.fn(async () => ({ size: 5, attachmentId: 'a'.repeat(32), transport: 'direct' as const, remotePath: '/staging/a.txt' }));
+    const fetchFile = vi.fn(async (input: { destinationPath: string }) => ({ size: 7, attachmentId: 'b'.repeat(32), transport: 'relay' as const, destinationPath: input.destinationPath }));
     const deps = createDaemonMachineToolDeps({
       loadCredential: async () => creds,
       listMachines: async () => [
@@ -188,7 +188,7 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     expect(sendFile).not.toHaveBeenCalled();
     expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-offline', destinationPath: '/tmp/offline-a' }));
 
-    expect(await deps.sendFileToMachine?.({ machine: 'win-1', sourcePath: '/tmp/a' })).toMatchObject({ ok: true, remotePath: '/staging/a.txt' });
+    expect(await deps.sendFileToMachine?.({ machine: 'win-1', sourcePath: '/tmp/a' })).toMatchObject({ ok: true, remotePath: '/staging/a.txt', transport: 'direct' });
     expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', sourcePath: '/tmp/a', sourceServerId: 's1' }));
     expect(await deps.fetchFileFromMachine?.({ machine: 'win-1', sourcePath: 'C:\\a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ ok: true, destinationPath: '/tmp/a' });
     expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'srv-win', sourcePath: 'C:\\a', destinationPath: '/tmp/a', overwrite: true }));

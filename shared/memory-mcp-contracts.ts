@@ -28,6 +28,7 @@ import {
   COMPUTER_USE_TOOLS,
 } from './computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
+import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import {
   MACHINE_NAME_PATTERN,
   MACHINE_REF_NAME_MAX,
@@ -616,18 +617,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
-    description: 'Send one regular file to a controlled machine. Pass either its bare ref_name or complete ^^(ref_name) marker without list_machines. Unsafe file types and credential paths are rejected. FULL nodes only.',
+    description: 'Direct→relay; reports mode. Relay≤2GiB. Resolve without list_machines. Unsafe/credential paths rejected.',
     inputSchema: objectSchema({
       machine: stringSchema('Bare stable ref_name or complete ^^(ref_name) marker.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
-      sourcePath: stringSchema(`Explicit local regular-file path, up to ${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes and ${FILE_TRANSFER_LIMITS.MAX_FILE_SIZE} file bytes.`),
+      sourcePath: stringSchema(`Path ≤${FILE_TRANSFER_PATH_MAX_BYTES} UTF-8 bytes.`),
     }, ['machine', 'sourcePath']),
     outputSchema: objectSchema({
-      status: stringSchema('Always ok for a successful transfer.', { enum: ['ok'] }),
-      machine: stringSchema('Resolved machine ref_name.'),
-      remotePath: stringSchema('Exact protected staging path on the controlled node.'),
-      attachmentId: stringSchema('Short-lived attachment id.'),
-      size: numberSchema('Transferred byte count.', { minimum: 0, maximum: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE }),
-    }, ['status', 'machine', 'remotePath', 'attachmentId', 'size']),
+      status: stringSchema('', { enum: ['ok'] }),
+      machine: stringSchema(''),
+      remotePath: stringSchema(''),
+      attachmentId: stringSchema(''),
+      size: numberSchema('', { minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      transport: stringSchema('', { enum: Object.values(MACHINE_FILE_TRANSFER_TRANSPORT) }),
+    }, ['status', 'machine', 'remotePath', 'attachmentId', 'size', 'transport']),
   },
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: {
     name: MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,

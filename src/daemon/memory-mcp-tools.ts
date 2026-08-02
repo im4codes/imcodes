@@ -62,6 +62,7 @@ import {
   type ComputerUseResult,
 } from '../../shared/computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
+import { MACHINE_FILE_TRANSFER_TRANSPORT, type MachineFileTransferTransport } from '../../shared/machine-direct-file-transfer.js';
 import { isValidMachineName, isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
@@ -240,7 +241,7 @@ export interface ComputerUseToolResult {
 }
 
 export type MachineFileToolResult =
-  | { ok: true; size: number; attachmentId: string; remotePath?: string; destinationPath?: string }
+  | { ok: true; size: number; attachmentId: string; transport: MachineFileTransferTransport; remotePath?: string; destinationPath?: string }
   | { ok: false; reason: MCPErrorReason; error?: string };
 
 export interface MachineToolDeps {
@@ -1536,7 +1537,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       });
       if (!result.ok) return error(result.reason, result.error);
       if (!result.remotePath) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no destination path');
-      return { status: 'ok', machine, remotePath: result.remotePath, attachmentId: result.attachmentId, size: result.size };
+      if (!result.transport) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'machine file transfer returned no transport mode');
+      return { status: 'ok', machine, remotePath: result.remotePath, attachmentId: result.attachmentId, size: result.size, transport: result.transport };
     },
     [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: async (input, context) => {
       if (!deps.machineDeps?.fetchFileFromMachine) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'machine file transfer is not available on this node');
@@ -1919,7 +1921,8 @@ const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>>
     machine: z.string().min(1),
     remotePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     attachmentId: z.string().min(1).max(128),
-    size: z.number().int().min(0).max(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE),
+    size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    transport: z.enum([MACHINE_FILE_TRANSFER_TRANSPORT.DIRECT, MACHINE_FILE_TRANSFER_TRANSPORT.RELAY]),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
     status: z.literal('ok'),

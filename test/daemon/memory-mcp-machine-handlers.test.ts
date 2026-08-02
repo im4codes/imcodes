@@ -28,8 +28,8 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
   });
 
   it('validates and returns metadata for explicit machine file transfers', async () => {
-    const send = vi.fn(async () => ({ ok: true as const, remotePath: '/staging/a.txt', attachmentId: 'a'.repeat(32), size: 5 }));
-    const fetch = vi.fn(async ({ destinationPath }: { destinationPath: string }) => ({ ok: true as const, destinationPath, attachmentId: 'b'.repeat(32), size: 7 }));
+    const send = vi.fn(async () => ({ ok: true as const, remotePath: '/staging/a.txt', attachmentId: 'a'.repeat(32), size: 5, transport: 'direct' as const }));
+    const fetch = vi.fn(async ({ destinationPath }: { destinationPath: string }) => ({ ok: true as const, destinationPath, attachmentId: 'b'.repeat(32), size: 7, transport: 'relay' as const }));
     const machineDeps: MachineToolDeps = {
       listMachines: async () => [],
       execRemote: async () => ({ outcome: 'completed' as const }),
@@ -42,11 +42,30 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
     expect(send).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
 
-    expect(await handlers[sendFile]({ machine: '^^(win)', sourcePath: '/tmp/a' })).toMatchObject({ status: 'ok', machine: 'win', remotePath: '/staging/a.txt', size: 5 });
+    expect(await handlers[sendFile]({ machine: '^^(win)', sourcePath: '/tmp/a' })).toMatchObject({ status: 'ok', machine: 'win', remotePath: '/staging/a.txt', size: 5, transport: 'direct' });
     expect(await handlers[fetchFile]({ machine: '^^(win)', sourcePath: '/remote/a', destinationPath: '/tmp/a', overwrite: true })).toMatchObject({ status: 'ok', machine: 'win', destinationPath: '/tmp/a', size: 7 });
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ machine: 'win' }));
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ machine: 'win' }));
     expect(fetch).toHaveBeenCalledWith(expect.objectContaining({ overwrite: true }));
+  });
+
+  it('fails closed when a successful send dependency omits its transport mode', async () => {
+    const machineDeps: MachineToolDeps = {
+      listMachines: async () => [],
+      execRemote: async () => ({ outcome: 'completed' as const }),
+      sendFileToMachine: (async () => ({
+        ok: true,
+        remotePath: '/staging/a.txt',
+        attachmentId: 'a'.repeat(32),
+        size: 5,
+      })) as never,
+    };
+    const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
+
+    expect(await handlers[sendFile]({ machine: 'win', sourcePath: '/tmp/a' })).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+    });
   });
 
   it('validates required + typed fields before dispatching', async () => {

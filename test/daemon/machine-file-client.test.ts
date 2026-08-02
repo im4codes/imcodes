@@ -57,7 +57,7 @@ describe('machine file client', () => {
       targetServerId: 'controlled-1',
       sourcePath,
       fetchImpl: fetchImpl as typeof fetch,
-    })).resolves.toEqual({ size: 5, attachmentId: 'a'.repeat(32), remotePath: '/staging/a.txt' });
+    })).resolves.toEqual({ size: 5, attachmentId: 'a'.repeat(32), transport: 'relay', remotePath: '/staging/a.txt' });
   });
 
   it('rejects a source symlink before network dispatch', async () => {
@@ -106,7 +106,7 @@ describe('machine file client', () => {
     await expect(sendFileToMachine({
       serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token', targetServerId: 'controlled-1', sourcePath,
       fetchImpl: fetchMock as typeof fetch,
-    })).resolves.toMatchObject({ attachmentId: 'd'.repeat(32), remotePath: '/staging/fallback.txt' });
+    })).resolves.toMatchObject({ attachmentId: 'd'.repeat(32), transport: 'relay', remotePath: '/staging/fallback.txt' });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledOnce();
   });
@@ -140,7 +140,7 @@ describe('machine file client', () => {
     await expect(sendFileToMachine({
       serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token', targetServerId: 'controlled-1', sourcePath,
       fetchImpl: fetchMock as typeof fetch,
-    })).resolves.toMatchObject({ attachmentId: 'a'.repeat(32), remotePath: '/staging/mismatch.txt' });
+    })).resolves.toMatchObject({ attachmentId: 'a'.repeat(32), transport: 'relay', remotePath: '/staging/mismatch.txt' });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(close).toHaveBeenCalledOnce();
   });
@@ -175,7 +175,7 @@ describe('machine file client', () => {
     await expect(sendFileToMachine({
       serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token', targetServerId: 'controlled-1', sourcePath,
       fetchImpl: fetchImpl as typeof fetch,
-    })).resolves.toEqual({ size, attachmentId: 'e'.repeat(32), remotePath: '/uploads/large.bin' });
+    })).resolves.toEqual({ size, attachmentId: 'e'.repeat(32), transport: 'direct', remotePath: '/uploads/large.bin' });
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
   });
@@ -196,7 +196,7 @@ describe('machine file client', () => {
       sourcePath: 'C:\\Temp\\a.txt',
       destinationPath,
       fetchImpl: fetchImpl as typeof fetch,
-    })).resolves.toEqual({ size: 5, attachmentId: 'b'.repeat(32), destinationPath });
+    })).resolves.toEqual({ size: 5, attachmentId: 'b'.repeat(32), transport: 'relay', destinationPath });
     await expect(readFile(destinationPath, 'utf8')).resolves.toBe('hello');
   });
 
