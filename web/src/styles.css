@@ -4065,6 +4065,11 @@ html.native-ios-mac .chat-dl-btn {
 .daemon-details-health-row > span:last-child { min-width: 0; overflow-wrap: anywhere; color: #cbd5e1; text-align: right; }
 .daemon-details-health-row.is-danger > span:last-child { color: #fca5a5; }
 .daemon-details-direct-row { align-items: flex-start; }
+.daemon-details-direct-block {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
 .daemon-details-direct-result {
   display: flex;
   align-items: center;
@@ -4081,6 +4086,38 @@ html.native-ios-mac .chat-dl-btn {
 .daemon-details-direct-result .is-warning { color: #fcd34d; }
 .daemon-details-direct-result .is-danger { color: #fca5a5; }
 .daemon-details-direct-result .is-probing { color: #67e8f9; }
+.daemon-details-direct-diagnostics {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid rgba(34, 211, 238, 0.14);
+  border-radius: 7px;
+  background: rgba(8, 47, 73, 0.2);
+  text-align: left;
+}
+.daemon-details-direct-diagnostics > span {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+.daemon-details-direct-diagnostics b {
+  color: #64748b;
+  font-size: 9px;
+}
+.daemon-details-direct-diagnostics em {
+  min-width: 0;
+  color: #cbd5e1;
+  font: normal 9px/1.35 'SF Mono', 'Cascadia Code', monospace;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.daemon-details-direct-diagnostics small {
+  color: #475569;
+  font: 8px/1.35 'SF Mono', 'Cascadia Code', monospace;
+  text-align: right;
+}
 .daemon-details-direct-refresh {
   flex: 0 0 auto;
   width: 24px;

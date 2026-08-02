@@ -39,6 +39,25 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.daemon_details_direct_ip') return 'IP direct';
       if (key === 'subsessionBar.daemon_details_direct_relay') return 'Relay path';
       if (key === 'subsessionBar.daemon_details_direct_refresh') return 'Test direct connectivity';
+      if (key === 'subsessionBar.daemon_details_direct_current_step') return 'Current step';
+      if (key === 'subsessionBar.daemon_details_direct_browser_nat') return 'Browser network (inferred)';
+      if (key === 'subsessionBar.daemon_details_direct_daemon_nat') return 'Daemon network (inferred)';
+      if (key === 'subsessionBar.daemon_details_direct_nat_note') return 'Candidate inference only';
+      if (key === 'subsessionBar.daemon_details_direct_no_candidates') return 'No ICE candidates observed';
+      if (key === 'subsessionBar.daemon_details_direct_stage_authorizing') return 'Requesting signaling authority';
+      if (key === 'subsessionBar.daemon_details_direct_stage_offer') return 'Creating browser offer';
+      if (key === 'subsessionBar.daemon_details_direct_stage_candidates') return 'Exchanging SDP / ICE candidates';
+      if (key === 'subsessionBar.daemon_details_direct_stage_checking') return 'Checking ICE connectivity';
+      if (key === 'subsessionBar.daemon_details_direct_stage_channel') return 'DataChannel open';
+      if (key === 'subsessionBar.daemon_details_direct_stage_verifying') return 'Verifying probe round trip';
+      if (key === 'subsessionBar.daemon_details_direct_stage_complete') return 'Probe complete';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_private') return 'Private / routed';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_public') return 'Public direct';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_nat') return 'NAT mapped';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_prflx') return 'Peer-reflexive mapping';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_relay') return 'TURN relay';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_host') return 'Host candidates';
+      if (key === 'subsessionBar.daemon_details_direct_endpoint_unknown') return 'Unknown';
       if (key === 'subsessionBar.daemon_details_local_time') return 'Local time';
       if (key === 'subsessionBar.daemon_details_no_data') return 'No data reported';
       if (key === 'embedding.status_ready') return 'Embedding ready';
@@ -367,9 +386,67 @@ describe('SubSessionBar', () => {
     fireEvent.click(view.getByRole('button', { name: 'Show daemon details' }));
 
     await waitFor(() => expect(probeDirectConnectivityMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(view.getByRole('dialog', { name: 'Daemon status' }).textContent).toContain('LAN direct · 1.4 ms'));
+    await waitFor(() => {
+      const text = view.getByRole('dialog', { name: 'Daemon status' }).textContent ?? '';
+      expect(text).toContain('LAN direct · 1.4 ms');
+      expect(text).toContain('Current stepProbe complete');
+      expect(text).toContain('Browser network (inferred)Peer-reflexive mapping · PRFLX · 192.168.2.59:59074');
+      expect(text).toContain('Daemon network (inferred)Private / routed · HOST · 192.168.2.145:49153');
+      expect(text).toContain('Candidate inference only');
+    });
     fireEvent.click(view.getByRole('button', { name: 'Test direct connectivity' }));
     await waitFor(() => expect(probeDirectConnectivityMock).toHaveBeenCalledTimes(2));
+  });
+
+  it('shows the live signaling stage and candidate inference before the probe finishes', async () => {
+    let finishProbe!: (value: unknown) => void;
+    probeDirectConnectivityMock.mockImplementationOnce((_ws, onDiagnostics) => {
+      onDiagnostics?.({
+        stage: 'checking',
+        browserCandidateTypes: ['srflx'],
+        daemonCandidateTypes: ['host'],
+      });
+      return new Promise((resolve) => { finishProbe = resolve; });
+    });
+    const statsWs = makeStatsWs(['file.transfer.direct.v1']);
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={statsWs.ws as any}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+    act(() => {
+      statsWs.emit({ ...daemonStatsMessage, directConnectivity: { state: 'available' } });
+    });
+    fireEvent.click(view.getByRole('button', { name: 'Show daemon details' }));
+
+    await waitFor(() => {
+      const text = view.getByTestId('direct-connectivity-diagnostics').textContent ?? '';
+      expect(text).toContain('Current stepChecking ICE connectivity');
+      expect(text).toContain('Browser network (inferred)NAT mapped · SRFLX');
+      expect(text).toContain('Daemon network (inferred)Host candidates · HOST');
+    });
+
+    act(() => {
+      finishProbe({
+        route: 'lan_direct',
+        rttMs: 1.4,
+        localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
+        remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
+      });
+    });
+    await waitFor(() => expect(view.getByTestId('direct-connectivity-diagnostics').textContent).toContain('Probe complete'));
   });
 
   it.each([true, false])('opens daemon details from the entire desktop status region when collapsed=%s', async (collapsed) => {

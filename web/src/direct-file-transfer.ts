@@ -1,4 +1,6 @@
 import {
+  DIRECT_CONNECTIVITY_CANDIDATE_TYPE,
+  DIRECT_CONNECTIVITY_PROBE_STAGE,
   classifyDirectConnectivityRoute,
   DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_DATA_MSG,
@@ -10,6 +12,8 @@ import {
   DIRECT_FILE_TRANSFER_STATE,
   validateDirectFileTransferAuthorized,
   validateDirectFileTransferDataMessage,
+  type DirectConnectivityCandidateType,
+  type DirectConnectivityProbeDiagnostics,
   type DirectConnectivityProbeResult,
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
@@ -97,6 +101,7 @@ type DirectOperation = {
 } | {
   kind: 'probe';
   nonce: string;
+  onDiagnostics?: (diagnostics: DirectConnectivityProbeDiagnostics) => void;
 };
 
 type DirectOperationResult =
@@ -121,6 +126,34 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let pumping = false;
   const pendingCandidates: RTCIceCandidateInit[] = [];
+  const browserCandidateTypes = new Set<DirectConnectivityCandidateType>();
+  const daemonCandidateTypes = new Set<DirectConnectivityCandidateType>();
+  let probeStage: DirectConnectivityProbeDiagnostics['stage'] = DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING;
+  const probeStageOrder: DirectConnectivityProbeDiagnostics['stage'][] = [
+    DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING,
+    DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER,
+    DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES,
+    DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING,
+    DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN,
+    DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING,
+    DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
+  ];
+
+  const readCandidateType = (candidate: string, declaredType?: string | null): DirectConnectivityCandidateType | null => {
+    const rawType = declaredType?.toLowerCase() ?? /\btyp\s+([a-z0-9_-]+)/i.exec(candidate)?.[1]?.toLowerCase();
+    return Object.values(DIRECT_CONNECTIVITY_CANDIDATE_TYPE).includes(rawType as DirectConnectivityCandidateType)
+      ? rawType as DirectConnectivityCandidateType
+      : null;
+  };
+  const emitProbeDiagnostics = (stage?: DirectConnectivityProbeDiagnostics['stage']) => {
+    if (operation.kind !== 'probe') return;
+    if (stage && probeStageOrder.indexOf(stage) >= probeStageOrder.indexOf(probeStage)) probeStage = stage;
+    operation.onDiagnostics?.({
+      stage: probeStage,
+      browserCandidateTypes: [...browserCandidateTypes],
+      daemonCandidateTypes: [...daemonCandidateTypes],
+    });
+  };
 
   return new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -172,6 +205,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         return;
       }
       capability = parsed.value.capability;
+      emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER);
       peer = new RTCPeerConnection({
         iceServers: parsed.value.iceServers.map((urls) => ({ urls })),
       });
@@ -179,6 +213,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       channel.binaryType = 'arraybuffer';
       channel.addEventListener('open', () => {
         if (!channel || settled) return;
+        emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN);
         channel.send(JSON.stringify(probe
           ? {
               type: DIRECT_FILE_TRANSFER_DATA_MSG.PROBE,
@@ -197,6 +232,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
               size,
               capability: parsed.value.capability,
             }));
+        emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING);
         armTimeout(probe ? DIRECT_FILE_TRANSFER_LIMITS.PROBE_TIMEOUT_MS : DIRECT_FILE_TRANSFER_LIMITS.IDLE_TIMEOUT_MS);
       });
       channel.addEventListener('message', (event) => {
@@ -215,6 +251,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
             localCandidate: parsedData.value.localCandidate,
             remoteCandidate: parsedData.value.remoteCandidate,
           };
+          emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE);
           cleanup();
           resolve({ kind: 'probe', result });
           return;
@@ -234,6 +271,12 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       });
       peer.addEventListener('icecandidate', (event) => {
         if (!event.candidate || !capability) return;
+        const candidateType = readCandidateType(
+          event.candidate.candidate,
+          (event.candidate as RTCIceCandidate & { type?: string | null }).type,
+        );
+        if (candidateType) browserCandidateTypes.add(candidateType);
+        emitProbeDiagnostics();
         ws.send({
           type: DIRECT_FILE_TRANSFER_MSG.ICE,
           requestId,
@@ -244,11 +287,15 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       });
       peer.addEventListener('connectionstatechange', () => {
         if (!peer || settled) return;
+        if (peer.connectionState === 'connecting' || peer.connectionState === 'connected') {
+          emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING);
+        }
         if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
           finishError(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED));
         }
       });
       const offer = await peer.createOffer();
+      emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES);
       await peer.setLocalDescription(offer);
       ws.send({
         type: DIRECT_FILE_TRANSFER_MSG.OFFER,
@@ -266,12 +313,16 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.ANSWER && peer && capability === message.capability) {
+        emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING);
         void peer.setRemoteDescription({ type: 'answer', sdp: message.sdp })
           .then(flushRemoteCandidates)
           .catch(finishError);
         return;
       }
       if (message.type === DIRECT_FILE_TRANSFER_MSG.ICE && peer && capability === message.capability) {
+        const candidateType = readCandidateType(message.candidate);
+        if (candidateType) daemonCandidateTypes.add(candidateType);
+        emitProbeDiagnostics();
         const candidate = { candidate: message.candidate, sdpMid: message.mid };
         if (peer.remoteDescription) void peer.addIceCandidate(candidate).catch(finishError);
         else pendingCandidates.push(candidate);
@@ -309,6 +360,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         finishError(new DirectFileTransferFailure(message.error, message.retryable, message.detail ?? message.error));
       }
     });
+    emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING);
     armTimeout(DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS);
     ws.send({
       type: DIRECT_FILE_TRANSFER_MSG.INIT,
@@ -334,8 +386,11 @@ export async function uploadFileDirect(
   return { ok: true, attachment: result.attachment };
 }
 
-export async function probeDirectConnectivity(ws: WsClient): Promise<DirectConnectivityProbeResult> {
-  const result = await runDirectOperation(ws, { kind: 'probe', nonce: crypto.randomUUID() });
+export async function probeDirectConnectivity(
+  ws: WsClient,
+  onDiagnostics?: (diagnostics: DirectConnectivityProbeDiagnostics) => void,
+): Promise<DirectConnectivityProbeResult> {
+  const result = await runDirectOperation(ws, { kind: 'probe', nonce: crypto.randomUUID(), onDiagnostics });
   if (result.kind !== 'probe') throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
   return result.result;
 }

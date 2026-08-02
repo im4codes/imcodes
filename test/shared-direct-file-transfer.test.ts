@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   classifyDirectConnectivityRoute,
+  DIRECT_CONNECTIVITY_CANDIDATE_TYPE,
+  DIRECT_CONNECTIVITY_ENDPOINT_KIND,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_PURPOSE,
+  inferDirectConnectivityEndpointKind,
+  inferDirectConnectivityEndpointKindFromTypes,
   validateDirectFileTransferBrowserMessage,
   validateDirectFileTransferDaemonCommand,
   validateDirectFileTransferDaemonMessage,
@@ -112,5 +116,22 @@ describe('direct file transfer protocol', () => {
       { address: '192.168.2.145', port: 49153, type: 'relay', transportType: 'udp' },
       { address: '172.16.253.211', port: 59074, type: 'host', transportType: 'udp' },
     )).toBe(DIRECT_CONNECTIVITY_ROUTE.RELAY);
+  });
+
+  it('reports only candidate-based endpoint inference without claiming a cone or symmetric NAT type', () => {
+    expect(inferDirectConnectivityEndpointKind(
+      { address: '172.16.253.111', port: 51907, type: 'host', transportType: 'udp' },
+    )).toBe(DIRECT_CONNECTIVITY_ENDPOINT_KIND.PRIVATE_ROUTED);
+    expect(inferDirectConnectivityEndpointKind(
+      { address: '203.0.113.8', port: 28167, type: 'srflx', transportType: 'udp' },
+    )).toBe(DIRECT_CONNECTIVITY_ENDPOINT_KIND.NAT_MAPPED);
+    expect(inferDirectConnectivityEndpointKind(
+      { address: '192.168.2.145', port: 59501, type: 'prflx', transportType: 'udp' },
+    )).toBe(DIRECT_CONNECTIVITY_ENDPOINT_KIND.PEER_REFLEXIVE);
+    expect(inferDirectConnectivityEndpointKindFromTypes([
+      DIRECT_CONNECTIVITY_CANDIDATE_TYPE.HOST,
+      DIRECT_CONNECTIVITY_CANDIDATE_TYPE.SERVER_REFLEXIVE,
+    ])).toBe(DIRECT_CONNECTIVITY_ENDPOINT_KIND.NAT_MAPPED);
+    expect(inferDirectConnectivityEndpointKindFromTypes([])).toBe(DIRECT_CONNECTIVITY_ENDPOINT_KIND.UNKNOWN);
   });
 });

@@ -227,11 +227,31 @@ describe('direct file upload fallback', () => {
 
   it('probes a routed private path over the data channel without uploading a file', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
-    const { ws, sent } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
-    const pending = probeDirectConnectivity(ws);
+    const { ws, sent, emit } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const diagnostics: Array<{
+      stage: string;
+      browserCandidateTypes: string[];
+      daemonCandidateTypes: string[];
+    }> = [];
+    const pending = probeDirectConnectivity(ws, (snapshot) => diagnostics.push(snapshot));
 
     await vi.waitFor(() => expect(FakePeerConnection.latest?.channel.sent.length).toBeGreaterThan(0));
     const peer = FakePeerConnection.latest!;
+    const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.INIT)!;
+    peer.dispatchEvent(Object.assign(new Event('icecandidate'), {
+      candidate: {
+        candidate: 'candidate:1 1 UDP 1686052863 203.0.113.8 28167 typ srflx raddr 0.0.0.0 rport 0',
+        sdpMid: '0',
+        type: 'srflx',
+      },
+    }));
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.ICE,
+      requestId: init.requestId as string,
+      capability,
+      candidate: 'candidate:2 1 UDP 2114977535 172.16.253.111 51907 typ host',
+      mid: '0',
+    } as ServerMessage);
     const probeRaw = peer.channel.sent.find((value) => typeof value === 'string') as string;
     const probe = JSON.parse(probeRaw) as { requestId: string; nonce: string };
     peer.channel.dispatchEvent(new MessageEvent('message', {
@@ -259,6 +279,19 @@ describe('direct file upload fallback', () => {
       type: DIRECT_FILE_TRANSFER_MSG.CANCEL,
       reason: 'canceled',
     }));
+    expect(init.requestId).toBe(probe.requestId);
+    expect(diagnostics.map((snapshot) => snapshot.stage)).toEqual(expect.arrayContaining([
+      'authorizing',
+      'creating_offer',
+      'exchanging_candidates',
+      'verifying',
+      'complete',
+    ]));
+    expect(diagnostics.at(-1)).toMatchObject({
+      stage: 'complete',
+      browserCandidateTypes: ['srflx'],
+      daemonCandidateTypes: ['host'],
+    });
     expect(uploadFileMock).not.toHaveBeenCalled();
   });
 });

@@ -40,11 +40,20 @@ import {
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
 import {
+  DIRECT_CONNECTIVITY_ENDPOINT_KIND,
+  DIRECT_CONNECTIVITY_PROBE_STAGE,
   DIRECT_CONNECTIVITY_ROUTE,
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
   DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
+  inferDirectConnectivityEndpointKind,
+  inferDirectConnectivityEndpointKindFromTypes,
+  type DirectConnectivityCandidateInfo,
+  type DirectConnectivityCandidateType,
+  type DirectConnectivityEndpointKind,
+  type DirectConnectivityProbeDiagnostics,
   type DirectConnectivityProbeResult,
+  type DirectConnectivityProbeStage,
   type DirectConnectivityRuntimeStatus,
 } from '@shared/direct-file-transfer.js';
 import { DirectFileTransferFailure, probeDirectConnectivity } from '../direct-file-transfer.js';
@@ -397,6 +406,7 @@ function DaemonStatsModal({
   } as const;
   const [probeState, setProbeState] = useState<typeof PROBE_VIEW_STATE[keyof typeof PROBE_VIEW_STATE]>(PROBE_VIEW_STATE.IDLE);
   const [probeResult, setProbeResult] = useState<DirectConnectivityProbeResult | null>(null);
+  const [probeDiagnostics, setProbeDiagnostics] = useState<DirectConnectivityProbeDiagnostics | null>(null);
   const [probeErrorKey, setProbeErrorKey] = useState<string | null>(null);
   const autoProbeStarted = useRef(false);
   const embeddingKey = stats.embedding?.state
@@ -410,10 +420,20 @@ function DaemonStatsModal({
     if (!ws || runtimeUnavailable || !capabilityReady) return;
     setProbeState(PROBE_VIEW_STATE.PROBING);
     setProbeResult(null);
+    setProbeDiagnostics({
+      stage: DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING,
+      browserCandidateTypes: [],
+      daemonCandidateTypes: [],
+    });
     setProbeErrorKey(null);
     try {
-      const result = await probeDirectConnectivity(ws);
+      const result = await probeDirectConnectivity(ws, setProbeDiagnostics);
       setProbeResult(result);
+      setProbeDiagnostics((current) => ({
+        stage: DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE,
+        browserCandidateTypes: current?.browserCandidateTypes ?? [],
+        daemonCandidateTypes: current?.daemonCandidateTypes ?? [],
+      }));
       setProbeState(PROBE_VIEW_STATE.SUCCESS);
     } catch (error) {
       const code = error instanceof DirectFileTransferFailure ? error.code : DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED;
@@ -440,6 +460,41 @@ function DaemonStatsModal({
     : probeResult?.route === DIRECT_CONNECTIVITY_ROUTE.RELAY
       ? 'subsessionBar.daemon_details_direct_relay'
       : 'subsessionBar.daemon_details_direct_ip';
+  const probeStageKeys: Record<DirectConnectivityProbeStage, string> = {
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.AUTHORIZING]: 'subsessionBar.daemon_details_direct_stage_authorizing',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.CREATING_OFFER]: 'subsessionBar.daemon_details_direct_stage_offer',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.EXCHANGING_CANDIDATES]: 'subsessionBar.daemon_details_direct_stage_candidates',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING]: 'subsessionBar.daemon_details_direct_stage_checking',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.DATA_CHANNEL_OPEN]: 'subsessionBar.daemon_details_direct_stage_channel',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.VERIFYING]: 'subsessionBar.daemon_details_direct_stage_verifying',
+    [DIRECT_CONNECTIVITY_PROBE_STAGE.COMPLETE]: 'subsessionBar.daemon_details_direct_stage_complete',
+  };
+  const endpointKindKeys: Record<DirectConnectivityEndpointKind, string> = {
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.PRIVATE_ROUTED]: 'subsessionBar.daemon_details_direct_endpoint_private',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.PUBLIC_DIRECT]: 'subsessionBar.daemon_details_direct_endpoint_public',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.NAT_MAPPED]: 'subsessionBar.daemon_details_direct_endpoint_nat',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.PEER_REFLEXIVE]: 'subsessionBar.daemon_details_direct_endpoint_prflx',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.TURN_RELAY]: 'subsessionBar.daemon_details_direct_endpoint_relay',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.HOST_CANDIDATE]: 'subsessionBar.daemon_details_direct_endpoint_host',
+    [DIRECT_CONNECTIVITY_ENDPOINT_KIND.UNKNOWN]: 'subsessionBar.daemon_details_direct_endpoint_unknown',
+  };
+  const formatEndpoint = (
+    candidate: DirectConnectivityCandidateInfo | null,
+    candidateTypes: readonly DirectConnectivityCandidateType[],
+  ) => {
+    if (!candidate && candidateTypes.length === 0) {
+      return t('subsessionBar.daemon_details_direct_no_candidates');
+    }
+    const kind = candidate
+      ? inferDirectConnectivityEndpointKind(candidate)
+      : inferDirectConnectivityEndpointKindFromTypes(candidateTypes);
+    const candidateDetail = candidate
+      ? `${candidate.type.toUpperCase()} · ${candidate.address.includes(':') ? `[${candidate.address}]` : candidate.address}:${candidate.port}`
+      : candidateTypes.map((type) => type.toUpperCase()).join('/');
+    return `${t(endpointKindKeys[kind])} · ${candidateDetail}`;
+  };
+  const browserCandidateTypes = probeDiagnostics?.browserCandidateTypes ?? [];
+  const daemonCandidateTypes = probeDiagnostics?.daemonCandidateTypes ?? [];
 
   return (
     <div
@@ -524,33 +579,52 @@ function DaemonStatsModal({
         <div class="daemon-details-health">
           <div class="daemon-details-health-row daemon-details-direct-row">
             <span>{t('subsessionBar.daemon_details_direct_connectivity')}</span>
-            <span class="daemon-details-direct-result">
-              {runtimeUnavailable || !capabilityReady ? (
-                <span class="is-danger">{t('subsessionBar.daemon_details_direct_runtime_unavailable')}</span>
-              ) : probeState === PROBE_VIEW_STATE.PROBING ? (
-                <span class="is-probing">{t('subsessionBar.daemon_details_direct_probing')}</span>
-              ) : probeState === PROBE_VIEW_STATE.SUCCESS && probeResult ? (
-                <span class={probeResult.route === DIRECT_CONNECTIVITY_ROUTE.RELAY ? 'is-warning' : 'is-direct'}>
-                  {t(routeKey)} · {probeResult.rttMs.toFixed(1)} ms
-                  <small title={`${probeResult.remoteCandidate.address}:${probeResult.remoteCandidate.port}`}>
-                    {probeResult.localCandidate.type}/{probeResult.remoteCandidate.type} · {probeResult.localCandidate.transportType.toUpperCase()}
-                  </small>
+            <span class="daemon-details-direct-block">
+              <span class="daemon-details-direct-result">
+                {runtimeUnavailable || !capabilityReady ? (
+                  <span class="is-danger">{t('subsessionBar.daemon_details_direct_runtime_unavailable')}</span>
+                ) : probeState === PROBE_VIEW_STATE.PROBING ? (
+                  <span class="is-probing">{t('subsessionBar.daemon_details_direct_probing')}</span>
+                ) : probeState === PROBE_VIEW_STATE.SUCCESS && probeResult ? (
+                  <span class={probeResult.route === DIRECT_CONNECTIVITY_ROUTE.RELAY ? 'is-warning' : 'is-direct'}>
+                    {t(routeKey)} · {probeResult.rttMs.toFixed(1)} ms
+                    <small title={`${probeResult.remoteCandidate.address}:${probeResult.remoteCandidate.port}`}>
+                      {probeResult.localCandidate.type}/{probeResult.remoteCandidate.type} · {probeResult.localCandidate.transportType.toUpperCase()}
+                    </small>
+                  </span>
+                ) : probeState === PROBE_VIEW_STATE.FAILED && probeErrorKey ? (
+                  <span class="is-danger">{t(probeErrorKey)}</span>
+                ) : (
+                  <span>{t('subsessionBar.daemon_details_direct_not_tested')}</span>
+                )}
+                <button
+                  type="button"
+                  class="daemon-details-direct-refresh"
+                  onClick={() => { void runProbe(); }}
+                  disabled={!capabilityReady || runtimeUnavailable || probeState === PROBE_VIEW_STATE.PROBING}
+                  aria-label={t('subsessionBar.daemon_details_direct_refresh')}
+                  title={t('subsessionBar.daemon_details_direct_refresh')}
+                >
+                  ↻
+                </button>
+              </span>
+              {probeDiagnostics && !runtimeUnavailable && capabilityReady && (
+                <span class="daemon-details-direct-diagnostics" data-testid="direct-connectivity-diagnostics">
+                  <span>
+                    <b>{t('subsessionBar.daemon_details_direct_current_step')}</b>
+                    <em>{t(probeStageKeys[probeDiagnostics.stage])}</em>
+                  </span>
+                  <span>
+                    <b>{t('subsessionBar.daemon_details_direct_browser_nat')}</b>
+                    <em>{formatEndpoint(probeResult?.remoteCandidate ?? null, browserCandidateTypes)}</em>
+                  </span>
+                  <span>
+                    <b>{t('subsessionBar.daemon_details_direct_daemon_nat')}</b>
+                    <em>{formatEndpoint(probeResult?.localCandidate ?? null, daemonCandidateTypes)}</em>
+                  </span>
+                  <small>{t('subsessionBar.daemon_details_direct_nat_note')}</small>
                 </span>
-              ) : probeState === PROBE_VIEW_STATE.FAILED && probeErrorKey ? (
-                <span class="is-danger">{t(probeErrorKey)}</span>
-              ) : (
-                <span>{t('subsessionBar.daemon_details_direct_not_tested')}</span>
               )}
-              <button
-                type="button"
-                class="daemon-details-direct-refresh"
-                onClick={() => { void runProbe(); }}
-                disabled={!capabilityReady || runtimeUnavailable || probeState === PROBE_VIEW_STATE.PROBING}
-                aria-label={t('subsessionBar.daemon_details_direct_refresh')}
-                title={t('subsessionBar.daemon_details_direct_refresh')}
-              >
-                ↻
-              </button>
             </span>
           </div>
           <div class="daemon-details-health-row">

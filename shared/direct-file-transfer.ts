@@ -19,6 +19,39 @@ export const DIRECT_CONNECTIVITY_ROUTE = {
 
 export type DirectConnectivityRoute = typeof DIRECT_CONNECTIVITY_ROUTE[keyof typeof DIRECT_CONNECTIVITY_ROUTE];
 
+export const DIRECT_CONNECTIVITY_PROBE_STAGE = {
+  AUTHORIZING: 'authorizing',
+  CREATING_OFFER: 'creating_offer',
+  EXCHANGING_CANDIDATES: 'exchanging_candidates',
+  CHECKING: 'checking',
+  DATA_CHANNEL_OPEN: 'data_channel_open',
+  VERIFYING: 'verifying',
+  COMPLETE: 'complete',
+} as const;
+
+export type DirectConnectivityProbeStage = typeof DIRECT_CONNECTIVITY_PROBE_STAGE[keyof typeof DIRECT_CONNECTIVITY_PROBE_STAGE];
+
+export const DIRECT_CONNECTIVITY_CANDIDATE_TYPE = {
+  HOST: 'host',
+  SERVER_REFLEXIVE: 'srflx',
+  PEER_REFLEXIVE: 'prflx',
+  RELAY: DIRECT_CONNECTIVITY_ROUTE.RELAY,
+} as const;
+
+export type DirectConnectivityCandidateType = typeof DIRECT_CONNECTIVITY_CANDIDATE_TYPE[keyof typeof DIRECT_CONNECTIVITY_CANDIDATE_TYPE];
+
+export const DIRECT_CONNECTIVITY_ENDPOINT_KIND = {
+  PRIVATE_ROUTED: 'private_routed',
+  PUBLIC_DIRECT: 'public_direct',
+  NAT_MAPPED: 'nat_mapped',
+  PEER_REFLEXIVE: 'peer_reflexive',
+  TURN_RELAY: 'turn_relay',
+  HOST_CANDIDATE: 'host_candidate',
+  UNKNOWN: 'unknown',
+} as const;
+
+export type DirectConnectivityEndpointKind = typeof DIRECT_CONNECTIVITY_ENDPOINT_KIND[keyof typeof DIRECT_CONNECTIVITY_ENDPOINT_KIND];
+
 export const DIRECT_CONNECTIVITY_RUNTIME_STATE = {
   AVAILABLE: 'available',
   RUNTIME_UNAVAILABLE: 'runtime_unavailable',
@@ -270,6 +303,12 @@ export interface DirectConnectivityProbeResult {
   remoteCandidate: DirectConnectivityCandidateInfo;
 }
 
+export interface DirectConnectivityProbeDiagnostics {
+  stage: DirectConnectivityProbeStage;
+  browserCandidateTypes: DirectConnectivityCandidateType[];
+  daemonCandidateTypes: DirectConnectivityCandidateType[];
+}
+
 export interface DirectFileTransferDataError {
   type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.ERROR;
   requestId: string;
@@ -420,6 +459,44 @@ export function classifyDirectConnectivityRoute(
   return isPrivateNetworkAddress(localCandidate.address) && isPrivateNetworkAddress(remoteCandidate.address)
     ? DIRECT_CONNECTIVITY_ROUTE.LAN_DIRECT
     : DIRECT_CONNECTIVITY_ROUTE.DIRECT;
+}
+
+export function inferDirectConnectivityEndpointKind(
+  candidate: DirectConnectivityCandidateInfo,
+): DirectConnectivityEndpointKind {
+  if (candidate.type === DIRECT_CONNECTIVITY_CANDIDATE_TYPE.RELAY) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.TURN_RELAY;
+  }
+  if (candidate.type === DIRECT_CONNECTIVITY_CANDIDATE_TYPE.PEER_REFLEXIVE) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.PEER_REFLEXIVE;
+  }
+  if (candidate.type === DIRECT_CONNECTIVITY_CANDIDATE_TYPE.SERVER_REFLEXIVE) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.NAT_MAPPED;
+  }
+  if (candidate.type === DIRECT_CONNECTIVITY_CANDIDATE_TYPE.HOST) {
+    return isPrivateNetworkAddress(candidate.address)
+      ? DIRECT_CONNECTIVITY_ENDPOINT_KIND.PRIVATE_ROUTED
+      : DIRECT_CONNECTIVITY_ENDPOINT_KIND.PUBLIC_DIRECT;
+  }
+  return DIRECT_CONNECTIVITY_ENDPOINT_KIND.UNKNOWN;
+}
+
+export function inferDirectConnectivityEndpointKindFromTypes(
+  candidateTypes: readonly DirectConnectivityCandidateType[],
+): DirectConnectivityEndpointKind {
+  if (candidateTypes.includes(DIRECT_CONNECTIVITY_CANDIDATE_TYPE.RELAY)) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.TURN_RELAY;
+  }
+  if (candidateTypes.includes(DIRECT_CONNECTIVITY_CANDIDATE_TYPE.PEER_REFLEXIVE)) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.PEER_REFLEXIVE;
+  }
+  if (candidateTypes.includes(DIRECT_CONNECTIVITY_CANDIDATE_TYPE.SERVER_REFLEXIVE)) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.NAT_MAPPED;
+  }
+  if (candidateTypes.includes(DIRECT_CONNECTIVITY_CANDIDATE_TYPE.HOST)) {
+    return DIRECT_CONNECTIVITY_ENDPOINT_KIND.HOST_CANDIDATE;
+  }
+  return DIRECT_CONNECTIVITY_ENDPOINT_KIND.UNKNOWN;
 }
 
 function validateAuthorityFields(value: Record<string, unknown>): boolean {
