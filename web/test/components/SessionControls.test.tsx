@@ -120,6 +120,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'upload.eta') return `ETA ${String(opts?.time ?? '')}`;
       if (key === 'upload.eta_calculating') return 'Calculating ETA';
       if (key === 'upload.eta_done') return 'Complete';
+      if (key === 'upload.cancel') return 'Stop';
+      if (key === 'upload.cancel_named') return `Stop uploading ${String(opts?.name ?? '')}`;
+      if (key === 'upload.cancel_confirm') return `Stop uploading ${String(opts?.name ?? '')}?`;
+      if (key === 'upload.delete_failed') return 'Could not delete the uploaded file';
+      if (key === 'upload.deleting') return 'Deleting uploaded file';
       if (key === 'upload.file_too_large') {
         return `File too large (max ${String(opts?.max ?? '')}MB)`;
       }
@@ -237,6 +242,7 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
 }));
 
 const uploadFileMock = vi.fn();
+const deleteAttachmentMock = vi.fn();
 const execCommandMock = vi.fn(() => true);
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
@@ -255,6 +261,7 @@ const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) 
 });
 vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
+  deleteAttachment: (...args: unknown[]) => deleteAttachmentMock(...args),
   getUserPref: async (key: string) => {
     if (key === 'supervision.user_default') {
       try {
@@ -467,6 +474,7 @@ afterEach(() => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    deleteAttachmentMock.mockResolvedValue(undefined);
     execCommandMock.mockImplementation((_command: string, _ui?: boolean, value?: string) => {
       const active = document.activeElement as HTMLDivElement | null;
       if (active && typeof active.textContent === 'string') {
@@ -6568,6 +6576,8 @@ afterEach(() => {
     await waitFor(() => {
       expect(screen.getAllByRole('progressbar').map((bar) => bar.getAttribute('aria-valuenow'))).toEqual(['24', '100']);
     });
+    expect(screen.getByRole('button', { name: 'Stop uploading alpha.txt' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Stop uploading beta.txt' })).toBeNull();
 
     await act(async () => {
       pendingUploads[0].resolve({ attachment: { daemonPath: '/tmp/alpha.txt' } });
@@ -6626,6 +6636,81 @@ afterEach(() => {
       sessionName: 'my-session',
       text: '#1:(/tmp/pending.txt) send after upload',
     });
+  });
+
+  it('requires confirmation before stopping an upload and aborts without showing a failure', async () => {
+    let observedSignal: AbortSignal | undefined;
+    uploadFileMock.mockImplementation((_serverId, _file, _onProgress, _clientUploadId, signal: AbortSignal) => {
+      observedSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const error = new Error('upload_canceled');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox');
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['pending'], 'pending.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+
+    const stop = await screen.findByRole('button', { name: 'Stop uploading pending.txt' });
+    fireEvent.click(stop);
+    expect(confirmSpy).toHaveBeenCalledWith('Stop uploading pending.txt?');
+    expect(observedSignal?.aborted).toBe(false);
+
+    confirmSpy.mockReturnValue(true);
+    fireEvent.click(stop);
+    await waitFor(() => expect(document.querySelector('[data-testid="composer-upload-row"]')).toBeNull());
+    expect(observedSignal?.aborted).toBe(true);
+    expect(screen.queryByText('Upload failed')).toBeNull();
+  });
+
+  it('deletes the daemon upload when the existing attachment x is clicked without confirmation', async () => {
+    uploadFileMock.mockResolvedValue({
+      attachment: {
+        id: 'abc123.txt',
+        serverId: 'srv-1',
+        daemonPath: '/tmp/abc123.txt',
+      },
+    });
+    const confirmSpy = vi.spyOn(window, 'confirm');
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['done'], 'done.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('done.txt'));
+
+    fireEvent.click(document.querySelector('.attachment-badge-remove') as HTMLButtonElement);
+
+    await waitFor(() => expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'abc123.txt'));
+    await waitFor(() => expect(document.querySelector('.attachment-badge')).toBeNull());
+    expect(confirmSpy).not.toHaveBeenCalled();
   });
 
   it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {

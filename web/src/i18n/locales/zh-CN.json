@@ -1564,6 +1564,11 @@
     "upload_file": "上传文件",
     "uploading": "上传中...",
     "upload_failed": "上传失败",
+    "cancel": "终止",
+    "cancel_named": "终止上传 {{name}}",
+    "cancel_confirm": "确定终止上传 {{name}}？当前传输内容将被丢弃。",
+    "delete_failed": "无法删除已上传的文件",
+    "deleting": "正在删除已上传文件…",
     "direct_required_large": "此文件需要直连；服务器中转回退最大为 {{max}}MB",
     "transport": {
       "connecting": "P2P 连接中",

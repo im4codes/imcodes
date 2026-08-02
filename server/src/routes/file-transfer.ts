@@ -12,9 +12,11 @@ import {
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
+  validateFileDeleteRequest,
   validateFilePathHandleRequest,
 } from '../../../shared/transport/file-transfer.js';
 import { DIRECT_FILE_TRANSFER_CAPABILITY, isDirectFileTransferClientUploadId } from '../../../shared/direct-file-transfer.js';
@@ -30,6 +32,7 @@ import type {
   FileDownloadRequest,
   FileDownloadStreamRequest,
   FilePathHandleRequest,
+  FileDeleteRequest,
   FileUploadFetchRequest,
   FileUploadRequest,
 } from '../../../shared/transport/file-transfer.js';
@@ -329,6 +332,7 @@ fileTransferRoutes.use('/:id/upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
 fileTransferRoutes.use('/:id/machine-direct-upload', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
+fileTransferRoutes.use('/:id/uploads/:attachmentId', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
   // Token-based auth bypass for native downloads (system browser has no app auth)
   const token = c.req.query('token');
@@ -833,6 +837,43 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       'Cache-Control': 'no-store',
     },
   });
+});
+
+// ── DELETE /api/server/:id/uploads/:attachmentId ───────────────────────────
+
+fileTransferRoutes.delete('/:id/uploads/:attachmentId', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const attachmentId = c.req.param('attachmentId')!;
+
+  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  const gate = await authorizeControlledFileTarget(c, serverId, FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY, false);
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+  if (!gate.bridge.isDaemonConnected()) return c.json({ error: 'daemon_offline' }, 503);
+
+  const requestId = randomHex(16);
+  const parsed = validateFileDeleteRequest({ type: FILE_TRANSFER_MSG.DELETE, requestId, attachmentId });
+  if (!parsed.ok) return c.json({ error: 'invalid_attachment_id' }, 400);
+
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      requestId,
+      parsed.value as FileDeleteRequest as unknown as Record<string, unknown>,
+      30_000,
+    );
+    if (result.type === FILE_TRANSFER_MSG.DELETE_DONE) return c.json({ ok: true });
+    const reason = typeof result.error === 'string' ? result.error : FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED;
+    return c.json({ error: reason }, reason === FILE_TRANSFER_DELETE_ERROR.FORBIDDEN ? 403 : 500);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    logger.error({ serverId, attachmentId, error }, 'Attachment deletion failed');
+    return c.json({ error: FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED }, 500);
+  }
 });
 
 // ── POST /api/server/:id/uploads/:attachmentId/download-token ────────────────

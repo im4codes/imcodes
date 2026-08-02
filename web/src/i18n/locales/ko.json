@@ -1563,6 +1563,11 @@
     "upload_file": "파일 업로드",
     "uploading": "업로드 중...",
     "upload_failed": "업로드 실패",
+    "cancel": "중지",
+    "cancel_named": "{{name}} 업로드 중지",
+    "cancel_confirm": "{{name}} 업로드를 중지할까요? 현재 전송 내용은 삭제됩니다.",
+    "delete_failed": "업로드된 파일을 삭제하지 못했습니다",
+    "deleting": "업로드된 파일 삭제 중…",
     "direct_required_large": "이 파일은 직접 연결이 필요합니다. 서버 릴레이는 최대 {{max}}MB입니다",
     "transport": {
       "connecting": "P2P 연결 중",

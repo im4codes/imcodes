@@ -128,6 +128,7 @@ describe('direct file upload fallback', () => {
       file,
       undefined,
       expect.stringMatching(/^[0-9a-f-]{36}$/),
+      undefined,
     );
   });
 
@@ -164,6 +165,25 @@ describe('direct file upload fallback', () => {
     })).resolves.toMatchObject({ attachment: { id: 'relay' } });
     expect(modes).toEqual(['connecting', 'falling_back', 'relay']);
     expect(uploadFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an active direct upload without starting relay fallback', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const controller = new AbortController();
+    const pending = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: new File(['cancel me'], 'cancel.txt', { type: 'text/plain' }),
+      signal: controller.signal,
+    });
+
+    await vi.waitFor(() => expect(FakePeerConnection.latest).not.toBeNull());
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ code: 'canceled', retryable: false });
+    expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.CANCEL, reason: 'canceled' }));
+    expect(uploadFileMock).not.toHaveBeenCalled();
   });
 
   it('streams bytes over the data channel and reports P2P direct mode without invoking relay', async () => {

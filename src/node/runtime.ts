@@ -20,6 +20,7 @@ import {
   handleFileDownloadStream,
   handleFilePathHandle,
   handleFileUploadFetch,
+  handleFileDelete,
   type FileTransferSender,
 } from '../daemon/file-transfer-handler.js';
 import {
@@ -189,7 +190,8 @@ export function createControlledNodeRuntime(
       if (message.type === 'file.upload_fetch'
         || message.type === 'file.download'
         || message.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
-        || message.type === FILE_TRANSFER_MSG.PATH_HANDLE) {
+        || message.type === FILE_TRANSFER_MSG.PATH_HANDLE
+        || message.type === FILE_TRANSFER_MSG.DELETE) {
         const parsed = validateControlledFileTransferRequest(message);
         if (!parsed.ok) return;
         const relayUrl = parsed.value.type === 'file.upload_fetch'
@@ -210,6 +212,8 @@ export function createControlledNodeRuntime(
           await handleFileDownload(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else if (parsed.value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
           await handleFileDownloadStream(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === FILE_TRANSFER_MSG.DELETE) {
+          await handleFileDelete(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else {
           await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
         }

@@ -4617,6 +4617,11 @@ export class WsBridge {
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
     }
+    if (type === FILE_TRANSFER_MSG.DELETE_DONE || type === FILE_TRANSFER_MSG.DELETE_ERROR) {
+      const requestId = msg.requestId as string | undefined;
+      if (requestId) this.resolveFileTransfer(requestId, msg);
+      return;
+    }
     if (type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
       const requestId = msg.downloadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
@@ -6418,6 +6423,7 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD
       || parsedType === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
+      || parsedType === FILE_TRANSFER_MSG.DELETE
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');

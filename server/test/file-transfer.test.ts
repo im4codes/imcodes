@@ -359,6 +359,29 @@ describe('WsBridge file transfer', () => {
     expect(result.message).toBe('expired');
   });
 
+  it('correlates daemon attachment deletion responses by requestId', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    await authDaemon(bridge, daemon, makeDb('valid-hash'));
+
+    const promise = bridge.sendFileTransferRequest('delete-1', {
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-1',
+      attachmentId: 'abc123.txt',
+    }, 5000);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: FILE_TRANSFER_MSG.DELETE_DONE,
+      requestId: 'delete-1',
+    })));
+    await flushAsync();
+
+    await expect(promise).resolves.toEqual({
+      type: FILE_TRANSFER_MSG.DELETE_DONE,
+      requestId: 'delete-1',
+    });
+  });
+
   it('orphan responses are silently discarded', async () => {
     const bridge = WsBridge.get(serverId);
     const daemon = new MockWs();

@@ -539,6 +539,45 @@ describe('file-transfer upload route', () => {
   });
 });
 
+describe('file-transfer attachment deletion route', () => {
+  beforeEach(() => {
+    sendFileTransferRequestMock.mockReset();
+    isDaemonConnectedMock.mockReset().mockReturnValue(true);
+    hasDaemonCapabilityMock.mockReset().mockReturnValue(true);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
+    sendFileTransferRequestMock.mockResolvedValue({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'a'.repeat(32) });
+  });
+
+  it('authorizes the member and relays an exact attachment delete request', async () => {
+    const response = await makeApp().request('/api/server/srv-1/uploads/abcdef1234.txt', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true });
+    expect(mockResolveServerMemberAccessOrShareDeny).toHaveBeenCalledWith(expect.anything(), {
+      serverId: 'srv-1',
+      userId: 'user-1',
+    });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
+      'a'.repeat(32),
+      { type: FILE_TRANSFER_MSG.DELETE, requestId: 'a'.repeat(32), attachmentId: 'abcdef1234.txt' },
+      30_000,
+    );
+  });
+
+  it('rejects malformed attachment ids before contacting the daemon', async () => {
+    const response = await makeApp().request('/api/server/srv-1/uploads/not.valid.ext.more', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer test' },
+    });
+    expect(response.status).toBe(400);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('file-transfer download route', () => {
   beforeEach(() => {
     sendFileTransferRequestMock.mockReset();

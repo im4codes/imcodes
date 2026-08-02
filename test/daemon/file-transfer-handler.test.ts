@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -369,6 +369,50 @@ describe('file-transfer local handle hardening', () => {
         downloadable: true,
       }),
     }));
+  });
+
+  it('deletes a completed upload and its metadata while refusing local project handles', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const uploaded = createServerLinkMock();
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'upload-delete',
+      filename: 'delete-me.txt',
+      originalName: 'delete-me.txt',
+      size: 5,
+      content: Buffer.from('hello').toString('base64'),
+    }, uploaded.serverLink as never);
+
+    const uploadPath = path.join(fakeHome, '.imcodes', 'uploads', 'delete-me.txt');
+    await expect(stat(uploadPath)).resolves.toMatchObject({ size: 5 });
+    await expect(stat(`${uploadPath}.meta.json`)).resolves.toBeDefined();
+
+    const deleted = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-request',
+      attachmentId: 'delete-me.txt',
+    }, deleted.serverLink as never);
+    expect(deleted.sent).toEqual([{ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'delete-request' }]);
+    await expect(stat(uploadPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(`${uploadPath}.meta.json`)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const projectPath = path.join(rootDir, 'project-file.txt');
+    await writeFile(projectPath, 'keep');
+    const validated = await transfer.validateProjectFilePath(projectPath);
+    const local = transfer.createProjectFileHandleFromValidatedPath(validated, 'project-file.txt', 'text/plain', 4);
+    const refused = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-local',
+      attachmentId: local.id,
+    }, refused.serverLink as never);
+    expect(refused.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-local',
+      error: 'forbidden',
+    }]);
+    await expect(stat(projectPath)).resolves.toMatchObject({ size: 4 });
   });
 
   it('waits for an ambiguous direct attempt and reuses its committed attachment instead of uploading twice', async () => {

@@ -115,6 +115,7 @@ type DirectOperation = {
   clientUploadId: string;
   onProgress?: (pct: number) => void;
   onConnected?: () => void;
+  signal?: AbortSignal;
 } | {
   kind: 'probe';
   nonce: string;
@@ -174,6 +175,8 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
   };
 
   return new Promise((resolve, reject) => {
+    const signal = operation.kind === 'upload' ? operation.signal : undefined;
+    let abortHandler: (() => void) | null = null;
     const cleanup = () => {
       if (timeout) clearTimeout(timeout);
       timeout = null;
@@ -183,6 +186,8 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       try { peer?.close(); } catch { /* already closed */ }
       channel = null;
       peer = null;
+      if (abortHandler) signal?.removeEventListener('abort', abortHandler);
+      abortHandler = null;
     };
     const cancel = (reason: typeof DIRECT_FILE_TRANSFER_ERROR[keyof typeof DIRECT_FILE_TRANSFER_ERROR]) => {
       if (!capability) return;
@@ -191,7 +196,10 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
     const finishError = (error: unknown) => {
       if (settled) return;
       settled = true;
-      cancel(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
+      const reason = error instanceof DirectFileTransferFailure && error.code === DIRECT_FILE_TRANSFER_ERROR.CANCELED
+        ? DIRECT_FILE_TRANSFER_ERROR.CANCELED
+        : DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED;
+      cancel(reason);
       cleanup();
       reject(error instanceof DirectFileTransferFailure
         ? error
@@ -201,6 +209,16 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
           error instanceof Error ? error.message : String(error),
         ));
     };
+    abortHandler = () => finishError(new DirectFileTransferFailure(
+      DIRECT_FILE_TRANSFER_ERROR.CANCELED,
+      false,
+      'upload_canceled',
+    ));
+    signal?.addEventListener('abort', abortHandler, { once: true });
+    if (signal?.aborted) {
+      abortHandler();
+      return;
+    }
     const armTimeout = (ms = DIRECT_FILE_TRANSFER_LIMITS.IDLE_TIMEOUT_MS) => {
       if (timeout) clearTimeout(timeout);
       timeout = setTimeout(() => finishError(new DirectFileTransferFailure(
@@ -413,8 +431,9 @@ export async function uploadFileDirect(
   clientUploadId: string,
   onProgress?: (pct: number) => void,
   onConnected?: () => void,
+  signal?: AbortSignal,
 ): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
-  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, onProgress, onConnected });
+  const result = await runDirectOperation(ws, { kind: 'upload', file, clientUploadId, onProgress, onConnected, signal });
   if (result.kind !== 'upload') throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
   return { ok: true, attachment: result.attachment };
 }
@@ -434,6 +453,7 @@ export async function uploadFileWithDirectFallback(options: {
   file: File;
   onProgress?: (pct: number) => void;
   onMode?: (mode: FileUploadTransportMode) => void;
+  signal?: AbortSignal;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const clientUploadId = crypto.randomUUID();
   if (options.ws && supportsDirectUpload(options.ws)) {
@@ -445,9 +465,14 @@ export async function uploadFileWithDirectFallback(options: {
         clientUploadId,
         options.onProgress,
         () => options.onMode?.(DIRECT_FILE_TRANSFER_STATE.DIRECT),
+        options.signal,
       );
       return result;
     } catch (error) {
+      if (options.signal?.aborted
+        || (error instanceof DirectFileTransferFailure && error.code === DIRECT_FILE_TRANSFER_ERROR.CANCELED)) {
+        throw error;
+      }
       if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
         throw new DirectFileTransferFailure(
           DIRECT_FILE_TRANSFER_ERROR.RELAY_SIZE_LIMIT,
@@ -461,5 +486,10 @@ export async function uploadFileWithDirectFallback(options: {
     throw new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.RELAY_SIZE_LIMIT, false);
   }
   options.onMode?.(DIRECT_FILE_TRANSFER_STATE.RELAY);
-  return uploadFile(options.serverId, options.file, options.onProgress, clientUploadId);
+  return uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
+}
+
+export function isFileUploadCanceled(error: unknown): boolean {
+  return (error instanceof DirectFileTransferFailure && error.code === DIRECT_FILE_TRANSFER_ERROR.CANCELED)
+    || (error instanceof Error && error.name === 'AbortError');
 }

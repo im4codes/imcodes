@@ -1563,6 +1563,11 @@
     "upload_file": "ファイルをアップロード",
     "uploading": "アップロード中...",
     "upload_failed": "アップロード失敗",
+    "cancel": "中止",
+    "cancel_named": "{{name}} のアップロードを中止",
+    "cancel_confirm": "{{name}} のアップロードを中止しますか？現在の転送内容は破棄されます。",
+    "delete_failed": "アップロード済みファイルを削除できませんでした",
+    "deleting": "アップロード済みファイルを削除中…",
     "direct_required_large": "このファイルには直接接続が必要です。サーバー中継は最大 {{max}}MB です",
     "transport": {
       "connecting": "P2P 接続中",

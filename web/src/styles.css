@@ -790,7 +790,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .composer-upload-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
+  grid-template-columns: minmax(0, 1fr) max-content max-content;
   align-items: center;
   min-height: 30px;
   padding: 5px 7px;
@@ -865,6 +865,7 @@ html.native-ios-mac .chat-dl-btn {
   animation: composer-upload-signal 1.1s ease-in-out infinite;
 }
 .composer-upload-progress-track {
+  grid-column: 1 / 3;
   height: 4px;
   overflow: hidden;
   border-radius: 999px;
@@ -895,6 +896,25 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+.composer-upload-cancel {
+  appearance: none;
+  min-height: 20px;
+  padding: 1px 7px;
+  border: 1px solid rgba(248, 113, 113, 0.34);
+  border-radius: 999px;
+  background: rgba(127, 29, 29, 0.18);
+  color: #fca5a5;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+}
+.composer-upload-cancel:hover,
+.composer-upload-cancel:focus-visible {
+  border-color: rgba(248, 113, 113, 0.7);
+  background: rgba(153, 27, 27, 0.32);
+  color: #fecaca;
 }
 .composer-upload-stats {
   display: flex;
@@ -930,6 +950,7 @@ html.native-ios-mac .chat-dl-btn {
 .attachment-badge-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-badge-remove { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
 .attachment-badge-remove:hover { color: #ef4444; }
+.attachment-badge-remove:disabled { cursor: wait; opacity: 0.45; }
 .quote-badge { border-color: rgba(167,139,250,0.42); background: rgba(76,29,149,0.28); }
 .quote-badge .attachment-badge-icon { color: #a78bfa; }
 .controls-target-bubble {

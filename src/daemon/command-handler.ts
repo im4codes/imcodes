@@ -956,6 +956,7 @@ import {
   handleFileUploadFetch,
   handleFileDownload,
   handleFileDownloadStream,
+  handleFileDelete,
   tryCreateProjectFileHandle,
   lookupAttachment,
 } from './file-transfer-handler.js';
@@ -1806,6 +1807,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case FILE_TRANSFER_MSG.DOWNLOAD_STREAM:
       void handleFileDownloadStream(cmd, serverLink);
+      break;
+    case FILE_TRANSFER_MSG.DELETE:
+      void handleFileDelete(cmd, serverLink);
       break;
     case TRANSPORT_MSG.LIST_SESSIONS:
       void handleListProviderSessions(cmd, serverLink);

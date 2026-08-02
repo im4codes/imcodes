@@ -1564,6 +1564,11 @@
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",
     "upload_failed": "Error al subir",
+    "cancel": "Detener",
+    "cancel_named": "Detener la subida de {{name}}",
+    "cancel_confirm": "¿Detener la subida de {{name}}? La transferencia actual se descartará.",
+    "delete_failed": "No se pudo eliminar el archivo subido",
+    "deleting": "Eliminando el archivo subido…",
     "direct_required_large": "Este archivo requiere conexión directa; el relevo del servidor está limitado a {{max}}MB",
     "transport": {
       "connecting": "Conectando P2P",

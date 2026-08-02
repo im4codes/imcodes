@@ -50,8 +50,8 @@ import { parseBooleanish, usePref } from '../hooks/usePref.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
-import { sendSessionViaHttp, cancelSessionViaHttp } from '../api.js';
-import { DirectFileTransferFailure, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
+import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { DirectFileTransferFailure, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
@@ -387,13 +387,14 @@ const IME_ESCAPE_CANCEL_GRACE_MS = 800;
  * `clearComposer` clears the attachments array.
  */
 type ComposerAttachment = { path: string; name: string; seq: number };
+type ComposerAttachmentRecord = ComposerAttachment & { id?: string; serverId?: string };
 
 /**
  * Renumber attachments so `seq` is `1..N` in array order. Used after
  * removing a middle attachment so the remaining ones renumber to stay
  * consecutive (otherwise `#1`, `#3`, `#5` gaps would confuse users).
  */
-function renumberAttachments(list: ComposerAttachment[]): ComposerAttachment[] {
+function renumberAttachments(list: ComposerAttachmentRecord[]): ComposerAttachmentRecord[] {
   return list.map((entry, index) => ({ ...entry, seq: index + 1 }));
 }
 
@@ -523,7 +524,7 @@ const aliasPickerEmptyStyle: Record<string, string | number> = {
   cursor: 'default',
 };
 
-function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[] {
+function parseStoredComposerAttachments(raw: string | null): ComposerAttachmentRecord[] {
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -535,7 +536,7 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
      * consecutive across reloads even when the old entries lack
      * `seq`.
      */
-    const list: ComposerAttachment[] = parsed.flatMap((entry) => {
+    const list: ComposerAttachmentRecord[] = parsed.flatMap((entry) => {
       if (!entry || typeof entry !== 'object') return [];
       const path = typeof (entry as { path?: unknown }).path === 'string'
         ? (entry as { path: string }).path.trim()
@@ -544,7 +545,13 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
         ? (entry as { name: string }).name.trim()
         : '';
       if (!path || !name) return [];
-      return [{ path, name, seq: 0 }];
+      const id = typeof (entry as { id?: unknown }).id === 'string'
+        ? (entry as { id: string }).id.trim()
+        : undefined;
+      const storedServerId = typeof (entry as { serverId?: unknown }).serverId === 'string'
+        ? (entry as { serverId: string }).serverId.trim()
+        : undefined;
+      return [{ path, name, seq: 0, ...(id ? { id } : {}), ...(storedServerId ? { serverId: storedServerId } : {}) }];
     });
     return renumberAttachments(list);
   } catch {
@@ -552,7 +559,7 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachment[
   }
 }
 
-function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachment): ComposerAttachment[] {
+function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachmentRecord): ComposerAttachmentRecord[] {
   const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
   const next = renumberAttachments([...current, attachment]);
   window.sessionStorage.setItem(storageKey, JSON.stringify(next));
@@ -588,6 +595,7 @@ const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
   error: null,
 };
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
+const composerUploadAbortControllers = new Map<string, AbortController>();
 let composerUploadIdCounter = 0;
 
 function createComposerUploadId(): string {
@@ -1335,7 +1343,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const draftRef = useRef('');      // saved unsent text while navigating
   const imeComposingRef = useRef(false);
   const lastImeCompositionAtRef = useRef(0);
-  const attachmentDraftRef = useRef<ComposerAttachment[]>([]);
+  const attachmentDraftRef = useRef<ComposerAttachmentRecord[]>([]);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
   const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
   const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
@@ -1351,7 +1359,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const uploadNow = useNowTicker(uploading);
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
+  const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
@@ -4143,8 +4152,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
     addComposerUploadItems(uploadKey, uploadItems);
 
-    const uploadedAttachments = await Promise.all(files.map(async (file, index) => {
+    const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
       const uploadItem = uploadItems[index];
+      const abortController = new AbortController();
+      composerUploadAbortControllers.set(uploadItem.id, abortController);
       try {
         const result = await uploadFileWithDirectFallback({
           ws,
@@ -4156,14 +4167,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           onMode: (transport) => {
             updateComposerUploadTransport(uploadKey, uploadItem.id, transport);
           },
+          signal: abortController.signal,
         });
         updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
         updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
         if (result.attachment?.daemonPath) {
-          return { path: result.attachment.daemonPath, name: file.name, seq: 0 };
+          return {
+            path: result.attachment.daemonPath,
+            name: file.name,
+            seq: 0,
+            ...(result.attachment.id ? { id: result.attachment.id } : {}),
+            ...(result.attachment.serverId ? { serverId: result.attachment.serverId } : { serverId }),
+          };
         }
         return null;
       } catch (err) {
+        if (isFileUploadCanceled(err)) {
+          removeComposerUploadItems(uploadKey, [uploadItem.id]);
+          return null;
+        }
         console.error('[upload] failed:', err);
         const body = err instanceof Error ? err.message : String(err);
         let errorMessage: string;
@@ -4182,13 +4204,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         updateComposerUploadSnapshot(uploadKey, { error: errorMessage });
         setTimeout(() => updateComposerUploadSnapshot(uploadKey, { error: null }), 5000);
         return null;
+      } finally {
+        composerUploadAbortControllers.delete(uploadItem.id);
       }
     }));
 
-    const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachment => !!entry);
+    const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachmentRecord => !!entry);
     if (successfulAttachments.length > 0) {
       if (uploadAttachmentDraftKey) {
-        let next: ComposerAttachment[] = [];
+        let next: ComposerAttachmentRecord[] = [];
         for (const attachment of successfulAttachments) {
           next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
         }
@@ -4202,6 +4226,34 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
     return successfulAttachments.length > 0;
   }, [attachmentDraftKey, composerUploadKey, serverId, t]);
+
+  const handleCancelUpload = useCallback((item: ComposerUploadItem) => {
+    if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
+    composerUploadAbortControllers.get(item.id)?.abort();
+  }, [t]);
+
+  const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
+    const attachmentKey = attachment.id ?? attachment.path;
+    if (deletingAttachmentKeys.has(attachmentKey)) return;
+    const inferredId = attachment.id ?? attachment.path.split(/[\\/]/).pop();
+    setDeletingAttachmentKeys((current) => new Set(current).add(attachmentKey));
+    try {
+      if (inferredId && (attachment.serverId || serverId)) {
+        await deleteAttachment(attachment.serverId || serverId!, inferredId);
+      }
+      setAttachments((current) => renumberAttachments(current.filter((entry) => entry !== attachment)));
+    } catch (error) {
+      console.error('[upload] delete failed:', error);
+      updateComposerUploadSnapshot(composerUploadKey, { error: t('upload.delete_failed') });
+      setTimeout(() => updateComposerUploadSnapshot(composerUploadKey, { error: null }), 5000);
+    } finally {
+      setDeletingAttachmentKeys((current) => {
+        const next = new Set(current);
+        next.delete(attachmentKey);
+        return next;
+      });
+    }
+  }, [composerUploadKey, deletingAttachmentKeys, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -5437,6 +5489,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   <span class="composer-upload-transport-signal" aria-hidden="true" />
                   {t(`upload.transport.${item.transport}`)}
                 </span>
+                {item.status === 'uploading' && (
+                  <button
+                    type="button"
+                    class="composer-upload-cancel"
+                    onClick={() => handleCancelUpload(item)}
+                    title={t('upload.cancel')}
+                    aria-label={t('upload.cancel_named', { name: item.name })}
+                  >{t('upload.cancel')}</button>
+                )}
                 <div
                   role="progressbar"
                   aria-label={t('upload.progress_aria', {
@@ -5507,7 +5568,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       {/* Attachment badges — above input row */}
       {attachments.length > 0 && (
         <div class="attachment-badges">
-          {attachments.map((a, i) => (
+          {attachments.map((a) => (
             <span
               key={a.path}
               class="attachment-badge"
@@ -5525,8 +5586,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <span class="attachment-badge-name">{a.name}</span>
               <button
                 class="attachment-badge-remove"
-                onClick={() => setAttachments((prev) => renumberAttachments(prev.filter((_, j) => j !== i)))}
-                title={t('common.delete')}
+                disabled={deletingAttachmentKeys.has(a.id ?? a.path)}
+                onClick={() => { void handleRemoveAttachment(a); }}
+                title={deletingAttachmentKeys.has(a.id ?? a.path) ? t('upload.deleting') : t('common.delete')}
               >×</button>
             </span>
           ))}

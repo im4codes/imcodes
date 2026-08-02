@@ -13,6 +13,7 @@ import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_MSG,
+  FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_PATH_HANDLE_ERROR,
   type AttachmentRef,
@@ -28,6 +29,9 @@ import {
   type FileDownloadError,
   validateFilePathHandleRequest,
   type FilePathHandleErrorReason,
+  type FileDeleteDone,
+  type FileDeleteError,
+  validateFileDeleteRequest,
 } from '../../shared/transport/file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { validateCanonicalRealPath } from './file-preview-path-policy.js';
@@ -612,6 +616,49 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
     sendUploadError(serverLink, uploadId, filename, err);
   } finally {
     if (msg.clientUploadId && uploadClaim) releaseClientUploadClaim(msg.clientUploadId, uploadClaim);
+  }
+}
+
+async function deleteUploadedAttachment(entry: AttachmentEntry): Promise<void> {
+  if (entry.source !== 'upload') throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
+  const resolved = path.resolve(entry.daemonPath);
+  const uploadRoot = path.resolve(UPLOAD_DIR);
+  if (!resolved.startsWith(`${uploadRoot}${path.sep}`)) throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
+  try {
+    await unlink(resolved);
+  } catch (error) {
+    if (!isNotFoundError(error)) throw error;
+  }
+  await unlink(`${resolved}.meta.json`).catch((error) => {
+    if (!isNotFoundError(error)) logger.warn({ attachmentId: entry.id, error }, 'Failed to remove upload metadata');
+  });
+  attachmentRegistry.delete(entry.id);
+}
+
+export async function handleFileDelete(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
+  const parsed = validateFileDeleteRequest(cmd);
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!parsed.ok) {
+    if (requestId) serverLink.send({
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId,
+      error: FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED,
+    } satisfies FileDeleteError);
+    return;
+  }
+  try {
+    await initFileTransfer();
+    const entry = attachmentRegistry.get(parsed.value.attachmentId);
+    // Deletion is idempotent: an expired/already-removed upload is already in
+    // the state requested by the user.
+    if (entry) await deleteUploadedAttachment(entry);
+    serverLink.send({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: parsed.value.requestId } satisfies FileDeleteDone);
+  } catch (error) {
+    const reason = error instanceof Error && error.message === FILE_TRANSFER_DELETE_ERROR.FORBIDDEN
+      ? FILE_TRANSFER_DELETE_ERROR.FORBIDDEN
+      : FILE_TRANSFER_DELETE_ERROR.DELETE_FAILED;
+    logger.error({ requestId: parsed.value.requestId, attachmentId: parsed.value.attachmentId, error }, 'Failed to delete uploaded attachment');
+    serverLink.send({ type: FILE_TRANSFER_MSG.DELETE_ERROR, requestId: parsed.value.requestId, error: reason } satisfies FileDeleteError);
   }
 }
 

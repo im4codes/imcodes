@@ -62,4 +62,27 @@ describe('controlled file-transfer trust boundary', () => {
       message: '/Users/alice/.ssh/id_rsa',
     }).ok).toBe(false);
   });
+
+  it('strictly validates attachment deletion requests and terminals', () => {
+    expect(validateControlledFileTransferRequest({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-1',
+      attachmentId: 'abc123.txt',
+    }).ok).toBe(true);
+    expect(validateControlledFileTransferRequest({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-1',
+      attachmentId: 'abc123.txt',
+      daemonPath: '/tmp/other-file',
+    })).toEqual({ ok: false, error: 'unknown_field' });
+    expect(validateControlledFileTransferResponse({
+      type: FILE_TRANSFER_MSG.DELETE_DONE,
+      requestId: 'delete-1',
+    }).ok).toBe(true);
+    expect(validateControlledFileTransferResponse({
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-1',
+      error: 'arbitrary_error',
+    }).ok).toBe(false);
+  });
 });

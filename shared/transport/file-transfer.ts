@@ -98,7 +98,17 @@ export const FILE_TRANSFER_MSG = {
   PATH_HANDLE: 'file.path_handle',
   PATH_HANDLE_DONE: 'file.path_handle_done',
   PATH_HANDLE_ERROR: 'file.path_handle_error',
+  DELETE: 'file.delete_attachment',
+  DELETE_DONE: 'file.delete_attachment_done',
+  DELETE_ERROR: 'file.delete_attachment_error',
 } as const;
+
+export const FILE_TRANSFER_DELETE_ERROR = {
+  FORBIDDEN: 'forbidden',
+  DELETE_FAILED: 'delete_failed',
+} as const;
+
+export type FileTransferDeleteError = typeof FILE_TRANSFER_DELETE_ERROR[keyof typeof FILE_TRANSFER_DELETE_ERROR];
 
 export const FILE_PATH_HANDLE_ERROR = {
   INVALID_PATH: 'invalid_path',
@@ -153,6 +163,12 @@ export interface FilePathHandleRequest {
   type: typeof FILE_TRANSFER_MSG.PATH_HANDLE;
   requestId: string;
   path: string;
+}
+
+export interface FileDeleteRequest {
+  type: typeof FILE_TRANSFER_MSG.DELETE;
+  requestId: string;
+  attachmentId: string;
 }
 
 // ── Daemon → Server messages ──────────────────────────────────────────────────
@@ -213,6 +229,17 @@ export interface FilePathHandleError {
   error: FilePathHandleErrorReason;
 }
 
+export interface FileDeleteDone {
+  type: typeof FILE_TRANSFER_MSG.DELETE_DONE;
+  requestId: string;
+}
+
+export interface FileDeleteError {
+  type: typeof FILE_TRANSFER_MSG.DELETE_ERROR;
+  requestId: string;
+  error: FileTransferDeleteError;
+}
+
 export type FileTransferDaemonMessage =
   | FileUploadDone
   | FileUploadError
@@ -221,14 +248,17 @@ export type FileTransferDaemonMessage =
   | FileDownloadStreamReady
   | FileDownloadError
   | FilePathHandleDone
-  | FilePathHandleError;
+  | FilePathHandleError
+  | FileDeleteDone
+  | FileDeleteError;
 
 export type FileTransferServerMessage =
   | FileUploadRequest
   | FileUploadFetchRequest
   | FileDownloadRequest
   | FileDownloadStreamRequest
-  | FilePathHandleRequest;
+  | FilePathHandleRequest
+  | FileDeleteRequest;
 
 export type ControlledFileTransferResponse =
   | FileUploadDone
@@ -238,13 +268,16 @@ export type ControlledFileTransferResponse =
   | FileDownloadStreamReady
   | FileDownloadError
   | FilePathHandleDone
-  | FilePathHandleError;
+  | FilePathHandleError
+  | FileDeleteDone
+  | FileDeleteError;
 
 export type ControlledFileTransferRequest =
   | FileUploadFetchRequest
   | FileDownloadRequest
   | FileDownloadStreamRequest
-  | FilePathHandleRequest;
+  | FilePathHandleRequest
+  | FileDeleteRequest;
 
 export type FileTransferValidationResult<T> =
   | { ok: true; value: T }
@@ -314,12 +347,22 @@ export function validateFilePathHandleRequest(value: unknown): FileTransferValid
   return { ok: true, value: value as unknown as FilePathHandleRequest };
 }
 
+export function validateFileDeleteRequest(value: unknown): FileTransferValidationResult<FileDeleteRequest> {
+  if (!isObject(value)) return { ok: false, error: 'invalid_object' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId', 'attachmentId']))) return { ok: false, error: 'unknown_field' };
+  if (value.type !== FILE_TRANSFER_MSG.DELETE) return { ok: false, error: 'invalid_type' };
+  if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  if (!isTransferId(value.attachmentId)) return { ok: false, error: 'invalid_attachment_id' };
+  return { ok: true, value: value as unknown as FileDeleteRequest };
+}
+
 /** Strict validator for the bounded file controls accepted by the thin node. */
 export function validateControlledFileTransferRequest(
   value: unknown,
 ): FileTransferValidationResult<ControlledFileTransferRequest> {
   if (!isObject(value) || typeof value.type !== 'string') return { ok: false, error: 'invalid_object' };
   if (value.type === FILE_TRANSFER_MSG.PATH_HANDLE) return validateFilePathHandleRequest(value);
+  if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
   if (value.type === 'file.upload_fetch') {
     if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId']))
       || !isTransferId(value.uploadId)
@@ -415,6 +458,20 @@ export function validateControlledFileTransferResponse(
       return { ok: false, error: 'invalid_path_handle_error' };
     }
     return { ok: true, value: v as unknown as FilePathHandleError };
+  }
+  if (v.type === FILE_TRANSFER_MSG.DELETE_DONE) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId'])) || !isTransferId(v.requestId)) {
+      return { ok: false, error: 'invalid_lifecycle_done' };
+    }
+    return { ok: true, value: v as unknown as FileDeleteDone };
+  }
+  if (v.type === FILE_TRANSFER_MSG.DELETE_ERROR) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'error']))
+      || !isTransferId(v.requestId)
+      || !Object.values(FILE_TRANSFER_DELETE_ERROR).includes(v.error as FileTransferDeleteError)) {
+      return { ok: false, error: 'invalid_lifecycle_error' };
+    }
+    return { ok: true, value: v as unknown as FileDeleteError };
   }
   return { ok: false, error: 'invalid_type' };
 }

@@ -1564,6 +1564,11 @@
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",
     "upload_failed": "上傳失敗",
+    "cancel": "終止",
+    "cancel_named": "終止上傳 {{name}}",
+    "cancel_confirm": "確定終止上傳 {{name}}？目前傳輸內容將被捨棄。",
+    "delete_failed": "無法刪除已上傳的檔案",
+    "deleting": "正在刪除已上傳檔案…",
     "direct_required_large": "此檔案需要直連；伺服器中轉回退上限為 {{max}}MB",
     "transport": {
       "connecting": "P2P 連線中",
