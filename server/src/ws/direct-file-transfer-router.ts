@@ -44,6 +44,22 @@ function mintOpaque(bytes = 32): string {
   return randomBytes(bytes).toString('base64url');
 }
 
+/**
+ * Daemon `ServerLink.send()` wraps every outbound payload with a monotonically
+ * increasing `seq`. The direct-transfer protocol deliberately rejects unknown
+ * keys, so validate the protocol payload only after removing that trusted
+ * transport envelope field. Keep this normalization daemon-side only: browser
+ * frames must still satisfy the exact public schema as received.
+ */
+function unwrapDaemonTransportSequence(message: unknown): unknown {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return message;
+  const record = message as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, 'seq')) return message;
+  if (!Number.isSafeInteger(record.seq) || (record.seq as number) <= 0) return message;
+  const { seq: _seq, ...payload } = record;
+  return payload;
+}
+
 export class DirectFileTransferRouter {
   private readonly routes = new Map<string, DirectFileTransferRoute>();
   private readonly uploadIds = new Map<string, string>();
@@ -89,8 +105,22 @@ export class DirectFileTransferRouter {
 
   handleDaemon(message: unknown, daemonGeneration: number): boolean {
     if (!this.handlesType((message as { type?: unknown } | null)?.type)) return false;
-    const parsed = validateDirectFileTransferDaemonMessage(message);
-    if (!parsed.ok) return true;
+    const payload = unwrapDaemonTransportSequence(message);
+    const parsed = validateDirectFileTransferDaemonMessage(payload);
+    if (!parsed.ok) {
+      const requestId = typeof (message as { requestId?: unknown } | null)?.requestId === 'string'
+        ? (message as { requestId: string }).requestId
+        : undefined;
+      const route = requestId ? this.routes.get(requestId) : undefined;
+      if (route?.daemonGeneration === daemonGeneration) {
+        // A malformed response from the authenticated daemon used to vanish
+        // here, leaving the browser to report only an opaque negotiation
+        // timeout. Fail the bound request immediately while preserving the
+        // strict protocol boundary and relay fallback.
+        this.failRoute(route, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
+      }
+      return true;
+    }
     const route = this.routes.get(parsed.value.requestId);
     const capability = 'capability' in parsed.value ? parsed.value.capability : undefined;
     if (!route || route.daemonGeneration !== daemonGeneration || !capability || !capabilityMatches(route, capability)) {

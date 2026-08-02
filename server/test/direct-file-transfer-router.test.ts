@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import { DirectFileTransferRouter } from '../src/ws/direct-file-transfer-router.js';
+import { stringifyForServerSend } from '../../src/daemon/latency-tracer.js';
 import {
   DIRECT_FILE_TRANSFER_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
@@ -94,6 +95,80 @@ describe('DirectFileTransferRouter', () => {
       attachment: { serverId: 'server-1' },
     });
     expect(f.messages(f.browserB)).toHaveLength(0);
+  });
+
+  it('unwraps the ServerLink sequence envelope before strict daemon-frame validation', () => {
+    const f = fixture();
+    f.router.handleBrowser(f.browserA, 'user-a', init);
+    const capability = f.messages(f.browserA)[0].capability;
+
+    const serialized = stringifyForServerSend({
+      type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      requestId: init.requestId,
+      capability,
+      sdp: 'answer-sdp',
+    }, 42);
+    // Exercise the exact daemon serialization composition. Before this fix,
+    // the appended `seq` made strict direct-frame validation reject every
+    // real answer/ICE frame while hand-built unit frames stayed green.
+    f.router.handleDaemon(JSON.parse(serialized.payload), 3);
+
+    expect(f.messages(f.browserA).at(-1)).toEqual({
+      type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      requestId: init.requestId,
+      capability,
+      sdp: 'answer-sdp',
+    });
+  });
+
+  it('fails a bound route immediately when a daemon signaling frame is malformed', () => {
+    const f = fixture();
+    f.router.handleBrowser(f.browserA, 'user-a', init);
+    const capability = f.messages(f.browserA)[0].capability;
+
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      requestId: init.requestId,
+      capability,
+      sdp: 'answer-sdp',
+      seq: 'not-a-valid-transport-sequence',
+    }, 3);
+
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      requestId: init.requestId,
+      error: 'internal_error',
+      retryable: true,
+    });
+  });
+
+  it('ignores a malformed signaling frame from a stale daemon generation', () => {
+    const f = fixture();
+    f.router.handleBrowser(f.browserA, 'user-a', init);
+    const capability = f.messages(f.browserA)[0].capability;
+    const messageCount = f.messages(f.browserA).length;
+
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      requestId: init.requestId,
+      capability,
+      sdp: 'stale-answer-sdp',
+      seq: 'not-a-valid-transport-sequence',
+    }, 2);
+
+    expect(f.messages(f.browserA)).toHaveLength(messageCount);
+
+    const current = stringifyForServerSend({
+      type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      requestId: init.requestId,
+      capability,
+      sdp: 'current-answer-sdp',
+    }, 43);
+    f.router.handleDaemon(JSON.parse(current.payload), 3);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.ANSWER,
+      sdp: 'current-answer-sdp',
+    });
   });
 
   it('rejects wrong sockets, stale generations, unsupported daemons, and duplicate upload identities', () => {
