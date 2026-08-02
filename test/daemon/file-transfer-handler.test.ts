@@ -415,6 +415,68 @@ describe('file-transfer local handle hardening', () => {
     await expect(stat(projectPath)).resolves.toMatchObject({ size: 4 });
   });
 
+  it('refuses a local registry entry even when its path is inside the upload root', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const uploaded = createServerLinkMock();
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'upload-source-guard',
+      filename: 'source-guard.txt',
+      originalName: 'source-guard.txt',
+      size: 4,
+      content: Buffer.from('keep').toString('base64'),
+    }, uploaded.serverLink as never);
+
+    const uploadPath = path.join(fakeHome, '.imcodes', 'uploads', 'source-guard.txt');
+    const entry = transfer.lookupAttachmentById('source-guard.txt');
+    expect(entry).toBeDefined();
+    entry!.source = 'local';
+
+    const refused = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-source-guard',
+      attachmentId: 'source-guard.txt',
+    }, refused.serverLink as never);
+
+    expect(refused.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-source-guard',
+      error: 'forbidden',
+    }]);
+    await expect(stat(uploadPath)).resolves.toMatchObject({ size: 4 });
+  });
+
+  it('refuses an upload-labeled registry entry whose path is outside the upload root', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const projectPath = path.join(rootDir, 'outside-upload-root.txt');
+    await writeFile(projectPath, 'keep');
+    const validated = await transfer.validateProjectFilePath(projectPath);
+    const handle = transfer.createProjectFileHandleFromValidatedPath(
+      validated,
+      'outside-upload-root.txt',
+      'text/plain',
+      4,
+    );
+    const entry = transfer.lookupAttachmentById(handle.id);
+    expect(entry).toBeDefined();
+    entry!.source = 'upload';
+
+    const refused = createServerLinkMock();
+    await transfer.handleFileDelete({
+      type: FILE_TRANSFER_MSG.DELETE,
+      requestId: 'delete-path-guard',
+      attachmentId: handle.id,
+    }, refused.serverLink as never);
+
+    expect(refused.sent).toEqual([{
+      type: FILE_TRANSFER_MSG.DELETE_ERROR,
+      requestId: 'delete-path-guard',
+      error: 'forbidden',
+    }]);
+    await expect(stat(projectPath)).resolves.toMatchObject({ size: 4 });
+  });
+
   it('waits for an ambiguous direct attempt and reuses its committed attachment instead of uploading twice', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
     const fetchMock = vi.fn();

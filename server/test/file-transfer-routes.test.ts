@@ -544,7 +544,7 @@ describe('file-transfer attachment deletion route', () => {
     sendFileTransferRequestMock.mockReset();
     isDaemonConnectedMock.mockReset().mockReturnValue(true);
     hasDaemonCapabilityMock.mockReset().mockReturnValue(true);
-    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveServerMemberAccessOrShareDeny.mockReset().mockResolvedValue({ ok: true, role: 'owner' });
     queryOneMock.mockReset().mockResolvedValue({ user_id: 'user-1', node_role: 'full', exec_enabled: true, revoked_at: null });
     sendFileTransferRequestMock.mockResolvedValue({ type: FILE_TRANSFER_MSG.DELETE_DONE, requestId: 'a'.repeat(32) });
   });
@@ -566,6 +566,26 @@ describe('file-transfer attachment deletion route', () => {
       { type: FILE_TRANSFER_MSG.DELETE, requestId: 'a'.repeat(32), attachmentId: 'abcdef1234.txt' },
       30_000,
     );
+  });
+
+  it('rejects share-only attachment deletion before contacting the daemon', async () => {
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValueOnce({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+
+    const response = await makeApp().request('/api/server/srv-1/uploads/abcdef1234.txt', {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer test' },
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: 'forbidden',
+      reason: 'share-direct-surface-denied',
+    });
+    expect(mockResolveServerMemberAccessOrShareDeny).toHaveBeenCalledOnce();
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
   it('rejects malformed attachment ids before contacting the daemon', async () => {

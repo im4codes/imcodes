@@ -6713,6 +6713,43 @@ afterEach(() => {
     expect(confirmSpy).not.toHaveBeenCalled();
   });
 
+  it('keeps the completed attachment and draft when daemon deletion fails', async () => {
+    uploadFileMock.mockResolvedValue({
+      attachment: {
+        id: 'keep-on-failure.txt',
+        serverId: 'srv-1',
+        daemonPath: '/tmp/keep-on-failure.txt',
+      },
+    });
+    deleteAttachmentMock.mockRejectedValueOnce(new Error('delete failed'));
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['keep'], 'keep.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('keep.txt'));
+    const draftKey = 'rcc_draft_attachments_session:my-session';
+    await waitFor(() => expect(sessionStorage.getItem(draftKey)).toContain('keep-on-failure.txt'));
+    const savedDraft = sessionStorage.getItem(draftKey);
+
+    fireEvent.click(document.querySelector('.attachment-badge-remove') as HTMLButtonElement);
+
+    await waitFor(() => expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'keep-on-failure.txt'));
+    expect(await screen.findByText('Could not delete the uploaded file')).toBeTruthy();
+    expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('keep.txt');
+    expect(sessionStorage.getItem(draftKey)).toBe(savedDraft);
+  });
+
   it('R3 v2 PR-ρ — removing a middle attachment renumbers the remaining tags consecutively', async () => {
     let nextDaemonPath = '/tmp/x1.png';
     uploadFileMock.mockImplementation(async () => ({ attachment: { daemonPath: nextDaemonPath } }));
