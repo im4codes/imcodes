@@ -89,6 +89,7 @@ async function pumpFile(
   file: File,
   requestId: string,
   onProgress?: (pct: number) => void,
+  onFinalizing?: () => void,
 ): Promise<void> {
   let offset = 0;
   while (offset < file.size) {
@@ -98,6 +99,9 @@ async function pumpFile(
     offset = end;
     onProgress?.(file.size > 0 ? Math.round((offset / file.size) * 100) : 100);
   }
+  // From this point onward the receiver may commit the file and close the data
+  // channel before its DONE frame reaches us over the separate WebSocket.
+  onFinalizing?.();
   channel.send(JSON.stringify({
     type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
     requestId,
@@ -138,6 +142,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
   let unsubscribe: (() => void) | null = null;
   let timeout: ReturnType<typeof setTimeout> | null = null;
   let pumping = false;
+  let uploadFinalizing = false;
   const pendingCandidates: RTCIceCandidateInit[] = [];
   const browserCandidateTypes = new Set<DirectConnectivityCandidateType>();
   const daemonCandidateTypes = new Set<DirectConnectivityCandidateType>();
@@ -201,6 +206,17 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
       timeout = setTimeout(() => finishError(new DirectFileTransferFailure(
         DIRECT_FILE_TRANSFER_ERROR.NEGOTIATION_TIMEOUT,
       )), ms);
+    };
+    const handleTransportFailure = (error: DirectFileTransferFailure) => {
+      if (!probe && uploadFinalizing && !settled) {
+        // DONE/STATUS travels over WebSocket, while the receiver closes this
+        // data channel after committing. Cross-transport delivery order is not
+        // guaranteed, so give the reliable completion frame time to arrive
+        // instead of restarting an already committed upload through relay.
+        armTimeout(DIRECT_FILE_TRANSFER_LIMITS.STATUS_TIMEOUT_MS);
+        return;
+      }
+      finishError(error);
     };
     const flushRemoteCandidates = async () => {
       if (!peer?.remoteDescription) return;
@@ -276,11 +292,16 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
         void pumpFile(channel, operation.file, requestId, (pct) => {
           armTimeout();
           operation.onProgress?.(pct);
+        }, () => {
+          uploadFinalizing = true;
+          armTimeout();
         }).catch(finishError);
       });
-      channel.addEventListener('error', () => finishError(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED)));
+      channel.addEventListener('error', () => handleTransportFailure(
+        new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED),
+      ));
       channel.addEventListener('close', () => {
-        if (!settled) finishError(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
+        if (!settled) handleTransportFailure(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
       });
       peer.addEventListener('icecandidate', (event) => {
         if (!event.candidate || !capability) return;
@@ -304,7 +325,7 @@ async function runDirectOperation(ws: WsClient, operation: DirectOperation): Pro
           emitProbeDiagnostics(DIRECT_CONNECTIVITY_PROBE_STAGE.CHECKING);
         }
         if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
-          finishError(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED));
+          handleTransportFailure(new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED));
         }
       });
       const offer = await peer.createOffer();

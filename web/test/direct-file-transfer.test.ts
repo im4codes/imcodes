@@ -225,6 +225,55 @@ describe('direct file upload fallback', () => {
     expect(peer.channel.sent.some((value) => typeof value !== 'string')).toBe(true);
   });
 
+  it('does not restart through relay when the data channel closes after FINISH before DONE arrives', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, emit } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
+    const modes: string[] = [];
+    const bytes = new TextEncoder().encode('committed direct upload');
+    const file = {
+      name: 'committed.txt',
+      type: 'text/plain',
+      size: bytes.byteLength,
+      slice: (start: number, end: number) => ({
+        arrayBuffer: async () => bytes.slice(start, end).buffer,
+      }),
+    } as unknown as File;
+    const pending = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file,
+      onMode: (mode) => modes.push(mode),
+    });
+
+    await vi.waitFor(() => expect(FakePeerConnection.latest?.channel.sent.length).toBeGreaterThan(0));
+    const peer = FakePeerConnection.latest!;
+    const start = peer.channel.sent.find((value) => typeof value === 'string') as string;
+    const startPayload = JSON.parse(start) as { requestId: string };
+    peer.channel.onSend = (value) => {
+      if (typeof value !== 'string') return;
+      const payload = JSON.parse(value) as { type: string; requestId: string };
+      if (payload.type !== DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) return;
+      peer.channel.dispatchEvent(new Event('close'));
+      queueMicrotask(() => emit({
+        type: DIRECT_FILE_TRANSFER_MSG.DONE,
+        requestId: payload.requestId,
+        capability,
+        clientUploadId: 'ignored-by-client',
+        attachment: {
+          id: 'direct-after-close', source: 'upload', serverId: 'server-1', daemonPath: '/direct/committed',
+          size: file.size, createdAt: new Date().toISOString(), downloadable: true,
+        },
+      } as ServerMessage));
+    };
+    peer.channel.dispatchEvent(new MessageEvent('message', {
+      data: JSON.stringify({ type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED, requestId: startPayload.requestId }),
+    }));
+
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'direct-after-close' } });
+    expect(modes).toEqual(['connecting', 'direct']);
+    expect(uploadFileMock).not.toHaveBeenCalled();
+  });
+
   it('probes a routed private path over the data channel without uploading a file', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
     const { ws, sent, emit } = createWs([DIRECT_FILE_TRANSFER_CAPABILITY]);
